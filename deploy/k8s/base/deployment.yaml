@@ -1,24 +1,44 @@
 # Two replicas = one active instance + one hot standby. Replicas of the same
 # LAZYVIEW_INSTANCE_ID compete for a MySQL named lock (GET_LOCK) on the source; the loser waits
-# (alive, booted, /readyz "hot standby") and takes over within seconds when the active one stops.
+# (alive, /readyz "hot standby", polling the lock every 5 s) and takes over once the lock is free:
+#   * the active pod stops (SIGTERM, crash, OOM kill, pod deletion): its connection closes, the
+#     lock is released at once and the standby takes over within about 5 s;
+#   * the active pod's node dies, freezes or is cut off from the database: nothing closes its
+#     connection, so the server keeps the lock until it ends that session itself, after its
+#     `wait_timeout` (MySQL default 28800 s = 8 h) or a failed TCP keepalive on the database host
+#     (Linux default about 2 h 10 min). Until then nothing streams and LazyviewNotStreaming
+#     (components/prometheus) fires after 10 min. Lower the server's wait_timeout or the database
+#     host's net.ipv4.tcp_keepalive_* settings if that gap matters.
 #
 # Probes (semantics in src/health.rs):
-#   startupProbe   /startupz         booted: hot standby, or the binlog stream connected once.
-#                                    Liveness only starts after it passed, so waiting for the
-#                                    database / metadata migrations get a 15 min budget.
-#   livenessProbe  /livez            fails only when the engine loop is wedged
-#                                    (LAZYVIEW_LIVENESS_STALL_SECS, default 120 s), never because
-#                                    of long builds, the database being down, lag or standby.
-#   readinessProbe /readyz?standby=ok  active: streaming and every view live; a healthy hot
-#                                    standby also counts as ready. Plain /readyz reports a standby
-#                                    as not ready, which would deadlock this rollout strategy (a
-#                                    new pod could never become Ready while an old one holds the
-#                                    lock) and make the PodDisruptionBudget block every drain.
+#   startupProbe   /startupz   the process serves and the engine reports progress. It does not
+#                              wait for the database: a pod restarted during a database outage
+#                              would only be restarted again.
+#   livenessProbe  /livez      fails only when the engine loop is wedged: no progress for
+#                              LAZYVIEW_LIVENESS_STALL_SECS (120 s), or for
+#                              LAZYVIEW_LIVENESS_BOOT_STALL_SECS (900 s) while booting, which also
+#                              covers the boot after a standby took over. Never because of long
+#                              builds, the database being down, lag, views in error or standby.
+#   readinessProbe /readyz?standby=ok&building=ok
+#                              a healthy member of the pair: a standby connected to the source and
+#                              polling the lock, or the active pod streaming the binlog (first
+#                              builds may still be running). Plain /readyz (humans, monitoring,
+#                              lazyview_ready) is stricter. Without standby=ok a new pod could never
+#                              become Ready while an old one holds the lock (rollouts deadlock) and
+#                              the PodDisruptionBudget would block every drain. Without building=ok
+#                              the Deployment is unavailable for the whole of a long first build,
+#                              drains of the standby's node are blocked, and the ReplicaSet scales
+#                              down the not-ready builder first, so the build starts over.
 #
-# Strategy: RollingUpdate maxSurge 1 / maxUnavailable 0. The new pod starts as a standby, becomes
-# Ready once it has connected to the database and is waiting for the lock (so a broken image or
-# configuration never takes down the running instance), then an old pod is terminated; when that
-# was the active one, a standby takes over. `Recreate` also works but stops everything first.
+# Strategy: RollingUpdate maxSurge 1 / maxUnavailable 0. The new pod starts as a standby and
+# becomes Ready once it is connected to the source and polling the lock: the image starts, the
+# configuration parses, the source accepts these credentials and the metadata tables are
+# migrated. Target DSNs and connections, the REPLICATION SLAVE / CLIENT grants and the view
+# definitions are only checked after a pod takes the lock, so a release that breaks those still
+# rolls out and then fails on takeover (`kubectl rollout undo deployment/lazyview`). Then an old
+# pod is terminated; when that was the active one, a standby takes over. A rollout replaces the
+# active pod, so a view build in progress starts over on the new active pod. `Recreate` also
+# works but stops everything first.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,8 +50,9 @@ metadata:
 spec:
   replicas: 2
   revisionHistoryLimit: 5
-  # A new active instance may (re)build views before it reports ready.
-  progressDeadlineSeconds: 1800
+  # New pods become Ready as standbys within seconds; a rollout that does not progress for 10 min
+  # (database unreachable, image pull errors) is reported as failed.
+  progressDeadlineSeconds: 600
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -65,8 +86,8 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       affinity:
-        # Active and standby on different nodes when possible (a node failure then only costs a
-        # takeover).
+        # Active and standby on different nodes when possible, so one node failure never takes
+        # both (see the node failure note above for how long the takeover then takes).
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
@@ -78,9 +99,10 @@ spec:
                     app.kubernetes.io/instance: lazyview
       containers:
         - name: lazyview
-          # Distroless static image, runs as 65532, no shell (see Dockerfile). Set the registry /
-          # tag (or a digest) with the `images:` field of your kustomization.
-          image: ghcr.io/OWNER/lazyview:0.1.0
+          # Distroless static image, runs as 65532, no shell (see Dockerfile). `edge` is the
+          # latest build of main; pin a release (0.1.0 once v0.1.0 is tagged), a sha-<commit> tag
+          # or a digest with the `images:` field of your kustomization.
+          image: ghcr.io/kirmorozov/lazyview:edge
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef:
@@ -91,13 +113,15 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+          # 60 s for the process to start serving; the boot itself is guarded by liveness.
           startupProbe:
             httpGet:
               path: /startupz
               port: http
-            periodSeconds: 5
+            periodSeconds: 2
             timeoutSeconds: 3
-            failureThreshold: 180
+            failureThreshold: 30
+          # Restart about 30 s after the stall limit is reached.
           livenessProbe:
             httpGet:
               path: /livez
@@ -107,7 +131,7 @@ spec:
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /readyz?standby=ok
+              path: /readyz?standby=ok&building=ok
               port: http
             periodSeconds: 5
             timeoutSeconds: 3

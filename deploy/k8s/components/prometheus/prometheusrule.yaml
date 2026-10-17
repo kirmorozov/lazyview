@@ -1,4 +1,6 @@
-# Alerts on what the probes deliberately ignore (they would not be fixed by a restart).
+# Alerts on what the probes deliberately ignore (a restart would not fix them). Rules group by
+# namespace and job (the scraped Service, `lazyview-metrics` plus any name prefix/suffix of your
+# overlay), so several lazyview deployments, also in one namespace, are told apart.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -11,34 +13,56 @@ spec:
     - name: lazyview
       rules:
         - alert: LazyviewDown
-          expr: absent(lazyview_build_info)
+          # Pods exist but none answers the scrape (crash loop, image pull or configuration
+          # errors: the Service also publishes pods that are not ready).
+          expr: max by (namespace, job) (up{job=~".*lazyview-metrics.*"}) == 0
           for: 10m
           labels:
             severity: critical
           annotations:
-            summary: No lazyview instance is being scraped.
+            summary: No lazyview pod of {{ $labels.job }} in {{ $labels.namespace }} can be scraped.
+        - alert: LazyviewUnavailable
+          # No pod is Ready, including pods that never got an IP (Pending, unschedulable), which
+          # LazyviewDown cannot see. Needs kube-state-metrics (part of kube-prometheus-stack).
+          expr: max by (namespace, deployment) (kube_deployment_status_replicas_available{deployment=~".*lazyview.*"}) == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: Deployment {{ $labels.deployment }} in {{ $labels.namespace }} has no available pod.
+        - alert: LazyviewNotScraped
+          # Cluster-wide: Prometheus has no lazyview target at all (e.g. the ServiceMonitor lacks
+          # the `release` label kube-prometheus-stack selects on).
+          expr: absent(up{job=~".*lazyview-metrics.*"})
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Prometheus scrapes no lazyview target.
         - alert: LazyviewNotStreaming
-          # No replica holds the lock and streams the binlog (database unreachable, missing
-          # grants, purged binlog, or every replica still starting).
-          expr: max by (namespace) (lazyview_streaming) == 0
+          # Pods are scraped but none holds the lock and streams the binlog: database unreachable,
+          # missing grants, purged binlog, a takeover still booting, or the lock still held by the
+          # session of a pod whose node died (see deploy/k8s/base/deployment.yaml).
+          expr: max by (namespace, job) (lazyview_streaming) == 0
           for: 10m
           labels:
             severity: critical
           annotations:
-            summary: No lazyview instance in {{ $labels.namespace }} is streaming the binlog.
+            summary: No lazyview pod of {{ $labels.job }} in {{ $labels.namespace }} is streaming the binlog.
         - alert: LazyviewViewsInError
-          expr: max by (namespace) (lazyview_views_error) > 0
+          expr: max by (namespace, job) (lazyview_views_error) > 0
           for: 15m
           labels:
             severity: warning
           annotations:
-            summary: "{{ $value }} lazyview view(s) in error in {{ $labels.namespace }}"
+            summary: "{{ $value }} lazyview view(s) of {{ $labels.job }} in {{ $labels.namespace }} in error"
             description: "SELECT name, target, last_error FROM _lazyview_state WHERE state = 'error'"
         - alert: LazyviewViewsNotLive
-          # Views without a live version for 2 h (initial build very slow or stuck).
-          expr: max by (namespace) (lazyview_views - lazyview_views_ready - lazyview_views_error) > 0
+          # Views without a live version for 2 h (initial build very slow or stuck). The
+          # Kubernetes readiness probe ignores first builds (building=ok); this alert does not.
+          expr: max by (namespace, job) (lazyview_views - lazyview_views_ready - lazyview_views_error) > 0
           for: 2h
           labels:
             severity: warning
           annotations:
-            summary: "{{ $value }} lazyview view(s) in {{ $labels.namespace }} have no live table yet."
+            summary: "{{ $value }} lazyview view(s) of {{ $labels.job }} in {{ $labels.namespace }} have no live table yet."

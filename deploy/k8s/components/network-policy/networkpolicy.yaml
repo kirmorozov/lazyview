@@ -1,0 +1,26 @@
+# lazyview serves nothing but port 8080 (/metrics and the probe endpoints). Only Prometheus needs
+# it: allow the namespace it runs in (adjust the label, or add a podSelector term). Kubelet probes
+# come from the pod's own node, which NetworkPolicy always allows. Egress (DNS, the databases) is
+# not restricted here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lazyview
+  labels:
+    app.kubernetes.io/name: lazyview
+    app.kubernetes.io/instance: lazyview
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lazyview
+      app.kubernetes.io/instance: lazyview
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: http
+          protocol: TCP

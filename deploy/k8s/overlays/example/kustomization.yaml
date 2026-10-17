@@ -1,6 +1,7 @@
 # Example deployment into namespace `lazyview`. Copy this directory, then:
-#   * set the image below (registry/owner, tag or digest);
+#   * pin the image below (a release tag, sha-<commit> or a digest);
 #   * replace secret.yaml (or create the Secret out of band / via SealedSecrets / ExternalSecrets);
+#   * set the namespace Prometheus runs in (components/network-policy), or drop that component;
 #   * kubectl apply -k <dir>
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -12,14 +13,17 @@ resources:
   - secret.yaml
   - ../../base
 
-# With the Prometheus Operator installed:
-# components:
-#   - ../../components/prometheus
+components:
+  # Only Prometheus (namespace `monitoring`) may connect to port 8080; kubelet probes always may.
+  - ../../components/network-policy
+  # With the Prometheus Operator installed:
+  # - ../../components/prometheus
 
+# `edge` is the latest build of main. After the first release (git tag v0.1.0) use
+# `newTag: 0.1.0`, or pin an exact build: `newTag: sha-1234567` or `digest: sha256:…`.
 images:
-  - name: ghcr.io/OWNER/lazyview
-    newName: ghcr.io/OWNER/lazyview
-    newTag: 0.1.0
+  - name: ghcr.io/kirmorozov/lazyview
+    newTag: edge
 
 # Tuning, e.g. a strict readiness or larger limits:
 # configMapGenerator:
@@ -33,3 +37,9 @@ images:
 #       - op: replace
 #         path: /spec/template/spec/containers/0/resources/limits/memory
 #         value: 1Gi
+#   # Prometheus in another namespace:
+#   - target: { kind: NetworkPolicy, name: lazyview }
+#     patch: |
+#       - op: replace
+#         path: /spec/ingress/0/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+#         value: prometheus

@@ -1,7 +1,13 @@
-# Voluntary disruptions (node drains) take one pod at a time: draining the active pod's node
-# hands over to the standby, the evicted pod is rescheduled as the new standby, and only then may
-# the next one go. Works because a healthy standby is Ready (readinessProbe /readyz?standby=ok).
-# Pods that are not Ready (crash-looping, still booting) never block a drain.
+# Voluntary disruptions (node drains) take one pod at a time. A healthy standby and an active pod
+# that streams the binlog are both Ready (readinessProbe /readyz?standby=ok&building=ok), so a
+# drain is allowed whenever both pods are healthy and waits only while the other pod is not, e.g.
+# until the replacement of the previously evicted pod is a standby again.
+#
+# Evicting the active pod hands over to the standby within seconds. A view build in progress (a
+# first version on the first deploy, after LAZYVIEW_START_MODE=rebuild, a purged binlog or a new
+# definition, or a new version behind a live table) starts over on the new active pod, so avoid
+# drains and rollouts during long builds. Pods that are not Ready (crash-looping, still booting)
+# never block a drain (unhealthyPodEvictionPolicy: AlwaysAllow).
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

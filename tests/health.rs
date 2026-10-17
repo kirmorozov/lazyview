@@ -1,6 +1,7 @@
 //! Probe endpoints of a real engine (`/livez`, `/readyz`, `/startupz`, `/metrics`) through every
 //! state a Kubernetes pod goes through: waiting for the database, first build, streaming, a view
-//! in error, hot standby and takeover, a database outage, plus HTTP edge cases.
+//! in error, hot standby and takeover, a database outage, plus HTTP edge cases (HEAD, 404, 405,
+//! JSON, a slow client, a flood of idle connections).
 
 mod common;
 
@@ -15,9 +16,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-/// Liveness stall window and readiness disconnect grace used by every engine in this binary
-/// (the health settings come from the process environment).
-const STALL_SECS: u64 = 15;
+/// Liveness stall window (the minimum), boot budget and readiness disconnect grace used by every
+/// engine in this binary (the health settings come from the process environment).
+const STALL_SECS: u64 = lazyview::health::MIN_STALL_SECS;
+const BOOT_STALL_SECS: u64 = 600;
 const GRACE_SECS: u64 = 2;
 
 fn init_env() {
@@ -25,12 +27,20 @@ fn init_env() {
     ONCE.call_once(|| {
         std::env::set_var("LAZYVIEW_LIVENESS_STALL_SECS", STALL_SECS.to_string());
         std::env::set_var(
+            "LAZYVIEW_LIVENESS_BOOT_STALL_SECS",
+            BOOT_STALL_SECS.to_string(),
+        );
+        std::env::set_var(
             "LAZYVIEW_READY_DISCONNECT_GRACE_SECS",
             GRACE_SECS.to_string(),
         );
         std::env::remove_var("LAZYVIEW_READY_REQUIRE_ALL");
+        std::env::remove_var("LAZYVIEW_HEARTBEAT_MS");
     });
 }
+
+/// The readiness probe of deploy/k8s/base/deployment.yaml.
+const K8S_READY: &str = "/readyz?standby=ok&building=ok";
 
 fn free_addr() -> Result<String> {
     let port = std::net::TcpListener::bind("127.0.0.1:0")?
@@ -139,9 +149,10 @@ async fn setup(db: &Db) -> Result<mysql_async::Conn> {
     Ok(c)
 }
 
-/// Probe transitions: waiting for the database → starting/not ready; first build → ready; an
-/// invalid definition → still ready unless strict; a second engine on the same schema → hot
-/// standby (alive, started, not ready) → takes over when the first stops; HTTP edge cases.
+/// Probe transitions: waiting for the database → alive, started (startup does not wait for the
+/// database), not ready; first build → ready; an invalid definition → still ready unless strict;
+/// a second engine on the same schema → hot standby (alive, started, not ready, ready for the
+/// Kubernetes probe) → takes over when the first stops; HTTP edge cases.
 #[test]
 fn health_probe_transitions() {
     init_env();
@@ -149,7 +160,7 @@ fn health_probe_transitions() {
         let db = ctx.new_db("health").await?;
         let mut c = setup(&db).await?;
 
-        // 1. Database unreachable at boot: alive (the connect loop beats), not started, not ready.
+        // 1. Database unreachable at boot: alive (the connect loop beats), started, not ready.
         let dead = free_addr()?;
         let dead_dsn = with_authority_host(&db.dsn, &dead);
         let w = free_addr()?;
@@ -173,12 +184,48 @@ fn health_probe_transitions() {
             "role while waiting for the database: {}",
             r.body
         );
+        let j = json(&r)?;
         ensure!(
-            status(&w, "/startupz").await? == 503,
-            "/startupz must fail while waiting for the database"
+            j["engine"]["booting"] == true
+                && j["engine"]["liveness_limit_seconds"] == BOOT_STALL_SECS
+                && j["engine"]["binlog_disconnected_seconds"] == 0,
+            "engine while waiting for the database: {}",
+            r.body
         );
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_alive(&w, "while waiting for the database").await?;
+        let r = get(&w, "/startupz?verbose").await?;
+        ensure!(
+            r.status == 200 && r.body.contains("[+]phase ok: booting"),
+            "/startupz must pass while waiting for the database (a restart does not help): {} {:?}",
+            r.status,
+            r.body
+        );
+        // The connect loop beats (backoff 1, 2, 4, 8 s): the heartbeat age keeps resetting.
+        let (mut beats, mut last_age) = (0, u64::MAX);
+        let watch = Instant::now();
+        while beats < 3 {
+            ensure!(
+                watch.elapsed() < Duration::from_secs(25),
+                "only {beats} heartbeat(s) in 25 s while waiting for the database"
+            );
+            let r = get(&w, "/livez?format=json").await?;
+            ensure!(
+                r.status == 200,
+                "/livez while waiting for the database: {}",
+                r.body
+            );
+            let age = json(&r)?["engine"]["heartbeat_age_seconds"]
+                .as_u64()
+                .context("heartbeat_age_seconds")?;
+            ensure!(
+                age < STALL_SECS,
+                "heartbeat {age}s old while waiting for the database"
+            );
+            if age < last_age && last_age != u64::MAX {
+                beats += 1;
+            }
+            last_age = age;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         waiting
             .stop()
             .await
@@ -200,6 +247,10 @@ fn health_probe_transitions() {
             r.body.contains("[+]role ok: active") && r.body.ends_with("readyz check passed\n"),
             "verbose: {}",
             r.body
+        );
+        ensure!(
+            status(&a_addr, K8S_READY).await? == 200,
+            "Kubernetes readiness of the active engine"
         );
 
         // 3. A view in error: still ready (reported), not ready in strict mode.
@@ -248,9 +299,12 @@ fn health_probe_transitions() {
         .await?;
         b.check_alive()?;
         assert_alive(&b_addr, "in standby").await?;
+        let r = get(&b_addr, "/startupz?verbose").await?;
         ensure!(
-            status(&b_addr, "/startupz").await? == 200,
-            "/startupz must pass in standby"
+            r.status == 200 && r.body.contains("[+]phase ok: hot standby"),
+            "/startupz must pass in standby: {} {:?}",
+            r.status,
+            r.body
         );
         let r = get(&b_addr, "/readyz").await?;
         ensure!(
@@ -259,20 +313,25 @@ fn health_probe_transitions() {
             r.status,
             r.body
         );
-        let r = get(&b_addr, "/readyz?standby=ok").await?;
-        ensure!(
-            r.status == 200 && r.body == "ready (hot standby)\n",
-            "standby /readyz?standby=ok: {} {:?}",
-            r.status,
-            r.body
-        );
+        for path in ["/readyz?standby=ok", K8S_READY] {
+            let r = get(&b_addr, path).await?;
+            ensure!(
+                r.status == 200 && r.body == "ready (hot standby)\n",
+                "standby {path}: {} {:?}",
+                r.status,
+                r.body
+            );
+        }
         ensure!(
             lazyview::health::probe(b_addr.parse()?).await,
             "`lazyview healthcheck` probe of the standby"
         );
         let m = get(&b_addr, "/metrics").await?.body;
         ensure!(
-            metric(&m, "lazyview_ready") == Some(0.0) && metric(&m, "lazyview_alive") == Some(1.0),
+            metric(&m, "lazyview_ready") == Some(0.0)
+                && metric(&m, "lazyview_alive") == Some(1.0)
+                && metric(&m, "lazyview_binlog_disconnected_seconds") == Some(0.0)
+                && metric(&m, "lazyview_liveness_limit_seconds") == Some(STALL_SECS as f64),
             "standby metrics:\n{m}"
         );
         ensure!(
@@ -342,7 +401,7 @@ fn health_probe_transitions() {
             "active metrics:\n{}",
             m.body
         );
-        // Slow client: the head must arrive within 5 s, the endpoint keeps answering meanwhile.
+        // Slow client: the head must arrive within 2 s, the endpoint keeps answering meanwhile.
         let mut slow = TcpStream::connect(&a_addr).await?;
         slow.write_all(b"GET /livez HTTP/1.1\r\n").await?;
         assert_alive(&a_addr, "while a slow client is connected").await?;
@@ -355,6 +414,23 @@ fn health_probe_transitions() {
             "slow client: {:?}",
             String::from_utf8_lossy(&buf)
         );
+        // A flood of idle connections (more than the 512 the endpoint keeps open) from the same
+        // address as the probe: probes are still answered at once.
+        let mut idle = Vec::new();
+        for _ in 0..700 {
+            idle.push(TcpStream::connect(&a_addr).await?);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            assert_alive(&a_addr, "with 700 idle connections open").await?;
+            ensure!(
+                t0.elapsed() < Duration::from_secs(1),
+                "/livez took {:?} with 700 idle connections open",
+                t0.elapsed()
+            );
+        }
+        drop(idle);
 
         // 6. The active engine stops: the standby takes over and becomes ready.
         a.stop().await?;
