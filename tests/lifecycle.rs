@@ -852,25 +852,33 @@ fn lifecycle_named_definitions() {
             ),
         }
 
-        // Name ≠ the definition's view name → error, nothing materialized.
+        // Name ≠ the definition's view name: the CREATE VIEW name wins and `name` follows it.
         exec(&mut c, "INSERT INTO _lazyview (name, definition) VALUES ('v_a', 'CREATE VIEW v_b AS SELECT id FROM orders')").await?;
-        let mismatch = scalar_i64(&mut c, "SELECT LAST_INSERT_ID()").await? as u64;
-        let st = wait_def_state(&mut c, &mut eng, mismatch, "error", t_ready()).await?;
+        let renamed = scalar_i64(&mut c, "SELECT LAST_INSERT_ID()").await? as u64;
+        wait_ready(&mut c, &mut eng, &["v_b"], t_ready()).await?;
         ensure!(
-            !st.last_error.clone().unwrap_or_default().trim().is_empty(),
-            "name mismatch: empty last_error"
+            name_of(&db.dsn, renamed).await?.as_deref() == Some("v_b"),
+            "_lazyview.name not updated to the CREATE VIEW name"
         );
-        ctx.log(format!(
-            "name mismatch → {}: {}",
-            st.name,
-            clip(&st.last_error.unwrap_or_default(), 160)
-        ));
-        for t in ["v_a", "v_b"] {
-            ensure!(
-                !table_exists(&mut c, t).await?,
-                "{t} materialized despite the name mismatch"
-            );
-        }
+        ensure!(
+            !table_exists(&mut c, "v_a").await?,
+            "v_a materialized despite the CREATE VIEW name v_b"
+        );
+
+        // A CREATE VIEW name another row already uses → error naming that row, nothing built.
+        exec(&mut c, "INSERT INTO _lazyview (name, definition) VALUES ('v_c', 'CREATE VIEW v_b AS SELECT id, status FROM orders')").await?;
+        let dup = scalar_i64(&mut c, "SELECT LAST_INSERT_ID()").await? as u64;
+        let st = wait_def_state(&mut c, &mut eng, dup, "error", t_ready()).await?;
+        let err = st.last_error.unwrap_or_default();
+        ensure!(
+            err.contains(&format!("already used by row #{renamed}")),
+            "duplicate CREATE VIEW name: unexpected error {err:?}"
+        );
+        ctx.log(format!("duplicate CREATE VIEW name → {}", clip(&err, 160)));
+        ensure!(
+            !table_exists(&mut c, "v_c").await?,
+            "v_c materialized despite the duplicate CREATE VIEW name"
+        );
 
         // CREATE VIEW with NULL name → name backfilled.
         let v3 = ViewSpec::new(
