@@ -289,6 +289,8 @@ struct Next {
     since: Option<Position>,
     /// Images resolved against the shadow table (handed to the live version at the swap).
     recent: Lookback,
+    /// Rebuild of the unchanged live version (see `start_next`): state rows stay `ready`.
+    routine: bool,
 }
 
 struct Slot {
@@ -374,10 +376,12 @@ impl std::fmt::Display for WaitingFor {
 
 impl std::error::Error for WaitingFor {}
 
-/// A finished build: its layout and the targets it could not be built on.
+/// A finished build: its layout, the targets it could not be built on and those it already
+/// swapped in itself (routine rebuilds of full-mode views).
 struct Built {
     layout: Layout,
     failed: Vec<(String, anyhow::Error)>,
+    swapped: Vec<String>,
 }
 
 struct BuildDone {
@@ -452,6 +456,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Binlog dump connections: connect, register as a replica and request the stream.
 const BINLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Flushes taking longer are logged (debug) with their slowest steps.
+const SLOW_FLUSH: Duration = Duration::from_secs(1);
 
 /// While the binlog stream keeps delivering (a backlog), a due flush waits at most this long.
 const CATCH_UP_BATCH: Duration = Duration::from_millis(100);
@@ -895,7 +902,12 @@ impl Engine {
             }
         }
         let plan = analyze::plan(&parsed, &self.schema, &infos)?;
-        if plan.cascades.iter().any(|c| c.unit_from_parent.is_none()) && plan.is_incremental() {
+        if plan
+            .cascades
+            .iter()
+            .any(|c| c.unit_from_parent.is_none() && !c.traced)
+            && plan.is_incremental()
+        {
             warn!(view = %plan.name, "reads a child of a cascading foreign key whose units cannot be derived from the parent; parent deletes/updates trigger an online rebuild");
         }
         Ok(plan)
@@ -1437,9 +1449,19 @@ impl Engine {
         }
         let def_id = self.slots[idx].def_id;
         let hash = self.slots[idx].hash.clone();
+        // A routine rebuild (full-mode refresh, unknown affected rows) of the unchanged live
+        // version: its tables and state rows are ours, and its state stays `ready`.
+        let routine = !partial
+            && self.slots[idx].live.as_ref().is_some_and(|l| {
+                Arc::ptr_eq(&l.plan, &plan) && l.name == name && l.targets == targets
+            });
         // Side tables (`<name>__lv_new` / `__lv_old`) are only ever ours if a state row of this
         // definition exists for that name and target; the table itself if we created it.
-        let state = meta::load_state(&mut self.meta).await.unwrap_or_default();
+        let state = if routine {
+            HashMap::new()
+        } else {
+            meta::load_state(&mut self.meta).await.unwrap_or_default()
+        };
         let specs: Vec<BuildSpec> = targets
             .iter()
             .map(|t| {
@@ -1454,20 +1476,26 @@ impl Engine {
                     opts: self.targets[t].opts.clone(),
                     schema: self.targets[t].schema.clone(),
                     marker: mv::marker(&name, def_id),
-                    check_side: !state
-                        .get(&key)
-                        .map(|r| r.definition_id == def_id)
-                        .unwrap_or(false),
+                    check_side: !routine
+                        && !state
+                            .get(&key)
+                            .map(|r| r.definition_id == def_id)
+                            .unwrap_or(false),
                     check_table: !(self.owned.contains_key(&key) || live_has),
                 }
             })
             .collect();
         self.generation += 1;
         let generation = self.generation;
-        for t in &targets {
-            self.set_state(&name, t, def_id, &hash, Some(&plan), "building", None)
-                .await;
+        if !routine {
+            for t in &targets {
+                self.set_state(&name, t, def_id, &hash, Some(&plan), "building", None)
+                    .await;
+            }
         }
+        // A full-mode view has nothing to apply to the shadow table: the build swaps it in
+        // itself, keeping the DDL off the binlog loop.
+        let swap = routine && matches!(plan.mode, Mode::Full(_));
         let task = tokio::spawn(build_task(
             self.src_opts.clone(),
             self.schema.clone(),
@@ -1478,15 +1506,10 @@ impl Engine {
             self.metrics.clone(),
             self.build_tx.clone(),
             self.build_slots.clone(),
-            def_id,
-            generation,
+            (def_id, generation),
+            swap,
         ));
-        let routine = self.slots[idx]
-            .live
-            .as_ref()
-            .map(|l| Arc::ptr_eq(&l.plan, &plan))
-            .unwrap_or(false);
-        if routine && !partial {
+        if routine {
             debug!(view = %name, "rebuilding");
         } else {
             info!(view = %name, targets = %targets.join(","), mode = %plan.mode, tracing = %plan.tracing(), "building");
@@ -1512,6 +1535,7 @@ impl Engine {
             started: self.boundary.clone(),
             since: None,
             recent: Lookback::default(),
+            routine,
         });
         self.rebuild_routes();
     }
@@ -1693,7 +1717,8 @@ impl Engine {
                         });
                     }
                 }
-                for (ci, c) in plan.cascades.iter().enumerate() {
+                // (A traced cascade is found through the parent's alias route.)
+                for (ci, c) in plan.cascades.iter().enumerate().filter(|(_, c)| !c.traced) {
                     routes
                         .entry((c.parent.schema.clone(), c.parent.name.clone()))
                         .or_default()
@@ -2515,6 +2540,8 @@ impl Engine {
 
     async fn flush(&mut self) -> Result<()> {
         let started = Instant::now();
+        // (duration, step, slot) of the per-view steps, for the slow-flush log.
+        let mut slow: Vec<(Duration, &str, usize)> = Vec::new();
         // Failures below re-arm it.
         self.first_dirty = None;
         let recheck_due = self
@@ -2588,6 +2615,7 @@ impl Engine {
             self.retry_down().await;
             let now = Instant::now();
             for i in 0..self.slots.len() {
+                let t0 = Instant::now();
                 if self.slots[i]
                     .next
                     .as_ref()
@@ -2595,8 +2623,11 @@ impl Engine {
                     .unwrap_or(false)
                 {
                     self.finish_next(i).await;
+                    slow.push((t0.elapsed(), "swap", i));
                 }
+                let t1 = Instant::now();
                 self.refresh_live(i).await;
+                slow.push((t1.elapsed(), "refresh", i));
             }
         }
         if let Err(e) = self.persist_position(false).await {
@@ -2610,7 +2641,20 @@ impl Engine {
         Metrics::add(&self.metrics.flushes, 1);
         self.update_gauges();
         self.after_boundary();
-        tracing::trace!(elapsed = ?started.elapsed(), "flush");
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_FLUSH {
+            slow.sort_by_key(|x| std::cmp::Reverse(x.0));
+            let top: Vec<String> = slow
+                .iter()
+                .take(5)
+                .filter_map(|(d, what, i)| {
+                    let s = self.slots.get(*i)?;
+                    Some(format!("{what} {} {:.0}ms", s.name, d.as_secs_f64() * 1e3))
+                })
+                .collect();
+            debug!(elapsed = ?elapsed, "slow flush: {}", top.join(", "));
+        }
+        tracing::trace!(elapsed = ?elapsed, "flush");
         Ok(())
     }
 
@@ -2862,13 +2906,18 @@ impl Engine {
     /// Applies changes buffered during the build to the shadow tables, swaps them in.
     async fn finish_next(&mut self, i: usize) {
         let mut n = self.slots[i].next.take().unwrap();
-        let Built { layout, failed } = match n.done.take().unwrap() {
+        let Built {
+            layout,
+            failed,
+            swapped,
+        } = match n.done.take().unwrap() {
             Ok(b) => b,
             Err(e) => {
                 self.next_failed(i, n, e).await;
                 return;
             }
         };
+        n.swapped.extend(swapped);
         // Targets the build could not use are retried later; the view goes live on the rest.
         let mut first_err = None;
         for (t, e) in failed {
@@ -2989,6 +3038,7 @@ impl Engine {
                     n.done = Some(Ok(Built {
                         layout,
                         failed: Vec::new(),
+                        swapped: Vec::new(),
                     }));
                     n.not_before = Some(Instant::now() + Duration::from_secs(5));
                     self.slots[i].next = Some(n);
@@ -3018,8 +3068,13 @@ impl Engine {
             .cloned()
             .collect();
         for t in &swapped {
-            self.set_state(&n.name, t, def_id, &n.hash, Some(&n.plan), "ready", None)
-                .await;
+            if n.routine {
+                // The state row says `ready` already; only `refreshed_at` moves.
+                self.refreshed.insert(n.name.clone());
+            } else {
+                self.set_state(&n.name, t, def_id, &n.hash, Some(&n.plan), "ready", None)
+                    .await;
+            }
             self.slots[i].down.remove(t);
         }
         let s = &mut self.slots[i];
@@ -3862,8 +3917,8 @@ async fn build_task(
     metrics: Arc<Metrics>,
     tx: mpsc::UnboundedSender<BuildDone>,
     slots: Arc<tokio::sync::Semaphore>,
-    def_id: u64,
-    generation: u64,
+    (def_id, generation): (u64, u64),
+    swap: bool,
 ) {
     let result = async {
         let _permit = slots.acquire_owned().await?;
@@ -3892,11 +3947,33 @@ async fn build_task(
             .await?;
             debug!(view = %name, rows = n, "build finished");
         }
+        // `swap`: swap the shadow tables in right away. A target where that fails is left to
+        // the engine, which swaps (and retries) the rest as for any build.
+        let mut swapped = Vec::new();
+        for ((c, ts), spec) in conns.iter_mut().zip(
+            targets
+                .iter()
+                .filter(|s| !failed.iter().any(|(t, _)| *t == s.target)),
+        ) {
+            if !swap {
+                break;
+            }
+            match mv::swap(c, ts, &name).await {
+                Ok(()) => swapped.push(spec.target.clone()),
+                Err(e) => {
+                    debug!(view = %name, target = %spec.target, "swap left to the engine: {e:#}")
+                }
+            }
+        }
         for (c, _) in conns {
             let _ = c.disconnect().await;
         }
         let _ = src.disconnect().await;
-        Ok::<_, anyhow::Error>(Built { layout, failed })
+        Ok::<_, anyhow::Error>(Built {
+            layout,
+            failed,
+            swapped,
+        })
     }
     .await;
     match &result {

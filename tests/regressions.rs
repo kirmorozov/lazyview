@@ -1607,3 +1607,163 @@ fn reg_visibility_fence_without_delay() {
         eng.stop().await
     });
 }
+
+/// E1c: a view that joins the parent of a cascading foreign key on the key (here two levels:
+/// groups → parents → children) finds the rows a cascade changes through the parent's own row
+/// (lineage), instead of rebuilding on every parent delete or key update.
+#[test]
+fn reg_cascade_traced_through_the_parent() {
+    scenario("reg_fk_traced", |ctx| async move {
+        let ddl = [
+            "CREATE TABLE grps (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+            "CREATE TABLE pars (id INT PRIMARY KEY, grp_id INT NULL, label VARCHAR(20) NOT NULL, KEY (grp_id),
+             FOREIGN KEY (grp_id) REFERENCES grps (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "CREATE TABLE kids (par_id INT NOT NULL, seq INT NOT NULL, qty INT NOT NULL, PRIMARY KEY (par_id, seq),
+             FOREIGN KEY (par_id) REFERENCES pars (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "INSERT INTO grps VALUES (1, 'g1'), (2, 'g2'), (3, 'g3')",
+            "INSERT INTO pars VALUES (10, 1, 'a'), (11, 1, 'b'), (12, 2, 'c'), (13, NULL, 'd'), (14, 3, 'e')",
+            "INSERT INTO kids VALUES (10, 1, 5), (10, 2, 6), (11, 1, 7), (12, 1, 8), (13, 1, 9), (14, 1, 1)",
+        ];
+        let specs = vec![ViewSpec::new(
+            "r_kids",
+            Kind::Incremental,
+            "SELECT k.par_id, k.seq, k.qty, p.label, g.name AS grp FROM kids k \
+             JOIN pars p ON p.id = k.par_id LEFT JOIN grps g ON g.id = p.grp_id",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_fk_traced", &ddl, &specs, &[]).await?;
+        let before = eng.snapshot();
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "parent deleted (children cascade)",
+                &["DELETE FROM pars WHERE id = 12"],
+            ),
+            (
+                "parent key moved (children follow)",
+                &["UPDATE pars SET id = 20 WHERE id = 10"],
+            ),
+            (
+                "group deleted (two levels cascade)",
+                &["DELETE FROM grps WHERE id = 1"],
+            ),
+            ("group key moved", &["UPDATE grps SET id = 30 WHERE id = 3"]),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0,
+            "cascades rebuilt the view: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
+/// E8: a saved position belongs to the server that wrote it (`_lazyview_status.server_identity`:
+/// `@@server_uuid`, MariaDB server id + GTID domain). Restored onto or failed over to another
+/// server, the same file name may hold other events: that goes through
+/// LAZYVIEW_ON_MISSING_BINLOG (fail by default, rebuild on request) instead of replaying them.
+#[test]
+fn reg_saved_position_from_another_server() {
+    scenario("reg_identity", |ctx| async move {
+        let specs = vec![join_view()];
+        let (db, eng) = setup(&ctx, "reg_identity", &[], &specs, &[]).await?;
+        eng.stop().await?;
+        let mut c = db.conn().await?;
+        let saved = scalar(&mut c, "SELECT server_identity FROM _lazyview_status").await?;
+        ensure!(
+            saved.as_deref().is_some_and(|s| !s.is_empty()),
+            "no server identity saved: {saved:?}"
+        );
+        exec(
+            &mut c,
+            "UPDATE _lazyview_status SET server_identity = 'another-server'",
+        )
+        .await?;
+        run(
+            &mut c,
+            &["UPDATE customers SET name = 'moved' WHERE id = 1"],
+        )
+        .await?;
+        let eng = ctx.start_engine(&db, &[])?;
+        match eng.wait_finished(Duration::from_secs(60)).await? {
+            Err(e) if e.contains("another-server") => {}
+            other => bail!("expected a failure naming the saved server, got {other:?}"),
+        }
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_ON_MISSING_BINLOG", "rebuild")])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "rebuilt after a position from another server",
+        )
+        .await?;
+        let now = scalar(&mut c, "SELECT server_identity FROM _lazyview_status").await?;
+        ensure!(
+            now == saved,
+            "identity not re-recorded: {now:?} (was {saved:?})"
+        );
+        eng.stop().await
+    });
+}
+
+/// E6, lookup table without a primary key: its whole row is the lineage key. Equal duplicate
+/// rows, membership moves and an ENUM predicate in numeric context (`p.e + 0 >= 2`, which a
+/// row image bound as a label string evaluated wrongly) stay exact.
+#[test]
+fn reg_lineage_without_primary_key() {
+    scenario("reg_lineage_nopk", |ctx| async move {
+        let ddl = [
+            "CREATE TABLE tags (status VARCHAR(10) NOT NULL, label VARCHAR(10) NOT NULL, e ENUM('a','b','c') NULL)",
+            "INSERT INTO tags VALUES ('new', 'fresh', 'a'), ('new', 'fresh', 'a'), ('paid', 'done', 'c'), ('paid', 'cash', 'b')",
+        ];
+        let specs = vec![
+            ViewSpec::new(
+                "r_tagged",
+                Kind::Incremental,
+                "SELECT o.id, t.label, t.e FROM orders o JOIN tags t ON t.status = o.status",
+            ),
+            ViewSpec::new(
+                "r_tagged_hi",
+                Kind::Incremental,
+                "SELECT o.id, t.label FROM orders o JOIN tags t ON t.status = o.status WHERE t.e + 0 >= 2",
+            ),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_lineage_nopk", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "one of two duplicates deleted",
+                &["DELETE FROM tags WHERE label = 'fresh' LIMIT 1"],
+            ),
+            (
+                "ENUM moves across the numeric threshold",
+                &[
+                    "UPDATE tags SET e = 'a' WHERE label = 'done'",
+                    "UPDATE tags SET e = 'c' WHERE label = 'fresh'",
+                ],
+            ),
+            (
+                "membership moves",
+                &["UPDATE tags SET status = 'paid' WHERE label = 'fresh'"],
+            ),
+            (
+                "duplicate added, then all deleted",
+                &[
+                    "INSERT INTO tags VALUES ('paid', 'cash', 'b')",
+                    "DELETE FROM tags WHERE label = 'cash'",
+                ],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}

@@ -584,8 +584,15 @@ pub struct CascadeRoute {
     pub on_delete: FkAction,
     pub on_update: FkAction,
     /// Parent column giving each unit value (the child's unit columns are the FK columns).
-    /// `None`: affected units are unknown, the view is rebuilt.
+    /// `None`: affected units are unknown, the view is rebuilt (unless `traced`).
     pub unit_from_parent: Option<Vec<usize>>,
+    /// The child table and its FK column ordinals (constraint order, matching `parent_cols`).
+    pub child: TableRef,
+    pub child_cols: Vec<usize>,
+    /// The view reads the parent through a lineage alias joined to every alias of the child on
+    /// the FK: the parent's own rows (routed to that alias) find every materialized row the
+    /// cascade changes, so the parent needs no route of its own.
+    pub traced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -685,6 +692,8 @@ impl ViewPlan {
         parts.extend(self.cascades.iter().map(|c| {
             let how = if c.unit_from_parent.is_some() {
                 "unit"
+            } else if c.traced {
+                "traced"
             } else {
                 "rebuild"
             };
@@ -1587,27 +1596,33 @@ pub fn plan(
             )));
         }
     }
-    // Lineage (select/join views): a lookup-resolved table with a primary key is traced to the
-    // materialized rows its rows are part of through hidden key columns. Its images carry only
-    // that key, and a key-only UPDATE must refresh them (the hidden columns change).
+    // Lineage (select/join views): a lookup-resolved table is traced to the materialized rows
+    // its rows are part of through hidden key columns: its primary key or, without one, the
+    // whole row (equal duplicates belong to the same materialized rows). Its images carry only
+    // that key, and an UPDATE of a key column must refresh them (the hidden columns change).
+    // Only keys whose binlog values compare exactly with their SQL values qualify; others keep
+    // looking up images joined with the current state.
     let mut lineage = Vec::new();
     if mode == Mode::Spj {
         for (ai, a) in alias_plans.iter_mut().enumerate() {
-            if a.direct_unit.is_some() || a.table.pk.is_empty() {
+            let key: Vec<usize> = if a.table.pk.is_empty() {
+                (0..a.table.columns.len()).collect()
+            } else {
+                a.table.pk.clone()
+            };
+            if a.direct_unit.is_some()
+                || key.is_empty()
+                || !key.iter().all(|&c| a.table.columns[c].exact_key())
+            {
                 continue;
             }
-            for &c in &a.table.pk {
+            for &c in &key {
                 a.referenced[c] = true;
             }
-            a.image_cols = a.table.pk.clone();
             lineage.push(LineageKey {
                 alias: ai,
-                cols: (0..a.table.pk.len())
-                    .map(|j| format!("_lv_a{ai}_pk{j}"))
-                    .collect(),
-                exprs: a
-                    .table
-                    .pk
+                cols: (0..key.len()).map(|j| format!("_lv_a{ai}_pk{j}")).collect(),
+                exprs: key
                     .iter()
                     .map(|&c| {
                         Expr::CompoundIdentifier(vec![
@@ -1618,6 +1633,7 @@ pub fn plan(
                     })
                     .collect(),
             });
+            a.image_cols = key;
         }
     }
     let unit_unique = match mode {
@@ -1625,6 +1641,50 @@ pub fn plan(
         Mode::Grouped => true,
         _ => false,
     };
+    let mut cascades = cascade_routes(
+        &alias_plans
+            .iter()
+            .map(|a| (a.table.clone(), a.direct_unit.clone()))
+            .collect::<Vec<_>>(),
+        tables,
+    );
+    // Cascades the parent's own rows trace: the view reads the parent through an alias whose
+    // changed rows map to units directly or by lineage, joined on the whole FK (= the parent's
+    // primary key) to every alias of the child. The child rows a cascade changes are exactly
+    // those joined to the changed parent row, so they are found through it.
+    let table_ref = |t: &TableInfo| (t.schema.clone(), t.name.clone());
+    for c in cascades.iter_mut().filter(|c| c.unit_from_parent.is_none()) {
+        let (mut keyed, mut pk) = (c.parent_cols.clone(), c.parent.pk.clone());
+        keyed.sort_unstable();
+        pk.sort_unstable();
+        if pk.is_empty() || keyed != pk {
+            continue;
+        }
+        let parent = table_ref(&c.parent);
+        let parents: Vec<usize> = (0..n_alias)
+            .filter(|&x| {
+                table_ref(&alias_plans[x].table) == parent
+                    && (alias_plans[x].direct_unit.is_some()
+                        || lineage.iter().any(|k| k.alias == x))
+            })
+            .collect();
+        let children: Vec<usize> = (0..n_alias)
+            .filter(|&y| table_ref(&alias_plans[y].table) == c.child)
+            .collect();
+        c.traced = !children.is_empty()
+            && children.iter().all(|&y| {
+                parents.iter().any(|&x| {
+                    let mut cls = Classes::new();
+                    for (a, b) in base_edges.iter().chain(&own_edges[x]).chain(&own_edges[y]) {
+                        cls.union(*a, *b);
+                    }
+                    c.child_cols
+                        .iter()
+                        .zip(&c.parent_cols)
+                        .all(|(&cc, &pc)| cls.find((y, cc)) == cls.find((x, pc)))
+                })
+            });
+    }
     Ok(ViewPlan {
         schema,
         name: def.name.clone(),
@@ -1667,13 +1727,7 @@ pub fn plan(
         full_select: query.to_string(),
         unit_unique,
         lineage,
-        cascades: cascade_routes(
-            &alias_plans
-                .iter()
-                .map(|a| (a.table.clone(), a.direct_unit.clone()))
-                .collect::<Vec<_>>(),
-            tables,
-        ),
+        cascades,
         aliases: alias_plans,
         output_names,
     })
@@ -1868,6 +1922,9 @@ fn cascade_routes(
                 on_delete: fk.on_delete,
                 on_update: fk.on_update,
                 unit_from_parent,
+                child: (child.schema.clone(), child.name.clone()),
+                child_cols: fk.child_cols.clone(),
+                traced: false,
             });
             if depth < 8 {
                 // A cascade into the parent cascades further into the child: unknown units.
@@ -2213,6 +2270,11 @@ mod tests {
         assert_eq!(v.lineage[0].exprs, vec!["`i`.`order_id`", "`i`.`line`"]);
         assert_eq!(v.aliases[1].image_cols, vec![0, 1]);
         assert!(v.aliases[1].referenced[1], "order_items.line");
+        // Without a primary key the whole row is the key.
+        let v =
+            p("CREATE VIEW v AS SELECT o.id, l.msg FROM orders o JOIN logs l ON l.msg = o.status");
+        assert_eq!(v.lineage[0].exprs, vec!["`l`.`msg`"]);
+        assert_eq!(v.aliases[1].image_cols, vec![0]);
         // Tables whose rows map to units directly, grouped views and single tables: none.
         for sql in [
             "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.id",
@@ -2221,6 +2283,75 @@ mod tests {
         ] {
             assert!(p(sql).lineage.is_empty(), "{sql}");
         }
+    }
+
+    /// E1c: a cascading FK whose parent the view joins on the FK (through a lineage or
+    /// direct-unit alias) is traced by the parent's own rows; one whose parent the view does not
+    /// read (or joins otherwise) still rebuilds.
+    #[test]
+    fn cascades_traced_by_the_parent_alias() {
+        use crate::catalog::{FkAction, ForeignKey};
+        let fk = |parent: &str, child_cols: Vec<usize>| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols,
+            parent_cols: vec!["id".into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let mut cat = catalog();
+        let with_fk = |t: (TableRef, Arc<TableInfo>), f: ForeignKey| {
+            let mut i = (*t.1).clone();
+            i.cascades = vec![f];
+            (t.0, Arc::new(i))
+        };
+        cat.extend([
+            table("grps", &[("id", "int"), ("name", "varchar")], &[0]),
+            with_fk(
+                table(
+                    "pars",
+                    &[("id", "int"), ("grp_id", "int"), ("label", "varchar")],
+                    &[0],
+                ),
+                fk("grps", vec![1]),
+            ),
+            with_fk(
+                table(
+                    "kids",
+                    &[("par_id", "int"), ("seq", "int"), ("qty", "int")],
+                    &[0, 1],
+                ),
+                fk("pars", vec![0]),
+            ),
+        ]);
+        let routes = |sql: &str| {
+            let d = parse_definition(sql).unwrap();
+            let v = plan(&d, "db", &cat).unwrap();
+            let mut r: Vec<(String, bool)> = v
+                .cascades
+                .iter()
+                .map(|c| (c.parent.name.clone(), c.traced))
+                .collect();
+            r.sort();
+            r
+        };
+        assert_eq!(
+            routes(
+                "CREATE VIEW v AS SELECT k.par_id, k.seq, p.label, g.name FROM kids k \
+                 JOIN pars p ON p.id = k.par_id LEFT JOIN grps g ON g.id = p.grp_id"
+            ),
+            vec![("grps".into(), true), ("pars".into(), true)]
+        );
+        // The parent is not read, or not joined on the FK: rebuilt.
+        assert_eq!(
+            routes("CREATE VIEW v AS SELECT par_id, seq, qty FROM kids"),
+            vec![("grps".into(), false), ("pars".into(), false)]
+        );
+        assert_eq!(
+            routes(
+                "CREATE VIEW v AS SELECT k.par_id, k.seq, p.label FROM kids k JOIN pars p ON p.grp_id = k.qty"
+            ),
+            vec![("grps".into(), false), ("pars".into(), false)]
+        );
     }
 
     /// E6: lookups that replace several tables by their row images at once, with parameters in

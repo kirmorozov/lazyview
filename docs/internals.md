@@ -11,10 +11,10 @@
 * **Lineage, not the current state, for old rows.** The current state of the sources can be
   ahead of the binlog read so far, so an old row joined with the *current* rows of the other
   tables may find nothing (a customer and its region deleted one after the other). Select/join
-  views therefore store the primary key of each looked-up table in hidden indexed columns
-  (`_lv_a<i>_pk<j>`): the old rows are found in the materialized table by key, the new rows by
-  a key-restricted query on the sources. Grouped views (and tables without a primary key) still
-  join images with the current state, which is exact for one such table. With several, every
+  views therefore store the primary key (or the whole row) of each looked-up table in hidden
+  indexed columns (`_lv_a<i>_pk<j>`): the old rows are found in the materialized table by key,
+  the new rows by a key-restricted query on the sources. Grouped views still join images with
+  the current state, which is exact for one such table. With several, every
   combination of them is looked up with their images, and each flush's images are remembered
   until the binlog has been read past the server position taken right after its lookups: every
   change those lookups could see is combined with them before they are dropped

@@ -246,6 +246,8 @@ schema: each would maintain the same views.
    is safe to run repeatedly.
 3. With `LAZYVIEW_START_MODE=resume` (the default) it continues from the saved position. Views
    whose definition and table layout are unchanged are reused; the rest are rebuilt online.
+   Select/join views over several tables are rebuilt once when an upgrade adds hidden lineage
+   columns to their layout (see [the materialized table](views.md#the-materialized-table)).
 4. Views that are resumed keep their previous `_lazyview_state.mode` and `detail` (`detail` is
    NULL after the upgrade that introduced it) until they are next rebuilt.
    `LAZYVIEW_SYNC=false` with another `LAZYVIEW_INSTANCE_ID` prints the current classification of

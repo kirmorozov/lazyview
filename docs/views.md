@@ -58,9 +58,10 @@ was missing is retried when the table appears.
   `PRIMARY KEY`. A unit that is not selected is stored in hidden `INVISIBLE` columns `_lv_u0`,
   `_lv_u1`, … with an index. `SELECT *` does not return them.
 * Select/join views also keep the lineage of their rows: for each joined table whose rows map to
-  units only through a lookup, its primary key in hidden, indexed `INVISIBLE` columns
-  `_lv_a<i>_pk<j>`. A change to such a row is traced to the materialized rows it was part of
-  through them, also when its join partners changed at the same time.
+  units only through a lookup, its primary key (or, for a table without one, the whole row) in
+  hidden, indexed `INVISIBLE` columns `_lv_a<i>_pk<j>`. A change to such a row is traced to the
+  materialized rows it was part of through them, also when its join partners changed at the same
+  time.
 * lazyview never replaces or drops a table it did not create. If a table of that name already
   exists, the view goes into error: `refusing to replace existing base table … that lazyview does
   not manage`. Ownership is recorded in `_lazyview_state.managed`.
@@ -177,6 +178,9 @@ reads.
 
 * If the view's unit is the foreign-key column (grouped by `order_id`, or joined
   `i.order_id = o.id`), the affected units come from the parent's binlog row.
+* If the view joins the parent on the foreign key (`JOIN customers c ON c.id = a.customer_id`),
+  the rows a cascade changes are found through the parent's row as well, also over several
+  levels (groups → parents → children) when every level is joined.
 * Otherwise a delete or key update on the parent triggers an online rebuild of the view (at most
   once per `LAZYVIEW_FULL_REFRESH_MS`, never more than one at a time). lazyview logs a warning
   when such a view is created: `reads a child of a cascading foreign key whose units cannot be
