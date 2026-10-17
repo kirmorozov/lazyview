@@ -196,9 +196,10 @@ jobs:
           cid=$(dc ps -q lazyview)
           test "$(docker inspect -f '{{.State.Health.Status}}' "$cid")" = healthy
           # The service process really runs as 65532 (not just the image config).
-          uids=$(docker top "$cid" -eo uid | tail -n +2 | sort -u)
-          echo "process uids: ${uids}"
-          test "$uids" = 65532
+          pid=$(docker inspect -f '{{.State.Pid}}' "$cid")
+          ids=$(awk '/^(Uid|Gid):/ { printf "%s %s ", $1, $2 }' "/proc/${pid}/status")
+          echo "lazyview process: ${ids}"
+          test "$ids" = "Uid: 65532 Gid: 65532 "
           wait_for "SELECT COUNT(*) FROM _lazyview" 0
           sql "CREATE TABLE orders (id INT PRIMARY KEY, customer VARCHAR(50), total DECIMAL(10,2));
                INSERT INTO orders VALUES (1,'ann',10),(2,'bob',5),(3,'ann',7);
