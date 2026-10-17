@@ -109,7 +109,8 @@ jobs:
         env:
           LAZYVIEW_TEST_DSNS: ${{ matrix.flavor }}=mysql://lv:lv@127.0.0.1:${{ matrix.port }}/lvtest
           LAZYVIEW_HEALTH_ADDR: "off"
-        run: cargo test --locked --test '*' -- --test-threads=1
+        # --no-fail-fast: run every suite and report all failures, not just the first.
+        run: cargo test --locked --no-fail-fast --test '*' -- --test-threads=1
       - name: collect server logs
         if: failure()
         run: |
