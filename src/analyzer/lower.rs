@@ -9,7 +9,7 @@ use anyhow::Result;
 use sqlparser::ast::{Expr, SelectItem};
 use sqlparser::tokenizer::Token;
 
-use super::ast::qident;
+use super::ast::{and_all, qident};
 use super::ir::{Block, Semi};
 use super::names::{finish_view_names, ident_name};
 use super::normalize::{fill_placeholders, marker_args, marker_name, query_of};
@@ -69,16 +69,22 @@ pub(crate) fn plan_block(
             }
         })
         .collect();
+    let mut query = query_of(select);
+    if let Some(tail) = &b.tail {
+        query.order_by = tail.order_by.clone();
+        query.limit_clause = tail.limit_clause.clone();
+        query.fetch = tail.fetch.clone();
+    }
     let flat = ParsedDef {
         schema: def.schema.clone(),
         name: def.name.clone(),
         columns: def.columns.clone(),
-        query: query_of(select),
+        query,
         hash: def.hash.clone(),
         query_sql: def.query_sql.clone(),
         item_sql,
     };
-    let mut plan = match analyze::plan(&flat, schema, tables) {
+    let mut plan = match analyze::plan_block(&flat, schema, tables) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(view = %def.name, "analyzer: the merged form does not plan: {e:#}");
@@ -87,6 +93,10 @@ pub(crate) fn plan_block(
             ))));
         }
     };
+    // A Full plan watches what the statement as written reads (semi-join subqueries included).
+    if let Mode::Full(r) = &plan.mode {
+        return Ok(Err(Refused::Reason(r.clone())));
+    }
     if let Err(why) = attach_semis(&mut plan, b) {
         return Ok(Err(why));
     }
@@ -105,18 +115,35 @@ fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refus
         return Err(missing());
     };
     let mut where_sql = plan.where_sql.clone().unwrap_or_default();
+    // Lookups of the subquery tables evaluate their predicates on the substituted rows.
+    let mut lookup_where = plan
+        .lookup_where_sql
+        .clone()
+        .unwrap_or_else(|| where_sql.clone());
     for s in &b.semis {
         let args = marker_args(w, s.id).ok_or_else(missing)?;
         let mut pred = s.predicate.clone();
         fill_placeholders(&mut pred, &args);
         where_sql = replace_call(&where_sql, &marker_name(s.id), &format!("({pred})"))
             .ok_or_else(missing)?;
+        lookup_where =
+            replace_call(&lookup_where, &marker_name(s.id), "TRUE").ok_or_else(missing)?;
+        let mut conds = s.lookup_conditions.clone();
+        conds.iter_mut().for_each(|c| fill_placeholders(c, &args));
+        let exists = format!(
+            "EXISTS (SELECT 1 FROM {} AS {}{})",
+            analyze::SUBST_MARKER,
+            qident(&s.alias),
+            and_all(conds)
+                .map(|c| format!(" WHERE {c}"))
+                .unwrap_or_default()
+        );
+        // Direct units where the correlation equals the unit, else forward lookups.
         let direct = match &plan.mode {
             Mode::Full(_) => continue,
             Mode::Global => None,
-            Mode::Spj | Mode::Grouped => {
-                Some(direct_columns(plan, s, &args).map_err(|why| Refused::Semi(s.id, why))?)
-            }
+            Mode::Spj | Mode::Grouped if s.not_in => None,
+            Mode::Spj | Mode::Grouped => direct_columns(plan, s, &args).ok(),
         };
         if !s.info.cascades.is_empty() {
             return Err(Refused::Semi(
@@ -138,9 +165,11 @@ fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refus
             membership: s.referenced.clone(),
             direct_unit: direct,
             image_cols,
-            // Never used: the alias has direct units (or the view is one row).
+            // Not in FROM: lookups use `semi`.
             subst_from: (String::new(), String::new()),
             pos: (usize::MAX, None),
+            semi: Some(exists),
+            lookup_where: true,
         });
         if !plan.tables.contains(&s.table) {
             plan.tables.push(s.table.clone());
@@ -148,6 +177,7 @@ fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refus
         }
     }
     plan.where_sql = Some(where_sql);
+    plan.lookup_where_sql = Some(lookup_where);
     Ok(())
 }
 
@@ -256,7 +286,7 @@ pub(crate) fn full_plan(
     tables: &HashMap<TableRef, Arc<TableInfo>>,
     reason: &str,
 ) -> Result<ViewPlan> {
-    let mut p = analyze::plan(def, schema, tables)?;
+    let mut p = analyze::plan_block(def, schema, tables)?;
     if matches!(&p.mode, Mode::Full(r) if r.starts_with("reads SQL view")) {
         return Ok(p);
     }

@@ -109,7 +109,7 @@ pub(crate) fn branches(
             blocks[0].outputs[i].name.text
         ))));
     }
-    let probe_sql = analyze::plan(def, schema, tables)?.full_select;
+    let probe_sql = analyze::plan_block(def, schema, tables)?.full_select;
     let mut plans = Vec::new();
     for (i, mut b) in blocks.into_iter().enumerate() {
         if i > 0 {

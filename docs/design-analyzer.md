@@ -1,9 +1,11 @@
 # Query analyzer: design
 
-Status: phase A done (`src/analyzer`, tested on all six servers by `tests/cte.rs`, not yet
-called by the engine); phases B–D below. Owner rule: **a view is maintained incrementally
-unless it is mathematically impossible to trace a source change to the output rows it affects.**
-Every Full fallback names the construct and states why no trace exists.
+Status: phases A and B done and wired (`analyze::plan` delegates to `analyzer::plan`; the old
+planner body is the block planner `analyze::plan_block`); JSON group keys wait for typed unit
+filters (engine A); phase C (internal views, UNION ALL branch plans) waits for the engine, those
+views are Full with a reason naming the missing piece (§3.3). Owner rule: **a view is maintained
+incrementally unless it is mathematically impossible to trace a source change to the output
+rows it affects.** Every Full fallback names the construct and states why no trace exists.
 
 ## 1. Tracing model
 
@@ -50,22 +52,26 @@ ParsedDef ─build─► IR ─normalize─► IR' ─classify─► Strategy tr
   aliases, ORDER BY the reverse; unreferenced CTEs are ignored (never evaluated by the server).
 * `normalize.rs` — semantics-preserving rewrites, each with a precondition that yields a precise
   reason when it does not apply: CTE inlining (one copy per reference), derived-table merging,
-  merge-up of a sole aggregated item, DISTINCT→GROUP BY, semi-join→join, ORDER BY drop,
-  USING→ON, wildcard expansion. Predicate pushdown falls out of merging (outer predicates land
-  in the flat WHERE); for merge-up, group-key-only conjuncts go to WHERE, the rest to HAVING.
-* `classify.rs` — assigns each subtree a strategy (§3) and derives keys: PKs, GROUP BY keys
-  (unique per group), key-preserving joins (a join on a full PK of the joined table keeps the
-  left key unique), functional dependencies for unit reduction.
+  merge-up of a sole aggregated item, pull-up through key-preserving joins, DISTINCT→GROUP BY,
+  semi-join→join or semi-join alias (markers), scalar subquery→LEFT JOIN, ORDER BY drop,
+  wildcard expansion. Predicate pushdown falls out of merging (outer predicates land in the flat
+  WHERE); for merge-up, group-key-only conjuncts go to WHERE, the rest to HAVING.
+* `joins.rs` (RIGHT→LEFT, STRAIGHT_JOIN, NATURAL→USING, nested inner joins flattened), `scope.rs`
+  (WITH scoping, `referenced_tables`), `names.rs` (§5), `source.rs` (spans into the text as
+  written), `internal.rs` (§4), `union.rs` (branch plans), `ast.rs` (helpers).
 * `lower.rs` — renders a flat block back to a sqlparser `Select` + synthetic `ParsedDef` and hands
-  it to the **block planner** (today's `analyze::plan` core: units, equality classes,
-  null-side rules, lineage, cascades). There is exactly one implementation of those rules, so a
-  merged CTE is planned *identically* to its hand-inlined form. Full plans keep the user's
-  statement (`full_select`), watched tables come from the scoped resolution.
+  it to the **block planner** `analyze::plan_block` (units, equality classes, null-side rules,
+  lineage, cascades, unit reduction by FDs, windows, top-N), then attaches semi-join aliases.
+  There is exactly one implementation of those rules, so a merged CTE is planned *identically*
+  to its hand-inlined form. Full plans are always built from the user's statement as written
+  (`full_select`, watched tables from the scoped resolution, subquery tables included).
 
-Contract: `analyzer::analyze(def, schema, tables, opts) -> Outcome` with
-`Outcome::Plan(ViewPlan)` or `Outcome::NeedsInternal(Vec<InternalView>)`; `analyzer::plan()` is
-the drop-in for `analyze::plan` (no internal views yet); `analyzer::referenced_tables()` replaces
-the CTE-unaware one. `ViewPlan` stays the executor contract; additions are backward compatible.
+Contract: `analyzer::analyze(def, schema, tables, opts) -> Outcome` with `Outcome::Plan`,
+`Outcome::NeedsInternal(Vec<InternalView>)` or `Outcome::Branches`; `analyzer::plan()` (what
+`analyze::plan` calls) runs it with internal views and branch plans disabled and turns those
+outcomes into Full plans whose reason ends in `(needs internal views)` / `(needs branch plans)`.
+`ViewPlan` stays the executor contract; additions (`order_limit_sql`, `lookup_where_sql`,
+`AliasPlan.semi`, `AliasPlan.lookup_where`) are backward compatible.
 
 ## 3. Taxonomy
 
@@ -105,15 +111,17 @@ the CTE-unaware one. `ViewPlan` stays the executor contract; additions are backw
 | correlated scalar subquery `(SELECT e FROM s WHERE s.pk = x …)` | **LEFT JOIN** `s ON s.pk = x …`, value `e` (guarded `IF(s.pk IS NULL, NULL, e)` unless NULL-propagating) | normal alias | ≤ 1 row matches; no row gives NULL in both forms |
 | NOT IN | as NOT EXISTS, plus units with `x IS NULL` on any change and **all units** when a NULL k enters/leaves | — | `x NOT IN K` is TRUE iff K = ∅ or (x, K have no NULL and x ∉ K) |
 | uncorrelated EXISTS / scalar subquery in WHERE | all units on a change of the subquery's tables | — | the predicate is one value for all rows |
-| window functions with PARTITION BY | **partitioned units**: unit = PARTITION BY columns common to all windows; filter before windowing keeps whole partitions | partition key; per-alias lineage (rows are 1:1 with source tuples) | window values of a partition depend only on its rows |
-| window without PARTITION BY | one unit, **bounded recompute** (one query, diff; no swap) | — | the result is one partition |
-| top-N `ORDER BY … LIMIT n` | **bounded recompute** into an internal `top-(n+B)` buffer view; the MV is top-n over the buffer; changes ranked strictly below the buffer's last key are skipped (exact-kind sort keys only); the buffer is recomputed when < n rows remain or a change is not comparable | one unit | a change ranked strictly below the buffer's last row cannot enter the first n; removals use up the B spare rows |
+| window functions with PARTITION BY | **partitioned units**: unit = PARTITION BY columns common to all windows (named windows resolved), not unique; filter before windowing keeps whole partitions | partition key; per-alias lineage (rows are 1:1 with source tuples) | window values of a partition depend only on its rows |
+| window without PARTITION BY | one unit (Global), **bounded recompute** (one query, diff; no swap) | — | the result is one partition |
+| top-N `ORDER BY … LIMIT n` | **bounded recompute**: one unit (Global), the refresh query keeps `ORDER BY … LIMIT` (`order_limit_sql`). Phase D: an internal `top-(n+B)` buffer view, changes ranked strictly below its last key skipped | one unit | the refresh recomputes the whole top-n; with ties at the boundary the definition itself picks rows arbitrarily (tests use a total ORDER BY) |
 | filter on a window result (top-N per partition) | window block as internal partitioned view + outer filter as chained view (unit = partition key) | partition key | composition |
 | RIGHT JOIN at the start, STRAIGHT_JOIN, NATURAL JOIN, parenthesized inner joins | rewritten to LEFT JOIN / JOIN / USING (common columns) / one chain | normal | syntax; inner joins associate |
 | LEFT JOIN with WHERE keeping NULL-extended rows (`IS NULL`, `COALESCE`, `OR`) | lookups of the NULL-side alias drop the conjuncts that are not NULL-rejecting on it (superset), refresh re-evaluates them | normal | dropping conjuncts can only add units |
 | table without PK as anchor | **value units**: unit = its referenced columns (exact kinds), duplicates counted by the refresh | value lineage | equal rows are interchangeable; the refresh rewrites the multiset |
 | SQL view as a source | inlined like a derived table (needs `VIEW_DEFINITION` in the catalog) | as merged | a view is a named derived table |
-| JSON / BIT / opaque (UUID, INET6) unit keys | internal view computing a SQL surrogate (`HEX(k)`, `CAST(k AS CHAR)`) as the downstream unit | surrogate | SQL computes both sides of the comparison |
+| BIT unit keys | plain units (BIT values compare exactly through typed placeholders) | unit | measured on all six servers (`edge_bit_group`) |
+| JSON unit keys (MySQL) | units filtered with `CAST(? AS JSON)` (typed unit filters, engine A); until then Full `JSON group key (needs typed unit filters)`. MariaDB JSON is LONGTEXT: text units | unit | MySQL groups JSON-equal values; a plain `?` never equals a JSON value |
+| opaque (UUID, INET6) unit keys | internal view computing a SQL surrogate (`HEX(k)`, `CAST(k AS CHAR)`) as the downstream unit | surrogate | SQL computes both sides of the comparison |
 
 ### 3.3 Full fallbacks (impossibility arguments)
 
@@ -126,9 +134,17 @@ the CTE-unaware one. `ViewPlan` stays the executor contract; additions are backw
 | user / system variables | error (servers reject them in views) | — |
 | cross join with a changing table | stays `table … contributes to every row` (an *all units* trace: every output row contains that row) | the minimal affected set is the whole view |
 
-Everything else is traceable; until its phase lands, the view is Full with a reason naming the
-construct and the missing piece, e.g. ``GROUP BY in CTE `t` joined to other tables (internal
-views not enabled)``.
+Everything else is traceable; until its engine piece lands, the view is Full with a reason that
+names the construct and ends in the missing piece:
+
+| construct (today Full) | reason suffix | lands with |
+|---|---|---|
+| aggregated / DISTINCT / window / top-N CTE or derived table joined to other tables (no pull-up) | `(needs internal views)` | §4 |
+| group key on the NULL side of a LEFT JOIN; NULL-side DISTINCT | `group key on the NULL side of a LEFT JOIN (needs internal views)` | tuple lineage J |
+| semi-join not correlated on the unit / over a cascading-FK child | ``IN subquery over `s` is not correlated on the view's unit key`` (suffix still to add, see handoff) | distinct-keys view |
+| UNION ALL | `UNION ALL … (needs branch plans)` | branch plans |
+| UNION (distinct), INTERSECT, EXCEPT | construct name | §3.2 rows (phase C/D) |
+| JSON group key (MySQL) | `JSON group key (needs typed unit filters)` | engine A |
 
 ### 3.4 Semi- and anti-joins in detail
 
@@ -199,19 +215,48 @@ pushdown (MySQL 8.0.22+, MariaDB 10.2+) only affects rebuild speed. Naming diffe
   shared CTE text across definitions, window ties and partition moves, top-N ties at the
   boundary, 30× hammering, big transactions, groups becoming empty, HAVING crossed both ways).
   Each view asserts mode/detail and MV == oracle (rows and column names).
+* State: `cargo test --lib` 106 tests; the differential is strict (an incremental plan that
+  changes, or a Full plan that changes without an `improvements()` entry naming the new mode,
+  fails). `tests/cte.rs`: 45 main cases and 19 edge cases; the mode/detail asserted is the
+  engine's own (from `_lazyview_overview` after start) and equals the analyzer's plan.
 
 ## 8. Rollout
 
-* **A** (analyzer, no executor change): build/normalize/classify/lower; merge family, merge-up,
+* **A** (done; analyzer, no executor change): build/normalize/lower; merge family, merge-up,
   pull-up, DISTINCT→GROUP BY, semi-joins with unique keys or unit correlation, scalar lookups
   as LEFT JOINs, join syntax; analyzer side of internal views (`analyze()` with `Options`,
   `Outcome::NeedsInternal`: aggregated / window / top-N CTEs, tuple lineage, distinct keys of
   semi-joins) and of UNION ALL branch plans (`Outcome::Branches`); tests.
-* **B** (wiring, `analyze.rs` after go-ahead): `analyze::plan` / `referenced_tables` delegate;
+* **B** (done and wired, except JSON keys): `analyze::plan` / `referenced_tables` delegate;
   block-planner additions that need no engine change: partitioned windows, bounded recompute
-  (top-N, windows without PARTITION BY), semi/anti-join lookup templates, NULL-side lookup
-  weakening, value units for PK-less anchors, DISTINCT unit reduction, RIGHT/NATURAL/STRAIGHT.
+  (top-N, windows without PARTITION BY), semi/anti-join forward-key lookups (EXISTS template
+  per alias, `AliasPlan.semi`; NOT IN with its NULL branches), NULL-side lookup weakening (weak
+  aliases filter with `lookup_where_sql` and carry no lineage), value units for PK-less
+  anchors, BIT units, DISTINCT/GROUP BY unit reduction by FD closure (`reduce_unit`),
+  RIGHT/NATURAL/STRAIGHT. Pending: JSON group keys (typed unit filters, engine A).
 * **C** (engine, other owners; spec sent to the coordinator): internal views (§4), branch plans
   for UNION ALL (one slot, N plans sharing the table, `_lv_branch` in unit filters), NULL-safe
   lineage filters, `detail` from the plan, `VIEW_DEFINITION` in the catalog.
 * **D**: top-N buffer, INTERSECT/EXCEPT, LATERAL, surrogate keys, DRed for recursion.
+
+## 9. Server schema & metadata
+
+What the analyzer and planner take from the server today, verified in the code, and what they
+should take. Risk: **W** = wrong results possible, **M** = missed incremental opportunity only.
+
+| item | today | risk | decision |
+|---|---|---|---|
+| columns: type, charset/collation, octet length, INVISIBLE | `catalog.rs` (`information_schema.COLUMNS`) → exact kinds, type families, typed placeholders | — | keep |
+| PRIMARY KEY | `KEY_COLUMN_USAGE` `PRIMARY` → `TableInfo.pk` (lineage, semi→join, pull-up, unit reduction) | — | keep |
+| cascading FKs, SQL-view sources | `REFERENTIAL_CONSTRAINTS`; `VIEWS.VIEW_DEFINITION` (SQL-view sources stay Full) | — | keep; inline SQL views later (phase D) |
+| stored / loadable functions | `engine.rs` reads `ROUTINES`, `mysql.func` and rejects the view | — | keep (their reads are invisible) |
+| output names and types | `mv::probe` creates a temporary VIEW of the planned SELECT and reads its `COLUMNS` | M | probe names come from the *rewritten* SELECT (our `names.rs` prediction); see canonical form |
+| UNIQUE keys other than the PK | not loaded: every key argument uses the PK only | M | load `STATISTICS NON_UNIQUE = 0` (skip prefix parts `SUB_PART`, functional parts); a UNIQUE key is a key only if all its columns are NOT NULL; use it in semi→join, pull-up, `reduce_unit`, and as lineage for PK-less tables (instead of value lineage) |
+| NOT NULL | not loaded for sources (only for probe outputs): every source column is treated as nullable | M | load `IS_NULLABLE`; NOT IN over NOT NULL columns on both sides = NOT EXISTS (drops the all-units trace for NULL keys); UNIQUE keys above. Never for NULL-side aliases (NULL-extended rows) |
+| generated columns | `EXTRA` read only for INVISIBLE; generated columns are ordinary columns | **W** (to verify) | load `GENERATION_EXPRESSION` + VIRTUAL/STORED and the base columns it reads; referenced/membership sets include those base columns; a VIRTUAL column's binlog value is used as a unit or lineage value only once a test proves every flavor logs it in FULL images (update of the base column only, view filtering and grouping on the generated column) |
+| canonical definition (probe `VIEW_DEFINITION`) | not read | **W** (resolution bugs undetected) | **validator, not input**: read it after the probe of the statement as written, parse it, and compare base tables, referenced columns per table and output names with the analyzer's resolution; a mismatch fails the definition with an error naming the difference. Not the input: its printing differs per flavor and version (`count(0)`, charset introducers, `(not(exists(…)))`, comments kept by 8.4), and Full plans, names and errors must stay the user's text |
+| session sql_mode | `mv::init_session` keeps the server's mode minus strict / zero-date flags; the parser assumes the default mode | **W** | `ANSI_QUOTES` (`"x"` is a column to the server, a string to us: its changes are never traced), `PIPES_AS_CONCAT`, `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES` (tokens), MariaDB `ORACLE`/`MSSQL`/… change the parse. Recommended: strip these flags in `init_session` like the strict ones (server and parser then agree by construction; documented in docs/views.md); otherwise read `@@SESSION.sql_mode` when planning and fail the definition naming the flag. `IGNORE_SPACE`, `ONLY_FULL_GROUP_BY`, `REAL_AS_FLOAT` do not change our parse. Already in the default mode sqlparser 0.63 parses `||` as concatenation (at multiplication precedence) where the servers read OR: refuse `||` with an error asking for `OR` / `CONCAT()` |
+| `lower_case_table_names` | not read; tables compared as written, aliases partly case-insensitive (`lower.rs`) | **W** | 1/2: canonicalize schema/table names to the stored `TABLE_NAME` (else binlog events for `orders` never match a definition writing `Orders`); 0: compare tables and aliases exactly and refuse definitions whose aliases collide case-insensitively. Columns are always case-insensitive (correct today) |
+| flavor-specific functions | one `MySqlDialect`, one non-deterministic list | **W** | add `NEXTVAL`/`LASTVAL`/`SETVAL`/`NEXT VALUE FOR` (MariaDB sequences), `LOAD_FILE`, `GET_LOCK`/`RELEASE_LOCK`/`IS_FREE_LOCK`/`IS_USED_LOCK` to the non-deterministic set; reject sequences as sources. MariaDB JSON is LONGTEXT (text units, correct) |
+| session variables (`group_concat_max_len`, `div_precision_increment`, `time_zone`, `lc_time_names`, `default_week_format`) | the service's session values | — | they change values, not traces; MV and oracle agree when sessions agree; document |
+| CHECK constraints, other FDs | not loaded | M | skip |

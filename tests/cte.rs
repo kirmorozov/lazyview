@@ -207,7 +207,7 @@ fn cases() -> Vec<Case> {
         case(
             "distinct_left",
             "full",
-            "group key on the NULL side of a LEFT JOIN",
+            "group key on the NULL side of a LEFT JOIN (needs internal views)",
             "SELECT DISTINCT o.status, c.tier FROM orders o LEFT JOIN customers c ON c.id = o.customer_id",
         ),
         // --- semi- and anti-joins
@@ -245,6 +245,19 @@ fn cases() -> Vec<Case> {
             "WITH vip AS (SELECT id FROM customers WHERE FIND_IN_SET('vip', flags) > 0)
              SELECT id, customer_id FROM orders WHERE customer_id IN (SELECT id FROM vip)",
         ),
+        // Correlated on something else than the unit: the subquery's rows are looked up.
+        case(
+            "in_lookup",
+            "incremental",
+            "spj",
+            "SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT referrer_id FROM customers WHERE tier = 'gold')",
+        ),
+        case(
+            "not_exists_lookup",
+            "incremental",
+            "spj",
+            "SELECT c.id, c.name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.referrer_id)",
+        ),
         case(
             "grouped_exists",
             "incremental",
@@ -274,18 +287,67 @@ fn cases() -> Vec<Case> {
             "spj",
             "SELECT o.id, o.created_at FROM orders o WHERE (SELECT region_id FROM customers c WHERE c.id = o.customer_id) = 2",
         ),
+        // --- block shapes the planner maintains as bounded recomputes / partitions
+        case(
+            "topn_products",
+            "incremental",
+            "global",
+            "SELECT id, sku, price FROM products WHERE active = 1 ORDER BY price DESC, id LIMIT 5",
+        ),
+        case(
+            "window_partitioned",
+            "incremental",
+            "grouped",
+            "SELECT id, customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at, id) AS rn,
+                    COUNT(*) OVER (PARTITION BY customer_id) AS n
+             FROM orders",
+        ),
+        case(
+            "window_whole",
+            "incremental",
+            "global",
+            "SELECT id, RANK() OVER (ORDER BY created_at DESC, id) AS r FROM orders WHERE status = 'paid'",
+        ),
+        case(
+            "keyless_events",
+            "incremental",
+            "spj",
+            "SELECT customer_id, kind, amount FROM events_log WHERE amount > 50",
+        ),
+        // The group key reduced to what determines it (o.id; c joined on its key).
+        case(
+            "group_reduced_left",
+            "incremental",
+            "grouped",
+            "SELECT o.id, c.name, COUNT(i.line_no) AS n_lines
+             FROM orders o LEFT JOIN customers c ON c.id = o.customer_id LEFT JOIN order_items i ON i.order_id = o.id
+             GROUP BY o.id, c.name",
+        ),
+        case(
+            "distinct_reduced",
+            "incremental",
+            "grouped",
+            "SELECT DISTINCT c.id, c.name, c.tier FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.status = 'paid'",
+        ),
+        // Anti-join: NULL-extended rows kept by WHERE, the NULL side traced by lookups.
+        case(
+            "anti_join_is_null",
+            "incremental",
+            "spj",
+            "SELECT o.id, o.status FROM orders o LEFT JOIN payments p ON p.order_id = o.id AND p.status = 'ok' WHERE p.id IS NULL",
+        ),
         // --- not maintained incrementally yet (each reason names the construct)
         case(
             "cte_agg_joined",
             "full",
-            "GROUP BY in CTE `t` joined to other tables",
+            "GROUP BY in CTE `t` joined to other tables (needs internal views)",
             "WITH t AS (SELECT customer_id, SUM(amount) AS total FROM events_log GROUP BY customer_id)
              SELECT c.id, c.name, t.total FROM customers c JOIN t ON t.customer_id = c.region_id",
         ),
         case(
             "cte_union",
             "full",
-            "UNION ALL in CTE `u`",
+            "UNION ALL in CTE `u` (needs branch plans)",
             "WITH u AS (SELECT id, 'o' AS src FROM orders WHERE status = 'paid'
                         UNION ALL SELECT id, 'p' FROM payments WHERE status = 'ok')
              SELECT id, src FROM u",
@@ -293,7 +355,7 @@ fn cases() -> Vec<Case> {
         case(
             "cte_window",
             "full",
-            "window function in CTE `t`",
+            "window function in CTE `t` (needs internal views)",
             "WITH t AS (SELECT id, customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at, id) AS rn FROM orders)
              SELECT id, customer_id FROM t WHERE rn = 1",
         ),
@@ -307,13 +369,13 @@ fn cases() -> Vec<Case> {
         case(
             "cte_limit",
             "full",
-            "ORDER BY … LIMIT in CTE `t`",
+            "ORDER BY … LIMIT in CTE `t` (needs internal views)",
             "WITH t AS (SELECT id, price FROM products ORDER BY price DESC, id LIMIT 5) SELECT id, price FROM t",
         ),
         case(
             "not_in",
-            "full",
-            "subquery",
+            "incremental",
+            "spj",
             "SELECT id FROM orders WHERE customer_id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id IS NOT NULL)",
         ),
     ]
@@ -630,8 +692,8 @@ fn edge_cases() -> Vec<Case> {
         ),
         case(
             "edge_bit_group",
-            "full",
-            "BIT unit key",
+            "incremental",
+            "grouped",
             "SELECT flags, COUNT(*) AS n FROM e_parent GROUP BY flags",
         ),
         // Rows moving between groups, key swaps, delete + reinsert.
@@ -657,8 +719,8 @@ fn edge_cases() -> Vec<Case> {
         // A NULL in the subquery makes NOT IN false everywhere.
         case(
             "edge_not_in_nulls",
-            "full",
-            "subquery",
+            "incremental",
+            "spj",
             "SELECT p.id FROM e_parent p WHERE p.id NOT IN (SELECT parent_id FROM e_child)",
         ),
         case(
@@ -694,7 +756,7 @@ fn edge_cases() -> Vec<Case> {
         case(
             "edge_left_distinct",
             "full",
-            "group key on the NULL side of a LEFT JOIN",
+            "group key on the NULL side of a LEFT JOIN (needs internal views)",
             "SELECT DISTINCT p.grp, c.qty FROM e_parent p LEFT JOIN e_child c ON c.parent_id = p.id",
         ),
         case(

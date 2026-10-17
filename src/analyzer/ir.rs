@@ -109,6 +109,11 @@ pub(crate) struct Semi {
     /// Conditions equivalent to the predicate when it joins at most one row of the table
     /// (correlation equalities and the subquery's WHERE), with the same placeholders.
     pub join_conditions: Vec<Expr>,
+    /// The conditions relating one row of the table to the outer row for lookups: the join
+    /// conditions, except that `x NOT IN (…)` also relates every row when `x` or the key is NULL.
+    pub lookup_conditions: Vec<Expr>,
+    /// `x NOT IN (SELECT k …)` (never traced by direct units: a NULL key affects every row).
+    pub not_in: bool,
     /// (table column, index of the outer expression it equals).
     pub correlation: Vec<(usize, usize)>,
     /// Columns of the table the subquery uses.

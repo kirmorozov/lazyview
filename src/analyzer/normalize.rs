@@ -390,6 +390,25 @@ fn rewrite(b: &mut Block, r: &Resolver, subst: &HashMap<(usize, usize), Expr>) -
         }
     });
     res?;
+    // ORDER BY (kept with a LIMIT) prefers select aliases, then FROM columns.
+    let names: Vec<String> = b
+        .outputs
+        .iter()
+        .map(|o| o.name.text.to_lowercase())
+        .collect();
+    if let Some(sqlparser::ast::OrderByKind::Expressions(es)) = b
+        .tail
+        .as_mut()
+        .and_then(|t| t.order_by.as_mut())
+        .map(|o| &mut o.kind)
+    {
+        for e in es.iter_mut() {
+            let alias = matches!(&e.expr, Expr::Identifier(id) if names.contains(&ident_name(id).to_lowercase()));
+            if !alias && !matches!(&e.expr, Expr::Value(_)) {
+                rewrite_expr(&mut e.expr, r, &aliases, subst)?;
+            }
+        }
+    }
     b.qualified = true;
     b.rewritten = true;
     Ok(())
@@ -1421,12 +1440,10 @@ fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
         return Ok(());
     };
     let parts = conjuncts(w);
-    if !parts.iter().any(|c| {
-        matches!(
-            c,
-            Expr::Exists { .. } | Expr::InSubquery { negated: false, .. }
-        )
-    }) {
+    if !parts
+        .iter()
+        .any(|c| matches!(c, Expr::Exists { .. } | Expr::InSubquery { .. }))
+    {
         return Ok(());
     }
     let outer = Resolver::new(b);
@@ -1456,10 +1473,14 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
         Expr::InSubquery {
             expr,
             subquery,
-            negated: false,
-        } => (Some(expr), subquery, false),
+            negated,
+        } => (Some(expr), subquery, *negated),
         _ => return Ok(None),
     };
+    let not_in = lhs.is_some() && negated;
+    if not_in && matches!(lhs.map(|e| &**e), Some(Expr::Tuple(_))) {
+        return Ok(None);
+    }
     let Rel::Block(sb) = bld.nested(subquery, scope)? else {
         return Ok(None);
     };
@@ -1526,6 +1547,7 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
     }
     let mut correlation = Vec::new();
     let mut join_conditions = Vec::new();
+    let mut lookup_conditions = Vec::new();
     let lhs_parts: Vec<Expr> = match lhs {
         Some(e) => match &**e {
             Expr::Tuple(es) => es.clone(),
@@ -1549,11 +1571,19 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
                 return Ok(None);
             };
             correlation.push((col, placeholder_index(ph).unwrap()));
-            join_conditions.push(Expr::BinaryOp {
+            let eq = Expr::BinaryOp {
                 left: Box::new(p.clone()),
                 op: BinaryOperator::Eq,
                 right: Box::new(ph.clone()),
+            };
+            lookup_conditions.push(if not_in {
+                // `x NOT IN K` also changes for every x when a NULL enters or leaves K, and for
+                // a NULL x whenever K becomes empty or not.
+                parse_expr(&format!("({eq} OR {ph} IS NULL OR {p} IS NULL)"))?
+            } else {
+                eq.clone()
             });
+            join_conditions.push(eq);
         }
     }
     for cj in where_.iter().flat_map(conjuncts) {
@@ -1569,7 +1599,11 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
                 }
             }
         }
+        lookup_conditions.push(cj.clone());
         join_conditions.push(cj);
+    }
+    if not_in {
+        correlation.clear();
     }
     let mut sel = sb.select.clone();
     sel.selection = where_;
@@ -1587,7 +1621,7 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
                 Expr::Tuple(lhs_ph.clone())
             }),
             subquery: Box::new(query_of(sel)),
-            negated: false,
+            negated: not_in,
         },
         None => Expr::Exists {
             subquery: Box::new(query_of(sel)),
@@ -1607,6 +1641,8 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
             alias,
             predicate,
             join_conditions,
+            lookup_conditions,
+            not_in,
             correlation,
             referenced,
         },

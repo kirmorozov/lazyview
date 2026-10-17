@@ -266,6 +266,24 @@ fn improvements() -> Vec<(&'static str, Result<Mode, &'static str>)> {
             "WITH big AS (SELECT id FROM orders WHERE total > 5) SELECT id FROM big",
             Ok(Mode::Spj),
         ),
+        // Top-N with a semi-join on the unit: one bounded recompute.
+        (
+            "WHERE c.id IN (SELECT customer_id FROM orders WHERE total > 5) ORDER BY region_id LIMIT 3",
+            Ok(Mode::Global),
+        ),
+        // A group key on the NULL side: traced through the tuple-lineage view (internal views).
+        (
+            "SELECT i.order_id, COUNT(*) FROM orders o LEFT JOIN order_items i ON i.order_id = o.id GROUP BY i.order_id",
+            Ok(Mode::Full(
+                "group key on the NULL side of a LEFT JOIN (needs internal views)".into(),
+            )),
+        ),
+        (
+            "SELECT COALESCE(c.name, '?') n, COUNT(*) FROM orders o LEFT JOIN customers c",
+            Ok(Mode::Full(
+                "group key on the NULL side of a LEFT JOIN (needs internal views)".into(),
+            )),
+        ),
         // The server rejects the definition (2 columns for 1 name).
         (
             "CREATE VIEW v (a) AS SELECT * FROM (SELECT id, name FROM regions) d",
@@ -291,7 +309,7 @@ fn differential_against_the_block_planner() {
         let Ok(d) = parse_definition(sql) else {
             continue;
         };
-        let old = analyze::plan(&d, "db", &cat);
+        let old = analyze::plan_block(&d, "db", &cat);
         let new = analyzer_plan(&d, "db", &cat);
         let expected = improved.iter().find(|(s, _)| sql.contains(s));
         let same = match (&old, &new) {
@@ -483,22 +501,22 @@ fn taxonomy_strategies_and_reasons() {
             "WITH t AS (SELECT customer_id, SUM(total) s FROM orders GROUP BY customer_id) \
               SELECT c.name, t.s FROM customers c JOIN t ON t.customer_id = c.region_id"
         ),
-        "GROUP BY in CTE `t` joined to other tables"
+        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
     );
     assert_eq!(
         full("WITH t AS (SELECT DISTINCT customer_id FROM orders) SELECT c.name FROM customers c JOIN t ON t.customer_id = c.region_id"),
-        "DISTINCT in CTE `t` joined to other tables"
+        "DISTINCT in CTE `t` joined to other tables (needs internal views)"
     );
     assert_eq!(
         full("WITH t AS (SELECT customer_id, COUNT(*) n FROM orders GROUP BY customer_id) SELECT n, COUNT(*) FROM t GROUP BY n"),
-        "GROUP BY in CTE `t` under an aggregate, DISTINCT, window or LIMIT"
+        "GROUP BY in CTE `t` under an aggregate, DISTINCT, window or LIMIT (needs internal views)"
     );
     // Set operations, LIMIT, windows, recursion, constants, non-determinism.
     assert_eq!(
         full(
             "WITH u AS (SELECT id FROM orders UNION ALL SELECT id FROM customers) SELECT id FROM u"
         ),
-        "UNION ALL in CTE `u`"
+        "UNION ALL in CTE `u` (needs branch plans)"
     );
     assert_eq!(
         full("SELECT x.id FROM (SELECT id FROM orders UNION SELECT id FROM customers) x"),
@@ -506,7 +524,7 @@ fn taxonomy_strategies_and_reasons() {
     );
     assert_eq!(
         full("WITH t AS (SELECT id FROM orders ORDER BY total DESC LIMIT 5) SELECT id FROM t"),
-        "ORDER BY … LIMIT in CTE `t`"
+        "ORDER BY … LIMIT in CTE `t` (needs internal views)"
     );
     assert_eq!(
         full("WITH t AS (SELECT id FROM orders LIMIT 5) SELECT id FROM t"),
@@ -514,7 +532,7 @@ fn taxonomy_strategies_and_reasons() {
     );
     assert_eq!(
         full("WITH t AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) rn FROM orders) SELECT id FROM t WHERE rn = 1"),
-        "window function in CTE `t`"
+        "window function in CTE `t` (needs internal views)"
     );
     assert_eq!(
         full("WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT o.id FROM orders o JOIN r ON r.n = o.id"),
@@ -546,13 +564,14 @@ fn taxonomy_strategies_and_reasons() {
     assert_eq!(inu.aliases[1].direct_unit, Some(vec![1]));
     let g = v("SELECT customer_id, COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id AND c.region_id = 1) GROUP BY customer_id");
     assert_eq!(g.mode, Mode::Grouped);
+    // Not correlated on the unit: the subquery's rows are traced by forward lookups.
     assert_eq!(
-        full("SELECT o.id FROM orders o WHERE o.customer_id IN (SELECT customer_id FROM orders WHERE total > 100)"),
-        "IN subquery over `orders` is not correlated on the view's unit key"
+        m("SELECT o.id FROM orders o WHERE o.customer_id IN (SELECT customer_id FROM orders WHERE total > 100)"),
+        Mode::Spj
     );
     assert_eq!(
-        full("SELECT id FROM orders WHERE customer_id NOT IN (SELECT id FROM customers)"),
-        "subquery"
+        m("SELECT id FROM orders WHERE customer_id NOT IN (SELECT id FROM customers)"),
+        Mode::Spj
     );
     assert_eq!(
         m("SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id)"),
@@ -615,7 +634,10 @@ fn aggregation_pulled_up_through_key_joins() {
         "CREATE VIEW v AS WITH t AS (SELECT customer_id, SUM(total) AS s FROM orders GROUP BY customer_id) \
          SELECT c.id, t.s FROM customers c JOIN t ON t.customer_id = c.region_id"
     );
-    assert_eq!(r, "GROUP BY in CTE `t` joined to other tables");
+    assert_eq!(
+        r,
+        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
+    );
     // NULL side, and a key compared across type families: not pulled up.
     assert!(matches!(
         v(&format!(
@@ -715,7 +737,7 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
     // Without internal views: Full, naming the construct.
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {sql}")),
-        "GROUP BY in CTE `t` joined to other tables"
+        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
     );
 }
 
@@ -723,11 +745,23 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
 /// inner join with the internal view of its distinct keys.
 #[test]
 fn internal_views_for_untraceable_semi_joins() {
+    // A cascading foreign key changes order_items rows without binlog rows of their own.
     let mut cat = catalog();
-    let sql = "SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT customer_id FROM orders WHERE total > 100)";
+    let key = ("db".to_string(), "order_items".to_string());
+    let mut items = (*cat[&key]).clone();
+    items.cascades = vec![crate::catalog::ForeignKey {
+        parent: ("db".into(), "orders".into()),
+        child_cols: vec![0],
+        parent_cols: vec!["id".into()],
+        on_delete: crate::catalog::FkAction::Cascade,
+        on_update: crate::catalog::FkAction::Cascade,
+    }];
+    cat.insert(key, Arc::new(items));
+    let sql = "SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT qty FROM order_items WHERE price > 1)";
+    let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
     assert_eq!(
-        reason(&format!("CREATE VIEW v AS {sql}")),
-        "IN subquery over `orders` is not correlated on the view's unit key"
+        analyzer_plan(&d, "db", &cat).unwrap().mode,
+        Mode::Full("IN subquery over `order_items`, a child of a cascading foreign key".into())
     );
     let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
         panic!("expected an internal view")
@@ -735,13 +769,13 @@ fn internal_views_for_untraceable_semi_joins() {
     assert_eq!(
         ivs[0].sql,
         format!(
-            "CREATE VIEW `{}` AS SELECT `orders`.`customer_id` AS `customer_id` FROM `db`.`orders` AS `orders` \
-             WHERE (`orders`.total > 100) GROUP BY `orders`.`customer_id`",
+            "CREATE VIEW `{}` AS SELECT `order_items`.`qty` AS `qty` FROM `db`.`order_items` AS `order_items` \
+             WHERE (`order_items`.price > 1) GROUP BY `order_items`.`qty`",
             ivs[0].name
         )
     );
-    assert_eq!(ivs[0].key, vec!["customer_id".to_string()]);
-    let (k, t) = internal_table(&ivs[0], &[("customer_id", "int")], &[0]);
+    assert_eq!(ivs[0].key, vec!["qty".to_string()]);
+    let (k, t) = internal_table(&ivs[0], &[("qty", "int")], &[0]);
     cat.insert(k, t);
     let super::Outcome::Plan(v) = outcome(sql, &cat) else {
         panic!("expected a plan")
@@ -751,9 +785,55 @@ fn internal_views_for_untraceable_semi_joins() {
     assert!(
         v.where_sql
             .as_deref()
-            .is_some_and(|w| w.contains("`orders_keys`.`customer_id` = `o`.customer_id")),
+            .is_some_and(|w| w.contains("`order_items_keys`.`qty` = `o`.customer_id")),
         "{:?}",
         v.where_sql
+    );
+}
+
+/// Subquery tables not correlated on the unit are looked up: the view's FROM and WHERE without
+/// the subquery predicates, joined to their rows by the subquery's own conditions.
+#[test]
+fn semi_join_lookups() {
+    let v = |sql: &str| p(&format!("CREATE VIEW v AS {sql}"));
+    let a = v("SELECT o.id FROM orders o WHERE o.status <> 'x' AND o.customer_id IN (SELECT customer_id FROM orders WHERE total > 100)");
+    let s = a.aliases.len() - 1;
+    assert_eq!(a.aliases[s].direct_unit, None);
+    assert_eq!(
+        a.lookup_sql(s, "(R)"),
+        "SELECT DISTINCT `o`.`id` FROM orders o WHERE ((o.status <> 'x') AND TRUE) AND (EXISTS (SELECT 1 FROM (R) AS `orders` \
+         WHERE (`orders`.customer_id = o.customer_id) AND (`orders`.total > 100)))"
+    );
+    // Together with a table of the FROM clause: both substituted, parameters in statement order.
+    let j = v(
+        "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id \
+               WHERE NOT EXISTS (SELECT 1 FROM regions r WHERE r.id = c.region_id)",
+    );
+    let (sql, order) = j
+        .lookup_sql_multi(&[(2, "(R)".into()), (1, "(C)".into())])
+        .unwrap();
+    assert_eq!(
+        sql,
+        "SELECT DISTINCT `o`.`id` FROM orders o JOIN (C) AS `c` ON c.id = o.customer_id WHERE (TRUE) AND \
+         (EXISTS (SELECT 1 FROM (R) AS `r` WHERE (`r`.id = c.region_id)))"
+    );
+    assert_eq!(order, vec![1, 0]);
+    // NOT IN: a NULL key or a NULL operand relates every row.
+    let n = v("SELECT id FROM orders WHERE customer_id NOT IN (SELECT id FROM customers)");
+    assert!(
+        n.lookup_sql(1, "(R)").contains(
+            "`customers`.id = customer_id OR customer_id IS NULL OR `customers`.id IS NULL"
+        ),
+        "{}",
+        n.lookup_sql(1, "(R)")
+    );
+    // Uncorrelated: every row is related (the predicate is one value for all rows).
+    let u = v("SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM regions WHERE name = 'x')");
+    assert!(
+        u.lookup_sql(1, "(R)")
+            .ends_with("(EXISTS (SELECT 1 FROM (R) AS `regions` WHERE (`regions`.name = 'x')))"),
+        "{}",
+        u.lookup_sql(1, "(R)")
     );
 }
 
@@ -796,7 +876,7 @@ fn internal_views_for_windows_and_top_n() {
     // Without internal views: Full, naming the construct.
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {win}")),
-        "window function in CTE `t`"
+        "window function in CTE `t` (needs internal views)"
     );
 }
 

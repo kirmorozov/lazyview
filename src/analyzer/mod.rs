@@ -26,7 +26,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use sqlparser::ast::{Query, SetExpr, TableFactor};
 
-use crate::analyze::{self, ParsedDef, ViewPlan};
+use crate::analyze::{self, Mode, ParsedDef, ViewPlan};
+
+/// The block planner's reason for a group key on the NULL side of a LEFT JOIN.
+const NULL_SIDE_KEY: &str = "group key on the NULL side of a LEFT JOIN";
 use crate::catalog::{TableInfo, TableRef};
 use ir::{Rel, Source};
 
@@ -96,11 +99,15 @@ pub fn analyze(
             other => other,
         });
     }
-    let plan_as_written = || analyze::plan(def, default_schema, tables).map(Outcome::Plan);
+    let plan_as_written = || analyze::plan_block(def, default_schema, tables).map(Outcome::Plan);
     let full = |why: &str| lower::full_plan(def, default_schema, tables, why).map(Outcome::Plan);
     let set_op = matches!(def.query.body.as_ref(), SetExpr::SetOperation { .. });
     if !opts.internal_views && !(opts.branch_plans && set_op) && !needs_analysis(&def.query) {
-        return plan_as_written();
+        // (A group key on the NULL side goes on to name what would trace it.)
+        let p = analyze::plan_block(def, default_schema, tables)?;
+        if !matches!(&p.mode, Mode::Full(r) if r == NULL_SIDE_KEY) {
+            return Ok(Outcome::Plan(p));
+        }
     }
     // Spans must point into the text the item names are taken from.
     let Some((mut query, tokens)) = source::parse_query(&def.query_sql) else {
@@ -123,11 +130,16 @@ pub fn analyze(
         }
     }
     let mut b = match bld.query(&query, &scope::Scope::default())? {
+        // (UNION ALL is traceable per branch: the engine does not run branch plans yet.)
+        Rel::Opaque { why } if why.starts_with("UNION ALL") && !opts.branch_plans => {
+            return full(&format!("{why} (needs branch plans)"))
+        }
         Rel::Opaque { why } => return full(&why),
         Rel::Block(b) => *b,
     };
     b.rewritten |= joins_changed;
-    if b.limit {
+    // ORDER BY … LIMIT (top-N) is planned by the block planner; LIMIT alone has no defined rows.
+    if b.limit && (!b.ordered || b.tail.is_none()) {
         return full(if b.ordered {
             "LIMIT"
         } else {
@@ -140,7 +152,12 @@ pub fn analyze(
         .find(|i| matches!(i.source, Source::Derived(_)))
     {
         if !opts.internal_views {
-            return full(&normalize::unmerged_reason(&b, it));
+            let why = normalize::unmerged_reason(&b, it);
+            return full(&if internal::isolatable(&b, it) {
+                format!("{why} (needs internal views)")
+            } else {
+                why
+            });
         }
         match internal::isolate(&mut b, default_schema, tables) {
             Ok(missing) if !missing.is_empty() => return Ok(Outcome::NeedsInternal(missing)),
@@ -149,8 +166,12 @@ pub fn analyze(
         }
     }
     // (A WITH clause whose CTEs are all merged or unreferenced is dropped.)
-    let plan = if !b.rewritten && query.with.is_none() {
-        analyze::plan(def, default_schema, tables)?
+    let planned: std::result::Result<ViewPlan, String> = if !b.rewritten && query.with.is_none() {
+        let p = analyze::plan_block(def, default_schema, tables)?;
+        match &p.mode {
+            Mode::Full(r) if r == NULL_SIDE_KEY => Err(r.clone()),
+            _ => Ok(p),
+        }
     } else {
         if !def.columns.is_empty() && def.columns.len() != b.outputs.len() {
             anyhow::bail!(
@@ -161,7 +182,7 @@ pub fn analyze(
         }
         loop {
             match lower::plan_block(def, &b, default_schema, tables)? {
-                Ok(p) => break p,
+                Ok(p) => break Ok(p),
                 // A semi-join whose table cannot be traced to the units: over an internal view
                 // of its distinct keys it is an inner join.
                 Err(lower::Refused::Semi(id, why)) if opts.internal_views => {
@@ -171,10 +192,30 @@ pub fn analyze(
                         Err(()) => return full(&why),
                     }
                 }
-                Err(r) => return full(&r.reason()),
+                Err(r) => break Err(r.reason()),
             }
         }
     };
+    let plan = match planned {
+        Ok(p) => p,
+        // A group key on the NULL side is traced through the tuple-lineage view.
+        Err(why) if why == NULL_SIDE_KEY => {
+            return match internal::tuple_view(&b, default_schema, tables) {
+                Some((iv, None)) if opts.internal_views => Ok(Outcome::NeedsInternal(vec![iv])),
+                Some((_, Some(v))) if opts.internal_views => {
+                    match lower::plan_block(def, &v, default_schema, tables)? {
+                        Ok(p) => Ok(Outcome::Plan(p)),
+                        Err(r) => full(&r.reason()),
+                    }
+                }
+                Some(_) => full(&format!("{why} (needs internal views)")),
+                None => full(&why),
+            };
+        }
+        Err(why) => return full(&why),
+    };
+    // Grouped over two or more lookup tables: the tuple-lineage view where the engine has
+    // internal views (the engine's remembered before-images trace them meanwhile).
     if opts.internal_views && internal::needs_tuple_view(&plan) {
         match internal::tuple_view(&b, default_schema, tables) {
             Some((iv, None)) => return Ok(Outcome::NeedsInternal(vec![iv])),

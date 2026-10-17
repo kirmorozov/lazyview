@@ -8,11 +8,11 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    visit_expressions, visit_expressions_mut, visit_relations, BinaryOperator, DataType, Expr,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint,
-    JoinOperator, ObjectName, ObjectNamePart, Query, Select, SelectItem,
+    visit_expressions, visit_expressions_mut, BinaryOperator, DataType, Expr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
+    NamedWindowExpr, ObjectName, ObjectNamePart, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, TableAlias, TableFactor, TableWithJoins,
-    UnaryOperator, Value, Visit, Visitor,
+    UnaryOperator, Value, Visit, Visitor, WindowType,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -21,7 +21,7 @@ use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Word};
 use crate::catalog::{ColKind, FkAction, TableInfo, TableRef};
 
 /// Placeholder table name used to render "FROM with one table replaced by literal rows".
-const SUBST_MARKER: &str = "__lv_subst_marker__";
+pub(crate) const SUBST_MARKER: &str = "__lv_subst_marker__";
 
 const AGGREGATES: &[&str] = &[
     "COUNT",
@@ -402,18 +402,7 @@ fn split_projection<'a>(
 /// Every table a statement reads, including inside subqueries (used for full-refresh views and
 /// before the catalog is consulted).
 pub fn referenced_tables(query: &Query, default_schema: &str) -> Vec<TableRef> {
-    let ctes = cte_names(query);
-    let mut out = BTreeSet::new();
-    let _ = visit_relations(query, |rel: &ObjectName| {
-        let single = rel.0.len() == 1;
-        if let Some(t) = object_table_ref(rel, default_schema) {
-            if !(single && ctes.iter().any(|c| c.eq_ignore_ascii_case(&t.1))) {
-                out.insert(t);
-            }
-        }
-        ControlFlow::<()>::Continue(())
-    });
-    out.into_iter().collect()
+    crate::analyzer::referenced_tables(query, default_schema)
 }
 
 /// Names defined by `WITH` clauses anywhere in the query (they are not tables).
@@ -558,6 +547,13 @@ pub struct AliasPlan {
     pub subst_from: (String, String),
     /// Position in the FROM clause: (table index, join index).
     pub pos: (usize, Option<usize>),
+    /// The table of a semi-/anti-join subquery (not in FROM): `EXISTS (SELECT 1 FROM <rows> AS
+    /// alias WHERE …)` relating its rows to the view's rows, with `SUBST_MARKER` where the rows
+    /// go. Its lookups add this to the view's FROM and [`ViewPlan::lookup_where_sql`].
+    pub semi: Option<String>,
+    /// Lookups of this alias use [`ViewPlan::lookup_where_sql`] (semi-join tables, and NULL-side
+    /// tables whose WHERE conjuncts keep NULL-extended rows).
+    pub lookup_where: bool,
 }
 
 /// Lineage of a lookup-resolved alias (select/join views): hidden, indexed materialized columns
@@ -629,6 +625,13 @@ pub struct ViewPlan {
     /// Column names from `CREATE VIEW v (a, b, ...)`, applied positionally to the materialized
     /// table (the SELECT itself keeps its own aliases so GROUP BY / HAVING resolve as written).
     pub output_names: Option<Vec<String>>,
+    /// Top-N views (single-unit, recomputed with one bounded query per batch): the
+    /// `ORDER BY … LIMIT n` that ends their SELECT.
+    pub order_limit_sql: Option<String>,
+    /// WHERE of the lookups of the aliases marked `lookup_where`: `where_sql` without the
+    /// subquery predicates (evaluated on the substituted rows instead) and without conjuncts that
+    /// keep NULL-extended rows.
+    pub lookup_where_sql: Option<String>,
 }
 
 impl ViewPlan {
@@ -660,6 +663,10 @@ impl ViewPlan {
         if let Some(h) = &self.having_sql {
             sql.push_str(" HAVING ");
             sql.push_str(h);
+        }
+        if let Some(o) = &self.order_limit_sql {
+            sql.push(' ');
+            sql.push_str(o);
         }
         sql
     }
@@ -727,6 +734,16 @@ impl ViewPlan {
     /// `SELECT DISTINCT <units> FROM <from with alias replaced by derived rows> WHERE ...`
     pub fn lookup_sql(&self, alias: usize, derived: &str) -> String {
         let a = &self.aliases[alias];
+        if let Some(exists) = &a.semi {
+            let mut sql = format!(
+                "SELECT DISTINCT {} FROM {}",
+                self.unit_exprs.join(", "),
+                self.from_sql
+            );
+            let exists = exists.replacen(SUBST_MARKER, derived, 1);
+            push_where(&mut sql, self.lookup_where_sql.as_deref(), Some(&exists));
+            return sql;
+        }
         let mut sql = format!(
             "SELECT DISTINCT {} FROM {}{}{}",
             self.unit_exprs.join(", "),
@@ -734,7 +751,12 @@ impl ViewPlan {
             derived,
             a.subst_from.1
         );
-        push_where(&mut sql, self.where_sql.as_deref(), None);
+        let where_sql = if a.lookup_where {
+            self.lookup_where_sql.as_deref()
+        } else {
+            self.where_sql.as_deref()
+        };
+        push_where(&mut sql, where_sql, None);
         sql
     }
 
@@ -744,31 +766,43 @@ impl ViewPlan {
     pub fn lookup_sql_multi(&self, subst: &[(usize, String)]) -> Result<(String, Vec<usize>)> {
         let mut from = self.from_items.clone();
         let marker = |k: usize| format!("__lv_subst_{k}__");
+        // Tables of the FROM clause are replaced in place; semi-join tables join as EXISTS.
+        let mut exists = Vec::new();
         for (k, (a, _)) in subst.iter().enumerate() {
             let a = &self.aliases[*a];
-            substitute_factor(&mut from, a.pos, &a.name, &marker(k));
+            match &a.semi {
+                Some(e) => exists.push(e.replacen(SUBST_MARKER, &marker(k), 1)),
+                None => substitute_factor(&mut from, a.pos, &a.name, &marker(k)),
+            }
         }
-        let mut from_sql = from
+        let from_sql = from
             .iter()
             .map(|t| t.to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        let mut sql = format!(
+            "SELECT DISTINCT {} FROM {from_sql}",
+            self.unit_exprs.join(", ")
+        );
+        let weak = subst.iter().any(|(a, _)| self.aliases[*a].lookup_where);
+        let where_sql = if weak || !exists.is_empty() {
+            self.lookup_where_sql.as_deref()
+        } else {
+            self.where_sql.as_deref()
+        };
+        let filter = (!exists.is_empty()).then(|| exists.join(" AND "));
+        push_where(&mut sql, where_sql, filter.as_deref());
         let mut order: Vec<(usize, usize)> = Vec::new();
         for k in 0..subst.len() {
-            let at = from_sql
+            let at = sql
                 .find(&marker(k))
                 .ok_or_else(|| anyhow!("internal: substitution marker missing"))?;
             order.push((at, k));
         }
         order.sort_unstable();
         for (k, (_, derived)) in subst.iter().enumerate() {
-            from_sql = from_sql.replacen(&marker(k), derived, 1);
+            sql = sql.replacen(&marker(k), derived, 1);
         }
-        let mut sql = format!(
-            "SELECT DISTINCT {} FROM {from_sql}",
-            self.unit_exprs.join(", ")
-        );
-        push_where(&mut sql, self.where_sql.as_deref(), None);
         Ok((sql, order.into_iter().map(|(_, k)| k).collect()))
     }
 }
@@ -1057,10 +1091,20 @@ fn function_name(f: &sqlparser::ast::Function) -> String {
     }
 }
 
-/// Reasons the query cannot be maintained incrementally, plus whether it aggregates.
-fn scan_exprs(select: &Select) -> (Option<String>, bool) {
+/// Reasons the query cannot be maintained incrementally, whether it aggregates, and the
+/// PARTITION BY expressions of each window function call.
+fn scan_exprs(select: &Select) -> (Option<String>, bool, Vec<Vec<Expr>>) {
     let mut reason = None;
     let mut has_agg = false;
+    let mut windows = Vec::new();
+    let named = |name: &Ident| {
+        select.named_window.iter().find_map(|w| match &w.1 {
+            NamedWindowExpr::WindowSpec(spec) if w.0.value.eq_ignore_ascii_case(&name.value) => {
+                Some(spec.partition_by.clone())
+            }
+            _ => None,
+        })
+    };
     let mut check = |e: &Expr| {
         match e {
             Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
@@ -1071,8 +1115,15 @@ fn scan_exprs(select: &Select) -> (Option<String>, bool) {
             }
             Expr::Function(f) => {
                 let n = function_name(f);
-                if f.over.is_some() {
-                    reason.get_or_insert_with(|| "window function".to_string());
+                if let Some(over) = &f.over {
+                    // A window inheriting a named one takes its PARTITION BY (none if unknown).
+                    windows.push(match over {
+                        WindowType::WindowSpec(spec) => match &spec.window_name {
+                            Some(w) => named(w).unwrap_or_default(),
+                            None => spec.partition_by.clone(),
+                        },
+                        WindowType::NamedWindow(w) => named(w).unwrap_or_default(),
+                    });
                 } else if AGGREGATES.contains(&n.as_str()) {
                     has_agg = true;
                 } else if NONDETERMINISTIC.contains(&n.as_str()) {
@@ -1088,7 +1139,67 @@ fn scan_exprs(select: &Select) -> (Option<String>, bool) {
     let _ = visit_expressions(&select.having, &mut check);
     let _ = visit_expressions(&select.group_by, &mut check);
     let _ = visit_expressions(&select.from, &mut check);
-    (reason, has_agg)
+    (reason, has_agg, windows)
+}
+
+/// The group expressions that determine all the others: one is dropped when its columns follow
+/// from the columns of the remaining plain-column keys through equalities (inner joins, WHERE)
+/// and primary keys (a table's whole primary key determines its row; a LEFT JOINed table whose
+/// whole primary key equals determined columns is determined too, matched or NULL-extended).
+fn reduce_unit(
+    keys: Vec<Expr>,
+    scope: &Scope,
+    base_edges: &[(ColRef, ColRef)],
+    own_edges: &[Vec<(ColRef, ColRef)>],
+) -> Vec<Expr> {
+    let closure = |known: &[ColRef]| {
+        let mut d: HashSet<ColRef> = known.iter().copied().collect();
+        loop {
+            let before = d.len();
+            for (x, y) in base_edges {
+                if d.contains(x) {
+                    d.insert(*y);
+                }
+                if d.contains(y) {
+                    d.insert(*x);
+                }
+            }
+            for (a, (_, t)) in scope.aliases.iter().enumerate() {
+                if t.pk.is_empty() {
+                    continue;
+                }
+                let bound = |c: usize| {
+                    d.contains(&(a, c))
+                        || own_edges[a].iter().any(|(x, y)| {
+                            (*x == (a, c) && y.0 != a && d.contains(y))
+                                || (*y == (a, c) && x.0 != a && d.contains(x))
+                        })
+                };
+                if t.pk.iter().all(|&c| bound(c)) {
+                    d.extend((0..t.columns.len()).map(|c| (a, c)));
+                }
+            }
+            if d.len() == before {
+                return d;
+            }
+        }
+    };
+    let mut keep = vec![true; keys.len()];
+    for i in (0..keys.len()).rev() {
+        let known: Vec<ColRef> = (0..keys.len())
+            .filter(|&j| j != i && keep[j])
+            .filter_map(|j| scope.resolve(&keys[j]))
+            .collect();
+        let refs = col_refs(&keys[i], scope);
+        let d = closure(&known);
+        if !refs.is_empty() && refs.iter().all(|r| d.contains(r)) {
+            keep[i] = false;
+        }
+    }
+    keys.into_iter()
+        .zip(keep)
+        .filter_map(|(k, kept)| kept.then_some(k))
+        .collect()
 }
 
 fn quote(id: &str) -> String {
@@ -1099,8 +1210,20 @@ fn qident(id: &str) -> Ident {
     Ident::with_quote('`', id)
 }
 
-/// Builds the plan. `tables` must contain metadata for every table the query reads.
+/// Plans a definition: the query analyzer resolves CTEs, derived tables and subqueries and
+/// normalizes them into flat blocks it plans with [`plan_block`] (see `crate::analyzer`).
+/// `tables` must contain metadata for every table [`referenced_tables`] lists.
 pub fn plan(
+    def: &ParsedDef,
+    default_schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> Result<ViewPlan> {
+    crate::analyzer::plan(def, default_schema, tables)
+}
+
+/// The block planner: plans one flat block (no CTE references or derived tables left).
+/// `tables` must contain metadata for every table the query reads.
+pub fn plan_block(
     def: &ParsedDef,
     default_schema: &str,
     tables: &HashMap<TableRef, Arc<TableInfo>>,
@@ -1156,6 +1279,8 @@ pub fn plan(
         unit_exprs: Vec::new(),
         unit_in_projection: Vec::new(),
         full_select: full_select.clone(),
+        order_limit_sql: None,
+        lookup_where_sql: None,
         unit_unique: false,
         lineage: Vec::new(),
         output_names: output_names.clone(),
@@ -1178,13 +1303,17 @@ pub fn plan(
     }
 
     let mut query = def.query.clone();
-    query.order_by = None;
+    let order_by = query.order_by.take();
     if query.with.is_some() {
         return Ok(full("WITH clause"));
     }
-    if query.limit_clause.is_some() || query.fetch.is_some() {
-        return Ok(full("LIMIT"));
-    }
+    // ORDER BY … LIMIT n: the first n rows are one unit, recomputed with one bounded query per
+    // batch. Without ORDER BY the rows are not a function of the data: nothing to converge to.
+    let top_n = match (order_by, query.limit_clause.take(), query.fetch.is_some()) {
+        (_, None, false) => None,
+        (Some(o), Some(l), false) => Some(format!("{o}{l}")),
+        _ => return Ok(full("LIMIT without ORDER BY")),
+    };
     let select: &mut Select = match query.body.as_mut() {
         SetExpr::Select(s) => s,
         _ => return Ok(full("set operation (UNION/INTERSECT/EXCEPT)")),
@@ -1310,10 +1439,24 @@ pub fn plan(
     }
     select.projection = projection;
 
-    let (reason, has_agg) = scan_exprs(select);
+    let (reason, has_agg, windows) = scan_exprs(select);
     if let Some(r) = reason {
         return Ok(full(&r));
     }
+    // A window's values depend on its whole partition: the unit is the PARTITION BY expressions
+    // every window shares (filtering on them keeps whole partitions); without any, one unit.
+    let windowed = !windows.is_empty();
+    let partition: Vec<Expr> = match windows.split_first() {
+        Some((first, rest)) => first
+            .iter()
+            .filter(|e| {
+                rest.iter()
+                    .all(|w| w.iter().any(|x| x.to_string() == e.to_string()))
+            })
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
 
     let scope = Scope { aliases: &aliases };
     strip_column_schemas(select, &scope);
@@ -1350,6 +1493,10 @@ pub fn plan(
         }
     }
     usage.mark(&select.having, false, true);
+    usage.mark(&select.named_window, false, false);
+    for e in &partition {
+        usage.mark(e, true, false);
+    }
 
     // USING (col): the column of the joined table and the first earlier table having it.
     let mut using_pairs: Vec<(usize, ColRef, ColRef)> = Vec::new();
@@ -1417,7 +1564,11 @@ pub fn plan(
         ..
     } = usage;
 
-    let mode = if !resolved_groups.is_empty() {
+    let mode = if top_n.is_some()
+        || windowed && (partition.is_empty() || has_agg || !resolved_groups.is_empty())
+    {
+        Mode::Global
+    } else if windowed || !resolved_groups.is_empty() {
         Mode::Grouped
     } else if has_agg {
         Mode::Global
@@ -1429,13 +1580,22 @@ pub fn plan(
     let unit_refs: Vec<Expr> = match mode {
         Mode::Spj => {
             let (n, t) = &aliases[0];
-            if t.pk.is_empty() {
+            // Without a primary key, equal rows are one unit: the referenced columns whose
+            // binlog values compare exactly with their SQL values.
+            let key: Vec<usize> = if t.pk.is_empty() {
+                (0..t.columns.len())
+                    .filter(|&c| referenced[0][c] && t.columns[c].exact_key())
+                    .collect()
+            } else {
+                t.pk.clone()
+            };
+            if key.is_empty() {
                 return Ok(full(&format!(
                     "first table `{}` has no primary key",
                     t.name
                 )));
             }
-            t.pk.iter()
+            key.iter()
                 .map(|&c| {
                     referenced[0][c] = true;
                     membership[0][c] = true;
@@ -1443,6 +1603,7 @@ pub fn plan(
                 })
                 .collect()
         }
+        Mode::Grouped if windowed => partition.clone(),
         Mode::Grouped => resolved_groups.clone(),
         _ => Vec::new(),
     };
@@ -1461,56 +1622,6 @@ pub fn plan(
             }
         }
     }
-    // Units and WHERE are evaluated on literal row images in lookups; that is only sound when the
-    // NULL-extended rows of LEFT JOINs cannot change them.
-    let null_side: Vec<usize> = joins
-        .iter()
-        .filter(|(_, left, _)| *left)
-        .map(|(a, _, _)| *a)
-        .collect();
-    let on_null_side = |e: &Expr| {
-        col_refs(e, &scope)
-            .iter()
-            .any(|(a, _)| null_side.contains(a))
-    };
-    if unit_refs.iter().any(&on_null_side) {
-        return Ok(full("group key on the NULL side of a LEFT JOIN"));
-    }
-    if let Some(w) = &select.selection {
-        let mut cs = Vec::new();
-        conjuncts(w, &mut cs);
-        if cs
-            .into_iter()
-            .any(|c| on_null_side(c) && !null_rejecting(c))
-        {
-            return Ok(full(
-                "WHERE condition that keeps NULL-extended rows of a LEFT JOIN",
-            ));
-        }
-    }
-    if unit_refs.iter().any(|u| json_valued(u, &scope)) {
-        return Ok(full("JSON group key"));
-    }
-    let unit_cols: Vec<Option<ColRef>> = unit_refs.iter().map(|e| scope.resolve(e)).collect();
-    if unit_cols
-        .iter()
-        .flatten()
-        .any(|(a, c)| matches!(aliases[*a].1.columns[*c].kind, ColKind::Bit(_)))
-    {
-        return Ok(full("BIT unit key"));
-    }
-    let unit_exprs: Vec<String> = unit_refs.iter().map(|e| e.to_string()).collect();
-    let unit_in_projection: Vec<Option<usize>> = unit_refs
-        .iter()
-        .zip(&unit_cols)
-        .map(|(u, uc)| {
-            proj_exprs.iter().position(|(e, _)| match uc {
-                Some(uc) => scope.resolve(e) == Some(*uc),
-                None => e.to_string() == u.to_string(),
-            })
-        })
-        .collect();
-
     // Equality classes valid for rows that involve a given alias.
     let mut base_edges = Vec::new();
     if let Some(w) = &select.selection {
@@ -1537,6 +1648,71 @@ pub fn plan(
             base_edges.push((*l, *r));
         }
     }
+
+    // A group key that the rest of the key determines adds nothing to the unit (DISTINCT over a
+    // table's primary key and its other columns, GROUP BY o.id, c.name with c joined on its key).
+    let unit_refs = if mode == Mode::Grouped && !windowed {
+        reduce_unit(unit_refs, &scope, &base_edges, &own_edges)
+    } else {
+        unit_refs
+    };
+    // Units and WHERE are evaluated on literal row images in lookups; that is only sound when the
+    // NULL-extended rows of LEFT JOINs cannot change them.
+    let null_side: Vec<usize> = joins
+        .iter()
+        .filter(|(_, left, _)| *left)
+        .map(|(a, _, _)| *a)
+        .collect();
+    let on_null_side = |e: &Expr| {
+        col_refs(e, &scope)
+            .iter()
+            .any(|(a, _)| null_side.contains(a))
+    };
+    if unit_refs.iter().any(&on_null_side) {
+        return Ok(full("group key on the NULL side of a LEFT JOIN"));
+    }
+    // A WHERE conjunct that keeps NULL-extended rows (`c.id IS NULL`, COALESCE, OR) cannot be
+    // evaluated on a substituted row of its NULL-side table: lookups of that table leave it out
+    // (a superset of the affected units) and the refresh evaluates it. Such a table is traced
+    // by lookups for both images: rows it stops hiding were never materialized (no lineage).
+    let mut weak: Vec<usize> = Vec::new();
+    let mut lookup_where: Option<Vec<String>> = None;
+    if let Some(w) = &select.selection {
+        let mut cs = Vec::new();
+        conjuncts(w, &mut cs);
+        if cs.iter().any(|c| on_null_side(c) && !null_rejecting(c)) {
+            let mut kept = Vec::new();
+            for c in cs {
+                if on_null_side(c) && !null_rejecting(c) {
+                    for (a, _) in col_refs(c, &scope) {
+                        if null_side.contains(&a) && !weak.contains(&a) {
+                            weak.push(a);
+                        }
+                    }
+                } else {
+                    kept.push(format!("({c})"));
+                }
+            }
+            lookup_where = Some(kept);
+        }
+    }
+    if unit_refs.iter().any(|u| json_valued(u, &scope)) {
+        return Ok(full("JSON group key (needs typed unit filters)"));
+    }
+    // (BIT unit keys: binlog values become unsigned integers and are bound as such; both sides
+    // of every comparison see the same number.)
+    let unit_cols: Vec<Option<ColRef>> = unit_refs.iter().map(|e| scope.resolve(e)).collect();
+    let unit_exprs: Vec<String> = unit_refs.iter().map(|e| e.to_string()).collect();
+    let unit_in_projection: Vec<Option<usize>> = unit_refs
+        .iter()
+        .zip(&unit_cols)
+        .map(|(u, uc)| {
+            proj_exprs.iter().position(|(e, _)| match uc {
+                Some(uc) => scope.resolve(e) == Some(*uc),
+                None => e.to_string() == u.to_string(),
+            })
+        })
+        .collect();
 
     let from_sql = select
         .from
@@ -1582,6 +1758,8 @@ pub fn plan(
             image_cols,
             subst_from,
             pos: alias_pos[ai],
+            semi: None,
+            lookup_where: weak.contains(&ai),
         });
     }
 
@@ -1611,6 +1789,7 @@ pub fn plan(
                 a.table.pk.clone()
             };
             if a.direct_unit.is_some()
+                || a.lookup_where
                 || key.is_empty()
                 || !key.iter().all(|&c| a.table.columns[c].exact_key())
             {
@@ -1637,8 +1816,8 @@ pub fn plan(
         }
     }
     let unit_unique = match mode {
-        Mode::Spj => n_alias == 1,
-        Mode::Grouped => true,
+        Mode::Spj => n_alias == 1 && !aliases[0].1.pk.is_empty(),
+        Mode::Grouped => !windowed,
         _ => false,
     };
     let mut cascades = cascade_routes(
@@ -1725,6 +1904,10 @@ pub fn plan(
         unit_exprs,
         unit_in_projection,
         full_select: query.to_string(),
+        order_limit_sql: top_n,
+        lookup_where_sql: lookup_where
+            .map(|w| w.join(" AND "))
+            .filter(|w| !w.is_empty()),
         unit_unique,
         lineage,
         cascades,
@@ -2165,7 +2348,7 @@ mod tests {
 
     fn p(sql: &str) -> ViewPlan {
         let d = parse_definition(sql).unwrap();
-        plan(&d, "db", &catalog()).unwrap()
+        plan_block(&d, "db", &catalog()).unwrap()
     }
 
     #[test]
@@ -2325,7 +2508,7 @@ mod tests {
         ]);
         let routes = |sql: &str| {
             let d = parse_definition(sql).unwrap();
-            let v = plan(&d, "db", &cat).unwrap();
+            let v = plan_block(&d, "db", &cat).unwrap();
             let mut r: Vec<(String, bool)> = v
                 .cascades
                 .iter()
@@ -2438,6 +2621,14 @@ mod tests {
             "{s}"
         );
 
+        // The group key reduced to what determines it: customers' key, equal to orders' column.
+        let v = p("CREATE VIEW v AS SELECT c.id, c.name, COUNT(*) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.id, c.name");
+        assert_eq!(v.unit_exprs, vec!["c.id"]);
+        assert_eq!(
+            v.aliases[0].direct_unit,
+            Some(vec![1]),
+            "orders map to the unit directly"
+        );
         let v = p("CREATE VIEW v AS SELECT DATE(o.note) d, COUNT(*) FROM orders o GROUP BY 1");
         assert_eq!(v.unit_exprs, vec!["DATE(o.note)"]);
         assert_eq!(v.aliases[0].direct_unit, None);
@@ -2454,7 +2645,6 @@ mod tests {
             "CREATE VIEW v AS SELECT id FROM orders LIMIT 5",
             "CREATE VIEW v AS SELECT id FROM orders UNION SELECT id FROM customers",
             "CREATE VIEW v AS SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers)",
-            "CREATE VIEW v AS SELECT msg FROM logs",
             "CREATE VIEW v AS SELECT id, NOW() FROM orders",
             "CREATE VIEW v AS SELECT o.id FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id",
         ] {
@@ -2476,16 +2666,16 @@ mod tests {
         );
         assert!(
             parse_definition("CREATE VIEW v (a) AS SELECT id, name FROM regions")
-                .and_then(|d| plan(&d, "db", &catalog()))
+                .and_then(|d| plan_block(&d, "db", &catalog()))
                 .is_err(),
             "column list length must match"
         );
         assert!(parse_definition("CREATE VIEW v AS SELECT * FROM nope")
-            .and_then(|d| plan(&d, "db", &catalog()))
+            .and_then(|d| plan_block(&d, "db", &catalog()))
             .is_err());
         assert!(
             parse_definition("CREATE VIEW v AS SELECT bogus FROM orders")
-                .and_then(|d| plan(&d, "db", &catalog()))
+                .and_then(|d| plan_block(&d, "db", &catalog()))
                 .is_err()
         );
     }
@@ -2516,12 +2706,19 @@ mod tests {
 
     #[test]
     fn order_by_kept_for_full_and_ctes_are_not_tables() {
+        // Top-N: one unit, recomputed by the bounded query itself.
         let v = p("CREATE VIEW v AS SELECT id FROM orders ORDER BY total DESC LIMIT 3");
-        assert!(matches!(v.mode, Mode::Full(_)));
+        assert_eq!(v.mode, Mode::Global);
+        assert!(v.unit_exprs.is_empty() && v.lineage.is_empty());
         assert!(
-            v.full_select.contains("ORDER BY total DESC LIMIT 3"),
+            v.select_sql(&[], None)
+                .ends_with("FROM orders ORDER BY total DESC LIMIT 3"),
             "{}",
-            v.full_select
+            v.select_sql(&[], None)
+        );
+        assert_eq!(
+            full_reason("CREATE VIEW v AS SELECT id FROM orders LIMIT 3"),
+            "LIMIT without ORDER BY"
         );
         // ORDER BY without LIMIT is irrelevant for a table: dropped on the incremental path.
         let v = p("CREATE VIEW v AS SELECT id FROM orders ORDER BY total");
@@ -2536,9 +2733,47 @@ mod tests {
             vec![("db".to_string(), "orders".to_string())]
         );
         assert!(matches!(
-            plan(&d, "db", &catalog()).unwrap().mode,
+            plan_block(&d, "db", &catalog()).unwrap().mode,
             Mode::Full(_)
         ));
+    }
+
+    /// Window functions: the unit is the PARTITION BY all windows share (whole partitions are
+    /// recomputed); without one, the view is one unit.
+    #[test]
+    fn window_partitions_are_units() {
+        let v = p("CREATE VIEW v AS SELECT id, customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) AS rn, \
+                   SUM(total) OVER w AS run FROM orders WINDOW w AS (PARTITION BY customer_id, status ORDER BY id)");
+        assert_eq!(v.mode, Mode::Grouped);
+        assert_eq!(v.unit_exprs, vec!["customer_id"]);
+        assert!(!v.unit_unique);
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![1]));
+        assert!(
+            v.aliases[0].referenced[2],
+            "status, used by the named window"
+        );
+        assert!(v
+            .select_sql(&[], Some("customer_id IN (1)"))
+            .contains("WHERE customer_id IN (1)"));
+        assert_eq!(
+            p("CREATE VIEW v AS SELECT id, RANK() OVER (ORDER BY total DESC) AS r FROM orders")
+                .mode,
+            Mode::Global
+        );
+        assert_eq!(
+            p("CREATE VIEW v AS SELECT customer_id, SUM(total), RANK() OVER (ORDER BY SUM(total)) FROM orders GROUP BY customer_id").mode,
+            Mode::Global
+        );
+    }
+
+    /// A first table without primary key: equal rows are one unit (its referenced columns).
+    #[test]
+    fn keyless_anchor_units() {
+        let v = p("CREATE VIEW v AS SELECT msg, LENGTH(msg) AS n FROM logs WHERE msg <> ''");
+        assert_eq!(v.mode, Mode::Spj);
+        assert_eq!(v.unit_exprs, vec!["`logs`.`msg`"]);
+        assert!(!v.unit_unique);
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![0]));
     }
 
     #[test]
@@ -2548,13 +2783,30 @@ mod tests {
         assert!(r.contains("NULL side"), "{r}");
         let r = full_reason("CREATE VIEW v AS SELECT COALESCE(c.name, '?') n, COUNT(*) FROM orders o LEFT JOIN customers c ON c.id = o.customer_id GROUP BY n");
         assert!(r.contains("NULL side"), "{r}");
-        // Anti-join: keeps NULL-extended rows.
-        let r = full_reason("CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.id IS NULL");
-        assert!(r.contains("NULL-extended"), "{r}");
-        let r = full_reason("CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE IFNULL(c.name, 'x') = 'x'");
-        assert!(r.contains("NULL-extended"), "{r}");
-        let r = full_reason("CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.name = 'a' OR o.total > 1");
-        assert!(r.contains("NULL-extended"), "{r}");
+        // Anti-join (WHERE keeps NULL-extended rows): the NULL-side table's lookups leave those
+        // conjuncts out and it is traced by lookups only (no lineage).
+        let v = p("CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.id IS NULL AND o.total > 0");
+        assert_eq!(v.mode, Mode::Spj);
+        assert!(v.aliases[1].lookup_where && v.lineage.is_empty());
+        assert_eq!(
+            v.lookup_sql(1, "(R)"),
+            "SELECT DISTINCT `o`.`id` FROM orders o JOIN (R) AS `c` ON c.id = o.customer_id WHERE (o.total > 0)"
+        );
+        assert!(v
+            .select_sql(&[], None)
+            .ends_with("WHERE c.id IS NULL AND o.total > 0"));
+        for sql in [
+            "CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE IFNULL(c.name, 'x') = 'x'",
+            "CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.name = 'a' OR o.total > 1",
+        ] {
+            let v = p(sql);
+            assert_eq!(v.mode, Mode::Spj, "{sql}");
+            assert_eq!(v.lookup_sql(1, "(R)"), "SELECT DISTINCT `o`.`id` FROM orders o JOIN (R) AS `c` ON c.id = o.customer_id");
+        }
+        // A NULL-side group key that the rest of the key determines is not part of the unit.
+        let v = p("CREATE VIEW v AS SELECT o.id, c.name, COUNT(*) FROM orders o LEFT JOIN customers c ON c.id = o.customer_id GROUP BY o.id, c.name");
+        assert_eq!(v.mode, Mode::Grouped);
+        assert_eq!(v.unit_exprs, vec!["o.id"]);
         // Null-rejecting conditions stay incremental.
         let v = p("CREATE VIEW v AS SELECT o.id, c.name FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.name LIKE 'a%' AND UPPER(c.name) <> 'B' AND c.region_id IN (1, 2)");
         assert_eq!(v.mode, Mode::Spj);
@@ -2598,7 +2850,7 @@ mod tests {
             &[0],
         );
         cat.insert(k, t);
-        let pl = |sql: &str| plan(&parse_definition(sql).unwrap(), "db", &cat).unwrap();
+        let pl = |sql: &str| plan_block(&parse_definition(sql).unwrap(), "db", &cat).unwrap();
         // int = varchar: implicit conversion, not transitive -> no direct unit.
         let v = pl(
             "CREATE VIEW v AS SELECT c.code, r.id FROM codes c JOIN refs r ON r.code_int = c.code",
@@ -2645,7 +2897,7 @@ mod tests {
         );
         cat.insert(k, t);
         let pl = |sql: &str| {
-            plan(&parse_definition(sql).unwrap(), "db", &cat)
+            plan_block(&parse_definition(sql).unwrap(), "db", &cat)
                 .unwrap()
                 .mode
         };
@@ -2654,7 +2906,11 @@ mod tests {
             "CREATE VIEW v AS SELECT JSON_EXTRACT(doc, '$.a') k, COUNT(*) FROM docs GROUP BY k",
             "CREATE VIEW v AS SELECT doc->'$.a' k, COUNT(*) FROM docs GROUP BY k",
         ] {
-            assert_eq!(pl(sql), Mode::Full("JSON group key".into()), "{sql}");
+            assert_eq!(
+                pl(sql),
+                Mode::Full("JSON group key (needs typed unit filters)".into()),
+                "{sql}"
+            );
         }
         // ->> yields text: fine.
         assert_eq!(
@@ -2663,7 +2919,7 @@ mod tests {
         );
         assert_eq!(
             pl("CREATE VIEW v AS SELECT flags, COUNT(*) FROM docs GROUP BY flags"),
-            Mode::Full("BIT unit key".into())
+            Mode::Grouped
         );
     }
 
@@ -2684,7 +2940,7 @@ mod tests {
         nested.is_view = true;
         nested.view_bases = vec![("db".into(), "regions".into())];
         cat.insert(("db".into(), "nested_v".into()), Arc::new(nested));
-        let v = plan(&parse_definition("CREATE VIEW v AS SELECT p.id, c.name FROM paid_orders p JOIN customers c ON c.id = p.customer_id").unwrap(), "db", &cat).unwrap();
+        let v = plan_block(&parse_definition("CREATE VIEW v AS SELECT p.id, c.name FROM paid_orders p JOIN customers c ON c.id = p.customer_id").unwrap(), "db", &cat).unwrap();
         assert!(
             matches!(&v.mode, Mode::Full(r) if r.contains("paid_orders")),
             "{:?}",
@@ -2705,14 +2961,14 @@ mod tests {
             "CREATE VIEW _lazyview_state AS SELECT id FROM orders",
         ] {
             assert!(
-                plan(&parse_definition(bad).unwrap(), "db", &cat).is_err(),
+                plan_block(&parse_definition(bad).unwrap(), "db", &cat).is_err(),
                 "{bad}"
             );
         }
         let mut cat2 = catalog();
         let (k, t) = table("_lazyview_state", &[("name", "varchar")], &[0]);
         cat2.insert(k, t);
-        let e = plan(
+        let e = plan_block(
             &parse_definition("CREATE VIEW v AS SELECT name FROM _lazyview_state").unwrap(),
             "db",
             &cat2,
@@ -2776,7 +3032,7 @@ mod tests {
             referenced_tables(&d.query, "db"),
             vec![("db".to_string(), "we`ird".to_string())]
         );
-        let v = plan(&d, "db", &cat).unwrap();
+        let v = plan_block(&d, "db", &cat).unwrap();
         assert_eq!(v.mode, Mode::Spj);
         assert_eq!(v.unit_exprs, vec!["`w`.`i``d`"]);
         assert_eq!(v.aliases[0].referenced, vec![true, true]);
@@ -2813,7 +3069,7 @@ mod tests {
         );
         cat.insert(k, t);
         let pl = |sql: &str| {
-            plan(&parse_definition(sql).unwrap(), "db", &cat)
+            plan_block(&parse_definition(sql).unwrap(), "db", &cat)
                 .unwrap()
                 .mode
         };
@@ -2892,7 +3148,7 @@ mod tests {
             "WITH `_lv_cols` (`x`, `y`) AS (SELECT id, status AS s FROM orders UNION ALL \
              SELECT id, name FROM customers ORDER BY s LIMIT 2) SELECT * FROM `_lv_cols`"
         );
-        let pl = |sql: &str| parse_definition(sql).and_then(|d| plan(&d, "db", &catalog()));
+        let pl = |sql: &str| parse_definition(sql).and_then(|d| plan_block(&d, "db", &catalog()));
         for ok in [
             "CREATE VIEW v (a, b) AS SELECT DISTINCT * FROM regions",
             "CREATE VIEW v (a, b, c) AS SELECT DISTINCT r.*, c.id FROM regions r JOIN customers c ON c.region_id = r.id",

@@ -122,6 +122,35 @@ fn render(b: &Block) -> Result<String, String> {
     Ok(q.to_string())
 }
 
+/// Whether an unmerged derived item of `b` can be an internal view: an aggregate, window or
+/// top-N block over tables, joined inner or LEFT.
+pub(crate) fn isolatable(b: &Block, it: &Item) -> bool {
+    let Source::Derived(Rel::Block(inner)) = &it.source else {
+        return false;
+    };
+    inner
+        .items
+        .iter()
+        .all(|it| matches!(it.source, Source::Table(..)))
+        && super::normalize::blocker(inner).is_some_and(|w| {
+            matches!(
+                w.as_str(),
+                "GROUP BY"
+                    | "HAVING"
+                    | "aggregate function"
+                    | "DISTINCT"
+                    | "window function"
+                    | "ORDER BY … LIMIT"
+            )
+        })
+        && inner.semis.is_empty()
+        && (!inner.limit || inner.tail.is_some())
+        && matches!(
+            kind_at(&b.select.from, it.pos),
+            JoinKind::Head | JoinKind::Inner | JoinKind::Left
+        )
+}
+
 /// Replaces the unmerged aggregated derived items of `b` by their internal views' tables, where
 /// those exist in `tables`. Returns the internal views still missing, or the reason an item
 /// cannot be isolated.
@@ -138,30 +167,7 @@ pub(crate) fn isolate(
         let Rel::Block(inner) = rel else {
             return Err(super::normalize::unmerged_reason(b, &b.items[i]));
         };
-        // Aggregates, windows and top-N blocks over tables: views of their own.
-        let simple = inner
-            .items
-            .iter()
-            .all(|it| matches!(it.source, Source::Table(..)))
-            && super::normalize::blocker(inner).is_some_and(|w| {
-                matches!(
-                    w.as_str(),
-                    "GROUP BY"
-                        | "HAVING"
-                        | "aggregate function"
-                        | "DISTINCT"
-                        | "window function"
-                        | "ORDER BY … LIMIT"
-                )
-            })
-            && inner.semis.is_empty()
-            && (!inner.limit || inner.tail.is_some());
-        if !simple
-            || !matches!(
-                kind_at(&b.select.from, b.items[i].pos),
-                JoinKind::Head | JoinKind::Inner | JoinKind::Left
-            )
-        {
+        if !isolatable(b, &b.items[i]) {
             return Err(super::normalize::unmerged_reason(b, &b.items[i]));
         }
         let mut inner = (**inner).clone();
@@ -215,7 +221,7 @@ pub(crate) fn needs_tuple_view(plan: &ViewPlan) -> bool {
                 .count()
                 >= 2
         }
-        Mode::Full(r) => r == "group key on the NULL side of a LEFT JOIN",
+        Mode::Full(r) => r == super::NULL_SIDE_KEY,
         _ => false,
     }
 }
