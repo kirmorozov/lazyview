@@ -500,6 +500,9 @@ impl Ctx {
         env.insert("LAZYVIEW_HEARTBEAT_MS".into(), "1000".into());
         // Many engines run in one process: no HTTP endpoint unless a test asks for one.
         env.insert("LAZYVIEW_HEALTH_ADDR".into(), "off".into());
+        // Full-mode / unknown-unit rebuilds immediately (the default cadence would leave them
+        // stale at check time); efficiency_full_refresh_cadence tests the cadence itself.
+        env.insert("LAZYVIEW_FULL_REFRESH_MS".into(), "0".into());
         for (k, v) in overrides {
             env.insert(k.to_string(), v.to_string());
         }

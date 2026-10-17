@@ -712,13 +712,21 @@ fn lifecycle_health_endpoint() {
         )
         .await?;
         wait_state(&mut c, &mut eng, "v_broken", "error", t_ready()).await?;
+        // Views in error do not make the instance unready by default (LAZYVIEW_READY_REQUIRE_ALL
+        // is process-wide, so the per-request override is used for the strict variant).
+        let (st, body) = http_get(&addr, "/readyz").await?;
+        ensure!(
+            st == 200,
+            "/readyz must stay 200 with a failing view by default, got {st}: {}",
+            clip(&body, 300)
+        );
         wait_until(
-            "/readyz 503 while a view is failing",
+            "/readyz?require_all=1 503 while a view is failing",
             Duration::from_secs(30),
             || {
                 let addr = addr.clone();
                 async move {
-                    Ok(http_get(&addr, "/readyz")
+                    Ok(http_get(&addr, "/readyz?require_all=1")
                         .await
                         .map(|r| r.0 == 503)
                         .unwrap_or(false))
@@ -947,13 +955,17 @@ fn lifecycle_metadata_upgrade_from_minimal_table() {
                 "_lazyview not migrated: no column {needed} in {cols:?}"
             );
         }
-        let named = rows(&mut c, "SELECT id, name FROM _lazyview ORDER BY id").await?;
+        // Names are backfilled once a definition plans; the disabled one (#3) is never planned.
+        let named = rows(
+            &mut c,
+            "SELECT id, name FROM _lazyview WHERE enabled = 1 ORDER BY id",
+        )
+        .await?;
         let got: Vec<Option<String>> = named.iter().map(|r| r[1].clone()).collect();
         ensure!(
             got == vec![
                 Some("v_paid_orders".to_string()),
-                Some("v_status_counts".to_string()),
-                Some("v_disabled".to_string())
+                Some("v_status_counts".to_string())
             ],
             "names not backfilled: {named:?}"
         );

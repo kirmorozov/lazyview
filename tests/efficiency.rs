@@ -524,3 +524,95 @@ fn efficiency_big_transaction() {
         Ok(())
     });
 }
+
+/// `LAZYVIEW_FULL_REFRESH_MS`: a burst of changes to the sources of full-refresh views causes at
+/// most about one rebuild per view per interval, and the views converge afterwards.
+#[test]
+fn efficiency_full_refresh_cadence() {
+    scenario("eff_cadence", |ctx| async move {
+        let db = ctx.new_db("eff_cadence").await?;
+        setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::tiny()).await?;
+        let keep = ["v_distinct_methods", "v_events_big"];
+        let specs: Vec<ViewSpec> = ecommerce_views()
+            .into_iter()
+            .filter(|v| keep.contains(&v.name.as_str()))
+            .collect();
+        let interval = Duration::from_millis(3000);
+        let interval_ms = interval.as_millis().to_string();
+        let (mut eng, _ids) = start_with_views(
+            &ctx,
+            &db,
+            &specs,
+            &[
+                ("LAZYVIEW_FULL_REFRESH_MS", interval_ms.as_str()),
+                ("LAZYVIEW_BATCH_WINDOW_MS", "50"),
+            ],
+        )
+        .await?;
+        let none = std::collections::HashMap::new();
+        let converge = Duration::from_secs(60);
+        eventually_equal(&ctx, &mut eng, &db, &none, &specs, converge, "initial").await?;
+        quiesce(&mut eng, &db).await?;
+        tokio::time::sleep(interval).await;
+
+        let mut c = db.conn().await?;
+        let before = eng.snapshot();
+        let t0 = std::time::Instant::now();
+        let methods = ["card", "paypal", "wire", "cash"];
+        let statuses = ["ok", "pending", "failed", "refund", "void"];
+        for k in 0..40usize {
+            exec(
+                &mut c,
+                &format!(
+                    "INSERT INTO payments (id, order_id, method, amount, status) VALUES ({}, 1, '{}', 10.00, '{}')",
+                    9_500_000 + k,
+                    methods[k % 4],
+                    statuses[k % 5]
+                ),
+            )
+            .await?;
+            exec(
+                &mut c,
+                &format!("INSERT INTO events_log (customer_id, kind, amount, happened_at) VALUES ({}, 'promo', {}.00, '2024-01-01 00:00:00')", k % 5, 60 + k),
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let burst = t0.elapsed();
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &db,
+            &none,
+            &specs,
+            converge,
+            "after the burst",
+        )
+        .await?;
+        let total = t0.elapsed();
+        let d = eng.snapshot().since(&before);
+        let per_view_max = (total.as_millis() / interval.as_millis()) as u64 + 1;
+        let max = per_view_max * specs.len() as u64;
+        ctx.log(format!(
+            "burst {:.1}s, converged after {:.1}s: {} full rebuilds (max {max}); {}",
+            burst.as_secs_f64(),
+            total.as_secs_f64(),
+            d.full_rebuilds,
+            fmt_snapshot(&d)
+        ));
+        ensure!(
+            d.full_rebuilds >= 1,
+            "the burst changed both views but no full rebuild ran: {}",
+            fmt_snapshot(&d)
+        );
+        ensure!(
+            d.full_rebuilds <= max,
+            "{} full rebuilds within {:.1}s exceed one per view per {interval:?} ({max}): {}",
+            d.full_rebuilds,
+            total.as_secs_f64(),
+            fmt_snapshot(&d)
+        );
+        eng.stop().await?;
+        Ok(())
+    });
+}
