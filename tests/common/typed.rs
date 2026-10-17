@@ -63,13 +63,36 @@ pub fn ddl() -> Vec<String> {
     ]
 }
 
-pub const U64: &[&str] = &["NULL", "0", "1", "42", "9223372036854775808", "18446744073709551614", "18446744073709551615"];
-pub const I64: &[&str] = &["NULL", "-9223372036854775808", "9223372036854775807", "-1", "0", "7"];
+pub const U64: &[&str] = &[
+    "NULL",
+    "0",
+    "1",
+    "42",
+    "9223372036854775808",
+    "18446744073709551614",
+    "18446744073709551615",
+];
+pub const I64: &[&str] = &[
+    "NULL",
+    "-9223372036854775808",
+    "9223372036854775807",
+    "-1",
+    "0",
+    "7",
+];
 pub const I32: &[&str] = &["NULL", "-2147483648", "2147483647", "-5", "5"];
 pub const U8: &[&str] = &["NULL", "0", "255", "128"];
 pub const I8: &[&str] = &["NULL", "-128", "127", "-1"];
 pub const M24: &[&str] = &["NULL", "-8388608", "8388607", "0"];
-pub const DEC: &[&str] = &["NULL", "-99999999999999.999999", "99999999999999.999999", "0.000001", "-0.000001", "0", "12.5"];
+pub const DEC: &[&str] = &[
+    "NULL",
+    "-99999999999999.999999",
+    "99999999999999.999999",
+    "0.000001",
+    "-0.000001",
+    "0",
+    "12.5",
+];
 pub const DBIG: &[&str] = &[
     "NULL",
     "1.000000000000000000000000000001",
@@ -95,7 +118,13 @@ pub const TS: &[&str] = &[
     "'2021-06-01 12:00:00.499999'",
 ];
 pub const DATE: &[&str] = &["NULL", "'1000-01-01'", "'9999-12-31'", "'2024-02-29'"];
-pub const TIME: &[&str] = &["NULL", "'-838:59:59.000'", "'838:59:59.000'", "'00:00:00.001'", "'-00:00:01.500'"];
+pub const TIME: &[&str] = &[
+    "NULL",
+    "'-838:59:59.000'",
+    "'838:59:59.000'",
+    "'00:00:00.001'",
+    "'-00:00:01.500'",
+];
 pub const YEAR: &[&str] = &["NULL", "1901", "2155", "2000"];
 pub const JSONS: &[&str] = &[
     "NULL",
@@ -109,7 +138,17 @@ pub const JSONS: &[&str] = &[
 ];
 /// Case-insensitive group/join keys: ASCII only, so `UPPER()`/`LOWER()` of any group member is
 /// the same (accent-insensitive equalities would make the displayed key nondeterministic).
-pub const CI: &[&str] = &["NULL", "'abc'", "'ABC'", "'Abc'", "'xyz'", "'XYZ'", "''", "'mixed Case'", "'MIXED CASE'"];
+pub const CI: &[&str] = &[
+    "NULL",
+    "'abc'",
+    "'ABC'",
+    "'Abc'",
+    "'xyz'",
+    "'XYZ'",
+    "''",
+    "'mixed Case'",
+    "'MIXED CASE'",
+];
 pub const CS: &[&str] = &["NULL", "'abc'", "'ABC'", "'résumé'", "'RESUME'", "'a b'"];
 pub const EMOJI: &[&str] = &[
     "NULL",
@@ -124,7 +163,15 @@ pub const EMOJI: &[&str] = &[
     r"'back\\slash'",
 ];
 pub const CHARS: &[&str] = &["NULL", "'a'", "'ab'", "'abcde'", "''"];
-pub const BIN: &[&str] = &["NULL", "X''", "X'00'", "X'00FF'", "X'FF'", "X'DEADBEEF'", "'abc'"];
+pub const BIN: &[&str] = &[
+    "NULL",
+    "X''",
+    "X'00'",
+    "X'00FF'",
+    "X'FF'",
+    "X'DEADBEEF'",
+    "'abc'",
+];
 pub const BLOB: &[&str] = &["NULL", "X'00010203'", "X''", "'text in blob'"];
 pub const BITS: &[&str] = &["NULL", "b'0'", "b'11111111'", "b'1010'"];
 
@@ -202,12 +249,20 @@ fn ckey_row(g: &mut Gen) -> String {
 /// Seed rows: `n` t_types rows, n/2 t_ref rows, n/2 t_ckey rows.
 pub fn seed(g: &mut Gen, n: u64) -> Vec<String> {
     let rows: Vec<String> = (1..=n).map(|id| types_row(g, id)).collect();
-    let refs: Vec<String> = (1..=(n as i64 / 2).max(4)).map(|id| ref_row(g, id)).collect();
+    let refs: Vec<String> = (1..=(n as i64 / 2).max(4))
+        .map(|id| ref_row(g, id))
+        .collect();
     let ck: Vec<String> = (0..(n / 2).max(4)).map(|_| ckey_row(g)).collect();
     vec![
         format!("INSERT INTO t_types ({COLS}) VALUES {}", rows.join(", ")),
-        format!("INSERT INTO t_ref (id, u64, d, ci, dt, e, bin, label) VALUES {}", refs.join(", ")),
-        format!("INSERT INTO t_ckey (k1, k2, k3, v) VALUES {} ON DUPLICATE KEY UPDATE v = VALUES(v)", ck.join(", ")),
+        format!(
+            "INSERT INTO t_ref (id, u64, d, ci, dt, e, bin, label) VALUES {}",
+            refs.join(", ")
+        ),
+        format!(
+            "INSERT INTO t_ckey (k1, k2, k3, v) VALUES {} ON DUPLICATE KEY UPDATE v = VALUES(v)",
+            ck.join(", ")
+        ),
     ]
 }
 
@@ -242,10 +297,14 @@ pub fn random_change(g: &mut Gen) -> Vec<String> {
         ("bt", BITS),
     ];
     match g.range(0, 11) {
-        0 | 1 | 2 => {
+        0..=2 => {
             let (c1, d1) = *g.pick(col_set);
             let (c2, d2) = *g.pick(col_set);
-            vec![format!("UPDATE t_types SET {c1} = {}, {c2} = {} WHERE id = {id}", g.pick(d1), g.pick(d2))]
+            vec![format!(
+                "UPDATE t_types SET {c1} = {}, {c2} = {} WHERE id = {id}",
+                g.pick(d1),
+                g.pick(d2)
+            )]
         }
         3 => {
             let row = types_row(g, id as u64);
@@ -256,24 +315,52 @@ pub fn random_change(g: &mut Gen) -> Vec<String> {
             vec![format!("INSERT INTO t_types ({COLS}) VALUES {row} ON DUPLICATE KEY UPDATE ci = VALUES(ci), u64 = VALUES(u64), d = VALUES(d)")]
         }
         5 => vec![format!("DELETE FROM t_types WHERE id = {id}")],
-        6 => vec![format!("UPDATE IGNORE t_types SET id = {} WHERE id = {id}", id2 + 100)],
+        6 => vec![format!(
+            "UPDATE IGNORE t_types SET id = {} WHERE id = {id}",
+            id2 + 100
+        )],
         7 => {
             // predicate on typed columns, possibly hitting several rows (CI match, unsigned max)
-            let (c, dom) = *g.pick(&[("ci", CI), ("u64", U64), ("e", ENUMS), ("bin", BIN), ("dt", DT)][..]);
+            let (c, dom) = *g.pick(
+                &[
+                    ("ci", CI),
+                    ("u64", U64),
+                    ("e", ENUMS),
+                    ("bin", BIN),
+                    ("dt", DT),
+                ][..],
+            );
             let v = nn(g, dom);
             let (c2, d2) = *g.pick(col_set);
-            vec![format!("UPDATE t_types SET {c2} = {} WHERE {c} = {v} ORDER BY id LIMIT 3", g.pick(d2))]
+            vec![format!(
+                "UPDATE t_types SET {c2} = {} WHERE {c} = {v} ORDER BY id LIMIT 3",
+                g.pick(d2)
+            )]
         }
         8 => {
             let rid = g.range(1, 40);
-            let (c, dom) = *g.pick(&[("u64", U64), ("d", DEC), ("ci", CI), ("dt", DT), ("e", ENUMS), ("bin", BIN)][..]);
+            let (c, dom) = *g.pick(
+                &[
+                    ("u64", U64),
+                    ("d", DEC),
+                    ("ci", CI),
+                    ("dt", DT),
+                    ("e", ENUMS),
+                    ("bin", BIN),
+                ][..],
+            );
             if g.chance(0.2) {
                 vec![format!("DELETE FROM t_ref WHERE id = {rid}")]
             } else if g.chance(0.3) {
                 let row = ref_row(g, rid);
-                vec![format!("REPLACE INTO t_ref (id, u64, d, ci, dt, e, bin, label) VALUES {row}")]
+                vec![format!(
+                    "REPLACE INTO t_ref (id, u64, d, ci, dt, e, bin, label) VALUES {row}"
+                )]
             } else {
-                vec![format!("UPDATE t_ref SET {c} = {} WHERE id = {rid}", g.pick(dom))]
+                vec![format!(
+                    "UPDATE t_ref SET {c} = {} WHERE id = {rid}",
+                    g.pick(dom)
+                )]
             }
         }
         9 => {
@@ -286,8 +373,13 @@ pub fn random_change(g: &mut Gen) -> Vec<String> {
                 // PK changes that only change case (same key under the collation)
                 0 => vec![format!("UPDATE t_ckey SET k1 = UPPER(k1) WHERE k1 = {k1}")],
                 1 => vec![format!("UPDATE t_ckey SET k1 = LOWER(k1) WHERE k1 = {k1}")],
-                2 => vec![format!("UPDATE IGNORE t_ckey SET k2 = {} WHERE k1 = {k1} ORDER BY k2 LIMIT 1", nn(g, DT))],
-                _ => vec![format!("DELETE FROM t_ckey WHERE k1 = {k1} ORDER BY k2 LIMIT 1")],
+                2 => vec![format!(
+                    "UPDATE IGNORE t_ckey SET k2 = {} WHERE k1 = {k1} ORDER BY k2 LIMIT 1",
+                    nn(g, DT)
+                )],
+                _ => vec![format!(
+                    "DELETE FROM t_ckey WHERE k1 = {k1} ORDER BY k2 LIMIT 1"
+                )],
             }
         }
         _ => {
@@ -298,7 +390,12 @@ pub fn random_change(g: &mut Gen) -> Vec<String> {
     }
 }
 
+/// The typed view set (minus `LAZYVIEW_TEST_SKIP_VIEWS`).
 pub fn views() -> Vec<ViewSpec> {
+    super::skip_views(all_views())
+}
+
+fn all_views() -> Vec<ViewSpec> {
     use Kind::*;
     vec![
         ViewSpec::new(

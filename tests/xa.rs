@@ -29,8 +29,19 @@ fn xa_transactions() {
     scenario("xa", |ctx| async move {
         let db = ctx.new_db("xa").await?;
         let ids = setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::tiny()).await?;
-        let keep = ["v_paid_orders", "v_order_lines", "v_status_counts", "v_global_orders", "v_customer_stats", "v_orders_left", "v_distinct_methods"];
-        let specs: Vec<ViewSpec> = ecommerce_views().into_iter().filter(|v| keep.contains(&v.name.as_str())).collect();
+        let keep = [
+            "v_paid_orders",
+            "v_order_lines",
+            "v_status_counts",
+            "v_global_orders",
+            "v_customer_stats",
+            "v_orders_left",
+            "v_distinct_methods",
+        ];
+        let specs: Vec<ViewSpec> = ecommerce_views()
+            .into_iter()
+            .filter(|v| keep.contains(&v.name.as_str()))
+            .collect();
         let mut c = db.conn().await?;
         ensure_lazyview_table(&mut c).await?;
         add_views(&mut c, &specs).await?;
@@ -44,7 +55,9 @@ fn xa_transactions() {
         exec_all(&mut xc, &xa_dml("x1", 800_001, 8_000_001, 8_000_001, 1)).await?;
         exec(&mut xc, "XA PREPARE 'x1'").await?;
         exec(&mut c, "INSERT INTO orders (id, customer_id, status, created_at) VALUES (800100, 2, 'new', '2024-03-02 00:00:00')").await?;
-        verify(&ctx, &mut eng, &db, &specs, "XA prepared (uncommitted)").await.context("prepared XA data leaked or catch-up stalled")?;
+        verify(&ctx, &mut eng, &db, &specs, "XA prepared (uncommitted)")
+            .await
+            .context("prepared XA data leaked or catch-up stalled")?;
 
         // 2. Two-phase commit from the same session.
         exec(&mut xc, "XA COMMIT 'x1'").await?;
@@ -77,13 +90,31 @@ fn xa_transactions() {
         xc2.disconnect().await.ok();
         // Normal writes that do not touch rows locked by the prepared branches.
         exec(&mut c, "INSERT INTO orders (id, customer_id, status, created_at) VALUES (800200, 3, 'paid', '2024-03-03 00:00:00')").await?;
-        exec(&mut c, "UPDATE orders SET status = 'refunded' WHERE id = 12").await?;
+        exec(
+            &mut c,
+            "UPDATE orders SET status = 'refunded' WHERE id = 12",
+        )
+        .await?;
         exec(&mut c, "UPDATE customers SET name = 'xa-side' WHERE id = 3").await?;
-        verify(&ctx, &mut eng, &db, &specs, "two detached prepared XA + normal writes").await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "two detached prepared XA + normal writes",
+        )
+        .await?;
         let mut other = db.conn().await?;
         exec(&mut other, "XA COMMIT 'x5'").await?;
         exec(&mut other, "XA ROLLBACK 'x6'").await?;
-        verify(&ctx, &mut eng, &db, &specs, "detached XA committed / rolled back from another session").await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "detached XA committed / rolled back from another session",
+        )
+        .await?;
         run_batches(&mut c, &mut wl, scaled(20)).await?;
         verify(&ctx, &mut eng, &db, &specs, "normal writes after XA").await?;
         assert_ready(&mut c, &names(&specs)).await?;

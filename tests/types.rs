@@ -10,7 +10,12 @@ use common::typed;
 use common::workload::{names, Gen};
 use common::*;
 
-async fn setup_typed(ctx: &Ctx, tag: &str, seed_rows: u64, specs: &[ViewSpec]) -> Result<(Db, Gen)> {
+async fn setup_typed(
+    ctx: &Ctx,
+    tag: &str,
+    seed_rows: u64,
+    specs: &[ViewSpec],
+) -> Result<(Db, Gen)> {
     let db = ctx.new_db(tag).await?;
     let mut c = db.conn().await?;
     for s in typed::ddl() {
@@ -42,7 +47,13 @@ fn types_all_types_roundtrip() {
             let tag = format!("types_all_{k}");
             let (db, mut g) = setup_typed(&ctx, &tag, 60, &specs).await?;
             let mut c = db.conn().await?;
-            let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_BATCH_WINDOW_MS", window), ("LAZYVIEW_QUERY_CHUNK", chunk)])?;
+            let mut eng = ctx.start_engine(
+                &db,
+                &[
+                    ("LAZYVIEW_BATCH_WINDOW_MS", window),
+                    ("LAZYVIEW_QUERY_CHUNK", chunk),
+                ],
+            )?;
             wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
             verify(&ctx, &mut eng, &db, &specs, &format!("{tag}: initial")).await?;
 
@@ -51,9 +62,18 @@ fn types_all_types_roundtrip() {
                 for _ in 0..scaled(80) {
                     let stmts = typed::random_change(&mut g);
                     let rb = g.chance(0.08);
-                    txn(&mut c, &stmts, rb).await.with_context(|| format!("{stmts:?}"))?;
+                    txn(&mut c, &stmts, rb)
+                        .await
+                        .with_context(|| format!("{stmts:?}"))?;
                 }
-                verify(&ctx, &mut eng, &db, &specs, &format!("{tag}: random phase {phase}")).await?;
+                verify(
+                    &ctx,
+                    &mut eng,
+                    &db,
+                    &specs,
+                    &format!("{tag}: random phase {phase}"),
+                )
+                .await?;
             }
 
             // Walk one row through every value of every domain (NULL ↔ value, boundaries).
@@ -84,29 +104,55 @@ fn types_all_types_roundtrip() {
                 ("bt", typed::BITS),
             ];
             let row = typed::types_row(&mut g, 5);
-            exec(&mut c, &format!("REPLACE INTO t_types ({}) VALUES {row}", typed::COLS)).await?;
+            exec(
+                &mut c,
+                &format!("REPLACE INTO t_types ({}) VALUES {row}", typed::COLS),
+            )
+            .await?;
             for (col, dom) in domains {
                 for v in dom.iter().chain(std::iter::once(&"NULL")) {
-                    exec(&mut c, &format!("UPDATE t_types SET {col} = {v} WHERE id = 5")).await?;
+                    exec(
+                        &mut c,
+                        &format!("UPDATE t_types SET {col} = {v} WHERE id = 5"),
+                    )
+                    .await?;
                 }
             }
             verify(&ctx, &mut eng, &db, &specs, &format!("{tag}: value walk")).await?;
 
             // Huge unsigned and negative primary keys as units; boundary rows deleted by value.
-            let big_ids = ["18446744073709551615", "18446744073709551614", "9223372036854775808", "9223372036854775807", "0"];
+            let big_ids = [
+                "18446744073709551615",
+                "18446744073709551614",
+                "9223372036854775808",
+                "9223372036854775807",
+                "0",
+            ];
             for id in big_ids {
                 let row = typed::types_row(&mut g, 1).replacen("(1,", &format!("({id},"), 1);
-                exec(&mut c, &format!("REPLACE INTO t_types ({}) VALUES {row}", typed::COLS)).await?;
+                exec(
+                    &mut c,
+                    &format!("REPLACE INTO t_types ({}) VALUES {row}", typed::COLS),
+                )
+                .await?;
             }
             exec(&mut c, "UPDATE t_types SET u64 = 18446744073709551615, ci = 'ABC' WHERE id >= 9223372036854775807").await?;
             for id in ["-2147483648", "-1", "2147483647"] {
                 exec(&mut c, &format!("REPLACE INTO t_ref (id, u64, d, ci, dt, e, bin, label) VALUES ({id}, 18446744073709551615, -0.000001, 'abc', '2021-06-01 12:00:00.500000', 'ö', X'00', 'neg{id}')")).await?;
             }
-            verify(&ctx, &mut eng, &db, &specs, &format!("{tag}: huge / negative keys")).await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                &format!("{tag}: huge / negative keys"),
+            )
+            .await?;
             txn(
                 &mut c,
                 &[
-                    "UPDATE t_types SET id = 18446744073709551613 WHERE id = 18446744073709551615".into(),
+                    "UPDATE t_types SET id = 18446744073709551613 WHERE id = 18446744073709551615"
+                        .into(),
                     "DELETE FROM t_types WHERE id = 9223372036854775808".into(),
                     "UPDATE t_ref SET id = -2147483647 WHERE id = -2147483648".into(),
                     "DELETE FROM t_types WHERE u64 = 18446744073709551615 AND id < 100".into(),
@@ -120,7 +166,14 @@ fn types_all_types_roundtrip() {
                 false,
             )
             .await?;
-            verify(&ctx, &mut eng, &db, &specs, &format!("{tag}: deletes by typed values")).await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                &format!("{tag}: deletes by typed values"),
+            )
+            .await?;
             assert_ready(&mut c, &names(&specs)).await?;
             eng.stop().await?;
         }
@@ -131,8 +184,19 @@ fn types_all_types_roundtrip() {
 #[test]
 fn types_case_insensitive_keys_step_by_step() {
     scenario("types_ci", |ctx| async move {
-        let keep = ["vt_all", "vt_by_ci", "vt_by_lower", "vt_join_ci", "vt_ref_groups", "vt_ckey", "vt_ckey_group"];
-        let specs: Vec<ViewSpec> = typed::views().into_iter().filter(|v| keep.contains(&v.name.as_str())).collect();
+        let keep = [
+            "vt_all",
+            "vt_by_ci",
+            "vt_by_lower",
+            "vt_join_ci",
+            "vt_ref_groups",
+            "vt_ckey",
+            "vt_ckey_group",
+        ];
+        let specs: Vec<ViewSpec> = typed::views()
+            .into_iter()
+            .filter(|v| keep.contains(&v.name.as_str()))
+            .collect();
         let (db, _g) = setup_typed(&ctx, "types_ci", 0, &specs).await?;
         let mut c = db.conn().await?;
         let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_BATCH_WINDOW_MS", "0")])?;

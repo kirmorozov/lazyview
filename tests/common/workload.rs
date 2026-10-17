@@ -149,11 +149,19 @@ pub const ECOMMERCE_DDL: &[&str] = &[
 ];
 
 /// Columns no view reads (updates of these must cost nothing).
-pub const UNREFERENCED: &[(&str, &str)] =
-    &[("customers", "last_seen_at"), ("orders", "note"), ("products", "updated_at"), ("regions", "notes")];
+pub const UNREFERENCED: &[(&str, &str)] = &[
+    ("customers", "last_seen_at"),
+    ("orders", "note"),
+    ("products", "updated_at"),
+    ("regions", "notes"),
+];
 
-/// The shared, heavily overlapping view set.
+/// The shared, heavily overlapping view set (minus `LAZYVIEW_TEST_SKIP_VIEWS`).
 pub fn ecommerce_views() -> Vec<ViewSpec> {
+    super::skip_views(all_ecommerce_views())
+}
+
+fn all_ecommerce_views() -> Vec<ViewSpec> {
     use Kind::*;
     vec![
         // single-table filter, written with noise + column list + LOCAL CHECK OPTION
@@ -355,9 +363,17 @@ pub fn ecommerce_views() -> Vec<ViewSpec> {
     ]
 }
 
+/// Whether a view of [`ecommerce_views`] reads a child table of a cascading foreign key.
+pub fn reads_fk_child(name: &str) -> bool {
+    name.starts_with("vf_")
+}
+
 /// Views of the given kinds.
 pub fn views_of(kinds: &[Kind]) -> Vec<ViewSpec> {
-    ecommerce_views().into_iter().filter(|v| kinds.contains(&v.kind)).collect()
+    ecommerce_views()
+        .into_iter()
+        .filter(|v| kinds.contains(&v.kind))
+        .collect()
 }
 
 pub fn names(specs: &[ViewSpec]) -> Vec<&str> {
@@ -391,7 +407,13 @@ impl Sizes {
     }
 
     pub fn tiny() -> Sizes {
-        Sizes { regions: 3, customers: 8, products: 6, orders: 12, events: 10 }
+        Sizes {
+            regions: 3,
+            customers: 8,
+            products: 6,
+            orders: 12,
+            events: 10,
+        }
     }
 }
 
@@ -399,6 +421,8 @@ impl Sizes {
 #[derive(Debug)]
 pub struct Ids {
     pub regions: i64,
+    /// Order ids 1..=seed_orders came from the seed data (never handed out by the allocator).
+    pub seed_orders: i64,
     pub customer: AtomicI64,
     pub product: AtomicI64,
     pub order: AtomicI64,
@@ -426,11 +450,35 @@ impl Ids {
 // ---------------------------------------------------------------------------------------------
 
 const NAMES: &[&str] = &[
-    "alice", "Bob", "carol", "Dave", "Eve", "mallory", "Zoë", "José", "李雷", "Ольга", "o'brien",
-    "back\\slash", "😀 smiley", "trent", "peggy", "victor", "walter", "Sybil", "x",
+    "alice",
+    "Bob",
+    "carol",
+    "Dave",
+    "Eve",
+    "mallory",
+    "Zoë",
+    "José",
+    "李雷",
+    "Ольга",
+    "o'brien",
+    "back\\slash",
+    "😀 smiley",
+    "trent",
+    "peggy",
+    "victor",
+    "walter",
+    "Sybil",
+    "x",
 ];
 const KINDS: &[&str] = &["login", "view", "cart", "refund", "promo"];
-const CATEGORIES: &[Option<&str>] = &[Some("books"), Some("toys"), Some("food"), Some("garden"), Some("tools"), None];
+const CATEGORIES: &[Option<&str>] = &[
+    Some("books"),
+    Some("toys"),
+    Some("food"),
+    Some("garden"),
+    Some("tools"),
+    None,
+];
 const ORDER_STATUS: &[&str] = &["new", "paid", "shipped", "cancelled", "refunded"];
 const METHODS: &[&str] = &["card", "paypal", "wire", "cash"];
 const PAY_STATUS: &[&str] = &["ok", "pending", "failed"];
@@ -438,7 +486,18 @@ const TIERS: &[&str] = &["bronze", "silver", "gold", "platinum"];
 const FLAGS: &[&str] = &["vip", "newsletter", "blocked", "test"];
 const LANGS: &[&str] = &["en", "de", "fr", "ja"];
 const CITIES: &[&str] = &["Berlin", "Paris", "Tokyo", "Lima", "Oslo"];
-const REGION_NAMES: &[&str] = &["North", "South", "East", "West", "Central", "Overseas", "Île-de-France", "Zürich"];
+/// Seeded fk_groups ids (1..=N); only these are re-created by id (fresh ids belong to the allocator).
+const N_FK_GROUPS: i64 = 5;
+const REGION_NAMES: &[&str] = &[
+    "North",
+    "South",
+    "East",
+    "West",
+    "Central",
+    "Overseas",
+    "Île-de-France",
+    "Zürich",
+];
 
 pub struct Gen {
     pub rng: Xoshiro256PlusPlus,
@@ -446,7 +505,9 @@ pub struct Gen {
 
 impl Gen {
     pub fn new(seed: u64) -> Gen {
-        Gen { rng: Xoshiro256PlusPlus::seed_from_u64(seed) }
+        Gen {
+            rng: Xoshiro256PlusPlus::seed_from_u64(seed),
+        }
     }
     pub fn range(&mut self, lo: i64, hi_incl: i64) -> i64 {
         if hi_incl <= lo {
@@ -512,7 +573,12 @@ impl Gen {
         )
     }
     pub fn date(&mut self) -> String {
-        format!("'{:04}-{:02}-{:02}'", self.range(1950, 2010), self.range(1, 12), self.range(1, 28))
+        format!(
+            "'{:04}-{:02}-{:02}'",
+            self.range(1950, 2010),
+            self.range(1, 12),
+            self.range(1, 28)
+        )
     }
     pub fn flags(&mut self) -> String {
         let mut set = Vec::new();
@@ -529,7 +595,10 @@ impl Gen {
             return "NULL".into();
         }
         let lang = *self.pick(LANGS);
-        q(&format!("{{\"lang\": \"{lang}\", \"score\": {}}}", self.range(0, 10)))
+        q(&format!(
+            "{{\"lang\": \"{lang}\", \"score\": {}}}",
+            self.range(0, 10)
+        ))
     }
 }
 
@@ -563,11 +632,19 @@ pub fn seed_statements(seed: u64, s: Sizes) -> (Vec<String>, Ids) {
     let mut out = Vec::new();
     let regions: Vec<String> = (1..=s.regions)
         .map(|id| {
-            let name = opt!(g, 0.1, q(REGION_NAMES[(id as usize - 1) % REGION_NAMES.len()]));
+            let name = opt!(
+                g,
+                0.1,
+                q(REGION_NAMES[(id as usize - 1) % REGION_NAMES.len()])
+            );
             format!("({id}, {name}, 'US', 0.{:03}, NULL)", g.range(0, 250))
         })
         .collect();
-    chunked_insert(&mut out, "INSERT INTO regions (id, name, country, tax_rate, notes)", regions);
+    chunked_insert(
+        &mut out,
+        "INSERT INTO regions (id, name, country, tax_rate, notes)",
+        regions,
+    );
 
     let customers: Vec<String> = (1..=s.customers)
         .map(|id| {
@@ -623,7 +700,10 @@ pub fn seed_statements(seed: u64, s: Sizes) -> (Vec<String>, Ids) {
         let cust = opt!(g, 0.05, g.range(1, s.customers + 2).to_string());
         let status = q(g.pick(ORDER_STATUS));
         let shipped = opt!(g, 0.5, g.ts6());
-        orders.push(format!("({id}, {cust}, {status}, {}, {shipped}, NULL)", g.dt6()));
+        orders.push(format!(
+            "({id}, {cust}, {status}, {}, {shipped}, NULL)",
+            g.dt6()
+        ));
         for _ in 0..g.range(0, 4) {
             let disc = opt!(g, 0.6, g.decimal(0, 5000));
             items.push(format!(
@@ -645,9 +725,21 @@ pub fn seed_statements(seed: u64, s: Sizes) -> (Vec<String>, Ids) {
             pay_id += 1;
         }
     }
-    chunked_insert(&mut out, "INSERT INTO orders (id, customer_id, status, created_at, shipped_at, note)", orders);
-    chunked_insert(&mut out, "INSERT INTO order_items (order_id, line_no, product_id, qty, price, discount)", items);
-    chunked_insert(&mut out, "INSERT INTO payments (id, order_id, method, amount, status, paid_at)", payments);
+    chunked_insert(
+        &mut out,
+        "INSERT INTO orders (id, customer_id, status, created_at, shipped_at, note)",
+        orders,
+    );
+    chunked_insert(
+        &mut out,
+        "INSERT INTO order_items (order_id, line_no, product_id, qty, price, discount)",
+        items,
+    );
+    chunked_insert(
+        &mut out,
+        "INSERT INTO payments (id, order_id, method, amount, status, paid_at)",
+        payments,
+    );
 
     let events: Vec<String> = (0..s.events)
         .map(|_| {
@@ -656,25 +748,39 @@ pub fn seed_statements(seed: u64, s: Sizes) -> (Vec<String>, Ids) {
             format!("({cust}, {}, {amount}, {})", q(g.pick(KINDS)), g.dt0())
         })
         .collect();
-    chunked_insert(&mut out, "INSERT INTO events_log (customer_id, kind, amount, happened_at)", events);
+    chunked_insert(
+        &mut out,
+        "INSERT INTO events_log (customer_id, kind, amount, happened_at)",
+        events,
+    );
 
     let mut inv = Vec::new();
     for r in 1..=s.regions {
         for p in 1..=s.products {
             if g.chance(0.3) {
-                inv.push(format!("({r}, {p}, {}, {})", g.range(0, 100), g.range(0, 10)));
+                inv.push(format!(
+                    "({r}, {p}, {}, {})",
+                    g.range(0, 100),
+                    g.range(0, 10)
+                ));
             }
         }
     }
     if inv.is_empty() {
         inv.push("(1, 1, 5, 0)".into());
     }
-    chunked_insert(&mut out, "INSERT INTO inventory (region_id, product_id, qty, reserved)", inv);
+    chunked_insert(
+        &mut out,
+        "INSERT INTO inventory (region_id, product_id, qty, reserved)",
+        inv,
+    );
 
     // FK tables (parents before children).
-    let n_groups = 5i64;
+    let n_groups = N_FK_GROUPS;
     let n_parents = (s.customers / 2).max(4);
-    let groups: Vec<String> = (1..=n_groups).map(|id| format!("({id}, 'group {id}')")).collect();
+    let groups: Vec<String> = (1..=n_groups)
+        .map(|id| format!("({id}, 'group {id}')"))
+        .collect();
     chunked_insert(&mut out, "INSERT INTO fk_groups (id, name)", groups);
     let parents: Vec<String> = (1..=n_parents)
         .map(|id| {
@@ -682,7 +788,11 @@ pub fn seed_statements(seed: u64, s: Sizes) -> (Vec<String>, Ids) {
             format!("({id}, {gid}, 'parent {id}')")
         })
         .collect();
-    chunked_insert(&mut out, "INSERT INTO fk_parents (id, group_id, label)", parents);
+    chunked_insert(
+        &mut out,
+        "INSERT INTO fk_parents (id, group_id, label)",
+        parents,
+    );
     let mut fk_seq = 1i64;
     let mut children = Vec::new();
     for pid in 1..=n_parents {
@@ -692,7 +802,11 @@ pub fn seed_statements(seed: u64, s: Sizes) -> (Vec<String>, Ids) {
         }
     }
     if !children.is_empty() {
-        chunked_insert(&mut out, "INSERT INTO fk_children (parent_id, seq, qty)", children);
+        chunked_insert(
+            &mut out,
+            "INSERT INTO fk_children (parent_id, seq, qty)",
+            children,
+        );
     }
     let n_notes = n_parents;
     let notes: Vec<String> = (1..=n_notes)
@@ -701,7 +815,11 @@ pub fn seed_statements(seed: u64, s: Sizes) -> (Vec<String>, Ids) {
             format!("({id}, {pid}, 'note {id}')")
         })
         .collect();
-    chunked_insert(&mut out, "INSERT INTO fk_notes (id, parent_id, body)", notes);
+    chunked_insert(
+        &mut out,
+        "INSERT INTO fk_notes (id, parent_id, body)",
+        notes,
+    );
     let mut addr_seq = 1i64;
     let mut addrs = Vec::new();
     for cid in 1..=s.customers {
@@ -711,11 +829,16 @@ pub fn seed_statements(seed: u64, s: Sizes) -> (Vec<String>, Ids) {
         }
     }
     if !addrs.is_empty() {
-        chunked_insert(&mut out, "INSERT INTO customer_addresses (customer_id, seq, city)", addrs);
+        chunked_insert(
+            &mut out,
+            "INSERT INTO customer_addresses (customer_id, seq, city)",
+            addrs,
+        );
     }
 
     let ids = Ids {
         regions: s.regions,
+        seed_orders: s.orders,
         customer: AtomicI64::new(s.customers + 1),
         product: AtomicI64::new(s.products + 1),
         order: AtomicI64::new(s.orders + 1),
@@ -753,7 +876,12 @@ pub struct Workload {
 
 impl Workload {
     pub fn new(seed: u64, ids: Arc<Ids>) -> Workload {
-        Workload { g: Gen::new(seed), ids, stats: BTreeMap::new(), p_rollback: 0.07 }
+        Workload {
+            g: Gen::new(seed),
+            ids,
+            stats: BTreeMap::new(),
+            p_rollback: 0.07,
+        }
     }
 
     fn order(&mut self) -> i64 {
@@ -784,7 +912,11 @@ impl Workload {
         let line = Ids::fresh(&self.ids.line);
         let disc = opt!(self.g, 0.6, self.g.decimal(0, 5000));
         let p = self.product();
-        format!("({order}, {line}, {p}, {}, {}, {disc})", self.g.range(1, 6), self.g.decimal(50, 50_000))
+        format!(
+            "({order}, {line}, {p}, {}, {}, {disc})",
+            self.g.range(1, 6),
+            self.g.decimal(50, 50_000)
+        )
     }
 
     fn payment_row(&mut self, order: String) -> String {
@@ -816,7 +948,11 @@ impl Workload {
         if rollback {
             *self.stats.entry("(rollback)").or_default() += 1;
         }
-        vec![Txn { label: labels.join("+"), stmts, rollback }]
+        vec![Txn {
+            label: labels.join("+"),
+            stmts,
+            rollback,
+        }]
     }
 
     /// The same order id written ~30× across orders / order_items / payments, as one big
@@ -827,14 +963,23 @@ impl Workload {
         let mut stmts = Vec::new();
         for k in 0..30 {
             let s = match k % 6 {
-                0 => format!("UPDATE orders SET status = {} WHERE id = {id}", q(self.g.pick(ORDER_STATUS))),
-                1 => format!("UPDATE order_items SET qty = qty + {} WHERE order_id = {id}", self.g.range(-1, 2)),
+                0 => format!(
+                    "UPDATE orders SET status = {} WHERE id = {id}",
+                    q(self.g.pick(ORDER_STATUS))
+                ),
+                1 => format!(
+                    "UPDATE order_items SET qty = qty + {} WHERE order_id = {id}",
+                    self.g.range(-1, 2)
+                ),
                 2 => format!("UPDATE payments SET amount = amount + 1.25 WHERE order_id = {id}"),
                 3 => {
                     let row = self.item_row(id);
                     format!("INSERT INTO order_items (order_id, line_no, product_id, qty, price, discount) VALUES {row}")
                 }
-                4 => format!("UPDATE orders SET customer_id = {} WHERE id = {id}", self.customer_opt()),
+                4 => format!(
+                    "UPDATE orders SET customer_id = {} WHERE id = {id}",
+                    self.customer_opt()
+                ),
                 _ => {
                     let row = self.payment_row(id.to_string());
                     format!("INSERT INTO payments (id, order_id, method, amount, status, paid_at) VALUES {row}")
@@ -845,7 +990,11 @@ impl Workload {
         let per = *self.g.pick(&[30usize, 10, 1]);
         stmts
             .chunks(per)
-            .map(|c| Txn { label: format!("hammer({id})"), stmts: c.to_vec(), rollback: false })
+            .map(|c| Txn {
+                label: format!("hammer({id})"),
+                stmts: c.to_vec(),
+                rollback: false,
+            })
             .collect()
     }
 
@@ -898,17 +1047,33 @@ impl Workload {
             }
             23..=24 => {
                 let o = self.order();
-                ("item_delete", vec![format!("DELETE FROM order_items WHERE order_id = {o} ORDER BY line_no LIMIT 1")])
+                (
+                    "item_delete",
+                    vec![format!(
+                        "DELETE FROM order_items WHERE order_id = {o} ORDER BY line_no LIMIT 1"
+                    )],
+                )
             }
             25..=31 => {
                 let o = self.order();
                 let st = q(self.g.pick(ORDER_STATUS));
                 let shipped = opt!(self.g, 0.5, self.g.ts6());
-                ("order_status", vec![format!("UPDATE orders SET status = {st}, shipped_at = {shipped} WHERE id = {o}")])
+                (
+                    "order_status",
+                    vec![format!(
+                        "UPDATE orders SET status = {st}, shipped_at = {shipped} WHERE id = {o}"
+                    )],
+                )
             }
             32..=34 => {
                 let o = self.order();
-                ("order_customer", vec![format!("UPDATE orders SET customer_id = {} WHERE id = {o}", self.customer_opt())])
+                (
+                    "order_customer",
+                    vec![format!(
+                        "UPDATE orders SET customer_id = {} WHERE id = {o}",
+                        self.customer_opt()
+                    )],
+                )
             }
             35..=36 => {
                 // PK update of a parent; sometimes children follow
@@ -916,8 +1081,12 @@ impl Workload {
                 let n = Ids::fresh(&self.ids.order);
                 let mut v = vec![format!("UPDATE orders SET id = {n} WHERE id = {o}")];
                 if self.g.chance(0.5) {
-                    v.push(format!("UPDATE order_items SET order_id = {n} WHERE order_id = {o}"));
-                    v.push(format!("UPDATE payments SET order_id = {n} WHERE order_id = {o}"));
+                    v.push(format!(
+                        "UPDATE order_items SET order_id = {n} WHERE order_id = {o}"
+                    ));
+                    v.push(format!(
+                        "UPDATE payments SET order_id = {n} WHERE order_id = {o}"
+                    ));
                 }
                 ("order_pk", v)
             }
@@ -950,18 +1119,27 @@ impl Workload {
             }
             48 => {
                 let c = self.customer();
-                ("customer_delete", vec![format!("DELETE FROM customers WHERE id = {c}")])
+                (
+                    "customer_delete",
+                    vec![format!("DELETE FROM customers WHERE id = {c}")],
+                )
             }
             49 => {
                 let c = self.customer();
                 let n = Ids::fresh(&self.ids.customer);
-                ("customer_pk", vec![format!("UPDATE customers SET id = {n} WHERE id = {c}")])
+                (
+                    "customer_pk",
+                    vec![format!("UPDATE customers SET id = {n} WHERE id = {c}")],
+                )
             }
             50..=54 => ("unreferenced", vec![self.unreferenced()]),
             55..=58 => {
                 let p = self.product();
                 let s = match self.g.range(0, 3) {
-                    0 => format!("UPDATE products SET price = {} WHERE id = {p}", self.g.decimal(50, 99_999)),
+                    0 => format!(
+                        "UPDATE products SET price = {} WHERE id = {p}",
+                        self.g.decimal(50, 99_999)
+                    ),
                     1 => {
                         let cat = match self.g.pick(CATEGORIES) {
                             Some(c) => q(c),
@@ -970,12 +1148,20 @@ impl Workload {
                         format!("UPDATE products SET category = {cat} WHERE id = {p}")
                     }
                     2 => format!("UPDATE products SET active = 1 - active WHERE id = {p}"),
-                    _ => format!("UPDATE products SET name = {}, stock = {} WHERE id = {p}", self.g.name(), self.g.range(0, 500)),
+                    _ => format!(
+                        "UPDATE products SET name = {}, stock = {} WHERE id = {p}",
+                        self.g.name(),
+                        self.g.range(0, 500)
+                    ),
                 };
                 ("product_update", vec![s])
             }
             59..=60 => {
-                let p = if self.g.chance(0.2) { Ids::fresh(&self.ids.product) } else { self.product() };
+                let p = if self.g.chance(0.2) {
+                    Ids::fresh(&self.ids.product)
+                } else {
+                    self.product()
+                };
                 let cat = match self.g.pick(CATEGORIES) {
                     Some(c) => q(c),
                     None => "NULL".into(),
@@ -999,16 +1185,32 @@ impl Workload {
             65..=67 => {
                 let p = self.payment();
                 let s = match self.g.range(0, 3) {
-                    0 => format!("UPDATE payments SET amount = {} WHERE id = {p}", self.g.decimal(100, 90_000)),
-                    1 => format!("UPDATE payments SET method = {}, status = {} WHERE id = {p}", q(self.g.pick(METHODS)), q(self.g.pick(PAY_STATUS))),
-                    2 => format!("UPDATE payments SET paid_at = {} WHERE id = {p}", opt!(self.g, 0.4, self.g.ts6())),
-                    _ => format!("UPDATE payments SET order_id = {} WHERE id = {p}", self.order()),
+                    0 => format!(
+                        "UPDATE payments SET amount = {} WHERE id = {p}",
+                        self.g.decimal(100, 90_000)
+                    ),
+                    1 => format!(
+                        "UPDATE payments SET method = {}, status = {} WHERE id = {p}",
+                        q(self.g.pick(METHODS)),
+                        q(self.g.pick(PAY_STATUS))
+                    ),
+                    2 => format!(
+                        "UPDATE payments SET paid_at = {} WHERE id = {p}",
+                        opt!(self.g, 0.4, self.g.ts6())
+                    ),
+                    _ => format!(
+                        "UPDATE payments SET order_id = {} WHERE id = {p}",
+                        self.order()
+                    ),
                 };
                 ("payment_update", vec![s])
             }
             68..=69 => {
                 let p = self.payment();
-                ("payment_delete", vec![format!("DELETE FROM payments WHERE id = {p}")])
+                (
+                    "payment_delete",
+                    vec![format!("DELETE FROM payments WHERE id = {p}")],
+                )
             }
             70..=74 => ("events", self.events()),
             75..=79 => ("inventory", self.inventory()),
@@ -1047,8 +1249,9 @@ impl Workload {
             }
             87..=91 => ("bulk", self.bulk()),
             92..=95 => {
-                // re-insert previously deleted parents with ON DUPLICATE KEY UPDATE (NULL <-> matched)
-                let o = self.order();
+                // re-insert previously deleted parents with ON DUPLICATE KEY UPDATE (NULL <-> matched);
+                // only seed ids: fresh ids belong to the allocator (concurrent writers)
+                let o = self.g.range(1, self.ids.seed_orders);
                 let s = format!(
                     "INSERT INTO orders (id, customer_id, status, created_at) VALUES ({o}, {}, 'new', {})
                      ON DUPLICATE KEY UPDATE status = VALUES(status)",
@@ -1073,9 +1276,9 @@ impl Workload {
 
     /// Operations on the FK-cascading tables (deletes / PK updates of parents cascade silently).
     fn fk_op(&mut self, k: i64) -> Vec<String> {
-        // Group ids are re-created by id, so stay within the allocated range (fresh ids are
-        // handed out by the counter only).
+        // Any allocated group id for deletes / updates; only seeded ids are re-created by id.
         let gid = self.g.range(1, Ids::max(&self.ids.fk_group));
+        let seed_gid = self.g.range(1, N_FK_GROUPS);
         let parents_hi = Ids::max(&self.ids.fk_parent) + 1;
         let pid = self.g.range(1, parents_hi);
         let pid2 = self.g.range(1, parents_hi);
@@ -1093,7 +1296,7 @@ impl Workload {
             5 => {
                 let n = Ids::fresh(&self.ids.fk_parent);
                 let mut v = vec![
-                    format!("INSERT IGNORE INTO fk_groups (id, name) VALUES ({gid}, 'group {gid}')"),
+                    format!("INSERT IGNORE INTO fk_groups (id, name) VALUES ({seed_gid}, 'group {seed_gid}')"),
                     format!("INSERT INTO fk_parents (id, group_id, label) SELECT {n}, id, 'parent {n}' FROM fk_groups WHERE id = {gid}"),
                 ];
                 if self.g.chance(0.3) {
@@ -1143,9 +1346,9 @@ impl Workload {
                 let n = Ids::fresh(&self.ids.fk_parent);
                 let seq = Ids::fresh(&self.ids.fk_seq);
                 vec![
-                    format!("DELETE FROM fk_groups WHERE id = {gid}"),
-                    format!("INSERT INTO fk_groups (id, name) VALUES ({gid}, 'reborn {gid}')"),
-                    format!("INSERT INTO fk_parents (id, group_id, label) VALUES ({n}, {gid}, 'new {n}')"),
+                    format!("DELETE FROM fk_groups WHERE id = {seed_gid}"),
+                    format!("INSERT INTO fk_groups (id, name) VALUES ({seed_gid}, 'reborn {seed_gid}')"),
+                    format!("INSERT INTO fk_parents (id, group_id, label) VALUES ({n}, {seed_gid}, 'new {n}')"),
                     format!("INSERT INTO fk_children (parent_id, seq, qty) VALUES ({n}, {seq}, 1)"),
                 ]
             }
@@ -1171,7 +1374,9 @@ impl Workload {
         }
         if self.g.chance(0.6) {
             let row = self.payment_row(id.to_string());
-            v.push(format!("INSERT INTO payments (id, order_id, method, amount, status, paid_at) VALUES {row}"));
+            v.push(format!(
+                "INSERT INTO payments (id, order_id, method, amount, status, paid_at) VALUES {row}"
+            ));
         }
         v
     }
@@ -1200,17 +1405,32 @@ impl Workload {
         match self.g.range(0, 3) {
             0 => {
                 let c = self.customer();
-                format!("UPDATE customers SET last_seen_at = {} WHERE id BETWEEN {c} AND {}", self.g.dt6(), c + 5)
+                format!(
+                    "UPDATE customers SET last_seen_at = {} WHERE id BETWEEN {c} AND {}",
+                    self.g.dt6(),
+                    c + 5
+                )
             }
             1 => {
                 let o = self.order();
-                format!("UPDATE orders SET note = {} WHERE id BETWEEN {o} AND {}", q(&format!("note {}", self.g.range(0, 1_000_000))), o + 5)
+                format!(
+                    "UPDATE orders SET note = {} WHERE id BETWEEN {o} AND {}",
+                    q(&format!("note {}", self.g.range(0, 1_000_000))),
+                    o + 5
+                )
             }
             2 => {
                 let p = self.product();
-                format!("UPDATE products SET updated_at = {} WHERE id = {p}", self.g.ts6())
+                format!(
+                    "UPDATE products SET updated_at = {} WHERE id = {p}",
+                    self.g.ts6()
+                )
             }
-            _ => format!("UPDATE regions SET notes = {} WHERE id = {}", q(&format!("n{}", self.g.range(0, 9999))), self.region()),
+            _ => format!(
+                "UPDATE regions SET notes = {} WHERE id = {}",
+                q(&format!("n{}", self.g.range(0, 9999))),
+                self.region()
+            ),
         }
     }
 
@@ -1261,7 +1481,10 @@ impl Workload {
     fn region_op(&mut self) -> Vec<String> {
         let r = self.region();
         match self.g.range(0, 2) {
-            0 => vec![format!("UPDATE regions SET name = {} WHERE id = {r}", opt!(self.g, 0.2, q(self.g.pick(REGION_NAMES))))],
+            0 => vec![format!(
+                "UPDATE regions SET name = {} WHERE id = {r}",
+                opt!(self.g, 0.2, q(self.g.pick(REGION_NAMES)))
+            )],
             1 => vec![format!("DELETE FROM regions WHERE id = {r}")],
             _ => vec![format!(
                 "REPLACE INTO regions (id, name, country, tax_rate) VALUES ({r}, {}, 'DE', {})",
@@ -1274,9 +1497,18 @@ impl Workload {
     fn bulk(&mut self) -> Vec<String> {
         let o = self.order();
         match self.g.range(0, 4) {
-            0 => vec![format!("UPDATE order_items SET price = price + 0.01 WHERE order_id BETWEEN {o} AND {}", o + 15)],
-            1 => vec![format!("UPDATE orders SET status = 'paid' WHERE id BETWEEN {o} AND {} AND status = 'new'", o + 10)],
-            2 => vec![format!("DELETE FROM payments WHERE order_id BETWEEN {o} AND {} AND status = 'failed'", o + 8)],
+            0 => vec![format!(
+                "UPDATE order_items SET price = price + 0.01 WHERE order_id BETWEEN {o} AND {}",
+                o + 15
+            )],
+            1 => vec![format!(
+                "UPDATE orders SET status = 'paid' WHERE id BETWEEN {o} AND {} AND status = 'new'",
+                o + 10
+            )],
+            2 => vec![format!(
+                "DELETE FROM payments WHERE order_id BETWEEN {o} AND {} AND status = 'failed'",
+                o + 8
+            )],
             3 => {
                 // big order: one parent + many lines in one statement
                 let id = Ids::fresh(&self.ids.order);
@@ -1287,12 +1519,19 @@ impl Workload {
                     format!("INSERT INTO order_items (order_id, line_no, product_id, qty, price, discount) VALUES {}", rows.join(", ")),
                 ]
             }
-            _ => vec![format!("UPDATE customers SET credit = COALESCE(credit, 0) - 1 WHERE region_id = {}", self.region())],
+            _ => vec![format!(
+                "UPDATE customers SET credit = COALESCE(credit, 0) - 1 WHERE region_id = {}",
+                self.region()
+            )],
         }
     }
 
     pub fn stats_line(&self) -> String {
-        self.stats.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+        self.stats
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -1325,7 +1564,9 @@ pub async fn run_txn(conn: &mut Conn, t: &Txn) -> Result<()> {
                     tokio::time::sleep(Duration::from_millis(5 * attempt)).await;
                     continue;
                 }
-                return Err(e).with_context(|| format!("transaction '{}' failed (attempt {attempt})", t.label));
+                return Err(e).with_context(|| {
+                    format!("transaction '{}' failed (attempt {attempt})", t.label)
+                });
             }
         }
     }
@@ -1345,7 +1586,13 @@ pub async fn run_batches(conn: &mut Conn, wl: &mut Workload, n: usize) -> Result
 
 /// Runs `writers` concurrent writer tasks (each with its own connection and derived seed),
 /// `batches_each` batches per writer. Returns total transactions.
-pub async fn run_concurrent(db: &Db, ids: Arc<Ids>, seed: u64, writers: usize, batches_each: usize) -> Result<usize> {
+pub async fn run_concurrent(
+    db: &Db,
+    ids: Arc<Ids>,
+    seed: u64,
+    writers: usize,
+    batches_each: usize,
+) -> Result<usize> {
     let mut handles = Vec::new();
     for w in 0..writers {
         let db = db.clone();
@@ -1353,7 +1600,9 @@ pub async fn run_concurrent(db: &Db, ids: Arc<Ids>, seed: u64, writers: usize, b
         handles.push(tokio::spawn(async move {
             let mut c = db.conn().await?;
             let mut wl = Workload::new(super::derive_seed(seed, &format!("writer{w}")), ids);
-            let n = run_batches(&mut c, &mut wl, batches_each).await.with_context(|| format!("writer {w}"))?;
+            let n = run_batches(&mut c, &mut wl, batches_each)
+                .await
+                .with_context(|| format!("writer {w}"))?;
             c.disconnect().await.ok();
             Ok::<usize, anyhow::Error>(n)
         }));
@@ -1386,7 +1635,9 @@ pub async fn run_until_stopped(
             let mut wl = Workload::new(super::derive_seed(seed, &format!("bg{w}")), ids);
             let mut n = 0;
             while !*stop.borrow() {
-                n += run_batches(&mut c, &mut wl, 1).await.with_context(|| format!("background writer {w}"))?;
+                n += run_batches(&mut c, &mut wl, 1)
+                    .await
+                    .with_context(|| format!("background writer {w}"))?;
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             c.disconnect().await.ok();
@@ -1402,4 +1653,3 @@ pub async fn run_until_stopped(
     }
     Ok(total)
 }
-

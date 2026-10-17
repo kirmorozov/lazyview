@@ -54,9 +54,12 @@ impl ViewSpec {
     pub fn noisy(mut self, head: &str, columns: Option<&str>, tail: &str) -> ViewSpec {
         self.columns = columns.map(str::to_string);
         let cols = columns.map(|c| format!(" ({c})")).unwrap_or_default();
-        self.definition = format!("CREATE {head} VIEW `{}`{cols} AS {} {tail}", self.name, self.select)
-            .trim()
-            .to_string();
+        self.definition = format!(
+            "CREATE {head} VIEW `{}`{cols} AS {} {tail}",
+            self.name, self.select
+        )
+        .trim()
+        .to_string();
         self
     }
 
@@ -87,8 +90,16 @@ impl ViewSpec {
     }
 
     pub fn oracle_ddl(&self) -> String {
-        let cols = self.columns.as_ref().map(|c| format!(" ({c})")).unwrap_or_default();
-        format!("CREATE OR REPLACE VIEW {}{cols} AS {}", ident(&self.oracle_name()), self.select)
+        let cols = self
+            .columns
+            .as_ref()
+            .map(|c| format!(" ({c})"))
+            .unwrap_or_default();
+        format!(
+            "CREATE OR REPLACE VIEW {}{cols} AS {}",
+            ident(&self.oracle_name()),
+            self.select
+        )
     }
 }
 
@@ -104,8 +115,15 @@ pub struct Table {
 }
 
 pub async fn fetch(conn: &mut Conn, sql: &str) -> Result<Table> {
-    let mut res = conn.query_iter(sql).await.with_context(|| format!("SQL failed: {sql}"))?;
-    let columns: Vec<String> = res.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
+    let mut res = conn
+        .query_iter(sql)
+        .await
+        .with_context(|| format!("SQL failed: {sql}"))?;
+    let columns: Vec<String> = res
+        .columns_ref()
+        .iter()
+        .map(|c| c.name_str().to_string())
+        .collect();
     let raw: Vec<Row> = res.collect().await?;
     drop(res);
     let rows = raw
@@ -128,21 +146,31 @@ pub fn fmt_cell(c: &Option<Vec<u8>>) -> String {
     match c {
         None => "NULL".into(),
         Some(b) => match std::str::from_utf8(b) {
-            Ok(s) => format!("'{}'", s.replace('\n', "\\n")),
-            Err(_) => format!("0x{}", hex::encode(b)),
+            // Control characters (binary-ish values that happen to be valid UTF-8) are shown as hex.
+            Ok(s) if !s.chars().any(|c| c.is_control() && c != '\n') => {
+                format!("'{}'", s.replace('\n', "\\n"))
+            }
+            _ => format!("0x{}", hex::encode(b)),
         },
     }
 }
 
 pub fn fmt_row(r: &[Option<Vec<u8>>]) -> String {
-    format!("({})", r.iter().map(fmt_cell).collect::<Vec<_>>().join(", "))
+    format!(
+        "({})",
+        r.iter().map(fmt_cell).collect::<Vec<_>>().join(", ")
+    )
 }
 
 /// Compares two result sets as multisets; `None` if equal, else a readable diff.
 pub fn diff_tables(expected: &Table, actual: &Table, max_rows: usize) -> Option<String> {
     let mut out = String::new();
     if expected.columns != actual.columns {
-        let _ = writeln!(out, "  column mismatch: oracle {:?} vs MV {:?}", expected.columns, actual.columns);
+        let _ = writeln!(
+            out,
+            "  column mismatch: oracle {:?} vs MV {:?}",
+            expected.columns, actual.columns
+        );
         if expected.columns.len() != actual.columns.len() {
             return Some(out);
         }
@@ -191,11 +219,18 @@ pub fn diff_tables(expected: &Table, actual: &Table, max_rows: usize) -> Option<
             let _ = writeln!(out, "  … more differences omitted");
             break;
         }
-        let mult = if *c > 1 { format!(" ×{c}") } else { String::new() };
-        let partner = r.first().and_then(|k| extra_by_key.get_mut(k)).and_then(|v| {
-            let pos = v.iter().position(|i| !paired_extra[*i])?;
-            Some(v.remove(pos))
-        });
+        let mult = if *c > 1 {
+            format!(" ×{c}")
+        } else {
+            String::new()
+        };
+        let partner = r
+            .first()
+            .and_then(|k| extra_by_key.get_mut(k))
+            .and_then(|v| {
+                let pos = v.iter().position(|i| !paired_extra[*i])?;
+                Some(v.remove(pos))
+            });
         match partner {
             Some(i) => {
                 paired_extra[i] = true;
@@ -216,7 +251,11 @@ pub fn diff_tables(expected: &Table, actual: &Table, max_rows: usize) -> Option<
             let _ = writeln!(out, "  … more differences omitted");
             break;
         }
-        let mult = if *c > 1 { format!(" ×{c}") } else { String::new() };
+        let mult = if *c > 1 {
+            format!(" ×{c}")
+        } else {
+            String::new()
+        };
         let _ = writeln!(out, "  + extra    {}{mult}", fmt_row(r));
         shown += 1;
     }
@@ -225,24 +264,65 @@ pub fn diff_tables(expected: &Table, actual: &Table, max_rows: usize) -> Option<
 
 /// Creates/refreshes the oracle view of `spec` on the source connection.
 pub async fn install_oracle(src: &mut Conn, spec: &ViewSpec) -> Result<()> {
-    exec(src, &spec.oracle_ddl()).await.with_context(|| format!("creating oracle view for {}", spec.name))
+    exec(src, &spec.oracle_ddl())
+        .await
+        .with_context(|| format!("creating oracle view for {}", spec.name))
 }
 
-/// Compares one view: oracle (on `src`) vs MV table (on `mv`, or on `src` when `None`, then both
-/// reads happen inside one consistent snapshot).
-pub async fn compare_view(src: &mut Conn, mv: Option<&mut Conn>, spec: &ViewSpec) -> Result<Option<String>> {
+fn installed() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Creates the oracle view once per (schema, definition): repeated DDL is slow and every DDL is
+/// also binlog traffic the engine has to look at.
+async fn ensure_oracle(src: &mut Conn, schema: &str, spec: &ViewSpec, force: bool) -> Result<()> {
+    let key = format!("{schema}\0{}", spec.oracle_ddl());
+    if !force && installed().lock().unwrap().contains(&key) {
+        return Ok(());
+    }
     install_oracle(src, spec).await?;
-    let oracle_sql = format!("SELECT * FROM {}", ident(&spec.oracle_name()));
+    installed().lock().unwrap().insert(key);
+    Ok(())
+}
+
+/// Reads the oracle view, re-creating it once if the read fails (e.g. invalidated by DDL).
+async fn fetch_oracle(src: &mut Conn, schema: &str, spec: &ViewSpec) -> Result<Table> {
+    let sql = format!("SELECT * FROM {}", ident(&spec.oracle_name()));
+    match fetch(src, &sql).await {
+        Ok(t) => Ok(t),
+        Err(_) => {
+            ensure_oracle(src, schema, spec, true).await?;
+            fetch(src, &sql).await
+        }
+    }
+}
+
+/// Compares one view: oracle (on `src`, schema `schema`) vs MV table (on `mv`, or on `src` when
+/// `None`, then both reads happen inside one consistent snapshot).
+pub async fn compare_view(
+    src: &mut Conn,
+    schema: &str,
+    mv: Option<&mut Conn>,
+    spec: &ViewSpec,
+) -> Result<Option<String>> {
+    ensure_oracle(src, schema, spec, false).await?;
     let mv_sql = format!("SELECT * FROM {}", ident(&spec.name));
     let (expected, actual) = match mv {
         None => {
             match table_type(src, &spec.name).await? {
                 Some(t) if t == "BASE TABLE" => {}
-                Some(t) => return Ok(Some(format!("  MV `{}` is a {t}, expected a BASE TABLE\n", spec.name))),
+                Some(t) => {
+                    return Ok(Some(format!(
+                        "  MV `{}` is a {t}, expected a BASE TABLE\n",
+                        spec.name
+                    )))
+                }
                 None => return Ok(Some(format!("  MV table `{}` does not exist\n", spec.name))),
             }
             exec(src, "START TRANSACTION WITH CONSISTENT SNAPSHOT").await?;
-            let e = fetch(src, &oracle_sql).await;
+            let e = fetch_oracle(src, schema, spec).await;
             let a = fetch(src, &mv_sql).await;
             exec(src, "COMMIT").await?;
             (e?, a?)
@@ -250,10 +330,20 @@ pub async fn compare_view(src: &mut Conn, mv: Option<&mut Conn>, spec: &ViewSpec
         Some(mvc) => {
             match table_type(mvc, &spec.name).await? {
                 Some(t) if t == "BASE TABLE" => {}
-                Some(t) => return Ok(Some(format!("  MV `{}` on target is a {t}, expected a BASE TABLE\n", spec.name))),
-                None => return Ok(Some(format!("  MV table `{}` does not exist on the target\n", spec.name))),
+                Some(t) => {
+                    return Ok(Some(format!(
+                        "  MV `{}` on target is a {t}, expected a BASE TABLE\n",
+                        spec.name
+                    )))
+                }
+                None => {
+                    return Ok(Some(format!(
+                        "  MV table `{}` does not exist on the target\n",
+                        spec.name
+                    )))
+                }
             }
-            let e = fetch(src, &oracle_sql).await?;
+            let e = fetch_oracle(src, schema, spec).await?;
             let a = fetch(mvc, &mv_sql).await?;
             (e, a)
         }
@@ -268,7 +358,11 @@ pub async fn check_views(src: &Db, specs: &[ViewSpec]) -> Result<()> {
 
 /// Compares every (view, target) pair. `targets` maps target names to their schemas; the
 /// `source` target is `src`. Collects all mismatches into one error.
-pub async fn check_views_targets(src: &Db, targets: &HashMap<String, Db>, specs: &[ViewSpec]) -> Result<()> {
+pub async fn check_views_targets(
+    src: &Db,
+    targets: &HashMap<String, Db>,
+    specs: &[ViewSpec],
+) -> Result<()> {
     let mut sc = src.conn().await?;
     let mut tconns: HashMap<String, Conn> = HashMap::new();
     let mut failures = String::new();
@@ -276,18 +370,22 @@ pub async fn check_views_targets(src: &Db, targets: &HashMap<String, Db>, specs:
     for spec in specs {
         for t in spec.target_names() {
             let res = if t == "source" {
-                compare_view(&mut sc, None, spec).await?
+                compare_view(&mut sc, &src.name, None, spec).await?
             } else if let Some(db) = targets.get(&t) {
                 if !tconns.contains_key(&t) {
                     tconns.insert(t.clone(), db.conn().await?);
                 }
-                compare_view(&mut sc, tconns.get_mut(&t), spec).await?
+                compare_view(&mut sc, &src.name, tconns.get_mut(&t), spec).await?
             } else {
                 continue;
             };
             if let Some(d) = res {
                 n_bad += 1;
-                let where_ = if t == "source" { String::new() } else { format!(" on target {t}") };
+                let where_ = if t == "source" {
+                    String::new()
+                } else {
+                    format!(" on target {t}")
+                };
                 let _ = write!(
                     failures,
                     "\nview `{}`{where_} ({:?}) differs from oracle:\n  definition: {}\n{d}",
@@ -301,7 +399,10 @@ pub async fn check_views_targets(src: &Db, targets: &HashMap<String, Db>, specs:
     }
     sc.disconnect().await.ok();
     if n_bad > 0 {
-        bail!("{n_bad} view(s) differ from their oracle (schema {}):{failures}", src.name);
+        bail!(
+            "{n_bad} view(s) differ from their oracle (schema {}):{failures}",
+            src.name
+        );
     }
     Ok(())
 }
@@ -363,7 +464,11 @@ pub async fn table_ddl_like(conn: &mut Conn, source: &str, new_name: &str) -> Re
             format!("{} {ty}{cs} NULL DEFAULT NULL", ident(&name))
         })
         .collect();
-    Ok(format!("CREATE TABLE {} ({})", ident(new_name), defs.join(", ")))
+    Ok(format!(
+        "CREATE TABLE {} ({})",
+        ident(new_name),
+        defs.join(", ")
+    ))
 }
 
 /// Materializes every spec by hand from its oracle (in order, so chained views find their
@@ -380,7 +485,11 @@ pub async fn hand_materialize(db: &Db, specs: &[ViewSpec], fresh: bool) -> Resul
         }
         // Copied through the client: MySQL 8 rejects some INSERT … SELECT MAX(timestamp) … GROUP BY
         // with a bogus "Incorrect datetime value '0000-00-00'" error.
-        let t = fetch(&mut c, &format!("SELECT * FROM {}", ident(&s.oracle_name()))).await?;
+        let t = fetch(
+            &mut c,
+            &format!("SELECT * FROM {}", ident(&s.oracle_name())),
+        )
+        .await?;
         insert_rows(&mut c, &s.name, &t).await?;
     }
     c.disconnect().await.ok();
@@ -403,10 +512,18 @@ pub async fn insert_rows(conn: &mut Conn, table: &str, t: &Table) -> Result<()> 
     for chunk in t.rows.chunks(200) {
         let vals: Vec<String> = chunk
             .iter()
-            .map(|r| format!("({})", r.iter().map(cell_literal).collect::<Vec<_>>().join(", ")))
+            .map(|r| {
+                format!(
+                    "({})",
+                    r.iter().map(cell_literal).collect::<Vec<_>>().join(", ")
+                )
+            })
             .collect();
-        exec(conn, &format!("INSERT INTO {} VALUES {}", ident(table), vals.join(", "))).await?;
+        exec(
+            conn,
+            &format!("INSERT INTO {} VALUES {}", ident(table), vals.join(", ")),
+        )
+        .await?;
     }
     Ok(())
 }
-

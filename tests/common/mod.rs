@@ -58,12 +58,20 @@ impl Server {
 pub fn servers() -> Option<Vec<Server>> {
     let raw = std::env::var("LAZYVIEW_TEST_DSNS").ok()?;
     let mut out = Vec::new();
-    for (i, part) in raw.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+    for (i, part) in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
         let (flavor, dsn) = match part.split_once('=') {
             Some((n, d)) if !n.contains("://") => (n.trim().to_string(), d.trim().to_string()),
             _ => (format!("srv{i}"), part.to_string()),
         };
-        out.push(Server { flavor, base_dsn: dsn });
+        out.push(Server {
+            flavor,
+            base_dsn: dsn,
+        });
     }
     if out.is_empty() {
         None
@@ -93,6 +101,36 @@ pub fn base_seed() -> u64 {
         Ok(v) => v.trim().parse().expect("LAZYVIEW_TEST_SEED must be a u64"),
         Err(_) => rand::rng().random::<u64>() % 1_000_000_000_000,
     })
+}
+
+/// Applies the diagnostic view filters: `LAZYVIEW_TEST_SKIP_VIEWS` (comma separated names to
+/// drop, e.g. to look past a known engine bug in one view) and `LAZYVIEW_TEST_ONLY_VIEWS` (keep
+/// only these, for minimal reproductions). Prints what was filtered.
+pub fn skip_views(specs: Vec<ViewSpec>) -> Vec<ViewSpec> {
+    let list = |var: &str| -> Option<Vec<String>> {
+        std::env::var(var).ok().map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+    };
+    let skip = list("LAZYVIEW_TEST_SKIP_VIEWS").unwrap_or_default();
+    let only = list("LAZYVIEW_TEST_ONLY_VIEWS");
+    let (kept, gone): (Vec<ViewSpec>, Vec<ViewSpec>) = specs.into_iter().partition(|s| {
+        !skip.contains(&s.name) && only.as_ref().is_none_or(|o| o.contains(&s.name))
+    });
+    if !gone.is_empty() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            println!(
+                "NOTE: LAZYVIEW_TEST_SKIP_VIEWS / LAZYVIEW_TEST_ONLY_VIEWS filter out views {:?}",
+                gone.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+            )
+        });
+    }
+    kept
 }
 
 /// Deterministic seed derivation (splitmix64 over the base seed and a label).
@@ -169,7 +207,9 @@ pub fn redact(dsn: &str) -> String {
 
 /// Executes one (or several `;`-free) statement(s), discarding results.
 pub async fn exec(conn: &mut Conn, sql: &str) -> Result<()> {
-    conn.query_drop(sql).await.with_context(|| format!("SQL failed: {}", clip(sql, 600)))
+    conn.query_drop(sql)
+        .await
+        .with_context(|| format!("SQL failed: {}", clip(sql, 600)))
 }
 
 /// Executes statements in order.
@@ -182,7 +222,10 @@ pub async fn exec_all(conn: &mut Conn, stmts: &[String]) -> Result<()> {
 
 /// Rows as text (NULL → None); binary values are hex-escaped.
 pub async fn rows(conn: &mut Conn, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
-    let rows: Vec<Row> = conn.query(sql).await.with_context(|| format!("SQL failed: {}", clip(sql, 600)))?;
+    let rows: Vec<Row> = conn
+        .query(sql)
+        .await
+        .with_context(|| format!("SQL failed: {}", clip(sql, 600)))?;
     Ok(rows
         .into_iter()
         .map(|r| r.unwrap().into_iter().map(|v| value_text(&v)).collect())
@@ -191,12 +234,19 @@ pub async fn rows(conn: &mut Conn, sql: &str) -> Result<Vec<Vec<Option<String>>>
 
 /// First column of the first row as text (`None` if no row or NULL).
 pub async fn scalar(conn: &mut Conn, sql: &str) -> Result<Option<String>> {
-    Ok(rows(conn, sql).await?.into_iter().next().and_then(|r| r.into_iter().next().flatten()))
+    Ok(rows(conn, sql)
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next().flatten()))
 }
 
 pub async fn scalar_i64(conn: &mut Conn, sql: &str) -> Result<i64> {
-    let v = scalar(conn, sql).await?.ok_or_else(|| anyhow!("no value for: {sql}"))?;
-    v.parse::<i64>().with_context(|| format!("not an integer: {v} (from {sql})"))
+    let v = scalar(conn, sql)
+        .await?
+        .ok_or_else(|| anyhow!("no value for: {sql}"))?;
+    v.parse::<i64>()
+        .with_context(|| format!("not an integer: {v} (from {sql})"))
 }
 
 pub fn value_text(v: &Value) -> Option<String> {
@@ -257,14 +307,22 @@ pub fn clip(s: &str, n: usize) -> String {
 
 /// Server's current binlog end (`SHOW BINARY LOG STATUS`, fallback `SHOW MASTER STATUS`).
 pub async fn server_position(conn: &mut Conn) -> Result<Position> {
-    let mut res: Result<Vec<Row>> = conn.query("SHOW BINARY LOG STATUS").await.map_err(Into::into);
+    let mut res: Result<Vec<Row>> = conn
+        .query("SHOW BINARY LOG STATUS")
+        .await
+        .map_err(Into::into);
     if res.is_err() {
         res = conn.query("SHOW MASTER STATUS").await.map_err(Into::into);
     }
     let rows = res.context("reading binlog position")?;
-    let row = rows.into_iter().next().ok_or_else(|| anyhow!("binary logging is disabled (no status row)"))?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("binary logging is disabled (no status row)"))?;
     let file: String = row.get("File").ok_or_else(|| anyhow!("no File column"))?;
-    let pos: u64 = row.get("Position").ok_or_else(|| anyhow!("no Position column"))?;
+    let pos: u64 = row
+        .get("Position")
+        .ok_or_else(|| anyhow!("no Position column"))?;
     Ok(Position { file, pos })
 }
 
@@ -318,7 +376,13 @@ impl Db {
 /// Lowercase alnum/underscore tag, max `n` chars.
 fn tag_clean(tag: &str, n: usize) -> String {
     tag.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .take(n)
         .collect()
 }
@@ -326,13 +390,29 @@ fn tag_clean(tag: &str, n: usize) -> String {
 async fn create_db(server: &Server, server_idx: usize, tag: &str) -> Result<Db> {
     let suffix: String = {
         let mut r = rand::rng();
-        (0..6).map(|_| (b'a' + r.random_range(0..26u8)) as char).collect()
+        (0..6)
+            .map(|_| (b'a' + r.random_range(0..26u8)) as char)
+            .collect()
     };
     let name = format!("lvt_{}_{}", tag_clean(tag, 40), suffix);
-    let mut c = connect(&server.base_dsn).await.with_context(|| format!("[{}] admin connection", server.flavor))?;
-    exec(&mut c, &format!("CREATE DATABASE {} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", ident(&name))).await?;
+    let mut c = connect(&server.base_dsn)
+        .await
+        .with_context(|| format!("[{}] admin connection", server.flavor))?;
+    exec(
+        &mut c,
+        &format!(
+            "CREATE DATABASE {} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            ident(&name)
+        ),
+    )
+    .await?;
     c.disconnect().await.ok();
-    Ok(Db { flavor: server.flavor.clone(), server_idx, dsn: dsn_with_db(&server.base_dsn, &name), name })
+    Ok(Db {
+        flavor: server.flavor.clone(),
+        server_idx,
+        dsn: dsn_with_db(&server.base_dsn, &name),
+        name,
+    })
 }
 
 async fn drop_db(server: &Server, name: &str) -> Result<()> {
@@ -369,12 +449,22 @@ impl Ctx {
     }
 
     pub fn label(&self) -> String {
-        self.servers.iter().map(|s| s.flavor.as_str()).collect::<Vec<_>>().join("→")
+        self.servers
+            .iter()
+            .map(|s| s.flavor.as_str())
+            .collect::<Vec<_>>()
+            .join("→")
     }
 
     /// Progress line `[test/flavor +1.2s] msg` (shown with --nocapture or on failure).
     pub fn log(&self, msg: impl AsRef<str>) {
-        println!("[{}/{} +{:.1}s] {}", self.test, self.label(), self.started.elapsed().as_secs_f64(), msg.as_ref());
+        println!(
+            "[{}/{} +{:.1}s] {}",
+            self.test,
+            self.label(),
+            self.started.elapsed().as_secs_f64(),
+            msg.as_ref()
+        );
     }
 
     pub fn note(&self, msg: impl Into<String>) {
@@ -419,7 +509,12 @@ impl Ctx {
         let log_path = dir.join(format!("engine-{n}.log"));
         let label = format!("{}#{n}", db.flavor);
         let shown: Vec<String> = overrides.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        self.log(format!("start engine {label} server_id={} {} log={}", cfg.server_id, shown.join(" "), log_path.display()));
+        self.log(format!(
+            "start engine {label} server_id={} {} log={}",
+            cfg.server_id,
+            shown.join(" "),
+            log_path.display()
+        ));
         Engine::spawn(cfg, label, log_path)
     }
 
@@ -460,12 +555,21 @@ where
         return;
     };
     if servers.len() < n_peers + 1 {
-        println!("SKIP {test}: needs {} servers in LAZYVIEW_TEST_DSNS, have {}", n_peers + 1, servers.len());
+        println!(
+            "SKIP {test}: needs {} servers in LAZYVIEW_TEST_DSNS, have {}",
+            n_peers + 1,
+            servers.len()
+        );
         return;
     }
     let n = servers.len();
-    let groups: Vec<Vec<Server>> =
-        (0..n).map(|i| (0..=n_peers).map(|k| servers[(i + k) % n].clone()).collect()).collect();
+    let groups: Vec<Vec<Server>> = (0..n)
+        .map(|i| {
+            (0..=n_peers)
+                .map(|k| servers[(i + k) % n].clone())
+                .collect()
+        })
+        .collect();
     run_groups(test, groups, f);
 }
 
@@ -511,7 +615,10 @@ where
             match h.await {
                 Ok(Ok(())) => {}
                 Ok(Err(msg)) => failures.push(msg),
-                Err(e) => failures.push(format!("[{label}] scenario task panicked: {}", join_panic_msg(e))),
+                Err(e) => failures.push(format!(
+                    "[{label}] scenario task panicked: {}",
+                    join_panic_msg(e)
+                )),
             }
         }
         failures
@@ -535,7 +642,11 @@ async fn finish_run(ctx: &Ctx, res: Result<()>) -> std::result::Result<(), Strin
             tokio::time::sleep(Duration::from_millis(100)).await;
             for db in &dbs {
                 if let Err(e) = drop_db(&ctx.servers[db.server_idx], &db.name).await {
-                    println!("[{}] warning: could not drop {}: {e:#}", ctx.label(), db.name);
+                    println!(
+                        "[{}] warning: could not drop {}: {e:#}",
+                        ctx.label(),
+                        db.name
+                    );
                 }
                 std::fs::remove_dir_all(logs_root().join(&db.name)).ok();
             }
@@ -543,7 +654,12 @@ async fn finish_run(ctx: &Ctx, res: Result<()>) -> std::result::Result<(), Strin
             Ok(())
         }
         Err(e) => {
-            let mut msg = format!("[{} on {}] FAILED after {:.1}s: {e:#}", ctx.test, ctx.label(), ctx.elapsed().as_secs_f64());
+            let mut msg = format!(
+                "[{} on {}] FAILED after {:.1}s: {e:#}",
+                ctx.test,
+                ctx.label(),
+                ctx.elapsed().as_secs_f64()
+            );
             let notes = ctx.notes.lock().unwrap().clone();
             if !notes.is_empty() {
                 let _ = write!(msg, "\n  notes: {}", notes.join("; "));
@@ -607,7 +723,10 @@ impl Engine {
         let (sd_tx, sd_rx) = watch::channel(false);
         let (kill_tx, kill_rx) = oneshot::channel::<()>();
         let (done_tx, done_rx) = oneshot::channel();
-        let file = Arc::new(std::fs::File::create(&log_path).with_context(|| format!("create {}", log_path.display()))?);
+        let file = Arc::new(
+            std::fs::File::create(&log_path)
+                .with_context(|| format!("create {}", log_path.display()))?,
+        );
         let filter = std::env::var("LAZYVIEW_TEST_LOG")
             .or_else(|_| std::env::var("RUST_LOG"))
             .unwrap_or_else(|_| "lazyview=debug,warn".into());
@@ -671,7 +790,9 @@ impl Engine {
             match self.done.try_recv() {
                 Ok(r) => self.exit = Some(r),
                 Err(oneshot::error::TryRecvError::Empty) => {}
-                Err(oneshot::error::TryRecvError::Closed) => self.exit = Some(Err("engine thread vanished".into())),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.exit = Some(Err("engine thread vanished".into()))
+                }
             }
         }
         self.exit.as_ref()
@@ -703,7 +824,11 @@ impl Engine {
                 return Ok(r.clone());
             }
             if Instant::now() > deadline {
-                bail!("engine {} did not exit within {timeout:?} — log {}", self.label, self.log_path.display());
+                bail!(
+                    "engine {} did not exit within {timeout:?} — log {}",
+                    self.label,
+                    self.log_path.display()
+                );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -714,12 +839,19 @@ impl Engine {
         let _ = self.shutdown.send(true);
         match self.wait_exit(Duration::from_secs(60)).await? {
             Ok(()) => Ok(()),
-            Err(e) => bail!("engine {} stopped with error: {e} — log {}", self.label, self.log_path.display()),
+            Err(e) => bail!(
+                "engine {} stopped with error: {e} — log {}",
+                self.label,
+                self.log_path.display()
+            ),
         }
     }
 
     /// Waits for the engine to exit on its own (`once` / `LAZYVIEW_SYNC=false`); returns its result.
-    pub async fn wait_finished(mut self, timeout: Duration) -> Result<std::result::Result<(), String>> {
+    pub async fn wait_finished(
+        mut self,
+        timeout: Duration,
+    ) -> Result<std::result::Result<(), String>> {
         self.wait_exit(timeout).await
     }
 
@@ -730,8 +862,16 @@ impl Engine {
         }
         match self.wait_exit(Duration::from_secs(30)).await? {
             Err(e) if e == "engine killed" => Ok(()),
-            Err(e) => bail!("engine {} had already failed before the crash: {e} — log {}", self.label, self.log_path.display()),
-            Ok(()) => bail!("engine {} had already exited (Ok) before the crash — log {}", self.label, self.log_path.display()),
+            Err(e) => bail!(
+                "engine {} had already failed before the crash: {e} — log {}",
+                self.label,
+                self.log_path.display()
+            ),
+            Ok(()) => bail!(
+                "engine {} had already exited (Ok) before the crash — log {}",
+                self.label,
+                self.log_path.display()
+            ),
         }
     }
 
@@ -760,11 +900,18 @@ impl Engine {
 
     /// Captures the source's binlog end and waits until the engine applied it, `rounds` times
     /// (MV writes advance the binlog; chained views need one extra round per chain level).
-    pub async fn wait_caught_up_rounds(&mut self, src: &mut Conn, timeout: Duration, rounds: usize) -> Result<()> {
+    pub async fn wait_caught_up_rounds(
+        &mut self,
+        src: &mut Conn,
+        timeout: Duration,
+        rounds: usize,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         for _ in 0..rounds.max(1) {
             let target = server_position(src).await?;
-            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
             self.wait_applied(&target, left).await?;
         }
         Ok(())
@@ -788,27 +935,40 @@ pub fn t_catchup() -> Duration {
 // Metadata tables
 // ---------------------------------------------------------------------------------------------
 
-/// Creates `_lazyview` exactly as documented (PLAN.md §1 + `targets`), if missing. Used to
+/// Creates `_lazyview` as the engine does (PLAN.md §1 + `name`, `targets`), if missing. Used to
 /// pre-load definitions before the first engine start; the engine itself creates it otherwise.
 pub async fn ensure_lazyview_table(conn: &mut Conn) -> Result<()> {
     exec(
         conn,
         "CREATE TABLE IF NOT EXISTS _lazyview (
            id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+           name       VARCHAR(64) NULL,
            definition MEDIUMTEXT NOT NULL,
            enabled    TINYINT(1) NOT NULL DEFAULT 1,
            targets    VARCHAR(255) NULL,
            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-           updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-         )",
+           updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+           UNIQUE KEY uq_lazyview_name (name)
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
     )
     .await
 }
 
 /// Inserts a definition; returns its `_lazyview.id`.
-pub async fn add_definition(conn: &mut Conn, definition: &str, targets: Option<&str>) -> Result<u64> {
+pub async fn add_definition(
+    conn: &mut Conn,
+    definition: &str,
+    targets: Option<&str>,
+) -> Result<u64> {
     let t = targets.map(q).unwrap_or_else(|| "NULL".into());
-    exec(conn, &format!("INSERT INTO _lazyview (definition, targets) VALUES ({}, {t})", q(definition))).await?;
+    exec(
+        conn,
+        &format!(
+            "INSERT INTO _lazyview (definition, targets) VALUES ({}, {t})",
+            q(definition)
+        ),
+    )
+    .await?;
     let id = scalar_i64(conn, "SELECT LAST_INSERT_ID()").await?;
     Ok(id as u64)
 }
@@ -833,6 +993,8 @@ pub struct StateRow {
     pub refreshed_at: Option<String>,
     /// Target instance of this state row (`source` or a target name).
     pub target: Option<String>,
+    /// `_lazyview.id` this row belongs to.
+    pub definition_id: Option<u64>,
 }
 
 pub async fn view_states(conn: &mut Conn) -> Result<Vec<StateRow>> {
@@ -841,7 +1003,7 @@ pub async fn view_states(conn: &mut Conn) -> Result<Vec<StateRow>> {
     }
     let rs = rows(
         conn,
-        "SELECT name, state, mode, last_error, definition_hash, CAST(refreshed_at AS CHAR), target FROM _lazyview_state",
+        "SELECT name, state, mode, last_error, definition_hash, CAST(refreshed_at AS CHAR), target, definition_id FROM _lazyview_state",
     )
     .await?;
     Ok(rs
@@ -854,24 +1016,39 @@ pub async fn view_states(conn: &mut Conn) -> Result<Vec<StateRow>> {
             definition_hash: r[4].clone(),
             refreshed_at: r[5].clone(),
             target: r[6].clone(),
+            definition_id: r[7].as_deref().and_then(|v| v.parse().ok()),
         })
         .collect())
 }
 
 /// State rows of one view (several if the engine keeps one per target).
 pub async fn view_state(conn: &mut Conn, name: &str) -> Result<Vec<StateRow>> {
-    Ok(view_states(conn).await?.into_iter().filter(|s| s.name == name).collect())
+    Ok(view_states(conn)
+        .await?
+        .into_iter()
+        .filter(|s| s.name == name)
+        .collect())
 }
 
 /// Waits until every named view has state rows and all of them are `ready`. Fails fast if a
 /// view stays in `error` for 5 s (with the engine's message) or if the engine dies.
-pub async fn wait_ready(conn: &mut Conn, engine: &mut Engine, names: &[&str], timeout: Duration) -> Result<()> {
+pub async fn wait_ready(
+    conn: &mut Conn,
+    engine: &mut Engine,
+    names: &[&str],
+    timeout: Duration,
+) -> Result<()> {
     wait_ready_grace(conn, engine, names, timeout, Some(Duration::from_secs(5))).await
 }
 
 /// Like [`wait_ready`] but tolerates `error` states until the timeout (for views expected to
 /// recover, e.g. after a source table comes back or a definition is fixed).
-pub async fn wait_ready_tolerant(conn: &mut Conn, engine: &mut Engine, names: &[&str], timeout: Duration) -> Result<()> {
+pub async fn wait_ready_tolerant(
+    conn: &mut Conn,
+    engine: &mut Engine,
+    names: &[&str],
+    timeout: Duration,
+) -> Result<()> {
     wait_ready_grace(conn, engine, names, timeout, None).await
 }
 
@@ -889,25 +1066,33 @@ async fn wait_ready_grace(
         engine.check_alive()?;
         let states = view_states(conn).await?;
         let mut pending = Vec::new();
-        let any_ready = names.iter().any(|n| states.iter().any(|s| &s.name == n && s.state == "ready"));
+        // The engine is up and has made other views ready (any view, not only these).
+        let any_ready = states.iter().any(|s| s.state == "ready");
         for n in names {
             let mine: Vec<&StateRow> = states.iter().filter(|s| &s.name == n).collect();
-            // A view the engine never registers while others are already ready: fail after 45 s
+            // A view the engine never registers while others are already ready: fail after 60 s
             // instead of the full timeout (look for errors in the engine log).
             if mine.is_empty() && any_ready && error_grace.is_some() {
-                let since = *no_row_since.entry(n.to_string()).or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_secs(45) {
+                let since = *no_row_since
+                    .entry(n.to_string())
+                    .or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(60) {
                     bail!(
-                        "view {n} has no _lazyview_state row 45 s after other views became ready (engine never registered it?) — log {}",
+                        "view {n} has no _lazyview_state row 60 s after other views became ready (engine never registered its definition?) — log {}",
                         engine.log_path.display()
                     );
                 }
             }
             if let Some(e) = mine.iter().find(|s| s.state == "error") {
-                let since = *error_since.entry(n.to_string()).or_insert_with(Instant::now);
+                let since = *error_since
+                    .entry(n.to_string())
+                    .or_insert_with(Instant::now);
                 if let Some(g) = error_grace {
                     if since.elapsed() >= g {
-                        bail!("view {n} is in state 'error': {}", e.last_error.clone().unwrap_or_default());
+                        bail!(
+                            "view {n} is in state 'error': {}",
+                            e.last_error.clone().unwrap_or_default()
+                        );
                     }
                 }
             } else {
@@ -917,18 +1102,33 @@ async fn wait_ready_grace(
                 let detail: Vec<String> = mine
                     .iter()
                     .map(|s| match &s.last_error {
-                        Some(e) if s.state == "error" => format!("{}:error({})", s.target.as_deref().unwrap_or("?"), clip(e, 200)),
+                        Some(e) if s.state == "error" => format!(
+                            "{}:error({})",
+                            s.target.as_deref().unwrap_or("?"),
+                            clip(e, 200)
+                        ),
                         _ => format!("{}:{}", s.target.as_deref().unwrap_or("?"), s.state),
                     })
                     .collect();
-                pending.push(format!("{n}={}", if detail.is_empty() { "<no state row>".to_string() } else { detail.join("/") }));
+                pending.push(format!(
+                    "{n}={}",
+                    if detail.is_empty() {
+                        "<no state row>".to_string()
+                    } else {
+                        detail.join("/")
+                    }
+                ));
             }
         }
         if pending.is_empty() {
             return Ok(());
         }
         if Instant::now() > deadline {
-            bail!("views not ready within {timeout:?}: {} — log {}", pending.join(", "), engine.log_path.display());
+            bail!(
+                "views not ready within {timeout:?}: {} — log {}",
+                pending.join(", "),
+                engine.log_path.display()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -936,16 +1136,28 @@ async fn wait_ready_grace(
 
 /// Waits until the view's state rows are all `ready` with a definition hash different from
 /// `old_hash` (i.e. a changed definition has been built and swapped in).
-pub async fn wait_rebuilt(conn: &mut Conn, engine: &mut Engine, name: &str, old_hash: &Option<String>, timeout: Duration) -> Result<()> {
+pub async fn wait_rebuilt(
+    conn: &mut Conn,
+    engine: &mut Engine,
+    name: &str,
+    old_hash: &Option<String>,
+    timeout: Duration,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         engine.check_alive()?;
         let st = view_state(conn, name).await?;
-        if !st.is_empty() && st.iter().all(|s| s.state == "ready" && &s.definition_hash != old_hash) {
+        if !st.is_empty()
+            && st
+                .iter()
+                .all(|s| s.state == "ready" && &s.definition_hash != old_hash)
+        {
             return Ok(());
         }
         if Instant::now() > deadline {
-            bail!("view {name} not rebuilt with its new definition within {timeout:?}; state: {st:?}");
+            bail!(
+                "view {name} not rebuilt with its new definition within {timeout:?}; state: {st:?}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -953,15 +1165,56 @@ pub async fn wait_rebuilt(conn: &mut Conn, engine: &mut Engine, name: &str, old_
 
 /// Current definition hash of a view (first state row).
 pub async fn current_hash(conn: &mut Conn, name: &str) -> Result<Option<String>> {
-    Ok(view_state(conn, name).await?.into_iter().next().and_then(|s| s.definition_hash))
+    Ok(view_state(conn, name)
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|s| s.definition_hash))
 }
 
-/// Waits until a view reaches `state` (any of its rows); returns that row.
-pub async fn wait_state(conn: &mut Conn, engine: &mut Engine, name: &str, state: &str, timeout: Duration) -> Result<StateRow> {
+/// Waits until the state row of definition `def_id` (whatever name the engine gave it, e.g. `#5`
+/// for an unparsable definition) reaches `state`; returns that row.
+pub async fn wait_def_state(
+    conn: &mut Conn,
+    engine: &mut Engine,
+    def_id: u64,
+    state: &str,
+    timeout: Duration,
+) -> Result<StateRow> {
     let deadline = Instant::now() + timeout;
     loop {
         engine.check_alive()?;
-        if let Some(s) = view_state(conn, name).await?.into_iter().find(|s| s.state == state) {
+        let rows: Vec<StateRow> = view_states(conn)
+            .await?
+            .into_iter()
+            .filter(|s| s.definition_id == Some(def_id))
+            .collect();
+        if let Some(s) = rows.iter().find(|s| s.state == state) {
+            return Ok(s.clone());
+        }
+        if Instant::now() > deadline {
+            bail!("definition #{def_id} did not reach state '{state}' within {timeout:?}; its state rows: {rows:?} — log {}", engine.log_path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Waits until a view reaches `state` (any of its rows); returns that row.
+pub async fn wait_state(
+    conn: &mut Conn,
+    engine: &mut Engine,
+    name: &str,
+    state: &str,
+    timeout: Duration,
+) -> Result<StateRow> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        engine.check_alive()?;
+        if let Some(s) = view_state(conn, name)
+            .await?
+            .into_iter()
+            .find(|s| s.state == state)
+        {
             return Ok(s);
         }
         if Instant::now() > deadline {
@@ -984,7 +1237,11 @@ pub async fn assert_ready(conn: &mut Conn, names: &[&str]) -> Result<()> {
         }
         for s in mine {
             if s.state != "ready" {
-                bail!("view {n} state is '{}' (last_error: {:?})", s.state, s.last_error);
+                bail!(
+                    "view {n} state is '{}' (last_error: {:?})",
+                    s.state,
+                    s.last_error
+                );
             }
         }
     }
@@ -1017,8 +1274,16 @@ where
 pub fn fmt_snapshot(s: &Snapshot) -> String {
     let dbg = format!("{s:?}");
     // Snapshot { a: 1, b: 0, ... } → keep non-zero fields.
-    let inner = dbg.trim_start_matches("Snapshot").trim().trim_start_matches('{').trim_end_matches('}');
-    let parts: Vec<&str> = inner.split(',').map(str::trim).filter(|p| !p.ends_with(": 0") && !p.is_empty()).collect();
+    let inner = dbg
+        .trim_start_matches("Snapshot")
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}');
+    let parts: Vec<&str> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.ends_with(": 0") && !p.is_empty())
+        .collect();
     format!("{{{}}}", parts.join(", "))
 }
 
@@ -1040,7 +1305,13 @@ where
 /// Waits for catch-up, then compares every view materialized on the source against its oracle.
 /// On mismatch, waits a bit more and re-checks to tell "wrong" from "applied() reported too
 /// early" — both fail.
-pub async fn verify(ctx: &Ctx, engine: &mut Engine, src: &Db, specs: &[ViewSpec], what: &str) -> Result<()> {
+pub async fn verify(
+    ctx: &Ctx,
+    engine: &mut Engine,
+    src: &Db,
+    specs: &[ViewSpec],
+    what: &str,
+) -> Result<()> {
     verify_targets(ctx, engine, src, &HashMap::new(), specs, what).await
 }
 
@@ -1054,13 +1325,20 @@ pub async fn verify_targets(
     what: &str,
 ) -> Result<()> {
     let mut sc = src.conn().await?;
-    engine.wait_caught_up(&mut sc, t_catchup()).await.with_context(|| format!("catch-up before check '{what}'"))?;
+    engine
+        .wait_caught_up(&mut sc, t_catchup())
+        .await
+        .with_context(|| format!("catch-up before check '{what}'"))?;
     engine.check_alive()?;
     let t = Instant::now();
     let res = oracle::check_views_targets(src, targets, specs).await;
     match res {
         Ok(()) => {
-            ctx.log(format!("check '{what}': {} views equal oracle ({} ms)", specs.len(), t.elapsed().as_millis()));
+            ctx.log(format!(
+                "check '{what}': {} views equal oracle ({} ms)",
+                specs.len(),
+                t.elapsed().as_millis()
+            ));
             sc.disconnect().await.ok();
             Ok(())
         }
@@ -1072,7 +1350,10 @@ pub async fn verify_targets(
                 Ok(()) => "converged after an extra wait → applied() was reported before the changes were visible",
                 Err(_) => "still mismatched after an extra 3 s wait",
             };
-            Err(first.context(format!("check '{what}' failed ({verdict}); metrics: {}", fmt_snapshot(&engine.snapshot()))))
+            Err(first.context(format!(
+                "check '{what}' failed ({verdict}); metrics: {}",
+                fmt_snapshot(&engine.snapshot())
+            )))
         }
     }
 }
@@ -1093,11 +1374,18 @@ pub async fn eventually_equal(
         engine.check_alive()?;
         match oracle::check_views_targets(src, targets, specs).await {
             Ok(()) => {
-                ctx.log(format!("check '{what}': {} views converged after {:.1}s", specs.len(), start.elapsed().as_secs_f64()));
+                ctx.log(format!(
+                    "check '{what}': {} views converged after {:.1}s",
+                    specs.len(),
+                    start.elapsed().as_secs_f64()
+                ));
                 return Ok(());
             }
             Err(e) if start.elapsed() > timeout => {
-                return Err(e.context(format!("'{what}': not converged within {timeout:?}; metrics {}", fmt_snapshot(&engine.snapshot()))))
+                return Err(e.context(format!(
+                    "'{what}': not converged within {timeout:?}; metrics {}",
+                    fmt_snapshot(&engine.snapshot())
+                )))
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
@@ -1111,9 +1399,18 @@ pub fn ov_refs(v: &[(String, String)]) -> Vec<(&str, &str)> {
 
 /// Env overrides configuring named targets (`LAZYVIEW_TARGETS` + `LAZYVIEW_TARGET_<NAME>_DSN`).
 pub fn target_env(targets: &[(&str, &str)]) -> Vec<(String, String)> {
-    let mut v = vec![("LAZYVIEW_TARGETS".to_string(), targets.iter().map(|t| t.0).collect::<Vec<_>>().join(","))];
+    let mut v = vec![(
+        "LAZYVIEW_TARGETS".to_string(),
+        targets.iter().map(|t| t.0).collect::<Vec<_>>().join(","),
+    )];
     for (name, dsn) in targets {
-        v.push((format!("LAZYVIEW_TARGET_{}_DSN", name.to_ascii_uppercase().replace('-', "_")), dsn.to_string()));
+        v.push((
+            format!(
+                "LAZYVIEW_TARGET_{}_DSN",
+                name.to_ascii_uppercase().replace('-', "_")
+            ),
+            dsn.to_string(),
+        ));
     }
     v
 }
@@ -1130,7 +1427,8 @@ pub async fn start_with_views(
 ) -> Result<(Engine, HashMap<String, u64>)> {
     let mut c = db.conn().await?;
     ensure_lazyview_table(&mut c).await?;
-    let (chained, base): (Vec<ViewSpec>, Vec<ViewSpec>) = specs.iter().cloned().partition(|s| s.kind == Kind::Chained);
+    let (chained, base): (Vec<ViewSpec>, Vec<ViewSpec>) =
+        specs.iter().cloned().partition(|s| s.kind == Kind::Chained);
     let mut ids = add_views(&mut c, &base).await?;
     let mut eng = ctx.start_engine(db, overrides)?;
     let base_names: Vec<&str> = base.iter().map(|s| s.name.as_str()).collect();
@@ -1143,4 +1441,3 @@ pub async fn start_with_views(
     c.disconnect().await.ok();
     Ok((eng, ids))
 }
-

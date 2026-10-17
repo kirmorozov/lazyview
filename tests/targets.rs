@@ -20,14 +20,28 @@ async fn exists_on(db: &Db, table: &str) -> Result<bool> {
 }
 
 /// Asserts that every view's MV exists exactly on the instances it targets.
-async fn check_placement(src: &Db, targets: &HashMap<String, Db>, specs: &[ViewSpec]) -> Result<()> {
+async fn check_placement(
+    src: &Db,
+    targets: &HashMap<String, Db>,
+    specs: &[ViewSpec],
+) -> Result<()> {
     for s in specs {
         let want = s.target_names();
         let on_src = exists_on(src, &s.name).await?;
-        ensure!(on_src == want.contains(&"source".to_string()), "view {} (targets {:?}): exists on source = {on_src}", s.name, s.targets);
+        ensure!(
+            on_src == want.contains(&"source".to_string()),
+            "view {} (targets {:?}): exists on source = {on_src}",
+            s.name,
+            s.targets
+        );
         for (t, db) in targets {
             let here = exists_on(db, &s.name).await?;
-            ensure!(here == want.contains(t), "view {} (targets {:?}): exists on target {t} = {here}", s.name, s.targets);
+            ensure!(
+                here == want.contains(t),
+                "view {} (targets {:?}): exists on target {t} = {here}",
+                s.name,
+                s.targets
+            );
         }
     }
     Ok(())
@@ -41,7 +55,11 @@ async fn wait_exists(eng: &mut Engine, db: &Db, table: &str, exists: bool) -> Re
             return Ok(());
         }
         if std::time::Instant::now() > deadline {
-            bail!("{table} on {} ({}): expected exists={exists}", db.name, db.flavor);
+            bail!(
+                "{table} on {} ({}): expected exists={exists}",
+                db.name,
+                db.flavor
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -54,7 +72,14 @@ fn targets_fan_out_and_retarget() {
         let tb = ctx.new_db_on(1, "tg_b").await?;
         let tc = ctx.new_db_on(2, "tg_c").await?;
         let ids = setup_ecommerce(&src, ctx.sub_seed("seed"), Sizes::scaled()).await?;
-        let patterns = [None, Some("b"), Some("c"), Some("b,c"), Some("source,b"), Some("source,b,c")];
+        let patterns = [
+            None,
+            Some("b"),
+            Some("c"),
+            Some("b,c"),
+            Some("source,b"),
+            Some("source,b,c"),
+        ];
         let mut specs = Vec::new();
         let mut k = 0;
         for v in ecommerce_views() {
@@ -73,31 +98,67 @@ fn targets_fan_out_and_retarget() {
             };
             specs.push(v);
         }
-        let tmap: HashMap<String, Db> = [("b".to_string(), tb.clone()), ("c".to_string(), tc.clone())].into();
+        let tmap: HashMap<String, Db> =
+            [("b".to_string(), tb.clone()), ("c".to_string(), tc.clone())].into();
         let env = target_env(&[("b", &tb.dsn), ("c", &tc.dsn)]);
         let (mut eng, idmap) = start_with_views(&ctx, &src, &specs, &ov_refs(&env)).await?;
         let mut c = src.conn().await?;
-        verify_targets(&ctx, &mut eng, &src, &tmap, &specs, "initial build on all targets").await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &specs,
+            "initial build on all targets",
+        )
+        .await?;
         check_placement(&src, &tmap, &specs).await?;
 
         let mut wl = Workload::new(ctx.sub_seed("wl"), ids.clone());
         for phase in 1..=2 {
             let n = run_batches(&mut c, &mut wl, scaled(60)).await?;
-            verify_targets(&ctx, &mut eng, &src, &tmap, &specs, &format!("phase {phase} ({n} txns)")).await?;
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &specs,
+                &format!("phase {phase} ({n} txns)"),
+            )
+            .await?;
         }
 
         // Online retargeting: add a target, remove a target, drop the source copy.
-        let find = |specs: &Vec<ViewSpec>, t: &str| specs.iter().position(|s| s.targets.as_deref() == Some(t) && s.kind != Kind::Chained).context("pattern");
-        let changes = [(find(&specs, "b")?, "b,c"), (find(&specs, "b,c")?, "c"), (find(&specs, "source,b")?, "b")];
+        let find = |specs: &Vec<ViewSpec>, t: &str| {
+            specs
+                .iter()
+                .position(|s| s.targets.as_deref() == Some(t) && s.kind != Kind::Chained)
+                .context("pattern")
+        };
+        let changes = [
+            (find(&specs, "b")?, "b,c"),
+            (find(&specs, "b,c")?, "c"),
+            (find(&specs, "source,b")?, "b"),
+        ];
         for (i, new_t) in changes {
             let name = specs[i].name.clone();
             let old = specs[i].target_names();
-            exec(&mut c, &format!("UPDATE _lazyview SET targets = {} WHERE id = {}", q(new_t), idmap[&name])).await?;
+            exec(
+                &mut c,
+                &format!(
+                    "UPDATE _lazyview SET targets = {} WHERE id = {}",
+                    q(new_t),
+                    idmap[&name]
+                ),
+            )
+            .await?;
             specs[i].targets = Some(new_t.to_string());
             let new = specs[i].target_names();
             for t in old.iter().chain(new.iter()) {
                 let db = if t == "source" { &src } else { &tmap[t] };
-                wait_exists(&mut eng, db, &name, new.contains(t)).await.with_context(|| format!("retarget {name} {old:?} → {new:?}"))?;
+                wait_exists(&mut eng, db, &name, new.contains(t))
+                    .await
+                    .with_context(|| format!("retarget {name} {old:?} → {new:?}"))?;
             }
             run_batches(&mut c, &mut wl, scaled(15)).await?;
             wait_ready_tolerant(&mut c, &mut eng, &[name.as_str()], t_ready()).await?;
@@ -118,28 +179,52 @@ fn targets_invalid_configurations_error() {
         setup_ecommerce(&src, ctx.sub_seed("seed"), Sizes::tiny()).await?;
         let all = ecommerce_views();
         let get = |n: &str| all.iter().find(|v| v.name == n).unwrap().clone();
-        let good = vec![get("v_status_counts").with_targets("b"), get("v_paid_orders")];
+        let good = vec![
+            get("v_status_counts").with_targets("b"),
+            get("v_paid_orders"),
+        ];
         let upstream_on_target = get("v_customer_stats").with_targets("b");
         let chained = get("v_vip_stats"); // reads v_customer_stats, which only exists on target b
         let unknown = get("v_global_orders").with_targets("nope");
         let mut c = src.conn().await?;
         ensure_lazyview_table(&mut c).await?;
         add_views(&mut c, &good).await?;
-        add_views(&mut c, &[upstream_on_target.clone(), chained.clone(), unknown.clone()]).await?;
+        add_views(
+            &mut c,
+            &[upstream_on_target.clone(), chained.clone(), unknown.clone()],
+        )
+        .await?;
         let tmap: HashMap<String, Db> = [("b".to_string(), tb.clone())].into();
         let env = target_env(&[("b", &tb.dsn)]);
         let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
         wait_ready(&mut c, &mut eng, &["v_customer_stats"], t_ready()).await?;
         for bad in [&chained, &unknown] {
             let st = wait_state(&mut c, &mut eng, &bad.name, "error", t_ready()).await?;
-            ctx.log(format!("{} (targets {:?}): error as expected: {}", bad.name, bad.targets, clip(&st.last_error.unwrap_or_default(), 160)));
+            ctx.log(format!(
+                "{} (targets {:?}): error as expected: {}",
+                bad.name,
+                bad.targets,
+                clip(&st.last_error.unwrap_or_default(), 160)
+            ));
         }
-        ensure!(!exists_on(&src, "v_global_orders").await? && !exists_on(&tb, "v_global_orders").await?, "view with unknown target was materialized");
+        ensure!(
+            !exists_on(&src, "v_global_orders").await?
+                && !exists_on(&tb, "v_global_orders").await?,
+            "view with unknown target was materialized"
+        );
         wait_ready(&mut c, &mut eng, &names(&good), t_ready()).await?;
         exec(&mut c, "UPDATE orders SET status = 'paid' WHERE id % 2 = 0").await?;
         let mut checked = good.clone();
         checked.push(upstream_on_target);
-        verify_targets(&ctx, &mut eng, &src, &tmap, &checked, "valid views next to invalid ones").await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &checked,
+            "valid views next to invalid ones",
+        )
+        .await?;
         eng.stop().await?;
         Ok(())
     });
@@ -171,11 +256,29 @@ fn targets_one_target_down() {
         let env = target_env(&[("b", &tb.dsn), ("down", &dead)]);
         let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
         let converge = Duration::from_secs_f64(150.0 * scale().max(1.0));
-        eventually_equal(&ctx, &mut eng, &src, &tmap, &healthy, converge, "healthy targets with one target down").await?;
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &healthy,
+            converge,
+            "healthy targets with one target down",
+        )
+        .await?;
 
         let mut wl = Workload::new(ctx.sub_seed("wl"), ids.clone());
         run_batches(&mut c, &mut wl, scaled(50)).await?;
-        eventually_equal(&ctx, &mut eng, &src, &tmap, &healthy, converge, "after writes, one target down").await?;
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &healthy,
+            converge,
+            "after writes, one target down",
+        )
+        .await?;
 
         // Transient outage of target b: its connections get killed repeatedly during writes.
         let killer_db = tb.clone();
@@ -201,9 +304,23 @@ fn targets_one_target_down() {
         let killed = killer.await.context("killer panicked")??;
         ctx.log(format!("killed {killed} target connections during writes"));
         run_batches(&mut c, &mut wl, scaled(10)).await?;
-        eventually_equal(&ctx, &mut eng, &src, &tmap, &healthy, converge, "after transient outage of b").await?;
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &healthy,
+            converge,
+            "after transient outage of b",
+        )
+        .await?;
         for s in view_states(&mut c).await? {
-            ctx.log(format!("state {} = {} {}", s.name, s.state, clip(s.last_error.as_deref().unwrap_or(""), 120)));
+            ctx.log(format!(
+                "state {} = {} {}",
+                s.name,
+                s.state,
+                clip(s.last_error.as_deref().unwrap_or(""), 120)
+            ));
         }
         eng.check_alive()?;
         drop(eng); // kill: a graceful stop may legitimately wait for the dead target
