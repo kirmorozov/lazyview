@@ -264,3 +264,24 @@ These supersede the corresponding parts above.
 * **Ownership.** `_lazyview_state.managed` marks tables lazyview created; it never replaces or drops
   anything else.
 * **Metadata migrations.** `meta::MIGRATIONS` adds missing columns idempotently at startup.
+
+### Later revisions
+
+* **Definitions by name.** `_lazyview.name` (UNIQUE); with a name the definition may be a bare
+  SELECT; names of `CREATE VIEW` rows are backfilled; name/definition mismatch → error.
+* **Full-refresh cadence.** `LAZYVIEW_FULL_REFRESH_MS` (default 60 s): full-mode views (and
+  incremental views with unknown affected rows) are rebuilt at most once per interval. The mode
+  and reason are decided at plan time and shown in `_lazyview_overview`.
+* **Operational model.** One instance; fatal errors exit, the orchestrator restarts, the saved
+  position resumes. A `GET_LOCK` guard + fencing epoch keep an accidental second copy from
+  writing. No HA backends.
+* **Robustness.** Replans keyed by definition id with exponential retry; a failed build keeps the
+  live version maintained; swaps retry on metadata-lock timeouts; ownership recorded only after a
+  successful swap; orphans cleaned at start; source connection self-heals; per-target timeouts.
+* **Correctness additions.** FK cascades (parents watched; direct units or rebuild), XA (rows
+  re-fed at XA COMMIT; position never past an open XA PREPARE), LEFT JOIN anti-join / COALESCE →
+  full mode, SQL-view sources → full mode, stored functions rejected, cycles rejected.
+* **Health.** `/livez` `/readyz` `/startupz` `/metrics` + `lazyview healthcheck` (distroless image
+  has no shell). Kubernetes manifests in `deploy/k8s`.
+* **Supervisor (in progress).** Parallel flushes (views × chunks × targets) on pools with an
+  adaptive per-endpoint concurrency limit; see `docs/design-supervisor.md`.
