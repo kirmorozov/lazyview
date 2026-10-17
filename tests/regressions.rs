@@ -577,3 +577,147 @@ fn reg_multi_target_with_one_down() {
         Ok(())
     });
 }
+
+/// Full-refresh views must be rebuilt when their sources change (also when an incremental view
+/// reads the same table), around XA transactions too.
+#[test]
+fn reg_full_view_refresh_around_xa() {
+    scenario("reg_full_xa", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_distinct",
+                Kind::Full,
+                "SELECT DISTINCT method, status FROM pay",
+            ),
+            ViewSpec::new(
+                "r_pay",
+                Kind::Incremental,
+                "SELECT id, method, status FROM pay",
+            ),
+        ];
+        let ddl = [
+            "CREATE TABLE pay (id INT PRIMARY KEY, method VARCHAR(10) NOT NULL, status VARCHAR(10) NOT NULL)",
+            "INSERT INTO pay VALUES (1, 'card', 'ok'), (2, 'wire', 'ok')",
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_full_xa", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        run(&mut c, &["INSERT INTO pay VALUES (3, 'cash', 'pending')"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "plain insert").await?;
+        run(
+            &mut c,
+            &[
+                "XA START 'r1'",
+                "INSERT INTO pay VALUES (4, 'card', 'failed')",
+                "XA END 'r1'",
+                "XA PREPARE 'r1'",
+            ],
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "XA prepared").await?;
+        run(&mut c, &["XA COMMIT 'r1'"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "XA committed").await?;
+        run(
+            &mut c,
+            &[
+                "XA START 'r2'",
+                "INSERT INTO pay VALUES (5, 'gift', 'ok')",
+                "XA END 'r2'",
+                "XA PREPARE 'r2'",
+                "XA ROLLBACK 'r2'",
+            ],
+        )
+        .await?;
+        run(
+            &mut c,
+            &[
+                "INSERT INTO pay VALUES (6, 'paypal', 'ok')",
+                "UPDATE pay SET status = 'void' WHERE id = 1",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "XA rolled back, then plain writes",
+        )
+        .await?;
+        run(
+            &mut c,
+            &[
+                "XA START 'r3'",
+                "UPDATE pay SET method = 'cheque' WHERE id = 2",
+                "XA END 'r3'",
+                "XA COMMIT 'r3' ONE PHASE",
+            ],
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "XA one phase").await?;
+        eng.stop().await
+    });
+}
+
+/// Updates of columns no view reads must not rebuild full-refresh views, also next to
+/// incremental views over the same tables.
+#[test]
+fn reg_unreferenced_update_full_mode() {
+    scenario("reg_unref_full", |ctx| async move {
+        let db = ctx.new_db("reg_unref_full").await?;
+        common::workload::setup_ecommerce(
+            &db,
+            ctx.sub_seed("seed"),
+            common::workload::Sizes::tiny(),
+        )
+        .await?;
+        // Full-refresh views plus incremental views over the same tables (as in eff_unref).
+        let keep = [
+            "v_union_names",
+            "v_top_products",
+            "v_big_spenders",
+            "v_distinct_methods",
+            "v_customer_cards",
+            "v_noisy_products",
+            "v_status_counts",
+            "vf_addresses",
+        ];
+        let specs: Vec<ViewSpec> = common::workload::ecommerce_views()
+            .into_iter()
+            .filter(|v| keep.contains(&v.name.as_str()))
+            .collect();
+        let (mut eng, _) = start_with_views(
+            &ctx,
+            &db,
+            &specs,
+            &[("LAZYVIEW_POSITION_PERSIST_MS", "600000")],
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+        let mut c = db.conn().await?;
+        let mut sc = db.conn().await?;
+        for (what, stmt) in [
+            (
+                "customers.last_seen_at",
+                "UPDATE customers SET last_seen_at = '2024-05-01 10:00:00.000001'",
+            ),
+            (
+                "products.updated_at",
+                "UPDATE products SET updated_at = '2024-05-01 11:00:00.123'",
+            ),
+            ("orders.note", "UPDATE orders SET note = CONCAT('n', id)"),
+            ("regions.notes", "UPDATE regions SET notes = 'x'"),
+        ] {
+            eng.wait_caught_up(&mut sc, t_catchup()).await?;
+            let before = eng.snapshot();
+            exec(&mut c, stmt).await?;
+            eng.wait_caught_up(&mut sc, t_catchup()).await?;
+            let d = eng.snapshot().since(&before);
+            ensure!(
+                d.full_rebuilds == 0 && d.source_queries == 0 && d.mv_queries == 0,
+                "update of unreferenced {what} caused work: {}",
+                fmt_snapshot(&d)
+            );
+        }
+        eng.stop().await
+    });
+}
