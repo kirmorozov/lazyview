@@ -17,21 +17,36 @@ use super::source::tokenize;
 use crate::analyze::{self, AliasPlan, Mode, ParsedDef, ViewPlan};
 use crate::catalog::{TableInfo, TableRef};
 
-/// Plans a flat block. `Ok(Err(reason))`: it cannot be maintained incrementally as rewritten
-/// (the caller falls back to a Full plan of the original statement).
+/// Why a flat block was not planned incrementally as rewritten.
+pub(crate) enum Refused {
+    Reason(String),
+    /// The table of this semi-join cannot be traced to the view's units directly.
+    Semi(usize, String),
+}
+
+impl Refused {
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Refused::Reason(r) | Refused::Semi(_, r) => r,
+        }
+    }
+}
+
+/// Plans a flat block. `Ok(Err(_))`: it cannot be maintained incrementally as rewritten (the
+/// caller falls back to a Full plan of the original statement, or isolates a semi-join).
 pub(crate) fn plan_block(
     def: &ParsedDef,
     b: &Block,
     schema: &str,
     tables: &HashMap<TableRef, Arc<TableInfo>>,
-) -> Result<std::result::Result<ViewPlan, String>> {
+) -> Result<std::result::Result<ViewPlan, Refused>> {
     let mut names: Vec<_> = b.outputs.iter().map(|o| o.name.clone()).collect();
     for i in finish_view_names(&mut names) {
         if b.outputs[i].original.is_none() {
-            return Ok(Err(format!(
+            return Ok(Err(Refused::Reason(format!(
                 "unaliased column `{}` needs an alias (its server-generated name differs between versions)",
                 b.outputs[i].name.text
-            )));
+            ))));
         }
     }
     let mut select = b.select.clone();
@@ -67,7 +82,9 @@ pub(crate) fn plan_block(
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(view = %def.name, "analyzer: the merged form does not plan: {e:#}");
-            return Ok(Err(format!("internal analyzer error: {e}")));
+            return Ok(Err(Refused::Reason(format!(
+                "internal analyzer error: {e}"
+            ))));
         }
     };
     if let Err(why) = attach_semis(&mut plan, b) {
@@ -79,31 +96,36 @@ pub(crate) fn plan_block(
 /// The semi-joins left in the block: their predicates replace the markers in the plan's WHERE,
 /// and their tables become aliases whose changes map straight to the view's units (or, for a
 /// single-row aggregate, mark it for recomputation).
-fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), String> {
+fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refused> {
     if b.semis.is_empty() {
         return Ok(());
     }
+    let missing = || Refused::Reason("internal analyzer error: semi-join marker missing".into());
     let Some(w) = &b.select.selection else {
-        return Err("internal analyzer error: semi-join marker missing".into());
+        return Err(missing());
     };
     let mut where_sql = plan.where_sql.clone().unwrap_or_default();
     for s in &b.semis {
-        let args = marker_args(w, s.id)
-            .ok_or_else(|| "internal analyzer error: semi-join marker missing".to_string())?;
+        let args = marker_args(w, s.id).ok_or_else(missing)?;
         let mut pred = s.predicate.clone();
         fill_placeholders(&mut pred, &args);
         where_sql = replace_call(&where_sql, &marker_name(s.id), &format!("({pred})"))
-            .ok_or_else(|| "internal analyzer error: semi-join marker not rendered".to_string())?;
+            .ok_or_else(missing)?;
         let direct = match &plan.mode {
             Mode::Full(_) => continue,
             Mode::Global => None,
-            Mode::Spj | Mode::Grouped => Some(direct_columns(plan, s, &args)?),
+            Mode::Spj | Mode::Grouped => {
+                Some(direct_columns(plan, s, &args).map_err(|why| Refused::Semi(s.id, why))?)
+            }
         };
         if !s.info.cascades.is_empty() {
-            return Err(format!(
-                "{} over `{}`, a child of a cascading foreign key",
-                semi_kind(s),
-                s.info.name
+            return Err(Refused::Semi(
+                s.id,
+                format!(
+                    "{} over `{}`, a child of a cascading foreign key",
+                    semi_kind(s),
+                    s.info.name
+                ),
             ));
         }
         let image_cols = (0..s.referenced.len())

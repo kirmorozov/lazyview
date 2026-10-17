@@ -349,3 +349,128 @@ pub(crate) fn tuple_view(
     v.rewritten = true;
     Some((iv, Some(v)))
 }
+
+/// Replaces semi-join `id` of `b` (`x IN (SELECT k FROM s WHERE p)`, `EXISTS (… s.k = x AND p)`)
+/// by an inner join with the internal view of its distinct keys, `SELECT k FROM s WHERE p GROUP
+/// BY k`, when that table exists: its rows are unique on `k`, so the semi-join is a join. Returns
+/// the internal view while its table is missing; `Err` when the semi-join does not have that
+/// shape (negated, or conditions on the outer query besides the key equalities).
+pub(crate) fn semi_view(
+    b: &mut Block,
+    id: usize,
+    schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> Result<Option<InternalView>, ()> {
+    let k = b.semis.iter().position(|s| s.id == id).ok_or(())?;
+    let s = b.semis[k].clone();
+    if s.negated {
+        return Err(());
+    }
+    let placeholder = |e: &Expr| super::normalize::placeholder_of(e);
+    // Key equalities `s.col = <outer>`, and the subquery's own conditions.
+    let (mut keys, mut local): (Vec<(usize, usize)>, Vec<Expr>) = (Vec::new(), Vec::new());
+    for c in &s.join_conditions {
+        let pair = match c {
+            Expr::BinaryOp {
+                left,
+                op: sqlparser::ast::BinaryOperator::Eq,
+                right,
+            } => [(left, right), (right, left)]
+                .into_iter()
+                .find_map(|(a, z)| {
+                    let col = match &**a {
+                        Expr::CompoundIdentifier(p) if p.len() == 2 => {
+                            s.info.col_index(&super::names::ident_name(&p[1]))
+                        }
+                        _ => None,
+                    }?;
+                    Some((col, placeholder(z)?))
+                }),
+            _ => None,
+        };
+        match pair {
+            Some(p) => keys.push(p),
+            None if super::normalize::has_placeholder(c) => return Err(()),
+            None => local.push(c.clone()),
+        }
+    }
+    let mut cols: Vec<usize> = keys.iter().map(|(c, _)| *c).collect();
+    cols.sort_unstable();
+    cols.dedup();
+    if cols.is_empty() {
+        return Err(());
+    }
+    let col = |c: usize| qcol(&s.alias, &qident(&s.info.columns[c].name));
+    let sel = format!(
+        "SELECT {} FROM {}.{} AS {}{} GROUP BY {}",
+        cols.iter()
+            .map(|&c| format!("{} AS {}", col(c), qident(&s.info.columns[c].name)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        qident(&s.table.0),
+        qident(&s.table.1),
+        qident(&s.alias),
+        and_all(local)
+            .map(|w| format!(" WHERE {w}"))
+            .unwrap_or_default(),
+        cols.iter()
+            .map(|&c| col(c).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let key: Vec<String> = cols
+        .iter()
+        .map(|&c| s.info.columns[c].name.clone())
+        .collect();
+    let iv = view(
+        schema,
+        sel,
+        format!("distinct keys of a subquery over `{}`", s.info.name),
+        key,
+    );
+    let tref = (schema.to_string(), iv.name.clone());
+    let Some(info) = tables.get(&tref) else {
+        return Ok(Some(iv));
+    };
+    qualify(b).map_err(|_| ())?;
+    let args = b
+        .select
+        .selection
+        .as_ref()
+        .and_then(|w| super::normalize::marker_args(w, id))
+        .ok_or(())?;
+    let mut alias = format!("{}_keys", s.alias);
+    while b.items.iter().any(|i| i.alias.eq_ignore_ascii_case(&alias)) {
+        alias.push('_');
+    }
+    let marker = super::normalize::marker_name(id);
+    let mut conds: Vec<Expr> = b
+        .select
+        .selection
+        .take()
+        .iter()
+        .flat_map(conjuncts)
+        .filter(|c| !matches!(c, Expr::Function(f) if f.name.to_string() == marker))
+        .collect();
+    for (c, ph) in keys {
+        conds.push(Expr::BinaryOp {
+            left: Box::new(qcol(&alias, &qident(&s.info.columns[c].name))),
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right: Box::new(super::ast::nested(args.get(ph).ok_or(())?.clone())),
+        });
+    }
+    b.select.selection = and_all(conds);
+    b.select.from.push(TableWithJoins {
+        relation: table_ref_factor(&tref, &alias),
+        joins: vec![],
+    });
+    b.items.push(Item {
+        alias,
+        pos: (b.select.from.len() - 1, None),
+        origin: Origin::Table,
+        source: Source::Table(tref, info.clone()),
+    });
+    b.semis.remove(k);
+    b.rewritten = true;
+    Ok(None)
+}

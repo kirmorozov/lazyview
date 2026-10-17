@@ -719,6 +719,44 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
     );
 }
 
+/// A semi-join whose table maps to the units neither directly nor through a unique key: an
+/// inner join with the internal view of its distinct keys.
+#[test]
+fn internal_views_for_untraceable_semi_joins() {
+    let mut cat = catalog();
+    let sql = "SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT customer_id FROM orders WHERE total > 100)";
+    assert_eq!(
+        reason(&format!("CREATE VIEW v AS {sql}")),
+        "IN subquery over `orders` is not correlated on the view's unit key"
+    );
+    let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
+        panic!("expected an internal view")
+    };
+    assert_eq!(
+        ivs[0].sql,
+        format!(
+            "CREATE VIEW `{}` AS SELECT `orders`.`customer_id` AS `customer_id` FROM `db`.`orders` AS `orders` \
+             WHERE (`orders`.total > 100) GROUP BY `orders`.`customer_id`",
+            ivs[0].name
+        )
+    );
+    assert_eq!(ivs[0].key, vec!["customer_id".to_string()]);
+    let (k, t) = internal_table(&ivs[0], &[("customer_id", "int")], &[0]);
+    cat.insert(k, t);
+    let super::Outcome::Plan(v) = outcome(sql, &cat) else {
+        panic!("expected a plan")
+    };
+    assert_eq!(v.mode, Mode::Spj);
+    assert_eq!(v.aliases.len(), 2);
+    assert!(
+        v.where_sql
+            .as_deref()
+            .is_some_and(|w| w.contains("`orders_keys`.`customer_id` = `o`.customer_id")),
+        "{:?}",
+        v.where_sql
+    );
+}
+
 /// Window and top-N CTEs are isolated too: the parent filters or joins their table.
 #[test]
 fn internal_views_for_windows_and_top_n() {

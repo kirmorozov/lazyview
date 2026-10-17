@@ -1352,6 +1352,24 @@ pub(crate) fn fill_placeholders(e: &mut Expr, args: &[Expr]) {
     });
 }
 
+/// The outer-expression index of a placeholder.
+pub(crate) fn placeholder_of(e: &Expr) -> Option<usize> {
+    placeholder_index(e)
+}
+
+/// Whether `e` contains a placeholder (refers to the outer query).
+pub(crate) fn has_placeholder(e: &Expr) -> bool {
+    let mut found = false;
+    let _ = visit_expressions(e, |x: &Expr| {
+        if placeholder_index(x).is_some() {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
 pub(crate) fn marker_name(id: usize) -> String {
     format!("{SEMI_MARKER}{id}__")
 }

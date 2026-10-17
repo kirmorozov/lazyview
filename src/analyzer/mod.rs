@@ -159,9 +159,20 @@ pub fn analyze(
                 b.outputs.len()
             );
         }
-        match lower::plan_block(def, &b, default_schema, tables)? {
-            Ok(p) => p,
-            Err(why) => return full(&why),
+        loop {
+            match lower::plan_block(def, &b, default_schema, tables)? {
+                Ok(p) => break p,
+                // A semi-join whose table cannot be traced to the units: over an internal view
+                // of its distinct keys it is an inner join.
+                Err(lower::Refused::Semi(id, why)) if opts.internal_views => {
+                    match internal::semi_view(&mut b, id, default_schema, tables) {
+                        Ok(None) => continue,
+                        Ok(Some(iv)) => return Ok(Outcome::NeedsInternal(vec![iv])),
+                        Err(()) => return full(&why),
+                    }
+                }
+                Err(r) => return full(&r.reason()),
+            }
         }
     };
     if opts.internal_views && internal::needs_tuple_view(&plan) {
@@ -170,7 +181,7 @@ pub fn analyze(
             Some((_, Some(v))) => {
                 return match lower::plan_block(def, &v, default_schema, tables)? {
                     Ok(p) => Ok(Outcome::Plan(p)),
-                    Err(why) => full(&why),
+                    Err(r) => full(&r.reason()),
                 }
             }
             None => {}

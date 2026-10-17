@@ -1,7 +1,7 @@
 # Query analyzer: design
 
-Status: phase A done except branch plans (`src/analyzer`, tested on all six servers by
-`tests/cte.rs`, not yet called by the engine); phases B–D below. Owner rule: **a view is maintained incrementally
+Status: phase A done (`src/analyzer`, tested on all six servers by `tests/cte.rs`, not yet
+called by the engine); phases B–D below. Owner rule: **a view is maintained incrementally
 unless it is mathematically impossible to trace a source change to the output rows it affects.**
 Every Full fallback names the construct and states why no trace exists.
 
@@ -100,14 +100,16 @@ the CTE-unaware one. `ViewPlan` stays the executor contract; additions are backw
 | INTERSECT / EXCEPT (8.0.31+, MariaDB) | internal UNION ALL view with branch counts + grouped view (`HAVING SUM(b=1)>0 AND SUM(b=2)>0` / `=0`) | tuple | set semantics by counting |
 | IN / EXISTS with a unique subquery key (its PK, key-preserving join) | **semi-join → inner join**, merged | normal alias | ⋉ = ⋈ when each outer row matches ≤ 1 inner row; IN's NULL logic ≡ `=` |
 | IN / EXISTS / NOT EXISTS whose correlation equals the unit | **semi-join alias**: predicate kept in the refresh, subquery table traced by direct units | unit | the predicate of unit u reads only subquery rows with key u |
-| other IN / EXISTS / NOT EXISTS with equality correlation `k = x` | semi-join alias traced by a **forward key query** `… WHERE <outer WHERE without it> AND x IN (k values)` | outer units with x = k | the old relevance of a subquery row depends only on outer rows with x = k now or before; those that changed are traced by their own images |
+| other IN / EXISTS with equality correlation `k = x` | inner join with the **internal view of its distinct keys** `SELECT k FROM s WHERE p GROUP BY k` (unique on k) | normal alias over the internal table | ⋉ over a unique key = ⋈ |
+| other NOT EXISTS with equality correlation `k = x` | semi-join alias traced by a **forward key query** `… WHERE <outer WHERE without it> AND x IN (k values)` (phase B) | outer units with x = k | the old relevance of a subquery row depends only on outer rows with x = k now or before; those that changed are traced by their own images |
+| correlated scalar subquery `(SELECT e FROM s WHERE s.pk = x …)` | **LEFT JOIN** `s ON s.pk = x …`, value `e` (guarded `IF(s.pk IS NULL, NULL, e)` unless NULL-propagating) | normal alias | ≤ 1 row matches; no row gives NULL in both forms |
 | NOT IN | as NOT EXISTS, plus units with `x IS NULL` on any change and **all units** when a NULL k enters/leaves | — | `x NOT IN K` is TRUE iff K = ∅ or (x, K have no NULL and x ∉ K) |
 | uncorrelated EXISTS / scalar subquery in WHERE | all units on a change of the subquery's tables | — | the predicate is one value for all rows |
 | window functions with PARTITION BY | **partitioned units**: unit = PARTITION BY columns common to all windows; filter before windowing keeps whole partitions | partition key; per-alias lineage (rows are 1:1 with source tuples) | window values of a partition depend only on its rows |
 | window without PARTITION BY | one unit, **bounded recompute** (one query, diff; no swap) | — | the result is one partition |
 | top-N `ORDER BY … LIMIT n` | **bounded recompute** into an internal `top-(n+B)` buffer view; the MV is top-n over the buffer; changes ranked strictly below the buffer's last key are skipped (exact-kind sort keys only); the buffer is recomputed when < n rows remain or a change is not comparable | one unit | a change ranked strictly below the buffer's last row cannot enter the first n; removals use up the B spare rows |
 | filter on a window result (top-N per partition) | window block as internal partitioned view + outer filter as chained view (unit = partition key) | partition key | composition |
-| RIGHT JOIN at the start, STRAIGHT_JOIN, NATURAL JOIN | rewritten to LEFT JOIN / JOIN / USING | normal | syntax |
+| RIGHT JOIN at the start, STRAIGHT_JOIN, NATURAL JOIN, parenthesized inner joins | rewritten to LEFT JOIN / JOIN / USING (common columns) / one chain | normal | syntax; inner joins associate |
 | LEFT JOIN with WHERE keeping NULL-extended rows (`IS NULL`, `COALESCE`, `OR`) | lookups of the NULL-side alias drop the conjuncts that are not NULL-rejecting on it (superset), refresh re-evaluates them | normal | dropping conjuncts can only add units |
 | table without PK as anchor | **value units**: unit = its referenced columns (exact kinds), duplicates counted by the refresh | value lineage | equal rows are interchangeable; the refresh rewrites the multiset |
 | SQL view as a source | inlined like a derived table (needs `VIEW_DEFINITION` in the catalog) | as merged | a view is a named derived table |
@@ -201,9 +203,10 @@ pushdown (MySQL 8.0.22+, MariaDB 10.2+) only affects rebuild speed. Naming diffe
 ## 8. Rollout
 
 * **A** (analyzer, no executor change): build/normalize/classify/lower; merge family, merge-up,
-  pull-up, DISTINCT→GROUP BY, semi-joins with unique keys or unit correlation; analyzer side of
-  internal views (`analyze()` with `Options`, `Outcome::NeedsInternal`); tests. Branch plans
-  for UNION ALL still to do.
+  pull-up, DISTINCT→GROUP BY, semi-joins with unique keys or unit correlation, scalar lookups
+  as LEFT JOINs, join syntax; analyzer side of internal views (`analyze()` with `Options`,
+  `Outcome::NeedsInternal`: aggregated / window / top-N CTEs, tuple lineage, distinct keys of
+  semi-joins) and of UNION ALL branch plans (`Outcome::Branches`); tests.
 * **B** (wiring, `analyze.rs` after go-ahead): `analyze::plan` / `referenced_tables` delegate;
   block-planner additions that need no engine change: partitioned windows, bounded recompute
   (top-N, windows without PARTITION BY), semi/anti-join lookup templates, NULL-side lookup

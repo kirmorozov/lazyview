@@ -138,7 +138,13 @@ pub(crate) fn branches(
         b.rewritten = true;
         match lower::plan_block(&branch_def, &b, schema, tables)? {
             Ok(p) => plans.push(p),
-            Err(why) => return Ok(Some(Err(format!("{why} in UNION ALL branch {}", i + 1)))),
+            Err(r) => {
+                return Ok(Some(Err(format!(
+                    "{} in UNION ALL branch {}",
+                    r.reason(),
+                    i + 1
+                ))))
+            }
         }
     }
     Ok(Some(Ok(Branches { probe_sql, plans })))
