@@ -38,6 +38,13 @@ pub struct Config {
     pub drop_removed: bool,
     pub on_missing_binlog: MissingBinlog,
     pub heartbeat: Duration,
+    /// Minimum time between two full rebuilds of the same view (views that cannot be maintained
+    /// incrementally: DISTINCT, UNION, LIMIT, ...). Changes mark the view stale; it is rebuilt
+    /// once per interval at most. 0 = as soon as possible.
+    pub full_refresh_interval: Duration,
+    /// Upper bound for one write round-trip to a target (an unresponsive target must not stall
+    /// the binlog loop).
+    pub target_timeout: Duration,
     /// Background builds running at once (each holds 1 + targets connections).
     pub build_concurrency: usize,
     /// Wait before reading sources when no GTID fence is available (binlog events can arrive
@@ -58,7 +65,9 @@ impl Config {
         let discovered: Vec<String> = std::env::vars()
             .filter_map(|(k, _)| {
                 let rest = k.strip_prefix("LAZYVIEW_TARGET_")?;
-                let name = rest.strip_suffix("_DSN").or_else(|| rest.strip_suffix("_HOST"))?;
+                let name = rest
+                    .strip_suffix("_DSN")
+                    .or_else(|| rest.strip_suffix("_HOST"))?;
                 (!name.is_empty()).then(|| name.to_ascii_lowercase())
             })
             .collect();
@@ -75,7 +84,10 @@ impl Config {
         let instance_id = get("LAZYVIEW_INSTANCE_ID").unwrap_or_else(|| "default".into());
         let num = |k: &str, d: u64| -> Result<u64> {
             match get(k) {
-                Some(v) => v.trim().parse().with_context(|| format!("{k} must be a number")),
+                Some(v) => v
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("{k} must be a number")),
                 None => Ok(d),
             }
         };
@@ -96,17 +108,21 @@ impl Config {
                 _ => bail!("LAZYVIEW_START_MODE must be resume|rebuild|once"),
             },
         };
-        let on_missing_binlog = match get("LAZYVIEW_ON_MISSING_BINLOG").map(|v| v.to_ascii_lowercase()) {
-            None => MissingBinlog::Fail,
-            Some(v) => match v.as_str() {
-                "fail" => MissingBinlog::Fail,
-                "rebuild" => MissingBinlog::Rebuild,
-                _ => bail!("LAZYVIEW_ON_MISSING_BINLOG must be fail|rebuild"),
-            },
-        };
+        let on_missing_binlog =
+            match get("LAZYVIEW_ON_MISSING_BINLOG").map(|v| v.to_ascii_lowercase()) {
+                None => MissingBinlog::Fail,
+                Some(v) => match v.as_str() {
+                    "fail" => MissingBinlog::Fail,
+                    "rebuild" => MissingBinlog::Rebuild,
+                    _ => bail!("LAZYVIEW_ON_MISSING_BINLOG must be fail|rebuild"),
+                },
+            };
         let server_id_fixed = get("LAZYVIEW_SERVER_ID").is_some();
         let server_id = match get("LAZYVIEW_SERVER_ID") {
-            Some(v) => v.trim().parse().context("LAZYVIEW_SERVER_ID must be a number")?,
+            Some(v) => v
+                .trim()
+                .parse()
+                .context("LAZYVIEW_SERVER_ID must be a number")?,
             None => random_server_id(),
         };
         if server_id == 0 {
@@ -119,7 +135,10 @@ impl Config {
         let mut targets = BTreeMap::new();
         if let Some(names) = get("LAZYVIEW_TARGETS") {
             for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-                let prefix = format!("LAZYVIEW_TARGET_{}", name.to_ascii_uppercase().replace('-', "_"));
+                let prefix = format!(
+                    "LAZYVIEW_TARGET_{}",
+                    name.to_ascii_uppercase().replace('-', "_")
+                );
                 let dsn = connection(&get, &prefix)?
                     .ok_or_else(|| anyhow!("target {name}: set {prefix}_HOST/_USER/_PASSWORD/_DATABASE or {prefix}_DSN"))?;
                 targets.insert(name.to_string(), dsn);
@@ -139,13 +158,22 @@ impl Config {
             drop_removed: flag("LAZYVIEW_DROP_REMOVED", true)?,
             on_missing_binlog,
             build_concurrency: num("LAZYVIEW_BUILD_CONCURRENCY", 2)?.max(1) as usize,
+            full_refresh_interval: Duration::from_millis(num("LAZYVIEW_FULL_REFRESH_MS", 60_000)?),
+            target_timeout: Duration::from_millis(
+                num("LAZYVIEW_TARGET_TIMEOUT_MS", 60_000)?.max(1_000),
+            ),
             heartbeat: Duration::from_millis(num("LAZYVIEW_HEARTBEAT_MS", 5_000)?.max(100)),
             visibility_delay: Duration::from_millis(num("LAZYVIEW_VISIBILITY_DELAY_MS", 20)?),
-            position_persist_interval: Duration::from_millis(num("LAZYVIEW_POSITION_PERSIST_MS", 5_000)?),
+            position_persist_interval: Duration::from_millis(num(
+                "LAZYVIEW_POSITION_PERSIST_MS",
+                5_000,
+            )?),
             health_addr: match get("LAZYVIEW_HEALTH_ADDR").map(|v| v.trim().to_string()) {
                 None => Some(([0, 0, 0, 0], 8080).into()),
                 Some(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => None,
-                Some(v) => Some(v.parse().with_context(|| format!("LAZYVIEW_HEALTH_ADDR must be host:port or off, got {v}"))?),
+                Some(v) => Some(v.parse().with_context(|| {
+                    format!("LAZYVIEW_HEALTH_ADDR must be host:port or off, got {v}")
+                })?),
             },
             server_id_fixed,
         })
@@ -156,12 +184,27 @@ impl Config {
 /// `_DATABASE` (values used verbatim: no URL encoding needed by the user).
 fn connection(get: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Option<String>> {
     let part = |k: &str| get(&format!("{prefix}_{k}")).filter(|v| !v.is_empty());
-    let tls = part("TLS").or_else(|| get("LAZYVIEW_TLS").filter(|v| !v.is_empty()));
+    let ca = part("TLS_CA").or_else(|| get("LAZYVIEW_TLS_CA").filter(|v| !v.is_empty()));
+    // A CA file without an explicit mode means full verification (certificate + host name).
+    // (verify-ca, i.e. skipping only the host-name check, does not work with mysql_async 0.37 +
+    // current rustls: its NotValidForName string match never fires.)
+    let tls = part("TLS")
+        .or_else(|| get("LAZYVIEW_TLS").filter(|v| !v.is_empty()))
+        .or_else(|| ca.as_ref().map(|_| "verify-full".to_string()));
     let dsn = match part("DSN") {
         Some(dsn) => Some(dsn),
         None => assemble(&part, prefix)?,
     };
-    dsn.map(|d| finish_dsn(&d, tls.as_deref(), prefix)).transpose()
+    dsn.map(|d| {
+        let mut d = finish_dsn(&d, tls.as_deref(), prefix)?;
+        if let Some(ca) = &ca {
+            d.push(if d.contains('?') { '&' } else { '?' });
+            d.push_str("tls_ca=");
+            d.push_str(&encode(ca));
+        }
+        Ok(d)
+    })
+    .transpose()
 }
 
 /// Accepts `mariadb://` as an alias and appends TLS parameters for `<PREFIX>_TLS`.
@@ -174,10 +217,18 @@ fn finish_dsn(dsn: &str, tls: Option<&str>, prefix: &str) -> Result<String> {
         None => None,
         Some(t) => match t.as_str() {
             "disabled" | "off" | "false" => None,
-            "required" | "require" | "on" | "true" => Some("require_ssl=true&verify_ca=false&verify_identity=false"),
-            "verify-ca" | "verify_ca" => Some("require_ssl=true&verify_ca=true&verify_identity=false"),
-            "verify-full" | "verify_identity" | "verify-identity" => Some("require_ssl=true&verify_ca=true&verify_identity=true"),
-            other => bail!("{prefix}_TLS must be disabled|required|verify-ca|verify-full, got {other}"),
+            "required" | "require" | "on" | "true" => {
+                Some("require_ssl=true&verify_ca=false&verify_identity=false")
+            }
+            "verify-ca" | "verify_ca" => {
+                Some("require_ssl=true&verify_ca=true&verify_identity=false")
+            }
+            "verify-full" | "verify_identity" | "verify-identity" => {
+                Some("require_ssl=true&verify_ca=true&verify_identity=true")
+            }
+            other => {
+                bail!("{prefix}_TLS must be disabled|required|verify-ca|verify-full, got {other}")
+            }
         },
     };
     if let Some(p) = params {
@@ -191,18 +242,29 @@ fn assemble(part: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Opti
     let Some(host) = part("HOST") else {
         return Ok(None);
     };
-    let db = part("DATABASE").ok_or_else(|| anyhow!("{prefix}_DATABASE is required (the schema lazyview works in)"))?;
+    let db = part("DATABASE")
+        .ok_or_else(|| anyhow!("{prefix}_DATABASE is required (the schema lazyview works in)"))?;
     let user = part("USER").unwrap_or_else(|| "root".into());
     let port: u16 = match part("PORT") {
-        Some(p) => p.trim().parse().with_context(|| format!("{prefix}_PORT must be a port number"))?,
+        Some(p) => p
+            .trim()
+            .parse()
+            .with_context(|| format!("{prefix}_PORT must be a port number"))?,
         None => 3306,
     };
     let auth = match part("PASSWORD") {
         Some(pw) => format!("{}:{}", encode(&user), encode(&pw)),
         None => encode(&user),
     };
-    let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host };
-    Ok(Some(format!("mysql://{auth}@{host}:{port}/{}", encode(&db))))
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(Some(format!(
+        "mysql://{auth}@{host}:{port}/{}",
+        encode(&db)
+    )))
 }
 
 fn encode(s: &str) -> String {
@@ -221,7 +283,12 @@ fn encode(s: &str) -> String {
 pub fn random_server_id() -> u32 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
     h.write_u32(std::process::id());
     (1 << 30) | (h.finish() as u32 & ((1 << 30) - 1))
 }
@@ -232,7 +299,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config> {
-        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         Config::from_lookup(|k| m.get(k).cloned())
     }
 
@@ -267,7 +337,10 @@ mod tests {
             ("LAZYVIEW_TARGET_RE_PORT_DSN", "mysql://b"),
         ])
         .unwrap();
-        assert_eq!(c.targets.get("re-port").map(String::as_str), Some("mysql://b"));
+        assert_eq!(
+            c.targets.get("re-port").map(String::as_str),
+            Some("mysql://b")
+        );
         assert!(cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_TARGETS", "nope")]).is_err());
         let c = cfg(&[
             ("LAZYVIEW_HOST", "db"),
@@ -279,11 +352,31 @@ mod tests {
         assert_eq!(c.dsn, "mysql://lv:p%40ss%3Aw%2Frd%23%25@db:3306/app");
         let o = mysql_async::Opts::from_url(&c.dsn).unwrap();
         assert_eq!(o.pass(), Some("p@ss:w/rd#%"));
-        assert!(cfg(&[("LAZYVIEW_HOST", "db")]).is_err(), "database required");
-        let c = cfg(&[("LAZYVIEW_DSN", "mariadb://u:p@h:3307/d"), ("LAZYVIEW_TLS", "required"), ("LAZYVIEW_HEALTH_ADDR", "off")]).unwrap();
-        assert_eq!(c.dsn, "mysql://u:p@h:3307/d?require_ssl=true&verify_ca=false&verify_identity=false");
+        assert!(
+            cfg(&[("LAZYVIEW_HOST", "db")]).is_err(),
+            "database required"
+        );
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "mariadb://u:p@h:3307/d"),
+            ("LAZYVIEW_TLS", "required"),
+            ("LAZYVIEW_HEALTH_ADDR", "off"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.dsn,
+            "mysql://u:p@h:3307/d?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
         assert!(mysql_async::Opts::from_url(&c.dsn).is_ok());
         assert_eq!(c.health_addr, None);
         assert!(cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_TLS", "maybe")]).is_err());
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "mysql://u@h/d"),
+            ("LAZYVIEW_TLS_CA", "/etc/ca dir/rds.pem"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.dsn,
+            "mysql://u@h/d?require_ssl=true&verify_ca=true&verify_identity=true&tls_ca=%2Fetc%2Fca%20dir%2Frds.pem"
+        );
     }
 }

@@ -122,7 +122,8 @@ impl UnitChunk {
             UnitChunk::Keys(keys) => {
                 let mut params = Vec::new();
                 let mut parts = Vec::new();
-                let (nulls, plain): (Vec<&Key>, Vec<&Key>) = keys.iter().partition(|k| crate::datum::key_has_null(k));
+                let (nulls, plain): (Vec<&Key>, Vec<&Key>) =
+                    keys.iter().partition(|k| crate::datum::key_has_null(k));
                 if !plain.is_empty() {
                     let tuple = |n: usize| {
                         if n == 1 {
@@ -175,11 +176,27 @@ pub struct ViewDirty {
 
 impl ViewDirty {
     pub fn is_empty(&self) -> bool {
-        !self.all && !self.rebuild && self.units.is_empty() && self.images.iter().all(HashSet::is_empty)
+        !self.all
+            && !self.rebuild
+            && self.units.is_empty()
+            && self.images.iter().all(HashSet::is_empty)
     }
 
     pub fn key_count(&self) -> usize {
         self.units.len() + self.images.iter().map(HashSet::len).sum::<usize>()
+    }
+
+    /// Adds everything buffered in `other` (e.g. to retry after a failed refresh).
+    pub fn merge(&mut self, other: ViewDirty) {
+        self.units.extend(other.units);
+        if self.images.len() < other.images.len() {
+            self.images.resize(other.images.len(), HashSet::new());
+        }
+        for (mine, theirs) in self.images.iter_mut().zip(other.images) {
+            mine.extend(theirs);
+        }
+        self.all |= other.all;
+        self.rebuild |= other.rebuild;
     }
 
     pub fn take(&mut self) -> ViewDirty {
@@ -205,9 +222,10 @@ fn value_at(row: &BinlogRow, c: usize) -> Option<&BinlogValue<'_>> {
 }
 
 fn changed(before: &BinlogRow, after: &BinlogRow, mask: &[bool]) -> bool {
-    mask.iter()
-        .enumerate()
-        .any(|(c, &m)| m && (value_at(before, c) != value_at(after, c) || matches!(value_at(after, c), Some(BinlogValue::JsonDiff(_)))))
+    mask.iter().enumerate().any(|(c, &m)| {
+        m && (value_at(before, c) != value_at(after, c)
+            || matches!(value_at(after, c), Some(BinlogValue::JsonDiff(_))))
+    })
 }
 
 fn project(row: &BinlogRow, a: &AliasPlan, cols: &[usize]) -> Key {
@@ -217,7 +235,13 @@ fn project(row: &BinlogRow, a: &AliasPlan, cols: &[usize]) -> Key {
 }
 
 /// Records the effect of one row change of `alias` on `plan`.
-pub fn feed(plan: &ViewPlan, alias: usize, dirty: &mut ViewDirty, before: Option<&BinlogRow>, after: Option<&BinlogRow>) -> Fed {
+pub fn feed(
+    plan: &ViewPlan,
+    alias: usize,
+    dirty: &mut ViewDirty,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+) -> Fed {
     let a = &plan.aliases[alias];
     if let (Some(b), Some(af)) = (before, after) {
         if !changed(b, af, &a.referenced) {
@@ -254,13 +278,22 @@ pub fn feed(plan: &ViewPlan, alias: usize, dirty: &mut ViewDirty, before: Option
 
 /// Records the effect of a parent-row change that the storage engine cascades into a child
 /// table the view reads (cascade `ci` of the plan).
-pub fn feed_cascade(plan: &ViewPlan, ci: usize, dirty: &mut ViewDirty, before: Option<&BinlogRow>, after: Option<&BinlogRow>) -> Fed {
+pub fn feed_cascade(
+    plan: &ViewPlan,
+    ci: usize,
+    dirty: &mut ViewDirty,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+) -> Fed {
     let c = &plan.cascades[ci];
     let Some(b) = before else { return Fed::Skipped };
     let action = match after {
         None => c.on_delete,
         Some(a) => {
-            let changed = c.parent_cols.iter().any(|&p| value_at(b, p) != value_at(a, p));
+            let changed = c
+                .parent_cols
+                .iter()
+                .any(|&p| value_at(b, p) != value_at(a, p));
             if !changed {
                 return Fed::Skipped;
             }
@@ -279,16 +312,23 @@ pub fn feed_cascade(plan: &ViewPlan, ci: usize, dirty: &mut ViewDirty, before: O
         return Fed::Recorded;
     };
     let unit = |row: &BinlogRow| -> Key {
-        pcols.iter().map(|&p| Datum::from_binlog(value_at(row, p), &c.parent.columns[p])).collect()
+        pcols
+            .iter()
+            .map(|&p| Datum::from_binlog(value_at(row, p), &c.parent.columns[p]))
+            .collect()
     };
     dirty.units.insert(unit(b));
     if let Some(a) = after {
         match action {
             FkAction::Cascade => dirty.units.insert(unit(a)),
-            _ => dirty.units.insert(pcols.iter().map(|_| Datum::Null).collect()),
+            _ => dirty
+                .units
+                .insert(pcols.iter().map(|_| Datum::Null).collect()),
         }
     } else if action == FkAction::SetNull {
-        dirty.units.insert(pcols.iter().map(|_| Datum::Null).collect());
+        dirty
+            .units
+            .insert(pcols.iter().map(|_| Datum::Null).collect());
     }
     Fed::Recorded
 }

@@ -96,11 +96,29 @@ impl Datum {
                 Datum::Bytes(parts.join(",").into_bytes())
             }
             (ColKind::Unsigned(bits), Value::Int(i)) => {
-                let mask = if *bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                let mask = if *bits >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                };
                 Datum::uint((*i as u64) & mask)
             }
             // TIMESTAMP2 arrives as "<epoch>[.<usec>]"; the param wrapper is FROM_UNIXTIME(?).
             (ColKind::Timestamp, Value::Int(i)) => Datum::Bytes(i.to_string().into_bytes()),
+            // BIT(n): big-endian bytes; bound as CAST(? AS UNSIGNED).
+            (ColKind::Bit(_), Value::Bytes(b)) => {
+                Datum::uint(b.iter().take(8).fold(0u64, |acc, x| (acc << 8) | *x as u64))
+            }
+            // BINARY(n): the binlog drops trailing 0x00 padding that the stored value has.
+            (ColKind::Binary, Value::Bytes(b)) if col.data_type == "binary" => {
+                let mut b = b.clone();
+                if let Some(n) = col.octet_len.and_then(|n| usize::try_from(n).ok()) {
+                    if b.len() < n {
+                        b.resize(n, 0);
+                    }
+                }
+                Datum::Bytes(b)
+            }
             (_, other) => Datum::from_value(other.clone()),
         }
     }
@@ -113,4 +131,30 @@ fn serde_json_text(j: &mysql_async::binlog::jsonb::Value<'_>) -> Option<String> 
 
 pub fn key_has_null(k: &[Datum]) -> bool {
     k.iter().any(Datum::is_null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mysql_async::binlog::value::BinlogValue;
+
+    fn bv(v: Value) -> BinlogValue<'static> {
+        BinlogValue::Value(v)
+    }
+
+    #[test]
+    fn binary_padding_and_bit() {
+        let bin = Column::new("b", "binary", "binary(4)", None, None, Some(4), false);
+        let d = Datum::from_binlog(Some(&bv(Value::Bytes(vec![1, 2]))), &bin);
+        assert_eq!(d, Datum::Bytes(vec![1, 2, 0, 0]));
+        let varbin = Column::new("b", "varbinary", "varbinary(4)", None, None, Some(4), false);
+        let d = Datum::from_binlog(Some(&bv(Value::Bytes(vec![1, 2]))), &varbin);
+        assert_eq!(d, Datum::Bytes(vec![1, 2]));
+        let bit = Column::new("f", "bit", "bit(12)", None, None, None, false);
+        let d = Datum::from_binlog(Some(&bv(Value::Bytes(vec![0x0a, 0xbc]))), &bit);
+        assert_eq!(d, Datum::Int(0x0abc));
+        let wide = Column::new("f", "bit", "bit(64)", None, None, None, false);
+        let d = Datum::from_binlog(Some(&bv(Value::Bytes(vec![0xff; 8]))), &wide);
+        assert_eq!(d, Datum::UInt(u64::MAX));
+    }
 }

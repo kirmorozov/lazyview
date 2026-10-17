@@ -24,12 +24,21 @@ pub struct Leadership {
 }
 
 pub fn lock_name(schema: &str, instance_id: &str) -> String {
-    format!("lazyview:{}", crate::analyze::definition_hash(&format!("{schema}/{instance_id}")))
+    format!(
+        "lazyview:{}",
+        crate::analyze::definition_hash(&format!("{schema}/{instance_id}"))
+    )
 }
 
 /// Blocks (as hot standby) until this process holds the lock, then bumps the fencing epoch.
 /// `Ok(None)` when shutdown was requested while waiting.
-pub async fn acquire(conn: &mut Conn, schema: &str, instance_id: &str, metrics: &Metrics, shutdown: &mut watch::Receiver<bool>) -> Result<Option<Leadership>> {
+pub async fn acquire(
+    conn: &mut Conn,
+    schema: &str,
+    instance_id: &str,
+    metrics: &Metrics,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Option<Leadership>> {
     let name = lock_name(schema, instance_id);
     let mut logged = false;
     let mut wait = Duration::from_millis(250);
@@ -61,9 +70,15 @@ pub async fn acquire(conn: &mut Conn, schema: &str, instance_id: &str, metrics: 
     )
     .await?;
     let epoch: Option<u64> = conn
-        .exec_first("SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?", (instance_id,))
+        .exec_first(
+            "SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
+            (instance_id,),
+        )
         .await?;
-    Ok(Some(Leadership { lock_name: name, epoch: epoch.unwrap_or(1) }))
+    Ok(Some(Leadership {
+        lock_name: name,
+        epoch: epoch.unwrap_or(1),
+    }))
 }
 
 /// Fails if this connection no longer holds the lock (e.g. it was killed and re-established).
@@ -72,7 +87,10 @@ pub async fn verify(conn: &mut Conn, l: &Leadership) -> Result<()> {
         .exec_first("SELECT IS_USED_LOCK(?) = CONNECTION_ID()", (&l.lock_name,))
         .await?;
     if ok.flatten() != Some(1) {
-        bail!("lost leadership lock `{}`; another instance may be active", l.lock_name);
+        bail!(
+            "lost leadership lock `{}`; another instance may be active",
+            l.lock_name
+        );
     }
     Ok(())
 }
