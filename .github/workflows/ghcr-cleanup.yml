@@ -5,6 +5,7 @@ name: ghcr cleanup
 #            and the newest N images tagged sha-* (default 20)
 #   deleted: older sha-* images, and untagged images (superseded re-runs, pushes
 #            interrupted before the index was written)
+#   Images pushed within the last hour are never touched.
 #
 # A multi-arch image is an index whose platform manifests and attestation
 # manifests show up on GHCR as separate *untagged* versions. A plain "delete
@@ -28,6 +29,10 @@ on:
         description: Number of newest sha-* images to keep
         type: number
         default: 20
+      older-than:
+        description: Only consider images older than this (e.g. "1 hour", "30 minutes")
+        type: string
+        default: 1 hour
   workflow_call:
 
 permissions: {}
@@ -68,6 +73,10 @@ jobs:
           delete-tags: '^sha-[0-9a-f]+$'
           keep-n-tagged: ${{ inputs.keep-sha-tags || 20 }}
           delete-untagged: true
+          # Never touch anything pushed in the last hour: while a build is being pushed
+          # (here, or a release from a tag running in parallel) its platform manifests
+          # exist before the index that references them and would look untagged.
+          older-than: ${{ inputs.older-than || '1 hour' }}
           # Log any multi-arch image with a missing platform/attestation manifest.
           validate: true
           # Scheduled and post-publish runs delete; manual runs default to a dry run.
