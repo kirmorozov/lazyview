@@ -1,0 +1,40 @@
+version: 2
+updates:
+  # Workflow actions are pinned to commit SHAs with a `# vX.Y.Z` comment;
+  # Dependabot bumps both together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  # Minor and patch updates in one PR; a new major version gets its own PR.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+
+  # Base images in the Dockerfile (rust build image, distroless runtime), pinned by
+  # digest. Bumping the rust image also means bumping RUST_TOOLCHAIN in ci.yml.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      docker:
+        patterns: ["*"]
+    commit-message:
+      prefix: docker

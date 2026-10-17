@@ -1,4 +1,4 @@
-# lazyview + MySQL 8.4, ready to run (Docker Compose v2.23+ for inline `configs`).
+# lazyview + MySQL 8.4, ready to run (Docker Compose v2.23.1+ for inline `configs`).
 #
 #   docker compose -f docker-compose.example.yml up -d --build --wait   # until both are healthy
 #   docker compose -f docker-compose.example.yml logs -f lazyview
@@ -15,8 +15,9 @@
 #     mysql -ulazyview -plazyview app -e "SELECT * FROM _lazyview_state; SELECT * FROM customer_totals;"
 #
 # The lazyview image is built from this checkout (Dockerfile target `runtime`). To use a
-# published image instead:
-#   export LAZYVIEW_IMAGE=ghcr.io/OWNER/lazyview:latest
+# published image instead (`edge` = latest build of main; a version tag such as 0.1.0, or
+# `latest`, once a v* release exists):
+#   export LAZYVIEW_IMAGE=ghcr.io/kirmorozov/lazyview:edge
 #   docker compose -f docker-compose.example.yml pull && docker compose -f docker-compose.example.yml up -d --no-build
 #
 # Clean up (drops the database volume): docker compose -f docker-compose.example.yml down -v

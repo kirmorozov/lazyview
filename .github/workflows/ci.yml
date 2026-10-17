@@ -1,5 +1,10 @@
 name: ci
 
+# lint, unit, e2e and integration run on every push and pull request.
+# Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
+#   main  -> `image`   (needs lint + unit + e2e; integration runs alongside, not required)
+#   v*    -> `release` (needs lint + unit + e2e + all six integration servers)
+# Pull requests never get registry credentials and never push.
 on:
   push:
     branches: [main]
@@ -7,233 +12,273 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A newer run for the same ref and event cancels the superseded one.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
+  # Keep in step with the rust image in the Dockerfile.
   RUST_TOOLCHAIN: "1.99.1"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
 jobs:
-  lint-unit:
-    name: fmt + clippy + unit tests
+  lint:
+    name: lint (fmt + clippy)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt
+          persist-credentials: false
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: unit tests
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo test --lib --bins
         run: cargo test --locked --lib --bins
 
   integration:
     name: integration (${{ matrix.flavor }})
     runs-on: ubuntu-24.04
-    needs: lint-unit
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        # Service names and host ports from docker-compose.test.yml.
         include:
-          - { flavor: mysql80,     port: 33080 }
-          - { flavor: mysql84,     port: 33084 }
+          - { flavor: mysql80, port: 33080 }
+          - { flavor: mysql84, port: 33084 }
           - { flavor: mariadb1011, port: 33111 }
-          - { flavor: mariadb114,  port: 33114 }
-          - { flavor: percona80,   port: 33180 }
-          - { flavor: percona84,   port: 33184 }
+          - { flavor: mariadb114, port: 33114 }
+          - { flavor: percona80, port: 33180 }
+          - { flavor: percona84, port: 33184 }
+    env:
+      COMPOSE_FILE: docker-compose.test.yml
+      FLAVOR: ${{ matrix.flavor }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: start ${{ matrix.flavor }} (in the background)
+        run: docker compose up -d --quiet-pull "$FLAVOR"
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: integration
-      - name: start ${{ matrix.flavor }}
-        run: docker compose -f docker-compose.test.yml up -d ${{ matrix.flavor }} --wait --wait-timeout 300
-      - name: build tests
+          # One writer for the six matrix jobs; the test binaries compile even when tests fail.
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.flavor == 'mysql84' }}
+          cache-on-failure: true
+      - name: build integration tests
         run: cargo test --locked --test '*' --no-run
+      - name: wait for ${{ matrix.flavor }}
+        run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"
       - name: integration tests
+        timeout-minutes: 75
         env:
           LAZYVIEW_TEST_DSNS: ${{ matrix.flavor }}=mysql://lv:lv@127.0.0.1:${{ matrix.port }}/lvtest
+          LAZYVIEW_HEALTH_ADDR: "off"
         run: cargo test --locked --test '*' -- --test-threads=1
-      - name: server logs
+      - name: collect server logs
         if: failure()
-        run: docker compose -f docker-compose.test.yml logs ${{ matrix.flavor }}
-      - name: stop
-        if: always()
-        run: docker compose -f docker-compose.test.yml down -v
-
-  image:
-    name: distroless images (runtime + debug, amd64 + arm64)
-    runs-on: ubuntu-24.04
-    needs: [lint-unit, integration]
-    permissions:
-      contents: read
-      packages: write
-    env:
-      IMAGE: ghcr.io/${{ github.repository }}
-      PLATFORMS: linux/amd64,linux/arm64
-      # Push only for non-PR events on main or a v* tag (never for pull requests).
-      PUSH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
-      # OCI annotations on both the per-arch manifests and the multi-arch index
-      # (GHCR shows the index description for multi-arch packages).
-      DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
-    steps:
-      - uses: actions/checkout@v5
-      # No QEMU needed: the build stages run on the runner platform and cross-compile
-      # with cargo-zigbuild; the final stages only COPY onto distroless.
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
-        if: env.PUSH == 'true'
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - id: meta
-        name: tags + labels (runtime)
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=edge,branch=main
-            type=sha,format=short
-            type=ref,event=pr
-          labels: |
-            org.opencontainers.image.title=lazyview
-            org.opencontainers.image.description=Materialized views for MySQL/MariaDB/Percona maintained from the binlog
-            org.opencontainers.image.licenses=MIT
-          annotations: |
-            org.opencontainers.image.description=Materialized views for MySQL/MariaDB/Percona maintained from the binlog
-            org.opencontainers.image.licenses=MIT
-      - id: meta-debug
-        name: tags + labels (debug, -debug suffix)
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: |
-            suffix=-debug,onlatest=true
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=edge,branch=main
-            type=sha,format=short
-            type=ref,event=pr
-          labels: |
-            org.opencontainers.image.title=lazyview
-            org.opencontainers.image.description=Materialized views for MySQL/MariaDB/Percona maintained from the binlog (debug variant: busybox shell under /busybox)
-            org.opencontainers.image.licenses=MIT
-          annotations: |
-            org.opencontainers.image.description=Materialized views for MySQL/MariaDB/Percona maintained from the binlog (debug variant: busybox shell under /busybox)
-            org.opencontainers.image.licenses=MIT
-
-      # Smoke test: load the amd64 images into the runner's docker and run them.
-      # This also warms the builder cache that the multi-arch builds below reuse.
-      - name: build amd64 images for smoke test
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: runtime
-          platforms: linux/amd64
-          load: true
-          tags: lazyview:smoke
-          provenance: false
-          sbom: false
-          cache-from: type=gha,scope=image
-      - name: build amd64 debug image for smoke test
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: debug
-          platforms: linux/amd64
-          load: true
-          tags: lazyview:smoke-debug
-          provenance: false
-          sbom: false
-          cache-from: type=gha,scope=image
-      - name: smoke test
         run: |
-          set -x
-          docker run --rm lazyview:smoke --version
-          rc=0; docker run --rm lazyview:smoke || rc=$?
-          test "$rc" -eq 2   # configuration error without LAZYVIEW_* env
-          test "$(docker image inspect lazyview:smoke --format '{{.Config.User}} {{json .Config.Entrypoint}}')" = '65532:65532 ["/lazyview"]'
-          if docker run --rm --entrypoint /bin/sh lazyview:smoke -c true; then echo "runtime image must not have a shell"; exit 1; fi
-          docker run --rm --entrypoint sh lazyview:smoke-debug -c 'id -u | grep -qx 65532 && /lazyview --version'
-          test "$(docker image inspect lazyview:smoke --format '{{json .Config.Healthcheck.Test}}')" = '["CMD","/lazyview","healthcheck"]'
+          mkdir -p server-logs
+          docker compose logs --no-color --timestamps "$FLAVOR" > "server-logs/${FLAVOR}.log" 2>&1 || true
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload server logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: server-logs-${{ matrix.flavor }}
+          path: server-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop ${{ matrix.flavor }}
+        if: always()
+        run: docker compose down -v
+
+  e2e:
+    name: image smoke + end-to-end
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      AMD64_IMAGE: lazyview:ci-amd64
+      ARM64_IMAGE: lazyview:ci-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # QEMU only runs the finished arm64 image for its smoke test; the Dockerfile
+      # cross-compiles on the runner platform (no emulation during the build).
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The per-platform GitHub Actions caches written here are what the publish
+      # job (publish-image.yml) builds from, so it only assembles and pushes.
+      - name: build linux/amd64
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.AMD64_IMAGE }}
+          build-args: |
+            REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: |
+            type=gha,scope=image-amd64
+          cache-to: type=gha,scope=image-amd64,mode=max
+      - name: smoke test linux/amd64
+        run: make docker-smoke IMAGE="$AMD64_IMAGE"
+      - name: binary version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          got=$(docker run --rm "$AMD64_IMAGE" --version)
+          want="lazyview ${GITHUB_REF_NAME#v}"
+          if [[ $got != "$want" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} but the binary reports '${got}': bump the version in Cargo.toml"
+            exit 1
+          fi
+
       # The shell-free image against a real MySQL 8.4, via the documented compose example.
       - name: end-to-end (docker-compose.example.yml)
+        timeout-minutes: 15
         env:
-          LAZYVIEW_IMAGE: lazyview:smoke
+          LAZYVIEW_IMAGE: ${{ env.AMD64_IMAGE }}
         run: |
           dc() { docker compose -f docker-compose.example.yml "$@"; }
           sql() { dc exec -T mysql mysql -ulazyview -plazyview -NB app -e "$1" 2>/dev/null; }
-          wait_for() { for _ in $(seq 60); do if [ "$(sql "$1")" = "$2" ]; then return 0; fi; sleep 2; done; echo "timeout: $1 != $2"; return 1; }
-          dc up -d --no-build --wait --wait-timeout 300
+          wait_for() {
+            local got=
+            for _ in $(seq 90); do
+              got=$(sql "$1" || true)
+              if [[ $got == "$2" ]]; then echo "ok: $1 -> $2"; return 0; fi
+              sleep 2
+            done
+            echo "::error::timeout: '$1' returned '${got}', want '$2'"
+            return 1
+          }
+          dc up -d --no-build --quiet-pull --wait --wait-timeout 300
+          cid=$(dc ps -q lazyview)
+          test "$(docker inspect -f '{{.State.Health.Status}}' "$cid")" = healthy
+          # The service process really runs as 65532 (not just the image config).
+          uids=$(docker top "$cid" -eo uid | tail -n +2 | sort -u)
+          echo "process uids: ${uids}"
+          test "$uids" = 65532
           wait_for "SELECT COUNT(*) FROM _lazyview" 0
           sql "CREATE TABLE orders (id INT PRIMARY KEY, customer VARCHAR(50), total DECIMAL(10,2));
                INSERT INTO orders VALUES (1,'ann',10),(2,'bob',5),(3,'ann',7);
                INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW customer_totals AS SELECT customer, SUM(total) AS total, COUNT(*) AS n FROM orders GROUP BY customer');"
           wait_for "SELECT state FROM _lazyview_state WHERE name = 'customer_totals'" ready
+          wait_for "SELECT n FROM customer_totals WHERE customer = 'bob'" 1
+          # Incremental maintenance from the binlog: insert, update, delete.
           sql "INSERT INTO orders VALUES (4,'bob',1)"
-          wait_for "SELECT n FROM customer_totals WHERE customer = 'bob'" 2
-          test "$(docker inspect -f '{{.State.Health.Status}}' "$(dc ps -q lazyview)")" = healthy
+          wait_for "SELECT CONCAT(n, ' ', CAST(total AS DECIMAL(10,2))) FROM customer_totals WHERE customer = 'bob'" "2 6.00"
+          sql "UPDATE orders SET total = 20 WHERE id = 1"
+          wait_for "SELECT CONCAT(n, ' ', CAST(total AS DECIMAL(10,2))) FROM customer_totals WHERE customer = 'ann'" "2 27.00"
+          sql "DELETE FROM orders WHERE id = 3"
+          wait_for "SELECT CONCAT(n, ' ', CAST(total AS DECIMAL(10,2))) FROM customer_totals WHERE customer = 'ann'" "1 20.00"
+          test "$(docker inspect -f '{{.State.Health.Status}} {{.RestartCount}}' "$cid")" = "healthy 0"
       - name: end-to-end logs
         if: failure()
-        run: docker compose -f docker-compose.example.yml logs
+        run: |
+          mkdir -p e2e-logs
+          docker compose -f docker-compose.example.yml ps --all > e2e-logs/compose-ps.txt 2>&1 || true
+          docker compose -f docker-compose.example.yml logs --no-color --timestamps > e2e-logs/compose.log 2>&1 || true
+          tail -n 200 e2e-logs/compose.log
+      - name: upload end-to-end logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
       - name: end-to-end cleanup
         if: always()
         run: docker compose -f docker-compose.example.yml down -v
 
-      - name: build (and push) runtime image
-        uses: docker/build-push-action@v7
+      - name: build linux/arm64
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          target: runtime
-          platforms: ${{ env.PLATFORMS }}
-          push: ${{ env.PUSH == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
+          platforms: linux/arm64
+          load: true
+          tags: ${{ env.ARM64_IMAGE }}
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
             REVISION=${{ github.sha }}
-            CREATED=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
-            SOURCE=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=gha,scope=image
-          cache-to: type=gha,scope=image,mode=max
-          provenance: mode=max
-          sbom: true
-      - name: build (and push) debug image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: debug
-          platforms: ${{ env.PLATFORMS }}
-          push: ${{ env.PUSH == 'true' }}
-          tags: ${{ steps.meta-debug.outputs.tags }}
-          labels: ${{ steps.meta-debug.outputs.labels }}
-          annotations: ${{ steps.meta-debug.outputs.annotations }}
-          build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            REVISION=${{ github.sha }}
-            CREATED=${{ fromJSON(steps.meta-debug.outputs.json).labels['org.opencontainers.image.created'] }}
-            SOURCE=${{ github.server_url }}/${{ github.repository }}
-          # The build stages are shared with the runtime build above (same builder).
-          cache-from: type=gha,scope=image
-          provenance: mode=max
-          sbom: true
+          provenance: false
+          sbom: false
+          cache-from: |
+            type=gha,scope=image-amd64
+            type=gha,scope=image-arm64
+          cache-to: type=gha,scope=image-arm64,mode=max
+      - name: smoke test linux/arm64 (QEMU)
+        run: |
+          test "$(docker image inspect "$ARM64_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
+          make docker-smoke IMAGE="$ARM64_IMAGE"
+
+  image:
+    name: publish edge
+    needs: [lint, unit, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/publish-image.yml
+
+  release:
+    name: publish release
+    needs: [lint, unit, e2e, integration]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/publish-image.yml
+
+  cleanup:
+    name: ghcr cleanup
+    needs: [image, release]
+    # After whichever publish ran (the other one is skipped).
+    if: ${{ !cancelled() && (needs.image.result == 'success' || needs.release.result == 'success') }}
+    permissions:
+      packages: write
+    uses: ./.github/workflows/ghcr-cleanup.yml

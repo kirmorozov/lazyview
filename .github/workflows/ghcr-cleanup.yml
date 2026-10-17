@@ -1,0 +1,76 @@
+name: ghcr cleanup
+
+# Retention for ghcr.io/kirmorozov/lazyview:
+#   kept   : every semver tag (X.Y.Z, X.Y, X, pre-releases), edge, latest,
+#            and the newest N images tagged sha-* (default 20)
+#   deleted: older sha-* images, and untagged images (superseded re-runs, pushes
+#            interrupted before the index was written)
+#
+# A multi-arch image is an index whose platform manifests and attestation
+# manifests show up on GHCR as separate *untagged* versions. A plain "delete
+# untagged versions" would delete those children and break every multi-arch tag.
+# dataaxiom/ghcr-cleanup-action walks the indexes (and referrers) first, never
+# deletes a child that a kept image references, and deletes an image together
+# with its children.
+#
+# Runs after each publish (called from ci.yml), daily, and on demand
+# (Actions > ghcr cleanup > Run workflow; dry-run by default).
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Only log what would be deleted
+        type: boolean
+        default: true
+      keep-sha-tags:
+        description: Number of newest sha-* images to keep
+        type: number
+        default: 20
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  cleanup:
+    name: delete untagged and old sha-* images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      packages: write
+    # The cleanup is not safe to run concurrently against the same package.
+    concurrency:
+      group: ghcr-cleanup-lazyview
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSIONS_API: /users/${{ github.repository_owner }}/packages/container/lazyview/versions
+    steps:
+      - name: package versions (before)
+        run: |
+          gh api --paginate "$VERSIONS_API?per_page=100" \
+            --jq '.[] | [.id, .name, .created_at, (.metadata.container.tags | join(","))] | @tsv' | tee before.tsv
+          echo "versions: $(wc -l < before.tsv), tagged: $(awk -F'\t' '$4 != ""' before.tsv | wc -l)"
+      - uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          package: lazyview
+          use-regex: true
+          # Protected from every rule below: edge, latest and anything starting with a
+          # digit (X, X.Y, X.Y.Z, X.Y.Z-rc.N). An image is protected if any of its tags
+          # matches. (No nested quantifiers: the action rejects them as ReDoS-prone.)
+          exclude-tags: '^(edge|latest|[0-9][0-9A-Za-z.-]*)$'
+          # Keep only the newest N of the images tagged sha-*.
+          delete-tags: '^sha-[0-9a-f]+$'
+          keep-n-tagged: ${{ inputs.keep-sha-tags || 20 }}
+          delete-untagged: true
+          # Log any multi-arch image with a missing platform/attestation manifest.
+          validate: true
+          # Scheduled and post-publish runs delete; manual runs default to a dry run.
+          dry-run: ${{ inputs.dry-run == true }}
+      - name: package versions (after)
+        if: always()
+        run: |
+          gh api --paginate "$VERSIONS_API?per_page=100" \
+            --jq '.[] | [.id, .name, .created_at, (.metadata.container.tags | join(","))] | @tsv' | tee after.tsv
+          echo "versions: $(wc -l < after.tsv), tagged: $(awk -F'\t' '$4 != ""' after.tsv | wc -l)"

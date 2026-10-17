@@ -1,39 +1,32 @@
 # syntax=docker/dockerfile:1.7
 #
-# Multi-arch distroless image for lazyview.
+# Multi-arch distroless image for lazyview (linux/amd64, linux/arm64).
 #
 # The build stages always run on the *build* platform and cross-compile with
 # cargo-zigbuild (zig as C toolchain / linker for the zstd and ring C sources)
 # to a fully static musl binary, so no QEMU emulation is involved. The binary is
-# then copied onto Google distroless `static-debian12` (CA bundle, tzdata,
-# /etc/passwd with nonroot 65532, no shell, no package manager).
+# then copied onto Google distroless `static-debian12:nonroot` (tzdata, CA bundle,
+# /etc/passwd with nonroot 65532, no shell, no package manager). TLS to MySQL does
+# not use the CA bundle: mysql_async/rustls verifies against the Mozilla roots
+# compiled into the binary (webpki-roots from Cargo.lock).
 #
-# Targets (`--target`):
-#   runtime  (default, last stage)  gcr.io/distroless/static-debian12:nonroot
-#   debug                           gcr.io/distroless/static-debian12:debug-nonroot
-#                                   (same image + busybox shell under /busybox)
-#
+#   docker buildx build -t lazyview --load .
 #   docker buildx build --platform linux/amd64,linux/arm64 -t lazyview .
-#   docker buildx build --target debug -t lazyview:debug --load .
+#
+# Multi-platform builds need a docker-container builder (`docker buildx create --use
+# --driver docker-container`) or Docker's containerd image store; the default `docker`
+# driver rejects them. `make docker PLATFORMS=...` sets up such a builder by itself.
 #
 # Base images are pinned by their multi-arch *index* digest; the tag next to the
-# digest is only for readability (with tag@digest the digest wins). Refresh the
-# pins with `make image-digests`.
-
-ARG RUST_IMAGE=rust:1.99.1-slim-bookworm@sha256:a24e292b4af7bdee351a31d3a6379972a5652f0ea22a1b6d6883324ac4f5097c
-ARG DISTROLESS=gcr.io/distroless/static-debian12
-ARG DISTROLESS_TAG=nonroot
-ARG DISTROLESS_DIGEST=sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
-ARG DISTROLESS_DEBUG_TAG=debug-nonroot
-ARG DISTROLESS_DEBUG_DIGEST=sha256:d5563cc7f2f44313f332e91138cc8c6a158899afeeeab2fce3b0f9ccdb3cf9ee
-ARG ZIG_VERSION=0.17.0
-ARG CARGO_ZIGBUILD_VERSION=0.23.4
+# digest is only for readability (with tag@digest the digest wins). The FROM lines
+# are literal (no ARG) so Dependabot can bump them; `make image-digests` prints the
+# current digests for a manual refresh.
 
 # ---- toolchain: identical for every target platform (built once, shared) -----
-FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS toolchain
+FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-bookworm@sha256:a24e292b4af7bdee351a31d3a6379972a5652f0ea22a1b6d6883324ac4f5097c AS toolchain
 
-ARG ZIG_VERSION
-ARG CARGO_ZIGBUILD_VERSION
+ARG ZIG_VERSION=0.17.0
+ARG CARGO_ZIGBUILD_VERSION=0.23.4
 ARG BUILDARCH
 
 # bash with pipefail for every RUN in the build stages (inherited by `builder`).
@@ -117,65 +110,35 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     mkdir -p /out; \
     cp "target/${t}/release/lazyview" /out/lazyview
 
-# ---- debug: distroless + busybox (`docker exec -it <c> sh`) --------------------
-FROM ${DISTROLESS}:${DISTROLESS_DEBUG_TAG}@${DISTROLESS_DEBUG_DIGEST} AS debug
+# ---- runtime (default, last stage): distroless static, nonroot, no shell -------
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
 
-ARG DISTROLESS
-ARG DISTROLESS_DEBUG_TAG
-ARG DISTROLESS_DEBUG_DIGEST
+# Set by CI (docker/metadata-action overrides these labels with the same values)
+# and by `make docker`.
 ARG VERSION=dev
 ARG REVISION=unknown
 ARG CREATED=
-ARG SOURCE=
-
-LABEL org.opencontainers.image.title="lazyview" \
-      org.opencontainers.image.description="Materialized views for MySQL/MariaDB/Percona maintained from the binlog (debug variant: busybox shell under /busybox)" \
-      org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.source="${SOURCE}" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${REVISION}" \
-      org.opencontainers.image.created="${CREATED}" \
-      org.opencontainers.image.base.name="${DISTROLESS}:${DISTROLESS_DEBUG_TAG}" \
-      org.opencontainers.image.base.digest="${DISTROLESS_DEBUG_DIGEST}"
-
-# root-owned and read-only: the service (uid 65532) can execute but not modify it.
-COPY --from=builder --chown=0:0 --chmod=0555 /out/lazyview /lazyview
-
-# The base already sets SSL_CERT_FILE, PATH (incl. /busybox) and WORKDIR /home/nonroot.
-USER 65532:65532
-# /healthz /readyz /metrics (LAZYVIEW_HEALTH_ADDR, default 0.0.0.0:8080)
-EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD ["/lazyview", "healthcheck"]
-ENTRYPOINT ["/lazyview"]
-
-# ---- runtime (default): distroless static, nonroot, no shell -------------------
-FROM ${DISTROLESS}:${DISTROLESS_TAG}@${DISTROLESS_DIGEST} AS runtime
-
-ARG DISTROLESS
-ARG DISTROLESS_TAG
-ARG DISTROLESS_DIGEST
-ARG VERSION=dev
-ARG REVISION=unknown
-ARG CREATED=
-ARG SOURCE=
+ARG SOURCE=https://github.com/kirmorozov/lazyview
 
 LABEL org.opencontainers.image.title="lazyview" \
       org.opencontainers.image.description="Materialized views for MySQL/MariaDB/Percona maintained from the binlog" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.url="${SOURCE}" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
-      org.opencontainers.image.base.name="${DISTROLESS}:${DISTROLESS_TAG}" \
-      org.opencontainers.image.base.digest="${DISTROLESS_DIGEST}"
+      org.opencontainers.image.base.name="gcr.io/distroless/static-debian12:nonroot"
 
+# root-owned and read-only: the service (uid 65532) can execute but not modify it.
 COPY --from=builder --chown=0:0 --chmod=0555 /out/lazyview /lazyview
 
+# The base sets WORKDIR /home/nonroot and SSL_CERT_FILE (not read by lazyview, see
+# the header).
 USER 65532:65532
-# /healthz /readyz /metrics (LAZYVIEW_HEALTH_ADDR, default 0.0.0.0:8080)
+# /livez (alias /healthz) /readyz /startupz /metrics (LAZYVIEW_HEALTH_ADDR, default 0.0.0.0:8080)
 EXPOSE 8080
-# Exec form, no shell needed: the binary probes its own /healthz (same
+# Exec form, no shell needed: the binary probes its own /livez (same
 # LAZYVIEW_HEALTH_ADDR). With LAZYVIEW_HEALTH_ADDR=off run with --no-healthcheck.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD ["/lazyview", "healthcheck"]

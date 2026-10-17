@@ -1,0 +1,144 @@
+name: publish image
+
+# Called by ci.yml for pushes to main (`edge`) and v* tags (releases), after the
+# image was built and tested per platform by the `e2e` job. That job's GitHub
+# Actions caches (scopes image-amd64 / image-arm64) make this build a cache hit:
+# it assembles the multi-arch index, attaches provenance + SBOM, pushes and verifies.
+#
+# Tags (docker/metadata-action):
+#   main  : edge, sha-<short>
+#   vX.Y.Z: X.Y.Z, X.Y, X (not for 0.x), latest, sha-<short>
+#           (pre-releases such as v1.2.0-rc.1 get only 1.2.0-rc.1 and sha-<short>)
+on:
+  workflow_call:
+
+jobs:
+  publish:
+    name: build, push, attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Must not exceed what the calling job grants.
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      attestations: write # GitHub artifact attestation (gh attestation verify)
+      id-token: write # Sigstore signing for the attestation
+    env:
+      IMAGE: ghcr.io/kirmorozov/lazyview
+      PLATFORMS: linux/amd64,linux/arm64
+      SOURCE: https://github.com/kirmorozov/lazyview
+      DESCRIPTION: Materialized views for MySQL/MariaDB/Percona maintained from the binlog
+      # OCI annotations on the per-platform manifests and on the index
+      # (GHCR shows the index description for multi-arch packages).
+      DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=edge,branch=main
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=lazyview
+            org.opencontainers.image.description=${{ env.DESCRIPTION }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=${{ env.SOURCE }}
+            org.opencontainers.image.url=${{ env.SOURCE }}
+            org.opencontainers.image.documentation=${{ env.SOURCE }}#readme
+            org.opencontainers.image.base.name=gcr.io/distroless/static-debian12:nonroot
+          annotations: |
+            org.opencontainers.image.title=lazyview
+            org.opencontainers.image.description=${{ env.DESCRIPTION }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=${{ env.SOURCE }}
+            org.opencontainers.image.url=${{ env.SOURCE }}
+            org.opencontainers.image.documentation=${{ env.SOURCE }}#readme
+            org.opencontainers.image.base.name=gcr.io/distroless/static-debian12:nonroot
+
+      - id: build
+        name: build and push ${{ env.PLATFORMS }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            SOURCE=${{ env.SOURCE }}
+          cache-from: |
+            type=gha,scope=image-amd64
+            type=gha,scope=image-arm64
+          provenance: mode=max
+          sbom: true
+
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+
+      - name: verify the pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          ref="${IMAGE}@${DIGEST}"
+          docker buildx imagetools inspect --raw "$ref" > index.json
+          jq . index.json
+          jq -e '.mediaType == "application/vnd.oci.image.index.v1+json"' index.json > /dev/null
+          platforms=$(jq -r '[.manifests[] | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")
+                              | .platform.os + "/" + .platform.architecture] | sort | join(",")' index.json)
+          attestations=$(jq '[.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length' index.json)
+          echo "platforms=${platforms} attestation manifests=${attestations}"
+          test "$platforms" = "linux/amd64,linux/arm64"
+          test "$attestations" -eq 2
+          jq -e --arg src "$SOURCE" '.annotations["org.opencontainers.image.source"] == $src' index.json > /dev/null
+          # Every tag points at this index.
+          while read -r tag; do
+            [[ -n $tag ]] || continue
+            got=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest.Digest}}' | jq -r .)
+            echo "${tag} -> ${got}"
+            test "$got" = "$DIGEST"
+          done <<< "$TAGS"
+          # The published amd64 image runs (pulled by digest).
+          docker run --rm "$ref" --version
+          test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "$SOURCE"
+
+      - name: summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### ${IMAGE}"
+            echo
+            echo "Digest: \`${DIGEST}\` (${PLATFORMS}, provenance + SBOM attestations)"
+            echo
+            echo "Tags:"
+            while read -r tag; do [[ -n $tag ]] && echo "* \`${tag}\`"; done <<< "$TAGS"
+            echo
+            echo '```sh'
+            echo "docker pull ${IMAGE}@${DIGEST}"
+            echo "gh attestation verify oci://${IMAGE}@${DIGEST} --owner ${GITHUB_REPOSITORY_OWNER}"
+            echo "docker buildx imagetools inspect ${IMAGE}@${DIGEST} --format '{{json .SBOM}}'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
