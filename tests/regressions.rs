@@ -281,26 +281,72 @@ fn reg_view_column_list() {
 #[test]
 fn reg_bit_column() {
     scenario("reg_bit", |ctx| async move {
-        let specs = vec![ViewSpec::new(
-            "r_bits",
-            Kind::Incremental,
-            "SELECT id, b, b2 FROM bits",
-        )];
-        let ddl = [
-            "CREATE TABLE bits (id INT PRIMARY KEY, b BIT(8) NULL, b2 BIT(1) NULL)",
-            "INSERT INTO bits VALUES (1, b'11111111', b'1'), (2, b'0', b'0'), (3, NULL, NULL), (4, b'1010', b'1')",
+        let specs = vec![
+            ViewSpec::new("r_bits", Kind::Incremental, "SELECT id, b, b2 FROM bits"),
+            ViewSpec::new(
+                "r_bits_wide",
+                Kind::Incremental,
+                "SELECT id, m, blb, txt, b FROM bits",
+            ),
         ];
-        let (db, mut eng) = setup(&ctx, "reg_bit", &ddl, &specs, &[]).await?;
+        let ddl = [
+            "CREATE TABLE bits (id BIGINT UNSIGNED PRIMARY KEY, m MEDIUMINT NULL, blb BLOB NULL, txt TEXT NULL, b BIT(8) NULL, b2 BIT(1) NULL)",
+            "INSERT INTO bits VALUES (1, 1, X'00010203', 'x', b'11111111', b'1'), (2, NULL, NULL, '', b'0', b'0'), (3, -8388608, '', NULL, NULL, NULL), (4, 0, X'FF', 'multi\nline', b'1010', b'1')",
+        ];
+        let (db, mut eng) = setup(
+            &ctx,
+            "reg_bit",
+            &ddl,
+            &specs,
+            &[
+                ("LAZYVIEW_QUERY_CHUNK", "2"),
+                ("LAZYVIEW_BATCH_WINDOW_MS", "0"),
+            ],
+        )
+        .await?;
         let mut c = db.conn().await?;
         run(
             &mut c,
             &[
                 "UPDATE bits SET b = b'11111111' WHERE id = 2",
-                "INSERT INTO bits VALUES (5, b'10000000', b'0')",
+                "INSERT INTO bits VALUES (5, 5, NULL, 't', b'10000000', b'0')",
             ],
         )
         .await?;
         verify(&ctx, &mut eng, &db, &specs, "BIT values after changes").await?;
+        // Other columns change, BIT stays 0xff: the refresh re-reads and re-writes the row.
+        run(
+            &mut c,
+            &[
+                "UPDATE bits SET m = m + 1, txt = CONCAT(COALESCE(txt, ''), '!')",
+                "UPDATE bits SET blb = X'00' WHERE id IN (1, 2)",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "other columns changed, BIT unchanged",
+        )
+        .await?;
+        run(
+            &mut c,
+            &[
+                "REPLACE INTO bits VALUES (1, 9, NULL, 'r', b'11111111', b'1')",
+                "UPDATE bits SET id = 77 WHERE id = 4",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "REPLACE / PK change with BIT values",
+        )
+        .await?;
         eng.stop().await
     });
 }
@@ -718,6 +764,846 @@ fn reg_unreferenced_update_full_mode() {
                 fmt_snapshot(&d)
             );
         }
+        eng.stop().await
+    });
+}
+
+/// E1: a full-refresh view rebuilt in every flush (cadence 0) under continuous writes must not
+/// keep the engine from reporting progress. Catch-up used to need a moment without any build
+/// in flight, which never came: each swap started the next rebuild in the same flush (mig_alter
+/// / ddl / brutal catch-up timeouts behind a chained full view).
+#[test]
+fn reg_catch_up_while_full_view_rebuilds() {
+    scenario("reg_full_busy", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_per_customer",
+                Kind::Incremental,
+                "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+            ),
+            // Full: the upstream table has no primary key (customer_id is nullable).
+            ViewSpec::new(
+                "r_busy_full",
+                Kind::Chained,
+                "SELECT customer_id, n FROM r_per_customer WHERE n > 1",
+            ),
+        ];
+        let (db, mut eng) = setup(
+            &ctx,
+            "reg_full_busy",
+            &[],
+            &specs,
+            &[("LAZYVIEW_BATCH_WINDOW_MS", "10")],
+        )
+        .await?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (dsn, stop) = (db.dsn.clone(), stop.clone());
+            tokio::spawn(async move {
+                let mut c = connect(&dsn).await?;
+                let mut id = 100;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    exec(
+                        &mut c,
+                        &format!("INSERT INTO orders VALUES ({id}, {}, 'new')", id % 5),
+                    )
+                    .await?;
+                    id += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok::<_, anyhow::Error>(id)
+            })
+        };
+        let mut sc = db.conn().await?;
+        let caught_up = async {
+            for round in 0..3 {
+                eng.wait_caught_up(&mut sc, Duration::from_secs(60))
+                    .await
+                    .with_context(|| format!("round {round}: catch-up while writes continue"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.context("writer panicked")??;
+        caught_up?;
+        verify(&ctx, &mut eng, &db, &specs, "after continuous writes").await?;
+        eng.stop().await
+    });
+}
+
+/// E1b: a failed rebuild of a full-refresh view is retried by the re-plan with backoff; it
+/// used to re-arm an immediate rebuild in every flush (ddl_rename: ~80 failed builds per
+/// second while a source table was renamed away).
+#[test]
+fn reg_failed_full_rebuild_backs_off() {
+    scenario("reg_full_backoff", |ctx| async move {
+        let spec = ViewSpec::new(
+            "r_skus",
+            Kind::Full,
+            "SELECT DISTINCT sku FROM products WHERE active = 1",
+        );
+        let specs = vec![spec.clone()];
+        let (db, mut eng) = setup(
+            &ctx,
+            "reg_full_backoff",
+            &[],
+            &specs,
+            &[("LAZYVIEW_BATCH_WINDOW_MS", "0")],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        // Every build of this definition fails from now on: its probe view name is taken.
+        let probe = format!(
+            "_lv_probe_{}",
+            lazyview::analyze::definition_hash(&spec.definition)
+        );
+        exec(&mut c, &format!("CREATE TABLE `{probe}` (x INT)")).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let before = eng.snapshot();
+        run(&mut c, &["UPDATE products SET sku = 'zz' WHERE id = 1"]).await?;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            (1..=4).contains(&d.full_rebuilds),
+            "a failing full rebuild was retried {} times in 4 s (expected backoff): {}",
+            d.full_rebuilds,
+            fmt_snapshot(&d)
+        );
+        let st = wait_state(&mut c, &mut eng, "r_skus", "error", t_ready()).await?;
+        ensure!(
+            st.mode.as_deref() == Some("full"),
+            "a view in error keeps the mode of its plan, got {st:?}"
+        );
+        // Unblocked: the next retry builds it.
+        exec(&mut c, &format!("DROP TABLE `{probe}`")).await?;
+        wait_ready_tolerant(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "after the probe name was freed",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
+/// E1: DDL on the parent of a cascading foreign key must re-plan the views over the child (the
+/// parent's column positions are part of their plans). The stale plan's column count used to
+/// drop the parent's rows for every view and re-plan the others in every transaction.
+#[test]
+fn reg_ddl_on_cascade_parent() {
+    scenario("reg_fk_parent_ddl", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_addr_by_city",
+                Kind::Incremental,
+                "SELECT city, COUNT(*) AS n FROM addresses GROUP BY city",
+            ),
+            join_view(),
+        ];
+        let fk = [
+            "CREATE TABLE addresses (customer_id INT NOT NULL, seq INT NOT NULL, city VARCHAR(10) NOT NULL, PRIMARY KEY (customer_id, seq),
+             FOREIGN KEY (customer_id) REFERENCES customers (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "INSERT INTO addresses VALUES (1, 1, 'x'), (2, 1, 'y'), (3, 1, 'x'), (3, 2, 'z')",
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_fk_parent_ddl", &fk, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &["ALTER TABLE customers ADD COLUMN c0 INT NULL FIRST"],
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "after ALTER of the FK parent").await?;
+        run(
+            &mut c,
+            &[
+                "UPDATE customers SET name = 'zed' WHERE id = 3",
+                "DELETE FROM customers WHERE id = 1",
+                "UPDATE customers SET id = 30 WHERE id = 3",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "parent update, cascading delete and key update after the ALTER",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
+/// E2: a chained view defined before its upstream, both present at the first start, waits for
+/// the upstream (state `waiting`) instead of failing with "table ... does not exist".
+#[test]
+fn reg_chained_defined_first_at_startup() {
+    scenario("reg_chain_start", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_top_customers",
+                Kind::Chained,
+                "SELECT customer_id, n FROM r_per_customer WHERE n > 1",
+            ),
+            ViewSpec::new(
+                "r_per_customer",
+                Kind::Incremental,
+                "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+            ),
+        ];
+        let db = ctx.new_db("reg_chain_start").await?;
+        let mut c = db.conn().await?;
+        for s in DDL {
+            exec(&mut c, s).await?;
+        }
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        let deadline = std::time::Instant::now() + t_ready();
+        loop {
+            eng.check_alive()?;
+            let st = view_states(&mut c).await?;
+            if let Some(e) = st.iter().find(|s| s.state == "error") {
+                bail!("chained view went into error instead of waiting: {e:?}");
+            }
+            if specs
+                .iter()
+                .all(|v| st.iter().any(|s| s.name == v.name && s.state == "ready"))
+            {
+                break;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "not ready in time: {st:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        run(&mut c, &["INSERT INTO orders VALUES (14, 2, 'new')"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "chained view after writes").await?;
+        eng.stop().await
+    });
+}
+
+/// E4: the view name in a `CREATE VIEW` definition is the source of truth: a definition that
+/// renames the view updates `_lazyview.name` and renames online (it used to fail with a
+/// name/definition mismatch). A name used by another row is an error; a bare SELECT keeps the
+/// name it was given.
+#[test]
+fn reg_rename_via_definition() {
+    scenario("reg_rename_def", |ctx| async move {
+        let specs = vec![join_view()];
+        let (db, mut eng) = setup(&ctx, "reg_rename_def", &[], &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let id = scalar_i64(
+            &mut c,
+            "SELECT id FROM _lazyview WHERE name = 'r_order_customer'",
+        )
+        .await?;
+        let renamed = ViewSpec::new("r_renamed", Kind::Incremental, &specs[0].select);
+        exec(
+            &mut c,
+            &format!(
+                "UPDATE _lazyview SET definition = {} WHERE id = {id}",
+                q(&renamed.definition)
+            ),
+        )
+        .await?;
+        wait_ready(&mut c, &mut eng, &["r_renamed"], t_ready()).await?;
+        let name = scalar(
+            &mut c,
+            &format!("SELECT name FROM _lazyview WHERE id = {id}"),
+        )
+        .await?;
+        ensure!(
+            name.as_deref() == Some("r_renamed"),
+            "_lazyview.name not updated: {name:?}"
+        );
+        wait_until("old table dropped", t_ready(), || {
+            let dsn = db.dsn.clone();
+            async move { Ok(!table_exists(&mut connect(&dsn).await?, "r_order_customer").await?) }
+        })
+        .await?;
+        run(&mut c, &["UPDATE customers SET name = 'zed' WHERE id = 1"]).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            std::slice::from_ref(&renamed),
+            "after rename",
+        )
+        .await?;
+        // Another row renaming itself to a used name: error with the row that has it.
+        let other =
+            add_definition(&mut c, "CREATE VIEW r_other AS SELECT id FROM orders", None).await?;
+        wait_ready(&mut c, &mut eng, &["r_other"], t_ready()).await?;
+        exec(
+            &mut c,
+            &format!(
+                "UPDATE _lazyview SET definition = {} WHERE id = {other}",
+                q(&renamed.definition)
+            ),
+        )
+        .await?;
+        let st = wait_def_state(&mut c, &mut eng, other, "error", t_ready()).await?;
+        let want = format!("name `r_renamed` already used by row #{id}");
+        ensure!(
+            st.last_error.as_deref().is_some_and(|e| e.contains(&want)),
+            "expected '{want}', got {st:?}"
+        );
+        // A bare SELECT takes its name from `name`.
+        exec(
+            &mut c,
+            "INSERT INTO _lazyview (name, definition) VALUES ('r_bare', 'SELECT id, status FROM orders')",
+        )
+        .await?;
+        wait_ready(&mut c, &mut eng, &["r_bare"], t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            std::slice::from_ref(&renamed),
+            "unchanged",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
+/// E5: the saved position never passes a change a full-refresh view has not been rebuilt for
+/// (here: not due under a long LAZYVIEW_FULL_REFRESH_MS). After a crash the change is read
+/// again and the view rebuilt; it used to resume stale forever.
+#[test]
+fn reg_crash_with_stale_full_view() {
+    scenario("reg_crash_full", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_statuses",
+                Kind::Full,
+                "SELECT DISTINCT status FROM orders",
+            ),
+            ViewSpec::new(
+                "r_orders",
+                Kind::Incremental,
+                "SELECT id, status FROM orders",
+            ),
+        ];
+        let (db, eng) = setup(
+            &ctx,
+            "reg_crash_full",
+            &[],
+            &specs,
+            &[
+                ("LAZYVIEW_FULL_REFRESH_MS", "600000"),
+                ("LAZYVIEW_POSITION_PERSIST_MS", "50"),
+            ],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        run(&mut c, &["UPDATE orders SET status = 'void' WHERE id = 10"]).await?;
+        // Long enough for several position saves (and the incremental refresh).
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        eng.crash().await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "after crash and resume").await?;
+        eng.stop().await
+    });
+}
+
+const TWO_HOP_DDL: &[&str] = &[
+    "CREATE TABLE regs (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+    "CREATE TABLE custs (id INT PRIMARY KEY, reg_id INT NULL, name VARCHAR(20) NOT NULL)",
+    "INSERT INTO regs VALUES (1, 'north'), (2, 'south'), (3, 'east')",
+    "INSERT INTO custs VALUES (1, 1, 'ann'), (2, 1, 'bob'), (3, 2, 'cid')",
+];
+
+/// E6: two tables resolved by lookups change together (a customer moves to a region that is
+/// deleted in the same transaction): each before image joined with the current state of the
+/// other found nothing, so the orders of that customer stayed (v_order_customer_region).
+#[test]
+fn reg_two_lookup_tables_change_together() {
+    scenario("reg_two_lookups", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_order_region",
+            Kind::Incremental,
+            "SELECT o.id, o.status, c.name AS customer, r.name AS region FROM orders o JOIN custs c ON c.id = o.customer_id JOIN regs r ON r.id = c.reg_id",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_two_lookups", TWO_HOP_DDL, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &[
+                "START TRANSACTION",
+                "UPDATE custs SET reg_id = 3 WHERE id = 1",
+                "DELETE FROM regs WHERE id = 3",
+                "COMMIT",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "customer moved to a region deleted with it",
+        )
+        .await?;
+        run(
+            &mut c,
+            &[
+                "START TRANSACTION",
+                "INSERT INTO regs VALUES (4, 'west')",
+                "UPDATE custs SET reg_id = 4 WHERE id = 1",
+                "UPDATE regs SET id = 9 WHERE id = 2",
+                "UPDATE custs SET reg_id = NULL WHERE id = 3",
+                "COMMIT",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "both lookup tables changed again",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
+/// E6, grouped: the group of an order is two lookups away. Orders move to another customer
+/// while their old customer moves to another region in the same transaction: the old group
+/// was found through neither table and kept its count.
+#[test]
+fn reg_two_lookup_tables_change_together_grouped() {
+    scenario("reg_two_lookups_g", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_orders_per_region",
+            Kind::Incremental,
+            "SELECT r.name, COUNT(*) AS n FROM orders o JOIN custs c ON c.id = o.customer_id JOIN regs r ON r.id = c.reg_id GROUP BY r.name",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_two_lookups_g", TWO_HOP_DDL, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &[
+                "START TRANSACTION",
+                "UPDATE orders SET customer_id = 3 WHERE customer_id = 1",
+                "UPDATE custs SET reg_id = 2 WHERE id = 1",
+                "COMMIT",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "orders and their customer moved together",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
+/// E8: unit filters bind one placeholder per unit column; with composite units and a raised
+/// LAZYVIEW_QUERY_CHUNK one chunk exceeded the 65535 placeholders of a statement, every refresh
+/// failed and the view was rebuilt.
+#[test]
+fn reg_unit_chunks_stay_below_placeholder_limit() {
+    scenario("reg_big_chunk", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_pairs",
+            Kind::Incremental,
+            "SELECT a, b, COUNT(*) AS n FROM ev GROUP BY a, b",
+        )];
+        let nums: Vec<String> = (0..200).map(|i| format!("({i})")).collect();
+        let ddl = [
+            "CREATE TABLE ev (id INT AUTO_INCREMENT PRIMARY KEY, a INT NOT NULL, b INT NOT NULL)"
+                .to_string(),
+            "CREATE TABLE nums (n INT PRIMARY KEY)".to_string(),
+            format!("INSERT INTO nums VALUES {}", nums.join(",")),
+        ];
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let (db, mut eng) = setup(
+            &ctx,
+            "reg_big_chunk",
+            &ddl,
+            &specs,
+            &[("LAZYVIEW_QUERY_CHUNK", "40000")],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let before = eng.snapshot();
+        // 40000 groups in one transaction.
+        run(
+            &mut c,
+            &["INSERT INTO ev (a, b) SELECT x.n, y.n FROM nums x JOIN nums y"],
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "40000 new groups at once").await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0,
+            "the refresh failed and the view was rebuilt: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
+/// E5: while a stale full-refresh view holds the saved position back (its rebuild is not due),
+/// the engine must not spin: the position save returned early without moving its deadline, so
+/// the loop flushed thousands of times per second.
+#[test]
+fn reg_held_back_position_does_not_spin() {
+    scenario("reg_held_spin", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_statuses",
+            Kind::Full,
+            "SELECT DISTINCT status FROM orders",
+        )];
+        let (db, mut eng) = setup(
+            &ctx,
+            "reg_held_spin",
+            &[],
+            &specs,
+            &[
+                ("LAZYVIEW_FULL_REFRESH_MS", "600000"),
+                ("LAZYVIEW_POSITION_PERSIST_MS", "50"),
+            ],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        run(&mut c, &["UPDATE orders SET status = 'void' WHERE id = 10"]).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = eng.snapshot();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.flushes < 200,
+            "{} flushes in 2 s while idle with a held-back position: {}",
+            d.flushes,
+            fmt_snapshot(&d)
+        );
+        eng.check_alive()?;
+        eng.stop().await
+    });
+}
+
+/// Payments → orders → customers → regions: three lookup tables of a grouped view.
+const CHAIN_DDL: &[&str] = &[
+    "CREATE TABLE regs (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+    "CREATE TABLE custs (id INT PRIMARY KEY, reg_id INT NULL, name VARCHAR(20) NOT NULL)",
+    "CREATE TABLE pays (id INT PRIMARY KEY, order_id INT NULL, amount DECIMAL(10,2) NOT NULL)",
+    "INSERT INTO regs VALUES (1, 'north'), (2, 'south'), (3, 'east')",
+    "INSERT INTO custs VALUES (1, 1, 'ann'), (2, 1, 'bob'), (3, 2, 'cid')",
+    "INSERT INTO pays VALUES (1, 10, 5.00), (2, 11, 7.00), (3, 12, 1.50), (4, 13, 2.00)",
+];
+
+fn region_revenue() -> ViewSpec {
+    ViewSpec::new(
+        "r_region_revenue",
+        Kind::Incremental,
+        "SELECT r.name, COUNT(*) AS n, SUM(p.amount) AS paid FROM pays p JOIN orders o ON o.id = p.order_id \
+         JOIN custs c ON c.id = o.customer_id JOIN regs r ON r.id = c.reg_id GROUP BY r.name",
+    )
+}
+
+/// Stops the engine, runs each statement as its own transaction while it is down, and restarts
+/// it with a zero batch window: the catch-up flushes after every transaction while the later
+/// ones are already visible (the read-ahead window, made deterministic).
+async fn replay_after_restart(
+    ctx: &Ctx,
+    db: &Db,
+    eng: Engine,
+    stmts: &[&str],
+    ov: &[(&str, &str)],
+) -> Result<Engine> {
+    eng.stop().await?;
+    let mut c = db.conn().await?;
+    run(&mut c, stmts).await?;
+    let mut ov = ov.to_vec();
+    ov.push(("LAZYVIEW_BATCH_WINDOW_MS", "0"));
+    ctx.start_engine(db, &ov)
+}
+
+/// E6, grouped: changes in two and three lookup tables of a chain in one transaction. Each
+/// single lookup joins an old row with the current (already changed) partners and misses the
+/// old group; the combinations find it.
+#[test]
+fn reg_grouped_chain_changes_in_one_window() {
+    scenario("reg_chain_one", |ctx| async move {
+        let specs = vec![region_revenue()];
+        let (db, mut eng) = setup(&ctx, "reg_chain_one", CHAIN_DDL, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "order and its customer moved together",
+                &[
+                    "START TRANSACTION",
+                    "UPDATE orders SET customer_id = 3 WHERE id = 12",
+                    "UPDATE custs SET reg_id = 3 WHERE id = 2",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "payment, order and customer moved together",
+                &[
+                    "START TRANSACTION",
+                    "UPDATE pays SET order_id = 13 WHERE id = 1",
+                    "UPDATE orders SET customer_id = 2 WHERE id = 10",
+                    "UPDATE custs SET reg_id = 2 WHERE id = 1",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "far partner deleted with a key move",
+                &[
+                    "START TRANSACTION",
+                    "DELETE FROM regs WHERE id = 2",
+                    "UPDATE custs SET id = 30 WHERE id = 3",
+                    "COMMIT",
+                ],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}
+
+/// E6, grouped: the same changes in separate transactions that are already visible when the
+/// first one is resolved (catch-up after a restart). The partner's change is read in a later
+/// flush; only the images remembered from the earlier flush still find the old group.
+#[test]
+fn reg_grouped_chain_changes_across_windows() {
+    scenario("reg_chain_across", |ctx| async move {
+        let specs = vec![region_revenue()];
+        let (db, eng) = setup(&ctx, "reg_chain_across", CHAIN_DDL, &specs, &[]).await?;
+        let mut eng = replay_after_restart(
+            &ctx,
+            &db,
+            eng,
+            &[
+                "UPDATE custs SET reg_id = 3 WHERE id = 2",
+                "UPDATE orders SET customer_id = 3 WHERE id = 12",
+                "UPDATE custs SET reg_id = 3 WHERE id = 1",
+                "UPDATE orders SET customer_id = 3 WHERE id = 10",
+                "UPDATE pays SET order_id = 13 WHERE id = 2",
+            ],
+            &[],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "two and three tables, one per transaction",
+        )
+        .await?;
+        let mut eng = replay_after_restart(
+            &ctx,
+            &db,
+            eng,
+            &[
+                "DELETE FROM regs WHERE id = 3",
+                "UPDATE custs SET id = 40 WHERE id = 3",
+                "UPDATE orders SET customer_id = 1 WHERE id = 13",
+            ],
+            &[],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "far partner deleted, key moves",
+        )
+        .await?;
+        let d = eng.snapshot();
+        ensure!(
+            d.full_rebuilds == 0,
+            "the view was rebuilt: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
+/// E6, grouped: a long catch-up remembers more images than the cap allows; the view is rebuilt
+/// online instead (counted in `lookback_overflows`) and ends up correct.
+#[test]
+fn reg_grouped_chain_catch_up_hits_the_cap() {
+    scenario("reg_chain_cap", |ctx| async move {
+        let specs = vec![region_revenue()];
+        let (db, eng) = setup(&ctx, "reg_chain_cap", CHAIN_DDL, &specs, &[]).await?;
+        let mut stmts = Vec::new();
+        for i in 0..40 {
+            stmts.push(format!(
+                "UPDATE custs SET reg_id = {} WHERE id = {}",
+                1 + i % 3,
+                1 + i % 3
+            ));
+            stmts.push(format!(
+                "UPDATE orders SET customer_id = {} WHERE id = {}",
+                1 + (i + 1) % 3,
+                10 + i % 4
+            ));
+            stmts.push(format!(
+                "UPDATE pays SET order_id = {} WHERE id = {}",
+                10 + (i + 2) % 4,
+                1 + i % 4
+            ));
+        }
+        let stmts: Vec<&str> = stmts.iter().map(String::as_str).collect();
+        let mut eng =
+            replay_after_restart(&ctx, &db, eng, &stmts, &[("LAZYVIEW_BATCH_MAX_KEYS", "2")])
+                .await?;
+        verify(&ctx, &mut eng, &db, &specs, "after a long catch-up").await?;
+        let d = eng.snapshot();
+        ensure!(
+            d.lookback_overflows > 0 && d.full_rebuilds > 0,
+            "expected the cap to rebuild the view: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
+/// E6, select/join: old rows are traced through the lineage columns of the materialized table.
+/// A region and then its customer are deleted in separate transactions, both visible before the
+/// first is read: joining either old row with the current state of the other finds nothing.
+#[test]
+fn reg_lineage_traces_old_rows_across_windows() {
+    scenario("reg_lineage", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_order_region",
+                Kind::Incremental,
+                "SELECT o.id, o.status, c.name AS customer, r.name AS region FROM orders o \
+                 JOIN custs c ON c.id = o.customer_id JOIN regs r ON r.id = c.reg_id",
+            ),
+            ViewSpec::new(
+                "r_order_region_left",
+                Kind::Incremental,
+                "SELECT o.id, c.name AS customer, r.name AS region FROM orders o \
+                 LEFT JOIN custs c ON c.id = o.customer_id LEFT JOIN regs r ON r.id = c.reg_id",
+            ),
+        ];
+        let (db, eng) = setup(&ctx, "reg_lineage", TWO_HOP_DDL, &specs, &[]).await?;
+        let mut eng = replay_after_restart(
+            &ctx,
+            &db,
+            eng,
+            &[
+                "DELETE FROM regs WHERE id = 1",
+                "DELETE FROM custs WHERE id = 1",
+                "UPDATE custs SET id = 20 WHERE id = 2",
+                "UPDATE custs SET reg_id = 3 WHERE id = 3",
+                "DELETE FROM regs WHERE id = 3",
+            ],
+            &[],
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "partners deleted and moved").await?;
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "partners back (NULL-extended rows join again)",
+                &[
+                    "INSERT INTO regs VALUES (1, 'north2'), (3, 'east2')",
+                    "INSERT INTO custs VALUES (1, 1, 'ann2'), (2, 3, 'bob2')",
+                ],
+            ),
+            (
+                "region key moves",
+                &[
+                    "UPDATE regs SET id = 7 WHERE id = 1",
+                    "UPDATE custs SET reg_id = 7 WHERE id = 1",
+                ],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}
+
+/// E7: binlog events reach the replica before their commit is visible. MariaDB had only a fixed
+/// sleep (LAZYVIEW_VISIBILITY_DELAY_MS) between reading a transaction and reading the sources,
+/// so under load a refresh could read the old row and keep it (rows missing from / extra in
+/// v_paid_orders). Now the consistent-snapshot binlog position is the fence there. Concurrent
+/// writers with the delay set to 0 must leave the views exact.
+#[test]
+fn reg_visibility_fence_without_delay() {
+    scenario("reg_fence", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_paid",
+                Kind::Incremental,
+                "SELECT id, customer_id, status FROM orders WHERE status = 'paid'",
+            ),
+            join_view(),
+        ];
+        let ov = [
+            ("LAZYVIEW_VISIBILITY_DELAY_MS", "0"),
+            ("LAZYVIEW_BATCH_WINDOW_MS", "0"),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_fence", &[], &specs, &ov).await?;
+        let mut writers = Vec::new();
+        for w in 0..4i64 {
+            let dsn = db.dsn.clone();
+            writers.push(tokio::spawn(async move {
+                let mut c = connect(&dsn).await?;
+                for i in 0..150i64 {
+                    let id = 100 + w * 1000 + i % 20;
+                    let status = if (i / 20) % 2 == 0 { "paid" } else { "new" };
+                    exec(
+                        &mut c,
+                        &format!(
+                            "INSERT INTO orders VALUES ({id}, {}, '{status}') \
+                             ON DUPLICATE KEY UPDATE status = VALUES(status), customer_id = VALUES(customer_id)",
+                            1 + (i + w) % 3
+                        ),
+                    )
+                    .await?;
+                    if i % 7 == 0 {
+                        exec(
+                            &mut c,
+                            &format!("UPDATE customers SET name = 'n{w}_{i}' WHERE id = {}", 1 + i % 3),
+                        )
+                        .await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        for w in writers {
+            w.await.context("writer panicked")??;
+        }
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "concurrent writers, no visibility delay",
+        )
+        .await?;
         eng.stop().await
     });
 }
