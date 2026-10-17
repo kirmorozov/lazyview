@@ -132,6 +132,13 @@ fn p(sql: &str) -> ViewPlan {
     analyzer_plan(&d, "db", &catalog()).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
 }
 
+fn reason(sql: &str) -> String {
+    match p(sql).mode {
+        Mode::Full(r) => r,
+        m => panic!("{sql}: expected Full, got {m:?}"),
+    }
+}
+
 /// Every string literal of `analyze.rs`'s tests that holds a `CREATE VIEW` statement.
 fn corpus() -> Vec<String> {
     let src = include_str!("../analyze.rs");
@@ -239,7 +246,15 @@ fn improvements() -> Vec<(&'static str, Result<Mode, &'static str>)> {
         // The construct that really blocks it is named.
         (
             "SELECT DISTINCT id FROM orders NATURAL JOIN order_items",
-            Ok(Mode::Full("NATURAL join".into())),
+            // No common columns: a cross join.
+            Ok(Mode::Full(
+                "table `order_items` contributes to every row (no join condition)".into(),
+            )),
+        ),
+        // A leading RIGHT JOIN is a LEFT JOIN from the other side.
+        (
+            "SELECT o.id FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id",
+            Ok(Mode::Spj),
         ),
         // IN over a primary key = inner join.
         (
@@ -450,15 +465,28 @@ fn taxonomy_strategies_and_reasons() {
         m("SELECT n FROM (SELECT COUNT(*) AS n FROM orders) d WHERE n > 0"),
         Mode::Global
     );
+    // Joined on the other table's key: the aggregation is pulled up (see the dedicated test).
+    assert_eq!(
+        m(
+            "WITH t AS (SELECT customer_id, SUM(total) s FROM orders GROUP BY customer_id) \
+           SELECT c.name, t.s FROM customers c JOIN t ON t.customer_id = c.id"
+        ),
+        Mode::Grouped
+    );
+    assert_eq!(
+        m("WITH t AS (SELECT DISTINCT customer_id FROM orders) SELECT c.name FROM customers c JOIN t ON t.customer_id = c.id"),
+        Mode::Grouped
+    );
+    // Joined on anything else: kept apart (internal views pending).
     assert_eq!(
         full(
             "WITH t AS (SELECT customer_id, SUM(total) s FROM orders GROUP BY customer_id) \
-              SELECT c.name, t.s FROM customers c JOIN t ON t.customer_id = c.id"
+              SELECT c.name, t.s FROM customers c JOIN t ON t.customer_id = c.region_id"
         ),
         "GROUP BY in CTE `t` joined to other tables"
     );
     assert_eq!(
-        full("WITH t AS (SELECT DISTINCT customer_id FROM orders) SELECT c.name FROM customers c JOIN t ON t.customer_id = c.id"),
+        full("WITH t AS (SELECT DISTINCT customer_id FROM orders) SELECT c.name FROM customers c JOIN t ON t.customer_id = c.region_id"),
         "DISTINCT in CTE `t` joined to other tables"
     );
     assert_eq!(
@@ -550,6 +578,369 @@ fn taxonomy_strategies_and_reasons() {
         full("WITH t AS (SELECT id, total FROM orders) SELECT id, total /* c */ + 1 FROM t"),
         "unaliased column `total /* c */ + 1` needs an alias (its server-generated name differs between versions)"
     );
+}
+
+/// Aggregated CTEs joined to tables on their key: the aggregation is pulled up through the
+/// key-preserving joins; any other join keeps the CTE apart.
+#[test]
+fn aggregation_pulled_up_through_key_joins() {
+    let v = |sql: &str| p(&format!("CREATE VIEW v AS {sql}"));
+    let t = "WITH t AS (SELECT order_id, SUM(qty * price) AS amount, COUNT(*) AS n FROM order_items GROUP BY order_id) ";
+    let one = v(&format!(
+        "{t}SELECT o.id, o.status, t.amount FROM orders o JOIN t ON t.order_id = o.id WHERE t.n > 1 AND o.status <> 'x'"
+    ));
+    assert_eq!(one.mode, Mode::Grouped);
+    assert_eq!(
+        one.select_sql(&[], None),
+        "SELECT `o`.id AS `id`, `o`.status AS `status`, SUM(`order_items`.qty * `order_items`.price) AS `amount` \
+         FROM orders o JOIN order_items ON (`order_items`.order_id = `o`.id) WHERE (`o`.status <> 'x') \
+         GROUP BY `order_items`.order_id, `o`.`id`, `o`.`status` HAVING (COUNT(*) > 1)"
+    );
+    let inline = p(
+        "CREATE VIEW v AS SELECT o.id, o.status, SUM(i.qty * i.price) AS amount FROM orders o \
+                    JOIN order_items i ON i.order_id = o.id WHERE o.status <> 'x' \
+                    GROUP BY i.order_id, o.id, o.status HAVING COUNT(*) > 1",
+    );
+    assert_eq!(signature(&one), signature(&inline));
+    // Bound through another bound table.
+    assert_eq!(
+        v(&format!(
+            "{t}SELECT t.order_id, c.name, t.amount FROM t JOIN orders o ON o.id = t.order_id JOIN customers c ON c.id = o.customer_id"
+        ))
+        .mode,
+        Mode::Grouped
+    );
+    // Not the joined table's key: one group meets many rows.
+    let r = reason(
+        "CREATE VIEW v AS WITH t AS (SELECT customer_id, SUM(total) AS s FROM orders GROUP BY customer_id) \
+         SELECT c.id, t.s FROM customers c JOIN t ON t.customer_id = c.region_id"
+    );
+    assert_eq!(r, "GROUP BY in CTE `t` joined to other tables");
+    // NULL side, and a key compared across type families: not pulled up.
+    assert!(matches!(
+        v(&format!(
+            "{t}SELECT o.id, t.amount FROM orders o LEFT JOIN t ON t.order_id = o.id"
+        ))
+        .mode,
+        Mode::Full(_)
+    ));
+    assert!(matches!(
+        v(
+            "WITH t AS (SELECT status, COUNT(*) AS n FROM orders GROUP BY status) \
+           SELECT c.id, t.n FROM customers c JOIN t ON t.status = c.id"
+        )
+        .mode,
+        Mode::Full(_)
+    ));
+}
+
+fn outcome(sql: &str, cat: &HashMap<TableRef, Arc<TableInfo>>) -> super::Outcome {
+    let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+    let opts = super::Options {
+        internal_views: true,
+        ..Default::default()
+    };
+    super::analyze(&d, "db", cat, &opts).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+}
+
+/// The table the engine would create for an internal view (its columns, `pk` = its unit).
+fn internal_table(
+    iv: &super::InternalView,
+    cols: &[(&str, &str)],
+    pk: &[usize],
+) -> (TableRef, Arc<TableInfo>) {
+    table(&iv.name, cols, pk)
+}
+
+/// Aggregated CTEs joined on anything but a key become internal views; the parent is planned
+/// over their tables once they exist, and identical subtrees share one view.
+#[test]
+fn internal_views_for_aggregates_joined_on_non_keys() {
+    let sql = "WITH t AS (SELECT customer_id, SUM(total) AS s FROM orders GROUP BY customer_id) \
+               SELECT c.id, t.s FROM customers c JOIN t ON t.customer_id = c.region_id";
+    let mut cat = catalog();
+    let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
+        panic!("expected an internal view")
+    };
+    assert_eq!(ivs.len(), 1);
+    let iv = &ivs[0];
+    assert!(
+        iv.name.starts_with("_lv_int_") && iv.name.len() == 24,
+        "{}",
+        iv.name
+    );
+    assert_eq!(
+        iv.sql,
+        format!(
+            "CREATE VIEW `{}` AS SELECT `orders`.customer_id AS `customer_id`, SUM(`orders`.total) AS `s` \
+             FROM orders GROUP BY `orders`.customer_id",
+            iv.name
+        )
+    );
+    assert_eq!(iv.purpose, "GROUP BY in CTE `t`");
+    assert_eq!(iv.key, vec!["customer_id".to_string()]);
+    // The same CTE in another definition: the same internal view.
+    let other = "WITH t AS (SELECT customer_id, SUM(total) AS s FROM orders GROUP BY customer_id) \
+                 SELECT r.id, t.s FROM regions r JOIN t ON t.customer_id = r.id + 1";
+    let super::Outcome::NeedsInternal(again) = outcome(other, &cat) else {
+        panic!("expected an internal view")
+    };
+    assert_eq!(again[0].name, iv.name);
+    // The internal view itself plans as a grouped view despite its reserved name.
+    let d = parse_definition(&iv.sql).unwrap();
+    let opts = super::Options {
+        internal: true,
+        ..Default::default()
+    };
+    let super::Outcome::Plan(ip) = super::analyze(&d, "db", &cat, &opts).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        (ip.mode.clone(), ip.name.as_str()),
+        (Mode::Grouped, iv.name.as_str())
+    );
+    // Once its table exists, the parent is a chained view over it.
+    let (k, t) = internal_table(iv, &[("customer_id", "int"), ("s", "decimal")], &[]);
+    cat.insert(k, t);
+    let super::Outcome::Plan(v) = outcome(sql, &cat) else {
+        panic!("expected a plan")
+    };
+    assert_eq!(v.mode, Mode::Spj);
+    assert_eq!(v.aliases[1].table.name, iv.name);
+    assert!(
+        v.from_sql.contains(&format!("`db`.`{}` AS `t`", iv.name)),
+        "{}",
+        v.from_sql
+    );
+    // Without internal views: Full, naming the construct.
+    assert_eq!(
+        reason(&format!("CREATE VIEW v AS {sql}")),
+        "GROUP BY in CTE `t` joined to other tables"
+    );
+}
+
+/// Window and top-N CTEs are isolated too: the parent filters or joins their table.
+#[test]
+fn internal_views_for_windows_and_top_n() {
+    let mut cat = catalog();
+    let win = "WITH t AS (SELECT id, customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) AS rn \
+               FROM orders) SELECT id, customer_id FROM t WHERE rn = 1";
+    let super::Outcome::NeedsInternal(ivs) = outcome(win, &cat) else {
+        panic!("expected an internal view")
+    };
+    assert_eq!(ivs[0].purpose, "window function in CTE `t`");
+    assert!(
+        ivs[0].sql.contains(
+            "ROW_NUMBER() OVER (PARTITION BY `orders`.customer_id ORDER BY `orders`.id) AS `rn`"
+        ),
+        "{}",
+        ivs[0].sql
+    );
+    let top =
+        "WITH top AS (SELECT id, total AS amount FROM orders ORDER BY amount DESC, id LIMIT 5) \
+               SELECT c.name, t.amount FROM customers c JOIN top t ON t.id = c.id";
+    let super::Outcome::NeedsInternal(ivs) = outcome(top, &cat) else {
+        panic!("expected an internal view")
+    };
+    assert!(
+        ivs[0]
+            .sql
+            .ends_with("FROM orders ORDER BY 2 DESC, 1 LIMIT 5"),
+        "{}",
+        ivs[0].sql
+    );
+    let (k, t) = internal_table(&ivs[0], &[("id", "int"), ("amount", "decimal")], &[]);
+    cat.insert(k, t);
+    let super::Outcome::Plan(v) = outcome(top, &cat) else {
+        panic!("expected a plan")
+    };
+    assert_eq!(v.mode, Mode::Spj);
+    // Without internal views: Full, naming the construct.
+    assert_eq!(
+        reason(&format!("CREATE VIEW v AS {win}")),
+        "window function in CTE `t`"
+    );
+}
+
+/// Grouped views whose group key is reached through two lookup tables, or lies on the NULL side
+/// of a LEFT JOIN, aggregate a tuple-lineage view of their join.
+#[test]
+fn tuple_lineage_views_for_untraceable_groups() {
+    let mut cat = catalog();
+    let sql = "SELECT c.region_id, SUM(i.qty) AS units, COUNT(*) AS n FROM order_items i \
+               JOIN orders o ON o.id = i.order_id JOIN customers c ON c.id = o.customer_id GROUP BY c.region_id";
+    let today = p(&format!("CREATE VIEW v AS {sql}"));
+    assert_eq!(today.mode, Mode::Grouped);
+    assert_eq!(
+        today
+            .aliases
+            .iter()
+            .filter(|a| a.direct_unit.is_none())
+            .count(),
+        2
+    );
+    let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
+        panic!("expected the tuple-lineage view")
+    };
+    let j = &ivs[0];
+    assert_eq!(
+        j.sql,
+        format!(
+            "CREATE VIEW `{}` AS SELECT `c`.`region_id` AS `_lv_c0`, `i`.`qty` AS `_lv_c1` FROM order_items i \
+             JOIN orders o ON `o`.id = `i`.order_id JOIN customers c ON `c`.id = `o`.customer_id",
+            j.name
+        )
+    );
+    let (k, t) = internal_table(j, &[("_lv_c0", "int"), ("_lv_c1", "int")], &[]);
+    cat.insert(k, t);
+    let super::Outcome::Plan(v) = outcome(sql, &cat) else {
+        panic!("expected a plan")
+    };
+    assert_eq!(v.mode, Mode::Grouped);
+    assert_eq!(v.aliases.len(), 1);
+    assert_eq!(
+        v.aliases[0].direct_unit,
+        Some(vec![0]),
+        "J's rows carry the group key"
+    );
+    assert_eq!(
+        v.select_sql(&[], None),
+        format!(
+            "SELECT `_lv_j`.`_lv_c0` AS `region_id`, SUM(`_lv_j`.`_lv_c1`) AS `units`, COUNT(*) AS `n` \
+             FROM `db`.`{}` AS `_lv_j` GROUP BY `_lv_j`.`_lv_c0`",
+            j.name
+        )
+    );
+    // A group key on the NULL side; conditions on the NULL side are evaluated on J's rows.
+    let sql =
+        "SELECT c.region_id, COUNT(*) AS n FROM orders o LEFT JOIN customers c ON c.id = o.customer_id \
+               WHERE o.status <> 'x' AND c.name <> 'y' GROUP BY c.region_id";
+    let mut cat = catalog();
+    let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
+        panic!("expected the tuple-lineage view")
+    };
+    assert!(
+        ivs[0].sql.ends_with("WHERE (`o`.status <> 'x')"),
+        "{}",
+        ivs[0].sql
+    );
+    let (k, t) = internal_table(&ivs[0], &[("_lv_c0", "int"), ("_lv_c1", "varchar")], &[]);
+    cat.insert(k, t);
+    let super::Outcome::Plan(v) = outcome(sql, &cat) else {
+        panic!("expected a plan")
+    };
+    assert_eq!(v.mode, Mode::Grouped);
+    assert_eq!(v.where_sql.as_deref(), Some("(`_lv_j`.`_lv_c1` <> 'y')"));
+}
+
+/// Scalar subqueries that look one row up by its primary key are LEFT JOINs.
+#[test]
+fn scalar_lookups_unnested() {
+    let v = |sql: &str| p(&format!("CREATE VIEW v AS {sql}"));
+    let a = v("SELECT o.id, (SELECT name FROM customers c WHERE c.id = o.customer_id) AS cname FROM orders o");
+    assert_eq!(a.mode, Mode::Spj);
+    assert_eq!(
+        a.from_sql,
+        "orders o LEFT JOIN `db`.`customers` AS `c` ON (`c`.`id` = o.customer_id)"
+    );
+    assert_eq!(a.projection[1], "`c`.`name` AS `cname`");
+    // Not NULL-propagating: NULL when no row matches, as the subquery would be.
+    let g = v("SELECT o.id, (SELECT COALESCE(name, '?') FROM customers c WHERE c.id = o.customer_id) AS n FROM orders o");
+    assert_eq!(
+        g.projection[1],
+        "IF(`c`.`id` IS NULL, NULL, COALESCE(`c`.`name`, '?')) AS `n`"
+    );
+    // In WHERE, and unaliased (named after its text, as by the server).
+    let w = v(
+        "SELECT o.id, (SELECT name FROM customers c WHERE c.id = o.customer_id) FROM orders o \
+               WHERE (SELECT region_id FROM customers c WHERE c.id = o.customer_id) = 3",
+    );
+    assert_eq!(w.mode, Mode::Spj);
+    assert_eq!(
+        w.projection[1],
+        "`c`.`name` AS `(SELECT name FROM customers c WHERE c.id = o.customer_id)`"
+    );
+    assert_eq!(w.aliases.len(), 3);
+    // Not a key lookup, or an aggregate: still a subquery.
+    for sql in [
+        "SELECT o.id, (SELECT name FROM customers c WHERE c.region_id = o.customer_id) AS n FROM orders o",
+        "SELECT o.id, (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS n FROM orders o",
+    ] {
+        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), "subquery", "{sql}");
+    }
+}
+
+/// Join syntax that only spells an inner or left join differently.
+#[test]
+fn join_syntax_normalized() {
+    let v = |sql: &str| p(&format!("CREATE VIEW v AS {sql}"));
+    let r = v("SELECT o.id, c.name FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id");
+    assert_eq!(r.mode, Mode::Spj);
+    assert_eq!(
+        r.aliases[0].table.name, "orders",
+        "the preserved side is the anchor"
+    );
+    assert_eq!(
+        r.from_sql,
+        "orders o LEFT JOIN customers c ON o.customer_id = c.id"
+    );
+    let s =
+        v("SELECT o.id, c.name FROM orders o STRAIGHT_JOIN customers c ON c.id = o.customer_id");
+    assert_eq!(s.mode, Mode::Spj);
+    let n = v(
+        "SELECT o.id, i.qty, c.name FROM (orders o JOIN order_items i ON i.order_id = o.id) \
+               JOIN customers c ON c.id = o.customer_id",
+    );
+    assert_eq!(n.mode, Mode::Spj);
+    assert_eq!(n.aliases.len(), 3);
+    let u = v("SELECT r.id, r.name FROM regions r NATURAL JOIN customers c");
+    assert_eq!(u.mode, Mode::Spj);
+    assert_eq!(u.from_sql, "regions r JOIN customers c USING(`id`, `name`)");
+    // A LEFT JOIN inside parentheses keeps its own NULL semantics: not flattened.
+    assert_eq!(
+        reason("CREATE VIEW v AS SELECT o.id FROM orders o JOIN (customers c LEFT JOIN regions r ON r.id = c.region_id) ON c.id = o.customer_id"),
+        "unsupported FROM item"
+    );
+}
+
+/// UNION ALL: one plan per branch (names from the first branch); any other set operation is
+/// not split.
+#[test]
+fn union_all_branch_plans() {
+    let opts = super::Options {
+        branch_plans: true,
+        ..Default::default()
+    };
+    let go = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        super::analyze(&d, "db", &catalog(), &opts).unwrap()
+    };
+    let super::Outcome::Branches(b) = go(
+        "WITH paid AS (SELECT id, customer_id FROM orders WHERE status = 'paid') \
+         SELECT id, customer_id AS who, 'o' AS src FROM paid \
+         UNION ALL SELECT o.id, c.id, 'c' FROM orders o JOIN customers c ON c.id = o.customer_id \
+         UNION ALL (SELECT customer_id, COUNT(*), 'g' FROM orders GROUP BY customer_id)",
+    ) else {
+        panic!("expected branch plans")
+    };
+    assert_eq!(b.plans.len(), 3);
+    assert_eq!(
+        b.plans.iter().map(|p| p.mode.clone()).collect::<Vec<_>>(),
+        [Mode::Spj, Mode::Spj, Mode::Grouped]
+    );
+    assert_eq!(
+        b.plans[1].projection,
+        ["`o`.id AS `id`", "`c`.id AS `who`", "'c' AS `src`"]
+    );
+    assert!(b.probe_sql.contains("UNION ALL"), "{}", b.probe_sql);
+    // Not a UNION ALL chain: planned as before.
+    assert!(matches!(
+        go("SELECT id FROM orders UNION SELECT id FROM customers"),
+        super::Outcome::Plan(ViewPlan {
+            mode: Mode::Full(_),
+            ..
+        })
+    ));
 }
 
 #[test]

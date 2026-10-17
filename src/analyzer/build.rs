@@ -39,7 +39,16 @@ impl<'a> Builder<'a> {
         let limit = q.limit_clause.is_some() || q.fetch.is_some();
         let ordered = q.order_by.is_some();
         match q.body.as_ref() {
-            SetExpr::Select(s) => self.select(s, ordered, limit, &scope),
+            SetExpr::Select(s) => {
+                let mut r = self.select(s, ordered, limit, &scope)?;
+                if let (Rel::Block(b), true) = (&mut r, limit) {
+                    // Only the clauses after the body are kept (no WITH, no body).
+                    let mut tail = q.clone();
+                    tail.with = None;
+                    b.tail = Some(Box::new(tail));
+                }
+                Ok(r)
+            }
             SetExpr::Query(inner) => Ok(match self.query(inner, &scope)? {
                 Rel::Block(mut b) => {
                     b.limit |= limit;
@@ -60,6 +69,11 @@ impl<'a> Builder<'a> {
                 why: "unsupported query".into(),
             }),
         }
+    }
+
+    /// Builds one branch of a set operation at the top of the statement.
+    pub(crate) fn branch<'q>(&self, s: &'q Select, scope: &Scope<'q>) -> Result<Rel> {
+        self.select(s, false, false, scope)
     }
 
     /// Builds a relation nested in the current one (a derived table, CTE body or subquery).
@@ -119,6 +133,7 @@ impl<'a> Builder<'a> {
             semis: Vec::new(),
             qualified: false,
             distinct_was: false,
+            tail: None,
         };
         if !star_using {
             normalize::block(self, &mut b, scope)?;

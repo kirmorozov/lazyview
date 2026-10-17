@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use sqlparser::ast::{Expr, Select, SelectItem};
+use sqlparser::ast::{Expr, Query, Select, SelectItem};
 
 use super::names::Name;
 use crate::catalog::{TableInfo, TableRef};
@@ -123,6 +123,8 @@ pub(crate) struct Block {
     /// The enclosing query has ORDER BY (dropped unless there is a LIMIT) / LIMIT or FETCH.
     pub ordered: bool,
     pub limit: bool,
+    /// That ORDER BY / LIMIT, to render the block as an internal view.
+    pub tail: Option<Box<Query>>,
     pub semis: Vec<Semi>,
     /// Whether column references are all qualified with their item's alias.
     pub qualified: bool,

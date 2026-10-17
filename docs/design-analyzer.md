@@ -1,7 +1,7 @@
 # Query analyzer: design
 
-Status: phase A (analyzer module, merges, semi-joins, analyzer side of internal views and
-branch plans) in progress; phases B–D below. Owner rule: **a view is maintained incrementally
+Status: phase A done except branch plans (`src/analyzer`, tested on all six servers by
+`tests/cte.rs`, not yet called by the engine); phases B–D below. Owner rule: **a view is maintained incrementally
 unless it is mathematically impossible to trace a source change to the output rows it affects.**
 Every Full fallback names the construct and states why no trace exists.
 
@@ -84,7 +84,8 @@ the CTE-unaware one. `ViewPlan` stays the executor contract; additions are backw
 | multi-table derived on the NULL side | **internal view** (SPJ, lineage) joined as one table | `L ⟕ (R1⋈R2) ≠ (L⟕R1)⟕R2` (partial matches), so it cannot be flattened |
 | ORDER BY without LIMIT inside | dropped | no effect on the bag |
 | aggregated / DISTINCT CTE as the only FROM item of a filter/project block | **merge-up**: one Grouped/Global block; outer predicates on group keys → WHERE, others → HAVING | `σp(γG(Q)) = γG(σp Q)` for `p` over G; `π` over aggregates is HAVING/projection |
-| aggregated / DISTINCT CTE joined to tables | **internal grouped view** `_lv_int_<h>` (key = GROUP BY columns, unique) + outer as a chained view; joins on the key give direct units | the internal view is exact; the outer is a view over a table |
+| aggregated / DISTINCT CTE joined on the other tables' keys | **pull-up**: one grouped block over the CTE's tables joined to the others, grouped by the CTE's keys plus the other tables' used columns; aggregate conditions → HAVING | each group joins ≤ 1 row per table (its whole PK equals group keys or bound columns, same type family), the same row for every base row of the group (Yan & Larson) |
+| aggregated / DISTINCT CTE joined otherwise | **internal grouped view** `_lv_int_<h>` (key = GROUP BY columns, unique) + outer as a chained view; joins on the key give direct units | the internal view is exact; the outer is a view over a table |
 | LATERAL derived table (MySQL ≥ 8.0.14) | phase D: per-outer-row units (unit = outer key) | — |
 
 ### 3.2 Block shapes
@@ -200,8 +201,9 @@ pushdown (MySQL 8.0.22+, MariaDB 10.2+) only affects rebuild speed. Naming diffe
 ## 8. Rollout
 
 * **A** (analyzer, no executor change): build/normalize/classify/lower; merge family, merge-up,
-  DISTINCT→GROUP BY, semi-joins with unique keys or unit correlation; analyzer side of internal
-  views and branch plans behind `Options`; tests.
+  pull-up, DISTINCT→GROUP BY, semi-joins with unique keys or unit correlation; analyzer side of
+  internal views (`analyze()` with `Options`, `Outcome::NeedsInternal`); tests. Branch plans
+  for UNION ALL still to do.
 * **B** (wiring, `analyze.rs` after go-ahead): `analyze::plan` / `referenced_tables` delegate;
   block-planner additions that need no engine change: partitioned windows, bounded recompute
   (top-N, windows without PARTITION BY), semi/anti-join lookup templates, NULL-side lookup

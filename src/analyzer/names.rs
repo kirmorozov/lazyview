@@ -7,7 +7,7 @@
 //! * flavor-dependent: a comment inside the text (kept by 8.4, stripped by 8.0 and MariaDB) and
 //!   duplicates of generated names (`Name_exp_<x>` vs `My_exp_<x>`).
 
-use sqlparser::ast::{Expr, Ident, Value};
+use sqlparser::ast::{Expr, Ident, UnaryOperator, Value};
 use sqlparser::tokenizer::{Token, Whitespace};
 
 use super::source::tokenize;
@@ -62,6 +62,17 @@ pub(crate) fn item_name(expr: &Expr, alias: Option<&Ident>, text: Option<&str>) 
     while let Expr::Nested(inner) = e {
         e = inner;
     }
+    // Unary plus disappears in the parser: `+total` is named `total`.
+    while let Expr::UnaryOp {
+        op: UnaryOperator::Plus,
+        expr: inner,
+    } = e
+    {
+        if !matches!(**inner, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            return uncertain(expr, text);
+        }
+        e = inner;
+    }
     match e {
         Expr::Identifier(id) => return Name::new(ident_name(id), NameKind::Column),
         Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
@@ -69,40 +80,42 @@ pub(crate) fn item_name(expr: &Expr, alias: Option<&Ident>, text: Option<&str>) 
         }
         _ => {}
     }
-    if !std::ptr::eq(e, expr) {
-        // `(x + 1)`: the text includes the parentheses; keep it but do not guess.
-        return match text {
-            Some(t) => Name::new(t, NameKind::Generated { certain: false }),
-            None => Name::new(expr.to_string(), NameKind::Generated { certain: false }),
+    if let (Expr::Value(v), Some(t)) = (e, text) {
+        // String literals are named after their value: certain when the text is exactly that
+        // one literal without backslash escapes (adjacent literals `'a' 'b'` are named `a` by
+        // MySQL, `ab` by MariaDB; escapes depend on NO_BACKSLASH_ESCAPES).
+        let literal = |prefix: &str, q: char, s: &str| {
+            let plain = !s.contains('\\') && t == format!("{prefix}{q}{s}{q}");
+            Name::new(
+                s.replace(&format!("{q}{q}"), &q.to_string()),
+                NameKind::Generated { certain: plain },
+            )
         };
-    }
-    if let Expr::Value(v) = e {
         match &v.value {
-            // Named after the value: certain only without backslash escapes (their meaning
-            // depends on NO_BACKSLASH_ESCAPES) and when the text is the plain literal.
-            Value::SingleQuotedString(s) => {
-                let plain = !s.contains('\\') && text.is_some_and(|t| t.starts_with('\''));
-                return Name::new(s.replace("''", "'"), NameKind::Generated { certain: plain });
-            }
-            Value::Number(..) | Value::Null | Value::Boolean(_) => {}
-            // Other literals (introducers, hex, bit, double-quoted strings): not measured.
-            _ => {
-                return Name::new(
-                    text.map(str::to_string).unwrap_or_else(|| expr.to_string()),
-                    NameKind::Generated { certain: false },
-                )
-            }
+            Value::SingleQuotedString(s) => return literal("", '\'', s),
+            Value::DoubleQuotedString(s) => return literal("", '"', s),
+            Value::NationalStringLiteral(s) => return literal("N", '\'', s),
+            _ => {}
         }
     }
     match text {
+        // Numbers, NULL, TRUE/FALSE, hex and bit literals and every other expression: the text
+        // as written, parentheses included.
         Some(t) => Name::new(
             t,
             NameKind::Generated {
                 certain: !has_comment(t),
             },
         ),
-        None => Name::new(expr.to_string(), NameKind::Generated { certain: false }),
+        None => uncertain(expr, text),
     }
+}
+
+fn uncertain(expr: &Expr, text: Option<&str>) -> Name {
+    Name::new(
+        text.map(str::to_string).unwrap_or_else(|| expr.to_string()),
+        NameKind::Generated { certain: false },
+    )
 }
 
 /// Whether SQL text contains a comment token.
@@ -187,6 +200,17 @@ mod tests {
         assert!(!name_of(r"'a\'b'").certain());
         assert!(!name_of("total /* c */ + 1").certain());
         assert_eq!(name_of("-1"), g("-1"));
+        assert_eq!(name_of("(total + 1)"), g("(total + 1)"));
+        assert_eq!(name_of("((id))"), Name::new("id", NameKind::Column));
+        assert_eq!(name_of("+total"), Name::new("total", NameKind::Column));
+        assert_eq!(name_of("-total"), g("-total"));
+        assert_eq!(name_of("NOT id"), g("NOT id"));
+        assert_eq!(name_of("TRUE"), g("TRUE"));
+        assert_eq!(name_of("0x41"), g("0x41"));
+        assert_eq!(name_of("X'41'"), g("X'41'"));
+        assert_eq!(name_of("N'n'"), g("n"));
+        assert_eq!(name_of("\"dq\""), g("dq"));
+        assert!(!name_of("'a' 'b'").certain());
         let mut v = vec![
             name_of("dbl+1"),
             name_of(&format!("CONCAT(nm, '{}')", "a".repeat(60))),
