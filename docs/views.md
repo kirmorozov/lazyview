@@ -22,8 +22,10 @@ UPDATE _lazyview SET enabled = 1 WHERE name = 'paid_orders';
 DELETE FROM _lazyview WHERE name = 'paid_orders';
 ```
 
-* `name` is unique (enforced by the table). When both `name` and a `CREATE VIEW` statement are
-  given, they must be equal.
+* `name` is unique (enforced by the table). In a `CREATE VIEW` statement the view name of the
+  statement counts: `name` is filled in or updated to it, so changing the name in the statement
+  renames the view online. If another row already has that name, the view goes into error:
+  ``name `x` already used by row #N``. A bare SELECT takes its name from `name`.
 * The `CREATE VIEW` form accepts what `SHOW CREATE VIEW` prints:
   `CREATE [OR REPLACE] [ALGORITHM=…] [DEFINER=…] [SQL SECURITY …] VIEW name [(columns)] AS SELECT …
   [WITH CHECK OPTION]`.
@@ -55,6 +57,10 @@ was missing is retried when the table appears.
 * When the unit (see below) identifies one row and is part of the SELECT, it becomes the
   `PRIMARY KEY`. A unit that is not selected is stored in hidden `INVISIBLE` columns `_lv_u0`,
   `_lv_u1`, … with an index. `SELECT *` does not return them.
+* Select/join views also keep the lineage of their rows: for each joined table whose rows map to
+  units only through a lookup, its primary key in hidden, indexed `INVISIBLE` columns
+  `_lv_a<i>_pk<j>`. A change to such a row is traced to the materialized rows it was part of
+  through them, also when its join partners changed at the same time.
 * lazyview never replaces or drops a table it did not create. If a table of that name already
   exists, the view goes into error: `refusing to replace existing base table … that lazyview does
   not manage`. Ownership is recorded in `_lazyview_state.managed`.
@@ -113,9 +119,13 @@ These constructs switch a view to `full`. `detail` shows the text in the first c
 
 How full mode behaves:
 
-* Any change to a table the view reads marks it stale. The rebuild runs the definition exactly
-  as written (`ORDER BY` included) into `<name>__lv_new`, then swaps it in. The old table stays
-  readable the whole time; `state` is `building` meanwhile.
+* Any change to a table the view reads marks it stale, except an `UPDATE` that leaves every
+  column the statement names unchanged. The rebuild runs the definition exactly as written
+  (`ORDER BY` included) into `<name>__lv_new`, then swaps it in. The old table stays readable
+  the whole time; `state` is `building` meanwhile.
+* At most one rebuild of a view runs at a time. Changes during it schedule one more rebuild after
+  it; they never restart it. A rebuild that fails is retried with exponential backoff (up to 5
+  minutes), or right away when a table it reads is altered, renamed or created.
 * Rebuilds start at most once per `LAZYVIEW_FULL_REFRESH_MS` (default 60 s), measured from the
   start of the previous one. Under constant writes a full view is therefore up to about one
   interval plus one build behind. `0` rebuilds as soon as possible.
@@ -168,8 +178,9 @@ reads.
 * If the view's unit is the foreign-key column (grouped by `order_id`, or joined
   `i.order_id = o.id`), the affected units come from the parent's binlog row.
 * Otherwise a delete or key update on the parent triggers an online rebuild of the view (at most
-  once per `LAZYVIEW_FULL_REFRESH_MS`). lazyview logs a warning when such a view is created:
-  `reads a child of a cascading foreign key whose units cannot be derived from the parent`.
+  once per `LAZYVIEW_FULL_REFRESH_MS`, never more than one at a time). lazyview logs a warning
+  when such a view is created: `reads a child of a cascading foreign key whose units cannot be
+  derived from the parent`. Group or join by the foreign-key column to avoid the rebuilds.
 
 The same rate-limited online rebuild is used when too many changed keys were buffered to track
 individually: more than max(10 × `LAZYVIEW_BATCH_MAX_KEYS`, 100000) during a build.
@@ -188,6 +199,10 @@ A view may read another lazyview table, for example a daily summary over `order_
 source's binlog is read, so the upstream view must be materialized on target `source`. Otherwise
 the definition fails with ``chained views need the upstream view on target `source` ``. When the
 upstream view is rebuilt and swapped, its dependent views are rebuilt online too.
+
+The upstream may be defined in the same transaction, or after the dependent view. Until the
+upstream table is live, the dependent view has `state = 'waiting'` (``waiting for upstream view
+`x` to be built``); it is built as soon as the upstream is swapped in.
 
 A plain SQL view (`CREATE VIEW` run directly on the server) can also be a source. It has no binlog
 rows of its own, so lazyview watches its base tables and maintains the view in full mode.
@@ -220,7 +235,7 @@ maintained) until an atomic `RENAME TABLE` swap.
 |---|---|
 | new definition | built in the background into `<name>__lv_new`, then renamed into place |
 | `UPDATE _lazyview SET definition = …` | the new version is built next to the live one; changes during the build are buffered and applied; then swapped |
-| new `name` for the same `_lazyview.id` | the new table is built; the old one is dropped after the new one is live |
+| new `name` for the same `_lazyview.id`, or another view name in its `CREATE VIEW` statement | the new table is built; the old one is dropped after the new one is live. `name` follows the statement's view name |
 | `targets` changed | built on the new targets; removed targets are dropped after the swap |
 | `enabled = 0` or row deleted | the table is dropped (with `LAZYVIEW_DROP_REMOVED=true`, the default) |
 | `ALTER TABLE`, `TRUNCATE` or `RENAME TABLE` of a source table, or an online schema change tool's table swap (`RENAME TABLE t TO t_old, t_new TO t`) | the view is re-planned and rebuilt online. The old table stays readable but is not maintained until the swap |
@@ -252,7 +267,7 @@ lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing column
 | `name`, `target` | primary key |
 | `definition_id`, `definition_hash` | which definition the table was built from |
 | `mode`, `detail` | `incremental` / `full` / `unknown` (every view in `error`), and the kind or reason (see [above](#incremental-or-full)) |
-| `state` | `building`, `ready` or `error` |
+| `state` | `building`, `ready`, `waiting` (a chained view whose upstream view is not built yet) or `error` |
 | `managed` | `1` once lazyview created the table; only such tables are ever replaced or dropped |
 | `last_error` | the error message in state `error` |
 | `refreshed_at` | last time the table was built or refreshed |

@@ -226,8 +226,8 @@ schema: each would maintain the same views.
 | `saved binlog position … is no longer available on the server` | binlogs were purged while lazyview was down; see [restart and resume](#restart-and-resume) |
 | `another replica connected with the same server_id N` | give every lazyview instance and every real replica a unique `LAZYVIEW_SERVER_ID` |
 | `Amazon RDS/Aurora binlog retention is …` (warning) | `CALL mysql.rds_set_configuration('binlog retention hours', 24);` |
-| a view in `error`: `_lazyview.name is … but the definition creates view …` | make `name` and the `CREATE VIEW` name equal, or set `name` to NULL |
-| `another _lazyview row already uses the name …` / `another definition already materializes …` | two rows define the same view; remove one |
+| a view in `error`: ``name `x` already used by row #N`` | the view name of its `CREATE VIEW` statement belongs to row N; rename one of the two views |
+| `another definition already materializes …` | two rows define the same view; remove one |
 | `refusing to replace existing base table … that lazyview does not manage` | a table with that name exists; rename or drop it, or pick another view name |
 | ``table `app`.`t` does not exist`` | create the table; the view is retried when it appears |
 | `unknown target …` | configure `LAZYVIEW_TARGET_<NAME>_*`, or fix `_lazyview.targets` |
