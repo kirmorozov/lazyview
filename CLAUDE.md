@@ -7,9 +7,10 @@
 - Do NOT use `/tmp`, `$HOME`, or the session scratchpad for this project. `tmp/` is git-ignored.
 
 ## Environment notes
-- Docker/podman cannot run containers in this dev sandbox (mount namespaces denied).
-  Integration tests run against real server binaries from official tarballs under `tmp/out/db/`.
-  Dockerfile / compose / CI files are still maintained for real machines.
+- Docker works on this host since the 2026-10-17 restart (`docker` 29 + `docker compose` v5.6). Local test
+  servers are moving to `docker-compose.test.yml` with the exact pinned images CI uses (local == CI);
+  `scripts/test-servers.sh` keeps a tarball mode (official server tarballs under `tmp/out/db/`) as fallback.
+  Containers must not inherit `flock` file descriptors (a daemon holding the lock blocks everyone).
 - The host is shared by several agents and ~10 database servers (62 GB; rustc has been OOM-killed).
   Every cargo invocation runs as `flock tmp/out/cargo-build.lock env CARGO_BUILD_JOBS=4 cargo <...>`
   (one build at a time, own `CARGO_TARGET_DIR` under `tmp/out/`), and heavy integration suites
