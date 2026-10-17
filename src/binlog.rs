@@ -114,9 +114,74 @@ pub struct ServerInfo {
 /// connection is detected by the OS as well (the reader also has its own idle timeout derived from
 /// the heartbeat period). See the module docs for authentication notes.
 pub fn replica_opts(dsn: &str) -> Result<Opts> {
-    let opts = Opts::from_url(dsn).map_err(|e| anyhow!("invalid DSN: {e}"))?;
+    // `tls_ca` / `ssl-ca` / `ssl_ca` (lazyview extension, not a mysql_async URL parameter):
+    // PEM file(s) with CA certificates to trust in addition to the built-in roots (e.g. the
+    // AWS RDS / Azure / self-signed CA). Implies TLS with certificate verification.
+    let (url, cas) = split_ca_params(dsn);
+    let opts = Opts::from_url(&url).map_err(|e| anyhow!("invalid DSN: {e}"))?;
     let keepalive = opts.tcp_keepalive().or(Some(Duration::from_secs(30)));
-    Ok(OptsBuilder::from_opts(opts).tcp_keepalive(keepalive).into())
+    let mut b = OptsBuilder::from_opts(opts.clone()).tcp_keepalive(keepalive);
+    if !cas.is_empty() {
+        for c in &cas {
+            if !std::path::Path::new(c).is_file() {
+                bail!("TLS CA file `{c}` not found (LAZYVIEW_TLS_CA / tls_ca DSN parameter)");
+            }
+        }
+        let ssl = opts
+            .ssl_opts()
+            .cloned()
+            .unwrap_or_default()
+            .with_root_certs(
+                cas.into_iter()
+                    .map(|c| std::path::PathBuf::from(c).into())
+                    .collect(),
+            );
+        b = b.ssl_opts(Some(ssl));
+    }
+    Ok(b.into())
+}
+
+fn split_ca_params(dsn: &str) -> (String, Vec<String>) {
+    let Some((base, query)) = dsn.split_once('?') else {
+        return (dsn.to_string(), Vec::new());
+    };
+    let mut keep = Vec::new();
+    let mut cas = Vec::new();
+    for kv in query.split('&').filter(|kv| !kv.is_empty()) {
+        match kv.split_once('=') {
+            Some(("tls_ca" | "ssl-ca" | "ssl_ca", v)) => cas.extend(
+                percent_decode(v)
+                    .split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+            ),
+            _ => keep.push(kv),
+        }
+    }
+    let url = if keep.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", keep.join("&"))
+    };
+    (url, cas)
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn value_str(v: Option<&Value>) -> String {
@@ -156,7 +221,24 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     } else {
         String::new()
     };
-    let problems = requirement_problems(flavor, &log_bin, &format, &image, &compress);
+    let mut problems = requirement_problems(flavor, &log_bin, &format, &image, &compress);
+    if flavor == Flavor::MySql {
+        // Partial JSON row images carry diffs instead of values; lazyview needs full values.
+        let opts: Option<Value> = conn
+            .query_first("SELECT @@GLOBAL.binlog_row_value_options")
+            .await
+            .unwrap_or(None);
+        if value_str(opts.as_ref())
+            .to_ascii_uppercase()
+            .contains("PARTIAL_JSON")
+        {
+            problems.push(
+                "binlog_row_value_options is PARTIAL_JSON (must be empty); fix: SET PERSIST \
+                 binlog_row_value_options='' (Amazon RDS/Aurora: set it in the DB parameter group)"
+                    .into(),
+            );
+        }
+    }
     if !problems.is_empty() {
         bail!(
             "server {version} does not meet lazyview's binlog requirements:\n  - {}",
@@ -181,12 +263,12 @@ fn requirement_problems(
         if maria {
             format!(
                 "SET GLOBAL {var}='{val}' and add {var}={val} to my.cnf [mysqld] \
-                 (container: --{opt}={val})"
+                 (container: --{opt}={val}; Amazon RDS: set it in the DB parameter group)"
             )
         } else {
             format!(
                 "SET PERSIST {var}='{val}' (or {var}={val} in my.cnf [mysqld]; container: \
-                 --{opt}={val})"
+                 --{opt}={val}; Amazon RDS/Aurora: set {var}={val} in the DB parameter group)"
             )
         }
     };
@@ -1708,5 +1790,28 @@ mod tests {
         );
         assert_eq!(Flavor::from_version("8.0.43-34"), Flavor::MySql);
         assert_eq!(Flavor::from_version("8.4.6"), Flavor::MySql);
+    }
+}
+
+#[cfg(test)]
+mod ca_tests {
+    use super::*;
+
+    #[test]
+    fn ca_params_split_and_applied() {
+        let (u, c) = split_ca_params(
+            "mysql://u:p@h/d?require_ssl=true&tls_ca=%2Ftmp%2Fa.pem,%2Fb.pem&verify_ca=true",
+        );
+        assert_eq!(u, "mysql://u:p@h/d?require_ssl=true&verify_ca=true");
+        assert_eq!(c, vec!["/tmp/a.pem", "/b.pem"]);
+        assert_eq!(split_ca_params("mysql://h/d").1.len(), 0);
+        assert!(replica_opts("mysql://h/d?ssl-ca=/definitely/missing.pem").is_err());
+        let ca = std::env::current_dir().unwrap().join("Cargo.toml");
+        let o = replica_opts(&format!(
+            "mysql://h/d?require_ssl=true&tls_ca={}",
+            ca.display()
+        ))
+        .unwrap();
+        assert_eq!(o.ssl_opts().unwrap().root_certs().len(), 1);
     }
 }

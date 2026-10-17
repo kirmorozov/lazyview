@@ -1088,10 +1088,12 @@ async fn connection_modes() {
                 "SELECT host FROM information_schema.processlist WHERE id = CONNECTION_ID()",
             )
             .await?;
+        // A TCP login shows `address:port` (the address varies: loopback locally, the docker
+        // bridge gateway on CI); a socket login shows plain `localhost`.
         ensure!(
-            tcp_host
-                .as_deref()
-                .is_some_and(|h| h.starts_with("127.0.0.1")),
+            tcp_host.as_deref().is_some_and(|h| h != "localhost"
+                && h.rsplit_once(':')
+                    .is_some_and(|(_, p)| p.parse::<u16>().is_ok())),
             "not TCP: {tcp_host:?}"
         );
         let mut tls_note = "server has no TLS".to_string();
