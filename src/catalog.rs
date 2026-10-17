@@ -1,5 +1,6 @@
 //! Table metadata from `information_schema`, needed to resolve columns and decode binlog rows.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,6 +25,10 @@ pub enum ColKind {
     /// Values whose binlog and query representations differ (YEAR, FLOAT, DOUBLE);
     /// never used to derive unit keys directly.
     Inexact,
+    /// Types whose binlog bytes cannot be bound back as a parameter at all (MariaDB UUID, INET4,
+    /// INET6, spatial types, VECTOR, anything unknown): the server compares them as a different
+    /// value, so they can be neither unit keys nor lookup images.
+    Opaque,
 }
 
 #[derive(Debug, Clone)]
@@ -106,15 +111,13 @@ impl Column {
                 ColKind::Plain,
                 "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext",
             ) => match (charset, collation) {
-                (Some(cs), Some(co)) => {
-                    format!("CONVERT(CAST(? AS BINARY) USING {cs}) COLLATE {co}")
-                }
+                (Some(cs), Some(co)) => text_param(cs, Some(co)),
                 _ => "?".to_string(),
             },
             _ => "?".to_string(),
         };
         let exact = match kind {
-            ColKind::Timestamp | ColKind::Json | ColKind::Inexact => false,
+            ColKind::Timestamp | ColKind::Json | ColKind::Inexact | ColKind::Opaque => false,
             ColKind::Plain => utf8_like,
             _ => true,
         };
@@ -168,6 +171,27 @@ impl Column {
 
     pub fn exact_key(&self) -> bool {
         self.exact
+    }
+
+    /// Drops the `COLLATE` of a string param when the column has `default`, the collation that
+    /// `CONVERT(... USING charset)` yields on the server. The param then has the column's own
+    /// IMPLICIT coercibility; an EXPLICIT one clashes with any `COLLATE` in the view definition
+    /// ("Illegal mix of collations").
+    pub fn with_default_collation(mut self, default: Option<&str>) -> Column {
+        if let (Some(cs), Some(co), Some(d)) = (&self.charset, &self.collation, default) {
+            if co.eq_ignore_ascii_case(d) && self.param.starts_with("CONVERT(") {
+                self.param = text_param(cs, None);
+            }
+        }
+        self
+    }
+}
+
+/// Typed placeholder for a string value: its bytes in the column's charset (and collation).
+fn text_param(charset: &str, collation: Option<&str>) -> String {
+    match collation {
+        Some(co) => format!("CONVERT(CAST(? AS BINARY) USING {charset}) COLLATE {co}"),
+        None => format!("CONVERT(CAST(? AS BINARY) USING {charset})"),
     }
 }
 
@@ -229,6 +253,8 @@ pub type TableRef = (String, String);
 #[derive(Default)]
 pub struct Catalog {
     tables: HashMap<TableRef, Arc<TableInfo>>,
+    /// Charset -> collation of `CONVERT(... USING charset)` (None: unknown).
+    default_collations: HashMap<String, Option<String>>,
 }
 
 impl Catalog {
@@ -238,6 +264,7 @@ impl Catalog {
 
     pub fn clear(&mut self) {
         self.tables.clear();
+        self.default_collations.clear();
     }
 
     pub async fn get(
@@ -251,7 +278,8 @@ impl Catalog {
         if let Some(t) = self.tables.get(&key) {
             return Ok(Some(t.clone()));
         }
-        let Some(t) = load_table(conn, schema, name, mariadb).await? else {
+        let Some(t) = load_table(conn, schema, name, mariadb, &mut self.default_collations).await?
+        else {
             return Ok(None);
         };
         let t = Arc::new(t);
@@ -265,6 +293,7 @@ pub async fn load_table(
     schema: &str,
     name: &str,
     mariadb: bool,
+    default_collations: &mut HashMap<String, Option<String>>,
 ) -> Result<Option<TableInfo>> {
     type ColRow = (
         String,
@@ -294,10 +323,22 @@ pub async fn load_table(
             (schema, name),
         )
         .await?;
+    for (_, _, _, cs, ..) in &rows {
+        if let Some(cs) = cs.as_deref().map(str::to_ascii_lowercase) {
+            if let Entry::Vacant(e) = default_collations.entry(cs) {
+                let co = default_collation(conn, e.key()).await;
+                e.insert(co);
+            }
+        }
+    }
     let columns: Vec<Column> = rows
         .into_iter()
-        .map(
-            |(name, data_type, column_type, cs, co, extra, octets)| Column {
+        .map(|(name, data_type, column_type, cs, co, extra, octets)| {
+            let default = cs
+                .as_deref()
+                .and_then(|c| default_collations.get(&c.to_ascii_lowercase()))
+                .and_then(|d| d.as_deref());
+            Column {
                 invisible: extra.to_ascii_uppercase().contains("INVISIBLE"),
                 ..Column::new(
                     &name,
@@ -308,8 +349,9 @@ pub async fn load_table(
                     octets,
                     mariadb,
                 )
-            },
-        )
+                .with_default_collation(default)
+            }
+        })
         .collect();
     let pk = pk_names
         .iter()
@@ -380,6 +422,26 @@ pub async fn load_table(
     }))
 }
 
+/// The collation `CONVERT(... USING charset)` yields on this server (its default for the
+/// charset, which MariaDB's `character_set_collations` can override). None if unknown.
+async fn default_collation(conn: &mut Conn, charset: &str) -> Option<String> {
+    if charset.is_empty()
+        || !charset
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    conn.query_first::<Option<String>, _>(format!(
+        "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
+    ))
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .map(|c| c.to_ascii_lowercase())
+}
+
 pub fn col_kind(data_type: &str, column_type: &str) -> ColKind {
     let dt = data_type.to_ascii_lowercase();
     let ct = column_type.to_ascii_lowercase();
@@ -402,7 +464,10 @@ pub fn col_kind(data_type: &str, column_type: &str) -> ColKind {
         "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => ColKind::Binary,
         "json" => ColKind::Json,
         "year" | "float" | "double" | "real" => ColKind::Inexact,
-        _ => ColKind::Plain,
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "decimal"
+        | "numeric" | "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext"
+        | "date" | "datetime" | "time" => ColKind::Plain,
+        _ => ColKind::Opaque,
     }
 }
 
@@ -495,5 +560,67 @@ mod tests {
         let u = Column::new("u", "bigint", "bigint unsigned", None, None, None, false);
         assert_eq!(i.family(), u.family(), "signedness does not matter");
         assert_ne!(i.family(), a.family());
+    }
+
+    #[test]
+    fn opaque_types_and_default_collations() {
+        for (dt, ct) in [
+            ("uuid", "uuid"),
+            ("inet4", "inet4"),
+            ("inet6", "inet6"),
+            ("geometry", "geometry"),
+            ("point", "point"),
+            ("vector", "vector(3)"),
+        ] {
+            let c = Column::new("c", dt, ct, None, None, Some(16), true);
+            assert_eq!(c.kind, ColKind::Opaque, "{dt}");
+            assert!(!c.exact_key(), "{dt}");
+            assert_eq!(c.param, "?");
+        }
+        for dt in ["int", "varchar", "decimal", "date", "datetime", "time"] {
+            assert!(Column::simple("c", dt).exact_key(), "{dt}");
+        }
+        let s = Column::new(
+            "s",
+            "varchar",
+            "varchar(5)",
+            Some("utf8mb4"),
+            Some("utf8mb4_0900_ai_ci"),
+            Some(20),
+            false,
+        );
+        assert_eq!(
+            s.param,
+            "CONVERT(CAST(? AS BINARY) USING utf8mb4) COLLATE utf8mb4_0900_ai_ci"
+        );
+        assert_eq!(
+            s.clone()
+                .with_default_collation(Some("utf8mb4_0900_ai_ci"))
+                .param,
+            "CONVERT(CAST(? AS BINARY) USING utf8mb4)"
+        );
+        assert_eq!(
+            s.clone()
+                .with_default_collation(Some("utf8mb4_general_ci"))
+                .param,
+            s.param,
+            "a non-default collation stays explicit"
+        );
+        assert_eq!(s.clone().with_default_collation(None).param, s.param);
+        let i = Column::simple("i", "int");
+        assert_eq!(i.clone().with_default_collation(Some("x")).param, i.param);
+        let e = Column::new(
+            "e",
+            "enum",
+            "enum('a')",
+            Some("utf8mb4"),
+            Some("utf8mb4_general_ci"),
+            Some(4),
+            false,
+        );
+        assert_eq!(
+            e.with_default_collation(Some("utf8mb4_general_ci")).param,
+            "?"
+        );
     }
 }

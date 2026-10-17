@@ -8,14 +8,15 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    visit_expressions, visit_relations, BinaryOperator, DataType, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    ObjectName, ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind,
-    SetExpr, TableAlias, TableFactor, TableWithJoins, UnaryOperator, Value, Visit,
+    visit_expressions, visit_expressions_mut, visit_relations, BinaryOperator, DataType, Expr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, ObjectName, ObjectNamePart, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, TableAlias, TableFactor, TableWithJoins,
+    UnaryOperator, Value, Visit,
 };
 use sqlparser::dialect::MySqlDialect;
-use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, Tokenizer, Word};
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Word};
 
 use crate::catalog::{ColKind, FkAction, TableInfo, TableRef};
 
@@ -120,6 +121,38 @@ const JSON_PRODUCING: &[&str] = &[
     "JSON_QUOTE",
 ];
 
+/// SELECT modifiers that may precede the first projection item.
+const SELECT_MODIFIERS: &[&str] = &[
+    "ALL",
+    "DISTINCT",
+    "DISTINCTROW",
+    "HIGH_PRIORITY",
+    "STRAIGHT_JOIN",
+    "SQL_SMALL_RESULT",
+    "SQL_BIG_RESULT",
+    "SQL_BUFFER_RESULT",
+    "SQL_NO_CACHE",
+    "SQL_CACHE",
+    "SQL_CALC_FOUND_ROWS",
+];
+
+/// Reserved words that end a projection list.
+const PROJECTION_END: &[&str] = &[
+    "FROM",
+    "INTO",
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "WINDOW",
+    "ORDER",
+    "LIMIT",
+    "UNION",
+    "EXCEPT",
+    "INTERSECT",
+    "FOR",
+    "LOCK",
+];
+
 /// The statement as written in `_lazyview.definition`.
 #[derive(Debug, Clone)]
 pub struct ParsedDef {
@@ -128,6 +161,12 @@ pub struct ParsedDef {
     pub columns: Vec<String>,
     pub query: Query,
     pub hash: String,
+    /// The SELECT exactly as written (escapes, spacing and comments included): statements run as
+    /// written get the same column names from the server as the real view.
+    pub query_sql: String,
+    /// Source text of each projection item of a plain top-level SELECT (None where it cannot be
+    /// recovered exactly; empty for other query shapes).
+    pub item_sql: Vec<Option<String>>,
 }
 
 pub fn definition_hash(def: &str) -> String {
@@ -138,41 +177,39 @@ pub fn definition_hash(def: &str) -> String {
 /// SELECT ... [WITH [CASCADED|LOCAL] CHECK OPTION]`.
 pub fn parse_definition(def: &str) -> Result<ParsedDef> {
     let dialect = MySqlDialect {};
-    let tokens = Tokenizer::new(&dialect, def)
-        .tokenize()
-        .map_err(|e| anyhow!("tokenize: {e}"))?;
-    let words: Vec<&Token> = tokens
-        .iter()
-        .filter(|t| !matches!(t, Token::Whitespace(_)))
+    let tokens = tokenize(def)?;
+    // Indexes of the non-whitespace tokens.
+    let words: Vec<usize> = (0..tokens.len())
+        .filter(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
         .collect();
+    let word = |i: usize| words.get(i).map(|&w| &tokens[w].token);
     let kw = |t: &Token, k: &str| matches!(t, Token::Word(Word { value, quote_style: None, .. }) if value.eq_ignore_ascii_case(k));
-    if words.first().map(|t| kw(t, "CREATE")) != Some(true) {
+    if word(0).map(|t| kw(t, "CREATE")) != Some(true) {
         bail!("definition must start with CREATE ... VIEW");
     }
-    let view_at = words
-        .iter()
-        .position(|t| kw(t, "VIEW"))
+    let view_at = (0..words.len())
+        .position(|i| kw(&tokens[words[i]].token, "VIEW"))
         .ok_or_else(|| anyhow!("definition must be a CREATE VIEW statement"))?;
     let mut i = view_at + 1;
     let mut parts = Vec::new();
     loop {
-        match words.get(i) {
-            Some(Token::Word(w)) => parts.push(w.value.clone()),
+        match word(i) {
+            Some(Token::Word(w)) => parts.push(unquote(&w.value, w.quote_style)),
             _ => bail!("expected view name after VIEW"),
         }
         i += 1;
-        if matches!(words.get(i), Some(Token::Period)) {
+        if matches!(word(i), Some(Token::Period)) {
             i += 1;
             continue;
         }
         break;
     }
     let mut columns = Vec::new();
-    if matches!(words.get(i), Some(Token::LParen)) {
+    if matches!(word(i), Some(Token::LParen)) {
         i += 1;
         loop {
-            match words.get(i) {
-                Some(Token::Word(w)) => columns.push(w.value.clone()),
+            match word(i) {
+                Some(Token::Word(w)) => columns.push(unquote(&w.value, w.quote_style)),
                 Some(Token::Comma) => {}
                 Some(Token::RParen) => {
                     i += 1;
@@ -183,29 +220,14 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
             i += 1;
         }
     }
-    if !words.get(i).map(|t| kw(t, "AS")).unwrap_or(false) {
+    if !word(i).map(|t| kw(t, "AS")).unwrap_or(false) {
         bail!("expected AS after view name");
     }
-    // Re-render the remaining tokens and hand them to the query parser.
-    let rest: Vec<Token> = {
-        let skip = words[..=i].len();
-        let mut seen = 0;
-        tokens
-            .iter()
-            .skip_while(|t| {
-                if seen >= skip {
-                    return false;
-                }
-                if !matches!(t, Token::Whitespace(_)) {
-                    seen += 1;
-                }
-                true
-            })
-            .cloned()
-            .collect()
-    };
-    let mut parser = Parser::new(&dialect).with_tokens(rest);
+    // Hand the remaining tokens (with their locations in `def`) to the query parser.
+    let rest = &tokens[words[i] + 1..];
+    let mut parser = Parser::new(&dialect).with_tokens_with_locations(rest.to_vec());
     let query = parser.parse_query().context("parse SELECT")?;
+    let tail = parser.peek_token().span.start;
     // Allow a trailing WITH ... CHECK OPTION and/or semicolon; reject anything else.
     loop {
         match parser.next_token().token {
@@ -218,6 +240,29 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
             t => bail!("unexpected token after SELECT: {t}"),
         }
     }
+    let offsets = Offsets::new(def);
+    // The SELECT as written: its first token up to the last one before the trailing clauses.
+    let end = rest
+        .iter()
+        .position(|t| tail.line != 0 && t.span.start == tail)
+        .unwrap_or(rest.len());
+    let body: Vec<&TokenWithSpan> = rest[..end]
+        .iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
+        .collect();
+    let query_sql = body
+        .first()
+        .zip(body.last())
+        .and_then(|(a, b)| offsets.text(a, b))
+        .filter(|sql| {
+            parse_sql(sql, |p| p.parse_query()).map(|q| q.to_string()) == Some(query.to_string())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| query.to_string());
+    let item_sql = match query.body.as_ref() {
+        SetExpr::Select(sel) => select_item_sql(&tokens, sel, &offsets),
+        _ => Vec::new(),
+    };
     let name = parts.pop().unwrap();
     Ok(ParsedDef {
         schema: parts.pop(),
@@ -225,7 +270,133 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
         columns,
         query: *query,
         hash: definition_hash(def),
+        query_sql,
+        item_sql,
     })
+}
+
+/// Definitions are tokenized without unescaping: string literals keep their escapes (`'a\'b'`,
+/// `'x\_y'`), so rendered SQL means what was written, and quoted identifiers keep doubled quote
+/// characters (see [`unquote`]).
+fn tokenize(sql: &str) -> Result<Vec<TokenWithSpan>> {
+    Tokenizer::new(&MySqlDialect {}, sql)
+        .with_unescape(false)
+        .tokenize_with_location()
+        .map_err(|e| anyhow!("tokenize: {e}"))
+}
+
+/// Parses all of `sql` with `f`; None if it fails or leaves tokens over.
+fn parse_sql<T>(sql: &str, f: impl FnOnce(&mut Parser) -> Result<T, ParserError>) -> Option<T> {
+    let mut p = Parser::new(&MySqlDialect {}).with_tokens_with_locations(tokenize(sql).ok()?);
+    let v = f(&mut p).ok()?;
+    (p.peek_token().token == Token::EOF).then_some(v)
+}
+
+/// The name a (raw-tokenized) identifier stands for: a doubled quote character inside a quoted
+/// identifier is one character of the name.
+fn unquote(value: &str, quote: Option<char>) -> String {
+    match quote {
+        Some(q) => value.replace(&format!("{q}{q}"), &q.to_string()),
+        None => value.to_string(),
+    }
+}
+
+fn ident_name(i: &Ident) -> String {
+    unquote(&i.value, i.quote_style)
+}
+
+/// Maps tokenizer locations (1-based lines and character columns) to byte offsets of a string.
+struct Offsets<'a> {
+    sql: &'a str,
+    line_starts: Vec<usize>,
+}
+
+impl<'a> Offsets<'a> {
+    fn new(sql: &'a str) -> Self {
+        let line_starts = std::iter::once(0)
+            .chain(sql.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        Offsets { sql, line_starts }
+    }
+
+    fn at(&self, loc: Location) -> Option<usize> {
+        let line = usize::try_from(loc.line).ok()?.checked_sub(1)?;
+        let col = usize::try_from(loc.column).ok()?.checked_sub(1)?;
+        let start = *self.line_starts.get(line)?;
+        self.sql[start..]
+            .char_indices()
+            .map(|(i, _)| start + i)
+            .chain(std::iter::once(self.sql.len()))
+            .nth(col)
+    }
+
+    /// Source text from the start of token `a` to the end of token `b`.
+    fn text(&self, a: &TokenWithSpan, b: &TokenWithSpan) -> Option<&'a str> {
+        self.sql.get(self.at(a.span.start)?..self.at(b.span.end)?)
+    }
+}
+
+/// Source text of each projection item of `select`, kept only where it parses back to the same
+/// item.
+fn select_item_sql(
+    tokens: &[TokenWithSpan],
+    select: &Select,
+    offsets: &Offsets,
+) -> Vec<Option<String>> {
+    match split_projection(tokens, select.select_token.0.span.start, offsets) {
+        Some(texts) if texts.len() == select.projection.len() => texts
+            .into_iter()
+            .zip(&select.projection)
+            .map(|(text, item)| {
+                let parsed = parse_sql(text, |p| p.parse_select_item())?;
+                (parsed.to_string() == item.to_string()).then(|| text.to_string())
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Splits the projection list after the `SELECT` keyword at `select_at` at its top-level commas.
+fn split_projection<'a>(
+    tokens: &[TokenWithSpan],
+    select_at: Location,
+    offsets: &Offsets<'a>,
+) -> Option<Vec<&'a str>> {
+    let is_word = |t: &Token, list: &[&str]| matches!(t, Token::Word(w) if w.quote_style.is_none() && list.iter().any(|k| w.value.eq_ignore_ascii_case(k)));
+    let mut i = tokens.iter().position(|t| t.span.start == select_at)? + 1;
+    while tokens.get(i).is_some_and(|t| {
+        matches!(t.token, Token::Whitespace(_)) || is_word(&t.token, SELECT_MODIFIERS)
+    }) {
+        i += 1;
+    }
+    let mut items = Vec::new();
+    let (mut depth, mut first, mut last) = (0usize, None, None);
+    loop {
+        let t = tokens.get(i);
+        let at_end = match t.map(|t| &t.token) {
+            None | Some(Token::EOF | Token::SemiColon) => true,
+            Some(Token::Comma | Token::RParen) => depth == 0,
+            Some(tok) => depth == 0 && is_word(tok, PROJECTION_END),
+        };
+        if at_end {
+            items.push(offsets.text(first?, last?)?);
+            if !matches!(t.map(|t| &t.token), Some(Token::Comma)) {
+                return Some(items);
+            }
+            (first, last) = (None, None);
+        } else {
+            match t.map(|t| &t.token) {
+                Some(Token::LParen) => depth += 1,
+                Some(Token::RParen) => depth -= 1,
+                _ => {}
+            }
+            if !matches!(t.map(|t| &t.token), Some(Token::Whitespace(_))) {
+                first = first.or(t);
+                last = t;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Every table a statement reads, including inside subqueries (used for full-refresh views and
@@ -250,7 +421,7 @@ fn cte_names(query: &Query) -> Vec<String> {
     fn walk(q: &Query, out: &mut Vec<String>) {
         if let Some(w) = &q.with {
             for c in &w.cte_tables {
-                out.push(c.alias.name.value.clone());
+                out.push(ident_name(&c.alias.name));
                 walk(&c.query, out);
             }
         }
@@ -292,13 +463,9 @@ fn cte_names(query: &Query) -> Vec<String> {
 
 /// Tables read by a stored SELECT (e.g. a SQL view's definition); empty if it does not parse.
 pub fn select_tables(select_sql: &str, default_schema: &str) -> Vec<TableRef> {
-    let dialect = MySqlDialect {};
-    match Parser::new(&dialect)
-        .try_with_sql(select_sql)
-        .and_then(|mut p| p.parse_query())
-    {
-        Ok(q) => referenced_tables(&q, default_schema),
-        Err(_) => Vec::new(),
+    match parse_sql(select_sql, |p| p.parse_query()) {
+        Some(q) => referenced_tables(&q, default_schema),
+        None => Vec::new(),
     }
 }
 
@@ -313,7 +480,7 @@ pub fn function_calls(query: &Query) -> Vec<(Option<String>, String)> {
                 .0
                 .iter()
                 .filter_map(|p| match p {
-                    ObjectNamePart::Identifier(i) => Some(i.value.clone()),
+                    ObjectNamePart::Identifier(i) => Some(ident_name(i)),
                     _ => None,
                 })
                 .collect();
@@ -333,17 +500,17 @@ pub fn function_calls(query: &Query) -> Vec<(Option<String>, String)> {
 }
 
 fn object_table_ref(name: &ObjectName, default_schema: &str) -> Option<TableRef> {
-    let idents: Vec<&str> = name
+    let idents: Vec<String> = name
         .0
         .iter()
         .map(|p| match p {
-            ObjectNamePart::Identifier(i) => Some(i.value.as_str()),
+            ObjectNamePart::Identifier(i) => Some(ident_name(i)),
             _ => None,
         })
         .collect::<Option<_>>()?;
     match idents.as_slice() {
-        [t] => Some((default_schema.to_string(), t.to_string())),
-        [s, t] => Some((s.to_string(), t.to_string())),
+        [t] => Some((default_schema.to_string(), t.clone())),
+        [s, t] => Some((s.clone(), t.clone())),
         _ => None,
     }
 }
@@ -497,22 +664,23 @@ struct Scope<'a> {
 impl Scope<'_> {
     fn resolve(&self, e: &Expr) -> Option<ColRef> {
         match e {
-            Expr::Identifier(id) => self.find_unqualified(&id.value),
+            Expr::Identifier(id) => self.find_unqualified(&ident_name(id)),
             Expr::CompoundIdentifier(parts) => {
-                let col = &parts.last()?.value;
-                let tbl = &parts.get(parts.len().checked_sub(2)?)?.value;
+                let col = ident_name(parts.last()?);
+                let tbl = ident_name(parts.get(parts.len().checked_sub(2)?)?);
                 let schema = if parts.len() >= 3 {
-                    Some(&parts[parts.len() - 3].value)
+                    Some(ident_name(&parts[parts.len() - 3]))
                 } else {
                     None
                 };
                 let a = self.aliases.iter().position(|(n, t)| {
-                    n.eq_ignore_ascii_case(tbl)
+                    n.eq_ignore_ascii_case(&tbl)
                         && schema
+                            .as_ref()
                             .map(|s| t.schema.eq_ignore_ascii_case(s))
                             .unwrap_or(true)
                 })?;
-                Some((a, self.aliases[a].1.col_index(col)?))
+                Some((a, self.aliases[a].1.col_index(&col)?))
             }
             Expr::Nested(inner) => self.resolve(inner),
             _ => None,
@@ -552,7 +720,7 @@ impl Usage<'_> {
                     }
                     None => {
                         let is_alias = matches!(e, Expr::Identifier(id)
-                            if self.select_aliases.iter().any(|a| a.eq_ignore_ascii_case(&id.value)));
+                            if self.select_aliases.iter().any(|a| a.eq_ignore_ascii_case(&ident_name(id))));
                         if !(allow_select_alias && is_alias) {
                             self.unresolved.get_or_insert_with(|| e.to_string());
                         }
@@ -754,7 +922,7 @@ fn json_valued(e: &Expr, scope: &Scope) -> bool {
 
 fn function_name(f: &sqlparser::ast::Function) -> String {
     match f.name.0.last() {
-        Some(ObjectNamePart::Identifier(i)) => i.value.to_ascii_uppercase(),
+        Some(ObjectNamePart::Identifier(i)) => ident_name(i).to_ascii_uppercase(),
         _ => String::new(),
     }
 }
@@ -833,6 +1001,7 @@ pub fn plan(
     }
     let output_names = (!def.columns.is_empty()).then(|| def.columns.clone());
     // Full rebuilds run the statement exactly as written (ORDER BY matters with LIMIT).
+    let full_select = full_select_sql(def, default_schema, tables)?;
     let full_with = |reason: &str, watched: Vec<TableRef>| ViewPlan {
         schema: schema.clone(),
         name: def.name.clone(),
@@ -854,7 +1023,7 @@ pub fn plan(
         having_sql: None,
         unit_exprs: Vec::new(),
         unit_in_projection: Vec::new(),
-        full_select: def.query.to_string(),
+        full_select: full_select.clone(),
         unit_unique: false,
         output_names: output_names.clone(),
     };
@@ -909,7 +1078,7 @@ pub fn plan(
                 let info = tables.get(&t)?.clone();
                 let n = alias
                     .as_ref()
-                    .map(|a| a.name.value.clone())
+                    .map(|a| ident_name(&a.name))
                     .unwrap_or_else(|| t.1.clone());
                 aliases.push((n, info));
                 alias_pos.push(pos);
@@ -950,7 +1119,12 @@ pub fn plan(
 
     // Expand wildcards so the projection order is explicit.
     let mut projection = Vec::new();
-    for item in std::mem::take(&mut select.projection) {
+    // Source text of each projection item (none for wildcard expansions).
+    let mut item_sql: Vec<Option<&str>> = Vec::new();
+    for (ii, item) in std::mem::take(&mut select.projection)
+        .into_iter()
+        .enumerate()
+    {
         match item {
             SelectItem::Wildcard(_) => {
                 for (n, t) in &aliases {
@@ -959,12 +1133,13 @@ pub fn plan(
                             qident(n),
                             qident(&c.name),
                         ])));
+                        item_sql.push(None);
                     }
                 }
             }
             SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(on), _) => {
                 let q = match on.0.last() {
-                    Some(ObjectNamePart::Identifier(i)) => i.value.clone(),
+                    Some(ObjectNamePart::Identifier(i)) => ident_name(i),
                     _ => bail!("bad qualified wildcard"),
                 };
                 let (n, t) = aliases
@@ -976,10 +1151,14 @@ pub fn plan(
                         qident(n),
                         qident(&c.name),
                     ])));
+                    item_sql.push(None);
                 }
             }
             SelectItem::QualifiedWildcard(..) => bail!("unsupported wildcard"),
-            other => projection.push(other),
+            other => {
+                projection.push(other);
+                item_sql.push(def.item_sql.get(ii).and_then(|s| s.as_deref()));
+            }
         }
     }
     if !def.columns.is_empty() && def.columns.len() != projection.len() {
@@ -997,6 +1176,7 @@ pub fn plan(
     }
 
     let scope = Scope { aliases: &aliases };
+    strip_column_schemas(select, &scope);
     let n_alias = aliases.len();
     let referenced: Vec<Vec<bool>> = aliases
         .iter()
@@ -1004,12 +1184,12 @@ pub fn plan(
         .collect();
     let membership = referenced.clone();
 
-    let proj_exprs: Vec<(&Expr, Option<&str>)> = select
+    let proj_exprs: Vec<(&Expr, Option<String>)> = select
         .projection
         .iter()
         .map(|i| match i {
             SelectItem::UnnamedExpr(e) => (e, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(ident_name(alias))),
             _ => unreachable!(),
         })
         .collect();
@@ -1017,10 +1197,7 @@ pub fn plan(
     // Column usage. Unresolvable identifiers in GROUP BY / HAVING may be select aliases.
     let mut usage = Usage {
         scope: &scope,
-        select_aliases: proj_exprs
-            .iter()
-            .filter_map(|(_, a)| a.map(str::to_string))
-            .collect(),
+        select_aliases: proj_exprs.iter().filter_map(|(_, a)| a.clone()).collect(),
         referenced,
         membership,
         unresolved: None,
@@ -1040,7 +1217,7 @@ pub fn plan(
         if let JoinConstraint::Using(cols) = c {
             for on in cols {
                 let col = match on.0.last() {
-                    Some(ObjectNamePart::Identifier(i)) => i.value.clone(),
+                    Some(ObjectNamePart::Identifier(i)) => ident_name(i),
                     _ => bail!("bad USING column"),
                 };
                 let rc = aliases[*ja]
@@ -1078,7 +1255,8 @@ pub fn plan(
             Expr::Identifier(id) if scope.resolve(g).is_none() => proj_exprs
                 .iter()
                 .find(|(_, a)| {
-                    a.map(|a| a.eq_ignore_ascii_case(&id.value))
+                    a.as_ref()
+                        .map(|a| a.eq_ignore_ascii_case(&ident_name(id)))
                         .unwrap_or(false)
                 })
                 .map(|(e, _)| (*e).clone())
@@ -1128,6 +1306,21 @@ pub fn plan(
         Mode::Grouped => resolved_groups.clone(),
         _ => Vec::new(),
     };
+    // Unit keys and lookup images of opaque types would be compared as different values.
+    if matches!(mode, Mode::Spj | Mode::Grouped) {
+        for (a, (_, t)) in aliases.iter().enumerate() {
+            if let Some(c) = (0..t.columns.len())
+                .find(|&c| membership[a][c] && t.columns[c].kind == ColKind::Opaque)
+            {
+                return Ok(full(&format!(
+                    "{} column `{}`.`{}` decides which rows match, but its binlog value cannot be compared with its SQL value",
+                    t.columns[c].data_type.to_ascii_uppercase(),
+                    t.name,
+                    t.columns[c].name
+                )));
+            }
+        }
+    }
     // Units and WHERE are evaluated on literal row images in lookups; that is only sound when the
     // NULL-extended rows of LEFT JOINs cannot change them.
     let null_side: Vec<usize> = joins
@@ -1273,7 +1466,21 @@ pub fn plan(
         hash: def.hash.clone(),
         mode,
         tables: all_tables.clone(),
-        projection: select.projection.iter().map(|p| p.to_string()).collect(),
+        projection: select
+            .projection
+            .iter()
+            .zip(&item_sql)
+            .map(|(p, src)| match (p, src) {
+                // Unaliased expressions as written: the server names the column after the text
+                // (or `Name_exp_<n>`, or a unique variant of a duplicate), as for the real view.
+                (SelectItem::UnnamedExpr(e), Some(src))
+                    if !matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) =>
+                {
+                    src.to_string()
+                }
+                _ => p.to_string(),
+            })
+            .collect(),
         from_sql,
         where_sql: select.selection.as_ref().map(|e| e.to_string()),
         group_sql: if group_exprs.is_empty() {
@@ -1302,6 +1509,129 @@ pub fn plan(
         aliases: alias_plans,
         output_names,
     })
+}
+
+/// `db.t.col` -> `t`.`col` for columns of the FROM clause: lookups replace a table by derived
+/// rows, which can only be referenced through the alias.
+fn strip_column_schemas(select: &mut Select, scope: &Scope) {
+    let _ = visit_expressions_mut(select, |e: &mut Expr| {
+        let resolved = match &*e {
+            Expr::CompoundIdentifier(parts) if parts.len() == 3 => {
+                scope.resolve(e).map(|(a, _)| (a, parts[2].clone()))
+            }
+            _ => None,
+        };
+        if let Some((a, col)) = resolved {
+            *e = Expr::CompoundIdentifier(vec![qident(&scope.aliases[a].0), col]);
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Statement for full rebuilds: the SELECT as written, with the view's column list applied by a
+/// CTE column list. That names columns by position like `CREATE VIEW v (a, b)` does (duplicate
+/// names in the SELECT included); renaming the items instead would break ORDER BY / HAVING
+/// references to their own aliases.
+fn full_select_sql(
+    def: &ParsedDef,
+    default_schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> Result<String> {
+    if def.columns.is_empty() {
+        return Ok(def.query_sql.clone());
+    }
+    let ctes = cte_names(&def.query);
+    if let Some(n) =
+        leftmost_select(&def.query).and_then(|s| select_width(s, default_schema, tables, &ctes))
+    {
+        if n != def.columns.len() {
+            bail!(
+                "view column list has {} names but SELECT returns {n} columns",
+                def.columns.len()
+            );
+        }
+    }
+    let names: Vec<String> = def.columns.iter().map(|c| quote(c)).collect();
+    Ok(format!(
+        "WITH `_lv_cols` ({}) AS ({}) SELECT * FROM `_lv_cols`",
+        names.join(", "),
+        def.query_sql
+    ))
+}
+
+/// The first SELECT of a query body (it names the columns of a set operation).
+fn leftmost_select(q: &Query) -> Option<&Select> {
+    let mut body = q.body.as_ref();
+    loop {
+        match body {
+            SetExpr::Select(s) => return Some(s),
+            SetExpr::SetOperation { left, .. } => body = left,
+            SetExpr::Query(q) => body = q.body.as_ref(),
+            _ => return None,
+        }
+    }
+}
+
+/// Number of columns a SELECT returns, if its wildcards can be expanded from the catalog.
+fn select_width(
+    s: &Select,
+    default_schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+    ctes: &[String],
+) -> Option<usize> {
+    // FROM tables by the name the query uses; None if a wildcard cannot be counted from them.
+    let from: Option<Vec<(String, &TableInfo)>> = s
+        .from
+        .iter()
+        .flat_map(|t| std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)))
+        .map(|f| match f {
+            TableFactor::Table {
+                name,
+                alias,
+                args: None,
+                ..
+            } if !(name.0.len() == 1
+                && object_table_ref(name, default_schema)
+                    .is_some_and(|t| ctes.iter().any(|c| c.eq_ignore_ascii_case(&t.1)))) =>
+            {
+                let t = object_table_ref(name, default_schema)?;
+                let info = tables.get(&t)?;
+                let n = alias.as_ref().map(|a| ident_name(&a.name)).unwrap_or(t.1);
+                Some((n, info.as_ref()))
+            }
+            _ => None,
+        })
+        .collect();
+    // USING / NATURAL joins merge columns in `*`.
+    let merged = s.from.iter().flat_map(|t| &t.joins).any(|j| {
+        matches!(
+            &j.join_operator,
+            JoinOperator::Join(c) | JoinOperator::Inner(c) | JoinOperator::Left(c)
+                | JoinOperator::LeftOuter(c) | JoinOperator::Right(c) | JoinOperator::RightOuter(c)
+                if matches!(c, JoinConstraint::Using(_) | JoinConstraint::Natural)
+        )
+    });
+    let visible = |t: &TableInfo| t.columns.iter().filter(|c| !c.invisible).count();
+    s.projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::Wildcard(_) if !merged => {
+                Some(from.as_ref()?.iter().map(|(_, t)| visible(t)).sum())
+            }
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(on), _) => {
+                let q = match on.0.last()? {
+                    ObjectNamePart::Identifier(i) => ident_name(i),
+                    _ => return None,
+                };
+                from.as_ref()?
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&q))
+                    .map(|(_, t)| visible(t))
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => None,
+            _ => Some(1),
+        })
+        .sum()
 }
 
 /// Base tables behind the referenced tables, expanding SQL views recursively (views present in
@@ -1517,6 +1847,7 @@ mod tests {
         assert_eq!(d.name, "v1");
         assert_eq!(d.schema.as_deref(), Some("db"));
         assert_eq!(d.columns, vec!["a", "b"]);
+        assert_eq!(d.query_sql, "SELECT id, status FROM orders");
         assert!(parse_definition("SELECT 1").is_err());
         assert!(parse_definition("CREATE TABLE t (a int)").is_err());
         assert!(parse_definition("CREATE VIEW v AS SELECT 1 garbage garbage").is_err());
@@ -1883,5 +2214,227 @@ mod tests {
         assert!(f.contains(&(None, "my_fn".to_string())));
         assert!(f.contains(&(Some("app".to_string()), "calc".to_string())));
         assert!(f.contains(&(None, "UPPER".to_string())));
+    }
+
+    #[test]
+    fn literal_escapes_and_quoted_identifiers_survive() {
+        let v = p(
+            r"CREATE VIEW v AS SELECT id, status FROM orders WHERE status = 'a\'b' OR status LIKE 'x\_y' OR note = '\\n'",
+        );
+        let w = v.where_sql.as_deref().unwrap();
+        for lit in [r"'a\'b'", r"'x\_y'", r"'\\n'"] {
+            assert!(w.contains(lit), "{lit} in {w}");
+        }
+        let v =
+            p(r"CREATE VIEW v AS SELECT CONCAT(status, '\\n') k, COUNT(*) FROM orders GROUP BY k");
+        assert_eq!(v.unit_exprs, vec![r"CONCAT(status, '\\n')"]);
+        // Full rebuilds run the text as written.
+        let d = parse_definition(
+            "CREATE VIEW v AS\n  SELECT DISTINCT CONCAT(status, '\\\\n')  FROM orders WHERE note = 'it''s' -- tail\n WITH CHECK OPTION;",
+        )
+        .unwrap();
+        assert_eq!(
+            d.query_sql,
+            "SELECT DISTINCT CONCAT(status, '\\\\n')  FROM orders WHERE note = 'it''s'"
+        );
+        // Doubled backticks: names resolve unquoted and render quoted again.
+        let mut cat = catalog();
+        let (k, t) = table("we`ird", &[("i`d", "int"), ("v", "int")], &[0]);
+        cat.insert(k, t);
+        let d = parse_definition(
+            "CREATE VIEW `v``1` (`a``b`, c) AS SELECT `i``d`, w.v FROM `we``ird` w WHERE w.`i``d` > 1",
+        )
+        .unwrap();
+        assert_eq!(d.name, "v`1");
+        assert_eq!(d.columns, vec!["a`b", "c"]);
+        assert_eq!(
+            referenced_tables(&d.query, "db"),
+            vec![("db".to_string(), "we`ird".to_string())]
+        );
+        let v = plan(&d, "db", &cat).unwrap();
+        assert_eq!(v.mode, Mode::Spj);
+        assert_eq!(v.unit_exprs, vec!["`w`.`i``d`"]);
+        assert_eq!(v.aliases[0].referenced, vec![true, true]);
+        assert_eq!(v.aliases[0].membership, vec![true, false]);
+        assert_eq!(
+            select_tables("select `x`.`i``d` from `db`.`we``ird` `x`", "db"),
+            vec![("db".to_string(), "we`ird".to_string())]
+        );
+    }
+
+    #[test]
+    fn opaque_key_columns_fall_back() {
+        let mut cat = catalog();
+        let opaque = |n: &str, ty: &str| Column::new(n, ty, ty, None, None, Some(16), true);
+        let (k, t) = typed(
+            "devices",
+            vec![
+                opaque("id", "uuid"),
+                opaque("ip", "inet6"),
+                Column::simple("name", "varchar"),
+                opaque("pos", "point"),
+            ],
+            &[0],
+        );
+        cat.insert(k, t);
+        let (k, t) = typed(
+            "hits",
+            vec![
+                Column::simple("n", "int"),
+                opaque("ip", "inet6"),
+                opaque("v4", "inet4"),
+            ],
+            &[0],
+        );
+        cat.insert(k, t);
+        let pl = |sql: &str| {
+            plan(&parse_definition(sql).unwrap(), "db", &cat)
+                .unwrap()
+                .mode
+        };
+        for (sql, want) in [
+            (
+                "CREATE VIEW v AS SELECT id, name FROM devices",
+                "UUID column `devices`.`id`",
+            ),
+            (
+                "CREATE VIEW v AS SELECT ip, COUNT(*) FROM hits GROUP BY ip",
+                "INET6 column `hits`.`ip`",
+            ),
+            (
+                "CREATE VIEW v AS SELECT h.n, d.name FROM hits h JOIN devices d ON d.ip = h.ip",
+                "INET6 column `hits`.`ip`",
+            ),
+            (
+                "CREATE VIEW v AS SELECT n FROM hits WHERE v4 > '10.0.0.0'",
+                "INET4 column `hits`.`v4`",
+            ),
+        ] {
+            let m = pl(sql);
+            assert!(
+                matches!(&m, Mode::Full(r) if r.contains(want)),
+                "{sql}: {m:?}"
+            );
+        }
+        // Only projected (values come from queries), or no units at all: unaffected.
+        assert_eq!(pl("CREATE VIEW v AS SELECT n, ip, v4 FROM hits"), Mode::Spj);
+        assert_eq!(
+            pl("CREATE VIEW v AS SELECT COUNT(*) FROM hits WHERE ip IS NOT NULL"),
+            Mode::Global
+        );
+    }
+
+    #[test]
+    fn schema_qualified_columns_use_the_alias() {
+        let v = p(
+            "CREATE VIEW v AS SELECT db.orders.id, db.customers.name, db.orders.total + 1 \
+                   FROM db.orders JOIN db.customers ON db.customers.id = db.orders.customer_id \
+                   WHERE db.customers.name <> 'x' AND db.orders.total > 0",
+        );
+        assert_eq!(v.mode, Mode::Spj);
+        assert_eq!(v.unit_exprs, vec!["`orders`.`id`"]);
+        assert_eq!(
+            v.where_sql.as_deref(),
+            Some("`customers`.name <> 'x' AND `orders`.total > 0")
+        );
+        assert_eq!(v.projection[..2], ["`orders`.id", "`customers`.name"]);
+        // Valid as written in the full SELECT (it is not substituted).
+        assert_eq!(v.projection[2], "db.orders.total + 1");
+        let look = v.lookup_sql(1, "(SELECT ? AS `id`, ? AS `name`)");
+        assert_eq!(
+            look,
+            "SELECT DISTINCT `orders`.`id` FROM db.orders JOIN (SELECT ? AS `id`, ? AS `name`) AS `customers` \
+             ON `customers`.id = `orders`.customer_id WHERE `customers`.name <> 'x' AND `orders`.total > 0"
+        );
+        let look = v.lookup_sql(0, "(SELECT ? AS `id`)");
+        assert!(!look.contains("db.orders."), "{look}");
+        let v = p("CREATE VIEW v AS SELECT db.orders.customer_id c, COUNT(*) FROM orders GROUP BY db.orders.customer_id");
+        assert_eq!(v.unit_exprs, vec!["`orders`.customer_id"]);
+        assert_eq!(v.group_sql.as_deref(), Some("`orders`.customer_id"));
+    }
+
+    #[test]
+    fn column_list_for_full_rebuilds() {
+        let v = p("CREATE VIEW v (st) AS SELECT DISTINCT status FROM orders");
+        assert_eq!(
+            v.full_select,
+            "WITH `_lv_cols` (`st`) AS (SELECT DISTINCT status FROM orders) SELECT * FROM `_lv_cols`"
+        );
+        // Set operations take names from the first SELECT; ORDER BY keeps its own aliases.
+        let v = p("CREATE VIEW v (x, y) AS SELECT id, status AS s FROM orders UNION ALL SELECT id, name FROM customers ORDER BY s LIMIT 2");
+        assert_eq!(
+            v.full_select,
+            "WITH `_lv_cols` (`x`, `y`) AS (SELECT id, status AS s FROM orders UNION ALL \
+             SELECT id, name FROM customers ORDER BY s LIMIT 2) SELECT * FROM `_lv_cols`"
+        );
+        let pl = |sql: &str| parse_definition(sql).and_then(|d| plan(&d, "db", &catalog()));
+        for ok in [
+            "CREATE VIEW v (a, b) AS SELECT DISTINCT * FROM regions",
+            "CREATE VIEW v (a, b, c) AS SELECT DISTINCT r.*, c.id FROM regions r JOIN customers c ON c.region_id = r.id",
+            // Not countable here (derived table, USING): the server checks the count.
+            "CREATE VIEW v (a) AS SELECT * FROM (SELECT id, name FROM regions) d",
+            "CREATE VIEW v (a, b, c, d) AS SELECT DISTINCT * FROM regions JOIN customers USING (id)",
+        ] {
+            let v = pl(ok).unwrap();
+            assert!(matches!(v.mode, Mode::Full(_)), "{ok}");
+            assert!(v.full_select.starts_with("WITH `_lv_cols` ("), "{ok}");
+        }
+        for bad in [
+            "CREATE VIEW v (a) AS SELECT DISTINCT id, status FROM orders",
+            "CREATE VIEW v (a) AS SELECT * FROM regions UNION SELECT id, name FROM customers",
+            "CREATE VIEW v (a, b, c) AS SELECT DISTINCT * FROM regions",
+        ] {
+            let e = pl(bad).unwrap_err().to_string();
+            assert!(e.contains("column list has"), "{bad}: {e}");
+        }
+        // Incremental plans keep their SELECT and are renamed positionally.
+        let v = pl("CREATE VIEW v (a, b) AS SELECT id, name FROM regions").unwrap();
+        assert_eq!(v.mode, Mode::Spj);
+        assert_eq!(v.output_names, Some(vec!["a".to_string(), "b".into()]));
+    }
+
+    #[test]
+    fn unaliased_expressions_keep_their_source_text() {
+        let v = p("CREATE VIEW v AS SELECT id, CONCAT(status,'-',note), CASE WHEN total > 1 THEN 'y' ELSE 'n' END, \
+                   id+customer_id, IF(total>1,'y','n'), `status`, o.note, (total), 'it''s', total AS t, \
+                   total /* c */ + 1, total\n  + 2, CONCAT(note, 'é—x'), \
+                   CONCAT(status, '-', note, '-', status, '-', note, '-', status, '-', note, '-', status) FROM orders o");
+        assert_eq!(v.mode, Mode::Spj);
+        assert_eq!(
+            v.projection,
+            vec![
+                "id",
+                "CONCAT(status,'-',note)",
+                "CASE WHEN total > 1 THEN 'y' ELSE 'n' END",
+                "id+customer_id",
+                "IF(total>1,'y','n')",
+                "`status`",
+                "o.note",
+                "(total)",
+                "'it''s'",
+                "total AS t",
+                "total /* c */ + 1",
+                "total\n  + 2",
+                "CONCAT(note, 'é—x')",
+                "CONCAT(status, '-', note, '-', status, '-', note, '-', status, '-', note, '-', status)",
+            ]
+        );
+        let v = p("CREATE VIEW v AS SELECT SQL_NO_CACHE customer_id, COUNT( * ), count(*), SUM(total*2) FROM orders GROUP BY customer_id");
+        assert_eq!(v.mode, Mode::Grouped);
+        assert_eq!(
+            v.projection,
+            vec!["customer_id", "COUNT( * )", "count(*)", "SUM(total*2)"]
+        );
+        assert_eq!(v.unit_in_projection, vec![Some(0)]);
+        let v = p("CREATE VIEW v AS SELECT r.*, LENGTH( name ) FROM regions r");
+        assert_eq!(
+            v.projection,
+            vec!["`r`.`id`", "`r`.`name`", "LENGTH( name )"]
+        );
+        let v = p("CREATE VIEW v AS SELECT DISTINCT  COUNT( * ) , 'a' 'b' FROM orders");
+        assert_eq!(
+            v.full_select,
+            "SELECT DISTINCT  COUNT( * ) , 'a' 'b' FROM orders"
+        );
     }
 }
