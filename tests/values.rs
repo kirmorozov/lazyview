@@ -545,6 +545,16 @@ fn values_timestamp_dst_fall_back() {
             ctx.note("SKIP: no time zone tables (load them with mysql_tzinfo_to_sql)");
             return Ok(());
         }
+        // SET GLOBAL time_zone affects every connection on the server, so a suite running in
+        // parallel against the same servers would see shifted DATE()s. Opt-in: CI sets it (it
+        // runs one test binary at a time).
+        if std::env::var("LAZYVIEW_TEST_GLOBAL_TZ")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+        {
+            ctx.note("SKIP: changes GLOBAL time_zone; set LAZYVIEW_TEST_GLOBAL_TZ=1 to run it");
+            return Ok(());
+        }
         let old = scalar(&mut admin, "SELECT @@GLOBAL.time_zone")
             .await?
             .unwrap_or_else(|| "SYSTEM".into());

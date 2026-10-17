@@ -64,6 +64,9 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
   `LAZYVIEW_TEST_SCALE` (default 1) scales the size, and `LAZYVIEW_TEST_TIMEOUT_S` sets the per-run
   timeout (default 900 × scale). `LAZYVIEW_TEST_LOG` sets the engine log filter (falls back to
   `RUST_LOG`, default `lazyview=debug,warn`).
+* `LAZYVIEW_TEST_GLOBAL_TZ=1` enables `values_timestamp_dst_fall_back`, which changes the servers'
+  GLOBAL `time_zone` while it runs. Only set it when no other suite uses the same servers at the
+  same time (CI sets it; it runs one test binary at a time).
 
 Suites in `tests/`: `binlog_stream`, `brutal` (randomized correctness with many overlapping
 views), `ddl`, `efficiency`, `harness_selftest`, `health`, `lifecycle`, `migration`, `regressions`,
