@@ -1,0 +1,9 @@
+# Optional: Prometheus Operator objects (needs the monitoring.coreos.com CRDs). Add to an overlay:
+#   components:
+#     - ../../components/prometheus
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - servicemonitor.yaml
+  - prometheusrule.yaml

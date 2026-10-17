@@ -1,0 +1,35 @@
+# Example deployment into namespace `lazyview`. Copy this directory, then:
+#   * set the image below (registry/owner, tag or digest);
+#   * replace secret.yaml (or create the Secret out of band / via SealedSecrets / ExternalSecrets);
+#   * kubectl apply -k <dir>
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: lazyview
+
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - ../../base
+
+# With the Prometheus Operator installed:
+# components:
+#   - ../../components/prometheus
+
+images:
+  - name: ghcr.io/OWNER/lazyview
+    newName: ghcr.io/OWNER/lazyview
+    newTag: 0.1.0
+
+# Tuning, e.g. a strict readiness or larger limits:
+# configMapGenerator:
+#   - name: lazyview-config
+#     behavior: merge
+#     literals:
+#       - LAZYVIEW_READY_REQUIRE_ALL=true
+# patches:
+#   - target: { kind: Deployment, name: lazyview }
+#     patch: |
+#       - op: replace
+#         path: /spec/template/spec/containers/0/resources/limits/memory
+#         value: 1Gi

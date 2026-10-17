@@ -1,0 +1,23 @@
+# lazyview: namespace-agnostic base. Apply into a namespace that holds a Secret `lazyview-db`
+# (see ../overlays/example/secret.yaml):
+#   kubectl -n my-ns apply -k deploy/k8s/base
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: lazyview
+    includeSelectors: false
+    includeTemplates: true
+
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+
+# Tuning; the name gets a content hash, so changing a value rolls the Deployment.
+configMapGenerator:
+  - name: lazyview-config
+    envs:
+      - config.env

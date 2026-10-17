@@ -1,0 +1,8 @@
+# lazyview satisfies the `restricted` Pod Security Standard.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lazyview
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted

@@ -1,0 +1,21 @@
+# Scrapes /metrics of every lazyview pod (active and standby) through the lazyview-metrics
+# Service. kube-prometheus-stack only picks up ServiceMonitors carrying its `release: <name>`
+# label by default: add it here (or set serviceMonitorSelectorNilUsesHelmValues=false).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: lazyview
+  labels:
+    app.kubernetes.io/name: lazyview
+    app.kubernetes.io/instance: lazyview
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lazyview
+      app.kubernetes.io/instance: lazyview
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

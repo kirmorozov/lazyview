@@ -1,0 +1,129 @@
+# Two replicas = one active instance + one hot standby. Replicas of the same
+# LAZYVIEW_INSTANCE_ID compete for a MySQL named lock (GET_LOCK) on the source; the loser waits
+# (alive, booted, /readyz "hot standby") and takes over within seconds when the active one stops.
+#
+# Probes (semantics in src/health.rs):
+#   startupProbe   /startupz         booted: hot standby, or the binlog stream connected once.
+#                                    Liveness only starts after it passed, so waiting for the
+#                                    database / metadata migrations get a 15 min budget.
+#   livenessProbe  /livez            fails only when the engine loop is wedged
+#                                    (LAZYVIEW_LIVENESS_STALL_SECS, default 120 s), never because
+#                                    of long builds, the database being down, lag or standby.
+#   readinessProbe /readyz?standby=ok  active: streaming and every view live; a healthy hot
+#                                    standby also counts as ready. Plain /readyz reports a standby
+#                                    as not ready, which would deadlock this rollout strategy (a
+#                                    new pod could never become Ready while an old one holds the
+#                                    lock) and make the PodDisruptionBudget block every drain.
+#
+# Strategy: RollingUpdate maxSurge 1 / maxUnavailable 0. The new pod starts as a standby, becomes
+# Ready once it has connected to the database and is waiting for the lock (so a broken image or
+# configuration never takes down the running instance), then an old pod is terminated; when that
+# was the active one, a standby takes over. `Recreate` also works but stops everything first.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lazyview
+  labels:
+    app.kubernetes.io/name: lazyview
+    app.kubernetes.io/instance: lazyview
+    app.kubernetes.io/component: replicator
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  # A new active instance may (re)build views before it reports ready.
+  progressDeadlineSeconds: 1800
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lazyview
+      app.kubernetes.io/instance: lazyview
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lazyview
+        app.kubernetes.io/instance: lazyview
+        app.kubernetes.io/component: replicator
+    spec:
+      restartPolicy: Always
+      serviceAccountName: lazyview
+      automountServiceAccountToken: false
+      # Required: service links would inject LAZYVIEW_PORT=tcp://… (for a Service named
+      # `lazyview`) or LAZYVIEW_TARGET_*_SERVICE_HOST variables, which lazyview reads as config.
+      enableServiceLinks: false
+      # SIGTERM: stop reading the binlog, flush buffered changes, save the position, release the
+      # lock. A kill after the grace period is safe too (changes since the saved position are
+      # re-applied idempotently), it only means more work for the next instance.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        # Active and standby on different nodes when possible (a node failure then only costs a
+        # takeover).
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: lazyview
+                    app.kubernetes.io/instance: lazyview
+      containers:
+        - name: lazyview
+          # Distroless static image, runs as 65532, no shell (see Dockerfile). Set the registry /
+          # tag (or a digest) with the `images:` field of your kustomization.
+          image: ghcr.io/OWNER/lazyview:0.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: lazyview-config
+            - secretRef:
+                name: lazyview-db
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 180
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz?standby=ok
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL

@@ -1,0 +1,18 @@
+# Voluntary disruptions (node drains) take one pod at a time: draining the active pod's node
+# hands over to the standby, the evicted pod is rescheduled as the new standby, and only then may
+# the next one go. Works because a healthy standby is Ready (readinessProbe /readyz?standby=ok).
+# Pods that are not Ready (crash-looping, still booting) never block a drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: lazyview
+  labels:
+    app.kubernetes.io/name: lazyview
+    app.kubernetes.io/instance: lazyview
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lazyview
+      app.kubernetes.io/instance: lazyview

@@ -1,0 +1,21 @@
+# Only for scraping /metrics (lazyview serves no other traffic). Not-ready pods are published
+# too, so a pod that is building views or standing by is still scraped.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lazyview-metrics
+  labels:
+    app.kubernetes.io/name: lazyview
+    app.kubernetes.io/instance: lazyview
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: lazyview
+    app.kubernetes.io/instance: lazyview
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

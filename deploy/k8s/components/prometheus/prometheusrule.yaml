@@ -1,0 +1,44 @@
+# Alerts on what the probes deliberately ignore (they would not be fixed by a restart).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: lazyview
+  labels:
+    app.kubernetes.io/name: lazyview
+    app.kubernetes.io/instance: lazyview
+spec:
+  groups:
+    - name: lazyview
+      rules:
+        - alert: LazyviewDown
+          expr: absent(lazyview_build_info)
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: No lazyview instance is being scraped.
+        - alert: LazyviewNotStreaming
+          # No replica holds the lock and streams the binlog (database unreachable, missing
+          # grants, purged binlog, or every replica still starting).
+          expr: max by (namespace) (lazyview_streaming) == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: No lazyview instance in {{ $labels.namespace }} is streaming the binlog.
+        - alert: LazyviewViewsInError
+          expr: max by (namespace) (lazyview_views_error) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value }} lazyview view(s) in error in {{ $labels.namespace }}"
+            description: "SELECT name, target, last_error FROM _lazyview_state WHERE state = 'error'"
+        - alert: LazyviewViewsNotLive
+          # Views without a live version for 2 h (initial build very slow or stuck).
+          expr: max by (namespace) (lazyview_views - lazyview_views_ready - lazyview_views_error) > 0
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value }} lazyview view(s) in {{ $labels.namespace }} have no live table yet."
