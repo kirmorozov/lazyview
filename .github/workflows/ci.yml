@@ -1,0 +1,239 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint-unit:
+    name: fmt + clippy + unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: unit tests
+        run: cargo test --locked --lib --bins
+
+  integration:
+    name: integration (${{ matrix.flavor }})
+    runs-on: ubuntu-24.04
+    needs: lint-unit
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { flavor: mysql80,     port: 33080 }
+          - { flavor: mysql84,     port: 33084 }
+          - { flavor: mariadb1011, port: 33111 }
+          - { flavor: mariadb114,  port: 33114 }
+          - { flavor: percona80,   port: 33180 }
+          - { flavor: percona84,   port: 33184 }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration
+      - name: start ${{ matrix.flavor }}
+        run: docker compose -f docker-compose.test.yml up -d ${{ matrix.flavor }} --wait --wait-timeout 300
+      - name: build tests
+        run: cargo test --locked --test '*' --no-run
+      - name: integration tests
+        env:
+          LAZYVIEW_TEST_DSNS: ${{ matrix.flavor }}=mysql://lv:lv@127.0.0.1:${{ matrix.port }}/lvtest
+        run: cargo test --locked --test '*' -- --test-threads=1
+      - name: server logs
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs ${{ matrix.flavor }}
+      - name: stop
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  image:
+    name: distroless images (runtime + debug, amd64 + arm64)
+    runs-on: ubuntu-24.04
+    needs: [lint-unit, integration]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      PLATFORMS: linux/amd64,linux/arm64
+      # Push only for non-PR events on main or a v* tag (never for pull requests).
+      PUSH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+      # OCI annotations on both the per-arch manifests and the multi-arch index
+      # (GHCR shows the index description for multi-arch packages).
+      DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+    steps:
+      - uses: actions/checkout@v5
+      # No QEMU needed: the build stages run on the runner platform and cross-compile
+      # with cargo-zigbuild; the final stages only COPY onto distroless.
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        name: tags + labels (runtime)
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=edge,branch=main
+            type=sha,format=short
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=lazyview
+            org.opencontainers.image.description=Materialized views for MySQL/MariaDB/Percona maintained from the binlog
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            org.opencontainers.image.description=Materialized views for MySQL/MariaDB/Percona maintained from the binlog
+            org.opencontainers.image.licenses=MIT
+      - id: meta-debug
+        name: tags + labels (debug, -debug suffix)
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            suffix=-debug,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=edge,branch=main
+            type=sha,format=short
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=lazyview
+            org.opencontainers.image.description=Materialized views for MySQL/MariaDB/Percona maintained from the binlog (debug variant: busybox shell under /busybox)
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            org.opencontainers.image.description=Materialized views for MySQL/MariaDB/Percona maintained from the binlog (debug variant: busybox shell under /busybox)
+            org.opencontainers.image.licenses=MIT
+
+      # Smoke test: load the amd64 images into the runner's docker and run them.
+      # This also warms the builder cache that the multi-arch builds below reuse.
+      - name: build amd64 images for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          load: true
+          tags: lazyview:smoke
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=image
+      - name: build amd64 debug image for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: debug
+          platforms: linux/amd64
+          load: true
+          tags: lazyview:smoke-debug
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=image
+      - name: smoke test
+        run: |
+          set -x
+          docker run --rm lazyview:smoke --version
+          rc=0; docker run --rm lazyview:smoke || rc=$?
+          test "$rc" -eq 2   # configuration error without LAZYVIEW_* env
+          test "$(docker image inspect lazyview:smoke --format '{{.Config.User}} {{json .Config.Entrypoint}}')" = '65532:65532 ["/lazyview"]'
+          if docker run --rm --entrypoint /bin/sh lazyview:smoke -c true; then echo "runtime image must not have a shell"; exit 1; fi
+          docker run --rm --entrypoint sh lazyview:smoke-debug -c 'id -u | grep -qx 65532 && /lazyview --version'
+          test "$(docker image inspect lazyview:smoke --format '{{json .Config.Healthcheck.Test}}')" = '["CMD","/lazyview","healthcheck"]'
+      # The shell-free image against a real MySQL 8.4, via the documented compose example.
+      - name: end-to-end (docker-compose.example.yml)
+        env:
+          LAZYVIEW_IMAGE: lazyview:smoke
+        run: |
+          dc() { docker compose -f docker-compose.example.yml "$@"; }
+          sql() { dc exec -T mysql mysql -ulazyview -plazyview -NB app -e "$1" 2>/dev/null; }
+          wait_for() { for _ in $(seq 60); do if [ "$(sql "$1")" = "$2" ]; then return 0; fi; sleep 2; done; echo "timeout: $1 != $2"; return 1; }
+          dc up -d --no-build --wait --wait-timeout 300
+          wait_for "SELECT COUNT(*) FROM _lazyview" 0
+          sql "CREATE TABLE orders (id INT PRIMARY KEY, customer VARCHAR(50), total DECIMAL(10,2));
+               INSERT INTO orders VALUES (1,'ann',10),(2,'bob',5),(3,'ann',7);
+               INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW customer_totals AS SELECT customer, SUM(total) AS total, COUNT(*) AS n FROM orders GROUP BY customer');"
+          wait_for "SELECT state FROM _lazyview_state WHERE name = 'customer_totals'" ready
+          sql "INSERT INTO orders VALUES (4,'bob',1)"
+          wait_for "SELECT n FROM customer_totals WHERE customer = 'bob'" 2
+          test "$(docker inspect -f '{{.State.Health.Status}}' "$(dc ps -q lazyview)")" = healthy
+      - name: end-to-end logs
+        if: failure()
+        run: docker compose -f docker-compose.example.yml logs
+      - name: end-to-end cleanup
+        if: always()
+        run: docker compose -f docker-compose.example.yml down -v
+
+      - name: build (and push) runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,scope=image,mode=max
+          provenance: mode=max
+          sbom: true
+      - name: build (and push) debug image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: debug
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta-debug.outputs.tags }}
+          labels: ${{ steps.meta-debug.outputs.labels }}
+          annotations: ${{ steps.meta-debug.outputs.annotations }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ fromJSON(steps.meta-debug.outputs.json).labels['org.opencontainers.image.created'] }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          # The build stages are shared with the runtime build above (same builder).
+          cache-from: type=gha,scope=image
+          provenance: mode=max
+          sbom: true

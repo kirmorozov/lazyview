@@ -1,0 +1,121 @@
+# Integration-test database servers (same ports / credentials as scripts/test-servers.sh).
+#
+#   docker compose -f docker-compose.test.yml up -d --wait            # all six
+#   docker compose -f docker-compose.test.yml up -d mysql84 --wait    # one
+#   LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --test '*' -- --test-threads=1
+#   docker compose -f docker-compose.test.yml down -v
+#
+# Service names match the flavor names used by scripts/test-servers.sh and LAZYVIEW_TEST_DSNS.
+# Every server: ROW binlog, FULL row image, user lv/lv with ALL PRIVILEGES, database lvtest.
+# MySQL / Percona additionally run with GTIDs on (like the local tarball instances).
+
+x-mysql-common: &mysql-common
+  environment:
+    MYSQL_ROOT_PASSWORD: root
+    MYSQL_DATABASE: lvtest
+  volumes:
+    - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+  healthcheck:
+    # TCP (not the socket) so it only passes once the real server - not the
+    # entrypoint's temporary init server - is up and the lv user exists.
+    test: ["CMD", "mysql", "--protocol=TCP", "-h127.0.0.1", "-ulv", "-plv", "-e", "SELECT 1", "lvtest"]
+    interval: 3s
+    timeout: 5s
+    retries: 60
+    start_period: 20s
+  restart: "no"
+
+x-mariadb-common: &mariadb-common
+  environment:
+    MARIADB_ROOT_PASSWORD: root
+    MARIADB_DATABASE: lvtest
+  volumes:
+    - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+  healthcheck:
+    test: ["CMD", "mariadb", "--protocol=TCP", "-h127.0.0.1", "-ulv", "-plv", "-e", "SELECT 1", "lvtest"]
+    interval: 3s
+    timeout: 5s
+    retries: 60
+    start_period: 20s
+  restart: "no"
+
+services:
+  mysql80:
+    <<: *mysql-common
+    image: mysql:8.0
+    ports: ["33080:3306"]
+    command:
+      - --server-id=33080
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+
+  mysql84:
+    <<: *mysql-common
+    image: mysql:8.4
+    ports: ["33084:3306"]
+    command:
+      - --server-id=33084
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+
+  mariadb1011:
+    <<: *mariadb-common
+    image: mariadb:10.11
+    ports: ["33111:3306"]
+    command:
+      - --server-id=33111
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+
+  mariadb114:
+    <<: *mariadb-common
+    image: mariadb:11.4
+    ports: ["33114:3306"]
+    command:
+      - --server-id=33114
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+
+  percona80:
+    <<: *mysql-common
+    image: percona/percona-server:8.0
+    ports: ["33180:3306"]
+    command:
+      - --server-id=33180
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+
+  percona84:
+    <<: *mysql-common
+    image: percona/percona-server:8.4
+    ports: ["33184:3306"]
+    command:
+      - --server-id=33184
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF

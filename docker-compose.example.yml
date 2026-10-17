@@ -1,0 +1,95 @@
+# lazyview + MySQL 8.4, ready to run (Docker Compose v2.23+ for inline `configs`).
+#
+#   docker compose -f docker-compose.example.yml up -d --build --wait   # until both are healthy
+#   docker compose -f docker-compose.example.yml logs -f lazyview
+#
+# Define a view (the _lazyview table is created by lazyview on startup):
+#
+#   docker compose -f docker-compose.example.yml exec mysql \
+#     mysql -ulazyview -plazyview app -e "
+#       CREATE TABLE IF NOT EXISTS orders (id INT PRIMARY KEY, customer VARCHAR(50), total DECIMAL(10,2));
+#       INSERT INTO orders VALUES (1,'ann',10),(2,'bob',5),(3,'ann',7);
+#       INSERT INTO _lazyview (definition) VALUES
+#         ('CREATE VIEW customer_totals AS SELECT customer, SUM(total) AS total, COUNT(*) AS n FROM orders GROUP BY customer');"
+#   docker compose -f docker-compose.example.yml exec mysql \
+#     mysql -ulazyview -plazyview app -e "SELECT * FROM _lazyview_state; SELECT * FROM customer_totals;"
+#
+# The lazyview image is built from this checkout (Dockerfile target `runtime`). To use a
+# published image instead:
+#   export LAZYVIEW_IMAGE=ghcr.io/OWNER/lazyview:latest
+#   docker compose -f docker-compose.example.yml pull && docker compose -f docker-compose.example.yml up -d --no-build
+#
+# Clean up (drops the database volume): docker compose -f docker-compose.example.yml down -v
+
+name: lazyview-example
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: &database app
+      MYSQL_USER: &user lazyview
+      MYSQL_PASSWORD: &password lazyview
+    # lazyview reads the binlog as a replica: ROW format with full row images.
+    command:
+      - --server-id=1
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+    configs:
+      # MYSQL_USER gets ALL on MYSQL_DATABASE; lazyview additionally needs replication.
+      - source: lazyview-grants
+        target: /docker-entrypoint-initdb.d/10-lazyview-grants.sql
+    volumes:
+      - mysql-data:/var/lib/mysql
+    # ports: ["127.0.0.1:3306:3306"]   # uncomment to reach the database from the host
+    healthcheck:
+      # TCP, so it only passes once the real server (not the init-time one) is up.
+      test: ["CMD-SHELL", "mysql --protocol=TCP -h127.0.0.1 -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" -e 'SELECT 1' \"$$MYSQL_DATABASE\""]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    restart: unless-stopped
+
+  lazyview:
+    image: ${LAZYVIEW_IMAGE:-lazyview:local}
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      LAZYVIEW_HOST: mysql
+      LAZYVIEW_PORT: "3306"
+      LAZYVIEW_USER: *user
+      LAZYVIEW_PASSWORD: *password
+      LAZYVIEW_DATABASE: *database
+      RUST_LOG: info
+    # ports: ["127.0.0.1:8080:8080"]   # /healthz /readyz /metrics from the host
+    healthcheck:
+      # Exec form (the image has no shell); same check as the image HEALTHCHECK, just more often.
+      test: ["CMD", "/lazyview", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # Distroless nonroot (uid 65532), no shell: nothing to write, nothing to escalate.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+configs:
+  lazyview-grants:
+    content: |
+      GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lazyview'@'%';
+
+volumes:
+  mysql-data:

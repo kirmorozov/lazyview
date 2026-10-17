@@ -1,0 +1,7 @@
+# Allow-list: the Dockerfile only needs Cargo.toml, Cargo.lock and src/.
+# Everything else stays out of the build context (smaller uploads, no cache
+# busting from docs/tests/CI edits, no tmp/ or target/ leaking in).
+*
+!Cargo.toml
+!Cargo.lock
+!src
