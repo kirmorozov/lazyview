@@ -13,7 +13,7 @@ name: ghcr cleanup
 # deletes a child that a kept image references, and deletes an image together
 # with its children.
 #
-# Runs after each publish (called from ci.yml), daily, and on demand
+# Runs after each publish (called from publish-image.yml), daily, and on demand
 # (Actions > ghcr cleanup > Run workflow; dry-run by default).
 on:
   schedule:

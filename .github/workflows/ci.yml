@@ -279,12 +279,3 @@ jobs:
       attestations: write
       id-token: write
     uses: ./.github/workflows/publish-image.yml
-
-  cleanup:
-    name: ghcr cleanup
-    needs: [image, release]
-    # After whichever publish ran (the other one is skipped).
-    if: ${{ !cancelled() && (needs.image.result == 'success' || needs.release.result == 'success') }}
-    permissions:
-      packages: write
-    uses: ./.github/workflows/ghcr-cleanup.yml

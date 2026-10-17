@@ -4,6 +4,7 @@ name: publish image
 # image was built and tested per platform by the `e2e` job. That job's GitHub
 # Actions caches (scopes image-amd64 / image-arm64) make this build a cache hit:
 # it assembles the multi-arch index, attaches provenance + SBOM, pushes and verifies.
+# Then ghcr-cleanup.yml applies the retention policy.
 #
 # Tags (docker/metadata-action):
 #   main  : edge, sha-<short>
@@ -142,3 +143,10 @@ jobs:
             echo "docker buildx imagetools inspect ${IMAGE}@${DIGEST} --format '{{json .SBOM}}'"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    name: ghcr cleanup
+    needs: publish
+    permissions:
+      packages: write
+    uses: ./.github/workflows/ghcr-cleanup.yml
