@@ -42,9 +42,13 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use mysql_async::binlog::events::{
-    Event, EventData, GtidEvent, QueryEvent, TableMapEvent, TransactionPayloadEvent,
+    Event, EventData, FormatDescriptionEvent, GtidEvent, QueryEvent, TableMapEvent,
+    TransactionPayloadEvent,
 };
 use mysql_async::binlog::row::BinlogRow;
+use mysql_async::binlog::value::BinlogValue;
+use mysql_async::binlog::{BinlogVersion, EventType};
+use mysql_async::consts::ColumnType;
 use mysql_async::prelude::Queryable;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Opts, OptsBuilder, Row, Value};
 
@@ -592,7 +596,7 @@ struct Tracker {
     payload: Option<Payload>,
     /// Table maps by id, tagged with the file generation they were seen in. Entries survive one
     /// ROTATE (unlike mysql_common's map), so rows buffered across a rotate still decode.
-    tables: HashMap<u64, (u64, TableMapEvent<'static>)>,
+    tables: HashMap<u64, (u64, TableMapEvent<'static>, Option<Time2Twin>)>,
     generation: u64,
     /// Second item produced by one event (MariaDB XA GTID → `Gtid` + `XaStart`).
     queued: Option<Item>,
@@ -613,7 +617,7 @@ impl Tracker {
     }
 
     fn table_map(&self, table_id: u64) -> Option<&TableMapEvent<'static>> {
-        self.tables.get(&table_id).map(|(_, t)| t)
+        self.tables.get(&table_id).map(|(_, t, _)| t)
     }
 }
 
@@ -797,7 +801,7 @@ impl Tracker {
         table_id: u64,
         event: &Event,
     ) -> Result<Vec<(Option<BinlogRow>, Option<BinlogRow>)>> {
-        let tme = self.table_map(table_id).ok_or_else(|| {
+        let (_, tme, twin) = self.tables.get(&table_id).ok_or_else(|| {
             anyhow!("cannot decode rows event: no TABLE_MAP seen for table id {table_id}")
         })?;
         let data = event
@@ -815,10 +819,200 @@ impl Tracker {
                 re.table_id()
             );
         }
-        re.rows(tme)
+        let mut rows = re
+            .rows(twin.as_ref().map_or(tme, |t| &t.tme))
             .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("decoding rows of {} (table id {table_id})", tme_name(tme)))
+            .with_context(|| format!("decoding rows of {} (table id {table_id})", tme_name(tme)))?;
+        if let Some(t) = twin {
+            for (before, after) in rows.iter_mut() {
+                for row in [before, after].into_iter().flatten() {
+                    t.fix(row);
+                }
+            }
+        }
+        Ok(rows)
     }
+}
+
+/// Decode twin of a table map with TIME(1) / TIME(2) columns. mysql_common 0.37 decodes their
+/// negative values with a fraction wrongly (`frac -= 0x100` on a `u32` in
+/// `my_time_packed_from_binary`: an overflow panic in debug builds, garbage in release builds).
+/// In the twin those columns are 4-byte BIT columns (same width; like TIME2 neither numeric nor
+/// character, so the optional metadata still lines up), whose raw bytes [`Time2Twin::fix`]
+/// decodes as the server does.
+#[derive(Debug, Clone)]
+struct Time2Twin {
+    tme: TableMapEvent<'static>,
+    cols: Vec<usize>,
+}
+
+impl Time2Twin {
+    fn fix(&self, row: &mut BinlogRow) {
+        for &c in &self.cols {
+            let v = match row.as_ref(c) {
+                Some(BinlogValue::Value(Value::Bytes(b))) => match <[u8; 4]>::try_from(&b[..]) {
+                    Ok(b) => time2_short_fraction(b),
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            row.place(c, BinlogValue::Value(v));
+        }
+    }
+}
+
+/// The twin (see [`Time2Twin`]) of `tme` from event `ev`, if the table has TIME2 columns with 1
+/// or 2 fractional digits.
+fn time2_twin(ev: &Event, tme: &TableMapEvent<'_>) -> Option<Time2Twin> {
+    let n = usize::try_from(tme.columns_count()).ok()?;
+    let cols: Vec<usize> = (0..n)
+        .filter(|&i| {
+            matches!(
+                tme.get_column_type(i),
+                Ok(Some(ColumnType::MYSQL_TYPE_TIME2))
+            ) && matches!(tme.get_column_metadata(i), Some([1 | 2]))
+        })
+        .collect();
+    if cols.is_empty() {
+        return None;
+    }
+    let twin = time2_twin_body(ev, tme, &cols);
+    if twin.is_none() {
+        tracing::warn!(
+            table = %tme_name(tme),
+            "cannot build the TIME(1)/TIME(2) decode twin; negative values with a fraction may be misread"
+        );
+    }
+    Some(Time2Twin { tme: twin?, cols })
+}
+
+fn time2_twin_body(
+    ev: &Event,
+    tme: &TableMapEvent<'_>,
+    cols: &[usize],
+) -> Option<TableMapEvent<'static>> {
+    // Body: table id + flags (post-header), schema and table name (length byte, name, NUL),
+    // column count, column types, metadata block, NULL bitmap, optional metadata.
+    let body = ev.data();
+    let post = usize::from(
+        ev.fde()
+            .get_event_type_header_length(EventType::TABLE_MAP_EVENT),
+    );
+    let mut p = post;
+    for _ in 0..2 {
+        p += usize::from(*body.get(p)?) + 2;
+    }
+    let (count, len) = lenenc(body.get(p..)?)?;
+    let n = usize::try_from(count).ok()?;
+    let types_at = p + len;
+    let (meta_len, len) = lenenc(body.get(types_at + n..)?)?;
+    let meta_at = types_at + n + len;
+    let meta_end = meta_at.checked_add(usize::try_from(meta_len).ok()?)?;
+    let meta = body.get(meta_at..meta_end)?;
+    let mut new_meta = Vec::with_capacity(meta.len() + cols.len());
+    let mut off = 0;
+    for i in 0..n {
+        let m = tme.get_column_metadata(i)?;
+        if meta.get(off..off + m.len())? != m {
+            return None;
+        }
+        off += m.len();
+        // BIT metadata: (bits % 8, bytes).
+        new_meta.extend_from_slice(if cols.contains(&i) { &[0, 4] } else { m });
+    }
+    if off != meta.len() || post < 6 {
+        return None;
+    }
+    let mut twin = Vec::with_capacity(19 + body.len() + cols.len() + 8);
+    twin.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+    twin.push(ty::TABLE_MAP);
+    twin.extend_from_slice(&ev.header().server_id().to_le_bytes());
+    twin.extend_from_slice(&0u32.to_le_bytes()); // event size, below
+    twin.extend_from_slice(&0u32.to_le_bytes()); // log_pos
+    twin.extend_from_slice(&0u16.to_le_bytes()); // flags
+                                                 // The default format description expects a 6-byte table id.
+    twin.extend_from_slice(&tme.table_id().to_le_bytes()[..6]);
+    twin.extend_from_slice(body.get(post - 2..post)?);
+    twin.extend_from_slice(&body[post..types_at]);
+    twin.extend(
+        body[types_at..types_at + n]
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                if cols.contains(&i) {
+                    ColumnType::MYSQL_TYPE_BIT as u8
+                } else {
+                    t
+                }
+            }),
+    );
+    put_lenenc(&mut twin, new_meta.len() as u64);
+    twin.extend_from_slice(&new_meta);
+    twin.extend_from_slice(&body[meta_end..]);
+    let size = u32::try_from(twin.len()).ok()?;
+    twin[9..13].copy_from_slice(&size.to_le_bytes());
+    let fde = FormatDescriptionEvent::new(BinlogVersion::Version4);
+    let ev = Event::read(&fde, &twin[..]).ok()?;
+    let tme: TableMapEvent<'_> = ev.read_event().ok()?;
+    Some(tme.into_owned())
+}
+
+/// Length-encoded integer at the start of `b`: (value, bytes used).
+fn lenenc(b: &[u8]) -> Option<(u64, usize)> {
+    let le = |n: usize| -> Option<u64> {
+        let mut v = [0u8; 8];
+        v[..n].copy_from_slice(b.get(1..1 + n)?);
+        Some(u64::from_le_bytes(v))
+    };
+    match *b.first()? {
+        x @ 0..=0xfa => Some((u64::from(x), 1)),
+        0xfc => Some((le(2)?, 3)),
+        0xfd => Some((le(3)?, 4)),
+        0xfe => Some((le(8)?, 9)),
+        _ => None,
+    }
+}
+
+fn put_lenenc(out: &mut Vec<u8>, v: u64) {
+    match v {
+        0..=0xfa => out.push(v as u8),
+        0xfb..=0xffff => {
+            out.push(0xfc);
+            out.extend_from_slice(&(v as u16).to_le_bytes());
+        }
+        0x1_0000..=0xff_ffff => {
+            out.push(0xfd);
+            out.extend_from_slice(&v.to_le_bytes()[..3]);
+        }
+        _ => {
+            out.push(0xfe);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// A TIME2 value with 1 or 2 fractional digits from its 4 binlog bytes (MySQL's
+/// `my_time_packed_from_binary` and `TIME_from_longlong_time_packed`).
+fn time2_short_fraction(b: [u8; 4]) -> Value {
+    let mut int = (i64::from(b[0]) << 16 | i64::from(b[1]) << 8 | i64::from(b[2])) - 0x80_0000;
+    let mut frac = i64::from(b[3]);
+    if int < 0 && frac != 0 {
+        // Negative values store the fraction reversed: -(0x100 - frac) of the next second up.
+        int += 1;
+        frac -= 0x100;
+    }
+    let packed = (int << 24) + frac * 10_000;
+    let abs = packed.unsigned_abs();
+    let hms = abs >> 24;
+    let hours = (hms >> 12) % (1 << 10);
+    Value::Time(
+        packed < 0,
+        (hours / 24) as u32,
+        (hours % 24) as u8,
+        ((hms >> 6) % (1 << 6)) as u8,
+        (hms % (1 << 6)) as u8,
+        (abs % (1 << 24)) as u32,
+    )
 }
 
 impl Tracker {
@@ -882,7 +1076,7 @@ impl Tracker {
                 if real {
                     // Keep table maps of the file just finished, drop older ones.
                     let g = self.generation;
-                    self.tables.retain(|_, (gen, _)| *gen >= g);
+                    self.tables.retain(|_, (gen, _, _)| *gen >= g);
                     self.generation += 1;
                 }
                 self.pos = Position { file, pos: pos.max(4) };
@@ -896,7 +1090,11 @@ impl Tracker {
                     table: tme.table_name().into_owned(),
                     columns: tme.columns_count(),
                 };
-                self.tables.insert(tme.table_id(), (self.generation, tme.into_owned()));
+                let twin = time2_twin(&ev, &tme);
+                self.tables.insert(
+                    tme.table_id(),
+                    (self.generation, tme.into_owned(), twin),
+                );
                 item
             }
             ty::WRITE_ROWS_V1
@@ -1556,6 +1754,105 @@ mod tests {
         t.map_event(rotate(4, "binlog.000002", 0, true, false))
             .unwrap();
         assert_eq!(t.pos, pos("binlog.000002", 4));
+    }
+
+    /// TABLE_MAP for `schema.table (a INT, t TIME(fsp), u TIME(6), v VARCHAR(10))`, with
+    /// SIGNEDNESS optional metadata for the INT column.
+    fn table_map_times(log_pos: u32, table_id: u64, fsp: u8) -> Event {
+        let mut b = table_id.to_le_bytes()[..6].to_vec();
+        b.extend_from_slice(&1u16.to_le_bytes());
+        for name in ["db", "tq"] {
+            b.push(name.len() as u8);
+            b.extend_from_slice(name.as_bytes());
+            b.push(0);
+        }
+        b.push(4); // columns
+        b.extend_from_slice(&[0x03, 0x13, 0x13, 0x0f]); // LONG, TIME2, TIME2, VARCHAR
+        b.extend_from_slice(&[4, fsp, 6, 40, 0]); // metadata: fsp, fsp, max length (LE u16)
+        b.push(0x0f); // all nullable
+        b.extend_from_slice(&[1, 1, 0x00]); // SIGNEDNESS: one numeric column, signed
+        ev(ty::TABLE_MAP, log_pos, &b)
+    }
+
+    /// WRITE_ROWS v1 with one row `(a, t, u, 'x')`; `t` and `u` as raw TIME2 bytes.
+    fn write_rows_times(log_pos: u32, table_id: u64, a: i32, t: &[u8], u: &[u8]) -> Event {
+        let mut b = table_id.to_le_bytes()[..6].to_vec();
+        b.extend_from_slice(&1u16.to_le_bytes()); // STMT_END
+        b.extend_from_slice(&[4, 0x0f, 0x00]); // 4 columns, all present, no NULLs
+        b.extend_from_slice(&a.to_le_bytes());
+        b.extend_from_slice(t);
+        b.extend_from_slice(u);
+        b.extend_from_slice(&[1, b'x']);
+        ev(ty::WRITE_ROWS_V1, log_pos, &b)
+    }
+
+    /// Negative TIME(1) / TIME(2) values with a fraction (mysql_common 0.37 panics on them in
+    /// debug builds) decode as the server stores them; other columns are unaffected.
+    #[test]
+    fn short_fraction_negative_times() {
+        let t6 = [0x80, 0xc0, 0x00, 0x00, 0x00, 0x01]; // 12:00:00.000001
+        let cases: &[(u8, [u8; 4], Value)] = &[
+            // -00:00:01.50 (intpart -2, reversed fraction 0x100 - 50)
+            (
+                2,
+                [0x7f, 0xff, 0xfe, 206],
+                Value::Time(true, 0, 0, 0, 1, 500_000),
+            ),
+            // -00:00:00.01
+            (
+                2,
+                [0x7f, 0xff, 0xff, 255],
+                Value::Time(true, 0, 0, 0, 0, 10_000),
+            ),
+            // -838:59:58.99
+            (
+                2,
+                [0x4b, 0x91, 0x05, 157],
+                Value::Time(true, 34, 22, 59, 58, 990_000),
+            ),
+            // -00:00:01.00: no fraction, nothing reversed
+            (2, [0x7f, 0xff, 0xff, 0], Value::Time(true, 0, 0, 0, 1, 0)),
+            // 12:00:00.75
+            (
+                2,
+                [0x80, 0xc0, 0x00, 75],
+                Value::Time(false, 0, 12, 0, 0, 750_000),
+            ),
+            // TIME(1) -100:00:00.1 is stored like TIME(2) -100:00:00.10
+            (
+                1,
+                [0x79, 0xbf, 0xff, 246],
+                Value::Time(true, 4, 4, 0, 0, 100_000),
+            ),
+        ];
+        for (k, (fsp, raw, want)) in cases.iter().enumerate() {
+            let mut t = Tracker::new(Flavor::MySql, &pos("binlog.000001", 4));
+            let id = 40 + k as u64;
+            t.map_event(table_map_times(100, id, *fsp)).unwrap();
+            let rows = match t
+                .map_event(write_rows_times(200, id, -7, raw, &t6))
+                .unwrap()
+            {
+                Item::Rows { event, .. } => event,
+                other => panic!("{other:?}"),
+            };
+            let decoded = t.rows(id, &rows).unwrap();
+            let row = decoded[0].1.as_ref().unwrap();
+            assert_eq!(row.as_ref(0), Some(&BinlogValue::Value(Value::Int(-7))));
+            assert_eq!(
+                row.as_ref(1),
+                Some(&BinlogValue::Value(want.clone())),
+                "{raw:?}"
+            );
+            assert_eq!(
+                row.as_ref(2),
+                Some(&BinlogValue::Value(Value::Time(false, 0, 12, 0, 0, 1)))
+            );
+            assert_eq!(
+                row.as_ref(3),
+                Some(&BinlogValue::Value(Value::Bytes(b"x".to_vec())))
+            );
+        }
     }
 
     #[test]

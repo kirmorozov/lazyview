@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod analyze;
+pub mod analyzer;
 pub mod binlog;
 pub mod catalog;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod datum;
 pub mod ddl;
 pub mod engine;
 pub mod health;
+pub mod lookback;
 pub mod metrics;
 
 pub use config::Config;

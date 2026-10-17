@@ -74,6 +74,62 @@ impl UnitSet {
     }
 }
 
+/// Consumes a [`UnitSet`] chunk by chunk, materializing each chunk only when it is requested
+/// (the chunk size may change from one chunk to the next). Order as in [`UnitSet::chunks`]:
+/// sorted integer keys first, then the other keys.
+pub struct ChunkCursor {
+    ints: std::iter::Peekable<roaring::treemap::IntoIter>,
+    keys: std::iter::Peekable<std::collections::hash_set::IntoIter<Key>>,
+    left: usize,
+}
+
+impl ChunkCursor {
+    pub fn new(units: UnitSet) -> ChunkCursor {
+        let left = units.len();
+        ChunkCursor {
+            ints: units.ints.into_iter().peekable(),
+            keys: units.keys.into_iter().peekable(),
+            left,
+        }
+    }
+
+    /// Units not yet handed out.
+    pub fn remaining(&self) -> usize {
+        self.left
+    }
+
+    /// The next chunk of at most `n` (≥ 1) keys; integer and other keys are never mixed.
+    pub fn next_chunk(&mut self, n: usize) -> Option<UnitChunk> {
+        let n = n.max(1);
+        if self.ints.peek().is_some() {
+            let v: Vec<i64> = self
+                .ints
+                .by_ref()
+                .take(n)
+                .map(|v| (v ^ SIGN) as i64)
+                .collect();
+            self.left -= v.len();
+            return Some(UnitChunk::Ints(v));
+        }
+        if self.keys.peek().is_some() {
+            let v: Vec<Key> = self.keys.by_ref().take(n).collect();
+            self.left -= v.len();
+            return Some(UnitChunk::Keys(v));
+        }
+        None
+    }
+
+    /// Everything not handed out yet, back as a set (carry-over of an interrupted run).
+    pub fn into_rest(self) -> UnitSet {
+        let mut s = UnitSet::default();
+        for v in self.ints {
+            s.ints.insert(v);
+        }
+        s.keys.extend(self.keys);
+        s
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum UnitChunk {
     /// Sorted ascending.
@@ -82,6 +138,22 @@ pub enum UnitChunk {
 }
 
 impl UnitChunk {
+    /// Adds the chunk's keys to `set` (carry-over of a failed chunk).
+    pub fn insert_into(&self, set: &mut UnitSet) {
+        match self {
+            UnitChunk::Ints(v) => {
+                for &i in v {
+                    set.insert_int(i);
+                }
+            }
+            UnitChunk::Keys(v) => {
+                for k in v {
+                    set.insert(k.clone());
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             UnitChunk::Ints(v) => v.len(),
@@ -94,8 +166,27 @@ impl UnitChunk {
     }
 
     /// Predicate over `exprs` matching exactly the chunk's keys, plus its parameters.
-    /// Integer runs become `BETWEEN` ranges and inline literals (no parameters).
+    /// Integer runs become `BETWEEN` ranges and inline literals (no parameters). Every expression
+    /// is parenthesized: a unit can be `NOT a`, `a OR b` or `a BETWEEN b AND c`.
     pub fn filter(&self, exprs: &[String]) -> (String, Vec<mysql_async::Value>) {
+        self.filter_typed(exprs, &[])
+    }
+
+    /// [`Self::filter`] where `timestamp[i]` tells that `exprs[i]` is a TIMESTAMP and its keys
+    /// are local datetimes of the session's time zone. Those are matched by local time within
+    /// an hour around the key: in a DST fall-back hour one local time is two instants, and an
+    /// index lookup of `ts = ?` finds only the first of them (a scan compares local times and
+    /// finds both).
+    pub fn filter_typed(
+        &self,
+        exprs: &[String],
+        timestamp: &[bool],
+    ) -> (String, Vec<mysql_async::Value>) {
+        let exprs: Vec<String> = exprs.iter().map(|e| format!("({e})")).collect();
+        let local = |i: usize, d: &Datum| {
+            timestamp.get(i).copied().unwrap_or(false)
+                && matches!(d, Datum::Date(y, m, ..) if *y != 0 || *m != 0)
+        };
         match self {
             UnitChunk::Ints(v) => {
                 let e = &exprs[0];
@@ -122,8 +213,13 @@ impl UnitChunk {
             UnitChunk::Keys(keys) => {
                 let mut params = Vec::new();
                 let mut parts = Vec::new();
-                let (nulls, plain): (Vec<&Key>, Vec<&Key>) =
-                    keys.iter().partition(|k| crate::datum::key_has_null(k));
+                // Keys with a NULL need `<=>`. So do TIME keys: on MySQL an `IN` list of two or
+                // more TIME(fsp > 0) parameters matches nothing.
+                let (null_safe, plain): (Vec<&Key>, Vec<&Key>) = keys.iter().partition(|k| {
+                    k.iter()
+                        .enumerate()
+                        .any(|(i, d)| matches!(d, Datum::Null | Datum::Time(..)) || local(i, d))
+                });
                 if !plain.is_empty() {
                     let tuple = |n: usize| {
                         if n == 1 {
@@ -143,10 +239,21 @@ impl UnitChunk {
                         params.extend(k.iter().map(Datum::to_value));
                     }
                 }
-                for k in nulls {
-                    let conj: Vec<String> = exprs.iter().map(|e| format!("{e} <=> ?")).collect();
+                for k in null_safe {
+                    let mut conj = Vec::with_capacity(exprs.len());
+                    for (i, (e, d)) in exprs.iter().zip(k.iter()).enumerate() {
+                        if local(i, d) {
+                            conj.push(format!(
+                                "{e} BETWEEN ? - INTERVAL 1 HOUR AND ? + INTERVAL 1 HOUR \
+                                 AND CAST({e} AS DATETIME(6)) = ?"
+                            ));
+                            params.extend([d.to_value(), d.to_value(), d.to_value()]);
+                        } else {
+                            conj.push(format!("{e} <=> ?"));
+                            params.push(d.to_value());
+                        }
+                    }
                     parts.push(format!("({})", conj.join(" AND ")));
-                    params.extend(k.iter().map(Datum::to_value));
                 }
                 (or_join(parts), params)
             }
@@ -175,6 +282,14 @@ pub struct ViewDirty {
 }
 
 impl ViewDirty {
+    /// An empty buffer for a plan with `aliases` aliases.
+    pub fn for_aliases(aliases: usize) -> ViewDirty {
+        ViewDirty {
+            images: vec![HashSet::new(); aliases],
+            ..Default::default()
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         !self.all
             && !self.rebuild
@@ -265,13 +380,17 @@ pub fn feed(
         (Some(b), Some(af)) => changed(b, af, &a.membership),
         _ => true,
     };
-    if let Some(af) = after {
-        dirty.images[alias].insert(project(af, a, &a.image_cols));
-    }
+    let new = after.map(|af| project(af, a, &a.image_cols));
     if let Some(b) = before {
-        if after.is_none() || membership_changed {
-            dirty.images[alias].insert(project(b, a, &a.image_cols));
+        // Also when only the image changed: a lineage image is the primary key, and the
+        // materialized rows still carry the old one.
+        let old = project(b, a, &a.image_cols);
+        if membership_changed || new.as_ref() != Some(&old) {
+            dirty.images[alias].insert(old);
         }
+    }
+    if let Some(new) = new {
+        dirty.images[alias].insert(new);
     }
     Fed::Recorded
 }
@@ -341,6 +460,85 @@ mod tests {
         UnitChunk::Ints(v.to_vec())
     }
 
+    /// A row image whose image columns change records its old image too, even when no
+    /// membership column changed: with lineage the image is the primary key, and the old key is
+    /// what finds the materialized rows (a key change followed by a delete of the new key).
+    #[test]
+    fn changed_images_keep_the_old_one() {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        use mysql_async::Value;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, TableInfo};
+
+        let table = |name: &str, cols: &[(&str, &str)]| {
+            let t = TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns: cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
+                pk: vec![0],
+                cascades: vec![],
+                is_view: false,
+                view_bases: vec![],
+            };
+            (("db".to_string(), name.to_string()), Arc::new(t))
+        };
+        let tables: std::collections::HashMap<_, _> = [
+            table(
+                "r",
+                &[("id", "int"), ("e", "varchar"), ("label", "varchar")],
+            ),
+            table("t", &[("id", "bigint"), ("e", "varchar"), ("v", "int")]),
+        ]
+        .into_iter()
+        .collect();
+        let p = plan(
+            &parse_definition(
+                "CREATE VIEW v AS SELECT r.id, r.label, t.id AS tid FROM r LEFT JOIN t ON t.e = r.e",
+            )
+            .unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        let a = &p.aliases[1];
+        assert!(a.direct_unit.is_none(), "t is resolved by lookups");
+        let row = |id: i64, e: &str| {
+            let cols: Arc<[mysql_async::Column]> = (0..3)
+                .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
+                .collect();
+            BinlogRow::new(
+                vec![
+                    Some(BinlogValue::Value(Value::Int(id))),
+                    Some(BinlogValue::Value(Value::Bytes(e.as_bytes().to_vec()))),
+                    Some(BinlogValue::Value(Value::Int(1))),
+                ],
+                cols,
+            )
+        };
+        let mut dirty = ViewDirty::for_aliases(p.aliases.len());
+        let (before, after) = (row(-1, "x"), row(-3, "x"));
+        assert_eq!(
+            feed(&p, 1, &mut dirty, Some(&before), Some(&after)),
+            Fed::Recorded
+        );
+        // Both images are buffered (one entry when they are equal).
+        let images = |b: &BinlogRow, af: &BinlogRow| {
+            [project(b, a, &a.image_cols), project(af, a, &a.image_cols)]
+        };
+        let [old, new] = images(&before, &after);
+        assert!(dirty.images[1].contains(&old) && dirty.images[1].contains(&new));
+        assert_eq!(dirty.images[1].len(), if old != new { 2 } else { 1 });
+        // A membership column changes (the key stays): both images again.
+        let mut dirty = ViewDirty::for_aliases(p.aliases.len());
+        let moved = row(-1, "y");
+        feed(&p, 1, &mut dirty, Some(&before), Some(&moved));
+        let [old, new] = images(&before, &moved);
+        assert!(dirty.images[1].contains(&old) && dirty.images[1].contains(&new));
+    }
+
     #[test]
     fn roaring_dedup_and_order() {
         let mut s = UnitSet::default();
@@ -359,12 +557,163 @@ mod tests {
         assert!(s.contains(&[Datum::Int(-5)]));
     }
 
+    fn chunk_keys(c: &UnitChunk) -> Vec<Key> {
+        match c {
+            UnitChunk::Ints(v) => v.iter().map(|&i| Key::from([Datum::Int(i)])).collect(),
+            UnitChunk::Keys(v) => v.clone(),
+        }
+    }
+
+    /// Random unit sets chunk disjointly and completely for every chunk size sequence, and an
+    /// interrupted cursor returns exactly the keys not handed out.
+    #[test]
+    fn cursor_chunks_disjoint_and_complete() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..200 {
+            let mut s = UnitSet::default();
+            let n = (rnd() % 600) as usize;
+            for _ in 0..n {
+                match rnd() % 4 {
+                    0 => s.insert(Box::new([Datum::Bytes(
+                        format!("k{}", rnd() % 300).into_bytes(),
+                    )])),
+                    1 => s.insert(Box::new([Datum::Int((rnd() % 50) as i64), Datum::Null])),
+                    _ => s.insert_int((rnd() % 1000) as i64 - 500),
+                }
+            }
+            let all: HashSet<Key> = {
+                let mut v = HashSet::new();
+                for c in s.chunks(7) {
+                    v.extend(chunk_keys(&c));
+                }
+                v
+            };
+            assert_eq!(all.len(), s.len());
+            let total = s.len();
+            let mut cur = ChunkCursor::new(s.clone());
+            let mut seen: HashSet<Key> = HashSet::new();
+            let stop_after = if round % 3 == 0 {
+                Some((rnd() % 5) as usize)
+            } else {
+                None
+            };
+            let mut handed = 0;
+            let mut i = 0;
+            while let Some(c) = cur.next_chunk(1 + (rnd() % 40) as usize) {
+                assert!(!c.is_empty());
+                if let UnitChunk::Ints(v) = &c {
+                    assert!(v.windows(2).all(|w| w[0] < w[1]), "sorted");
+                }
+                for k in chunk_keys(&c) {
+                    assert!(seen.insert(k), "a unit is in exactly one chunk");
+                }
+                handed += c.len();
+                assert_eq!(cur.remaining(), total - handed);
+                i += 1;
+                if stop_after == Some(i) {
+                    break;
+                }
+            }
+            let rest = cur.into_rest();
+            for k in all.iter() {
+                assert!(
+                    seen.contains(k) != rest.contains(k),
+                    "every unit is either handed out or left over, never both"
+                );
+            }
+            assert_eq!(seen.len() + rest.len(), total);
+            let mut back = UnitSet::default();
+            for k in &seen {
+                back.insert(k.clone());
+            }
+            back.extend(rest);
+            assert_eq!(back.len(), total);
+        }
+    }
+
     #[test]
     fn int_filters_use_ranges() {
         let (f, p) = ints(&[1, 2, 3, 4, 5, 9, 11, 12]).filter(&["u".into()]);
-        assert_eq!(f, "(u BETWEEN 1 AND 5 OR u IN (9,11,12))");
+        assert_eq!(f, "((u) BETWEEN 1 AND 5 OR (u) IN (9,11,12))");
         assert!(p.is_empty());
-        assert_eq!(ints(&[3]).filter(&["u".into()]).0, "u IN (3)");
+        assert_eq!(ints(&[3]).filter(&["u".into()]).0, "(u) IN (3)");
+    }
+
+    /// Unit expressions are operands: `NOT a IN (...)` would be `NOT (a IN (...))`, and
+    /// `a AND b IN (...)` would be `a AND (b IN (...))`.
+    #[test]
+    fn filters_parenthesize_expressions() {
+        let e = ["NOT a".to_string()];
+        assert_eq!(ints(&[0, 1]).filter(&e).0, "(NOT a) IN (0,1)");
+        assert_eq!(
+            ints(&[1, 2, 3, 4]).filter(&["a OR b".into()]).0,
+            "(a OR b) BETWEEN 1 AND 4"
+        );
+        let k = UnitChunk::Keys(vec![
+            Box::new([Datum::Int(1), Datum::Bytes(b"x".to_vec())]),
+            Box::new([Datum::Null, Datum::Bytes(b"y".to_vec())]),
+        ]);
+        let (f, _) = k.filter(&["a BETWEEN 1 AND 2".into(), "b AND c".into()]);
+        assert_eq!(
+            f,
+            "(((a BETWEEN 1 AND 2), (b AND c)) IN ((?,?)) OR ((a BETWEEN 1 AND 2) <=> ? AND (b AND c) <=> ?))"
+        );
+    }
+
+    /// TIME keys never go into an `IN` list (MySQL matches none of two or more TIME(fsp > 0)
+    /// parameters there).
+    #[test]
+    fn time_keys_use_null_safe_equality() {
+        let t = |s| Datum::Time(false, 0, 1, 2, s, 500_000);
+        let k = UnitChunk::Keys(vec![
+            Box::new([t(3)]),
+            Box::new([t(4)]),
+            Box::new([Datum::Bytes(b"z".to_vec())]),
+        ]);
+        let (f, p) = k.filter(&["tm".into()]);
+        assert_eq!(f, "((tm) IN (?) OR ((tm) <=> ?) OR ((tm) <=> ?))");
+        assert_eq!(p.len(), 3);
+        let k = UnitChunk::Keys(vec![
+            Box::new([Datum::Int(1), t(3)]),
+            Box::new([Datum::Int(2), t(4)]),
+        ]);
+        let (f, p) = k.filter(&["a".into(), "tm".into()]);
+        assert_eq!(
+            f,
+            "(((a) <=> ? AND (tm) <=> ?) OR ((a) <=> ? AND (tm) <=> ?))"
+        );
+        assert_eq!(p.len(), 4);
+    }
+
+    /// TIMESTAMP keys (local datetimes) match by local time within an hour of the key, so both
+    /// instants of a DST fall-back hour are found with or without an index.
+    #[test]
+    fn timestamp_keys_match_local_time() {
+        let dt = Datum::Date(2021, 10, 31, 2, 30, 0, 250_000);
+        let k = UnitChunk::Keys(vec![
+            Box::new([Datum::Int(1), dt.clone()]),
+            Box::new([Datum::Int(2), Datum::Null]),
+            Box::new([Datum::Int(3), Datum::Date(0, 0, 0, 0, 0, 0, 0)]),
+        ]);
+        let (f, p) = k.filter_typed(&["g".into(), "ts".into()], &[false, true]);
+        assert_eq!(
+            f,
+            "(((g), (ts)) IN ((?,?)) OR ((g) <=> ? AND (ts) BETWEEN ? - INTERVAL 1 HOUR AND ? + INTERVAL 1 HOUR \
+             AND CAST((ts) AS DATETIME(6)) = ?) OR ((g) <=> ? AND (ts) <=> ?))"
+        );
+        assert_eq!(p.len(), 2 + 4 + 2);
+        assert_eq!(p[3], dt.to_value());
+        // Without types (and for DATETIME columns) nothing changes.
+        assert_eq!(
+            k.filter(&["g".into(), "ts".into()]).0,
+            "(((g), (ts)) IN ((?,?),(?,?)) OR ((g) <=> ? AND (ts) <=> ?))"
+        );
     }
 
     #[test]
@@ -374,7 +723,7 @@ mod tests {
             Box::new([Datum::Null, Datum::Bytes(b"b".to_vec())]),
         ]);
         let (f, p) = k.filter(&["a".into(), "b".into()]);
-        assert_eq!(f, "((a, b) IN ((?,?)) OR (a <=> ? AND b <=> ?))");
+        assert_eq!(f, "(((a), (b)) IN ((?,?)) OR ((a) <=> ? AND (b) <=> ?))");
         assert_eq!(p.len(), 4);
     }
 }

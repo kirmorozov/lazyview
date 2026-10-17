@@ -1,7 +1,7 @@
 //! Turns a `CREATE VIEW` statement into a [`ViewPlan`]: what to watch, how a changed row maps to
 //! the materialized rows it affects ("units"), and pre-rendered SQL for every refresh query.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -9,10 +9,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
     visit_expressions, visit_expressions_mut, visit_relations, BinaryOperator, DataType, Expr,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint,
     JoinOperator, ObjectName, ObjectNamePart, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, TableAlias, TableFactor, TableWithJoins,
-    UnaryOperator, Value, Visit,
+    UnaryOperator, Value, Visit, Visitor,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -556,6 +556,22 @@ pub struct AliasPlan {
     pub image_cols: Vec<usize>,
     /// FROM clause with this alias replaced by `SUBST_MARKER`, split around it.
     pub subst_from: (String, String),
+    /// Position in the FROM clause: (table index, join index).
+    pub pos: (usize, Option<usize>),
+}
+
+/// Lineage of a lookup-resolved alias (select/join views): hidden, indexed materialized columns
+/// carrying the primary key of that alias's row in each materialized row. A changed row of the
+/// table maps to the materialized rows it is part of by an index lookup on the materialized
+/// table, never by joining its old image with the current state of the other tables (which may
+/// have changed too, in a transaction not read from the binlog yet).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineageKey {
+    pub alias: usize,
+    /// Materialized column names, `_lv_a<alias>_pk<j>`, one per primary-key column.
+    pub cols: Vec<String>,
+    /// The primary-key columns as source expressions (`c`.`id`).
+    pub exprs: Vec<String>,
 }
 
 /// A parent table whose deletes/updates change rows of a table the view reads through a
@@ -579,10 +595,15 @@ pub struct ViewPlan {
     pub hash: String,
     pub mode: Mode,
     pub tables: Vec<TableRef>,
+    /// Full-refresh plans: per entry of `tables`, the columns the statement may read (`None`:
+    /// any). An UPDATE that changes none of them cannot change the view.
+    pub table_columns: Vec<Option<Vec<bool>>>,
     pub aliases: Vec<AliasPlan>,
     /// Rendered projection items (with `AS` aliases where given).
     pub projection: Vec<String>,
     pub from_sql: String,
+    /// The FROM clause (incremental plans), for lookups that replace several tables at once.
+    pub from_items: Vec<TableWithJoins>,
     pub where_sql: Option<String>,
     pub group_sql: Option<String>,
     pub having_sql: Option<String>,
@@ -594,6 +615,9 @@ pub struct ViewPlan {
     pub full_select: String,
     /// Whether one unit maps to at most one materialized row.
     pub unit_unique: bool,
+    /// Lineage keys of the lookup-resolved aliases that have a primary key (select/join views).
+    /// Their images carry only the primary key (`image_cols`).
+    pub lineage: Vec<LineageKey>,
     pub cascades: Vec<CascadeRoute>,
     /// Column names from `CREATE VIEW v (a, b, ...)`, applied positionally to the materialized
     /// table (the SELECT itself keeps its own aliases so GROUP BY / HAVING resolve as written).
@@ -605,8 +629,8 @@ impl ViewPlan {
         matches!(self.mode, Mode::Spj | Mode::Grouped)
     }
 
-    /// SELECT producing materialized rows (projection + hidden unit columns), optionally
-    /// restricted by `filter` (a predicate over `unit_exprs`).
+    /// SELECT producing materialized rows (projection, hidden unit columns, then the lineage
+    /// columns), optionally restricted by `filter` (a predicate over `unit_exprs`).
     pub fn select_sql(&self, hidden_units: &[usize], filter: Option<&str>) -> String {
         if let Mode::Full(_) = self.mode {
             return self.full_select.clone();
@@ -614,6 +638,11 @@ impl ViewPlan {
         let mut cols = self.projection.clone();
         for &u in hidden_units {
             cols.push(format!("{} AS `_lv_u{u}`", self.unit_exprs[u]));
+        }
+        for k in &self.lineage {
+            for (e, c) in k.exprs.iter().zip(&k.cols) {
+                cols.push(format!("{e} AS {}", quote_ident(c)));
+            }
         }
         let mut sql = format!("SELECT {} FROM {}", cols.join(", "), self.from_sql);
         push_where(&mut sql, self.where_sql.as_deref(), filter);
@@ -625,6 +654,64 @@ impl ViewPlan {
             sql.push_str(" HAVING ");
             sql.push_str(h);
         }
+        sql
+    }
+
+    /// How a changed row of each table maps to the materialized rows it affects, for logs:
+    /// `alias:unit` (straight from the row image), `alias:lineage` (old rows by the hidden key
+    /// columns, new rows by key), `alias:lookup` (images joined with the current state) or, for
+    /// full-refresh views, `rebuild`; parents of cascading foreign keys as `^parent:unit|rebuild`.
+    pub fn tracing(&self) -> String {
+        if !self.is_incremental() && !matches!(self.mode, Mode::Global) {
+            return "rebuild".into();
+        }
+        let mut parts: Vec<String> = self
+            .aliases
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let how = if matches!(self.mode, Mode::Global) {
+                    "recompute"
+                } else if a.direct_unit.is_some() {
+                    "unit"
+                } else if self.lineage_of(i).is_some() {
+                    "lineage"
+                } else {
+                    "lookup"
+                };
+                format!("{}:{how}", a.name)
+            })
+            .collect();
+        parts.extend(self.cascades.iter().map(|c| {
+            let how = if c.unit_from_parent.is_some() {
+                "unit"
+            } else {
+                "rebuild"
+            };
+            format!("^{}:{how}", c.parent.name)
+        }));
+        parts.join(",")
+    }
+
+    /// Number of lineage columns (they follow the hidden unit columns).
+    pub fn lineage_width(&self) -> usize {
+        self.lineage.iter().map(|k| k.cols.len()).sum()
+    }
+
+    /// The lineage key of `alias`, if it has one.
+    pub fn lineage_of(&self, alias: usize) -> Option<&LineageKey> {
+        self.lineage.iter().find(|k| k.alias == alias)
+    }
+
+    /// `SELECT DISTINCT <units> FROM ... WHERE ... AND <filter>`: the units of the current rows
+    /// that `filter` (over a lineage alias's primary key) selects.
+    pub fn key_lookup_sql(&self, filter: &str) -> String {
+        let mut sql = format!(
+            "SELECT DISTINCT {} FROM {}",
+            self.unit_exprs.join(", "),
+            self.from_sql
+        );
+        push_where(&mut sql, self.where_sql.as_deref(), Some(filter));
         sql
     }
 
@@ -640,6 +727,40 @@ impl ViewPlan {
         );
         push_where(&mut sql, self.where_sql.as_deref(), None);
         sql
+    }
+
+    /// As [`Self::lookup_sql`] with several aliases replaced by derived rows at once
+    /// (`(alias, derived table)`). Also returns the order (indexes into `subst`) in which the
+    /// derived tables appear in the statement, which is the order of their parameters.
+    pub fn lookup_sql_multi(&self, subst: &[(usize, String)]) -> Result<(String, Vec<usize>)> {
+        let mut from = self.from_items.clone();
+        let marker = |k: usize| format!("__lv_subst_{k}__");
+        for (k, (a, _)) in subst.iter().enumerate() {
+            let a = &self.aliases[*a];
+            substitute_factor(&mut from, a.pos, &a.name, &marker(k));
+        }
+        let mut from_sql = from
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut order: Vec<(usize, usize)> = Vec::new();
+        for k in 0..subst.len() {
+            let at = from_sql
+                .find(&marker(k))
+                .ok_or_else(|| anyhow!("internal: substitution marker missing"))?;
+            order.push((at, k));
+        }
+        order.sort_unstable();
+        for (k, (_, derived)) in subst.iter().enumerate() {
+            from_sql = from_sql.replacen(&marker(k), derived, 1);
+        }
+        let mut sql = format!(
+            "SELECT DISTINCT {} FROM {from_sql}",
+            self.unit_exprs.join(", ")
+        );
+        push_where(&mut sql, self.where_sql.as_deref(), None);
+        Ok((sql, order.into_iter().map(|(_, k)| k).collect()))
     }
 }
 
@@ -1002,7 +1123,7 @@ pub fn plan(
     let output_names = (!def.columns.is_empty()).then(|| def.columns.clone());
     // Full rebuilds run the statement exactly as written (ORDER BY matters with LIMIT).
     let full_select = full_select_sql(def, default_schema, tables)?;
-    let full_with = |reason: &str, watched: Vec<TableRef>| ViewPlan {
+    let full_with = |reason: &str, watched: Vec<TableRef>, columns| ViewPlan {
         schema: schema.clone(),
         name: def.name.clone(),
         hash: def.hash.clone(),
@@ -1015,9 +1136,11 @@ pub fn plan(
             tables,
         ),
         tables: watched,
+        table_columns: columns,
         aliases: Vec::new(),
         projection: Vec::new(),
         from_sql: String::new(),
+        from_items: Vec::new(),
         where_sql: None,
         group_sql: None,
         having_sql: None,
@@ -1025,15 +1148,23 @@ pub fn plan(
         unit_in_projection: Vec::new(),
         full_select: full_select.clone(),
         unit_unique: false,
+        lineage: Vec::new(),
         output_names: output_names.clone(),
     };
-    let full = |reason: &str| full_with(reason, all_tables.clone());
+    let full = |reason: &str| {
+        let columns = read_columns(&def.query, &all_tables, tables);
+        full_with(reason, all_tables.clone(), columns)
+    };
 
     // A SQL view has no binlog rows of its own: watch its base tables, rebuild on change.
     if let Some(v) = all_tables.iter().find(|t| tables[*t].is_view) {
+        // Which base columns the SQL view reads is not known here: any change counts.
+        let bases = expand_views(&all_tables, tables);
+        let columns = vec![None; bases.len()];
         return Ok(full_with(
             &format!("reads SQL view `{}`", v.1),
-            expand_views(&all_tables, tables),
+            bases,
+            columns,
         ));
     }
 
@@ -1441,6 +1572,7 @@ pub fn plan(
             direct_unit,
             image_cols,
             subst_from,
+            pos: alias_pos[ai],
         });
     }
 
@@ -1455,6 +1587,39 @@ pub fn plan(
             )));
         }
     }
+    // Lineage (select/join views): a lookup-resolved table with a primary key is traced to the
+    // materialized rows its rows are part of through hidden key columns. Its images carry only
+    // that key, and a key-only UPDATE must refresh them (the hidden columns change).
+    let mut lineage = Vec::new();
+    if mode == Mode::Spj {
+        for (ai, a) in alias_plans.iter_mut().enumerate() {
+            if a.direct_unit.is_some() || a.table.pk.is_empty() {
+                continue;
+            }
+            for &c in &a.table.pk {
+                a.referenced[c] = true;
+            }
+            a.image_cols = a.table.pk.clone();
+            lineage.push(LineageKey {
+                alias: ai,
+                cols: (0..a.table.pk.len())
+                    .map(|j| format!("_lv_a{ai}_pk{j}"))
+                    .collect(),
+                exprs: a
+                    .table
+                    .pk
+                    .iter()
+                    .map(|&c| {
+                        Expr::CompoundIdentifier(vec![
+                            qident(&a.name),
+                            qident(&a.table.columns[c].name),
+                        ])
+                        .to_string()
+                    })
+                    .collect(),
+            });
+        }
+    }
     let unit_unique = match mode {
         Mode::Spj => n_alias == 1,
         Mode::Grouped => true,
@@ -1465,6 +1630,7 @@ pub fn plan(
         name: def.name.clone(),
         hash: def.hash.clone(),
         mode,
+        table_columns: vec![None; all_tables.len()],
         tables: all_tables.clone(),
         projection: select
             .projection
@@ -1482,6 +1648,7 @@ pub fn plan(
             })
             .collect(),
         from_sql,
+        from_items: select.from.clone(),
         where_sql: select.selection.as_ref().map(|e| e.to_string()),
         group_sql: if group_exprs.is_empty() {
             None
@@ -1499,6 +1666,7 @@ pub fn plan(
         unit_in_projection,
         full_select: query.to_string(),
         unit_unique,
+        lineage,
         cascades: cascade_routes(
             &alias_plans
                 .iter()
@@ -1710,14 +1878,130 @@ fn cascade_routes(
     out
 }
 
+/// Columns of each table in `watched` that `query` may read, matched by name: every identifier
+/// anywhere in the statement (columns, aliases, `USING` lists, ...) that names a column of the
+/// table counts, so this is a superset. `None` (any column) where the statement reads columns
+/// implicitly: `*`, NATURAL joins, FROM items other than tables and subqueries.
+fn read_columns(
+    query: &Query,
+    watched: &[TableRef],
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> Vec<Option<Vec<bool>>> {
+    #[derive(Default)]
+    struct Names {
+        names: HashSet<String>,
+        any: bool,
+    }
+    impl Names {
+        fn joins(&mut self, joins: &[Join]) {
+            for j in joins {
+                if !matches!(
+                    join_constraint(&j.join_operator),
+                    Some(JoinConstraint::On(_) | JoinConstraint::Using(_) | JoinConstraint::None)
+                ) {
+                    self.any = true;
+                }
+            }
+        }
+    }
+    impl Visitor for Names {
+        type Break = ();
+        fn pre_visit_ident(&mut self, i: &Ident) -> ControlFlow<()> {
+            self.names.insert(ident_name(i).to_lowercase());
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_select(&mut self, s: &Select) -> ControlFlow<()> {
+            if s.projection.iter().any(|p| {
+                matches!(
+                    p,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+                )
+            }) {
+                self.any = true;
+            }
+            for t in &s.from {
+                self.joins(&t.joins);
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, f: &TableFactor) -> ControlFlow<()> {
+            match f {
+                TableFactor::Table { args: None, .. } | TableFactor::Derived { .. } => {}
+                TableFactor::NestedJoin {
+                    table_with_joins, ..
+                } => self.joins(&table_with_joins.joins),
+                _ => self.any = true,
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut n = Names::default();
+    let _ = query.visit(&mut n);
+    watched
+        .iter()
+        .map(|t| {
+            let info = tables.get(t).filter(|_| !n.any)?;
+            Some(
+                info.columns
+                    .iter()
+                    .map(|c| n.names.contains(&c.name.to_lowercase()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+    match op {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c)
+        | JoinOperator::AsOf { constraint: c, .. } => Some(c),
+        _ => None,
+    }
+}
+
 fn render_substituted_from(
     from: &[TableWithJoins],
     pos: (usize, Option<usize>),
     alias: &str,
 ) -> Result<(String, String)> {
     let mut from = from.to_vec();
+    substitute_factor(&mut from, pos, alias, SUBST_MARKER);
+    let s = from
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (a, b) = s
+        .split_once(SUBST_MARKER)
+        .ok_or_else(|| anyhow!("internal: substitution marker missing"))?;
+    Ok((a.to_string(), b.to_string()))
+}
+
+/// Replaces the table at `pos` by a placeholder table `marker` (keeping the alias). Only rows
+/// that actually match the substituted rows are affected by them, so a LEFT JOIN of that table
+/// becomes an inner join (the refresh of the units recomputes any NULL extension).
+fn substitute_factor(
+    from: &mut [TableWithJoins],
+    pos: (usize, Option<usize>),
+    alias: &str,
+    marker: &str,
+) {
     let marker = TableFactor::Table {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(SUBST_MARKER))]),
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(marker))]),
         alias: Some(TableAlias {
             explicit: true,
             name: qident(alias),
@@ -1738,22 +2022,11 @@ fn render_substituted_from(
         (t, Some(j)) => {
             let join = &mut from[t].joins[j];
             join.relation = marker;
-            // Only rows that actually match the image are affected by it; the refresh of those
-            // units recomputes any NULL extension.
             if let JoinOperator::Left(c) | JoinOperator::LeftOuter(c) = &join.join_operator {
                 join.join_operator = JoinOperator::Join(c.clone());
             }
         }
     }
-    let s = from
-        .iter()
-        .map(|t| t.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let (a, b) = s
-        .split_once(SUBST_MARKER)
-        .ok_or_else(|| anyhow!("internal: substitution marker missing"))?;
-    Ok((a.to_string(), b.to_string()))
 }
 
 pub fn quote_ident(id: &str) -> String {
@@ -1851,6 +2124,127 @@ mod tests {
         assert!(parse_definition("SELECT 1").is_err());
         assert!(parse_definition("CREATE TABLE t (a int)").is_err());
         assert!(parse_definition("CREATE VIEW v AS SELECT 1 garbage garbage").is_err());
+    }
+
+    /// Full-refresh views watch only the columns their statement names (E1a: an update of
+    /// `orders.note` must not rebuild a DISTINCT view over `orders.status`).
+    #[test]
+    fn full_views_read_columns() {
+        let cols = |sql: &str| {
+            let v = p(sql);
+            assert!(matches!(v.mode, Mode::Full(_)), "{sql}: {:?}", v.mode);
+            v.tables
+                .iter()
+                .zip(&v.table_columns)
+                .map(|(t, c)| (t.1.clone(), c.clone()))
+                .collect::<Vec<_>>()
+        };
+        let (t, f) = (true, false);
+        assert_eq!(
+            cols("CREATE VIEW v AS SELECT DISTINCT status FROM orders"),
+            vec![("orders".into(), Some(vec![f, f, t, f, f]))]
+        );
+        // Subqueries, ORDER BY, USING and aliases all count; names match any watched table.
+        assert_eq!(
+            cols(
+                "CREATE VIEW v AS SELECT c.name FROM customers c JOIN regions USING (id) \
+                 WHERE c.id IN (SELECT customer_id FROM orders WHERE total > 5) ORDER BY region_id LIMIT 3"
+            ),
+            vec![
+                ("customers".into(), Some(vec![t, t, t])),
+                ("orders".into(), Some(vec![t, t, f, t, f])),
+                ("regions".into(), Some(vec![t, t])),
+            ]
+        );
+        // Implicit column reads: any column counts.
+        for sql in [
+            "CREATE VIEW v AS SELECT DISTINCT * FROM orders",
+            "CREATE VIEW v AS SELECT DISTINCT o.* FROM orders o",
+            "CREATE VIEW v AS SELECT DISTINCT id FROM orders NATURAL JOIN order_items",
+            "CREATE VIEW v AS SELECT id FROM orders UNION SELECT * FROM (SELECT id FROM regions) x",
+        ] {
+            assert!(cols(sql).iter().all(|(_, c)| c.is_none()), "{sql}");
+        }
+    }
+
+    /// E6: select/join views trace lookup tables through hidden lineage key columns (their
+    /// primary key per materialized row); their images carry only that key.
+    #[test]
+    fn spj_lineage_keys() {
+        let v = p(
+            "CREATE VIEW v AS SELECT o.id, c.name, r.name AS region FROM orders o \
+             JOIN customers c ON c.id = o.customer_id LEFT JOIN regions r ON r.id = c.region_id",
+        );
+        assert_eq!(
+            v.lineage,
+            vec![
+                LineageKey {
+                    alias: 1,
+                    cols: vec!["_lv_a1_pk0".into()],
+                    exprs: vec!["`c`.`id`".into()],
+                },
+                LineageKey {
+                    alias: 2,
+                    cols: vec!["_lv_a2_pk0".into()],
+                    exprs: vec!["`r`.`id`".into()],
+                },
+            ]
+        );
+        assert_eq!(
+            (v.aliases[1].image_cols.clone(), v.lineage_width()),
+            (vec![0], 2)
+        );
+        assert_eq!(v.tracing(), "o:unit,c:lineage,r:lineage");
+        assert!(v.select_sql(&[], None).ends_with(
+            "`c`.`id` AS `_lv_a1_pk0`, `r`.`id` AS `_lv_a2_pk0` FROM orders o \
+             JOIN customers c ON c.id = o.customer_id LEFT JOIN regions r ON r.id = c.region_id"
+        ));
+        assert_eq!(
+            v.key_lookup_sql("`c`.`id` IN (1, 2)"),
+            "SELECT DISTINCT `o`.`id` FROM orders o JOIN customers c ON c.id = o.customer_id \
+             LEFT JOIN regions r ON r.id = c.region_id WHERE `c`.`id` IN (1, 2)"
+        );
+        // Composite keys; a key that the query does not read still counts as read (a key-only
+        // UPDATE changes the hidden columns).
+        let v = p(
+            "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.customer_id",
+        );
+        assert_eq!(v.lineage[0].cols, vec!["_lv_a1_pk0", "_lv_a1_pk1"]);
+        assert_eq!(v.lineage[0].exprs, vec!["`i`.`order_id`", "`i`.`line`"]);
+        assert_eq!(v.aliases[1].image_cols, vec![0, 1]);
+        assert!(v.aliases[1].referenced[1], "order_items.line");
+        // Tables whose rows map to units directly, grouped views and single tables: none.
+        for sql in [
+            "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.id",
+            "CREATE VIEW v AS SELECT c.name, COUNT(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.name",
+            "CREATE VIEW v AS SELECT id, status FROM orders",
+        ] {
+            assert!(p(sql).lineage.is_empty(), "{sql}");
+        }
+    }
+
+    /// E6: lookups that replace several tables by their row images at once, with parameters in
+    /// the order the derived tables appear.
+    #[test]
+    fn multi_alias_lookup_sql() {
+        let v = p(
+            "CREATE VIEW v AS SELECT o.id, c.name, r.name AS region FROM orders o \
+             JOIN customers c ON c.id = o.customer_id LEFT JOIN regions r ON r.id = c.region_id",
+        );
+        let (c, r) = (1, 2);
+        assert!(v.aliases[c].direct_unit.is_none() && v.aliases[r].direct_unit.is_none());
+        let (sql, order) = v
+            .lookup_sql_multi(&[(r, "(R)".into()), (c, "(C)".into())])
+            .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT DISTINCT `o`.`id` FROM orders o JOIN (C) AS `c` ON c.id = o.customer_id \
+             JOIN (R) AS `r` ON r.id = c.region_id"
+        );
+        assert_eq!(order, vec![1, 0]);
+        // One alias: the same statement as the single-table lookup.
+        let (one, _) = v.lookup_sql_multi(&[(r, "(R)".into())]).unwrap();
+        assert_eq!(one, v.lookup_sql(r, "(R)"));
     }
 
     #[test]

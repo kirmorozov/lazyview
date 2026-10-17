@@ -1,0 +1,248 @@
+//! Lowering: a normalized flat block becomes a synthetic definition that the block planner
+//! (`analyze::plan`) turns into the executor's [`ViewPlan`]; semi-join aliases are attached
+//! afterwards. Full plans keep the statement exactly as written.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::Result;
+use sqlparser::ast::{Expr, SelectItem};
+use sqlparser::tokenizer::Token;
+
+use super::ast::qident;
+use super::ir::{Block, Semi};
+use super::names::{finish_view_names, ident_name};
+use super::normalize::{fill_placeholders, marker_args, marker_name, query_of};
+use super::source::tokenize;
+use crate::analyze::{self, AliasPlan, Mode, ParsedDef, ViewPlan};
+use crate::catalog::{TableInfo, TableRef};
+
+/// Plans a flat block. `Ok(Err(reason))`: it cannot be maintained incrementally as rewritten
+/// (the caller falls back to a Full plan of the original statement).
+pub(crate) fn plan_block(
+    def: &ParsedDef,
+    b: &Block,
+    schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> Result<std::result::Result<ViewPlan, String>> {
+    let mut names: Vec<_> = b.outputs.iter().map(|o| o.name.clone()).collect();
+    for i in finish_view_names(&mut names) {
+        if b.outputs[i].original.is_none() {
+            return Ok(Err(format!(
+                "unaliased column `{}` needs an alias (its server-generated name differs between versions)",
+                b.outputs[i].name.text
+            )));
+        }
+    }
+    let mut select = b.select.clone();
+    let mut item_sql = Vec::new();
+    select.projection = b
+        .outputs
+        .iter()
+        .zip(&names)
+        .map(|(o, n)| match &o.original {
+            Some((item, text)) => {
+                item_sql.push(text.clone());
+                item.clone()
+            }
+            None => {
+                item_sql.push(None);
+                SelectItem::ExprWithAlias {
+                    expr: o.expr.clone(),
+                    alias: qident(&n.text),
+                }
+            }
+        })
+        .collect();
+    let flat = ParsedDef {
+        schema: def.schema.clone(),
+        name: def.name.clone(),
+        columns: def.columns.clone(),
+        query: query_of(select),
+        hash: def.hash.clone(),
+        query_sql: def.query_sql.clone(),
+        item_sql,
+    };
+    let mut plan = match analyze::plan(&flat, schema, tables) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(view = %def.name, "analyzer: the merged form does not plan: {e:#}");
+            return Ok(Err(format!("internal analyzer error: {e}")));
+        }
+    };
+    if let Err(why) = attach_semis(&mut plan, b) {
+        return Ok(Err(why));
+    }
+    Ok(Ok(plan))
+}
+
+/// The semi-joins left in the block: their predicates replace the markers in the plan's WHERE,
+/// and their tables become aliases whose changes map straight to the view's units (or, for a
+/// single-row aggregate, mark it for recomputation).
+fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), String> {
+    if b.semis.is_empty() {
+        return Ok(());
+    }
+    let Some(w) = &b.select.selection else {
+        return Err("internal analyzer error: semi-join marker missing".into());
+    };
+    let mut where_sql = plan.where_sql.clone().unwrap_or_default();
+    for s in &b.semis {
+        let args = marker_args(w, s.id)
+            .ok_or_else(|| "internal analyzer error: semi-join marker missing".to_string())?;
+        let mut pred = s.predicate.clone();
+        fill_placeholders(&mut pred, &args);
+        where_sql = replace_call(&where_sql, &marker_name(s.id), &format!("({pred})"))
+            .ok_or_else(|| "internal analyzer error: semi-join marker not rendered".to_string())?;
+        let direct = match &plan.mode {
+            Mode::Full(_) => continue,
+            Mode::Global => None,
+            Mode::Spj | Mode::Grouped => Some(direct_columns(plan, s, &args)?),
+        };
+        if !s.info.cascades.is_empty() {
+            return Err(format!(
+                "{} over `{}`, a child of a cascading foreign key",
+                semi_kind(s),
+                s.info.name
+            ));
+        }
+        let image_cols = (0..s.referenced.len())
+            .filter(|&c| s.referenced[c])
+            .collect();
+        plan.aliases.push(AliasPlan {
+            name: s.alias.clone(),
+            table: s.info.clone(),
+            referenced: s.referenced.clone(),
+            membership: s.referenced.clone(),
+            direct_unit: direct,
+            image_cols,
+            // Never used: the alias has direct units (or the view is one row).
+            subst_from: (String::new(), String::new()),
+            pos: (usize::MAX, None),
+        });
+        if !plan.tables.contains(&s.table) {
+            plan.tables.push(s.table.clone());
+            plan.table_columns.push(None);
+        }
+    }
+    plan.where_sql = Some(where_sql);
+    Ok(())
+}
+
+fn semi_kind(s: &Semi) -> &'static str {
+    match (&s.predicate, s.negated) {
+        (Expr::InSubquery { .. }, _) => "IN subquery",
+        (_, true) => "NOT EXISTS subquery",
+        _ => "EXISTS subquery",
+    }
+}
+
+/// For each unit expression, the column of the subquery's table equal to it: a correlation
+/// `t.k = outer` whose outer side is a column that equals that unit on every row of its alias.
+fn direct_columns(
+    plan: &ViewPlan,
+    s: &Semi,
+    args: &[Expr],
+) -> std::result::Result<Vec<usize>, String> {
+    let resolve = |mut e: &Expr| -> Option<(usize, usize)> {
+        while let Expr::Nested(inner) = e {
+            e = inner;
+        }
+        let (tbl, col) = match e {
+            Expr::Identifier(id) => (None, ident_name(id)),
+            Expr::CompoundIdentifier(p) if p.len() >= 2 => (
+                Some(ident_name(&p[p.len() - 2])),
+                ident_name(&p[p.len() - 1]),
+            ),
+            _ => return None,
+        };
+        plan.aliases.iter().enumerate().find_map(|(a, ap)| {
+            if tbl
+                .as_ref()
+                .is_some_and(|t| !ap.name.eq_ignore_ascii_case(t))
+            {
+                return None;
+            }
+            ap.table.col_index(&col).map(|c| (a, c))
+        })
+    };
+    (0..plan.unit_exprs.len())
+        .map(|u| {
+            s.correlation.iter().find_map(|&(sc, k)| {
+                let (a, c) = resolve(args.get(k)?)?;
+                let ap = &plan.aliases[a];
+                let tc = &ap.table.columns[c];
+                let sc_col = &s.info.columns[sc];
+                (ap.direct_unit.as_ref()?.get(u) == Some(&c)
+                    && tc.exact_key()
+                    && sc_col.exact_key()
+                    && tc.family() == sc_col.family())
+                .then_some(sc)
+            })
+        })
+        .collect::<Option<Vec<usize>>>()
+        .ok_or_else(|| {
+            format!(
+                "{} over `{}` is not correlated on the view's unit key",
+                semi_kind(s),
+                s.info.name
+            )
+        })
+}
+
+/// Replaces the call `name(…)` in `sql` (token-aware) by `replacement`.
+fn replace_call(sql: &str, name: &str, replacement: &str) -> Option<String> {
+    let tokens = tokenize(sql)?;
+    let chars: Vec<(usize, char)> = sql.char_indices().collect();
+    let offset = |loc: sqlparser::tokenizer::Location| -> Option<usize> {
+        // Rendered expressions are on one line.
+        (loc.line == 1).then(|| {
+            chars
+                .get(loc.column as usize - 1)
+                .map(|(i, _)| *i)
+                .unwrap_or(sql.len())
+        })
+    };
+    let start = tokens
+        .iter()
+        .position(|t| matches!(&t.token, Token::Word(w) if w.value == name))?;
+    let mut depth = 0usize;
+    for t in &tokens[start + 1..] {
+        match t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let a = offset(tokens[start].span.start)?;
+                    let z = offset(t.span.end)?;
+                    return Some(format!("{}{replacement}{}", &sql[..a], &sql[z..]));
+                }
+            }
+            Token::Whitespace(_) => {}
+            _ if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A Full plan for the statement as written, with `reason` and the tables resolved with CTE
+/// scoping.
+pub(crate) fn full_plan(
+    def: &ParsedDef,
+    schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+    reason: &str,
+) -> Result<ViewPlan> {
+    let mut p = analyze::plan(def, schema, tables)?;
+    if matches!(&p.mode, Mode::Full(r) if r.starts_with("reads SQL view")) {
+        return Ok(p);
+    }
+    p.mode = Mode::Full(reason.to_string());
+    let scoped = super::referenced_tables(&def.query, schema);
+    if p.tables != scoped {
+        p.table_columns = vec![None; scoped.len()];
+        p.tables = scoped;
+    }
+    Ok(p)
+}

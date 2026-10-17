@@ -1,0 +1,1228 @@
+//! Semantics-preserving rewrites of one block whose children are already normalized:
+//!
+//! 1. semi-/anti-join conjuncts (`[NOT] EXISTS`, `x IN (SELECT …)`) are taken out of WHERE;
+//! 2. derived relations (CTE references, derived tables) that only select, project and join are
+//!    **merged**: their FROM joins the block's FROM, their WHERE goes to the WHERE (or to the ON of
+//!    their join), references to their columns become their (qualified) expressions;
+//! 3. a sole aggregated derived relation under a filter/project block is **merged up**;
+//! 4. DISTINCT becomes GROUP BY over the output columns;
+//! 5. semi-joins whose subquery returns a unique key become inner joins.
+
+use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
+
+use anyhow::{anyhow, bail, Result};
+use sqlparser::ast::{
+    visit_expressions, visit_expressions_mut, BinaryOperator, Distinct, Expr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
+    ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
+    UnaryOperator, Value,
+};
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
+
+use super::ast::{
+    and_all, conjuncts, exprs_of, factor_alias, factors, for_each_expr_mut, function_name,
+    has_column_ref, has_subquery, join_constraint, join_constraint_mut, kind_at, nested, qcol,
+    qident, table_factor, JoinKind,
+};
+use super::build::{star_with_using, Builder, Res, Resolver};
+use super::ir::{Block, Item, Origin, Rel, Semi, Source};
+use super::names::ident_name;
+use super::scope::Scope;
+
+pub(crate) const AGGREGATES: &[&str] = &[
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "GROUP_CONCAT",
+    "BIT_AND",
+    "BIT_OR",
+    "BIT_XOR",
+    "STD",
+    "STDDEV",
+    "STDDEV_POP",
+    "STDDEV_SAMP",
+    "VAR_POP",
+    "VAR_SAMP",
+    "VARIANCE",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECTAGG",
+];
+
+/// Functions whose result is not NULL when an argument is NULL.
+const NULL_TOLERANT: &[&str] = &[
+    "COALESCE",
+    "IFNULL",
+    "IF",
+    "NULLIF",
+    "ISNULL",
+    "CONCAT_WS",
+    "NVL",
+    "IIF",
+    "ELT",
+    "FIELD",
+    "MAKE_SET",
+    "JSON_ARRAY",
+    "JSON_OBJECT",
+    "JSON_QUOTE",
+    "QUOTE",
+];
+
+const SEMI_MARKER: &str = "__lv_semi_";
+const OUTER_PLACEHOLDER: &str = "__lv_outer_";
+
+pub(crate) fn block(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
+    extract_semis(bld, b, scope)?;
+    merge(b)?;
+    merge_up(b)?;
+    distinct_to_group(b);
+    semis_to_joins(b)?;
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------------ facts
+
+/// Whether `e` contains an aggregate function call (window functions excluded).
+fn has_aggregate(e: &Expr) -> bool {
+    let mut found = false;
+    let _ = visit_expressions(e, |x: &Expr| {
+        if let Expr::Function(f) = x {
+            if f.over.is_none() && AGGREGATES.contains(&function_name(f).as_str()) {
+                found = true;
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+fn has_window(e: &Expr) -> bool {
+    let mut found = false;
+    let _ = visit_expressions(e, |x: &Expr| {
+        if matches!(x, Expr::Function(f) if f.over.is_some()) {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+fn group_exprs(s: &Select) -> Option<&Vec<Expr>> {
+    match &s.group_by {
+        GroupByExpr::Expressions(es, mods) if mods.is_empty() => Some(es),
+        _ => None,
+    }
+}
+
+/// GROUP BY, HAVING or aggregates (a block with one row per group).
+pub(crate) fn aggregated(b: &Block) -> bool {
+    !matches!(group_exprs(&b.select), Some(es) if es.is_empty())
+        || b.select.having.is_some()
+        || b.outputs.iter().any(|o| has_aggregate(&o.expr))
+}
+
+fn windowed(b: &Block) -> bool {
+    !b.select.named_window.is_empty() || b.outputs.iter().any(|o| has_window(&o.expr))
+}
+
+fn block_has_subquery(b: &Block) -> bool {
+    exprs_of(&b.select).into_iter().any(has_subquery)
+        || b.outputs.iter().any(|o| has_subquery(&o.expr))
+}
+
+/// The construct that keeps a derived block from being merged into its parent as a plain
+/// select/project/join (None: it can be merged).
+pub(crate) fn blocker(b: &Block) -> Option<String> {
+    if b.select.from.is_empty() {
+        return Some("no FROM clause".into());
+    }
+    if let Some(it) = b
+        .items
+        .iter()
+        .find(|i| matches!(i.source, Source::Derived(_)))
+    {
+        return Some(unmerged_reason(b, it));
+    }
+    if b.limit {
+        return Some(if b.ordered {
+            "ORDER BY … LIMIT".into()
+        } else {
+            "LIMIT without ORDER BY".into()
+        });
+    }
+    if windowed(b) {
+        return Some("window function".into());
+    }
+    if b.select.distinct.is_some() || b.converted_distinct() {
+        return Some("DISTINCT".into());
+    }
+    if !matches!(&b.select.group_by, GroupByExpr::Expressions(es, mods) if es.is_empty() && mods.is_empty())
+    {
+        return Some("GROUP BY".into());
+    }
+    if b.select.having.is_some() {
+        return Some("HAVING".into());
+    }
+    if b.outputs.iter().any(|o| has_aggregate(&o.expr)) {
+        return Some("aggregate function".into());
+    }
+    if block_has_subquery(b) {
+        return Some("subquery".into());
+    }
+    None
+}
+
+impl Block {
+    fn converted_distinct(&self) -> bool {
+        self.distinct_was
+    }
+}
+
+/// Why item `it` of `b` stays a separate relation (it was not merged).
+pub(crate) fn unmerged_reason(b: &Block, it: &Item) -> String {
+    let what = it.origin.describe(&it.alias);
+    if star_with_using(&b.select) {
+        return "SELECT * over a USING join".into();
+    }
+    let Source::Derived(rel) = &it.source else {
+        return format!("{what} could not be merged");
+    };
+    let inner = match rel {
+        Rel::Opaque { why } => return why.clone(),
+        Rel::Block(inner) => inner,
+    };
+    if let Some(why) = blocker(inner) {
+        if aggregated(inner) || why == "DISTINCT" {
+            return if b.items.len() > 1 {
+                format!("{why} in {what} joined to other tables")
+            } else {
+                format!("{why} in {what} under an aggregate, DISTINCT, window or LIMIT")
+            };
+        }
+        return format!("{why} in {what}");
+    }
+    match kind_at(&b.select.from, it.pos) {
+        JoinKind::Left if !single_table(inner) => {
+            format!("{what} joins several tables on the NULL side of a LEFT JOIN")
+        }
+        JoinKind::Left => format!(
+            "{what} on the NULL side of a LEFT JOIN computes a column that is not NULL for missing rows"
+        ),
+        JoinKind::Other => match &it.pos {
+            (t, Some(j)) => match join_constraint(&b.select.from[*t].joins[*j].join_operator) {
+                Some(JoinConstraint::Natural) => "NATURAL join".into(),
+                _ => "RIGHT/FULL/other join".into(),
+            },
+            _ => "RIGHT/FULL/other join".into(),
+        },
+        _ if block_has_subquery(b) => "subquery".into(),
+        _ => format!("{what} could not be merged"),
+    }
+}
+
+fn single_table(b: &Block) -> bool {
+    b.select.from.len() == 1 && b.select.from[0].joins.is_empty() && b.items.len() == 1
+}
+
+/// The expression is NULL whenever a column it references is NULL (conservative).
+fn null_propagating(e: &Expr) -> bool {
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
+        Expr::Nested(x) => null_propagating(x),
+        Expr::UnaryOp { op, expr } => {
+            matches!(
+                op,
+                UnaryOperator::Minus | UnaryOperator::Plus | UnaryOperator::Not
+            ) && null_propagating(expr)
+        }
+        Expr::BinaryOp { left, op, right } => {
+            !matches!(
+                op,
+                BinaryOperator::And
+                    | BinaryOperator::Or
+                    | BinaryOperator::Xor
+                    | BinaryOperator::Spaceship
+            ) && null_propagating(left)
+                && null_propagating(right)
+        }
+        Expr::Cast { expr, .. } => null_propagating(expr),
+        Expr::Function(f) => {
+            f.over.is_none()
+                && !NULL_TOLERANT.contains(&function_name(f).as_str())
+                && !AGGREGATES.contains(&function_name(f).as_str())
+                && match &f.args {
+                    FunctionArguments::None => false,
+                    FunctionArguments::Subquery(_) => false,
+                    FunctionArguments::List(l) => l.args.iter().all(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => null_propagating(e),
+                        _ => false,
+                    }),
+                }
+        }
+        _ => false,
+    }
+}
+
+// ------------------------------------------------------------------------------- rewriting
+
+fn parse_expr(sql: &str) -> Result<Expr> {
+    Parser::new(&MySqlDialect {})
+        .try_with_sql(sql)
+        .and_then(|mut p| p.parse_expr())
+        .map_err(|e| anyhow!("internal: cannot parse {sql}: {e}"))
+}
+
+/// Replaces GROUP BY ordinals and select-alias references in GROUP BY / HAVING by the
+/// expressions they stand for (FROM columns take precedence, as on the server).
+fn resolve_aliases(b: &mut Block, r: &Resolver) -> Result<()> {
+    let outputs: Vec<(String, Expr)> = b
+        .outputs
+        .iter()
+        .map(|o| (o.name.text.to_lowercase(), o.expr.clone()))
+        .collect();
+    let alias = |id: &Ident| {
+        outputs
+            .iter()
+            .find(|(n, _)| *n == ident_name(id).to_lowercase())
+            .map(|(_, e)| nested(e.clone()))
+    };
+    if let GroupByExpr::Expressions(es, _) = &mut b.select.group_by {
+        for e in es.iter_mut() {
+            let new = match &*e {
+                Expr::Value(v) => match &v.value {
+                    Value::Number(n, _) => {
+                        let i: usize = n.parse().map_err(|_| anyhow!("bad GROUP BY {n}"))?;
+                        Some(
+                            outputs
+                                .get(i.wrapping_sub(1))
+                                .map(|(_, e)| e.clone())
+                                .ok_or_else(|| anyhow!("GROUP BY {i} out of range"))?,
+                        )
+                    }
+                    _ => None,
+                },
+                Expr::Identifier(id) if r.resolve(e) == Res::Unknown => alias(id),
+                _ => None,
+            };
+            if let Some(n) = new {
+                *e = n;
+            }
+        }
+    }
+    if let Some(h) = &mut b.select.having {
+        let _ = visit_expressions_mut(h, |x: &mut Expr| {
+            if let Expr::Identifier(id) = &*x {
+                if r.resolve(x) == Res::Unknown {
+                    if let Some(n) = alias(id) {
+                        *x = n;
+                    }
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+    Ok(())
+}
+
+/// Qualifies the column references of `e` with their item aliases and replaces those in
+/// `subst`. Errors on ambiguous references; leaves unknown identifiers alone.
+fn rewrite_expr(
+    e: &mut Expr,
+    r: &Resolver,
+    aliases: &[String],
+    subst: &HashMap<(usize, usize), Expr>,
+) -> Result<()> {
+    let mut err = None;
+    let _ = visit_expressions_mut(e, |x: &mut Expr| {
+        if matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            match r.resolve(x) {
+                Res::Col(i, c) => {
+                    *x = match subst.get(&(i, c)) {
+                        Some(s) => nested(s.clone()),
+                        None => {
+                            let col = match &*x {
+                                Expr::Identifier(id) => id.clone(),
+                                Expr::CompoundIdentifier(p) => p.last().unwrap().clone(),
+                                _ => unreachable!(),
+                            };
+                            qcol(&aliases[i], &col)
+                        }
+                    };
+                }
+                Res::Ambiguous(n) => {
+                    err.get_or_insert_with(|| anyhow!("column `{n}` is ambiguous"));
+                }
+                Res::Unknown => {}
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Qualifies and substitutes every expression of the block (see [`rewrite_expr`]), with the
+/// resolver of the block as it was before any FROM change. Outputs whose text changed lose their
+/// "as written" form.
+fn rewrite(b: &mut Block, r: &Resolver, subst: &HashMap<(usize, usize), Expr>) -> Result<()> {
+    resolve_aliases(b, r)?;
+    let aliases: Vec<String> = b.items.iter().map(|i| i.alias.clone()).collect();
+    for o in &mut b.outputs {
+        let before = o.expr.to_string();
+        rewrite_expr(&mut o.expr, r, &aliases, subst)?;
+        if o.expr.to_string() != before {
+            o.original = None;
+        }
+    }
+    let mut res = Ok(());
+    for_each_expr_mut(&mut b.select, |e| {
+        if res.is_ok() {
+            res = rewrite_expr(e, r, &aliases, subst);
+        }
+    });
+    res?;
+    b.qualified = true;
+    b.rewritten = true;
+    Ok(())
+}
+
+/// Qualifies every column reference of a block that is not qualified yet.
+fn qualify(b: &mut Block) -> Result<()> {
+    if !b.qualified {
+        let r = Resolver::new(b);
+        rewrite(b, &r, &HashMap::new())?;
+    }
+    Ok(())
+}
+
+/// Replaces `alias.col` qualifiers per `renames` (lower-case old alias → new alias).
+fn rename_refs(e: &mut Expr, renames: &HashMap<String, String>) {
+    let _ = visit_expressions_mut(e, |x: &mut Expr| {
+        if let Expr::CompoundIdentifier(parts) = x {
+            if parts.len() == 2 {
+                if let Some(n) = renames.get(&ident_name(&parts[0]).to_lowercase()) {
+                    parts[0] = qident(n);
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Renames the items of a qualified block so that none collides with `taken` (lower-case);
+/// adds the new names to `taken`.
+fn rename_items(b: &mut Block, prefix: &str, taken: &mut HashSet<String>) {
+    let mut renames = HashMap::new();
+    for it in &mut b.items {
+        let mut name = it.alias.clone();
+        if taken.contains(&name.to_lowercase()) {
+            let base = format!("{prefix}__{}", it.alias);
+            name = base.clone();
+            let mut n = 2;
+            while taken.contains(&name.to_lowercase()) || name.chars().count() > 64 {
+                name = if base.chars().count() > 60 {
+                    format!("_lv_t{n}")
+                } else {
+                    format!("{base}{n}")
+                };
+                n += 1;
+            }
+            renames.insert(it.alias.to_lowercase(), name.clone());
+        }
+        taken.insert(name.to_lowercase());
+        it.alias = name;
+    }
+    if renames.is_empty() {
+        return;
+    }
+    // FROM factors of renamed items get the new alias.
+    let new_alias: Vec<(super::ir::Pos, String)> =
+        b.items.iter().map(|i| (i.pos, i.alias.clone())).collect();
+    for (pos, alias) in new_alias {
+        let f = match pos {
+            (t, None) => &mut b.select.from[t].relation,
+            (t, Some(j)) => &mut b.select.from[t].joins[j].relation,
+        };
+        set_factor_alias(f, &alias);
+    }
+    for o in &mut b.outputs {
+        rename_refs(&mut o.expr, &renames);
+    }
+    for_each_expr_mut(&mut b.select, |e| rename_refs(e, &renames));
+}
+
+fn set_factor_alias(f: &mut TableFactor, alias: &str) {
+    if let TableFactor::Table { alias: a, .. } | TableFactor::Derived { alias: a, .. } = f {
+        let cols = a.as_ref().map(|a| a.columns.clone()).unwrap_or_default();
+        *a = Some(sqlparser::ast::TableAlias {
+            explicit: true,
+            name: qident(alias),
+            columns: cols,
+            at: None,
+        });
+    }
+}
+
+/// The name that qualifies a factor's columns.
+fn factor_name(f: &TableFactor) -> Option<String> {
+    if let Some(a) = factor_alias(f) {
+        return Some(ident_name(&a.name));
+    }
+    match f {
+        TableFactor::Table { name, .. } => match name.0.last() {
+            Some(ObjectNamePart::Identifier(i)) => Some(ident_name(i)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Recomputes item positions from the FROM clause (aliases are unique within a block).
+fn relocate(b: &mut Block) -> Result<()> {
+    let found: Vec<(super::ir::Pos, String)> = factors(&b.select.from)
+        .into_iter()
+        .map(|(p, f)| (p, factor_name(f).unwrap_or_default().to_lowercase()))
+        .collect();
+    let mut items = std::mem::take(&mut b.items);
+    for it in &mut items {
+        it.pos = found
+            .iter()
+            .find(|(_, n)| *n == it.alias.to_lowercase())
+            .map(|(p, _)| *p)
+            .ok_or_else(|| anyhow!("internal: FROM item `{}` lost while merging", it.alias))?;
+    }
+    items.sort_by_key(|i| i.pos);
+    b.items = items;
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------------- merge
+
+/// Converts `USING (c, …)` of every join into `ON left.c = right.c AND …` (left: the first
+/// earlier item of the same FROM entry having the column).
+fn using_to_on(b: &mut Block, r: &Resolver) {
+    let items = b.items.clone();
+    for (t, twj) in b.select.from.iter_mut().enumerate() {
+        for (j, join) in twj.joins.iter_mut().enumerate() {
+            let Some(c) = join_constraint_mut(&mut join.join_operator) else {
+                continue;
+            };
+            let JoinConstraint::Using(cols) = c else {
+                continue;
+            };
+            let Some(right) = items.iter().position(|i| i.pos == (t, Some(j))) else {
+                continue;
+            };
+            let mut eqs = Vec::new();
+            for col in cols.iter() {
+                let Some(ObjectNamePart::Identifier(id)) = col.0.last() else {
+                    continue;
+                };
+                let left = items.iter().position(|i| {
+                    i.pos.0 == t
+                        && i.pos < (t, Some(j))
+                        && r.resolve(&Expr::CompoundIdentifier(vec![
+                            qident(&i.alias),
+                            id.clone(),
+                        ])) != Res::Unknown
+                });
+                if let Some(left) = left {
+                    eqs.push(Expr::BinaryOp {
+                        left: Box::new(qcol(&items[left].alias, id)),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(qcol(&items[right].alias, id)),
+                    });
+                }
+            }
+            if let Some(on) = and_all(eqs) {
+                *c = JoinConstraint::On(on);
+            }
+        }
+    }
+}
+
+/// Whether a derived block may be merged at a position of this kind.
+fn mergeable_at(inner: &Block, kind: JoinKind) -> bool {
+    match kind {
+        JoinKind::Head | JoinKind::Inner => true,
+        JoinKind::Left => {
+            single_table(inner)
+                && (inner
+                    .outputs
+                    .iter()
+                    .all(|o| null_propagating(&o.expr) && has_column_ref(&o.expr))
+                    || inner.items[0].table().is_some_and(|t| !t.pk.is_empty()))
+        }
+        JoinKind::Other => false,
+    }
+}
+
+/// One chain `r1 joins1 CROSS JOIN r2 joins2 …` from FROM entries.
+fn chain(entries: Vec<TableWithJoins>) -> TableWithJoins {
+    let mut it = entries.into_iter();
+    let mut first = it.next().expect("non-empty FROM");
+    for e in it {
+        first.joins.push(Join {
+            relation: e.relation,
+            global: false,
+            join_operator: JoinOperator::CrossJoin(JoinConstraint::None),
+        });
+        first.joins.extend(e.joins);
+    }
+    first
+}
+
+fn merge(b: &mut Block) -> Result<()> {
+    let picks: Vec<usize> = b
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| match &it.source {
+            Source::Derived(Rel::Block(inner)) => {
+                blocker(inner).is_none() && mergeable_at(inner, kind_at(&b.select.from, it.pos))
+            }
+            _ => false,
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if picks.is_empty() || block_has_subquery(b) || star_with_using(&b.select) {
+        return Ok(());
+    }
+    let r = Resolver::new(b);
+    using_to_on(b, &r);
+    // Aliases that stay: the other items'.
+    let mut taken: HashSet<String> = b
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !picks.contains(i))
+        .map(|(_, it)| it.alias.to_lowercase())
+        .collect();
+    let mut inners: HashMap<usize, Block> = HashMap::new();
+    let mut subst: HashMap<(usize, usize), Expr> = HashMap::new();
+    for &i in &picks {
+        let it = &mut b.items[i];
+        let Source::Derived(Rel::Block(inner)) = std::mem::replace(
+            &mut it.source,
+            Source::Derived(Rel::Opaque { why: String::new() }),
+        ) else {
+            unreachable!()
+        };
+        let mut inner = *inner;
+        qualify(&mut inner)?;
+        rename_items(&mut inner, &it.alias, &mut taken);
+        let null_side = kind_at(&b.select.from, it.pos) == JoinKind::Left;
+        for (c, o) in inner.outputs.iter().enumerate() {
+            let e = if null_side && !(null_propagating(&o.expr) && has_column_ref(&o.expr)) {
+                let t = &inner.items[0];
+                let pk = t.table().map(|t| t.columns[t.pk[0]].name.clone()).unwrap();
+                parse_expr(&format!(
+                    "IF({} IS NULL, NULL, {})",
+                    qcol(&t.alias, &qident(&pk)),
+                    o.expr
+                ))?
+            } else {
+                o.expr.clone()
+            };
+            subst.insert((i, c), e);
+        }
+        inners.insert(i, inner);
+    }
+    rewrite(b, &r, &subst)?;
+    // Splice the FROM clauses, last position first so that earlier positions stay valid.
+    let mut order = picks.clone();
+    order.sort_by_key(|&i| std::cmp::Reverse(b.items[i].pos));
+    let mut extra_where = Vec::new();
+    for i in order {
+        let inner = inners.get_mut(&i).unwrap();
+        let ifrom = std::mem::take(&mut inner.select.from);
+        let iwhere = inner.select.selection.take();
+        match b.items[i].pos {
+            (t, None) => {
+                let rest = std::mem::take(&mut b.select.from[t].joins);
+                if rest.is_empty() {
+                    b.select.from.splice(t..=t, ifrom);
+                } else {
+                    let mut c = chain(ifrom);
+                    c.joins.extend(rest);
+                    b.select.from[t] = c;
+                }
+                extra_where.extend(iwhere);
+            }
+            (t, Some(j)) => {
+                let join = &mut b.select.from[t].joins[j];
+                let cond = match join_constraint_mut(&mut join.join_operator) {
+                    Some(c) => match std::mem::replace(c, JoinConstraint::None) {
+                        JoinConstraint::On(e) => Some(e),
+                        JoinConstraint::None => None,
+                        other => bail!("internal: unexpected join constraint {other:?}"),
+                    },
+                    None => None,
+                };
+                let single = ifrom.len() == 1 && ifrom[0].joins.is_empty();
+                if single {
+                    let on = and_all(cond.into_iter().chain(iwhere).collect());
+                    join.relation = ifrom.into_iter().next().unwrap().relation;
+                    if let Some(c) = join_constraint_mut(&mut join.join_operator) {
+                        *c = on.map(JoinConstraint::On).unwrap_or(JoinConstraint::None);
+                    }
+                } else {
+                    let c = chain(ifrom);
+                    let mut joins = vec![Join {
+                        relation: c.relation,
+                        global: false,
+                        join_operator: JoinOperator::Join(JoinConstraint::None),
+                    }];
+                    joins.extend(c.joins);
+                    b.select.from[t].joins.splice(j..=j, joins);
+                    extra_where.extend(cond);
+                    extra_where.extend(iwhere);
+                }
+            }
+        }
+    }
+    if !extra_where.is_empty() {
+        let mut all: Vec<Expr> = b
+            .select
+            .selection
+            .take()
+            .iter()
+            .flat_map(conjuncts)
+            .collect();
+        all.extend(extra_where);
+        b.select.selection = and_all(all);
+    }
+    // The merged blocks' items replace the derived items.
+    let mut items: Vec<Item> = b
+        .items
+        .drain(..)
+        .enumerate()
+        .filter(|(i, _)| !picks.contains(i))
+        .map(|(_, it)| it)
+        .collect();
+    for (_, inner) in inners {
+        items.extend(inner.items);
+        b.semis.extend(inner.semis);
+    }
+    b.items = items;
+    relocate(b)
+}
+
+// ---------------------------------------------------------------------------------- merge-up
+
+/// `SELECT f(c) FROM (SELECT g, agg(x) c FROM … GROUP BY g) d WHERE p` → one grouped block:
+/// conjuncts of `p` over group keys only go to WHERE, the others to HAVING.
+fn merge_up(b: &mut Block) -> Result<()> {
+    if b.items.len() != 1 || b.select.from.len() != 1 || !b.select.from[0].joins.is_empty() {
+        return Ok(());
+    }
+    let Source::Derived(Rel::Block(inner)) = &b.items[0].source else {
+        return Ok(());
+    };
+    let inner_ok = aggregated(inner)
+        && !windowed(inner)
+        && !inner.limit
+        && !block_has_subquery(inner)
+        && !inner.select.from.is_empty()
+        && inner
+            .items
+            .iter()
+            .all(|i| matches!(i.source, Source::Table(..)))
+        && inner.select.distinct.is_none()
+        && group_exprs(&inner.select).is_some();
+    if !inner_ok
+        || aggregated(b)
+        || windowed(b)
+        || b.limit
+        || b.select.distinct.is_some()
+        || !b.semis.is_empty()
+        || block_has_subquery(b)
+    {
+        return Ok(());
+    }
+    let r = Resolver::new(b);
+    let Source::Derived(Rel::Block(inner)) = std::mem::replace(
+        &mut b.items[0].source,
+        Source::Derived(Rel::Opaque { why: String::new() }),
+    ) else {
+        unreachable!()
+    };
+    let mut inner = *inner;
+    qualify(&mut inner)?;
+    let keys: HashSet<String> = group_exprs(&inner.select)
+        .map(|es| es.iter().map(|e| nested(e.clone()).to_string()).collect())
+        .unwrap_or_default();
+    let is_key: Vec<bool> = inner
+        .outputs
+        .iter()
+        .map(|o| keys.contains(&nested(o.expr.clone()).to_string()))
+        .collect();
+    let subst: HashMap<(usize, usize), Expr> = inner
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(c, o)| ((0, c), o.expr.clone()))
+        .collect();
+    let aliases = vec![b.items[0].alias.clone()];
+    let (mut to_where, mut to_having) = (Vec::new(), Vec::new());
+    for c in b.select.selection.take().iter().flat_map(conjuncts) {
+        let mut over_keys = true;
+        let _ = visit_expressions(&c, |x: &Expr| {
+            if let Res::Col(_, col) = r.resolve(x) {
+                over_keys &= is_key[col];
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        let mut c = c;
+        rewrite_expr(&mut c, &r, &aliases, &subst)?;
+        if over_keys {
+            to_where.push(c);
+        } else {
+            to_having.push(c);
+        }
+    }
+    let mut outputs = std::mem::take(&mut b.outputs);
+    for o in &mut outputs {
+        let before = o.expr.to_string();
+        rewrite_expr(&mut o.expr, &r, &aliases, &subst)?;
+        if o.expr.to_string() != before {
+            o.original = None;
+        }
+    }
+    let mut w: Vec<Expr> = inner
+        .select
+        .selection
+        .take()
+        .iter()
+        .flat_map(conjuncts)
+        .collect();
+    w.extend(to_where);
+    inner.select.selection = and_all(w);
+    let mut h: Vec<Expr> = inner
+        .select
+        .having
+        .take()
+        .iter()
+        .flat_map(conjuncts)
+        .collect();
+    h.extend(to_having);
+    inner.select.having = and_all(h);
+    inner.outputs = outputs;
+    inner.ordered = b.ordered;
+    inner.rewritten = true;
+    *b = inner;
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------- DISTINCT
+
+/// `SELECT DISTINCT e1, … FROM …` → `… GROUP BY e1, …` (same equality: NULLs equal,
+/// collation-aware). A DISTINCT over one-row-per-group results is dropped.
+fn distinct_to_group(b: &mut Block) {
+    if !matches!(b.select.distinct, Some(Distinct::Distinct)) || windowed(b) {
+        return;
+    }
+    let keys: Vec<Expr> = b
+        .outputs
+        .iter()
+        .map(|o| o.expr.clone())
+        .filter(has_column_ref)
+        .collect();
+    match group_exprs(&b.select) {
+        Some(es) if es.is_empty() && b.select.having.is_none() => {
+            if b.outputs.iter().any(|o| has_aggregate(&o.expr)) {
+                // A single aggregate row is distinct already.
+            } else if keys.is_empty() {
+                // Only constants: one row when there is any.
+                b.select.having = parse_expr("COUNT(*) > 0").ok();
+            } else {
+                b.select.group_by = GroupByExpr::Expressions(keys, vec![]);
+            }
+        }
+        Some(es) => {
+            let out: HashSet<String> = b
+                .outputs
+                .iter()
+                .map(|o| nested(o.expr.clone()).to_string())
+                .collect();
+            let resolved_ordinals = es.iter().all(|e| match e {
+                Expr::Value(v) => matches!(v.value, Value::Number(..)),
+                e => out.contains(&nested(e.clone()).to_string()),
+            });
+            if !resolved_ordinals {
+                return;
+            }
+        }
+        None => return,
+    }
+    b.select.distinct = None;
+    b.distinct_was = true;
+    b.rewritten = true;
+}
+
+// ------------------------------------------------------------------------------ semi-joins
+
+fn placeholder(n: usize) -> Expr {
+    Expr::Identifier(Ident::new(format!("{OUTER_PLACEHOLDER}{n}__")))
+}
+
+fn placeholder_index(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Identifier(id) if id.quote_style.is_none() => id
+            .value
+            .strip_prefix(OUTER_PLACEHOLDER)?
+            .strip_suffix("__")?
+            .parse()
+            .ok(),
+        _ => None,
+    }
+}
+
+/// Replaces placeholders by the given outer expressions.
+pub(crate) fn fill_placeholders(e: &mut Expr, args: &[Expr]) {
+    let _ = visit_expressions_mut(e, |x: &mut Expr| {
+        if let Some(i) = placeholder_index(x) {
+            if let Some(a) = args.get(i) {
+                *x = nested(a.clone());
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+pub(crate) fn marker_name(id: usize) -> String {
+    format!("{SEMI_MARKER}{id}__")
+}
+
+/// The arguments of the marker of semi-join `id` in `e`, if present.
+pub(crate) fn marker_args(e: &Expr, id: usize) -> Option<Vec<Expr>> {
+    let name = marker_name(id);
+    let mut out = None;
+    let _ = visit_expressions(e, |x: &Expr| {
+        if let Expr::Function(f) = x {
+            if f.name.to_string() == name {
+                if let FunctionArguments::List(l) = &f.args {
+                    out = Some(
+                        l.args
+                            .iter()
+                            .filter_map(|a| match a {
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                }
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    out
+}
+
+pub(crate) fn query_of(select: Select) -> Query {
+    Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(select))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: vec![],
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: vec![],
+    }
+}
+
+/// Takes semi-/anti-join conjuncts over one table out of WHERE (see [`Semi`]).
+fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
+    let Some(w) = &b.select.selection else {
+        return Ok(());
+    };
+    let parts = conjuncts(w);
+    if !parts.iter().any(|c| {
+        matches!(
+            c,
+            Expr::Exists { .. } | Expr::InSubquery { negated: false, .. }
+        )
+    }) {
+        return Ok(());
+    }
+    let outer = Resolver::new(b);
+    let mut kept = Vec::new();
+    let mut found = false;
+    for c in parts {
+        match semi(bld, &outer, &c, scope)? {
+            Some(s) => {
+                kept.push(s.1);
+                b.semis.push(s.0);
+                found = true;
+            }
+            None => kept.push(c),
+        }
+    }
+    if found {
+        b.select.selection = and_all(kept);
+        b.rewritten = true;
+    }
+    Ok(())
+}
+
+/// A semi-join for conjunct `c`, with the marker that replaces it.
+fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Option<(Semi, Expr)>> {
+    let (lhs, subquery, negated) = match c {
+        Expr::Exists { subquery, negated } => (None, subquery, *negated),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated: false,
+        } => (Some(expr), subquery, false),
+        _ => return Ok(None),
+    };
+    let Rel::Block(sb) = bld.nested(subquery, scope)? else {
+        return Ok(None);
+    };
+    let mut sb = *sb;
+    let simple = sb.items.len() == 1
+        && matches!(sb.items[0].source, Source::Table(..))
+        && single_table(&sb)
+        && !sb.limit
+        && !windowed(&sb)
+        && sb.semis.is_empty()
+        && sb.select.having.is_none()
+        && !sb.outputs.iter().any(|o| has_aggregate(&o.expr))
+        && !block_has_subquery(&sb);
+    if !simple {
+        return Ok(None);
+    }
+    let Source::Table(tref, info) = sb.items[0].source.clone() else {
+        unreachable!()
+    };
+    let alias = sb.items[0].alias.clone();
+    // Inner columns are qualified with the alias, outer references become placeholders.
+    let inner = Resolver::new(&sb);
+    let mut outer_exprs: Vec<Expr> = Vec::new();
+    let mut ok = true;
+    let mut referenced = vec![false; info.columns.len()];
+    let mut localize = |e: &mut Expr, outer_exprs: &mut Vec<Expr>, referenced: &mut Vec<bool>| {
+        let _ = visit_expressions_mut(e, |x: &mut Expr| {
+            if matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                && placeholder_index(x).is_none()
+            {
+                match inner.resolve(x) {
+                    Res::Col(_, col) => {
+                        referenced[col] = true;
+                        let id = match &*x {
+                            Expr::Identifier(id) => id.clone(),
+                            Expr::CompoundIdentifier(p) => p.last().unwrap().clone(),
+                            _ => unreachable!(),
+                        };
+                        *x = qcol(&alias, &id);
+                    }
+                    Res::Ambiguous(_) => ok = false,
+                    Res::Unknown => match outer.resolve(x) {
+                        Res::Col(..) => {
+                            outer_exprs.push(x.clone());
+                            *x = placeholder(outer_exprs.len() - 1);
+                        }
+                        _ => ok = false,
+                    },
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    };
+    let mut where_ = sb.select.selection.take();
+    if let Some(w) = &mut where_ {
+        localize(w, &mut outer_exprs, &mut referenced);
+    }
+    let mut proj: Vec<Expr> = sb.outputs.iter().map(|o| o.expr.clone()).collect();
+    for p in &mut proj {
+        localize(p, &mut outer_exprs, &mut referenced);
+    }
+    if !ok {
+        return Ok(None);
+    }
+    let mut correlation = Vec::new();
+    let mut join_conditions = Vec::new();
+    let lhs_parts: Vec<Expr> = match lhs {
+        Some(e) => match &**e {
+            Expr::Tuple(es) => es.clone(),
+            other => vec![other.clone()],
+        },
+        None => Vec::new(),
+    };
+    let lhs_ph: Vec<Expr> = lhs_parts
+        .iter()
+        .map(|e| {
+            outer_exprs.push(e.clone());
+            placeholder(outer_exprs.len() - 1)
+        })
+        .collect();
+    if lhs.is_some() {
+        if proj.len() != lhs_ph.len() {
+            return Ok(None);
+        }
+        for (p, ph) in proj.iter().zip(&lhs_ph) {
+            let Res::Col(_, col) = inner.resolve(p) else {
+                return Ok(None);
+            };
+            correlation.push((col, placeholder_index(ph).unwrap()));
+            join_conditions.push(Expr::BinaryOp {
+                left: Box::new(p.clone()),
+                op: BinaryOperator::Eq,
+                right: Box::new(ph.clone()),
+            });
+        }
+    }
+    for cj in where_.iter().flat_map(conjuncts) {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = &cj
+        {
+            for (a, z) in [(left, right), (right, left)] {
+                if let (Res::Col(_, col), Some(k)) = (inner.resolve(a), placeholder_index(z)) {
+                    correlation.push((col, k));
+                }
+            }
+        }
+        join_conditions.push(cj);
+    }
+    let mut sel = sb.select.clone();
+    sel.selection = where_;
+    sel.distinct = None;
+    sel.projection = if lhs.is_some() {
+        proj.into_iter().map(SelectItem::UnnamedExpr).collect()
+    } else {
+        sel.projection
+    };
+    let predicate = match lhs {
+        Some(_) => Expr::InSubquery {
+            expr: Box::new(if lhs_ph.len() == 1 {
+                lhs_ph[0].clone()
+            } else {
+                Expr::Tuple(lhs_ph.clone())
+            }),
+            subquery: Box::new(query_of(sel)),
+            negated: false,
+        },
+        None => Expr::Exists {
+            subquery: Box::new(query_of(sel)),
+            negated,
+        },
+    };
+    let id = bld.next_semi.get();
+    bld.next_semi.set(id + 1);
+    let args: Vec<String> = outer_exprs.iter().map(|e| e.to_string()).collect();
+    let marker = parse_expr(&format!("{}({})", marker_name(id), args.join(", ")))?;
+    Ok(Some((
+        Semi {
+            id,
+            negated,
+            table: tref,
+            info,
+            alias,
+            predicate,
+            join_conditions,
+            correlation,
+            referenced,
+        },
+        marker,
+    )))
+}
+
+/// Whether the semi-join's correlation covers the table's primary key (each outer row matches
+/// at most one row of the table: the semi-join is an inner join).
+fn unique(s: &Semi) -> bool {
+    !s.negated
+        && !s.info.pk.is_empty()
+        && s.info
+            .pk
+            .iter()
+            .all(|c| s.correlation.iter().any(|(sc, _)| sc == c))
+}
+
+fn semis_to_joins(b: &mut Block) -> Result<()> {
+    if !b.semis.iter().any(unique) {
+        return Ok(());
+    }
+    qualify(b)?;
+    let mut taken: HashSet<String> = b.items.iter().map(|i| i.alias.to_lowercase()).collect();
+    let semis = std::mem::take(&mut b.semis);
+    let mut conds_all = Vec::new();
+    for s in semis {
+        if !unique(&s) {
+            b.semis.push(s);
+            continue;
+        }
+        let args = b
+            .select
+            .selection
+            .as_ref()
+            .and_then(|w| marker_args(w, s.id))
+            .ok_or_else(|| anyhow!("internal: semi-join marker missing"))?;
+        let mut alias = s.alias.clone();
+        if taken.contains(&alias.to_lowercase()) {
+            let mut n = 2;
+            while taken.contains(&format!("{}_{n}", s.alias).to_lowercase()) {
+                n += 1;
+            }
+            alias = format!("{}_{n}", s.alias);
+        }
+        taken.insert(alias.to_lowercase());
+        let renames: HashMap<String, String> = [(s.alias.to_lowercase(), alias.clone())]
+            .into_iter()
+            .collect();
+        for mut c in s.join_conditions {
+            rename_refs(&mut c, &renames);
+            fill_placeholders(&mut c, &args);
+            conds_all.push(c);
+        }
+        // Drop the marker conjunct.
+        let name = marker_name(s.id);
+        let kept: Vec<Expr> = b
+            .select
+            .selection
+            .take()
+            .iter()
+            .flat_map(conjuncts)
+            .filter(|c| !matches!(c, Expr::Function(f) if f.name.to_string() == name))
+            .collect();
+        b.select.selection = and_all(kept);
+        let name = ObjectName(vec![
+            ObjectNamePart::Identifier(qident(&s.table.0)),
+            ObjectNamePart::Identifier(qident(&s.table.1)),
+        ]);
+        b.select.from.push(TableWithJoins {
+            relation: table_factor(name, Some(&alias)),
+            joins: vec![],
+        });
+        b.items.push(Item {
+            alias,
+            pos: (b.select.from.len() - 1, None),
+            origin: Origin::Table,
+            source: Source::Table(s.table, s.info),
+        });
+    }
+    let mut all: Vec<Expr> = b
+        .select
+        .selection
+        .take()
+        .iter()
+        .flat_map(conjuncts)
+        .collect();
+    all.extend(conds_all);
+    b.select.selection = and_all(all);
+    b.rewritten = true;
+    Ok(())
+}

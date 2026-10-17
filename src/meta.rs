@@ -47,6 +47,7 @@ const CREATE_STATUS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview_status` (
   `binlog_file` VARCHAR(255) NOT NULL,
   `binlog_pos` BIGINT UNSIGNED NOT NULL,
   `epoch` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `server_identity` VARCHAR(255) NULL,
   `updated_at` TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
 
@@ -80,6 +81,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "epoch",
         "BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER `binlog_pos`",
     ),
+    (STATUS, "server_identity", "VARCHAR(255) NULL AFTER `epoch`"),
 ];
 
 /// One-stop status: every definition with its per-target state.
@@ -178,14 +180,23 @@ impl DefRow {
     }
 }
 
-/// Records the parsed view name for rows inserted without one (so `WHERE name = ...` works).
-pub async fn backfill_name(conn: &mut Conn, id: u64, name: &str) -> Result<()> {
+/// Records the view name of a `CREATE VIEW` definition in `name` (filled in for rows inserted
+/// without one, updated when the definition renames the view). Fails with ER 1062 when another
+/// row uses the name.
+pub async fn set_name(conn: &mut Conn, id: u64, name: &str) -> Result<()> {
     conn.exec_drop(
-        "UPDATE `_lazyview` SET `name` = ? WHERE `id` = ? AND `name` IS NULL",
-        (name, id),
+        "UPDATE `_lazyview` SET `name` = ? WHERE `id` = ? AND NOT (`name` <=> ?)",
+        (name, id, name),
     )
     .await?;
     Ok(())
+}
+
+/// The id of the `_lazyview` row named `name`.
+pub async fn definition_named(conn: &mut Conn, name: &str) -> Result<Option<u64>> {
+    Ok(conn
+        .exec_first("SELECT `id` FROM `_lazyview` WHERE `name` = ?", (name,))
+        .await?)
 }
 
 pub async fn load_definitions(conn: &mut Conn) -> Result<Vec<DefRow>> {
@@ -307,6 +318,26 @@ pub async fn load_position(conn: &mut Conn, instance: &str) -> Result<Option<Pos
     Ok(row
         .filter(|(f, _)| !f.is_empty())
         .map(|(file, pos)| Position { file, pos }))
+}
+
+/// Identity of the server the saved position belongs to (see `engine::server_identity`).
+pub async fn load_identity(conn: &mut Conn, instance: &str) -> Result<Option<String>> {
+    let row: Option<Option<String>> = conn
+        .exec_first(
+            "SELECT CAST(`server_identity` AS CHAR) FROM `_lazyview_status` WHERE `instance_id` = ?",
+            (instance,),
+        )
+        .await?;
+    Ok(row.flatten())
+}
+
+pub async fn save_identity(conn: &mut Conn, instance: &str, identity: &str) -> Result<()> {
+    conn.exec_drop(
+        "UPDATE `_lazyview_status` SET `server_identity` = ? WHERE `instance_id` = ?",
+        (identity, instance),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Saves the position if `epoch` is still current; fails when another instance took over.
