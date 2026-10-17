@@ -502,7 +502,10 @@ impl Ctx {
         env.insert("LAZYVIEW_HEALTH_ADDR".into(), "off".into());
         // Full-mode / unknown-unit rebuilds immediately (the default cadence would leave them
         // stale at check time); efficiency_full_refresh_cadence tests the cadence itself.
-        env.insert("LAZYVIEW_FULL_REFRESH_MS".into(), "0".into());
+        env.insert(
+            "LAZYVIEW_FULL_REFRESH_MS".into(),
+            test_full_refresh_ms().to_string(),
+        );
         for (k, v) in overrides {
             env.insert(k.to_string(), v.to_string());
         }
@@ -926,6 +929,22 @@ impl Engine {
     }
 }
 
+/// `LAZYVIEW_FULL_REFRESH_MS` given to test engines: `LAZYVIEW_TEST_FULL_REFRESH_MS` (default 0 =
+/// rebuild full-mode / unknown-unit views on every flush, so checks are exact right after
+/// catch-up). With a cadence > 0, [`verify`] checks incrementally maintained views right after
+/// catch-up and polls the lazily rebuilt ones (Full, Chained, FK-child) for up to 2 × cadence.
+pub fn test_full_refresh_ms() -> u64 {
+    std::env::var("LAZYVIEW_TEST_FULL_REFRESH_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Views rebuilt on the `LAZYVIEW_FULL_REFRESH_MS` cadence rather than per flush.
+pub fn is_cadence_rebuilt(spec: &ViewSpec) -> bool {
+    spec.kind != Kind::Incremental || workload::reads_fk_child(&spec.name)
+}
+
 /// Default timeouts (scaled).
 pub fn t_ready() -> Duration {
     Duration::from_secs_f64(180.0 * scale().max(1.0))
@@ -1334,7 +1353,32 @@ pub async fn verify_targets(
         .with_context(|| format!("catch-up before check '{what}'"))?;
     engine.check_alive()?;
     let t = Instant::now();
-    let res = oracle::check_views_targets(src, targets, specs).await;
+    let cadence = test_full_refresh_ms();
+    let res = if cadence == 0 {
+        oracle::check_views_targets(src, targets, specs).await
+    } else {
+        // Strict for incremental views; cadence-rebuilt ones get up to 2 × cadence + 10 s.
+        let (lazy, strict): (Vec<ViewSpec>, Vec<ViewSpec>) =
+            specs.iter().cloned().partition(is_cadence_rebuilt);
+        match oracle::check_views_targets(src, targets, &strict).await {
+            Err(e) => Err(e),
+            Ok(()) => {
+                let deadline =
+                    Instant::now() + Duration::from_millis(2 * cadence) + Duration::from_secs(10);
+                loop {
+                    match oracle::check_views_targets(src, targets, &lazy).await {
+                        Ok(()) => break Ok(()),
+                        Err(e) if Instant::now() > deadline => {
+                            break Err(e.context(format!(
+                            "cadence-rebuilt views not converged within 2 × {cadence} ms + 10 s"
+                        )))
+                        }
+                        Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+                    }
+                }
+            }
+        }
+    };
     match res {
         Ok(()) => {
             ctx.log(format!(
