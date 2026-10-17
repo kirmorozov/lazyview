@@ -17,7 +17,7 @@ USAGE:
 CONNECTION (either):
   LAZYVIEW_HOST, LAZYVIEW_PORT (3306), LAZYVIEW_USER, LAZYVIEW_PASSWORD, LAZYVIEW_DATABASE
   LAZYVIEW_DSN=mysql://user:pass@host:3306/database      (mariadb:// accepted)
-  LAZYVIEW_TLS=disabled|required|verify-ca|verify-full
+  LAZYVIEW_TLS=disabled|required|verify-full   LAZYVIEW_TLS_CA=/path/ca.pem (private CA)
 
 OTHER TARGETS (optional, one view can be written to several instances):
   LAZYVIEW_TARGET_<NAME>_HOST/_PORT/_USER/_PASSWORD/_DATABASE or LAZYVIEW_TARGET_<NAME>_DSN
