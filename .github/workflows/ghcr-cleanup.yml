@@ -45,8 +45,12 @@ jobs:
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
+      PACKAGE_API: /users/${{ github.repository_owner }}/packages/container/lazyview
       VERSIONS_API: /users/${{ github.repository_owner }}/packages/container/lazyview/versions
     steps:
+      - name: package
+        run: |
+          gh api "$PACKAGE_API" --jq '{name, visibility, repository: .repository.full_name, version_count, html_url}'
       - name: package versions (before)
         run: |
           gh api --paginate "$VERSIONS_API?per_page=100" \
