@@ -1,6 +1,9 @@
-# Two replicas = one active instance + one hot standby. Replicas of the same
-# LAZYVIEW_INSTANCE_ID compete for a MySQL named lock (GET_LOCK) on the source; the loser waits
-# (alive, /readyz "hot standby", polling the lock every 5 s) and takes over once the lock is free:
+# One replica: lazyview's model is a single instance that exits on fatal errors, is restarted by
+# Kubernetes and resumes from the saved binlog position. During a rollout (maxSurge 1) the new pod
+# briefly runs next to the old one as a standby and takes over when the old one stops.
+# Optional hot standby: raise replicas to 2 in your overlay (see docs/kubernetes.md). Replicas of
+# the same LAZYVIEW_INSTANCE_ID compete for a MySQL named lock (GET_LOCK) on the source; the loser
+# waits (alive, /readyz "hot standby", polling the lock every 5 s) and takes over once it is free:
 #   * the active pod stops (SIGTERM, crash, OOM kill, pod deletion): its connection closes, the
 #     lock is released at once and the standby takes over within about 5 s;
 #   * the active pod's node dies, freezes or is cut off from the database: nothing closes its
@@ -48,7 +51,7 @@ metadata:
     app.kubernetes.io/instance: lazyview
     app.kubernetes.io/component: replicator
 spec:
-  replicas: 2
+  replicas: 1
   revisionHistoryLimit: 5
   # New pods become Ready as standbys within seconds; a rollout that does not progress for 10 min
   # (database unreachable, image pull errors) is reported as failed.

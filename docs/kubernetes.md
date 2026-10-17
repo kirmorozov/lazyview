@@ -13,23 +13,21 @@ Kustomize manifests live in [`deploy/k8s/`](../deploy/k8s):
 
 ## Replicas
 
-lazyview's basic model is a single instance. When it fails it exits, Kubernetes restarts it, and
-it resumes from the binlog position saved in the database. Changes made in the meantime are
-applied after the restart.
+lazyview runs as a single instance (`replicas: 1`). When it fails it exits, Kubernetes restarts
+it, and it resumes from the binlog position saved in the database; changes made in the meantime
+are applied after the restart. During a rollout (`maxSurge: 1`) the new pod starts next to the old
+one, waits as a standby and takes over the moment the old one stops, so there is no gap.
 
-The base Deployment ships with `replicas: 2`: one active instance plus one hot standby, which takes
-over within seconds of the active pod stopping instead of waiting for a restart (after a node
-failure it takes longer, see [below](#rollouts-drains-and-standby)). The standby is optional. For a single
-instance, set the count in your overlay:
+Optional hot standby: a second replica waits for the active one's lock and takes over within
+seconds of it stopping, instead of waiting for a restart (after a node failure it takes longer,
+see [below](#rollouts-drains-and-standby)):
 
 ```yaml
 # kustomization.yaml of your overlay
 replicas:
   - name: lazyview
-    count: 1
+    count: 2
 ```
-
-Rollouts and drains work the same either way (see [below](#rollouts-drains-and-standby)).
 
 ## Deploy
 
