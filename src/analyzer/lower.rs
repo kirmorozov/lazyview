@@ -40,6 +40,11 @@ pub(crate) fn plan_block(
     schema: &str,
     tables: &HashMap<TableRef, Arc<TableInfo>>,
 ) -> Result<std::result::Result<ViewPlan, Refused>> {
+    if b.outputs.is_empty() {
+        return Ok(Err(Refused::Reason(
+            "internal analyzer error: block without output columns".into(),
+        )));
+    }
     let mut names: Vec<_> = b.outputs.iter().map(|o| o.name.clone()).collect();
     for i in finish_view_names(&mut names) {
         if b.outputs[i].original.is_none() {

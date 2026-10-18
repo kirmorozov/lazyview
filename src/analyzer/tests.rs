@@ -243,6 +243,11 @@ fn improvements() -> Vec<(&'static str, Result<Mode, &'static str>)> {
             "SELECT DISTINCT  COUNT( * ) , 'a' 'b' FROM orders",
             Ok(Mode::Global),
         ),
+        // `*` over a USING join: the server coalesces the shared column (A4).
+        (
+            "(a, b, c, d) AS SELECT DISTINCT * FROM regions JOIN customers USING (id)",
+            Ok(Mode::Full(crate::analyze::STAR_USING.into())),
+        ),
         // The construct that really blocks it is named.
         (
             "SELECT DISTINCT id FROM orders NATURAL JOIN order_items",

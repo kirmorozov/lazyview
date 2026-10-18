@@ -16,7 +16,7 @@ use sqlparser::ast::{
     visit_expressions, visit_expressions_mut, BinaryOperator, Distinct, Expr, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
     ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
-    UnaryOperator, Value,
+    Value,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -30,6 +30,7 @@ use super::build::{star_with_using, Builder, Res, Resolver};
 use super::ir::{Block, Item, Origin, Rel, Semi, Source};
 use super::names::ident_name;
 use super::scope::Scope;
+use crate::analyze::null_propagating;
 
 pub(crate) const AGGREGATES: &[&str] = &[
     "COUNT",
@@ -53,24 +54,6 @@ pub(crate) const AGGREGATES: &[&str] = &[
 ];
 
 /// Functions whose result is not NULL when an argument is NULL.
-const NULL_TOLERANT: &[&str] = &[
-    "COALESCE",
-    "IFNULL",
-    "IF",
-    "NULLIF",
-    "ISNULL",
-    "CONCAT_WS",
-    "NVL",
-    "IIF",
-    "ELT",
-    "FIELD",
-    "MAKE_SET",
-    "JSON_ARRAY",
-    "JSON_OBJECT",
-    "JSON_QUOTE",
-    "QUOTE",
-];
-
 const SEMI_MARKER: &str = "__lv_semi_";
 const OUTER_PLACEHOLDER: &str = "__lv_outer_";
 
@@ -229,45 +212,6 @@ pub(crate) fn unmerged_reason(b: &Block, it: &Item) -> String {
 
 fn single_table(b: &Block) -> bool {
     b.select.from.len() == 1 && b.select.from[0].joins.is_empty() && b.items.len() == 1
-}
-
-/// The expression is NULL whenever a column it references is NULL (conservative).
-fn null_propagating(e: &Expr) -> bool {
-    match e {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
-        Expr::Nested(x) => null_propagating(x),
-        Expr::UnaryOp { op, expr } => {
-            matches!(
-                op,
-                UnaryOperator::Minus | UnaryOperator::Plus | UnaryOperator::Not
-            ) && null_propagating(expr)
-        }
-        Expr::BinaryOp { left, op, right } => {
-            !matches!(
-                op,
-                BinaryOperator::And
-                    | BinaryOperator::Or
-                    | BinaryOperator::Xor
-                    | BinaryOperator::Spaceship
-            ) && null_propagating(left)
-                && null_propagating(right)
-        }
-        Expr::Cast { expr, .. } => null_propagating(expr),
-        Expr::Function(f) => {
-            f.over.is_none()
-                && !NULL_TOLERANT.contains(&function_name(f).as_str())
-                && !AGGREGATES.contains(&function_name(f).as_str())
-                && match &f.args {
-                    FunctionArguments::None => false,
-                    FunctionArguments::Subquery(_) => false,
-                    FunctionArguments::List(l) => l.args.iter().all(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => null_propagating(e),
-                        _ => false,
-                    }),
-                }
-        }
-        _ => false,
-    }
 }
 
 // ------------------------------------------------------------------------------- rewriting

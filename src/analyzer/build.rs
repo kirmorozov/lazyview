@@ -105,20 +105,16 @@ impl<'a> Builder<'a> {
         }) {
             return Ok(Rel::Opaque { why });
         }
-        // `*` over USING / NATURAL joins coalesces columns: such a block is left as written
-        // (a derived one cannot be looked into).
-        let star_using = star_with_using(s);
-        if star_using && self.depth.get() > 0 {
+        // `*` over USING / NATURAL joins coalesces columns (the server lists the shared
+        // columns once, first): its columns are not the per-table expansion, so such a block
+        // is not planned (A4: an empty or duplicated projection made the view fail).
+        if star_with_using(s) {
             return Ok(Rel::Opaque {
-                why: "SELECT * over a USING join".into(),
+                why: crate::analyze::STAR_USING.into(),
             });
         }
         let texts = self.text.items(s);
-        let outputs = if star_using {
-            Vec::new()
-        } else {
-            outputs(s, &items, &texts)?
-        };
+        let outputs = outputs(s, &items, &texts)?;
         let mut select = s.clone();
         if matches!(select.distinct, Some(Distinct::All)) {
             select.distinct = None;
@@ -135,9 +131,7 @@ impl<'a> Builder<'a> {
             distinct_was: false,
             tail: None,
         };
-        if !star_using {
-            normalize::block(self, &mut b, scope)?;
-        }
+        normalize::block(self, &mut b, scope)?;
         Ok(Rel::Block(Box::new(b)))
     }
 

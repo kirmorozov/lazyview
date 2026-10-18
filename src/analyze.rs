@@ -71,7 +71,30 @@ const NONDETERMINISTIC: &[&str] = &[
     "ROW_COUNT",
     "SLEEP",
     "BENCHMARK",
+    // Sequences, advisory locks, files: a different value or side effect per evaluation.
+    "NEXTVAL",
+    "LASTVAL",
+    "SETVAL",
+    "NEXT_VALUE",
+    "PREVIOUS_VALUE",
+    "GET_LOCK",
+    "RELEASE_LOCK",
+    "RELEASE_ALL_LOCKS",
+    "IS_FREE_LOCK",
+    "IS_USED_LOCK",
+    "LOAD_FILE",
+    "RANDOM_BYTES",
+    "SYS_GUID",
+    "MASTER_POS_WAIT",
+    "SOURCE_POS_WAIT",
+    "WAIT_FOR_EXECUTED_GTID_SET",
+    "MASTER_GTID_WAIT",
 ];
+
+/// Why `SELECT *` over a USING / NATURAL join is not planned: the server lists each shared
+/// column once (first), which is not the per-table expansion of `*`.
+pub(crate) const STAR_USING: &str =
+    "SELECT * over a USING or NATURAL join (shared columns are coalesced): list the columns";
 
 /// lazyview's own tables: never valid as view sources or view names.
 const METADATA_TABLES: &[&str] = &[
@@ -81,24 +104,164 @@ const METADATA_TABLES: &[&str] = &[
     "_lazyview_overview",
 ];
 
-/// Functions whose result is not NULL when an argument is NULL; a predicate using them may
-/// accept the NULL-extended rows of a LEFT JOIN.
-const NULL_TOLERANT: &[&str] = &[
-    "COALESCE",
-    "IFNULL",
-    "IF",
-    "NULLIF",
-    "ISNULL",
-    "CONCAT_WS",
-    "NVL",
-    "IIF",
-    "ELT",
-    "FIELD",
-    "MAKE_SET",
-    "JSON_ARRAY",
-    "JSON_OBJECT",
-    "JSON_QUOTE",
-    "QUOTE",
+/// Builtins that are NULL whenever one of their arguments is NULL (strict). Any function not
+/// listed is taken as able to return a value for NULL arguments (`IF`, `COALESCE`, `CHAR`,
+/// `CHARSET`, `COERCIBILITY`, MariaDB `NVL2` / `DECODE_ORACLE`, aggregates, ...), so an
+/// expression over the NULL side of a LEFT JOIN gets its guard and a predicate using it keeps
+/// NULL-extended rows.
+const NULL_STRICT: &[&str] = &[
+    // arithmetic
+    "ABS",
+    "CEIL",
+    "CEILING",
+    "FLOOR",
+    "ROUND",
+    "TRUNCATE",
+    "MOD",
+    "POW",
+    "POWER",
+    "SQRT",
+    "EXP",
+    "LN",
+    "LOG",
+    "LOG2",
+    "LOG10",
+    "SIGN",
+    "SIN",
+    "COS",
+    "TAN",
+    "ASIN",
+    "ACOS",
+    "ATAN",
+    "ATAN2",
+    "COT",
+    "DEGREES",
+    "RADIANS",
+    "CRC32",
+    "CONV",
+    "BIN",
+    "OCT",
+    "HEX",
+    "UNHEX",
+    "GREATEST",
+    "LEAST",
+    "DIV",
+    // strings
+    "UPPER",
+    "UCASE",
+    "LOWER",
+    "LCASE",
+    "LENGTH",
+    "CHAR_LENGTH",
+    "CHARACTER_LENGTH",
+    "OCTET_LENGTH",
+    "BIT_LENGTH",
+    "CONCAT",
+    "SUBSTRING",
+    "SUBSTR",
+    "MID",
+    "LEFT",
+    "RIGHT",
+    "TRIM",
+    "LTRIM",
+    "RTRIM",
+    "REPLACE",
+    "REVERSE",
+    "REPEAT",
+    "LPAD",
+    "RPAD",
+    "INSTR",
+    "LOCATE",
+    "POSITION",
+    "SUBSTRING_INDEX",
+    "ASCII",
+    "ORD",
+    "SPACE",
+    "STRCMP",
+    "SOUNDEX",
+    "INSERT",
+    "FORMAT",
+    "MD5",
+    "SHA",
+    "SHA1",
+    "SHA2",
+    "TO_BASE64",
+    "FROM_BASE64",
+    "COMPRESS",
+    "UNCOMPRESS",
+    "WEIGHT_STRING",
+    "REGEXP_REPLACE",
+    "REGEXP_SUBSTR",
+    "REGEXP_INSTR",
+    "REGEXP_LIKE",
+    "BINARY",
+    "CONVERT",
+    "CAST",
+    // date and time
+    "DATE",
+    "TIME",
+    "YEAR",
+    "MONTH",
+    "DAY",
+    "DAYOFMONTH",
+    "DAYOFWEEK",
+    "DAYOFYEAR",
+    "WEEKDAY",
+    "WEEK",
+    "YEARWEEK",
+    "QUARTER",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "MICROSECOND",
+    "DAYNAME",
+    "MONTHNAME",
+    "LAST_DAY",
+    "TO_DAYS",
+    "TO_SECONDS",
+    "FROM_DAYS",
+    "FROM_UNIXTIME",
+    "UNIX_TIMESTAMP",
+    "STR_TO_DATE",
+    "DATE_FORMAT",
+    "TIME_FORMAT",
+    "DATE_ADD",
+    "DATE_SUB",
+    "ADDDATE",
+    "SUBDATE",
+    "ADDTIME",
+    "SUBTIME",
+    "DATEDIFF",
+    "TIMEDIFF",
+    "TIMESTAMPDIFF",
+    "TIMESTAMPADD",
+    "TIMESTAMP",
+    "MAKEDATE",
+    "MAKETIME",
+    "SEC_TO_TIME",
+    "TIME_TO_SEC",
+    "PERIOD_ADD",
+    "PERIOD_DIFF",
+    "CONVERT_TZ",
+    "EXTRACT",
+    "GET_FORMAT",
+    // network, uuid, json
+    "INET_ATON",
+    "INET_NTOA",
+    "INET6_ATON",
+    "INET6_NTOA",
+    "UUID_TO_BIN",
+    "BIN_TO_UUID",
+    "JSON_EXTRACT",
+    "JSON_UNQUOTE",
+    "JSON_LENGTH",
+    "JSON_DEPTH",
+    "JSON_TYPE",
+    "JSON_VALID",
+    "JSON_KEYS",
+    "JSON_PRETTY",
+    "JSON_STORAGE_SIZE",
+    "JSON_VALUE",
 ];
 
 /// Functions returning JSON values (JSON group keys never match their own refresh filter).
@@ -227,6 +390,24 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
     let rest = &tokens[words[i] + 1..];
     let mut parser = Parser::new(&dialect).with_tokens_with_locations(rest.to_vec());
     let query = parser.parse_query().context("parse SELECT")?;
+    // The servers read `||` as OR unless sql_mode has PIPES_AS_CONCAT; the parser reads it as
+    // concatenation. Neither reading can be trusted: ask for the explicit form.
+    let mut pipes = false;
+    let _ = visit_expressions(&query, |e: &Expr| {
+        if matches!(
+            e,
+            Expr::BinaryOp {
+                op: BinaryOperator::StringConcat,
+                ..
+            }
+        ) {
+            pipes = true;
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if pipes {
+        bail!("`||` is OR on the server (sql_mode without PIPES_AS_CONCAT) but concatenation to the parser: write OR or CONCAT()");
+    }
     let tail = parser.peek_token().span.start;
     // Allow a trailing WITH ... CHECK OPTION and/or semicolon; reject anything else.
     loop {
@@ -585,10 +766,16 @@ pub struct CascadeRoute {
     /// The child table and its FK column ordinals (constraint order, matching `parent_cols`).
     pub child: TableRef,
     pub child_cols: Vec<usize>,
-    /// The view reads the parent through a lineage alias joined to every alias of the child on
-    /// the FK: the parent's own rows (routed to that alias) find every materialized row the
-    /// cascade changes, so the parent needs no route of its own.
+    /// The view reads the parent through a lineage or direct-unit alias that every alias of the
+    /// child is joined to on the whole FK, in a shape where a child row's presence in a
+    /// materialized row implies that alias carries its parent (`cascade_joined`), and the same
+    /// holds down every further cascade out of the child: the parent's own rows (routed to that
+    /// alias) find every materialized row the cascade changes, so the parent needs no route of
+    /// its own.
     pub traced: bool,
+    /// Why the route is neither unit-derived nor traced (the view rebuilds on the parent's
+    /// deletes / key updates).
+    pub untraced: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -855,6 +1042,12 @@ impl Scope<'_> {
         self.aliases[a.0].1.columns[a.1].family() == self.aliases[b.0].1.columns[b.1].family()
     }
 
+    /// `alias.column` of a column reference, for messages.
+    fn name(&self, c: ColRef) -> String {
+        let (n, t) = &self.aliases[c.0];
+        format!("{n}.{}", t.columns[c.1].name)
+    }
+
     fn find_unqualified(&self, col: &str) -> Option<ColRef> {
         self.aliases
             .iter()
@@ -984,8 +1177,12 @@ static NULL_EXPR: Expr = Expr::Value(sqlparser::ast::ValueWithSpan {
     span: sqlparser::tokenizer::Span::empty(),
 });
 
-/// The expression is NULL whenever a column it references is NULL (conservative).
-fn null_propagating(e: &Expr) -> bool {
+/// The expression is NULL whenever a column it references is NULL (conservative): columns,
+/// literals, strict operators and the strict builtins of `NULL_STRICT` over such expressions.
+/// `||` is not among the operators: the servers read it as OR in the default sql_mode (the
+/// definition is refused at parse time); `<=>`, AND / OR / XOR, CASE, IS NULL, IN and every
+/// unlisted function count as able to yield a value for NULL.
+pub(crate) fn null_propagating(e: &Expr) -> bool {
     match e {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
         Expr::Nested(x) => null_propagating(x),
@@ -996,19 +1193,37 @@ fn null_propagating(e: &Expr) -> bool {
             ) && null_propagating(expr)
         }
         Expr::BinaryOp { left, op, right } => {
-            !matches!(
+            matches!(
                 op,
-                BinaryOperator::And
-                    | BinaryOperator::Or
-                    | BinaryOperator::Xor
-                    | BinaryOperator::Spaceship
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::MyIntegerDivide
+                    | BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::BitwiseAnd
+                    | BinaryOperator::BitwiseOr
+                    | BinaryOperator::BitwiseXor
+                    | BinaryOperator::PGBitwiseShiftLeft
+                    | BinaryOperator::PGBitwiseShiftRight
+                    | BinaryOperator::Arrow
+                    | BinaryOperator::LongArrow
             ) && null_propagating(left)
                 && null_propagating(right)
         }
-        Expr::Cast { expr, .. } => null_propagating(expr),
+        Expr::Cast { expr, .. } | Expr::Convert { expr, .. } | Expr::Collate { expr, .. } => {
+            null_propagating(expr)
+        }
+        Expr::Extract { expr, .. } => null_propagating(expr),
         Expr::Function(f) => {
             f.over.is_none()
-                && !NULL_TOLERANT.contains(&function_name(f).as_str())
+                && NULL_STRICT.contains(&function_name(f).as_str())
                 && function_args(f)
                     .map(|a| a.into_iter().all(null_propagating))
                     .unwrap_or(false)
@@ -1381,6 +1596,16 @@ pub fn plan_block(
                 joins.push((aliases.len() - 1, left, c));
             }
         }
+    }
+    if select
+        .projection
+        .iter()
+        .any(|p| matches!(p, SelectItem::Wildcard(_)))
+        && joins
+            .iter()
+            .any(|(_, _, c)| matches!(c, JoinConstraint::Using(_) | JoinConstraint::Natural))
+    {
+        return Ok(full(STAR_USING));
     }
     if let Some(r) = unsupported {
         return Ok(full(&r));
@@ -1829,40 +2054,125 @@ pub fn plan_block(
     );
     // Cascades the parent's own rows trace: the view reads the parent through an alias whose
     // changed rows map to units directly or by lineage, joined on the whole FK (= the parent's
-    // primary key) to every alias of the child. The child rows a cascade changes are exactly
-    // those joined to the changed parent row, so they are found through it.
+    // primary key) to every alias of the child so that a child row's presence implies that
+    // alias carries its parent (`cascade_joined`). The child rows a cascade changes are exactly
+    // those with the changed parent row, so every materialized row holding one is found through
+    // it. A cascade that continues into the child's own children is found the same way only if
+    // every further level is joined like that too.
     let table_ref = |t: &TableInfo| (t.schema.clone(), t.name.clone());
-    for c in cascades.iter_mut().filter(|c| c.unit_from_parent.is_none()) {
-        let (mut keyed, mut pk) = (c.parent_cols.clone(), c.parent.pk.clone());
-        keyed.sort_unstable();
-        pk.sort_unstable();
-        if pk.is_empty() || keyed != pk {
-            continue;
-        }
-        let parent = table_ref(&c.parent);
-        let parents: Vec<usize> = (0..n_alias)
-            .filter(|&x| {
-                table_ref(&alias_plans[x].table) == parent
-                    && (alias_plans[x].direct_unit.is_some()
-                        || lineage.iter().any(|k| k.alias == x))
-            })
-            .collect();
-        let children: Vec<usize> = (0..n_alias)
-            .filter(|&y| table_ref(&alias_plans[y].table) == c.child)
-            .collect();
-        c.traced = !children.is_empty()
-            && children.iter().all(|&y| {
-                parents.iter().any(|&x| {
-                    let mut cls = Classes::new();
-                    for (a, b) in base_edges.iter().chain(&own_edges[x]).chain(&own_edges[y]) {
-                        cls.union(*a, *b);
-                    }
-                    c.child_cols
-                        .iter()
-                        .zip(&c.parent_cols)
-                        .all(|(&cc, &pc)| cls.find((y, cc)) == cls.find((x, pc)))
+    let joined: Vec<Result<(), String>> = cascades
+        .iter()
+        .map(|c| {
+            let (mut keyed, mut pk) = (c.parent_cols.clone(), c.parent.pk.clone());
+            keyed.sort_unstable();
+            pk.sort_unstable();
+            if pk.is_empty() || keyed != pk {
+                return Err(format!(
+                    "the foreign key of `{}` does not reference the whole primary key of `{}`",
+                    c.child.1, c.parent.name
+                ));
+            }
+            let parent = table_ref(&c.parent);
+            let parents: Vec<usize> = (0..n_alias)
+                .filter(|&x| {
+                    table_ref(&alias_plans[x].table) == parent
+                        && (alias_plans[x].direct_unit.is_some()
+                            || lineage.iter().any(|k| k.alias == x))
                 })
+                .collect();
+            let children: Vec<usize> = (0..n_alias)
+                .filter(|&y| table_ref(&alias_plans[y].table) == c.child)
+                .collect();
+            if children.is_empty() {
+                return Err(format!("the view does not read `{}`", c.child.1));
+            }
+            if parents.is_empty() {
+                return Err(format!(
+                    "the view does not read `{}` through a unit or lineage alias",
+                    c.parent.name
+                ));
+            }
+            let mut why = String::new();
+            for &y in &children {
+                let mut ok = false;
+                for &x in &parents {
+                    match cascade_joined(
+                        x,
+                        y,
+                        &c.parent_cols,
+                        &c.child_cols,
+                        &scope,
+                        &base_edges,
+                        &own_edges,
+                        &null_side,
+                        &joins,
+                        &using_pairs,
+                    ) {
+                        Ok(()) => {
+                            ok = true;
+                            break;
+                        }
+                        Err(r) => why = r,
+                    }
+                }
+                if !ok {
+                    return Err(why);
+                }
+            }
+            Ok(())
+        })
+        .collect();
+    // Where the cascade continues (the child's own cascading children, recursively), the rows
+    // it changes there are found through this route only if every further level is joined like
+    // that: `traced` needs the structural condition here and down the chain, and a unit route
+    // (units from the parent's image) needs it down the chain as well. A cycle (a
+    // self-referential key, mutual cascades) reaches rows no image gives: never traced.
+    fn continues_ok(
+        i: usize,
+        cascades: &[CascadeRoute],
+        joined: &[Result<(), String>],
+        path: &mut Vec<usize>,
+    ) -> Result<(), (usize, String)> {
+        path.push(i);
+        let child = &cascades[i].child;
+        let r = (0..cascades.len())
+            .filter(|&j| cascades[j].parent.schema == child.0 && cascades[j].parent.name == child.1)
+            .try_for_each(|j| {
+                if path.contains(&j) {
+                    return Err((
+                        j,
+                        format!(
+                            "the cascade from `{}` into `{}` is part of a cycle",
+                            cascades[j].parent.name, cascades[j].child.1
+                        ),
+                    ));
+                }
+                joined[j].clone().map_err(|r| (j, r))?;
+                continues_ok(j, cascades, joined, path)
             });
+        path.pop();
+        r
+    }
+    for i in 0..cascades.len() {
+        let continues = continues_ok(i, &cascades, &joined, &mut Vec::new()).map_err(|(j, r)| {
+            format!(
+                "the cascade continues from `{}` into `{}`, which is not traced: {r}",
+                cascades[j].parent.name, cascades[j].child.1
+            )
+        });
+        let c = &mut cascades[i];
+        if c.unit_from_parent.is_some() {
+            // The parent's image gives this level's units; the next level may lie elsewhere.
+            if let Err(r) = continues {
+                c.unit_from_parent = None;
+                c.untraced = Some(r);
+            }
+        } else {
+            match joined[i].clone().and(continues) {
+                Ok(()) => c.traced = true,
+                Err(r) => c.untraced = Some(r),
+            }
+        }
     }
     Ok(ViewPlan {
         schema,
@@ -2059,6 +2369,109 @@ fn expand_views(refs: &[TableRef], tables: &HashMap<TableRef, Arc<TableInfo>>) -
     out.into_iter().collect()
 }
 
+/// Whether every materialized row in which alias `y` (the child of a cascading FK) holds a row
+/// also holds, in alias `x` (the parent), that row's parent: then the parent's own row finds the
+/// rows a cascade changes. `Err` names why not.
+///
+/// Equalities valid whenever `y`'s row is present are the WHERE / inner-join ones (true in every
+/// row, both sides non-NULL) and those of `y`'s own LEFT JOIN condition; `x`'s own LEFT JOIN
+/// condition is not among them (`kids k LEFT JOIN pars p ON p.id = k.par_id AND p.active = 1`
+/// keeps a kid whose parent is inactive, NULL-extended). A NULL-side parent is found anyway
+/// when its join condition is exactly the foreign-key equality: the constraint guarantees the
+/// parent row exists, so the condition matches it whenever the child's key is non-NULL (a child
+/// with a NULL key is not cascaded into).
+#[allow(clippy::too_many_arguments)]
+fn cascade_joined(
+    x: usize,
+    y: usize,
+    parent_cols: &[usize],
+    child_cols: &[usize],
+    scope: &Scope,
+    base_edges: &[(ColRef, ColRef)],
+    own_edges: &[Vec<(ColRef, ColRef)>],
+    null_side: &[usize],
+    joins: &[(usize, bool, JoinConstraint)],
+    using_pairs: &[(usize, ColRef, ColRef)],
+) -> Result<(), String> {
+    let (xn, yn) = (&scope.aliases[x].0, &scope.aliases[y].0);
+    let mut cls = Classes::new();
+    for (a, b) in base_edges.iter().chain(&own_edges[y]) {
+        cls.union(*a, *b);
+    }
+    let pairs = || child_cols.iter().copied().zip(parent_cols.iter().copied());
+    if pairs().all(|(cc, pc)| cls.find((y, cc)) == cls.find((x, pc))) {
+        return Ok(());
+    }
+    if !null_side.contains(&x) {
+        return Err(format!("`{xn}` is not joined to `{yn}` on the foreign key"));
+    }
+    // The parent on the NULL side: its own condition must be the key equality and nothing else.
+    let mut eqs: Vec<(ColRef, ColRef)> = Vec::new();
+    match joins.iter().find(|(a, _, _)| *a == x).map(|(_, _, c)| c) {
+        Some(JoinConstraint::On(e)) => {
+            let mut cs = Vec::new();
+            conjuncts(e, &mut cs);
+            for c in cs {
+                let eq = match c {
+                    Expr::BinaryOp {
+                        left,
+                        op: BinaryOperator::Eq,
+                        right,
+                    } => scope
+                        .resolve(left)
+                        .zip(scope.resolve(right))
+                        .filter(|(a, b)| scope.same_family(*a, *b)),
+                    _ => None,
+                };
+                match eq {
+                    Some(eq) => eqs.push(eq),
+                    None => {
+                        return Err(format!(
+                            "`{xn}` is on the NULL side of a LEFT JOIN whose condition is not \
+                             the foreign-key equality alone: `{c}` leaves a `{yn}` row whose \
+                             parent fails it without its parent"
+                        ))
+                    }
+                }
+            }
+        }
+        Some(JoinConstraint::Using(_)) => {
+            eqs.extend(
+                using_pairs
+                    .iter()
+                    .filter(|(a, _, _)| *a == x)
+                    .map(|(_, l, r)| (*l, *r)),
+            );
+        }
+        _ => return Err(format!("`{xn}` is not joined to `{yn}` on the foreign key")),
+    }
+    let mut covered = vec![false; child_cols.len()];
+    for (a, b) in &eqs {
+        let other = if a.0 == x { b } else { a };
+        let j = pairs().position(|(cc, pc)| {
+            (*a == (x, pc) || *b == (x, pc)) && cls.find((y, cc)) == cls.find(*other)
+        });
+        match j {
+            Some(j) => covered[j] = true,
+            None => {
+                return Err(format!(
+                    "`{xn}` is on the NULL side of a LEFT JOIN whose condition is not the \
+                     foreign-key equality alone: `{}` = `{}` restricts `{xn}` further",
+                    scope.name(*a),
+                    scope.name(*b)
+                ))
+            }
+        }
+    }
+    if covered.iter().all(|&c| c) {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{xn}` is not joined to `{yn}` on the whole foreign key"
+        ))
+    }
+}
+
 /// Cascading-FK parents (and, conservatively, their ancestors) of the given child tables.
 fn cascade_routes(
     children: &[(Arc<TableInfo>, Option<Vec<usize>>)],
@@ -2070,6 +2483,12 @@ fn cascade_routes(
         .map(|(t, d)| (t.clone(), d.clone(), 0))
         .collect();
     let mut seen: BTreeSet<(TableRef, TableRef)> = BTreeSet::new();
+    // Tables the view reads get their own routes (checked down the chain); the walk continues
+    // past them only through parents the view does not read.
+    let read: BTreeSet<TableRef> = children
+        .iter()
+        .map(|(t, _)| (t.schema.clone(), t.name.clone()))
+        .collect();
     while let Some((child, direct, depth)) = stack.pop() {
         for fk in &child.cascades {
             let Some(parent) = tables.get(&fk.parent) else {
@@ -2108,8 +2527,9 @@ fn cascade_routes(
                 child: (child.schema.clone(), child.name.clone()),
                 child_cols: fk.child_cols.clone(),
                 traced: false,
+                untraced: None,
             });
-            if depth < 8 {
+            if depth < 8 && !read.contains(&fk.parent) {
                 // A cascade into the parent cascades further into the child: unknown units.
                 stack.push((parent.clone(), None, depth + 1));
             }
@@ -2535,6 +2955,342 @@ mod tests {
             ),
             vec![("grps".into(), false), ("pars".into(), false)]
         );
+    }
+
+    /// A1: a cascade is traced only where a child row's presence in a materialized row implies
+    /// the parent alias carries its parent. A parent on the NULL side of a LEFT JOIN with a
+    /// condition beyond the key equality (or joined through another alias) keeps child rows
+    /// whose parent fails it, NULL-extended: their cascading deletes would go unseen. The
+    /// condition must hold down every further cascade; cycles are never traced.
+    #[test]
+    fn cascades_traced_only_where_the_child_row_implies_its_parent() {
+        use crate::catalog::{FkAction, ForeignKey};
+        let fk = |parent: &str, child_cols: Vec<usize>| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols,
+            parent_cols: vec!["id".into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let mut cat = catalog();
+        let with_fk = |t: (TableRef, Arc<TableInfo>), f: Vec<ForeignKey>| {
+            let mut i = (*t.1).clone();
+            i.cascades = f;
+            (t.0, Arc::new(i))
+        };
+        cat.extend([
+            table("grps", &[("id", "int"), ("name", "varchar")], &[0]),
+            with_fk(
+                table(
+                    "pars",
+                    &[
+                        ("id", "int"),
+                        ("grp_id", "int"),
+                        ("active", "tinyint"),
+                        ("name", "varchar"),
+                    ],
+                    &[0],
+                ),
+                vec![fk("grps", vec![1])],
+            ),
+            with_fk(
+                table(
+                    "kids",
+                    &[("id", "int"), ("par_id", "int"), ("qty", "int")],
+                    &[0],
+                ),
+                vec![fk("pars", vec![1])],
+            ),
+            table("ords", &[("id", "int"), ("kid_id", "int")], &[0]),
+            with_fk(
+                table(
+                    "nodes",
+                    &[("id", "int"), ("parent_id", "int"), ("name", "varchar")],
+                    &[0],
+                ),
+                vec![fk("nodes", vec![1])],
+            ),
+            with_fk(
+                table(
+                    "gkids",
+                    &[("id", "int"), ("kid_id", "int"), ("v", "int")],
+                    &[0],
+                ),
+                vec![fk("kids", vec![1])],
+            ),
+            with_fk(
+                table("ma", &[("id", "int"), ("b_id", "int")], &[0]),
+                vec![fk("mb", vec![1])],
+            ),
+            with_fk(
+                table("mb", &[("id", "int"), ("a_id", "int")], &[0]),
+                vec![fk("ma", vec![1])],
+            ),
+        ]);
+        let routes = |sql: &str| {
+            let d = parse_definition(sql).unwrap();
+            let v = plan_block(&d, "db", &cat).unwrap();
+            assert!(v.is_incremental(), "{sql}: {}", v.mode);
+            let mut r: Vec<(String, String, bool, String)> = v
+                .cascades
+                .iter()
+                .map(|c| {
+                    // Unit-derived routes need no tracing; the others are traced or say why not.
+                    let unit = c.unit_from_parent.is_some();
+                    assert_eq!(c.traced, !unit && c.untraced.is_none(), "{sql}: {c:?}");
+                    (
+                        c.parent.name.clone(),
+                        c.child.1.clone(),
+                        c.traced || unit,
+                        c.untraced.clone().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            r.sort();
+            r
+        };
+        // Every route of a parent the view reads is traced (one it does not read rebuilds).
+        let traced = |sql: &str| {
+            let rs = routes(sql);
+            let read: Vec<&str> = ["grps", "pars", "nodes"]
+                .into_iter()
+                .filter(|t| sql.contains(&format!(" {t} ")))
+                .collect();
+            assert!(!read.is_empty());
+            for r in rs.iter().filter(|r| read.contains(&r.0.as_str())) {
+                assert!(r.2, "{sql}: {r:?}");
+            }
+        };
+        let untraced = |sql: &str, parent: &str, why: &str| {
+            let rs = routes(sql);
+            let r = rs.iter().find(|r| r.0 == parent).unwrap();
+            assert!(!r.2 && r.3.contains(why), "{sql}: {rs:?}");
+        };
+        // The parent on the NULL side, joined on exactly the key: the constraint makes the
+        // join match whenever the key is non-NULL (an inner-join condition elsewhere is fine).
+        traced("CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id");
+        traced("CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON k.par_id = p.id WHERE k.qty > 1");
+        traced("CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON (p.id = k.par_id)");
+        // The parent on the NULL side with a condition beyond the key (A1): untraced.
+        let a1 = "whose condition is not the foreign-key equality alone";
+        untraced(
+            "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id AND p.active = 1",
+            "pars",
+            a1,
+        );
+        untraced(
+            "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id AND k.qty > 1",
+            "pars",
+            a1,
+        );
+        untraced(
+            "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id AND p.id > 1",
+            "pars",
+            a1,
+        );
+        // The same through a NULL-side child (A1, second shape).
+        untraced(
+            "CREATE VIEW v AS SELECT o.id, k.qty, p.name FROM ords o LEFT JOIN kids k ON k.id = o.kid_id \
+             LEFT JOIN pars p ON p.id = k.par_id AND p.active = 1",
+            "pars",
+            a1,
+        );
+        traced(
+            "CREATE VIEW v AS SELECT o.id, k.qty, p.name FROM ords o LEFT JOIN kids k ON k.id = o.kid_id \
+             LEFT JOIN pars p ON p.id = k.par_id",
+        );
+        // Inner joins: a child row is materialized only with its parent, whatever else the
+        // condition asks; so is a child on the NULL side of its parent.
+        traced("CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k JOIN pars p ON p.id = k.par_id AND p.active = 1");
+        traced("CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k, pars p WHERE p.id = k.par_id AND p.active = 1");
+        traced("CREATE VIEW v AS SELECT p.id, p.name, k.qty FROM pars p LEFT JOIN kids k ON k.par_id = p.id AND k.qty > 2");
+        // A NULL-side parent whose condition goes through a third alias is not the key
+        // equality (the constraint says nothing about `o.pid`).
+        untraced(
+            "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k JOIN ords o ON o.kid_id = k.id \
+             LEFT JOIN pars p ON p.id = o.id",
+            "pars",
+            "`p.id` = `o.id` restricts `p` further",
+        );
+        // Two aliases of the parent: one joined on the key is enough.
+        traced(
+            "CREATE VIEW v AS SELECT k.id, p.name, q.name AS other FROM kids k LEFT JOIN pars p ON p.id = k.par_id \
+             LEFT JOIN pars q ON q.id = k.qty",
+        );
+        // Chains: groups → parents → kids. Traced only when every level is.
+        traced(
+            "CREATE VIEW v AS SELECT k.id, p.name, g.name AS grp FROM kids k JOIN pars p ON p.id = k.par_id \
+             LEFT JOIN grps g ON g.id = p.grp_id",
+        );
+        untraced(
+            "CREATE VIEW v AS SELECT k.id, p.name, g.name AS grp FROM kids k LEFT JOIN pars p ON p.id = k.par_id AND p.active = 1 \
+             LEFT JOIN grps g ON g.id = p.grp_id",
+            "grps",
+            "continues from `pars` into `kids`, which is not traced",
+        );
+        untraced(
+            "CREATE VIEW v AS SELECT p.id, p.name, g.name AS grp FROM pars p LEFT JOIN grps g ON g.id = p.grp_id AND g.name <> ''",
+            "grps",
+            a1,
+        );
+        // A self-referential cascade reaches every descendant: never traced (the alias read
+        // as the parent is itself a child nobody is joined to as its parent).
+        untraced(
+            "CREATE VIEW v AS SELECT c.id, c.name, p.name AS parent FROM nodes c JOIN nodes p ON p.id = c.parent_id",
+            "nodes",
+            "`p` is not joined to `p` on the foreign key",
+        );
+        // A unit route (the parent's image gives the units) covers the next level only where
+        // its rows are joined to the child's: here grandkids follow their kid, there they do
+        // not (a deleted kid's grandkids sit in other units).
+        {
+            let d = parse_definition(
+                "CREATE VIEW v AS SELECT k.par_id, COUNT(*) AS n FROM kids k \
+                 JOIN gkids g ON g.kid_id = k.id AND g.v > 0 GROUP BY k.par_id",
+            )
+            .unwrap();
+            let v = plan_block(&d, "db", &cat).unwrap();
+            assert_eq!(
+                v.tracing(),
+                "k:unit,g:lookup,^kids:traced,^pars:unit,^grps:rebuild"
+            );
+            let d = parse_definition(
+                "CREATE VIEW v AS SELECT k.par_id, COUNT(*) AS n FROM kids k \
+                 JOIN gkids g ON g.v = k.qty GROUP BY k.par_id",
+            )
+            .unwrap();
+            let v = plan_block(&d, "db", &cat).unwrap();
+            assert_eq!(
+                v.tracing(),
+                "k:unit,g:lookup,^kids:rebuild,^pars:rebuild,^grps:rebuild"
+            );
+            let r = v.cascades.iter().find(|c| c.parent.name == "pars").unwrap();
+            assert!(
+                r.untraced.as_deref().is_some_and(|w| {
+                    w.contains("continues from `kids` into `gkids`")
+                        && w.contains("`k` is not joined to `g` on the foreign key")
+                }),
+                "{r:?}"
+            );
+        }
+        // A3: a self-referential cascade reaches every descendant, also with the unit on the
+        // key column (the parent's image gives one level): never unit-derived, never traced.
+        {
+            let d = parse_definition(
+                "CREATE VIEW v AS SELECT n.parent_id, COUNT(*) AS n FROM nodes n GROUP BY n.parent_id",
+            )
+            .unwrap();
+            let v = plan_block(&d, "db", &cat).unwrap();
+            assert_eq!(v.tracing(), "n:unit,^nodes:rebuild");
+            assert!(v.cascades[0]
+                .untraced
+                .as_deref()
+                .is_some_and(|w| w.contains("part of a cycle")));
+        }
+        // Mutual cascades, each level joined on its key: a cycle, never traced.
+        let rs = routes(
+            "CREATE VIEW v AS SELECT a.id, b.id AS b FROM ma a JOIN mb b ON b.id = a.b_id AND a.id = b.a_id",
+        );
+        assert!(
+            rs.iter().all(|r| !r.2 && r.3.contains("part of a cycle")),
+            "{rs:?}"
+        );
+        // The parent is read but weakly (a WHERE conjunct keeps its NULL-extended rows): no
+        // lineage, so nothing to trace through.
+        untraced(
+            "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id \
+             WHERE p.id IS NULL OR p.active = 1",
+            "pars",
+            "does not read `pars` through a unit or lineage alias",
+        );
+    }
+
+    /// A2: only strict builtins and operators propagate NULL; everything else (CHAR, CHARSET,
+    /// COERCIBILITY, NVL2, DECODE_ORACLE, aggregates, CASE, `<=>`, logical operators) may yield
+    /// a value for NULL arguments, so NULL-side expressions over them are guarded and
+    /// predicates over them keep NULL-extended rows.
+    #[test]
+    fn null_propagation_is_an_allow_list() {
+        let e = |sql: &str| parse_sql(sql, |p| p.parse_expr()).unwrap();
+        for sql in [
+            "c.x",
+            "c.x + 1",
+            "-c.x",
+            "c.x = 'a'",
+            "UPPER(c.x)",
+            "CONCAT(c.x, 'a')",
+            "DATE_FORMAT(c.at, '%Y')",
+            "CAST(c.x AS CHAR)",
+            "ROUND(c.x / 3, 2)",
+            "GREATEST(c.x, c.y)",
+            "c.doc->'$.a'",
+        ] {
+            assert!(null_propagating(&e(sql)), "{sql}");
+        }
+        for sql in [
+            "CHAR(c.x)",
+            "CHARSET(c.x)",
+            "COERCIBILITY(c.x)",
+            "COLLATION(c.x)",
+            "NVL2(c.x, 'a', 'b')",
+            "DECODE_ORACLE(c.x, NULL, 'x', 'y')",
+            "IFNULL(c.x, 0)",
+            "COALESCE(c.x, 0)",
+            "IF(c.x > 1, 1, 0)",
+            "CASE WHEN c.x IS NULL THEN 1 END",
+            "c.x <=> 1",
+            "c.x IS NULL",
+            "c.x > 1 AND c.y > 1",
+            "c.x > 1 OR c.y > 1",
+            "COUNT(c.x)",
+            "IS_IPV4(c.x)",
+            "INTERVAL_FN(c.x)",
+            "QUOTE(c.x)",
+            "JSON_ARRAY(c.x)",
+        ] {
+            assert!(!null_propagating(&e(sql)), "{sql}");
+        }
+        // `||` is OR to the server and concatenation to the parser: refused as written.
+        let err = parse_definition("CREATE VIEW v AS SELECT (a > 1) || 1 AS v FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`||` is OR on the server"), "{err}");
+        assert!(parse_definition("CREATE VIEW v AS SELECT a OR 1 AS v FROM t").is_ok());
+    }
+
+    /// A4: `SELECT *` over USING / NATURAL joins coalesces the shared columns (the server
+    /// lists them once, first): a per-table expansion would duplicate or drop columns, so
+    /// the view is Full with a reason naming the fix; `alias.*` and listed columns plan.
+    #[test]
+    fn star_over_using_joins_is_full() {
+        let cat: HashMap<TableRef, Arc<TableInfo>> = [
+            table("t_a", &[("k", "int"), ("x", "int")], &[0]),
+            table("t_b", &[("k", "int"), ("y", "int")], &[0]),
+        ]
+        .into();
+        for sql in [
+            "CREATE VIEW v AS SELECT * FROM t_a JOIN t_b USING (k)",
+            "CREATE VIEW v AS SELECT * FROM t_a LEFT JOIN t_b USING (k)",
+            "CREATE VIEW v AS SELECT * FROM t_a NATURAL JOIN t_b",
+            "CREATE VIEW v AS SELECT * FROM t_a RIGHT JOIN t_b USING (k)",
+            "CREATE VIEW v AS SELECT t_a.k, * FROM t_a JOIN t_b USING (k)",
+        ] {
+            let d = parse_definition(sql).unwrap();
+            let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
+            assert_eq!(p.mode, Mode::Full(STAR_USING.into()), "{sql}");
+            assert_eq!(p.tables.len(), 2, "{sql}");
+            // The block planner alone names this or the join kind it does not take.
+            let p = plan_block(&d, "db", &cat).unwrap();
+            assert!(matches!(p.mode, Mode::Full(_)), "{sql}: {}", p.mode);
+        }
+        for sql in [
+            "CREATE VIEW v AS SELECT t_a.*, y FROM t_a JOIN t_b USING (k)",
+            "CREATE VIEW v AS SELECT k, x, y FROM t_a LEFT JOIN t_b USING (k)",
+        ] {
+            let d = parse_definition(sql).unwrap();
+            let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
+            assert_eq!(p.mode, Mode::Spj, "{sql}: {}", p.mode);
+        }
     }
 
     /// E6: lookups that replace several tables by their row images at once, with parameters in
