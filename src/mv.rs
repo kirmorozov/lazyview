@@ -1397,6 +1397,7 @@ mod tests {
                 Column::new("ts", "timestamp", "timestamp(6)", None, None, None, false),
             ],
             pk: vec![0],
+            unique_keys: vec![],
             cascades: vec![],
             is_view: false,
             view_bases: vec![],

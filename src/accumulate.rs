@@ -502,6 +502,7 @@ mod tests {
                 name: name.into(),
                 columns: cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
                 pk: vec![0],
+                unique_keys: vec![],
                 cascades: vec![],
                 is_view: false,
                 view_bases: vec![],

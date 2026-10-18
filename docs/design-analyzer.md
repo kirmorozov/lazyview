@@ -1,8 +1,8 @@
 # Query analyzer: design
 
 Status: phases A and B done and wired (`analyze::plan` delegates to `analyzer::plan`; the old
-planner body is the block planner `analyze::plan_block`); JSON group keys wait for typed unit
-filters (engine A); phase C (internal views, UNION ALL branch plans) waits for the engine, those
+planner body is the block planner `analyze::plan_block`); JSON group keys are plain units since
+the engine's typed unit filters; phase C (internal views, UNION ALL branch plans) waits for the engine, those
 views are Full with a reason naming the missing piece (§3.3). Owner rule: **a view is maintained
 incrementally unless it is mathematically impossible to trace a source change to the output
 rows it affects.** Every Full fallback names the construct and states why no trace exists.
@@ -123,7 +123,7 @@ outcomes into Full plans whose reason ends in `(needs internal views)` / `(needs
 | table without PK as anchor | **value units**: unit = its referenced columns (exact kinds), duplicates counted by the refresh | value lineage | equal rows are interchangeable; the refresh rewrites the multiset |
 | SQL view as a source | inlined like a derived table (needs `VIEW_DEFINITION` in the catalog) | as merged | a view is a named derived table |
 | BIT unit keys | plain units (BIT values compare exactly through typed placeholders) | unit | measured on all six servers (`edge_bit_group`) |
-| JSON unit keys (MySQL) | units filtered with `CAST(? AS JSON)` (typed unit filters, engine A); until then Full `JSON group key (needs typed unit filters)`. MariaDB JSON is LONGTEXT: text units | unit | MySQL groups JSON-equal values; a plain `?` never equals a JSON value |
+| JSON unit keys (MySQL) | plain units: the engine binds JSON unit values as `CAST(? AS JSON)` (typed unit filters, `UnitKind::Json` from the probed MV column type; engine A, main 882ee55). MariaDB JSON is LONGTEXT: text units | unit | MySQL groups JSON-equal values and compares the bound JSON the same way; the MV keeps the server's representative text of each group |
 | opaque (UUID, INET6) unit keys | internal view computing a SQL surrogate (`HEX(k)`, `CAST(k AS CHAR)`) as the downstream unit | surrogate | SQL computes both sides of the comparison |
 
 ### 3.3 Full fallbacks (impossibility arguments)
@@ -151,7 +151,6 @@ names the construct and ends in the missing piece:
 | semi-join not correlated on the unit / over a cascading-FK child | ``IN subquery over `s` is not correlated on the view's unit key`` (suffix still to add, see handoff) | distinct-keys view |
 | UNION ALL | `UNION ALL … (needs branch plans)` | branch plans |
 | UNION (distinct), INTERSECT, EXCEPT | construct name | §3.2 rows (phase C/D) |
-| JSON group key (MySQL) | `JSON group key (needs typed unit filters)` | engine A |
 
 ### 3.4 Semi- and anti-joins in detail
 
@@ -240,7 +239,7 @@ pushdown (MySQL 8.0.22+, MariaDB 10.2+) only affects rebuild speed. Naming diffe
   per alias, `AliasPlan.semi`; NOT IN with its NULL branches), NULL-side lookup weakening (weak
   aliases filter with `lookup_where_sql` and carry no lineage), value units for PK-less
   anchors, BIT units, DISTINCT/GROUP BY unit reduction by FD closure (`reduce_unit`),
-  RIGHT/NATURAL/STRAIGHT. Pending: JSON group keys (typed unit filters, engine A).
+  RIGHT/NATURAL/STRAIGHT, JSON group keys (typed unit filters landed on main).
 * **C** (engine, other owners; spec sent to the coordinator): internal views (§4), branch plans
   for UNION ALL (one slot, N plans sharing the table, `_lv_branch` in unit filters), NULL-safe
   lineage filters, `detail` from the plan, `VIEW_DEFINITION` in the catalog.
@@ -258,9 +257,9 @@ should take. Risk: **W** = wrong results possible, **M** = missed incremental op
 | cascading FKs, SQL-view sources | `REFERENTIAL_CONSTRAINTS`; `VIEWS.VIEW_DEFINITION` (SQL-view sources stay Full) | — | keep; inline SQL views later (phase D) |
 | stored / loadable functions | `engine.rs` reads `ROUTINES`, `mysql.func` and rejects the view | — | keep (their reads are invisible) |
 | output names and types | `mv::probe` creates a temporary VIEW of the planned SELECT and reads its `COLUMNS` | M | probe names come from the *rewritten* SELECT (our `names.rs` prediction); see canonical form |
-| UNIQUE keys other than the PK | not loaded: every key argument uses the PK only | M | load `STATISTICS NON_UNIQUE = 0` (skip prefix parts `SUB_PART`, functional parts); a UNIQUE key is a key only if all its columns are NOT NULL; use it in semi→join, pull-up, `reduce_unit`, and as lineage for PK-less tables (instead of value lineage) |
-| NOT NULL | not loaded for sources (only for probe outputs): every source column is treated as nullable | M | load `IS_NULLABLE`; NOT IN over NOT NULL columns on both sides = NOT EXISTS (drops the all-units trace for NULL keys); UNIQUE keys above. Never for NULL-side aliases (NULL-extended rows) |
-| generated columns | `EXTRA` read only for INVISIBLE; generated columns are ordinary columns | **W** (to verify) | load `GENERATION_EXPRESSION` + VIRTUAL/STORED and the base columns it reads; referenced/membership sets include those base columns; a VIRTUAL column's binlog value is used as a unit or lineage value only once a test proves every flavor logs it in FULL images (update of the base column only, view filtering and grouping on the generated column) |
+| UNIQUE keys other than the PK | **loaded** (`TableInfo.unique_keys`: `STATISTICS NON_UNIQUE = 0`, whole columns only, every column NOT NULL; `TableInfo::keys()` / `row_key()`) and used as row keys: unit of a PK-less anchor, lineage of a PK-less lookup alias, FD closure in `reduce_unit` (DISTINCT / GROUP BY reduction), the parent key a cascading FK may reference | — | done (block planner); semi→join and pull-up in `normalize.rs` still use `pk` only: next |
+| NOT NULL | **loaded** (`Column.nullable`), used for the UNIQUE-key rule above | M | NOT IN over NOT NULL columns on both sides = NOT EXISTS (drops the all-units trace for NULL keys): next. Never for NULL-side aliases (NULL-extended rows) |
+| generated columns | **loaded** (`Column.generated { expr, stored, deps }`, base columns parsed from `GENERATION_EXPRESSION`; unparsable → all columns). The block planner **inlines every reference to a VIRTUAL column as its expression** over the alias-qualified base columns (`inline_virtual_columns`; a bare projection item keeps the column's name), so no plan ever reads a VIRTUAL value from a row image: measured on MariaDB 13.0 / 13.2, a unit lookup over `GROUP BY g` with `g` VIRTUAL took the image's value and missed the group (MySQL 8.4 / 26.7, Percona and MariaDB 10.11 happened to pass). An unreadable expression is Full with ``VIRTUAL generated column `t`.`g` with an expression the parser cannot read: …``. A referenced STORED column also marks its base columns referenced | — | done |
 | canonical definition (probe `VIEW_DEFINITION`) | not read | **W** (resolution bugs undetected) | **validator, not input**: read it after the probe of the statement as written, parse it, and compare base tables, referenced columns per table and output names with the analyzer's resolution; a mismatch fails the definition with an error naming the difference. Not the input: its printing differs per flavor and version (`count(0)`, charset introducers, `(not(exists(…)))`, comments kept by 8.4), and Full plans, names and errors must stay the user's text |
 | session sql_mode | `mv::init_session` keeps the server's mode minus strict / zero-date flags; the parser assumes the default mode | **W** | `ANSI_QUOTES` (`"x"` is a column to the server, a string to us: its changes are never traced), `PIPES_AS_CONCAT`, `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES` (tokens), MariaDB `ORACLE`/`MSSQL`/… change the parse. Recommended: strip these flags in `init_session` like the strict ones (server and parser then agree by construction; documented in docs/views.md); otherwise read `@@SESSION.sql_mode` when planning and fail the definition naming the flag. `IGNORE_SPACE`, `ONLY_FULL_GROUP_BY`, `REAL_AS_FLOAT` do not change our parse. Already in the default mode sqlparser 0.63 parses `||` as concatenation (at multiplication precedence) where the servers read OR: refuse `||` with an error asking for `OR` / `CONCAT()` |
 | `lower_case_table_names` | not read; tables compared as written, aliases partly case-insensitive (`lower.rs`) | **W** | 1/2: canonicalize schema/table names to the stored `TABLE_NAME` (else binlog events for `orders` never match a definition writing `Orders`); 0: compare tables and aliases exactly and refuse definitions whose aliases collide case-insensitively. Columns are always case-insensitive (correct today) |

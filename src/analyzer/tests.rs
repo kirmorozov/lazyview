@@ -14,6 +14,7 @@ fn typed(name: &str, cols: Vec<Column>, pk: &[usize]) -> (TableRef, Arc<TableInf
         name: name.into(),
         columns: cols,
         pk: pk.to_vec(),
+        unique_keys: vec![],
         cascades: vec![],
         is_view: false,
         view_bases: vec![],

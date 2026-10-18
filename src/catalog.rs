@@ -48,6 +48,22 @@ pub struct Column {
     pub collation: Option<String>,
     /// `CHARACTER_OCTET_LENGTH` (declared byte length of fixed-length BINARY(n)).
     pub octet_len: Option<u64>,
+    /// `IS_NULLABLE` (a NOT NULL column never holds NULL; NULL-extended rows of a LEFT JOIN
+    /// still do).
+    pub nullable: bool,
+    /// Generated column (`GENERATION_EXPRESSION`): its value follows other columns.
+    pub generated: Option<Generated>,
+}
+
+/// A generated column's definition.
+#[derive(Debug, Clone)]
+pub struct Generated {
+    pub expr: String,
+    /// STORED (in the row and its binlog images) rather than VIRTUAL (computed on read).
+    pub stored: bool,
+    /// Ordinals of the base columns the expression reads; `None` when the expression could
+    /// not be parsed (any column may be read).
+    pub deps: Option<Vec<usize>>,
 }
 
 /// Coarse type families: equality between columns of different families involves implicit
@@ -131,6 +147,8 @@ impl Column {
             charset: charset.map(|c| c.to_ascii_lowercase()),
             collation: collation.map(|c| c.to_ascii_lowercase()),
             octet_len,
+            nullable: true,
+            generated: None,
         }
     }
 
@@ -169,8 +187,11 @@ impl Column {
         )
     }
 
+    /// Whether binlog values of this column can stand for its SQL values in unit and lineage
+    /// keys. A VIRTUAL generated column has no value in the row images (MySQL and MariaDB log
+    /// base columns only), so it never can.
     pub fn exact_key(&self) -> bool {
-        self.exact
+        self.exact && !self.generated.as_ref().is_some_and(|g| !g.stored)
     }
 
     /// Drops the `COLLATE` of a string param when the column has `default`, the collation that
@@ -202,6 +223,9 @@ pub struct TableInfo {
     pub columns: Vec<Column>,
     /// Ordinals of primary key columns (empty: no primary key).
     pub pk: Vec<usize>,
+    /// Other keys that identify a row: UNIQUE indexes over NOT NULL columns, whole columns
+    /// only (no prefix or functional parts), in index-name order.
+    pub unique_keys: Vec<Vec<usize>>,
     /// Foreign keys of this (child) table whose ON DELETE / ON UPDATE action changes child rows.
     /// Those changes are made by the storage engine and are NOT written to the binlog.
     pub cascades: Vec<ForeignKey>,
@@ -240,6 +264,24 @@ pub struct ForeignKey {
 }
 
 impl TableInfo {
+    /// Every key that identifies a row: the primary key first, then the unique keys.
+    pub fn keys(&self) -> impl Iterator<Item = &[usize]> + '_ {
+        std::iter::once(self.pk.as_slice())
+            .filter(|k| !k.is_empty())
+            .chain(self.unique_keys.iter().map(Vec::as_slice))
+    }
+
+    /// The shortest key that identifies a row (the primary key when there is one).
+    pub fn row_key(&self) -> Option<&[usize]> {
+        if !self.pk.is_empty() {
+            return Some(&self.pk);
+        }
+        self.unique_keys
+            .iter()
+            .min_by_key(|k| k.len())
+            .map(Vec::as_slice)
+    }
+
     pub fn col_index(&self, name: &str) -> Option<usize> {
         self.columns
             .iter()
@@ -303,12 +345,14 @@ pub async fn load_table(
         Option<String>,
         String,
         Option<u64>,
+        String,
+        Option<String>,
     );
     let rows: Vec<ColRow> = conn
         .exec(
             "SELECT CAST(COLUMN_NAME AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(COLUMN_TYPE AS CHAR), \
              CAST(CHARACTER_SET_NAME AS CHAR), CAST(COLLATION_NAME AS CHAR), CAST(EXTRA AS CHAR), \
-             CHARACTER_OCTET_LENGTH \
+             CHARACTER_OCTET_LENGTH, CAST(IS_NULLABLE AS CHAR), CAST(GENERATION_EXPRESSION AS CHAR) \
              FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
             (schema, name),
         )
@@ -331,28 +375,59 @@ pub async fn load_table(
             }
         }
     }
-    let columns: Vec<Column> = rows
+    let mut columns: Vec<Column> = rows
         .into_iter()
-        .map(|(name, data_type, column_type, cs, co, extra, octets)| {
-            let default = cs
-                .as_deref()
-                .and_then(|c| default_collations.get(&c.to_ascii_lowercase()))
-                .and_then(|d| d.as_deref());
-            Column {
-                invisible: extra.to_ascii_uppercase().contains("INVISIBLE"),
-                ..Column::new(
-                    &name,
-                    &data_type,
-                    &column_type,
-                    cs.as_deref(),
-                    co.as_deref(),
-                    octets,
-                    mariadb,
-                )
-                .with_default_collation(default)
-            }
-        })
+        .map(
+            |(name, data_type, column_type, cs, co, extra, octets, nullable, gen)| {
+                let default = cs
+                    .as_deref()
+                    .and_then(|c| default_collations.get(&c.to_ascii_lowercase()))
+                    .and_then(|d| d.as_deref());
+                let extra_uc = extra.to_ascii_uppercase();
+                let generated = gen
+                    .filter(|g| !g.trim().is_empty() && extra_uc.contains("GENERATED"))
+                    .map(|expr| Generated {
+                        expr,
+                        stored: extra_uc.contains("STORED"),
+                        deps: None,
+                    });
+                Column {
+                    invisible: extra_uc.contains("INVISIBLE"),
+                    nullable: nullable.eq_ignore_ascii_case("YES"),
+                    generated,
+                    ..Column::new(
+                        &name,
+                        &data_type,
+                        &column_type,
+                        cs.as_deref(),
+                        co.as_deref(),
+                        octets,
+                        mariadb,
+                    )
+                    .with_default_collation(default)
+                }
+            },
+        )
         .collect();
+    // Base columns of the generated columns (the expression names them, quoted).
+    let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    for c in &mut columns {
+        if let Some(g) = &mut c.generated {
+            g.deps = generated_deps(&g.expr, &names);
+        }
+    }
+    type KeyRow = (String, u64, Option<String>, Option<u64>, String);
+    let key_rows: Vec<KeyRow> = conn
+        .exec(
+            "SELECT CAST(INDEX_NAME AS CHAR), SEQ_IN_INDEX, CAST(COLUMN_NAME AS CHAR), SUB_PART, \
+             CAST(COALESCE(NULLABLE, '') AS CHAR) \
+             FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0 AND INDEX_NAME <> 'PRIMARY' \
+             ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+            (schema, name),
+        )
+        .await?;
+    let unique_keys = unique_keys_from(&key_rows, &columns);
     let pk = pk_names
         .iter()
         .filter_map(|n| columns.iter().position(|c| &c.name == n))
@@ -416,10 +491,82 @@ pub async fn load_table(
         name: name.to_string(),
         columns,
         pk,
+        unique_keys,
         cascades,
         is_view,
         view_bases,
     }))
+}
+
+/// UNIQUE keys usable as row keys: whole columns only (no prefix `SUB_PART`, no functional
+/// part, which has no column name), every column NOT NULL (a nullable unique column admits
+/// several NULL rows). Rows come ordered by index name and sequence.
+fn unique_keys_from(
+    rows: &[(String, u64, Option<String>, Option<u64>, String)],
+    columns: &[Column],
+) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut current: Option<(String, Option<Vec<usize>>)> = None;
+    let flush = |cur: &mut Option<(String, Option<Vec<usize>>)>, out: &mut Vec<Vec<usize>>| {
+        if let Some((_, Some(k))) = cur.take() {
+            if !k.is_empty() && !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    };
+    for (index, _, col, sub_part, _) in rows {
+        if current.as_ref().map(|(n, _)| n != index).unwrap_or(true) {
+            flush(&mut current, &mut out);
+            current = Some((index.clone(), Some(Vec::new())));
+        }
+        let Some((_, key)) = &mut current else {
+            continue;
+        };
+        let ci = col
+            .as_deref()
+            .and_then(|c| columns.iter().position(|x| x.name == c));
+        match (ci, sub_part) {
+            (Some(ci), None) if !columns[ci].nullable => {
+                if let Some(k) = key {
+                    k.push(ci);
+                }
+            }
+            _ => *key = None,
+        }
+    }
+    flush(&mut current, &mut out);
+    out
+}
+
+/// Ordinals of the columns a generated column's expression reads (parsed with the MySQL
+/// dialect; `None` if the text does not parse).
+fn generated_deps(expr: &str, names: &[String]) -> Option<Vec<usize>> {
+    use sqlparser::ast::{visit_expressions, Expr};
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+    use std::ops::ControlFlow;
+    let e = Parser::new(&MySqlDialect {})
+        .try_with_sql(expr)
+        .ok()?
+        .parse_expr()
+        .ok()?;
+    let mut deps = Vec::new();
+    let _ = visit_expressions(&e, |x: &Expr| {
+        let id = match x {
+            Expr::Identifier(i) => Some(i),
+            Expr::CompoundIdentifier(parts) => parts.last(),
+            _ => None,
+        };
+        if let Some(i) = id {
+            if let Some(c) = names.iter().position(|n| n.eq_ignore_ascii_case(&i.value)) {
+                if !deps.contains(&c) {
+                    deps.push(c);
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    Some(deps)
 }
 
 /// The collation `CONVERT(... USING charset)` yields on this server (its default for the
@@ -510,6 +657,50 @@ fn parse_labels(column_type: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_keys_and_generated_dependencies() {
+        let mut cols = vec![
+            Column::simple("id", "int"),
+            Column::simple("code", "varchar"),
+            Column::simple("email", "varchar"),
+            Column::simple("a", "int"),
+            Column::simple("b", "int"),
+        ];
+        for c in &mut cols {
+            c.nullable = c.name == "email";
+        }
+        let row = |i: &str, n: u64, c: Option<&str>, sub: Option<u64>| {
+            (i.to_string(), n, c.map(str::to_string), sub, String::new())
+        };
+        let rows = vec![
+            row("u_ab", 1, Some("a"), None),
+            row("u_ab", 2, Some("b"), None),
+            row("u_code", 1, Some("code"), None),
+            row("u_email", 1, Some("email"), None),
+            row("u_func", 1, None, None),
+            row("u_pref", 1, Some("code"), Some(3)),
+            row("u_pref", 2, Some("a"), None),
+        ];
+        assert_eq!(unique_keys_from(&rows, &cols), vec![vec![3, 4], vec![1]]);
+        let names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(generated_deps("(`a` + `b`)", &names), Some(vec![3, 4]));
+        assert_eq!(generated_deps("`a` * 2", &names), Some(vec![3]));
+        assert_eq!(
+            generated_deps("concat(`code`,_utf8mb4'x')", &names),
+            Some(vec![1])
+        );
+        assert_eq!(generated_deps("((", &names), None);
+        let mut g = Column::simple("g", "int");
+        g.generated = Some(Generated {
+            expr: "a".into(),
+            stored: false,
+            deps: Some(vec![3]),
+        });
+        assert!(!g.exact_key());
+        g.generated.as_mut().unwrap().stored = true;
+        assert!(g.exact_key());
+    }
 
     #[test]
     fn labels() {

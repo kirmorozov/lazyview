@@ -479,6 +479,7 @@ fn wired() -> bool {
         name: "t0".into(),
         columns: vec![Column::simple("id", "int")],
         pk: vec![0],
+        unique_keys: vec![],
         cascades: vec![],
         is_view: false,
         view_bases: vec![],
@@ -1488,6 +1489,142 @@ fn cte_order_columns_match_their_oracles() {
     scenario("cte_order", |ctx| async move {
         run_order(&ctx, "w0", "0").await?;
         run_order(&ctx, "w50", "50").await?;
+        Ok(())
+    });
+}
+
+// --- server schema: UNIQUE NOT NULL keys and generated columns.
+
+const SCHEMA_DDL: &[&str] = &[
+    // No primary key: `code` and (a, b) identify rows; g is VIRTUAL, s STORED.
+    "CREATE TABLE sk_items (code VARCHAR(10) NOT NULL, a INT NOT NULL, b INT NOT NULL, note VARCHAR(40) NULL,
+     g INT GENERATED ALWAYS AS (a + b) VIRTUAL, s INT GENERATED ALWAYS AS (a * 2) STORED,
+     UNIQUE KEY u_code (code), UNIQUE KEY u_ab (a, b), KEY k_a (a))",
+    "CREATE TABLE sk_orders (id INT NOT NULL PRIMARY KEY, code VARCHAR(10) NULL, qty INT NOT NULL)",
+    "INSERT INTO sk_items (code, a, b, note) VALUES ('x1',1,10,'one'),('x2',2,20,NULL),('x3',3,30,'three'),('x4',4,40,'four')",
+    "INSERT INTO sk_orders VALUES (1,'x1',5),(2,'x2',6),(3,'x1',7),(4,NULL,8),(5,'x9',9)",
+];
+
+fn schema_cases() -> Vec<(Case, &'static str)> {
+    vec![
+        // PK-less anchor with a unique key: units by the key, not by every referenced column.
+        (
+            case("sk_flat", "incremental", "spj", "SELECT note, a, g FROM sk_items WHERE s > 2"),
+            "sk_items:unit",
+        ),
+        // A PK-less lookup alias traced by its unique key.
+        (
+            case("sk_join", "incremental", "spj",
+                 "SELECT o.id, o.qty, i.note, i.g FROM sk_orders o LEFT JOIN sk_items i ON i.code = o.code"),
+            "o:unit,i:lineage",
+        ),
+        // DISTINCT over a unique key and other columns reduces to the key.
+        (
+            case("sk_distinct", "incremental", "grouped", "SELECT DISTINCT code, note, s FROM sk_items"),
+            "sk_items:unit",
+        ),
+        (
+            case("sk_distinct_ab", "incremental", "grouped", "SELECT DISTINCT a, b, note, g FROM sk_items"),
+            "sk_items:unit",
+        ),
+        // Grouping by a generated column: its base columns are read columns.
+        (
+            case("sk_by_gen", "incremental", "grouped", "SELECT g, COUNT(*) AS n, SUM(s) AS t FROM sk_items GROUP BY g"),
+            "sk_items:lookup",
+        ),
+    ]
+}
+
+fn schema_steps() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "base column of a generated column",
+            "UPDATE sk_items SET a = 11 WHERE code = 'x1'",
+        ),
+        (
+            "other base column",
+            "UPDATE sk_items SET b = 21 WHERE code = 'x2'",
+        ),
+        (
+            "non-key column",
+            "UPDATE sk_items SET note = 'two' WHERE code = 'x2'",
+        ),
+        (
+            "unique key changed",
+            "UPDATE sk_items SET code = 'x5' WHERE code = 'x3'",
+        ),
+        (
+            "row inserted and one deleted",
+            "INSERT INTO sk_items (code, a, b, note) VALUES ('x9', 9, 90, 'nine')",
+        ),
+        ("row deleted", "DELETE FROM sk_items WHERE code = 'x4'"),
+        (
+            "order re-pointed",
+            "UPDATE sk_orders SET code = 'x5' WHERE id = 4",
+        ),
+    ]
+}
+
+async fn run_schema(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
+    let db = ctx.new_db(&format!("cte_schema_{label}")).await?;
+    let mut c = db.conn().await?;
+    for s in SCHEMA_DDL {
+        exec(&mut c, s).await?;
+    }
+    let mariadb = ctx.server().is_mariadb();
+    let mut bad = String::new();
+    let mut plain = Vec::new();
+    for (case, tracing) in schema_cases() {
+        let def = format!("CREATE VIEW {} AS {}", case.name, case.select);
+        let plan = analyzer_plan(&db, mariadb, &def).await?;
+        if plan.tracing() != *tracing {
+            bad.push_str(&format!(
+                "\n  {}: routes {}, expected {tracing}",
+                case.name,
+                plan.tracing()
+            ));
+        }
+        if case.name == "sk_flat" && plan.unit_exprs != vec!["`sk_items`.`code`"] {
+            bad.push_str(&format!("\n  sk_flat: units {:?}", plan.unit_exprs));
+        }
+        if case.name == "sk_distinct" && plan.unit_exprs != vec!["code"] {
+            bad.push_str(&format!("\n  sk_distinct: units {:?}", plan.unit_exprs));
+        }
+        if case.name == "sk_distinct_ab" && plan.unit_exprs != vec!["a", "b"] {
+            bad.push_str(&format!("\n  sk_distinct_ab: units {:?}", plan.unit_exprs));
+        }
+        plain.push(case);
+    }
+    if !bad.is_empty() {
+        bail!("schema plans differ:{bad}");
+    }
+    let (specs, expect) = prepare(&db, mariadb, plain).await?;
+    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        &format!("{label}: initial build"),
+    )
+    .await?;
+    for (what, stmt) in schema_steps() {
+        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
+        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
+    }
+    assert_ready(&mut c, &names(&specs)).await?;
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// Server schema: UNIQUE NOT NULL keys identify rows of PK-less tables (units, lineage, DISTINCT
+/// reduction); generated columns follow their base columns (VIRTUAL ones have no binlog value).
+#[test]
+fn cte_schema_keys_match_their_oracles() {
+    scenario("cte_schema", |ctx| async move {
+        run_schema(&ctx, "w0", "0").await?;
+        run_schema(&ctx, "w50", "50").await?;
         Ok(())
     });
 }

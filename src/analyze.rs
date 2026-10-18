@@ -1077,6 +1077,21 @@ impl Usage<'_> {
                         if set_membership {
                             self.membership[a][c] = true;
                         }
+                        // A generated column changes with its base columns (a VIRTUAL one
+                        // has no image of its own): they count as read too.
+                        let t = &self.scope.aliases[a].1;
+                        if let Some(g) = &t.columns[c].generated {
+                            let deps: Vec<usize> = match &g.deps {
+                                Some(d) => d.clone(),
+                                None => (0..t.columns.len()).collect(),
+                            };
+                            for d in deps {
+                                self.referenced[a][d] = true;
+                                if set_membership {
+                                    self.membership[a][d] = true;
+                                }
+                            }
+                        }
                     }
                     None => {
                         let is_alias = matches!(e, Expr::Identifier(id)
@@ -1383,9 +1398,6 @@ fn reduce_unit(
                 }
             }
             for (a, (_, t)) in scope.aliases.iter().enumerate() {
-                if t.pk.is_empty() {
-                    continue;
-                }
                 let bound = |c: usize| {
                     d.contains(&(a, c))
                         || own_edges[a].iter().any(|(x, y)| {
@@ -1393,7 +1405,8 @@ fn reduce_unit(
                                 || (*y == (a, c) && x.0 != a && d.contains(x))
                         })
                 };
-                if t.pk.iter().all(|&c| bound(c)) {
+                // Any whole key (primary or UNIQUE NOT NULL) determines the row.
+                if t.keys().any(|k| k.iter().all(|&c| bound(c))) {
                     d.extend((0..t.columns.len()).map(|c| (a, c)));
                 }
             }
@@ -1727,6 +1740,11 @@ pub fn plan_block(
 
     let scope = Scope { aliases: &aliases };
     strip_column_schemas(select, &scope);
+    // VIRTUAL generated columns have no value in the row images (lookups substitute literal
+    // rows): every reference becomes the column's own expression over its base columns.
+    if let Some(reason) = inline_virtual_columns(select, &scope)? {
+        return Ok(full(&reason));
+    }
     let n_alias = aliases.len();
     let referenced: Vec<Vec<bool>> = aliases
         .iter()
@@ -1850,14 +1868,14 @@ pub fn plan_block(
     let unit_refs: Vec<Expr> = match mode {
         Mode::Spj => {
             let (n, t) = &aliases[0];
-            // Without a primary key, equal rows are one unit: the referenced columns whose
-            // binlog values compare exactly with their SQL values.
-            let key: Vec<usize> = if t.pk.is_empty() {
-                (0..t.columns.len())
+            // Without a row key (primary key or a UNIQUE NOT NULL key), equal rows are one
+            // unit: the referenced columns whose binlog values compare exactly with their SQL
+            // values.
+            let key: Vec<usize> = match t.row_key() {
+                Some(k) => k.to_vec(),
+                None => (0..t.columns.len())
                     .filter(|&c| referenced[0][c] && t.columns[c].exact_key())
-                    .collect()
-            } else {
-                t.pk.clone()
+                    .collect(),
             };
             if key.is_empty() {
                 return Ok(full(&format!(
@@ -2053,10 +2071,9 @@ pub fn plan_block(
     let mut lineage = Vec::new();
     if mode == Mode::Spj {
         for (ai, a) in alias_plans.iter_mut().enumerate() {
-            let key: Vec<usize> = if a.table.pk.is_empty() {
-                (0..a.table.columns.len()).collect()
-            } else {
-                a.table.pk.clone()
+            let key: Vec<usize> = match a.table.row_key() {
+                Some(k) => k.to_vec(),
+                None => (0..a.table.columns.len()).collect(),
             };
             if a.direct_unit.is_some()
                 || a.lookup_where
@@ -2086,7 +2103,7 @@ pub fn plan_block(
         }
     }
     let unit_unique = match mode {
-        Mode::Spj => n_alias == 1 && !aliases[0].1.pk.is_empty(),
+        Mode::Spj => n_alias == 1 && aliases[0].1.row_key().is_some(),
         Mode::Grouped => !windowed,
         _ => false,
     };
@@ -2108,12 +2125,16 @@ pub fn plan_block(
     let joined: Vec<Result<(), String>> = cascades
         .iter()
         .map(|c| {
-            let (mut keyed, mut pk) = (c.parent_cols.clone(), c.parent.pk.clone());
+            let mut keyed = c.parent_cols.clone();
             keyed.sort_unstable();
-            pk.sort_unstable();
-            if pk.is_empty() || keyed != pk {
+            let whole_key = c.parent.keys().any(|k| {
+                let mut k = k.to_vec();
+                k.sort_unstable();
+                k == keyed
+            });
+            if !whole_key {
                 return Err(format!(
-                    "the foreign key of `{}` does not reference the whole primary key of `{}`",
+                    "the foreign key of `{}` does not reference a whole key of `{}`",
                     c.child.1, c.parent.name
                 ));
             }
@@ -2419,6 +2440,81 @@ pub(crate) fn expand_star_over_using(
     }
     select.projection = projection;
     Ok(true)
+}
+
+/// Replaces every reference to a VIRTUAL generated column by its expression (parenthesized,
+/// base columns qualified with the alias); a plain projection item keeps the column's name as
+/// its alias. `Some(reason)` when an expression cannot be read.
+fn inline_virtual_columns(select: &mut Select, scope: &Scope) -> Result<Option<String>> {
+    let virtual_of = |e: &Expr| -> Option<(usize, usize)> {
+        let (a, c) = scope.resolve(e)?;
+        let col = &scope.aliases[a].1.columns[c];
+        col.generated.as_ref().filter(|g| !g.stored).map(|_| (a, c))
+    };
+    let expansion = |a: usize, c: usize| -> std::result::Result<Expr, String> {
+        let (alias, t) = &scope.aliases[a];
+        let col = &t.columns[c];
+        let g = col.generated.as_ref().expect("virtual column");
+        let unreadable = || {
+            format!(
+                "VIRTUAL generated column `{}`.`{}` with an expression the parser cannot read: {}",
+                t.name, col.name, g.expr
+            )
+        };
+        if g.deps.is_none() {
+            return Err(unreadable());
+        }
+        let mut e = parse_sql(&g.expr, |p| p.parse_expr()).ok_or_else(unreadable)?;
+        let _ = visit_expressions_mut(&mut e, |x: &mut Expr| {
+            let name = match &*x {
+                Expr::Identifier(i) => Some(ident_name(i)),
+                Expr::CompoundIdentifier(parts) => parts.last().map(ident_name),
+                _ => None,
+            };
+            if let Some(n) = name {
+                if t.col_index(&n).is_some() {
+                    *x = Expr::CompoundIdentifier(vec![qident(alias), qident(&n)]);
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        Ok(match e {
+            Expr::Nested(_) => e,
+            e => Expr::Nested(Box::new(e)),
+        })
+    };
+    let mut failed: Option<String> = None;
+    // Projection: a bare column keeps its name.
+    for item in &mut select.projection {
+        if let SelectItem::UnnamedExpr(e) = item {
+            if let Some((a, c)) = virtual_of(e) {
+                match expansion(a, c) {
+                    Ok(x) => {
+                        let name = scope.aliases[a].1.columns[c].name.clone();
+                        *item = SelectItem::ExprWithAlias {
+                            expr: x,
+                            alias: qident(&name),
+                        };
+                    }
+                    Err(r) => {
+                        failed.get_or_insert(r);
+                    }
+                };
+            }
+        }
+    }
+    let _ = visit_expressions_mut(select, |e: &mut Expr| {
+        if let Some((a, c)) = virtual_of(e) {
+            match expansion(a, c) {
+                Ok(x) => *e = x,
+                Err(r) => {
+                    failed.get_or_insert(r);
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    Ok(failed)
 }
 
 /// `db.t.col` -> `t`.`col` for columns of the FROM clause: lookups replace a table by derived
@@ -2899,6 +2995,7 @@ mod tests {
             name: name.into(),
             columns: cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
             pk: pk.to_vec(),
+            unique_keys: vec![],
             cascades: vec![],
             is_view: false,
             view_bases: vec![],
@@ -2912,6 +3009,7 @@ mod tests {
             name: name.into(),
             columns: cols,
             pk: pk.to_vec(),
+            unique_keys: vec![],
             cascades: vec![],
             is_view: false,
             view_bases: vec![],
@@ -3642,6 +3740,102 @@ mod tests {
             let d = parse_definition(sql).unwrap();
             assert!(crate::analyzer::plan(&d, "db", &cat).is_ok(), "{sql}");
         }
+    }
+
+    /// Server schema: UNIQUE NOT NULL keys identify rows like the primary key (unit of a
+    /// PK-less anchor, lineage, FD reduction of a DISTINCT, the parent key of a cascade), and
+    /// a generated column is read through its base columns (a VIRTUAL one never a key).
+    #[test]
+    fn unique_keys_and_generated_columns() {
+        use crate::catalog::Generated;
+        let mut cat = catalog();
+        let mut t = TableInfo {
+            schema: "db".into(),
+            name: "skus".into(),
+            columns: vec![
+                Column::simple("code", "varchar"),
+                Column::simple("a", "int"),
+                Column::simple("b", "int"),
+                Column::simple("g", "int"),
+                Column::simple("s", "int"),
+                Column::simple("note", "text"),
+            ],
+            pk: vec![],
+            unique_keys: vec![vec![0], vec![1, 2]],
+            cascades: vec![],
+            is_view: false,
+            view_bases: vec![],
+        };
+        for c in &mut t.columns {
+            c.nullable = c.name != "code" && c.name != "a" && c.name != "b";
+        }
+        t.columns[3].generated = Some(Generated {
+            expr: "(`a` + `b`)".into(),
+            stored: false,
+            deps: Some(vec![1, 2]),
+        });
+        t.columns[4].generated = Some(Generated {
+            expr: "(`a` * 2)".into(),
+            stored: true,
+            deps: Some(vec![1]),
+        });
+        cat.insert(("db".into(), "skus".into()), Arc::new(t));
+        let plan = |sql: &str, cat: &HashMap<TableRef, Arc<TableInfo>>| {
+            let d = parse_definition(sql).unwrap();
+            crate::analyzer::plan(&d, "db", cat).unwrap()
+        };
+        // PK-less anchor with a unique key: the key is the unit, not the referenced columns.
+        let v = plan("CREATE VIEW v AS SELECT note, a FROM skus", &cat);
+        assert_eq!(v.mode, Mode::Spj);
+        assert_eq!(v.unit_exprs, vec!["`skus`.`code`"]);
+        assert!(v.unit_unique);
+        // Lineage of a joined PK-less table through its unique key.
+        let v = plan(
+            "CREATE VIEW v AS SELECT o.id, s.note FROM orders o JOIN skus s ON s.code = o.status",
+            &cat,
+        );
+        assert_eq!(v.mode, Mode::Spj);
+        assert_eq!(v.lineage_of(1).unwrap().cols, vec!["_lv_a1_pk0"]);
+        assert_eq!(v.lineage_of(1).unwrap().exprs, vec!["`s`.`code`"]);
+        // DISTINCT over a unique key and other columns reduces to the key.
+        let v = plan(
+            "CREATE VIEW v AS SELECT DISTINCT code, note, s FROM skus",
+            &cat,
+        );
+        assert_eq!(v.mode, Mode::Grouped);
+        assert_eq!(v.unit_exprs, vec!["code"]);
+        let v = plan(
+            "CREATE VIEW v AS SELECT DISTINCT a, b, note FROM skus",
+            &cat,
+        );
+        assert_eq!(v.unit_exprs, vec!["a", "b"]);
+        // A VIRTUAL generated column is inlined as its expression (no image value exists);
+        // a STORED one is an ordinary column that reads its base column too.
+        let v = plan("CREATE VIEW v AS SELECT g, s FROM skus WHERE g > 1", &cat);
+        assert_eq!(v.projection, vec!["(`skus`.`a` + `skus`.`b`) AS `g`", "s"]);
+        assert_eq!(
+            v.where_sql.as_deref(),
+            Some("(`skus`.`a` + `skus`.`b`) > 1")
+        );
+        let a = &v.aliases[0];
+        assert!(a.referenced[1] && a.referenced[2] && a.referenced[4] && !a.referenced[3]);
+        assert!(a.membership[1] && a.membership[2]);
+        let v = plan("CREATE VIEW v AS SELECT DISTINCT g FROM skus", &cat);
+        assert_eq!(v.unit_exprs, vec!["(`skus`.`a` + `skus`.`b`)"]);
+        let mut keyless = (*cat[&("db".to_string(), "skus".to_string())]).clone();
+        keyless.unique_keys.clear();
+        cat.insert(("db".into(), "skus".into()), Arc::new(keyless));
+        let v = plan("CREATE VIEW v AS SELECT g, s FROM skus", &cat);
+        assert_eq!(v.unit_exprs, vec!["`skus`.`a`", "`skus`.`b`", "`skus`.`s`"]);
+        let mut unreadable = (*cat[&("db".to_string(), "skus".to_string())]).clone();
+        unreadable.columns[3].generated.as_mut().unwrap().deps = None;
+        cat.insert(("db".into(), "skus".into()), Arc::new(unreadable));
+        let v = plan("CREATE VIEW v AS SELECT g FROM skus", &cat);
+        assert!(
+            matches!(&v.mode, Mode::Full(r) if r.starts_with("VIRTUAL generated column `skus`.`g`")),
+            "{}",
+            v.mode
+        );
     }
 
     /// E6: lookups that replace several tables by their row images at once, with parameters in
