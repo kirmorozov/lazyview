@@ -291,6 +291,8 @@ struct Next {
     recent: Lookback,
     /// Rebuild of the unchanged live version (see `start_next`): state rows stay `ready`.
     routine: bool,
+    /// The swap runs in the background (`task`); the live version pauses until it is done.
+    swapping: bool,
 }
 
 struct Slot {
@@ -1536,6 +1538,7 @@ impl Engine {
             since: None,
             recent: Lookback::default(),
             routine,
+            swapping: false,
         });
         self.rebuild_routes();
     }
@@ -2976,6 +2979,33 @@ impl Engine {
                     return;
                 }
             }
+            // A routine rebuild swaps off the binlog loop (DDL takes seconds on some servers).
+            // The live version pauses meanwhile: its changes are buffered for this version and
+            // applied right after the swap, so readers never see older data after it.
+            if n.routine && !n.swapping && !n.targets.is_empty() {
+                let specs = n
+                    .targets
+                    .iter()
+                    .map(|t| {
+                        let target = &self.targets[t];
+                        (t.clone(), target.opts.clone(), target.schema.clone())
+                    })
+                    .collect();
+                n.task = tokio::spawn(swap_task(
+                    specs,
+                    n.name.clone(),
+                    layout,
+                    self.build_tx.clone(),
+                    (self.slots[i].def_id, n.generation),
+                ));
+                n.swapping = true;
+                if !dirty.is_empty() {
+                    n.since = since;
+                }
+                n.dirty.merge(dirty);
+                self.slots[i].next = Some(n);
+                return;
+            }
         }
         for t in n.targets.clone() {
             if n.swapped.contains(&t) {
@@ -3112,7 +3142,9 @@ impl Engine {
         };
         live_dirty.merge(n.dirty);
         live_dirty.all |= full_again;
-        live_dirty.rebuild |= dirty.rebuild;
+        // Changes not applied to the shadow (a swap that was retried, or ran in the background)
+        // apply to the new live version.
+        live_dirty.merge(dirty);
         let since = match (since, n.since) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -3168,6 +3200,10 @@ impl Engine {
     }
 
     async fn refresh_live(&mut self, i: usize) {
+        // A routine rebuild is being swapped in: changes wait for it (see `finish_next`).
+        if self.slots[i].next.as_ref().is_some_and(|n| n.swapping) {
+            return;
+        }
         self.retry_lag(i).await;
         let def_id = self.slots[i].def_id;
         let replan_pending = self.replan.contains_key(&def_id);
@@ -3871,6 +3907,54 @@ struct BuildSpec {
     check_side: bool,
     /// Refuse if a table `<name>` exists (one lazyview did not create).
     check_table: bool,
+}
+
+/// Swaps the shadow tables of a routine rebuild in, off the binlog loop (see `finish_next`).
+/// A target where that fails is left to the engine, which retries it as for any build.
+async fn swap_task(
+    targets: Vec<(String, Opts, String)>,
+    name: String,
+    layout: Layout,
+    tx: mpsc::UnboundedSender<BuildDone>,
+    (def_id, generation): (u64, u64),
+) {
+    let mut swapped = Vec::new();
+    for (t, opts, schema) in targets {
+        let r = async {
+            let mut c = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT * 3, connect(&opts)).await
+            {
+                Ok(r) => r?,
+                Err(_) => bail!("connecting to target {t}: timed out"),
+            };
+            // A reader holding the old table's metadata lock: wait for it a while.
+            let mut attempts = 0;
+            let r = loop {
+                match mv::swap(&mut c, &schema, &name).await {
+                    Err(e) if server_code(&e) == Some(1205) && attempts < 12 => {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    r => break r,
+                }
+            };
+            let _ = c.disconnect().await;
+            r
+        }
+        .await;
+        match r {
+            Ok(()) => swapped.push(t),
+            Err(e) => debug!(view = %name, target = %t, "swap left to the engine: {e:#}"),
+        }
+    }
+    let _ = tx.send(BuildDone {
+        def_id,
+        generation,
+        result: Ok(Built {
+            layout,
+            failed: Vec::new(),
+            swapped,
+        }),
+    });
 }
 
 /// Connects to a build target, runs its ownership checks and creates the shadow table.

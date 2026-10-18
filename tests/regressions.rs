@@ -841,7 +841,8 @@ fn reg_failed_full_rebuild_backs_off() {
         let spec = ViewSpec::new(
             "r_skus",
             Kind::Full,
-            "SELECT DISTINCT sku FROM products WHERE active = 1",
+            // NOW() keeps it a full-refresh view (DISTINCT alone is maintained incrementally).
+            "SELECT DISTINCT sku FROM products WHERE active = 1 AND NOW() > '2000-01-01'",
         );
         let specs = vec![spec.clone()];
         let (db, mut eng) = setup(
@@ -1084,7 +1085,8 @@ fn reg_crash_with_stale_full_view() {
             ViewSpec::new(
                 "r_statuses",
                 Kind::Full,
-                "SELECT DISTINCT status FROM orders",
+                // NOW() keeps it a full-refresh view (DISTINCT alone is maintained incrementally).
+                "SELECT DISTINCT status FROM orders WHERE NOW() > '2000-01-01'",
             ),
             ViewSpec::new(
                 "r_orders",
@@ -1269,7 +1271,8 @@ fn reg_held_back_position_does_not_spin() {
         let specs = vec![ViewSpec::new(
             "r_statuses",
             Kind::Full,
-            "SELECT DISTINCT status FROM orders",
+            // NOW() keeps it a full-refresh view (DISTINCT alone is maintained incrementally).
+            "SELECT DISTINCT status FROM orders WHERE NOW() > '2000-01-01'",
         )];
         let (db, mut eng) = setup(
             &ctx,
@@ -1766,4 +1769,387 @@ fn reg_lineage_without_primary_key() {
         }
         eng.stop().await
     });
+}
+
+/// JSON unit keys (MySQL/Percona) must be matched as JSON values: the server groups JSON-equal
+/// values (`{"a": 1}` with `{"a": 1.0}`) but compares a JSON column with a plain string
+/// parameter as text, so the refresh filters (source read, MV read and the DELETE) never found a
+/// dirty unit's rows and the MV went stale. Drives `mv::apply` directly with the filters the
+/// engine uses: the planner still runs JSON group keys in full mode, so no engine path reaches
+/// them yet. MariaDB (JSON is LONGTEXT) runs the plain path.
+#[test]
+fn reg_json_unit_filters_match_json_equal_groups() {
+    scenario("reg_json_units", |ctx| async move {
+        use lazyview::accumulate::{UnitChunk, UnitKind};
+        use lazyview::datum::Datum;
+        use lazyview::mv::{self, Layout, MvCol};
+        use lazyview::Metrics;
+        use mysql_async::prelude::Queryable;
+        use mysql_async::Value;
+
+        let db = ctx.new_db("reg_json_units").await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &[
+                "CREATE TABLE jt (id INT PRIMARY KEY, g INT NULL, doc JSON NULL)",
+                "CREATE TABLE mv_j (doc JSON NULL, n BIGINT NOT NULL)",
+                "CREATE TABLE mv_gj (g INT NULL, doc JSON NULL, n BIGINT NOT NULL)",
+                r#"INSERT INTO jt VALUES (1, 1, '{"a": 1}'), (2, 1, '{"a": 1.0}'), (3, 2, '{"b": [1, 2]}'), (4, 2, NULL), (5, NULL, '{"a": 1}')"#,
+            ],
+        )
+        .await?;
+        // The MV layout as `mv::probe` builds it: column types from information_schema (`json`
+        // on MySQL/Percona, `longtext` on MariaDB), the first `units` columns as the unit.
+        async fn probe(
+            c: &mut mysql_async::Conn,
+            schema: &str,
+            table: &str,
+            units: usize,
+        ) -> Result<Layout> {
+            let rows: Vec<(String, String, String, String)> = c
+                .exec(
+                    "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(IS_NULLABLE AS CHAR) \
+                     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    (schema, table),
+                )
+                .await?;
+            let cols: Vec<MvCol> = rows
+                .into_iter()
+                .map(|(name, column_type, data_type, nullable)| MvCol {
+                    src_name: name.clone(),
+                    name,
+                    column_type,
+                    data_type: data_type.to_ascii_lowercase(),
+                    charset: None,
+                    collation: None,
+                    nullable: nullable == "YES",
+                })
+                .collect();
+            Ok(Layout {
+                n_visible: cols.len(),
+                hidden: Vec::new(),
+                unit_pos: (0..units).collect(),
+                primary: false,
+                lineage: Vec::new(),
+                epoch: Vec::new(),
+                cols,
+            })
+        }
+        let is_json = |l: &Layout| l.unit_kinds().contains(&UnitKind::Json);
+        let l_j = probe(&mut c, &db.name, "mv_j", 1).await?;
+        let l_gj = probe(&mut c, &db.name, "mv_gj", 2).await?;
+        ensure!(
+            is_json(&l_j) == !ctx.servers[0].is_mariadb(),
+            "JSON unit kind: {:?} (MariaDB stores JSON as LONGTEXT)",
+            l_j.unit_kinds()
+        );
+        let metrics = Metrics::default();
+        // Rows of the view's query for the chunk's units (what `mv::read_source` does).
+        async fn rows(
+            c: &mut mysql_async::Conn,
+            layout: &Layout,
+            select: &str,
+            unit_exprs: &[&str],
+            chunk: Option<&UnitChunk>,
+        ) -> Result<Vec<Vec<Value>>> {
+            let exprs: Vec<String> = unit_exprs.iter().map(|e| e.to_string()).collect();
+            let (f, p) = match chunk {
+                Some(ch) => ch.filter_typed(&exprs, &layout.unit_kinds()),
+                None => ("TRUE".into(), Vec::new()),
+            };
+            let sql = select.replace("{F}", &f);
+            let rows: Vec<mysql_async::Row> = c.exec(sql, p).await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| layout.normalize_source(r.unwrap()))
+                .collect())
+        }
+        // The MV must hold exactly the oracle's groups (JSON-equal keys, equal counts).
+        async fn check(
+            c: &mut mysql_async::Conn,
+            mv: &str,
+            oracle: &str,
+            on: &str,
+            what: &str,
+        ) -> Result<()> {
+            let (a, b, both): (i64, i64, i64) = c
+                .query_first(format!(
+                    "SELECT (SELECT COUNT(*) FROM {mv}), (SELECT COUNT(*) FROM ({oracle}) o), \
+                     (SELECT COUNT(*) FROM {mv} m JOIN ({oracle}) o ON {on} AND o.n = m.n)"
+                ))
+                .await?
+                .context("counts")?;
+            ensure!(
+                a == b && b == both,
+                "{what}: {mv} has {a} rows, the oracle {b}, {both} agree"
+            );
+            Ok(())
+        }
+        let j = |s: &str| Datum::Bytes(s.as_bytes().to_vec());
+        let sel_j = "SELECT doc, COUNT(*) AS n FROM jt WHERE {F} GROUP BY doc";
+        let orc_j = "SELECT doc, COUNT(*) AS n FROM jt GROUP BY doc";
+        let on_j = "o.doc <=> m.doc";
+        let sel_gj = "SELECT g, doc, COUNT(*) AS n FROM jt WHERE {F} GROUP BY g, doc";
+        let orc_gj = "SELECT g, doc, COUNT(*) AS n FROM jt GROUP BY g, doc";
+        let on_gj = "o.g <=> m.g AND o.doc <=> m.doc";
+        // Dirty keys as the engine sees them: on MySQL the binlog decoder renders the binary JSON
+        // (serde_json: no spaces, floats with a fraction) and the server compares JSON values; on
+        // MariaDB the text is stored as written and compared as text, so every text is its own
+        // group and the images are the exact texts.
+        let maria = ctx.servers[0].is_mariadb();
+        let key = |mysql: &str, mariadb: &str| j(if maria { mariadb } else { mysql });
+        // Initial fill of the single-column view (the whole view).
+        let r = rows(&mut c, &l_j, sel_j, &["doc"], None).await?;
+        mv::apply(&mut c, &db.name, "mv_j", &l_j, None, &r, 1000, &metrics).await?;
+        check(&mut c, "mv_j", orc_j, on_j, "initial fill").await?;
+        // Row 3 moves to the {"a": 1} group (a new text group on MariaDB).
+        exec(&mut c, r#"UPDATE jt SET doc = '{"a": 1.00}' WHERE id = 3"#).await?;
+        let chunk = UnitChunk::Keys(vec![
+            Box::new([key(r#"{"b":[1,2]}"#, r#"{"b": [1, 2]}"#)]),
+            Box::new([key(r#"{"a":1.0}"#, r#"{"a": 1.00}"#)]),
+        ]);
+        let r = rows(&mut c, &l_j, sel_j, &["doc"], Some(&chunk)).await?;
+        ensure!(
+            r.len() == 1,
+            "source read of the two dirty JSON units found {} groups, expected 1",
+            r.len()
+        );
+        mv::apply(
+            &mut c,
+            &db.name,
+            "mv_j",
+            &l_j,
+            Some(&chunk),
+            &r,
+            1000,
+            &metrics,
+        )
+        .await?;
+        check(
+            &mut c,
+            "mv_j",
+            orc_j,
+            on_j,
+            "update into a JSON-equal group",
+        )
+        .await?;
+        // The {"a": 1} group disappears: the DELETE must find the MV row(s).
+        exec(&mut c, "DELETE FROM jt WHERE id IN (1, 2, 3, 5)").await?;
+        let chunk = UnitChunk::Keys(if maria {
+            vec![
+                Box::new([j(r#"{"a": 1}"#)]),
+                Box::new([j(r#"{"a": 1.0}"#)]),
+                Box::new([j(r#"{"a": 1.00}"#)]),
+            ]
+        } else {
+            vec![Box::new([j(r#"{"a":1}"#)])]
+        });
+        let r = rows(&mut c, &l_j, sel_j, &["doc"], Some(&chunk)).await?;
+        ensure!(
+            r.is_empty(),
+            "deleted JSON unit still has {} source groups",
+            r.len()
+        );
+        mv::apply(
+            &mut c,
+            &db.name,
+            "mv_j",
+            &l_j,
+            Some(&chunk),
+            &r,
+            1000,
+            &metrics,
+        )
+        .await?;
+        check(&mut c, "mv_j", orc_j, on_j, "delete of a JSON group").await?;
+        // Composite units with NULLs: plain tuples and the null-safe branch bind per position.
+        let r = rows(&mut c, &l_gj, sel_gj, &["g", "doc"], None).await?;
+        mv::apply(&mut c, &db.name, "mv_gj", &l_gj, None, &r, 1000, &metrics).await?;
+        check(&mut c, "mv_gj", orc_gj, on_gj, "initial fill (composite)").await?;
+        run(
+            &mut c,
+            &[
+                r#"INSERT INTO jt VALUES (6, 1, '{"a": 1.0}'), (7, NULL, '{"a":1}'), (8, 3, NULL)"#,
+                "UPDATE jt SET g = 3 WHERE id = 4",
+            ],
+        )
+        .await?;
+        let chunk = UnitChunk::Keys(vec![
+            Box::new([Datum::Int(1), key(r#"{"a":1.0}"#, r#"{"a": 1.0}"#)]),
+            Box::new([Datum::Int(1), key(r#"{"a":1}"#, r#"{"a": 1.0}"#)]),
+            Box::new([Datum::Null, key(r#"{"a":1.0}"#, r#"{"a":1}"#)]),
+            Box::new([Datum::Int(2), Datum::Null]),
+            Box::new([Datum::Int(3), Datum::Null]),
+        ]);
+        let r = rows(&mut c, &l_gj, sel_gj, &["g", "doc"], Some(&chunk)).await?;
+        ensure!(
+            r.len() == 3,
+            "source read of the composite JSON units found {} groups, expected 3",
+            r.len()
+        );
+        mv::apply(
+            &mut c,
+            &db.name,
+            "mv_gj",
+            &l_gj,
+            Some(&chunk),
+            &r,
+            1000,
+            &metrics,
+        )
+        .await?;
+        check(&mut c, "mv_gj", orc_gj, on_gj, "composite units with NULLs").await?;
+        Ok(())
+    });
+}
+
+/// A view grouped by a JSON column stays equal to its oracle through inserts, updates and
+/// deletes of JSON-equal and NULL values. The planner runs it in full mode today ("JSON group
+/// key"); once it is maintained incrementally (typed unit filters, see
+/// `reg_json_unit_filters_match_json_equal_groups`), no change may fall back to a rebuild.
+#[test]
+fn reg_json_group_key_view() {
+    scenario("reg_json_view", |ctx| async move {
+        use mysql_async::prelude::Queryable;
+        let specs = vec![ViewSpec::new(
+            "r_docs",
+            Kind::Full,
+            "SELECT doc, COUNT(*) AS n FROM jdocs GROUP BY doc",
+        )];
+        let (db, mut eng) = setup(
+            &ctx,
+            "reg_json_view",
+            &[
+                "CREATE TABLE jdocs (id INT PRIMARY KEY, doc JSON NULL)",
+                r#"INSERT INTO jdocs VALUES (1, '{"a": 1}'), (2, '{"b": [1, 2]}'), (3, NULL)"#,
+            ],
+            &specs,
+            &[],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        let mode: Option<String> = c
+            .query_first("SELECT `mode` FROM _lazyview_state WHERE name = 'r_docs'")
+            .await?;
+        let incremental = mode.as_deref() == Some("incremental");
+        for (what, stmt) in [
+            (
+                "JSON-equal inserts",
+                r#"INSERT INTO jdocs VALUES (4, '{"a": 1.0}'), (5, '{"a": 1.00}'), (6, '{"b": [1.0, 2]}')"#,
+            ),
+            (
+                "update into a JSON-equal group",
+                r#"UPDATE jdocs SET doc = '{"b": [1, 2.0]}' WHERE id = 1"#,
+            ),
+            ("update to NULL", "UPDATE jdocs SET doc = NULL WHERE id = 4"),
+            ("delete", "DELETE FROM jdocs WHERE id IN (2, 5, 6)"),
+        ] {
+            let before = eng.snapshot();
+            exec(&mut c, stmt).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+            let d = eng.snapshot().since(&before);
+            ensure!(
+                !incremental || d.full_rebuilds == 0,
+                "{what}: an incremental JSON group key view fell back to a rebuild: {}",
+                fmt_snapshot(&d)
+            );
+        }
+        eng.stop().await
+    });
+}
+
+/// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
+/// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
+/// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed
+/// with an unknown column `paid`. Opt-in (changes a GLOBAL): `LAZYVIEW_TEST_GLOBAL_SQL_MODE=1`.
+#[test]
+fn reg_global_sql_mode_parser_flags() {
+    scenario("reg_sql_mode", |ctx| async move {
+        if std::env::var("LAZYVIEW_TEST_GLOBAL_SQL_MODE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+        {
+            ctx.note(
+                "SKIP: changes GLOBAL sql_mode; set LAZYVIEW_TEST_GLOBAL_SQL_MODE=1 to run it",
+            );
+            return Ok(());
+        }
+        let db = ctx.new_db("reg_sql_mode").await?;
+        let mut admin = db.conn().await?;
+        let old = scalar(&mut admin, "SELECT CAST(@@GLOBAL.sql_mode AS CHAR)")
+            .await?
+            .unwrap_or_default();
+        exec(
+            &mut admin,
+            "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ANSI_QUOTES,PIPES_AS_CONCAT')",
+        )
+        .await?;
+        let r = sql_mode_scenario(&ctx, &db).await;
+        let restored = exec(&mut admin, &format!("SET GLOBAL sql_mode = {}", q(&old))).await;
+        r.and(restored)
+    });
+}
+
+async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
+    use mysql_async::prelude::Queryable;
+    // This connection inherits the global mode: the test's own SQL uses single quotes.
+    let mut c = db.conn().await?;
+    let mode = scalar(&mut c, "SELECT CAST(@@SESSION.sql_mode AS CHAR)")
+        .await?
+        .unwrap_or_default();
+    ensure!(
+        mode.contains("ANSI_QUOTES"),
+        "new sessions do not inherit the global mode: {mode}"
+    );
+    run(
+        &mut c,
+        &[
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT NOT NULL, status VARCHAR(10) NOT NULL)",
+            "INSERT INTO orders VALUES (10, 1, 'new'), (11, 1, 'paid'), (12, 2, 'new'), (13, 3, 'paid')",
+        ],
+    )
+    .await?;
+    // Written for the default mode: "paid" is a string.
+    let specs = vec![ViewSpec::new(
+        "r_paid",
+        Kind::Incremental,
+        r#"SELECT customer_id, COUNT(*) AS n FROM orders WHERE status = "paid" GROUP BY customer_id"#,
+    )];
+    ensure_lazyview_table(&mut c).await?;
+    add_views(&mut c, &specs).await?;
+    let mut eng = ctx.start_engine(db, &[])?;
+    wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+    let mode: Option<String> = c
+        .query_first("SELECT `mode` FROM _lazyview_state WHERE name = 'r_paid'")
+        .await?;
+    ensure!(
+        mode.as_deref() == Some("incremental"),
+        "r_paid is not incremental: {mode:?}"
+    );
+    async fn same(c: &mut mysql_async::Conn, what: &str) -> Result<()> {
+        let mv: Vec<(i64, i64)> = c
+            .query("SELECT customer_id, n FROM r_paid ORDER BY 1")
+            .await?;
+        let src: Vec<(i64, i64)> = c
+            .query("SELECT customer_id, COUNT(*) FROM orders WHERE status = 'paid' GROUP BY customer_id ORDER BY 1")
+            .await?;
+        ensure!(mv == src, "{what}: r_paid {mv:?} != source {src:?}");
+        Ok(())
+    }
+    same(&mut c, "initial").await?;
+    let mut sc = db.conn().await?;
+    for (what, stmt) in [
+        (
+            "status change",
+            "UPDATE orders SET status = 'paid' WHERE id = 10",
+        ),
+        ("insert", "INSERT INTO orders VALUES (14, 2, 'paid')"),
+        ("delete", "DELETE FROM orders WHERE id IN (11, 13)"),
+    ] {
+        exec(&mut c, stmt).await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        same(&mut c, what).await?;
+    }
+    eng.stop().await
 }

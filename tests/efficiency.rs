@@ -532,11 +532,21 @@ fn efficiency_full_refresh_cadence() {
     scenario("eff_cadence", |ctx| async move {
         let db = ctx.new_db("eff_cadence").await?;
         setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::tiny()).await?;
-        let keep = ["v_distinct_methods", "v_events_big"];
-        let specs: Vec<ViewSpec> = ecommerce_views()
-            .into_iter()
-            .filter(|v| keep.contains(&v.name.as_str()))
-            .collect();
+        // Full-refresh copies of the workload's v_distinct_methods / v_events_big: DISTINCT and
+        // PK-less sources are maintained incrementally now, so NOW() (non-deterministic) keeps
+        // these plans Full while the always-true predicate leaves the rows as in the workload.
+        let specs = vec![
+            ViewSpec::new(
+                "v_distinct_methods",
+                Kind::Full,
+                "SELECT DISTINCT method, status FROM payments WHERE NOW() > '2000-01-01'",
+            ),
+            ViewSpec::new(
+                "v_events_big",
+                Kind::Full,
+                "SELECT customer_id, kind, amount FROM events_log WHERE amount > 50 AND NOW() > '2000-01-01'",
+            ),
+        ];
         let interval = Duration::from_millis(3000);
         let interval_ms = interval.as_millis().to_string();
         let (mut eng, _ids) = start_with_views(
