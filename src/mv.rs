@@ -204,11 +204,21 @@ impl Layout {
 
     /// Brings a row read with [`Layout::read_list`] (or [`Layout::normalize_source`]) into the
     /// form that is compared and written back: BIT values as unsigned integers (bound as strings
-    /// the server stores 0 for `b'11111111'`), TIMESTAMP epochs as UTC datetimes.
+    /// the server stores 0 for `b'11111111'`), TIME values in the form every server accepts as a
+    /// parameter (see [`crate::datum::time_param`]), TIMESTAMP epochs as UTC datetimes.
     pub fn normalize(&self, mut row: Vec<Value>) -> Vec<Value> {
         for (c, v) in self.cols.iter().zip(row.iter_mut()) {
-            if let ("bit", Value::Bytes(b)) = (c.data_type.as_str(), &*v) {
-                *v = Value::UInt(b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64));
+            match (c.data_type.as_str(), &*v) {
+                ("bit", Value::Bytes(b)) => {
+                    *v = Value::UInt(b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64));
+                }
+                // TIME values MySQL >= 9.0 rejects as binary parameters go as text (both the
+                // rows read from the source and those read back from the table, so they
+                // still compare equal).
+                ("time", Value::Time(..)) => {
+                    *v = crate::datum::time_param(std::mem::replace(v, Value::NULL));
+                }
+                _ => {}
             }
         }
         for (p, _) in &self.epoch {
