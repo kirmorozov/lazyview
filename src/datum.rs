@@ -21,6 +21,29 @@ pub enum Datum {
 /// A tuple of datums (a unit key, a primary key or a projected row image).
 pub type Key = Box<[Datum]>;
 
+/// A TIME value as the server accepts it as a parameter. MySQL >= 9.0 (26.x included) rejects a
+/// binary-protocol TIME parameter in the last hour of the range when it has a fraction ("TIME
+/// value is out of range in 'set_parameter_value'" for 838:00:00.5 up to 838:59:59.999999,
+/// either sign), although the server stores and returns such values (8.4 and MariaDB accept the
+/// parameter). Such a value is sent as text instead, which every server converts like a literal
+/// (lookups wrap it in `CAST(? AS TIME(6))`, see `Column::param_sql`; a TIME column takes it as
+/// is). Other values pass through unchanged.
+pub fn time_param(v: Value) -> Value {
+    match v {
+        Value::Time(neg, d, h, i, s, us) if us != 0 && d * 24 + u32::from(h) >= 838 => {
+            Value::Bytes(
+                format!(
+                    "{}{}:{i:02}:{s:02}.{us:06}",
+                    if neg { "-" } else { "" },
+                    d * 24 + u32::from(h)
+                )
+                .into_bytes(),
+            )
+        }
+        v => v,
+    }
+}
+
 impl Datum {
     /// Unsigned values that fit are stored as `Int` so binlog- and query-sourced keys compare equal.
     pub fn uint(v: u64) -> Datum {
@@ -42,7 +65,7 @@ impl Datum {
             Datum::Float(b) => Value::Double(f64::from_bits(*b)),
             Datum::Bytes(b) => Value::Bytes(b.clone()),
             Datum::Date(y, m, d, h, i, s, us) => Value::Date(*y, *m, *d, *h, *i, *s, *us),
-            Datum::Time(neg, d, h, i, s, us) => Value::Time(*neg, *d, *h, *i, *s, *us),
+            Datum::Time(neg, d, h, i, s, us) => time_param(Value::Time(*neg, *d, *h, *i, *s, *us)),
         }
     }
 
@@ -140,6 +163,30 @@ mod tests {
 
     fn bv(v: Value) -> BinlogValue<'static> {
         BinlogValue::Value(v)
+    }
+
+    #[test]
+    fn time_param_in_the_last_hour_with_a_fraction_is_text() {
+        // Accepted as binary TIME by every server.
+        let plain = Datum::Time(true, 34, 21, 59, 59, 990_000); // -837:59:59.99
+        assert_eq!(plain.to_value(), Value::Time(true, 34, 21, 59, 59, 990_000));
+        let whole = Datum::Time(true, 34, 22, 59, 59, 0); // -838:59:59
+        assert_eq!(whole.to_value(), Value::Time(true, 34, 22, 59, 59, 0));
+        // Rejected by MySQL >= 9.0 as a binary parameter: sent as text instead.
+        let edge = Datum::Time(true, 34, 22, 59, 58, 990_000); // -838:59:58.99
+        assert_eq!(edge.to_value(), Value::Bytes(b"-838:59:58.990000".to_vec()));
+        let pos = Datum::Time(false, 34, 22, 0, 0, 500_000); // 838:00:00.5
+        assert_eq!(pos.to_value(), Value::Bytes(b"838:00:00.500000".to_vec()));
+        // Rows read back from a table go through the same conversion.
+        assert_eq!(
+            time_param(Value::Time(true, 34, 22, 59, 58, 990_000)),
+            Value::Bytes(b"-838:59:58.990000".to_vec())
+        );
+        assert_eq!(time_param(Value::Int(5)), Value::Int(5));
+        assert_eq!(
+            time_param(Value::Time(false, 0, 1, 2, 3, 4)),
+            Value::Time(false, 0, 1, 2, 3, 4)
+        );
     }
 
     #[test]
