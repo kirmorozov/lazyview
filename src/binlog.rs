@@ -3,7 +3,8 @@
 //! # Connecting
 //!
 //! Plain `mysql_async::Opts::from_url(dsn)` works against every supported server (verified on
-//! MySQL 8.0 / 8.4, Percona 8.0 / 8.4, MariaDB 10.11 / 11.4), including accounts using
+//! MySQL 8.4 / 26.7, Percona 8.4 / 9.7, MariaDB 10.11 / 13.0 and the 13.2 preview; earlier also
+//! on the now EOL MySQL 8.0, Percona 8.0 and on MariaDB 11.4), including accounts using
 //! `caching_sha2_password` (the MySQL 8.x default) **without TLS**: when the server asks for full
 //! authentication over an insecure channel, mysql_async fetches the server's RSA public key and
 //! sends the password RSA-encrypted (needs only the default
@@ -33,6 +34,8 @@
 //!   `Tracker::boundary_here`.
 //! * MariaDB omits ANNOTATE_ROWS events (holes in the offsets) on every version; `log_pos` of
 //!   the following event is still exact.
+//! * MariaDB >= 12.3 splits a rows event larger than `binlog_row_event_fragment_threshold`
+//!   (default 1 GiB) into `Partial_rows` events; they are reassembled into the rows event.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -202,7 +205,10 @@ fn value_str(v: Option<&Value>) -> String {
 /// listing every violated requirement.
 ///
 /// On MariaDB `log_bin_compress=OFF` is required as well: compressed events (types 165–171)
-/// cannot be decoded by this reader.
+/// cannot be decoded by this reader. So is a file binlog: with `binlog_storage_engine=innodb`
+/// (MariaDB >= 12.3) the server only serves binlog dumps that start from a GTID ("GTID starting
+/// position is required on master with --binlog-storage-engine enabled"), and this reader
+/// starts and resumes from a file and offset.
 pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     let row: Row = conn
         .query_first(
@@ -216,16 +222,30 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     let format = value_str(row.as_ref(2));
     let image = value_str(row.as_ref(3));
     let flavor = Flavor::from_version(&version);
-    let compress = if flavor == Flavor::MariaDb {
+    let mut compress = String::new();
+    let mut storage_engine = String::new();
+    if flavor == Flavor::MariaDb {
+        // Variables missing on older servers (binlog_storage_engine before 12.3): nothing to
+        // check.
         let v: Option<Value> = conn
             .query_first("SELECT @@GLOBAL.log_bin_compress")
             .await
-            .unwrap_or(None); // variable missing on very old servers: nothing to check
-        value_str(v.as_ref())
-    } else {
-        String::new()
-    };
-    let mut problems = requirement_problems(flavor, &log_bin, &format, &image, &compress);
+            .unwrap_or(None);
+        compress = value_str(v.as_ref());
+        let v: Option<Value> = conn
+            .query_first("SELECT @@GLOBAL.binlog_storage_engine")
+            .await
+            .unwrap_or(None);
+        storage_engine = value_str(v.as_ref());
+    }
+    let mut problems = requirement_problems(
+        flavor,
+        &log_bin,
+        &format,
+        &image,
+        &compress,
+        &storage_engine,
+    );
     if flavor == Flavor::MySql {
         // Partial JSON row images carry diffs instead of values; lazyview needs full values.
         let opts: Option<Value> = conn
@@ -259,6 +279,7 @@ fn requirement_problems(
     format: &str,
     image: &str,
     compress: &str,
+    storage_engine: &str,
 ) -> Vec<String> {
     let on = |v: &str| matches!(v.to_ascii_uppercase().as_str(), "1" | "ON");
     let maria = flavor == Flavor::MariaDb;
@@ -314,6 +335,13 @@ fn requirement_problems(
                 .into(),
         );
     }
+    if maria && !storage_engine.is_empty() {
+        problems.push(format!(
+            "binlog_storage_engine is {storage_engine} (must be unset: a binlog kept in the \
+             storage engine is only served to replicas that start from a GTID, lazyview reads \
+             it by file and position); fix: remove binlog_storage_engine from my.cnf and restart"
+        ));
+    }
     problems
 }
 
@@ -325,18 +353,35 @@ fn show(v: &str) -> &str {
     }
 }
 
-/// Current end of the binlog (`SHOW BINARY LOG STATUS`, falling back to `SHOW MASTER STATUS`).
-pub async fn current_position(conn: &mut Conn) -> Result<Position> {
-    const NEW: &str = "SHOW BINARY LOG STATUS"; // MySQL >= 8.2 (SHOW MASTER STATUS removed in 8.4)
-    const OLD: &str = "SHOW MASTER STATUS"; // MySQL 8.0/8.1, MariaDB
-    let (major, minor, _) = conn.server_version();
-    let order = if (major == 8 && minor >= 2) || major == 9 {
+/// The two spellings of the binlog status statement, the one the server is expected to know
+/// first (the other is tried on a parse error).
+///
+/// The flavor follows from the version the handshake reports: MySQL and Percona are 8.x, 9.x
+/// and, since 26.7, calendar versions (`YY.M`); MariaDB is 10.x to 13.x (mysql_async strips its
+/// `5.5.5-` prefix). `SHOW BINARY LOG STATUS` exists on MySQL >= 8.2 (`SHOW MASTER STATUS` was
+/// removed in 8.4) and on MariaDB >= 13.0, which still accepts `SHOW MASTER STATUS` as well.
+fn status_statements(major: u16, minor: u16) -> [&'static str; 2] {
+    const NEW: &str = "SHOW BINARY LOG STATUS";
+    const OLD: &str = "SHOW MASTER STATUS";
+    let new_first = match major {
+        8 => minor >= 2,
+        9 => true,
+        // MariaDB; version numbers up to 25 cannot be a calendar MySQL version.
+        10..=25 => false,
+        _ => major >= 26,
+    };
+    if new_first {
         [NEW, OLD]
     } else {
         [OLD, NEW]
-    };
+    }
+}
+
+/// Current end of the binlog (`SHOW BINARY LOG STATUS`, falling back to `SHOW MASTER STATUS`).
+pub async fn current_position(conn: &mut Conn) -> Result<Position> {
+    let (major, minor, _) = conn.server_version();
     let mut parse_errors = Vec::new();
-    for q in order {
+    for q in status_statements(major, minor) {
         match conn.query_first::<Row, _>(q).await {
             Ok(Some(row)) => {
                 let file = value_str(row.as_ref(0));
@@ -568,6 +613,7 @@ mod ty {
     pub const MARIA_GTID: u8 = 162;
     pub const MARIA_QUERY_COMPRESSED: u8 = 165;
     pub const MARIA_DELETE_ROWS_COMPRESSED: u8 = 171;
+    pub const MARIA_PARTIAL_ROWS: u8 = 172;
 }
 
 /// Table id of the dummy rows event that only carries the end-of-statement flag.
@@ -582,6 +628,17 @@ struct Payload {
     remaining: u64,
 }
 
+/// A rows event being reassembled from MariaDB `Partial_rows` fragments.
+#[derive(Debug)]
+struct Partial {
+    total: u32,
+    /// Sequence number of the next fragment (they start at 1).
+    next: u32,
+    /// Length of the whole rows event, from the first fragment.
+    len: u64,
+    buf: Vec<u8>,
+}
+
 /// Position bookkeeping and event → [`Item`] mapping, independent of the connection.
 struct Tracker {
     flavor: Flavor,
@@ -594,6 +651,7 @@ struct Tracker {
     /// Position of the last `Commit` / `Statement` (or the start position).
     boundary: Position,
     payload: Option<Payload>,
+    partial: Option<Partial>,
     /// Table maps by id, tagged with the file generation they were seen in. Entries survive one
     /// ROTATE (unlike mysql_common's map), so rows buffered across a rotate still decode.
     tables: HashMap<u64, (u64, TableMapEvent<'static>, Option<Time2Twin>)>,
@@ -610,6 +668,7 @@ impl Tracker {
             pos_exact: true,
             boundary: from.clone(),
             payload: None,
+            partial: None,
             tables: HashMap::new(),
             generation: 0,
             queued: None,
@@ -1027,6 +1086,101 @@ impl Tracker {
         self.boundary.clone()
     }
 
+    /// `Item::Rows` for a rows event (`Item::Other` for the dummy end-of-statement one).
+    fn rows_item(&self, ev: Event) -> Result<Item> {
+        let et = ev.header().event_type_raw();
+        let kind = match et {
+            ty::WRITE_ROWS_V1 | ty::WRITE_ROWS => RowsKind::Insert,
+            ty::DELETE_ROWS_V1 | ty::DELETE_ROWS => RowsKind::Delete,
+            ty::UPDATE_ROWS_V1 | ty::UPDATE_ROWS | ty::PARTIAL_UPDATE_ROWS => RowsKind::Update,
+            _ => bail!("event type {et} at {} is not a rows event", self.pos),
+        };
+        let table_id = match ev
+            .read_data()
+            .with_context(|| format!("parsing rows event at {}", self.pos))?
+        {
+            Some(EventData::RowsEvent(re)) => re.table_id(),
+            _ => bail!(
+                "event type {et} at {} did not parse as a rows event",
+                self.pos
+            ),
+        };
+        Ok(if table_id == DUMMY_TABLE_ID {
+            Item::Other
+        } else {
+            Item::Rows {
+                table_id,
+                kind,
+                event: ev,
+            }
+        })
+    }
+
+    /// Adds a MariaDB `Partial_rows` fragment (type 172, MariaDB >= 12.3); returns the rows event
+    /// once its last fragment is in.
+    ///
+    /// Body: fragment count u32, sequence number u32 (from 1), flags u8; the first fragment then
+    /// has the length of the whole rows event u64. The fragments follow each other and their
+    /// payloads concatenate to the rows event (header and body, without its checksum, although
+    /// its header counts one).
+    fn partial_rows(&mut self, ev: &Event) -> Result<Option<Event>> {
+        let data = ev.data();
+        let at = &self.pos;
+        let bad = || {
+            anyhow!(
+                "malformed MariaDB Partial_rows event at {at} ({} bytes)",
+                data.len()
+            )
+        };
+        let u32_at = |i: usize| {
+            data.get(i..i + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        };
+        let total = u32_at(0).ok_or_else(bad)?;
+        let seq = u32_at(4).ok_or_else(bad)?;
+        let mut payload = data.get(9..).ok_or_else(bad)?;
+        if seq == 1 {
+            let len = payload
+                .get(..8)
+                .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+                .ok_or_else(bad)?;
+            payload = &payload[8..];
+            self.partial = Some(Partial {
+                total,
+                next: 1,
+                len,
+                buf: Vec::new(),
+            });
+        }
+        let Some(p) = self
+            .partial
+            .as_mut()
+            .filter(|p| p.next == seq && p.total == total)
+        else {
+            bail!("MariaDB Partial_rows fragment {seq} of {total} at {at} does not continue a rows event");
+        };
+        p.buf.extend_from_slice(payload);
+        p.next += 1;
+        if seq < total {
+            return Ok(None);
+        }
+        let Partial { len, mut buf, .. } = self.partial.take().expect("checked above");
+        if buf.len() as u64 != len || buf.len() < 19 {
+            bail!(
+                "MariaDB Partial_rows fragments ending at {at} hold {} bytes, the rows event has {len}",
+                buf.len()
+            );
+        }
+        let size = u32::try_from(buf.len()).context("reassembled rows event over 4 GiB")?;
+        buf[9..13].copy_from_slice(&size.to_le_bytes());
+        let mut footer = ev.fde().footer();
+        footer.set_checksum_enabled(false);
+        let fde = ev.fde().clone().with_footer(footer);
+        let rows = Event::read(&fde, &buf[..])
+            .with_context(|| format!("reading the rows event reassembled at {at}"))?;
+        Ok(Some(rows))
+    }
+
     /// Updates the position bookkeeping for `ev` and maps it to an [`Item`].
     fn map_event(&mut self, ev: Event) -> Result<Item> {
         let header = ev.header();
@@ -1103,22 +1257,11 @@ impl Tracker {
             | ty::WRITE_ROWS
             | ty::UPDATE_ROWS
             | ty::DELETE_ROWS
-            | ty::PARTIAL_UPDATE_ROWS => {
-                let kind = match et {
-                    ty::WRITE_ROWS_V1 | ty::WRITE_ROWS => RowsKind::Insert,
-                    ty::DELETE_ROWS_V1 | ty::DELETE_ROWS => RowsKind::Delete,
-                    _ => RowsKind::Update,
-                };
-                let table_id = match ev.read_data().with_context(|| format!("parsing rows event at {}", self.pos))? {
-                    Some(EventData::RowsEvent(re)) => re.table_id(),
-                    _ => bail!("event type {et} at {} did not parse as a rows event", self.pos),
-                };
-                if table_id == DUMMY_TABLE_ID {
-                    Item::Other
-                } else {
-                    Item::Rows { table_id, kind, event: ev }
-                }
-            }
+            | ty::PARTIAL_UPDATE_ROWS => self.rows_item(ev)?,
+            ty::MARIA_PARTIAL_ROWS => match self.partial_rows(&ev)? {
+                Some(rows) => self.rows_item(rows)?,
+                None => Item::Other,
+            },
             ty::PRE_GA_WRITE_ROWS..=ty::PRE_GA_DELETE_ROWS => {
                 bail!("unsupported pre-GA rows event (type {et}) at {}", self.pos)
             }
@@ -1996,6 +2139,87 @@ mod tests {
         ));
     }
 
+    /// MariaDB `Partial_rows` fragment `seq` of `total` (the first one carries `len`).
+    fn partial_rows(total: u32, seq: u32, len: Option<u64>, chunk: &[u8]) -> Event {
+        let mut b = total.to_le_bytes().to_vec();
+        b.extend_from_slice(&seq.to_le_bytes());
+        b.push(u8::from(len.is_some()));
+        if let Some(len) = len {
+            b.extend_from_slice(&len.to_le_bytes());
+        }
+        b.extend_from_slice(chunk);
+        ev(ty::MARIA_PARTIAL_ROWS, 0, &b)
+    }
+
+    #[test]
+    fn mariadb_partial_rows_reassembled() {
+        let mut t = Tracker::new(Flavor::MariaDb, &pos("mariadb-bin.000001", 1000));
+        t.map_event(table_map(0, 5, "db", "c")).unwrap();
+        // A WRITE_ROWS v1 event as the server fragments it: header and body, no checksum, but
+        // the header's size counts one.
+        let mut body = 5u64.to_le_bytes()[..6].to_vec();
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&[1, 0x01, 0x00]);
+        body.extend_from_slice(&(-3i32).to_le_bytes());
+        let mut inner = header(ty::WRITE_ROWS_V1, 7, 19 + body.len() + 4, 0, 0);
+        inner.extend_from_slice(&body);
+        let chunks: Vec<&[u8]> = inner.chunks(9).collect();
+        let n = chunks.len() as u32;
+        assert!(n >= 3);
+        let mut at = t.pos.pos;
+        for (i, c) in chunks.iter().enumerate() {
+            let seq = i as u32 + 1;
+            let frag = partial_rows(n, seq, (seq == 1).then_some(inner.len() as u64), c);
+            at += u64::from(size(&frag));
+            let item = t.map_event(frag).unwrap();
+            assert_eq!(
+                t.pos.pos, at,
+                "fragments advance the position by their size"
+            );
+            if seq < n {
+                assert!(matches!(item, Item::Other), "{item:?}");
+                continue;
+            }
+            let Item::Rows {
+                table_id: 5,
+                kind: RowsKind::Insert,
+                event,
+            } = item
+            else {
+                panic!("{item:?}");
+            };
+            let rows = t.rows(5, &event).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].0.is_none());
+            let after = rows[0].1.as_ref().unwrap();
+            assert!(
+                matches!(after.as_ref(0), Some(BinlogValue::Value(Value::Int(-3)))),
+                "{after:?}"
+            );
+        }
+        // A fragment that does not continue a rows event, and a length that does not add up.
+        let err = t.map_event(partial_rows(3, 2, None, &[0; 4])).unwrap_err();
+        assert!(err.to_string().contains("does not continue"), "{err}");
+        t.map_event(partial_rows(2, 1, Some(100), &inner[..10]))
+            .unwrap();
+        let err = t
+            .map_event(partial_rows(2, 2, None, &inner[10..]))
+            .unwrap_err();
+        assert!(err.to_string().contains("the rows event has 100"), "{err}");
+    }
+
+    #[test]
+    fn status_statement_order_by_version() {
+        let new = "SHOW BINARY LOG STATUS";
+        let old = "SHOW MASTER STATUS";
+        for (major, minor) in [(8, 0), (8, 1), (10, 11), (11, 4), (12, 3), (13, 0), (13, 2)] {
+            assert_eq!(status_statements(major, minor)[0], old, "{major}.{minor}");
+        }
+        for (major, minor) in [(8, 2), (8, 4), (9, 0), (9, 7), (26, 7), (26, 10), (27, 1)] {
+            assert_eq!(status_statements(major, minor)[0], new, "{major}.{minor}");
+        }
+    }
+
     #[test]
     fn crc32_known_value() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
@@ -2003,9 +2227,9 @@ mod tests {
 
     #[test]
     fn requirement_messages() {
-        assert!(requirement_problems(Flavor::MySql, "1", "ROW", "FULL", "").is_empty());
-        assert!(requirement_problems(Flavor::MariaDb, "ON", "row", "full", "OFF").is_empty());
-        let my = requirement_problems(Flavor::MySql, "0", "MIXED", "MINIMAL", "");
+        assert!(requirement_problems(Flavor::MySql, "1", "ROW", "FULL", "", "").is_empty());
+        assert!(requirement_problems(Flavor::MariaDb, "ON", "row", "full", "OFF", "").is_empty());
+        let my = requirement_problems(Flavor::MySql, "0", "MIXED", "MINIMAL", "", "");
         assert_eq!(my.len(), 3, "{my:#?}");
         assert!(my[0].starts_with("log_bin is 0 (must be ON)") && my[0].contains("--log-bin"));
         assert!(
@@ -2017,12 +2241,16 @@ mod tests {
             my[2].contains("SET PERSIST binlog_row_image='FULL'")
                 && my[2].contains("--binlog-row-image=FULL")
         );
-        let ma = requirement_problems(Flavor::MariaDb, "", "STATEMENT", "NOBLOB", "ON");
-        assert_eq!(ma.len(), 4, "{ma:#?}");
+        let ma = requirement_problems(Flavor::MariaDb, "", "STATEMENT", "NOBLOB", "ON", "innodb");
+        assert_eq!(ma.len(), 5, "{ma:#?}");
         assert!(ma[0].starts_with("log_bin is NULL") && ma[0].contains("log_bin=ON"));
         assert!(ma[1].contains("SET GLOBAL binlog_format='ROW'") && ma[1].contains("my.cnf"));
         assert!(ma[2].contains("SET GLOBAL binlog_row_image='FULL'"));
         assert!(ma[3].contains("SET GLOBAL log_bin_compress=OFF"));
+        assert!(
+            ma[4].starts_with("binlog_storage_engine is innodb (must be unset")
+                && ma[4].contains("remove binlog_storage_engine")
+        );
     }
 
     #[test]
@@ -2085,8 +2313,11 @@ mod tests {
             Flavor::from_version("10.11.14-MariaDB-log"),
             Flavor::MariaDb
         );
+        assert_eq!(Flavor::from_version("13.2.0-MariaDB-log"), Flavor::MariaDb);
         assert_eq!(Flavor::from_version("8.0.43-34"), Flavor::MySql);
         assert_eq!(Flavor::from_version("8.4.6"), Flavor::MySql);
+        assert_eq!(Flavor::from_version("9.7.2-2"), Flavor::MySql);
+        assert_eq!(Flavor::from_version("26.7.0"), Flavor::MySql);
     }
 }
 

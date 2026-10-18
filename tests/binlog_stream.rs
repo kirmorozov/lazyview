@@ -1224,3 +1224,184 @@ async fn duplicate_server_id_and_privileges() {
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// MariaDB Partial_rows fragments
+
+/// `(table, kind, [row image lengths])` per event: the rows hold blobs of tens of KiB, which a
+/// mismatch must not dump.
+fn shape(evs: &[Ev]) -> Vec<String> {
+    let len = |i: &Image| {
+        i.as_ref().map(|v| {
+            v.iter()
+                .map(|x| match x {
+                    Value::Bytes(b) => b.len(),
+                    _ => 1,
+                })
+                .sum::<usize>()
+        })
+    };
+    evs.iter()
+        .map(|e| match e {
+            Ev::Rows { table, kind, rows } => format!(
+                "{table} {kind:?} {:?}",
+                rows.iter()
+                    .map(|(b, a)| (len(b), len(a)))
+                    .collect::<Vec<_>>()
+            ),
+            Ev::Stmt(q) => format!("stmt {q}"),
+        })
+        .collect()
+}
+
+/// Joins adjacent rows events of one table and kind: the server packs rows into events of at
+/// most `binlog_row_event_max_size` (8 KiB), so a statement's rows may come in several events.
+fn merged(evs: &[Ev]) -> Vec<Ev> {
+    let mut out: Vec<Ev> = Vec::new();
+    for e in evs {
+        match (out.last_mut(), e) {
+            (
+                Some(Ev::Rows { table, kind, rows }),
+                Ev::Rows {
+                    table: t,
+                    kind: k,
+                    rows: r,
+                },
+            ) if table == t && kind == k => rows.extend(r.iter().cloned()),
+            _ => out.push(e.clone()),
+        }
+    }
+    out
+}
+
+/// Three statements whose rows events exceed the fragment threshold (one row of the first
+/// stays under it), then the marker; the stream must hold the whole rows.
+async fn partial_rows_workload(dsn: &str, w: &mut Conn, s: &str, start: &Position) -> Result<()> {
+    let row = |id: i64, n: usize, c: char| -> Image {
+        Some(vec![Value::Int(id), Value::Bytes(vec![c as u8; n])])
+    };
+    let f = "f".to_string();
+    let mut want = Vec::new();
+    // One multi-row INSERT is one rows event: 100 B, 5 KiB and 70 KiB blobs.
+    w.query_drop(format!(
+        "INSERT INTO `{s}`.f VALUES (1, REPEAT('a', 100)), (2, REPEAT('b', 5000)), (3, REPEAT('c', 70000))"
+    ))
+    .await?;
+    want.push(Ev::Rows {
+        table: f.clone(),
+        kind: RowsKind::Insert,
+        rows: vec![
+            (None, row(1, 100, 'a')),
+            (None, row(2, 5000, 'b')),
+            (None, row(3, 70000, 'c')),
+        ],
+    });
+    // Two 70 KiB images in one event.
+    w.query_drop(format!(
+        "UPDATE `{s}`.f SET d = REPEAT('d', 70000) WHERE id = 3"
+    ))
+    .await?;
+    want.push(Ev::Rows {
+        table: f.clone(),
+        kind: RowsKind::Update,
+        rows: vec![(row(3, 70000, 'c'), row(3, 70000, 'd'))],
+    });
+    w.query_drop(format!("DELETE FROM `{s}`.f")).await?;
+    want.push(Ev::Rows {
+        table: f,
+        kind: RowsKind::Delete,
+        rows: vec![
+            (row(1, 100, 'a'), None),
+            (row(2, 5000, 'b'), None),
+            (row(3, 70000, 'd'), None),
+        ],
+    });
+    let marker = format!("CREATE TABLE `{s}`.`{MARKER}` (id INT)");
+    w.query_drop(&marker).await?;
+    want.push(Ev::Stmt(marker));
+
+    // The server really fragmented them (about 150 KiB of row images per 1 KiB fragment).
+    let events: Vec<Row> = w
+        .query(format!(
+            "SHOW BINLOG EVENTS IN '{}' FROM {}",
+            start.file, start.pos
+        ))
+        .await?;
+    let fragments = events
+        .iter()
+        .filter(|r| r.get::<String, _>(2).as_deref() == Some("Partial_rows"))
+        .count();
+    ensure!(
+        fragments >= 200,
+        "{fragments} Partial_rows events after {start}, the workload should produce about 290"
+    );
+
+    let mut r = BinlogReader::connect(
+        replica_opts(dsn)?,
+        server_id(),
+        Flavor::MariaDb,
+        start,
+        Duration::from_secs(1),
+    )
+    .await?;
+    let seen = collect(&mut r, s, &[], MARKER).await?;
+    let got = merged(&flat(&seen.groups));
+    ensure!(
+        got == want,
+        "stream mismatch\n got: {:#?}\nwant: {:#?}",
+        shape(&got),
+        shape(&want)
+    );
+    ensure!(
+        seen.groups.len() == want.len(),
+        "{} groups, want {}",
+        seen.groups.len(),
+        want.len()
+    );
+    Ok(())
+}
+
+/// MariaDB >= 12.3 splits a rows event larger than `binlog_row_event_fragment_threshold` into
+/// `Partial_rows` events (type 172), which the reader reassembles. With the threshold at its
+/// minimum (1 KiB) every rows event of this workload is fragmented (up to 140 fragments).
+/// Other servers, and MariaDB without the variable, skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mariadb_partial_rows_reassembled() {
+    on_all_servers("mariadb_partial_rows_reassembled", |name, dsn| async move {
+        let mut w = connect(&dsn).await?;
+        let info = server_info(&mut w).await?;
+        let threshold: Option<u64> = if info.flavor == Flavor::MariaDb {
+            w.query_first("SELECT @@GLOBAL.binlog_row_event_fragment_threshold")
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        };
+        let Some(default) = threshold else {
+            println!(
+                "mariadb_partial_rows_reassembled [{name}]: no binlog_row_event_fragment_threshold on {}, skipping",
+                info.version
+            );
+            return Ok(());
+        };
+        let s = unique_schema("pr");
+        w.query_drop(format!("CREATE DATABASE `{s}`")).await?;
+        w.query_drop(format!(
+            "CREATE TABLE `{s}`.f (id INT NOT NULL PRIMARY KEY, d LONGBLOB NOT NULL) ENGINE=InnoDB"
+        ))
+        .await?;
+        let start = current_position(&mut w).await?;
+        w.query_drop("SET GLOBAL binlog_row_event_fragment_threshold = 1024")
+            .await?;
+        let res = partial_rows_workload(&dsn, &mut w, &s, &start).await;
+        // The server's setting comes back whatever happened (the schema stays for a failure).
+        w.query_drop(format!(
+            "SET GLOBAL binlog_row_event_fragment_threshold = {default}"
+        ))
+        .await?;
+        res?;
+        w.query_drop(format!("DROP DATABASE `{s}`")).await?;
+        Ok(())
+    })
+    .await;
+}
