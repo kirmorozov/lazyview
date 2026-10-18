@@ -101,7 +101,12 @@ All settings are environment variables. The most used ones are listed here. See
 
 ## Supported servers
 
-MySQL 8.0 / 8.4, Percona Server 8.0 / 8.4 and MariaDB 10.11 / 11.4, also on Amazon RDS and Aurora MySQL.
+MySQL 8.4 and 26.7, Percona Server 8.4 and 9.7, MariaDB 10.11 and 13.0 (per product the oldest
+supported LTS and the latest GA, both tested on every change), also on Amazon RDS and Aurora
+MySQL. The newest pre-releases (MySQL 26.10 EA, MariaDB 13.2 preview) are tested as advisory.
+Lines in between (MySQL 9.7, MariaDB 11.4 / 11.8 / 12.3) work but are not tested; MySQL 8.0,
+Percona 8.0 and MariaDB 10.6 are end-of-life and dropped. Details and dates:
+[Server setup](docs/server-setup.md#supported-servers).
 
 ## Documentation
 

@@ -14,32 +14,49 @@ in the `Dockerfile`).
 
 ## Local test servers
 
-Integration tests run against real MySQL, MariaDB and Percona servers. Two ways to get them:
+Integration tests run against real MySQL, MariaDB and Percona servers: the matrix of
+[Server setup](server-setup.md#supported-servers), one flavor name per line. Two ways to get
+them, with the same flavor names, ports, credentials and settings (so `LAZYVIEW_TEST_DSNS` and the
+test harness do not care which one runs a flavor):
 
-* **From official tarballs**, without Docker: extract each server's tarball under
-  `tmp/out/db/<flavor>/`, then
+* **As containers** (the default; the same pinned images CI runs, so local == CI):
 
   ```sh
-  scripts/test-servers.sh start      # all flavors that are extracted; or name some: start mysql84 mariadb114
-  scripts/test-servers.sh status
-  scripts/test-servers.sh dsns       # the LAZYVIEW_TEST_DSNS value for the running servers
+  scripts/test-servers.sh compose up               # the blocking matrix (or: make compose-up)
+  scripts/test-servers.sh compose up --pre         # plus the advisory pre-releases
+  scripts/test-servers.sh compose up mysql267      # one flavor
+  scripts/test-servers.sh status                   # mode, state, port, version per flavor
+  scripts/test-servers.sh dsns                     # LAZYVIEW_TEST_DSNS for the servers that are up
+  scripts/test-servers.sh compose logs mariadb130
+  scripts/test-servers.sh compose down             # stop (data volumes kept); `compose clean` drops them
+  ```
+
+  Plain `docker compose -f docker-compose.test.yml ...` works too (`--profile prerelease` for
+  the advisory flavors). The MySQL 26.10 Early Access image is not on any registry:
+  `scripts/test-servers.sh compose load-pre` downloads the labs docker tarball (sha256-verified)
+  and `docker load`s it; `compose up mysql2610-pre` does that on demand.
+
+* **From official tarballs**, without Docker: `scripts/test-servers.sh fetch [flavor...]`
+  downloads the pinned tarball (checksum verified) into `tmp/out/db/<flavor>/`, then
+
+  ```sh
+  scripts/test-servers.sh start      # the matrix flavors that are installed; or name some: start mysql84 mariadb130
   scripts/test-servers.sh stop
   ```
 
-  Flavors and ports: `mysql80` 33080, `mysql84` 33084, `mariadb1011` 33111, `mariadb114` 33114,
-  `percona80` 33180, `percona84` 33184. Each instance lives in `tmp/out/servers/<flavor>/`
-  (`my.cnf`, data, binlogs, error log) and listens on 127.0.0.1. It has ROW binlogs (GTIDs on
-  MySQL and Percona), a user `lv`/`lv` with all privileges and a database `lvtest`. Overrides:
-  `LV_DB_ROOT` (tarball directory), `LV_SERVERS_ROOT` (instance directory), `LV_START_TIMEOUT`
-  (seconds, default 180).
+  Each instance lives in `tmp/out/servers/<flavor>/` (`my.cnf`, data, binlogs, error log).
+  The MySQL tarballs need `libaio`, `libnuma` and (the client) `libncurses` on the host;
+  `scripts/test-servers.sh libs` copies them out of the Percona image into `tmp/out/lib` when the
+  host lacks them. Overrides: `LV_DB_ROOT`, `LV_SERVERS_ROOT`, `LV_LIB_DIR`, `LV_IMAGES_ROOT`,
+  `LV_START_TIMEOUT` (seconds, default 180). Other vendor-supported lines (`mysql97`,
+  `mariadb114`, `mariadb118`, `mariadb123`) and the EOL `mysql80` / `percona80` exist in tarball
+  mode only, on request.
 
-* **As containers**, with the same ports and credentials:
-
-  ```sh
-  docker compose -f docker-compose.test.yml up -d --wait            # all six (or: make compose-up)
-  docker compose -f docker-compose.test.yml up -d mysql84 --wait    # one
-  docker compose -f docker-compose.test.yml down -v                 # or: make compose-down
-  ```
+Flavors and ports: `mysql84` 33084, `mysql267` 33267, `percona84` 33184, `percona97` 33197,
+`mariadb1011` 33111, `mariadb130` 33130; advisory `mariadb132-pre` 33132, `mysql2610-pre` 33261.
+Every server listens on 127.0.0.1, has ROW binlogs with FULL row images (GTIDs on MySQL and
+Percona), a 128M InnoDB buffer pool, a user `lv`/`lv` with all privileges and a database
+`lvtest`. Every instance takes up to 1 GB of memory: start only what you test.
 
 ## Tests
 
@@ -49,7 +66,8 @@ make test-integration   # every integration suite against every server
 ```
 
 `make test-integration` takes the servers from `LAZYVIEW_TEST_DSNS`, else from
-`scripts/test-servers.sh dsns`, else the `docker-compose.test.yml` defaults. It runs the suites one
+`scripts/test-servers.sh dsns` (containers or tarball instances), else the blocking matrix's
+`docker-compose.test.yml` ports. It runs the suites one
 test at a time. To run one suite against one server:
 
 ```sh
@@ -130,15 +148,16 @@ cargo run --release --example throughput -- --dsn mysql://lv:lv@127.0.0.1:33084/
 
 Workflows in `.github/workflows/`:
 
-* `ci.yml` runs lint, unit tests, the integration matrix (all six servers from
-  `docker-compose.test.yml`) and the image smoke and end-to-end tests on every push and pull
-  request.
+* `ci.yml` runs lint, unit tests, the integration matrix (every service of
+  `docker-compose.test.yml`: the six blocking servers, plus the pre-releases with
+  `continue-on-error`, which only annotate the run when they fail) and the image smoke and
+  end-to-end tests on every push and pull request.
 * Every image is built and tested before it is pushed: `--version`, exit code `2` without
   configuration, user `65532`, no shell and the healthcheck, on both architectures (arm64 under
   QEMU). An end-to-end run of `docker-compose.example.yml` against MySQL 8.4 (amd64) follows.
 * `publish-image.yml` is called by `ci.yml`. Pushes to `main` publish `edge` once lint, unit and
   end-to-end tests pass. `v*` tags publish a release, which additionally needs the integration
-  tests on all six servers. Pull requests never get registry credentials and never push.
+  tests on the six blocking servers (the advisory pre-releases cannot block it). Pull requests never get registry credentials and never push.
 * `ghcr-cleanup.yml` deletes untagged images and `sha-*` images beyond the newest 20. It runs
   after each publish, daily, and on demand (dry run by default). It never touches the platform and
   attestation manifests of kept multi-arch images.

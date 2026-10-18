@@ -1,13 +1,36 @@
-# Integration-test database servers (same ports / credentials as scripts/test-servers.sh).
+# Integration-test database servers: the exact server builds CI runs, for local use too
+# (same images, ports, credentials and settings as the tarball instances of
+# scripts/test-servers.sh). Policy and lifecycle dates: docs/server-setup.md "Supported servers".
 #
-#   docker compose -f docker-compose.test.yml up -d --wait            # all six
-#   docker compose -f docker-compose.test.yml up -d mysql84 --wait    # one
+#   scripts/test-servers.sh compose up            # the blocking matrix (default profile)
+#   scripts/test-servers.sh compose up mysql267   # one flavor
+#   scripts/test-servers.sh compose up --pre      # plus the advisory pre-releases
+#   scripts/test-servers.sh dsns                  # LAZYVIEW_TEST_DSNS for the servers that are up
+#   scripts/test-servers.sh compose down          # stop; `compose clean` also drops the data
+#
+# or plain compose:
+#
+#   docker compose -f docker-compose.test.yml up -d --wait mysql84
+#   docker compose -f docker-compose.test.yml --profile prerelease up -d --wait
 #   LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --test '*' -- --test-threads=1
-#   docker compose -f docker-compose.test.yml down -v
+#   docker compose -f docker-compose.test.yml --profile prerelease down -v
 #
-# Service names match the flavor names used by scripts/test-servers.sh and LAZYVIEW_TEST_DSNS.
-# Every server: ROW binlog, FULL row image, user lv/lv with ALL PRIVILEGES, database lvtest.
-# MySQL / Percona additionally run with GTIDs on (like the local tarball instances).
+# Service names are the flavor names of scripts/test-servers.sh, LAZYVIEW_TEST_DSNS and the CI
+# matrix. Every server: ROW binlog, FULL row image, user lv/lv with ALL PRIVILEGES (created by
+# docker/initdb on the first start), database lvtest, 128M InnoDB buffer pool (several servers
+# share a developer host with the test runs), a 2 GiB memory limit (MySQL and Percona idle at
+# about 850 MiB; with 1 GiB the big-transaction test got mysqld OOM-killed), bound to
+# 127.0.0.1, server id = host port. MySQL and Percona additionally run with GTIDs on. The flag
+# lists are kept identical by hand (YAML cannot splice a shared list into `command`).
+#
+# Matrix (one image per flavor, pinned to the exact build; the preview image by digest):
+#   blocking   oldest supported LTS: mysql84 percona84 mariadb1011
+#   blocking   latest GA:            mysql267 percona97 mariadb130
+#   advisory   newest pre-release:   mariadb132-pre mysql2610-pre   (profile `prerelease`)
+# Percona publishes no pre-release. MySQL 26.10 EA has no registry image: `docker load` the
+# labs docker tarball first (scripts/test-servers.sh compose load-pre does that).
+#
+# Data lives in named volumes (lazyview_<flavor>): `down` keeps it, `down -v` drops it.
 
 x-mysql-common: &mysql-common
   environment:
@@ -23,6 +46,10 @@ x-mysql-common: &mysql-common
     timeout: 5s
     retries: 60
     start_period: 20s
+  deploy:
+    resources:
+      limits:
+        memory: 2g
   restart: "no"
 
 x-mariadb-common: &mariadb-common
@@ -37,27 +64,18 @@ x-mariadb-common: &mariadb-common
     timeout: 5s
     retries: 60
     start_period: 20s
+  deploy:
+    resources:
+      limits:
+        memory: 2g
   restart: "no"
 
 services:
-  mysql80:
-    <<: *mysql-common
-    image: mysql:8.0
-    ports: ["33080:3306"]
-    command:
-      - --server-id=33080
-      - --log-bin=binlog
-      - --binlog-format=ROW
-      - --binlog-row-image=FULL
-      - --gtid-mode=ON
-      - --enforce-gtid-consistency=ON
-      - --skip-name-resolve
-      - --mysqlx=OFF
-
+  # ---- MySQL: 8.4 LTS (oldest supported) + 26.7 Innovation (latest GA) ----------------------
   mysql84:
     <<: *mysql-common
-    image: mysql:8.4
-    ports: ["33084:3306"]
+    image: mysql:8.4.11
+    ports: ["127.0.0.1:33084:3306"]
     command:
       - --server-id=33084
       - --log-bin=binlog
@@ -67,37 +85,18 @@ services:
       - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mysql84:/var/lib/mysql
 
-  mariadb1011:
-    <<: *mariadb-common
-    image: mariadb:10.11
-    ports: ["33111:3306"]
-    command:
-      - --server-id=33111
-      - --log-bin=mariadb-bin
-      - --log-basename=mariadb
-      - --binlog-format=ROW
-      - --binlog-row-image=FULL
-      - --skip-name-resolve
-
-  mariadb114:
-    <<: *mariadb-common
-    image: mariadb:11.4
-    ports: ["33114:3306"]
-    command:
-      - --server-id=33114
-      - --log-bin=mariadb-bin
-      - --log-basename=mariadb
-      - --binlog-format=ROW
-      - --binlog-row-image=FULL
-      - --skip-name-resolve
-
-  percona80:
+  mysql267:
     <<: *mysql-common
-    image: percona/percona-server:8.0
-    ports: ["33180:3306"]
+    image: mysql:26.7.0
+    ports: ["127.0.0.1:33267:3306"]
     command:
-      - --server-id=33180
+      - --server-id=33267
       - --log-bin=binlog
       - --binlog-format=ROW
       - --binlog-row-image=FULL
@@ -105,11 +104,17 @@ services:
       - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mysql267:/var/lib/mysql
 
+  # ---- Percona Server: 8.4 LTS (oldest supported) + 9.7 LTS (latest GA) --------------------
   percona84:
     <<: *mysql-common
-    image: percona/percona-server:8.4
-    ports: ["33184:3306"]
+    image: percona/percona-server:8.4.11-11
+    ports: ["127.0.0.1:33184:3306"]
     command:
       - --server-id=33184
       - --log-bin=binlog
@@ -119,3 +124,125 @@ services:
       - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - percona84:/var/lib/mysql
+
+  percona97:
+    <<: *mysql-common
+    image: percona/percona-server:9.7.2-2
+    ports: ["127.0.0.1:33197:3306"]
+    command:
+      - --server-id=33197
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - percona97:/var/lib/mysql
+
+  # ---- MariaDB: 10.11 LTS (oldest supported) + 13.0 rolling (latest GA) --------------------
+  mariadb1011:
+    <<: *mariadb-common
+    image: mariadb:10.11.19
+    ports: ["127.0.0.1:33111:3306"]
+    command:
+      - --server-id=33111
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb1011:/var/lib/mysql
+
+  mariadb130:
+    <<: *mariadb-common
+    image: mariadb:13.0.2
+    ports: ["127.0.0.1:33130:3306"]
+    command:
+      - --server-id=33130
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb130:/var/lib/mysql
+
+  # ---- Advisory: newest pre-releases (profile `prerelease`, never required) -----------------
+  # MariaDB 13.2.0 Preview: no Docker Hub image, the MariaDB Foundation's devel image pinned by
+  # digest (tag 13.2-preview moves).
+  mariadb132-pre:
+    <<: *mariadb-common
+    image: quay.io/mariadb-foundation/mariadb-devel:13.2-preview@sha256:b065780c004aa1031ec674444d47667530c025c17d27b9ed35750b0394d7b6bb
+    profiles: [prerelease]
+    ports: ["127.0.0.1:33132:3306"]
+    command:
+      - --server-id=33132
+      # This preview image's my.cnf puts the socket and pid file under /run/mariadbd, which the
+      # image does not create (the entrypoint dies with "find: '/run/mariadbd': No such file",
+      # the server with "can't create PID file"), and its data directory /var/lib/mariadb
+      # (renamed in 13.2) ships pre-initialized, so the entrypoint would skip the first-start
+      # setup (root password, lvtest, docker/initdb). Use the paths the other images use.
+      - --socket=/run/mysqld/mysqld.sock
+      - --pid-file=/run/mysqld/mysqld.pid
+      - --datadir=/var/lib/mysql
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb132-pre:/var/lib/mysql
+
+  # MySQL 26.10.0 Early Access (labs.mysql.com): no registry image. Load the labs docker tarball
+  # first: `scripts/test-servers.sh compose load-pre` (= docker load of
+  # mysql-community-server-26.10.0-labs-docker-el9-x86_64.tar.gz, verified by sha256).
+  mysql2610-pre:
+    <<: *mysql-common
+    image: localhost/mysql/community-server:26.10.0-er1-amd64
+    pull_policy: never
+    profiles: [prerelease]
+    ports: ["127.0.0.1:33261:3306"]
+    command:
+      - --server-id=33261
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mysql2610-pre:/var/lib/mysql
+
+volumes:
+  mysql84:
+  mysql267:
+  percona84:
+  percona97:
+  mariadb1011:
+  mariadb130:
+  mariadb132-pre:
+  mysql2610-pre:

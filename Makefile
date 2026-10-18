@@ -33,8 +33,9 @@ PLATFORMS ?= linux/$(HOST_ARCH)
 BUILDER       ?=
 MULTI_BUILDER ?= lazyview-multiarch
 
-# DSNs matching docker-compose.test.yml (used when test-servers.sh is absent / reports none).
-COMPOSE_DSNS := mysql80=mysql://lv:lv@127.0.0.1:33080/lvtest,mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest,mariadb1011=mysql://lv:lv@127.0.0.1:33111/lvtest,mariadb114=mysql://lv:lv@127.0.0.1:33114/lvtest,percona80=mysql://lv:lv@127.0.0.1:33180/lvtest,percona84=mysql://lv:lv@127.0.0.1:33184/lvtest
+# DSNs matching docker-compose.test.yml (used when test-servers.sh is absent / reports none):
+# the blocking matrix (docs/server-setup.md "Supported servers").
+COMPOSE_DSNS := mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest,mysql267=mysql://lv:lv@127.0.0.1:33267/lvtest,percona84=mysql://lv:lv@127.0.0.1:33184/lvtest,percona97=mysql://lv:lv@127.0.0.1:33197/lvtest,mariadb1011=mysql://lv:lv@127.0.0.1:33111/lvtest,mariadb130=mysql://lv:lv@127.0.0.1:33130/lvtest
 
 VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 REVISION := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
@@ -52,8 +53,8 @@ build:
 test:
 	$(CARGO) test --locked --lib --bins
 
-# Uses LAZYVIEW_TEST_DSNS if set; else the running local tarball servers
-# (scripts/test-servers.sh dsns); else the docker-compose.test.yml defaults.
+# Uses LAZYVIEW_TEST_DSNS if set; else the running local servers, containers or tarball
+# instances (scripts/test-servers.sh dsns); else the docker-compose.test.yml defaults.
 test-integration:
 	@dsns="$${LAZYVIEW_TEST_DSNS:-}"; \
 	if [[ -z $$dsns && -x $(TEST_SERVERS) ]]; then dsns=$$($(TEST_SERVERS) dsns); fi; \
@@ -126,8 +127,10 @@ fmt-check:
 lint: fmt-check
 	$(CARGO) clippy --locked --all-targets -- -D warnings
 
+# The blocking matrix; SERVICES="mysql84 mariadb130" for some, `scripts/test-servers.sh compose
+# up --pre` for the advisory pre-releases too.
 compose-up:
-	$(COMPOSE) up -d --wait $(SERVICES)
+	$(TEST_SERVERS) compose up $(SERVICES)
 
 compose-down:
-	$(COMPOSE) down -v
+	$(TEST_SERVERS) compose down $(SERVICES)

@@ -3,7 +3,8 @@ name: ci
 # lint, unit, e2e and integration run on every push and pull request.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
 #   main  -> `image`   (needs lint + unit + e2e; integration runs alongside, not required)
-#   v*    -> `release` (needs lint + unit + e2e + all six integration servers)
+#   v*    -> `release` (needs lint + unit + e2e + the integration matrix; its advisory
+#                       pre-release entries run with continue-on-error and cannot block it)
 # Pull requests never get registry credentials and never push.
 on:
   push:
@@ -67,27 +68,40 @@ jobs:
         run: cargo test --locked --lib --bins
 
   integration:
-    name: integration (${{ matrix.flavor }})
+    # One job per server flavor of docker-compose.test.yml (docs/server-setup.md "Supported
+    # servers"): the blocking matrix (oldest supported LTS + latest GA per product) must pass,
+    # the advisory pre-releases only annotate the run when they fail (continue-on-error).
+    name: integration (${{ matrix.flavor }}${{ matrix.advisory && ', advisory' || '' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    continue-on-error: ${{ matrix.advisory }}
     strategy:
       fail-fast: false
       matrix:
         # Service names and host ports from docker-compose.test.yml.
         include:
-          - { flavor: mysql80, port: 33080 }
-          - { flavor: mysql84, port: 33084 }
-          - { flavor: mariadb1011, port: 33111 }
-          - { flavor: mariadb114, port: 33114 }
-          - { flavor: percona80, port: 33180 }
-          - { flavor: percona84, port: 33184 }
+          - { flavor: mysql84, port: 33084, advisory: false }
+          - { flavor: mysql267, port: 33267, advisory: false }
+          - { flavor: percona84, port: 33184, advisory: false }
+          - { flavor: percona97, port: 33197, advisory: false }
+          - { flavor: mariadb1011, port: 33111, advisory: false }
+          - { flavor: mariadb130, port: 33130, advisory: false }
+          # Newest pre-releases (compose profile `prerelease`): never required.
+          - { flavor: mariadb132-pre, port: 33132, advisory: true }
+          - { flavor: mysql2610-pre, port: 33261, advisory: true }
     env:
       COMPOSE_FILE: docker-compose.test.yml
+      COMPOSE_PROFILES: prerelease
       FLAVOR: ${{ matrix.flavor }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # MySQL 26.10 Early Access has no registry image: `docker load` the labs tarball
+      # (sha256-verified by the script).
+      - name: load the ${{ matrix.flavor }} image
+        if: matrix.flavor == 'mysql2610-pre'
+        run: scripts/test-servers.sh compose load-pre
       - name: start ${{ matrix.flavor }} (in the background)
         run: docker compose up -d --quiet-pull "$FLAVOR"
       - name: rust ${{ env.RUST_TOOLCHAIN }}
@@ -97,13 +111,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: integration
-          # One writer for the six matrix jobs; the test binaries compile even when tests fail.
+          # One writer for the matrix jobs; the test binaries compile even when tests fail.
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.flavor == 'mysql84' }}
           cache-on-failure: true
       - name: build integration tests
         run: cargo test --locked --test '*' --no-run
       - name: wait for ${{ matrix.flavor }}
         run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"
+      - name: server version
+        run: docker compose exec -T "$FLAVOR" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
       - name: integration tests
         timeout-minutes: 75
         env:
@@ -113,6 +129,12 @@ jobs:
           LAZYVIEW_TEST_GLOBAL_TZ: "1"
         # --no-fail-fast: run every suite and report all failures, not just the first.
         run: cargo test --locked --no-fail-fast --test '*' -- --test-threads=1
+      - name: advisory flavor failed
+        if: failure() && matrix.advisory
+        run: |
+          echo "::warning title=advisory server failed::${FLAVOR} is a pre-release server (advisory, not required for a release): see the integration logs"
+          echo "### :warning: ${FLAVOR}: advisory pre-release server failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "A pre-release server failed the integration suites. It does not block this run; check the logs before the release that moves the latest-GA pin." >> "$GITHUB_STEP_SUMMARY"
       - name: collect server logs
         if: failure()
         run: |
