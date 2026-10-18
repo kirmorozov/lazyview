@@ -251,14 +251,17 @@ fn direct_columns(
 fn replace_call(sql: &str, name: &str, replacement: &str) -> Option<String> {
     let tokens = tokenize(sql)?;
     let chars: Vec<(usize, char)> = sql.char_indices().collect();
+    // Character index at which each line starts (a string literal may contain newlines, C1).
+    let mut line_starts = vec![0usize];
+    for (i, (_, c)) in chars.iter().enumerate() {
+        if *c == '\n' {
+            line_starts.push(i + 1);
+        }
+    }
     let offset = |loc: sqlparser::tokenizer::Location| -> Option<usize> {
-        // Rendered expressions are on one line.
-        (loc.line == 1).then(|| {
-            chars
-                .get(loc.column as usize - 1)
-                .map(|(i, _)| *i)
-                .unwrap_or(sql.len())
-        })
+        let line = line_starts.get(loc.line.checked_sub(1)? as usize)?;
+        let at = line + loc.column.checked_sub(1)? as usize;
+        Some(chars.get(at).map(|(i, _)| *i).unwrap_or(sql.len()))
     };
     let start = tokens
         .iter()

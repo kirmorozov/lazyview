@@ -223,6 +223,118 @@ fn corpus() -> Vec<String> {
 
 /// Statements the analyzer plans differently from the block planner, with the expected new
 /// outcome (`Ok(mode)` or `Err(message part)`). Everything else must be planned identically.
+/// A chain of `n` CTEs, each joining the previous one to itself (2^n copies when inlined).
+fn cte_chain(n: usize) -> String {
+    let mut sql = "WITH t0 AS (SELECT id, customer_id, total FROM orders)".to_string();
+    for k in 1..=n {
+        sql.push_str(&format!(
+            ", t{k} AS (SELECT a.id, a.customer_id, a.total + b.total AS total FROM t{} a JOIN t{} b ON b.id = a.id)",
+            k - 1,
+            k - 1
+        ));
+    }
+    format!("CREATE VIEW v AS {sql} SELECT id, total FROM t{n}")
+}
+
+/// A5: the flat form of a definition is bounded before anything is built: a CTE chain whose
+/// copies would exceed the budget is refused in linear time with a reason naming the CTE;
+/// within the budget the copies are inlined and planned.
+#[test]
+fn cte_inlining_is_bounded() {
+    let cat = catalog();
+    let plan = |n: usize| {
+        let d = parse_definition(&cte_chain(n)).unwrap();
+        let t = std::time::Instant::now();
+        let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
+        (p, t.elapsed())
+    };
+    let (p, _) = plan(3);
+    assert_eq!(p.mode, Mode::Spj, "{}", p.mode);
+    let (p, dt) = plan(6);
+    assert_eq!(
+        p.mode,
+        Mode::Full(
+            "inlining the WITH clause and derived tables reads 64 table references (budget 32): \
+             CTE `t5` is referenced 2 times (needs internal views)"
+                .into()
+        )
+    );
+    assert!(dt.as_millis() < 500, "{dt:?}");
+    for n in [14, 18, 40] {
+        let (p, dt) = plan(n);
+        assert!(
+            matches!(p.mode, Mode::Full(ref r) if r.contains("(needs internal views)")),
+            "{}",
+            p.mode
+        );
+        assert!(dt.as_millis() < 500, "n={n}: {dt:?}");
+        assert_eq!(p.tables.len(), 1);
+    }
+}
+
+/// C1: a string literal containing a newline before a semi-join marker does not break the
+/// marker replacement (token locations are converted with the literal's lines). C2: a
+/// parenthesized join that is not a chain of inner joins names what it needs.
+#[test]
+fn newlines_in_literals_and_nested_outer_joins() {
+    let cat = catalog();
+    let d = parse_definition(
+        "CREATE VIEW v AS SELECT o.id FROM orders o WHERE o.note <> 'a\nb' \
+         AND EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.qty > 2)",
+    )
+    .unwrap();
+    let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
+    assert_eq!(p.mode, Mode::Spj, "{}", p.mode);
+    assert!(p.aliases.iter().any(|a| a.semi.is_some()));
+    let d = parse_definition(
+        "CREATE VIEW v AS SELECT o.id, c.name, r.name AS region FROM orders o \
+         LEFT JOIN (customers c JOIN regions r ON r.id = c.region_id) ON c.id = o.customer_id",
+    )
+    .unwrap();
+    let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
+    assert_eq!(
+        p.mode,
+        Mode::Full(
+            "parenthesized join (customers c JOIN regions r ON r.id = c.region_id) that cannot \
+             be flattened into the FROM chain (needs internal views)"
+                .into()
+        )
+    );
+    assert_eq!(p.tables.len(), 3);
+}
+
+/// A6: a scalar subquery whose value reads only outer columns (or constants) is guarded after
+/// the LEFT JOIN rewrite (the NULL-extended row would otherwise keep the outer value); one
+/// propagating NULL from the subquery's own column is not.
+#[test]
+fn outer_only_scalar_values_are_guarded() {
+    let cat = catalog();
+    let select = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
+        assert_eq!(p.mode, Mode::Spj, "{sql}: {}", p.mode);
+        p.select_sql(&[0], None)
+    };
+    for sql in [
+        "SELECT o.id, (SELECT o.note FROM regions r WHERE r.id = o.id * 10) AS v FROM orders o",
+        "SELECT o.id, (SELECT o.id * 2 FROM regions r WHERE r.id = o.id * 10) AS v FROM orders o",
+        "SELECT o.id, (SELECT CONCAT(o.note, 'x') FROM regions r WHERE r.id = o.id * 10) AS v FROM orders o",
+        "SELECT o.id, (SELECT 1 FROM regions r WHERE r.id = o.id * 10) AS v FROM orders o",
+    ] {
+        let s = select(sql);
+        assert!(s.contains("IF(`r`.`id` IS NULL, NULL,"), "{sql}\n{s}");
+    }
+    let s = select("SELECT o.id FROM orders o WHERE (SELECT o.note FROM regions r WHERE r.id = o.id * 10) IS NULL");
+    assert!(
+        s.contains("IF(`r`.`id` IS NULL, NULL, o.note) IS NULL"),
+        "{s}"
+    );
+    let s = select(
+        "SELECT o.id, (SELECT r.name FROM regions r WHERE r.id = o.id * 10) AS v FROM orders o",
+    );
+    assert!(!s.contains("IF("), "{s}");
+}
+
 fn improvements() -> Vec<(&'static str, Result<Mode, &'static str>)> {
     vec![
         // DISTINCT = GROUP BY over the output columns.
@@ -243,10 +355,11 @@ fn improvements() -> Vec<(&'static str, Result<Mode, &'static str>)> {
             "SELECT DISTINCT  COUNT( * ) , 'a' 'b' FROM orders",
             Ok(Mode::Global),
         ),
-        // `*` over a USING join: the server coalesces the shared column (A4).
+        // `*` over a USING join: the shared column once, then the rest (A4); DISTINCT over it
+        // is a GROUP BY like any other.
         (
             "(a, b, c, d) AS SELECT DISTINCT * FROM regions JOIN customers USING (id)",
-            Ok(Mode::Full(crate::analyze::STAR_USING.into())),
+            Ok(Mode::Grouped),
         ),
         // The construct that really blocks it is named.
         (
@@ -1022,7 +1135,7 @@ fn join_syntax_normalized() {
     // A LEFT JOIN inside parentheses keeps its own NULL semantics: not flattened.
     assert_eq!(
         reason("CREATE VIEW v AS SELECT o.id FROM orders o JOIN (customers c LEFT JOIN regions r ON r.id = c.region_id) ON c.id = o.customer_id"),
-        "unsupported FROM item"
+        "parenthesized join (customers c LEFT JOIN regions r ON r.id = c.region_id) that cannot be flattened into the FROM chain (needs internal views)"
     );
 }
 

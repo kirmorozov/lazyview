@@ -8,7 +8,7 @@
 //!   definition wins.
 //! * Derived tables and subqueries see the CTEs of every enclosing query.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 
@@ -205,4 +205,111 @@ fn walk_factor(f: &TableFactor, scope: &Scope, schema: &str, out: &mut BTreeSet<
         } => walk_from(std::slice::from_ref(table_with_joins), scope, schema, out),
         _ => {}
     }
+}
+
+/// Table references of the statement once every CTE and derived table is inlined (each
+/// reference of a CTE copies its body): the size of the flat form, and the CTE referenced the
+/// most times among those that make it grow. Computed without building anything, in time linear
+/// in the statement (bodies are measured once), so a chain of CTEs that each reference the
+/// previous one twice (2^n copies) is refused before any work is done (A5).
+pub(crate) struct InlinedSize {
+    pub refs: usize,
+    /// (CTE name, number of references), for the reason text.
+    pub worst: Option<(String, usize)>,
+}
+
+pub(crate) fn inlined_size(root: &Query, scope: &Scope) -> InlinedSize {
+    struct Count {
+        memo: HashMap<*const Query, usize>,
+        /// Per CTE name: references and inlined size of one copy.
+        times: HashMap<String, (usize, usize)>,
+    }
+    fn query(q: &Query, scope: &Scope, c: &mut Count) -> usize {
+        let inner = match &q.with {
+            Some(w) => scope.with_clause(w),
+            None => scope.clone(),
+        };
+        let mut n = set(&q.body, &inner, c);
+        if let Some(o) = &q.order_by {
+            if let sqlparser::ast::OrderByKind::Expressions(es) = &o.kind {
+                for e in es {
+                    for sq in subqueries(&e.expr) {
+                        n += query(&sq, &inner, c);
+                    }
+                }
+            }
+        }
+        n
+    }
+    fn set(s: &SetExpr, scope: &Scope, c: &mut Count) -> usize {
+        match s {
+            SetExpr::Select(sel) => {
+                let mut n = from(&sel.from, scope, c);
+                for e in exprs_of(sel) {
+                    for sq in subqueries(e) {
+                        n += query(&sq, scope, c);
+                    }
+                }
+                n
+            }
+            SetExpr::Query(q) => query(q, scope, c),
+            SetExpr::SetOperation { left, right, .. } => set(left, scope, c) + set(right, scope, c),
+            _ => 1,
+        }
+    }
+    fn from(from: &[TableWithJoins], scope: &Scope, c: &mut Count) -> usize {
+        let mut n = 0;
+        for twj in from {
+            n += factor(&twj.relation, scope, c);
+            for j in &twj.joins {
+                n += factor(&j.relation, scope, c);
+                if let Some(JoinConstraint::On(e)) = join_constraint(&j.join_operator) {
+                    for sq in subqueries(e) {
+                        n += query(&sq, scope, c);
+                    }
+                }
+            }
+        }
+        n
+    }
+    fn factor(f: &TableFactor, scope: &Scope, c: &mut Count) -> usize {
+        match f {
+            TableFactor::Table { name, .. } => match scope.cte_for(name) {
+                Some(cte) => {
+                    let key = cte.query as *const Query;
+                    let n = match c.memo.get(&key) {
+                        Some(&n) => n,
+                        None => {
+                            let (q, body) = (cte.query, cte.body.clone());
+                            let n = query(q, &body, c);
+                            c.memo.insert(key, n);
+                            n
+                        }
+                    };
+                    let e = c.times.entry(cte.name.clone()).or_insert((0, n));
+                    e.0 += 1;
+                    n
+                }
+                None => 1,
+            },
+            TableFactor::Derived { subquery, .. } => query(subquery, scope, c),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => from(std::slice::from_ref(table_with_joins), scope, c),
+            _ => 1,
+        }
+    }
+    let mut c = Count {
+        memo: HashMap::new(),
+        times: HashMap::new(),
+    };
+    let refs = query(root, scope, &mut c);
+    // The multiply-referenced CTE whose copies take the most room.
+    let worst = c
+        .times
+        .into_iter()
+        .filter(|(_, (n, _))| *n > 1)
+        .max_by_key(|(name, (n, size))| (n * size, std::cmp::Reverse(name.clone())))
+        .map(|(name, (n, _))| (name, n));
+    InlinedSize { refs, worst }
 }

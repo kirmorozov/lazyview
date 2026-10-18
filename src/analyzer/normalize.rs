@@ -1255,8 +1255,12 @@ fn scalar(
         });
         e
     };
+    // The value is NULL for an outer row without a match only if it propagates NULL from a
+    // column of the subquery's own table; a value over outer columns alone (or constants)
+    // keeps its value through the NULL-extended row and needs the guard (A6).
+    let reads_inner = !scan(&sb.outputs[0].expr).0.is_empty();
     let value = localize(sb.outputs[0].expr.clone());
-    let value = if null_propagating(&value) && has_column_ref(&value) {
+    let value = if reads_inner && null_propagating(&value) {
         value
     } else {
         parse_expr(&format!(

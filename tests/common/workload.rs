@@ -302,8 +302,8 @@ fn all_ecommerce_views() -> Vec<ViewSpec> {
             "SELECT kind, customer_id, COUNT(*) AS n, SUM(amount) AS total FROM events_log GROUP BY kind, customer_id",
         ),
         // full-refresh fallbacks
-        ViewSpec::new("v_events_big", Full, "SELECT customer_id, kind, amount FROM events_log WHERE amount > 50"),
-        ViewSpec::new("v_distinct_methods", Full, "SELECT DISTINCT method, status FROM payments"),
+        ViewSpec::new("v_events_big", Incremental, "SELECT customer_id, kind, amount FROM events_log WHERE amount > 50"),
+        ViewSpec::new("v_distinct_methods", Incremental, "SELECT DISTINCT method, status FROM payments"),
         ViewSpec::new(
             "v_union_names",
             Full,
@@ -312,12 +312,12 @@ fn all_ecommerce_views() -> Vec<ViewSpec> {
         ),
         ViewSpec::new(
             "v_top_products",
-            Full,
+            Incremental,
             "SELECT id, sku, price FROM products WHERE active = 1 ORDER BY price DESC, id LIMIT 5",
         ),
         ViewSpec::new(
             "v_big_spenders",
-            Full,
+            Incremental,
             "SELECT c.id, c.name FROM customers c
              WHERE c.id IN (SELECT o.customer_id FROM orders o JOIN payments p ON p.order_id = o.id WHERE p.amount > 400)",
         ),

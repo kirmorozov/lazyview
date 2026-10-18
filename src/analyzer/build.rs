@@ -222,7 +222,13 @@ impl<'a> Builder<'a> {
                     source: Source::Derived(rel),
                 }))
             }
-            TableFactor::NestedJoin { .. } => Ok(Err("unsupported FROM item".into())),
+            // (Chains of inner joins in parentheses are flattened before building: what is
+            // left holds an outer join or hangs on one.)
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => Ok(Err(format!(
+                "parenthesized join ({table_with_joins}) that cannot be flattened into the FROM chain (needs internal views)"
+            ))),
             _ => Ok(Err("unsupported FROM item".into())),
         }
     }

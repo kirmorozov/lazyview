@@ -133,24 +133,63 @@ fn cases() -> Vec<Case> {
             "spj",
             "SELECT o.id, (SELECT CHAR(65 + (p.amount > 10)) FROM payments p WHERE p.id = o.id) AS v FROM orders o",
         ),
-        // A4: `*` over USING / NATURAL joins (shared columns coalesced by the server): Full
-        // with a reason, never an empty or duplicated projection.
+        // A6: a scalar subquery whose value reads only outer columns is NULL where no row
+        // matches (guarded after the LEFT JOIN rewrite), in the projection and in WHERE.
+        case(
+            "scalar_outer_only",
+            "incremental",
+            "spj",
+            "SELECT o.id, (SELECT o.note FROM payments p WHERE p.id = o.id * 10) AS v,
+                    (SELECT CONCAT(o.status, 'x') FROM payments p WHERE p.id = o.id * 10) AS w FROM orders o",
+        ),
+        case(
+            "scalar_outer_only_where",
+            "incremental",
+            "spj",
+            "SELECT o.id, o.status FROM orders o WHERE (SELECT o.note FROM payments p WHERE p.id = o.id * 10) IS NULL",
+        ),
+        // C1: a string literal with a newline before a semi-join (the marker replacement
+        // must convert multi-line token locations).
+        case(
+            "semi_newline_literal",
+            "incremental",
+            "spj",
+            "SELECT o.id, o.status FROM orders o WHERE o.note <> 'a\nb'
+             AND EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.qty > 1)",
+        ),
+        // A5: a CTE chain whose inlined form would have 64 table references is Full with the
+        // budget in the reason (the server evaluates the statement as written).
+        case(
+            "cte_chain_64",
+            "full",
+            "inlining the WITH clause and derived tables reads 64 table references (budget 32): CTE `t5` is referenced 2 times (needs internal views)",
+            "WITH t0 AS (SELECT id, customer_id, status FROM orders)
+             , t1 AS (SELECT a.id, a.customer_id, a.status FROM t0 a JOIN t0 b ON b.id = a.id)
+             , t2 AS (SELECT a.id, a.customer_id, a.status FROM t1 a JOIN t1 b ON b.id = a.id)
+             , t3 AS (SELECT a.id, a.customer_id, a.status FROM t2 a JOIN t2 b ON b.id = a.id)
+             , t4 AS (SELECT a.id, a.customer_id, a.status FROM t3 a JOIN t3 b ON b.id = a.id)
+             , t5 AS (SELECT a.id, a.customer_id, a.status FROM t4 a JOIN t4 b ON b.id = a.id)
+             , t6 AS (SELECT a.id, a.customer_id, a.status FROM t5 a JOIN t5 b ON b.id = a.id)
+             SELECT id, status FROM t6",
+        ),
+        // A4: `*` over USING / NATURAL joins expanded as the server does (shared columns once,
+        // from the preserved side, then the rest): incremental, same columns as the view.
         case(
             "star_using_join",
-            "full",
-            "SELECT * over a USING or NATURAL join (shared columns are coalesced): list the columns",
+            "incremental",
+            "spj",
             "SELECT * FROM orders JOIN customers USING (id)",
         ),
         case(
             "star_natural_join",
-            "full",
-            "SELECT * over a USING or NATURAL join (shared columns are coalesced): list the columns",
+            "incremental",
+            "spj",
             "SELECT * FROM customers NATURAL JOIN regions",
         ),
         case(
             "star_right_using",
-            "full",
-            "SELECT * over a USING or NATURAL join (shared columns are coalesced): list the columns",
+            "incremental",
+            "spj",
             "SELECT * FROM orders RIGHT JOIN customers USING (id)",
         ),
         // Single-table derived table on the NULL side; its constant column is NULL when missing.
@@ -1325,6 +1364,130 @@ fn cte_cascades_match_their_oracles() {
         run_cascade(&ctx, "traced_w0", cascade_traced_cases(), false, "0").await?;
         run_cascade(&ctx, "rebuild_w0", cascade_rebuild_cases(), true, "0").await?;
         run_cascade(&ctx, "rebuild_w50", cascade_rebuild_cases(), true, "50").await?;
+        Ok(())
+    });
+}
+
+// --- L1: rows chosen by ORDER BY / PARTITION BY columns that are not projected.
+
+const ORDER_DDL: &[&str] = &[
+    "CREATE TABLE l_customers (id INT NOT NULL PRIMARY KEY, name VARCHAR(50) NOT NULL)",
+    "CREATE TABLE l_orders (id INT NOT NULL PRIMARY KEY, customer_id INT NULL, customer VARCHAR(50) NULL,
+     total DECIMAL(10,2) NOT NULL, KEY k_cust (customer_id))",
+    "INSERT INTO l_customers VALUES (1,'ann'),(2,'bob'),(3,'cat'),(4,'dan')",
+    "INSERT INTO l_orders VALUES (1,1,'ann',10),(2,2,'bob',5),(3,1,'ann',7),(4,3,'cat',1),(5,4,'dan',3),(6,NULL,NULL,2)",
+];
+
+/// Top-N and window views over columns that appear only in ORDER BY / PARTITION BY.
+fn order_cases() -> Vec<Case> {
+    vec![
+        case("r_ctl", "incremental", "global", "SELECT id FROM l_orders ORDER BY total DESC LIMIT 2"),
+        case("r_expr", "incremental", "global", "SELECT id FROM l_orders ORDER BY total * 2 DESC LIMIT 2"),
+        case("r_neg", "incremental", "global", "SELECT id FROM l_orders ORDER BY -total LIMIT 2"),
+        case("r_func", "incremental", "global", "SELECT id FROM l_orders ORDER BY ABS(total) DESC, id LIMIT 2"),
+        case("r_offset", "incremental", "global", "SELECT id FROM l_orders ORDER BY total DESC LIMIT 1 OFFSET 1"),
+        case("r_topcust", "incremental", "global",
+             "SELECT customer_id FROM l_orders GROUP BY customer_id ORDER BY SUM(total) DESC, customer_id LIMIT 2"),
+        case("r_joined", "incremental", "global",
+             "SELECT o.id FROM l_orders o JOIN l_customers c ON c.id = o.customer_id ORDER BY c.name DESC, o.id LIMIT 2"),
+        case("r_alias", "incremental", "global", "SELECT id, total * 2 AS t FROM l_orders ORDER BY t DESC LIMIT 2"),
+        case("w_part", "incremental", "grouped",
+             "SELECT id, SUM(total) OVER (PARTITION BY customer_id) AS s FROM l_orders"),
+        case("w_order", "incremental", "global",
+             "SELECT id, ROW_NUMBER() OVER (ORDER BY total DESC, id) AS rn FROM l_orders"),
+        case("w_joined", "incremental", "global",
+             "SELECT o.id, RANK() OVER (ORDER BY c.name, o.id) AS rk FROM l_orders o JOIN l_customers c ON c.id = o.customer_id"),
+        // L2: named windows (used by two functions, refined by another window, without
+        // PARTITION BY) stay in the refresh SELECT.
+        case(
+            "w_named",
+            "incremental",
+            "grouped",
+            "SELECT id, customer_id, ROW_NUMBER() OVER w AS rn, SUM(total) OVER w AS run FROM l_orders WINDOW w AS (PARTITION BY customer_id ORDER BY id)",
+        ),
+        case(
+            "w_named_one",
+            "incremental",
+            "global",
+            "SELECT id, ROW_NUMBER() OVER w AS rn FROM l_orders WINDOW w AS (ORDER BY total DESC, id)",
+        ),
+        case(
+            "w_named_ref",
+            "incremental",
+            "grouped",
+            "SELECT id, SUM(total) OVER (w ORDER BY id) AS run FROM l_orders WINDOW w AS (PARTITION BY customer_id)",
+        ),
+    ]
+}
+
+/// UPDATE-only mutations: nothing is inserted or deleted, so only the read-column filter
+/// decides whether the view is recomputed.
+fn order_steps() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "ORDER BY column raised",
+            "UPDATE l_orders SET total = 100 WHERE id = 4",
+        ),
+        (
+            "ORDER BY column lowered",
+            "UPDATE l_orders SET total = 0 WHERE id = 1",
+        ),
+        (
+            "unrelated column",
+            "UPDATE l_orders SET customer = 'bob' WHERE id = 3",
+        ),
+        (
+            "joined ORDER BY column",
+            "UPDATE l_customers SET name = 'aaa' WHERE id = 3",
+        ),
+        (
+            "joined ORDER BY column again",
+            "UPDATE l_customers SET name = 'zzz' WHERE id = 1",
+        ),
+        (
+            "PARTITION BY column",
+            "UPDATE l_orders SET customer_id = 1 WHERE id = 2",
+        ),
+        (
+            "ORDER BY column of several rows",
+            "UPDATE l_orders SET total = total + 50 WHERE id IN (5, 6)",
+        ),
+    ]
+}
+
+async fn run_order(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
+    let db = ctx.new_db(&format!("cte_order_{label}")).await?;
+    let mut c = db.conn().await?;
+    for s in ORDER_DDL {
+        exec(&mut c, s).await?;
+    }
+    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), order_cases()).await?;
+    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        &format!("{label}: initial build"),
+    )
+    .await?;
+    for (what, stmt) in order_steps() {
+        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
+        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
+    }
+    assert_ready(&mut c, &names(&specs)).await?;
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// L1: an UPDATE of a column that appears only in ORDER BY (plain, expression, aggregate input,
+/// OFFSET, joined alias) or in a window's PARTITION BY / ORDER BY reaches the recompute.
+#[test]
+fn cte_order_columns_match_their_oracles() {
+    scenario("cte_order", |ctx| async move {
+        run_order(&ctx, "w0", "0").await?;
+        run_order(&ctx, "w50", "50").await?;
         Ok(())
     });
 }

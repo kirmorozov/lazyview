@@ -77,6 +77,11 @@ pub fn plan(
 }
 
 /// Plans a definition, isolating subtrees into internal views where `opts` allows it.
+/// Most base-table references the inlined (flat) form of a definition may have. The servers
+/// allow 61 tables in a join; beyond this budget a multiply-referenced CTE belongs in an
+/// internal view instead of being copied.
+pub(crate) const INLINE_BUDGET: usize = 32;
+
 pub fn analyze(
     def: &ParsedDef,
     default_schema: &str,
@@ -113,7 +118,27 @@ pub fn analyze(
     let Some((mut query, tokens)) = source::parse_query(&def.query_sql) else {
         return plan_as_written();
     };
-    let joins_changed = joins::normalize(&mut query, default_schema, tables);
+    // Every CTE reference is inlined as a copy: bound the size of the flat form before building
+    // it (a chain of CTEs each referencing the previous one twice is 2^n copies).
+    let size = scope::inlined_size(&query, &scope::Scope::default());
+    if size.refs > INLINE_BUDGET {
+        let culprit = match &size.worst {
+            Some((name, n)) => format!(": CTE `{name}` is referenced {n} times"),
+            None => String::new(),
+        };
+        return full(&format!(
+            "inlining the WITH clause and derived tables reads {} table references (budget {INLINE_BUDGET}){culprit} (needs internal views)",
+            size.refs
+        ));
+    }
+    // `*` over USING / NATURAL joins is expanded as written (before a RIGHT JOIN is turned
+    // around: the preserved side gives the shared columns), so the column list and order are
+    // the server's. (The spans of the expanded items are none: they carry no source text.)
+    let mut star_expanded = false;
+    if let SetExpr::Select(s) = query.body.as_mut() {
+        star_expanded = analyze::expand_star_over_using(s, default_schema, tables)?;
+    }
+    let joins_changed = joins::normalize(&mut query, default_schema, tables) || star_expanded;
     let text = source::Text::new(&def.query_sql, tokens);
     let bld = build::Builder {
         schema: default_schema,

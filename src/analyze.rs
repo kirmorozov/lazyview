@@ -180,11 +180,9 @@ const NULL_STRICT: &[&str] = &[
     "STRCMP",
     "SOUNDEX",
     "INSERT",
-    "FORMAT",
     "MD5",
     "SHA",
     "SHA1",
-    "SHA2",
     "TO_BASE64",
     "FROM_BASE64",
     "COMPRESS",
@@ -207,8 +205,6 @@ const NULL_STRICT: &[&str] = &[
     "DAYOFWEEK",
     "DAYOFYEAR",
     "WEEKDAY",
-    "WEEK",
-    "YEARWEEK",
     "QUARTER",
     "HOUR",
     "MINUTE",
@@ -815,6 +811,9 @@ pub struct ViewPlan {
     /// Top-N views (single-unit, recomputed with one bounded query per batch): the
     /// `ORDER BY … LIMIT n` that ends their SELECT.
     pub order_limit_sql: Option<String>,
+    /// Named windows (`WINDOW w AS (…)`), rendered after HAVING: the projection's `OVER w`
+    /// references need them (L2).
+    pub window_sql: Option<String>,
     /// WHERE of the lookups of the aliases marked `lookup_where`: `where_sql` without the
     /// subquery predicates (evaluated on the substituted rows instead) and without conjuncts that
     /// keep NULL-extended rows.
@@ -850,6 +849,10 @@ impl ViewPlan {
         if let Some(h) = &self.having_sql {
             sql.push_str(" HAVING ");
             sql.push_str(h);
+        }
+        if let Some(w) = &self.window_sql {
+            sql.push(' ');
+            sql.push_str(w);
         }
         if let Some(o) = &self.order_limit_sql {
             sql.push(' ');
@@ -1495,6 +1498,7 @@ pub fn plan_block(
         unit_in_projection: Vec::new(),
         full_select: full_select.clone(),
         order_limit_sql: None,
+        window_sql: None,
         lookup_where_sql: None,
         unit_unique: false,
         lineage: Vec::new(),
@@ -1519,6 +1523,9 @@ pub fn plan_block(
 
     let mut query = def.query.clone();
     let order_by = query.order_by.take();
+    // Top-N rows are chosen by the ORDER BY: its columns (also of joined aliases, also as
+    // aggregate inputs) are read columns, whether or not they are projected (L1).
+    let order_usage = order_by.clone();
     if query.with.is_some() {
         return Ok(full("WITH clause"));
     }
@@ -1539,6 +1546,14 @@ pub fn plan_block(
     if select.from.is_empty() {
         return Ok(full("no FROM clause"));
     }
+    // `*` over USING / NATURAL joins lists the shared columns once (A4).
+    let expanded_star = expand_star_over_using(select, default_schema, tables)?;
+    let star_items: Vec<Option<&str>> = if expanded_star {
+        // Expanded items have no source text of their own.
+        Vec::new()
+    } else {
+        def.item_sql.iter().map(|s| s.as_deref()).collect()
+    };
 
     // FROM: tables and joins we know how to maintain.
     let mut aliases: Vec<(String, Arc<TableInfo>)> = Vec::new();
@@ -1651,7 +1666,34 @@ pub fn plan_block(
             SelectItem::QualifiedWildcard(..) => bail!("unsupported wildcard"),
             other => {
                 projection.push(other);
-                item_sql.push(def.item_sql.get(ii).and_then(|s| s.as_deref()));
+                item_sql.push(star_items.get(ii).copied().flatten());
+            }
+        }
+    }
+    if projection.is_empty() {
+        bail!("the SELECT has no columns");
+    }
+    // Output names the server will give (aliases and plain columns; other expressions get
+    // server-generated names that `names.rs` keeps unique): a duplicate fails CREATE TABLE,
+    // so it fails here, by name (L3). A column list renames everything positionally.
+    if def.columns.is_empty() {
+        let mut seen: Vec<String> = Vec::new();
+        for item in &projection {
+            let name = match item {
+                SelectItem::ExprWithAlias { alias, .. } => Some(ident_name(alias)),
+                SelectItem::UnnamedExpr(Expr::Identifier(id)) => Some(ident_name(id)),
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                    parts.last().map(ident_name)
+                }
+                _ => None,
+            };
+            if let Some(n) = name {
+                if seen.iter().any(|s| s.eq_ignore_ascii_case(&n)) {
+                    bail!(
+                        "duplicate column name `{n}` in the SELECT (the server refuses such a view): alias one of them"
+                    );
+                }
+                seen.push(n);
             }
         }
     }
@@ -1719,6 +1761,9 @@ pub fn plan_block(
     }
     usage.mark(&select.having, false, true);
     usage.mark(&select.named_window, false, false);
+    if let Some(o) = &order_usage {
+        usage.mark(o, false, true);
+    }
     for e in &partition {
         usage.mark(e, true, false);
     }
@@ -2174,6 +2219,19 @@ pub fn plan_block(
             }
         }
     }
+    let window_sql = if select.named_window.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "WINDOW {}",
+            select
+                .named_window
+                .iter()
+                .map(|w| w.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    };
     Ok(ViewPlan {
         schema,
         name: def.name.clone(),
@@ -2215,6 +2273,7 @@ pub fn plan_block(
         unit_in_projection,
         full_select: query.to_string(),
         order_limit_sql: top_n,
+        window_sql,
         lookup_where_sql: lookup_where
             .map(|w| w.join(" AND "))
             .filter(|w| !w.is_empty()),
@@ -2224,6 +2283,142 @@ pub fn plan_block(
         aliases: alias_plans,
         output_names,
     })
+}
+
+/// Expands an unqualified `*` over USING / NATURAL joins the way the servers do: the join's
+/// shared columns once, first, then the remaining columns of the left side, then those of the
+/// right table; a RIGHT JOIN is the mirrored LEFT JOIN (shared columns and the rest from the
+/// right table first); applied join by join along the chain. Only for a FROM of one chain of base tables with
+/// inner / LEFT / RIGHT joins; anything else is left to the caller's fallback. Whether `*` was
+/// expanded.
+pub(crate) fn expand_star_over_using(
+    select: &mut Select,
+    default_schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> Result<bool> {
+    if !select
+        .projection
+        .iter()
+        .any(|p| matches!(p, SelectItem::Wildcard(_)))
+        || select.from.len() != 1
+        || !select.from[0].joins.iter().any(|j| {
+            matches!(
+                join_constraint(&j.join_operator),
+                Some(JoinConstraint::Using(_) | JoinConstraint::Natural)
+            )
+        })
+    {
+        return Ok(false);
+    }
+    let twj = &select.from[0];
+    let factor = |f: &TableFactor| -> Option<(String, Arc<TableInfo>)> {
+        match f {
+            TableFactor::Table {
+                name,
+                alias,
+                args: None,
+                ..
+            } => {
+                let t = object_table_ref(name, default_schema)?;
+                let info = tables.get(&t)?.clone();
+                let n = alias
+                    .as_ref()
+                    .map(|a| ident_name(&a.name))
+                    .unwrap_or_else(|| t.1.clone());
+                Some((n, info))
+            }
+            _ => None,
+        }
+    };
+    let Some((alias0, t0)) = factor(&twj.relation) else {
+        return Ok(false);
+    };
+    // (alias, column name) in the server's `*` order so far.
+    let mut cols: Vec<(String, String)> = t0
+        .columns
+        .iter()
+        .filter(|c| !c.invisible)
+        .map(|c| (alias0.clone(), c.name.clone()))
+        .collect();
+    for j in &twj.joins {
+        let Some((alias, t)) = factor(&j.relation) else {
+            return Ok(false);
+        };
+        let right_preserved = match &j.join_operator {
+            JoinOperator::Join(_) | JoinOperator::Inner(_) | JoinOperator::CrossJoin(_) => false,
+            JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => false,
+            JoinOperator::Right(_) | JoinOperator::RightOuter(_) => true,
+            _ => return Ok(false),
+        };
+        let visible: Vec<String> = t
+            .columns
+            .iter()
+            .filter(|c| !c.invisible)
+            .map(|c| c.name.clone())
+            .collect();
+        let keys: Vec<String> = match join_constraint(&j.join_operator) {
+            Some(JoinConstraint::Using(names)) => names
+                .iter()
+                .map(|n| match n.0.last() {
+                    Some(ObjectNamePart::Identifier(i)) => Ok(ident_name(i)),
+                    _ => bail!("bad USING column"),
+                })
+                .collect::<Result<_>>()?,
+            Some(JoinConstraint::Natural) => cols
+                .iter()
+                .map(|(_, c)| c.clone())
+                .filter(|c| visible.iter().any(|v| v.eq_ignore_ascii_case(c)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut next: Vec<(String, String)> = Vec::new();
+        for k in &keys {
+            let left = cols
+                .iter()
+                .find(|(_, c)| c.eq_ignore_ascii_case(k))
+                .ok_or_else(|| anyhow!("USING column {k} not found"))?;
+            let right = visible
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(k))
+                .ok_or_else(|| anyhow!("USING column {k} not found"))?;
+            next.push(if right_preserved {
+                (alias.clone(), right.clone())
+            } else {
+                left.clone()
+            });
+        }
+        let is_key = |c: &str| keys.iter().any(|k| k.eq_ignore_ascii_case(c));
+        let left_rest = cols.iter().filter(|(_, c)| !is_key(c)).cloned();
+        let right_rest = visible
+            .iter()
+            .filter(|c| !is_key(c))
+            .map(|c| (alias.clone(), c.clone()));
+        // A RIGHT JOIN expands as the mirrored LEFT JOIN: the right table's columns first.
+        if right_preserved {
+            next.extend(right_rest);
+            next.extend(left_rest);
+        } else {
+            next.extend(left_rest);
+            next.extend(right_rest);
+        }
+        cols = next;
+    }
+    let mut projection = Vec::new();
+    for item in std::mem::take(&mut select.projection) {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (a, c) in &cols {
+                    projection.push(SelectItem::UnnamedExpr(Expr::CompoundIdentifier(vec![
+                        qident(a),
+                        qident(c),
+                    ])));
+                }
+            }
+            other => projection.push(other),
+        }
+    }
+    select.projection = projection;
+    Ok(true)
 }
 
 /// `db.t.col` -> `t`.`col` for columns of the FROM clause: lookups replace a table by derived
@@ -3247,6 +3442,11 @@ mod tests {
             "INTERVAL_FN(c.x)",
             "QUOTE(c.x)",
             "JSON_ARRAY(c.x)",
+            // A7: a NULL mode / locale / length argument selects a default.
+            "WEEK(c.at, c.x)",
+            "YEARWEEK(c.at, c.x)",
+            "FORMAT(c.x, 2, c.l)",
+            "SHA2(c.x, c.l)",
         ] {
             assert!(!null_propagating(&e(sql)), "{sql}");
         }
@@ -3258,31 +3458,63 @@ mod tests {
         assert!(parse_definition("CREATE VIEW v AS SELECT a OR 1 AS v FROM t").is_ok());
     }
 
-    /// A4: `SELECT *` over USING / NATURAL joins coalesces the shared columns (the server
-    /// lists them once, first): a per-table expansion would duplicate or drop columns, so
-    /// the view is Full with a reason naming the fix; `alias.*` and listed columns plan.
+    /// A4: `SELECT *` over USING / NATURAL joins is expanded as the server does it: the shared
+    /// columns once, first, from the preserved side, then the remaining columns of the left
+    /// side, then of the right table, join by join; shapes the expansion does not cover are
+    /// Full with a reason naming the fix.
     #[test]
-    fn star_over_using_joins_is_full() {
+    fn star_over_using_joins_expands_like_the_server() {
         let cat: HashMap<TableRef, Arc<TableInfo>> = [
             table("t_a", &[("k", "int"), ("x", "int")], &[0]),
             table("t_b", &[("k", "int"), ("y", "int")], &[0]),
+            table("t_c", &[("y", "int"), ("z", "int")], &[0]),
         ]
         .into();
-        for sql in [
-            "CREATE VIEW v AS SELECT * FROM t_a JOIN t_b USING (k)",
-            "CREATE VIEW v AS SELECT * FROM t_a LEFT JOIN t_b USING (k)",
-            "CREATE VIEW v AS SELECT * FROM t_a NATURAL JOIN t_b",
-            "CREATE VIEW v AS SELECT * FROM t_a RIGHT JOIN t_b USING (k)",
-            "CREATE VIEW v AS SELECT t_a.k, * FROM t_a JOIN t_b USING (k)",
-        ] {
+        let plan = |sql: &str| {
             let d = parse_definition(sql).unwrap();
-            let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
-            assert_eq!(p.mode, Mode::Full(STAR_USING.into()), "{sql}");
-            assert_eq!(p.tables.len(), 2, "{sql}");
-            // The block planner alone names this or the join kind it does not take.
-            let p = plan_block(&d, "db", &cat).unwrap();
-            assert!(matches!(p.mode, Mode::Full(_)), "{sql}: {}", p.mode);
+            crate::analyzer::plan(&d, "db", &cat).unwrap()
+        };
+        for (sql, cols) in [
+            (
+                "CREATE VIEW v AS SELECT * FROM t_a JOIN t_b USING (k)",
+                vec!["`t_a`.`k`", "`t_a`.`x`", "`t_b`.`y`"],
+            ),
+            (
+                "CREATE VIEW v AS SELECT * FROM t_a LEFT JOIN t_b USING (k)",
+                vec!["`t_a`.`k`", "`t_a`.`x`", "`t_b`.`y`"],
+            ),
+            (
+                "CREATE VIEW v AS SELECT * FROM t_a NATURAL JOIN t_b",
+                vec!["`t_a`.`k`", "`t_a`.`x`", "`t_b`.`y`"],
+            ),
+            // RIGHT JOIN: the mirrored LEFT JOIN, the right table's columns first.
+            (
+                "CREATE VIEW v AS SELECT * FROM t_a RIGHT JOIN t_b USING (k)",
+                vec!["`t_b`.`k`", "`t_b`.`y`", "`t_a`.`x`"],
+            ),
+            // A chain: the second join's shared columns move to the front.
+            (
+                "CREATE VIEW v AS SELECT * FROM t_a JOIN t_b USING (k) JOIN t_c USING (y)",
+                vec!["`t_b`.`y`", "`t_a`.`k`", "`t_a`.`x`", "`t_c`.`z`"],
+            ),
+            (
+                "CREATE VIEW v AS SELECT t_a.x AS ax, * FROM t_a JOIN t_b USING (k)",
+                vec!["t_a.x AS ax", "`t_a`.`k`", "`t_a`.`x`", "`t_b`.`y`"],
+            ),
+        ] {
+            let p = plan(sql);
+            assert_eq!(p.mode, Mode::Spj, "{sql}: {}", p.mode);
+            assert_eq!(p.projection, cols, "{sql}");
         }
+        // The block planner alone (the path without rewrites) expands the same way.
+        let d = parse_definition("CREATE VIEW v AS SELECT * FROM t_a JOIN t_b USING (k)").unwrap();
+        let p = plan_block(&d, "db", &cat).unwrap();
+        assert_eq!(p.mode, Mode::Spj);
+        assert_eq!(p.projection, vec!["`t_a`.`k`", "`t_a`.`x`", "`t_b`.`y`"]);
+        // Not covered (a derived table in the chain): Full, naming the fix.
+        let p = plan("CREATE VIEW v AS SELECT * FROM t_a JOIN (SELECT k, y FROM t_b) d USING (k)");
+        assert_eq!(p.mode, Mode::Full(STAR_USING.into()));
+        assert_eq!(p.tables.len(), 2);
         for sql in [
             "CREATE VIEW v AS SELECT t_a.*, y FROM t_a JOIN t_b USING (k)",
             "CREATE VIEW v AS SELECT k, x, y FROM t_a LEFT JOIN t_b USING (k)",
@@ -3290,6 +3522,125 @@ mod tests {
             let d = parse_definition(sql).unwrap();
             let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
             assert_eq!(p.mode, Mode::Spj, "{sql}: {}", p.mode);
+        }
+    }
+
+    /// L1: a top-N view's rows are chosen by its ORDER BY, so columns that appear only there
+    /// (plain, in expressions, as aggregate inputs, of joined aliases) are read columns: an
+    /// UPDATE of such a column must reach the recompute.
+    #[test]
+    fn order_by_columns_of_top_n_views_are_referenced() {
+        let col = |v: &ViewPlan, alias: &str, c: &str| -> bool {
+            let a = v.aliases.iter().find(|a| a.name == alias).unwrap();
+            a.referenced[a.table.col_index(c).unwrap()]
+        };
+        for sql in [
+            "CREATE VIEW v AS SELECT id FROM orders ORDER BY total DESC LIMIT 2",
+            "CREATE VIEW v AS SELECT id FROM orders ORDER BY total * 2 DESC LIMIT 2",
+            "CREATE VIEW v AS SELECT id FROM orders ORDER BY -total LIMIT 2",
+            "CREATE VIEW v AS SELECT id FROM orders ORDER BY ABS(total) DESC, id LIMIT 2",
+            "CREATE VIEW v AS SELECT id FROM orders ORDER BY total DESC LIMIT 1 OFFSET 1",
+            "CREATE VIEW v AS SELECT customer_id FROM orders GROUP BY customer_id ORDER BY SUM(total) DESC LIMIT 2",
+        ] {
+            let v = p(sql);
+            assert_eq!(v.mode, Mode::Global, "{sql}");
+            assert!(col(&v, "orders", "total"), "{sql}");
+            assert!(!col(&v, "orders", "note"), "{sql}");
+        }
+        let v = p(
+            "CREATE VIEW v AS SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id \
+             ORDER BY c.name DESC, o.id LIMIT 2",
+        );
+        assert!(col(&v, "c", "name") && !col(&v, "o", "total"));
+        // An alias or ordinal of a projected expression adds nothing new.
+        let v = p("CREATE VIEW v AS SELECT id, total * 2 AS t FROM orders ORDER BY t DESC LIMIT 2");
+        assert!(col(&v, "orders", "total"));
+        let v = p("CREATE VIEW v AS SELECT id, status FROM orders ORDER BY 2 DESC LIMIT 2");
+        assert!(col(&v, "orders", "status") && !col(&v, "orders", "total"));
+        // Windows: PARTITION BY / ORDER BY columns inside OVER are read columns too.
+        let v = p(
+            "CREATE VIEW v AS SELECT id, SUM(total) OVER (PARTITION BY customer_id ORDER BY status) AS s FROM orders",
+        );
+        assert!(col(&v, "orders", "customer_id") && col(&v, "orders", "status"));
+    }
+
+    /// L2: a named WINDOW clause stays part of the refresh SELECT (the projection's `OVER w`
+    /// needs it), for windows used by several functions and windows refining another one.
+    #[test]
+    fn named_windows_are_kept_in_the_select() {
+        let v = p(
+            "CREATE VIEW v AS SELECT id, customer_id, ROW_NUMBER() OVER w AS rn, SUM(total) OVER w AS run \
+             FROM orders WINDOW w AS (PARTITION BY customer_id ORDER BY id)",
+        );
+        assert_eq!(v.mode, Mode::Grouped);
+        assert_eq!(
+            v.window_sql.as_deref(),
+            Some("WINDOW w AS (PARTITION BY customer_id ORDER BY id)")
+        );
+        let sql = v.select_sql(&[0], None);
+        assert!(
+            sql.ends_with(" FROM orders WINDOW w AS (PARTITION BY customer_id ORDER BY id)"),
+            "{sql}"
+        );
+        let v = p(
+            "CREATE VIEW v AS SELECT id, SUM(total) OVER (w ORDER BY id) AS run FROM orders \
+             WINDOW w AS (PARTITION BY customer_id)",
+        );
+        assert_eq!(v.mode, Mode::Grouped);
+        assert!(v
+            .select_sql(&[0], None)
+            .ends_with(" WINDOW w AS (PARTITION BY customer_id)"));
+        let v = p("CREATE VIEW v AS SELECT id, ROW_NUMBER() OVER w AS rn FROM orders WINDOW w AS (ORDER BY id)");
+        assert_eq!(v.mode, Mode::Global);
+        assert!(v
+            .select_sql(&[], None)
+            .ends_with(" WINDOW w AS (ORDER BY id)"));
+        assert!(p("CREATE VIEW v AS SELECT id, status FROM orders")
+            .window_sql
+            .is_none());
+    }
+
+    /// L3: duplicate output names (two plain columns or aliases with the same name, `*` over
+    /// tables sharing names) and an empty projection are refused when planning, by name,
+    /// instead of failing at CREATE TABLE and retrying forever; a column list renames.
+    #[test]
+    fn duplicate_output_names_are_refused() {
+        let cat: HashMap<TableRef, Arc<TableInfo>> = [
+            table("t_a", &[("k", "int"), ("x", "int")], &[0]),
+            table("t_c", &[("k", "int"), ("z", "int"), ("x", "int")], &[0]),
+        ]
+        .into();
+        let err = |sql: &str| {
+            let d = parse_definition(sql).unwrap();
+            let e = crate::analyzer::plan(&d, "db", &cat)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                plan_block(&d, "db", &cat).unwrap_err().to_string(),
+                e,
+                "{sql}"
+            );
+            e
+        };
+        assert!(
+            err("CREATE VIEW v AS SELECT a.k, c.k FROM t_a a JOIN t_c c ON c.k = a.k")
+                .contains("duplicate column name `k`")
+        );
+        assert!(
+            err("CREATE VIEW v AS SELECT a.k, c.z AS K FROM t_a a JOIN t_c c ON c.k = a.k")
+                .contains("duplicate column name `K`")
+        );
+        assert!(
+            err("CREATE VIEW v AS SELECT * FROM t_a a JOIN t_c c ON c.k = a.k")
+                .contains("duplicate column name `k`")
+        );
+        for sql in [
+            "CREATE VIEW v AS SELECT a.k, c.k AS ck FROM t_a a JOIN t_c c ON c.k = a.k",
+            "CREATE VIEW v (k1, k2) AS SELECT a.k, c.k FROM t_a a JOIN t_c c ON c.k = a.k",
+            "CREATE VIEW v AS SELECT * FROM t_a JOIN t_c USING (k, x)",
+        ] {
+            let d = parse_definition(sql).unwrap();
+            assert!(crate::analyzer::plan(&d, "db", &cat).is_ok(), "{sql}");
         }
     }
 
