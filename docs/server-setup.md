@@ -25,6 +25,19 @@ Recommended:
   `LAZYVIEW_ON_MISSING_BINLOG=rebuild`. The settings are `binlog_expire_logs_seconds` (MySQL,
   Percona, MariaDB 10.6+) or `expire_logs_days`.
 
+### sql_mode
+
+lazyview's own sessions reset the parts of the server's `sql_mode` that change how SQL text is
+parsed: `ANSI_QUOTES`, `PIPES_AS_CONCAT`, `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES` and
+`IGNORE_SPACE` (and the combination modes `ANSI`, `TRADITIONAL`, `ORACLE`, ... that imply them;
+their other members stay). View definitions are read, and the SQL lazyview runs is written, in the
+default mode: `"paid"` is a string, `||` is `OR`, `NOT a = b` is `NOT (a = b)`. A global
+`ANSI_QUOTES` therefore does not break a definition written for the default mode; a definition
+that relies on `ANSI_QUOTES` (double-quoted identifiers) must use backticks instead. The strict and
+zero-date flags are dropped as well so values are copied as stored (see
+[internals](internals.md)). Other flags (`ONLY_FULL_GROUP_BY`, `NO_ENGINE_SUBSTITUTION`, ...) are
+kept.
+
 `binlog_transaction_compression=ON` on MySQL is supported. `binlog_format` and `binlog_row_image`
 are dynamic, but sessions that are already connected keep the old value until they reconnect.
 

@@ -4,14 +4,14 @@
 //! Sources are only ever read with plain SELECTs (never INSERT ... SELECT), so the service takes
 //! no locks on source rows; all writes go to the target tables.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Row, Value};
 
-use crate::accumulate::UnitChunk;
+use crate::accumulate::{UnitChunk, UnitKind};
 use crate::analyze::{quote_ident as q, Mode, ViewPlan};
 use crate::datum::{Datum, Key};
 use crate::metrics::Metrics;
@@ -245,16 +245,61 @@ impl Layout {
         self.unit_index().is_some()
     }
 
-    /// For each unit column, whether it is a TIMESTAMP (see [`UnitChunk::filter_typed`]).
-    pub fn timestamp_units(&self) -> Vec<bool> {
+    /// How each unit column's keys are bound in a filter (see [`UnitChunk::filter_typed`]), from
+    /// the probed column type: TIMESTAMP keys by local time, JSON keys (MySQL/Percona; MariaDB's
+    /// JSON is LONGTEXT) as JSON values.
+    pub fn unit_kinds(&self) -> Vec<UnitKind> {
         self.unit_pos
             .iter()
-            .map(|&p| self.cols[p].data_type == "timestamp")
+            .map(|&p| match self.cols[p].data_type.as_str() {
+                "timestamp" => UnitKind::Timestamp,
+                "json" => UnitKind::Json,
+                _ => UnitKind::Plain,
+            })
             .collect()
     }
 
     pub fn unit_key(&self, row: &[Datum]) -> Key {
         self.unit_pos.iter().map(|&p| row[p].clone()).collect()
+    }
+
+    /// This layout for a target of another product: every collation the target does not know is
+    /// replaced by the target's default collation of the column's character set; a column whose
+    /// character set is unknown too loses both clauses (the table default applies).
+    pub async fn with_target_collations(&self, conn: &mut Conn) -> Result<Layout> {
+        let rows: Vec<(String, String, String)> = conn
+            .query(
+                "SELECT CAST(COLLATION_NAME AS CHAR), CAST(CHARACTER_SET_NAME AS CHAR), \
+                 CAST(IS_DEFAULT AS CHAR) FROM information_schema.COLLATIONS",
+            )
+            .await
+            .context("reading the target's collations")?;
+        let known: HashSet<String> = rows
+            .iter()
+            .map(|(c, _, _)| c.to_ascii_lowercase())
+            .collect();
+        let default: HashMap<String, String> = rows
+            .iter()
+            .filter(|(_, _, d)| d.eq_ignore_ascii_case("yes"))
+            .map(|(c, cs, _)| (cs.to_ascii_lowercase(), c.clone()))
+            .collect();
+        let mut l = self.clone();
+        for c in &mut l.cols {
+            let (Some(cs), Some(co)) = (&c.charset, &c.collation) else {
+                continue;
+            };
+            if known.contains(&co.to_ascii_lowercase()) {
+                continue;
+            }
+            match default.get(&cs.to_ascii_lowercase()) {
+                Some(d) => c.collation = Some(d.clone()),
+                None => {
+                    c.charset = None;
+                    c.collation = None;
+                }
+            }
+        }
+        Ok(l)
     }
 }
 
@@ -605,7 +650,13 @@ pub async fn init_session(conn: &mut Conn) -> Result<()> {
     Ok(())
 }
 
-/// `mode` without the flags that reject values the source holds (strict mode, zero dates).
+/// `mode` without the flags that reject values the source holds (strict mode, zero dates) and
+/// without the flags that change how SQL text is parsed (`ANSI_QUOTES`, `PIPES_AS_CONCAT`,
+/// `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES`, `IGNORE_SPACE`): lazyview parses definitions
+/// and writes its SQL in the default mode, so under `ANSI_QUOTES` a `"paid"` the analyzer
+/// traced as a string would be a column for the server. The combination modes (`ANSI`,
+/// `TRADITIONAL`, `ORACLE`, ...) imply some of them and go too: the server lists their member
+/// flags individually, so nothing else is lost.
 fn permissive_sql_mode(mode: &str) -> String {
     mode.split(',')
         .map(str::trim)
@@ -618,7 +669,20 @@ fn permissive_sql_mode(mode: &str) -> String {
                         | "STRICT_ALL_TABLES"
                         | "NO_ZERO_DATE"
                         | "NO_ZERO_IN_DATE"
+                        | "ANSI_QUOTES"
+                        | "PIPES_AS_CONCAT"
+                        | "HIGH_NOT_PRECEDENCE"
+                        | "NO_BACKSLASH_ESCAPES"
+                        | "IGNORE_SPACE"
                         | "TRADITIONAL"
+                        | "ANSI"
+                        | "DB2"
+                        | "MAXDB"
+                        | "MSSQL"
+                        | "ORACLE"
+                        | "POSTGRESQL"
+                        | "MYSQL323"
+                        | "MYSQL40"
                 )
         })
         .collect::<Vec<_>>()
@@ -790,8 +854,26 @@ async fn create_shadow_with(
     let shadow = shadow_name(name);
     conn.query_drop(format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(&shadow)))
         .await?;
-    conn.query_drop(layout.create_sql_marked(schema, &shadow, marker))
-        .await?;
+    match conn
+        .query_drop(layout.create_sql_marked(schema, &shadow, marker))
+        .await
+    {
+        Ok(()) => {}
+        // A collation or character set of the source this target does not know (MariaDB 13's
+        // default `utf8mb4_uca1400_ai_ci` on MySQL): the target's default collation of each
+        // column's character set is the closest match.
+        Err(mysql_async::Error::Server(e)) if e.code == 1273 || e.code == 1115 => {
+            let adapted = layout.with_target_collations(conn).await?;
+            tracing::warn!(
+                table = %name,
+                "{}; creating the table with the target's default collations instead",
+                e.message
+            );
+            conn.query_drop(adapted.create_sql_marked(schema, &shadow, marker))
+                .await?;
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(shadow)
 }
 
@@ -932,7 +1014,7 @@ pub async fn read_source(
 ) -> Result<Vec<Vec<Value>>> {
     match chunk {
         Some(c) => {
-            let (f, p) = c.filter_typed(&plan.unit_exprs, &layout.timestamp_units());
+            let (f, p) = c.filter_typed(&plan.unit_exprs, &layout.unit_kinds());
             read_source_filtered(src, plan, layout, Some(&f), p, metrics).await
         }
         None => read_source_filtered(src, plan, layout, None, Vec::new(), metrics).await,
@@ -1033,7 +1115,7 @@ pub async fn read_old(
 ) -> Result<Vec<Vec<Value>>> {
     let unit_cols = layout.unit_cols();
     let (filter, params) = match chunk {
-        Some(c) => c.filter_typed(&unit_cols, &layout.timestamp_units()),
+        Some(c) => c.filter_typed(&unit_cols, &layout.unit_kinds()),
         None => ("TRUE".to_string(), Vec::new()),
     };
     let old: Vec<Row> = conn
@@ -1153,8 +1235,7 @@ async fn write_tx(
             // Keys from the rows: TIMESTAMPs as UTC datetimes, exact in the `+00:00` session.
             keys_chunk(d.changed.clone()).filter(&layout.unit_cols())
         } else {
-            keys_chunk(d.changed.clone())
-                .filter_typed(&layout.unit_cols(), &layout.timestamp_units())
+            keys_chunk(d.changed.clone()).filter_typed(&layout.unit_cols(), &layout.unit_kinds())
         };
         tx.exec_drop(
             format!(
@@ -1473,9 +1554,15 @@ mod tests {
             ),
             "ONLY_FULL_GROUP_BY,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
         );
+        // Parser flags and the combination modes implying them go too (the server lists the
+        // members of a combination mode individually, so `ANSI` keeps `REAL_AS_FLOAT`).
+        assert_eq!(permissive_sql_mode("TRADITIONAL,ANSI_QUOTES"), "");
         assert_eq!(
-            permissive_sql_mode("TRADITIONAL,ANSI_QUOTES"),
-            "ANSI_QUOTES"
+            permissive_sql_mode(
+                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI,\
+                 NO_BACKSLASH_ESCAPES,HIGH_NOT_PRECEDENCE,NO_ENGINE_SUBSTITUTION"
+            ),
+            "REAL_AS_FLOAT,ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"
         );
     }
 }

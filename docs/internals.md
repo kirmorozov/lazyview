@@ -30,7 +30,9 @@
   (READ COMMITTED), never with `INSERT … SELECT`. Fresh rows are compared with the materialized
   rows of each unit, and only the units that changed are written.
 * **Values as stored.** lazyview's sessions drop `STRICT_*`, `NO_ZERO_DATE` and `NO_ZERO_IN_DATE`
-  from the server's `sql_mode`. Zero dates (`'0000-00-00'`, `'2020-00-00'`) are read, compared
+  from the server's `sql_mode`, and the parser flags `ANSI_QUOTES`, `PIPES_AS_CONCAT`,
+  `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES` and `IGNORE_SPACE` (definitions are read and SQL
+  is written in the default mode; see [server setup](server-setup.md#sql_mode)). Zero dates (`'0000-00-00'`, `'2020-00-00'`) are read, compared
   and written as stored, as MariaDB does in any mode. MySQL in strict mode would group
   `'2020-00-00'` with `'0000-00-00'`. TIMESTAMP columns are read as `UNIX_TIMESTAMP(…)` and
   written in a `+00:00` session, so instants in a DST fall-back hour keep their hour. Other

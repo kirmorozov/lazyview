@@ -137,6 +137,18 @@ pub enum UnitChunk {
     Keys(Vec<Key>),
 }
 
+/// How a unit column's keys must be bound in a filter (see [`UnitChunk::filter_typed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnitKind {
+    /// Compared as the parameter is bound.
+    #[default]
+    Plain,
+    /// TIMESTAMP: keys are local datetimes of the session's time zone.
+    Timestamp,
+    /// JSON (MySQL/Percona): keys are JSON texts, compared as JSON values.
+    Json,
+}
+
 impl UnitChunk {
     /// Adds the chunk's keys to `set` (carry-over of a failed chunk).
     pub fn insert_into(&self, set: &mut UnitSet) {
@@ -172,20 +184,32 @@ impl UnitChunk {
         self.filter_typed(exprs, &[])
     }
 
-    /// [`Self::filter`] where `timestamp[i]` tells that `exprs[i]` is a TIMESTAMP and its keys
-    /// are local datetimes of the session's time zone. Those are matched by local time within
-    /// an hour around the key: in a DST fall-back hour one local time is two instants, and an
-    /// index lookup of `ts = ?` finds only the first of them (a scan compares local times and
-    /// finds both).
+    /// [`Self::filter`] where `kinds[i]` (default [`UnitKind::Plain`]) tells how the keys of
+    /// `exprs[i]` are bound:
+    ///
+    /// * [`UnitKind::Timestamp`]: the keys are local datetimes of the session's time zone,
+    ///   matched by local time within an hour around the key: in a DST fall-back hour one local
+    ///   time is two instants, and an index lookup of `ts = ?` finds only the first of them (a
+    ///   scan compares local times and finds both).
+    /// * [`UnitKind::Json`]: the keys are JSON texts, bound as `CAST(? AS JSON)`. MySQL groups
+    ///   JSON-equal values (`{"a": 1}` with `{"a": 1.0}`) and compares a JSON column with a plain
+    ///   string parameter as text, so a plain `doc IN (?)` never finds the group's rows. On
+    ///   MariaDB JSON is LONGTEXT and never of this kind.
     pub fn filter_typed(
         &self,
         exprs: &[String],
-        timestamp: &[bool],
+        kinds: &[UnitKind],
     ) -> (String, Vec<mysql_async::Value>) {
         let exprs: Vec<String> = exprs.iter().map(|e| format!("({e})")).collect();
+        let kind = |i: usize| kinds.get(i).copied().unwrap_or_default();
         let local = |i: usize, d: &Datum| {
-            timestamp.get(i).copied().unwrap_or(false)
+            kind(i) == UnitKind::Timestamp
                 && matches!(d, Datum::Date(y, m, ..) if *y != 0 || *m != 0)
+        };
+        // Parameter placeholder for a key of unit `i`.
+        let param = |i: usize| match kind(i) {
+            UnitKind::Json => "CAST(? AS JSON)",
+            _ => "?",
         };
         match self {
             UnitChunk::Ints(v) => {
@@ -221,19 +245,18 @@ impl UnitChunk {
                         .any(|(i, d)| matches!(d, Datum::Null | Datum::Time(..)) || local(i, d))
                 });
                 if !plain.is_empty() {
-                    let tuple = |n: usize| {
-                        if n == 1 {
-                            "?".to_string()
-                        } else {
-                            format!("({})", vec!["?"; n].join(","))
-                        }
+                    let holders: Vec<&str> = (0..exprs.len()).map(param).collect();
+                    let tuple = if exprs.len() == 1 {
+                        holders[0].to_string()
+                    } else {
+                        format!("({})", holders.join(","))
                     };
                     let lhs = if exprs.len() == 1 {
                         exprs[0].clone()
                     } else {
                         format!("({})", exprs.join(", "))
                     };
-                    let items: Vec<String> = plain.iter().map(|_| tuple(exprs.len())).collect();
+                    let items: Vec<String> = plain.iter().map(|_| tuple.clone()).collect();
                     parts.push(format!("{lhs} IN ({})", items.join(",")));
                     for k in &plain {
                         params.extend(k.iter().map(Datum::to_value));
@@ -249,7 +272,7 @@ impl UnitChunk {
                             ));
                             params.extend([d.to_value(), d.to_value(), d.to_value()]);
                         } else {
-                            conj.push(format!("{e} <=> ?"));
+                            conj.push(format!("{e} <=> {}", param(i)));
                             params.push(d.to_value());
                         }
                     }
@@ -701,7 +724,10 @@ mod tests {
             Box::new([Datum::Int(2), Datum::Null]),
             Box::new([Datum::Int(3), Datum::Date(0, 0, 0, 0, 0, 0, 0)]),
         ]);
-        let (f, p) = k.filter_typed(&["g".into(), "ts".into()], &[false, true]);
+        let (f, p) = k.filter_typed(
+            &["g".into(), "ts".into()],
+            &[UnitKind::Plain, UnitKind::Timestamp],
+        );
         assert_eq!(
             f,
             "(((g), (ts)) IN ((?,?)) OR ((g) <=> ? AND (ts) BETWEEN ? - INTERVAL 1 HOUR AND ? + INTERVAL 1 HOUR \
@@ -725,5 +751,50 @@ mod tests {
         let (f, p) = k.filter(&["a".into(), "b".into()]);
         assert_eq!(f, "(((a), (b)) IN ((?,?)) OR ((a) <=> ? AND (b) <=> ?))");
         assert_eq!(p.len(), 4);
+    }
+
+    /// JSON keys are bound as JSON values (a plain string parameter compares as text and never
+    /// finds a JSON-equal group), in the `IN` tuple as well as in the null-safe branch.
+    #[test]
+    fn json_keys_bind_as_json() {
+        let j = |s: &str| Datum::Bytes(s.as_bytes().to_vec());
+        let k = UnitChunk::Keys(vec![
+            Box::new([j(r#"{"a":1.0}"#)]),
+            Box::new([j(r#"{"b":2}"#)]),
+            Box::new([Datum::Null]),
+        ]);
+        let (f, p) = k.filter_typed(&["doc".into()], &[UnitKind::Json]);
+        assert_eq!(
+            f,
+            "((doc) IN (CAST(? AS JSON),CAST(? AS JSON)) OR ((doc) <=> CAST(? AS JSON)))"
+        );
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[0], j(r#"{"a":1.0}"#).to_value());
+        // Composite units bind per position.
+        let k = UnitChunk::Keys(vec![
+            Box::new([Datum::Int(1), j("[1, 2]")]),
+            Box::new([Datum::Int(2), j("[3]")]),
+            Box::new([Datum::Int(3), Datum::Null]),
+            Box::new([Datum::Null, j("4")]),
+        ]);
+        let (f, p) = k.filter_typed(
+            &["g".into(), "doc".into()],
+            &[UnitKind::Plain, UnitKind::Json],
+        );
+        assert_eq!(
+            f,
+            "(((g), (doc)) IN ((?,CAST(? AS JSON)),(?,CAST(? AS JSON))) \
+             OR ((g) <=> ? AND (doc) <=> CAST(? AS JSON)) OR ((g) <=> ? AND (doc) <=> CAST(? AS JSON)))"
+        );
+        assert_eq!(p.len(), 8);
+        // Plain kinds (MariaDB, where JSON is LONGTEXT) are unchanged.
+        assert_eq!(
+            k.filter_typed(
+                &["g".into(), "doc".into()],
+                &[UnitKind::Plain, UnitKind::Plain]
+            )
+            .0,
+            k.filter(&["g".into(), "doc".into()]).0
+        );
     }
 }
