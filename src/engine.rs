@@ -3779,7 +3779,9 @@ impl Engine {
             if !dirty.all {
                 return Ok(Refreshed::default());
             }
-            let rows = mv::read_source(&mut self.src, plan, layout, None, &self.metrics).await?;
+            let fresh = self.flavor == Flavor::MariaDb;
+            let rows =
+                mv::read_source(&mut self.src, plan, layout, None, &self.metrics, fresh).await?;
             Metrics::add(&self.metrics.units_refreshed, 1);
             for t in targets {
                 if let Err(e) = self.apply_target(t, table, layout, None, &rows).await {
@@ -3819,8 +3821,15 @@ impl Engine {
             .max(1);
         for chunk in units.chunks(per) {
             self.metrics.beat();
-            let rows =
-                mv::read_source(&mut self.src, plan, layout, Some(&chunk), &self.metrics).await?;
+            let rows = mv::read_source(
+                &mut self.src,
+                plan,
+                layout,
+                Some(&chunk),
+                &self.metrics,
+                self.flavor == Flavor::MariaDb,
+            )
+            .await?;
             for t in targets {
                 if failed.iter().any(|(f, _)| f == t) {
                     continue;
@@ -3999,7 +4008,9 @@ impl Engine {
             }
             // New rows: the current rows that contain them.
             let (f, p) = chunk.filter(&k.exprs);
-            let rows: Vec<mysql_async::Row> = self.src.exec(plan.key_lookup_sql(&f), p).await?;
+            let fresh = self.flavor == Flavor::MariaDb;
+            let rows: Vec<mysql_async::Row> =
+                mv::exec_source(&mut self.src, plan.key_lookup_sql(&f), p, fresh).await?;
             Metrics::add(&self.metrics.lookup_queries, 1);
             for r in rows {
                 units.insert(r.unwrap().into_iter().map(Datum::from_value).collect());
@@ -4133,7 +4144,9 @@ impl Engine {
                         .flat_map(|key| key.iter().map(Datum::to_value))
                 })
                 .collect();
-            let rows: Vec<mysql_async::Row> = self.src.exec(sql, params).await?;
+            let fresh = self.flavor == Flavor::MariaDb;
+            let rows: Vec<mysql_async::Row> =
+                mv::exec_source(&mut self.src, sql, params, fresh).await?;
             Metrics::add(&self.metrics.lookup_queries, 1);
             for r in rows {
                 let key: Key = r.unwrap().into_iter().map(Datum::from_value).collect();

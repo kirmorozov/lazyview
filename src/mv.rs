@@ -1014,21 +1014,47 @@ pub async fn fill(
     Ok(total)
 }
 
-/// Current source rows for a chunk of units, grouped by unit (`None` = whole view).
+/// Current source rows for a chunk of units, grouped by unit (`None` = whole view). `fresh`:
+/// see [`exec_source`].
 pub async fn read_source(
     src: &mut Conn,
     plan: &ViewPlan,
     layout: &Layout,
     chunk: Option<&UnitChunk>,
     metrics: &Metrics,
+    fresh: bool,
 ) -> Result<Vec<Vec<Value>>> {
     match chunk {
         Some(c) => {
             let (f, p) = c.filter_typed(&plan.unit_exprs, &layout.unit_kinds());
-            read_source_filtered(src, plan, layout, Some(&f), p, metrics).await
+            read_source_filtered(src, plan, layout, Some(&f), p, metrics, fresh).await
         }
-        None => read_source_filtered(src, plan, layout, None, Vec::new(), metrics).await,
+        None => read_source_filtered(src, plan, layout, None, Vec::new(), metrics, fresh).await,
     }
+}
+
+/// Runs a read of the sources. `fresh` (MariaDB): the statement is prepared for this execution
+/// only and closed after it. MariaDB returns a stale result for a re-executed prepared statement
+/// with `NOT IN (subquery)` once the subquery's result changes between empty and non-empty (it
+/// keeps answering as before; docs/server-setup.md). Without `fresh` the statement is cached.
+pub async fn exec_source<T>(
+    src: &mut Conn,
+    sql: String,
+    params: Vec<Value>,
+    fresh: bool,
+) -> Result<Vec<T>>
+where
+    T: FromRow + Send + 'static,
+{
+    if !fresh {
+        return Ok(src.exec(sql, params).await?);
+    }
+    let stmt = src.prep(sql).await?;
+    let rows = src.exec(&stmt, params).await;
+    let closed = src.close(stmt).await;
+    let rows = rows?;
+    closed?;
+    Ok(rows)
 }
 
 /// Current source rows matching `filter` (any predicate over the view's FROM clause, with
@@ -1040,9 +1066,10 @@ pub async fn read_source_filtered(
     filter: Option<&str>,
     params: Vec<Value>,
     metrics: &Metrics,
+    fresh: bool,
 ) -> Result<Vec<Vec<Value>>> {
     let sql = layout.source_sql(plan, filter);
-    let rows: Vec<Row> = src.exec(sql, params).await?;
+    let rows: Vec<Row> = exec_source(src, sql, params, fresh).await?;
     Metrics::add(&metrics.source_queries, 1);
     Ok(rows
         .into_iter()

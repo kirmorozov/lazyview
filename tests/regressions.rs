@@ -2913,6 +2913,90 @@ fn reg_slow_planning_is_bounded() {
     });
 }
 
+/// Server canary: MariaDB (10.11, 13.0 and 13.2 at least) returns a stale result for a
+/// re-executed prepared statement with `NOT IN (subquery)` once the subquery's result changes
+/// between empty and non-empty: it keeps answering as for the empty subquery (rows with a NULL
+/// `ref` stay in). lazyview prepares its source reads afresh on MariaDB (`mv::exec_source`), so
+/// such reads are right on every flavor, and a view with this predicate stays equal to its
+/// oracle through the flips. The cached statement's answer is only noted (it tells whether the
+/// server still has the bug); a MySQL-family server must answer it correctly.
+#[test]
+fn reg_not_in_prepared_statement_canary() {
+    scenario("reg_nin_ps", |ctx| async move {
+        use lazyview::mv::exec_source;
+        let db = ctx.new_db("reg_nin_ps").await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &[
+                "CREATE TABLE c (id INT PRIMARY KEY, ref INT NULL)",
+                "CREATE TABLE o (id INT PRIMARY KEY, customer_id INT NULL)",
+                "CREATE TABLE p (id INT PRIMARY KEY, order_id INT NULL, amount DECIMAL(10,2) NULL)",
+                "INSERT INTO c VALUES (1,2),(2,NULL),(3,1),(4,4),(5,NULL)",
+                "INSERT INTO o VALUES (20,2)",
+                "INSERT INTO p VALUES (200,20,1.00)",
+            ],
+        )
+        .await?;
+        let sql = "SELECT c.id FROM c WHERE (c.ref NOT IN (SELECT o.customer_id FROM o, p \
+                   WHERE p.order_id = o.id AND p.amount > 400)) AND c.id IN (1,2,5) ORDER BY c.id";
+        let mut cached = db.conn().await?;
+        let mut fresh = db.conn().await?;
+        let mut stale = Vec::new();
+        for (amount, expected) in [
+            ("1.00", vec![1i64, 2, 5]),
+            ("401.00", vec![]),
+            ("1.00", vec![1, 2, 5]),
+            ("401.00", vec![]),
+        ] {
+            exec(
+                &mut c,
+                &format!("UPDATE p SET amount = {amount} WHERE id = 200"),
+            )
+            .await?;
+            let got: Vec<i64> = exec_source(&mut fresh, sql.into(), Vec::new(), true).await?;
+            ensure!(
+                got == expected,
+                "amount {amount}: a freshly prepared read gave {got:?}, expected {expected:?}"
+            );
+            let got: Vec<i64> = exec_source(&mut cached, sql.into(), Vec::new(), false).await?;
+            if got != expected {
+                stale.push(format!("amount {amount}: {got:?} instead of {expected:?}"));
+            }
+        }
+        ensure!(
+            stale.is_empty() || ctx.servers[0].is_mariadb(),
+            "re-executed prepared statement gave stale results: {stale:?}"
+        );
+        ctx.log(if stale.is_empty() {
+            "re-executed prepared NOT IN statement: correct".to_string()
+        } else {
+            format!("re-executed prepared NOT IN statement: STALE (MariaDB bug present): {stale:?}")
+        });
+        // lazyview over the same predicate, through the same flips.
+        let specs = vec![ViewSpec::new(
+            "r_nin",
+            Kind::Full,
+            "SELECT c.id, c.ref FROM c WHERE c.ref NOT IN (SELECT o.customer_id FROM o, p \
+             WHERE p.order_id = o.id AND p.amount > 400)",
+        )];
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+        for amount in ["1.00", "401.00", "1.00"] {
+            exec(
+                &mut c,
+                &format!("UPDATE p SET amount = {amount} WHERE id = 200"),
+            )
+            .await?;
+            verify(&ctx, &mut eng, &db, &specs, &format!("amount {amount}")).await?;
+        }
+        eng.stop().await
+    });
+}
+
 /// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
 /// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
 /// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed

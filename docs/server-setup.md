@@ -98,6 +98,13 @@ Also supported: Amazon RDS for MySQL / MariaDB and Aurora MySQL running one of t
   then gets the target's default collation for the charset (logged as a warning); the bytes are
   the same, only comparisons on the target follow its rules.
 * **MariaDB, all versions**: `log_bin_compress` must be OFF.
+* **MariaDB, all versions tested (10.11, 13.0, 13.2)**: a prepared statement with
+  `x NOT IN (subquery)` that is executed again after the subquery's result changed between empty
+  and non-empty returns the result of the earlier execution (for example rows with a NULL `x` stay
+  in). lazyview prepares every source read afresh on MariaDB, so its views are not affected; the
+  cost is one extra round trip per read. Applications that reuse prepared statements should know
+  about it (`tests/regressions.rs` `reg_not_in_prepared_statement_canary` shows whether a server
+  still has it).
 
 ## MySQL 8.4 / 26.x and Percona Server 8.4 / 9.7
 
