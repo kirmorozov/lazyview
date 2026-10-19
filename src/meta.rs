@@ -29,7 +29,7 @@ const CREATE_DEFS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
 
 const CREATE_STATE: &str = "CREATE TABLE IF NOT EXISTS `_lazyview_state` (
-  `name` VARCHAR(64) NOT NULL,
+  `name` VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
   `target` VARCHAR(64) NOT NULL,
   `definition_id` BIGINT UNSIGNED NOT NULL,
   `definition_hash` CHAR(16) NOT NULL,
@@ -111,6 +111,20 @@ pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
             conn.query_drop(format!("ALTER TABLE `{table}` ADD COLUMN `{col}` {def}"))
                 .await?;
         }
+    }
+    // State rows are keyed by the view's table name, which the server compares case-sensitively
+    // (lower_case_table_names=0): `Lz_Case` and `lz_case` must not share a row.
+    let collation: Option<Option<String>> = conn
+        .exec_first(
+            "SELECT CAST(COLLATION_NAME AS CHAR) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_lazyview_state' AND COLUMN_NAME = 'name'",
+            (schema,),
+        )
+        .await?;
+    if collation.flatten().as_deref() != Some("utf8mb4_bin") {
+        conn.query_drop(
+            "ALTER TABLE `_lazyview_state` MODIFY `name` VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+        )
+        .await?;
     }
     let idx: Option<u64> = conn
         .exec_first(
@@ -211,10 +225,13 @@ pub async fn clear_rebuild(conn: &mut Conn, id: u64) -> Result<()> {
     Ok(())
 }
 
-/// The id of the `_lazyview` row named `name`.
-pub async fn definition_named(conn: &mut Conn, name: &str) -> Result<Option<u64>> {
+/// The id and the name of the `_lazyview` row named `name` (the key ignores letter case).
+pub async fn definition_named(conn: &mut Conn, name: &str) -> Result<Option<(u64, String)>> {
     Ok(conn
-        .exec_first("SELECT `id` FROM `_lazyview` WHERE `name` = ?", (name,))
+        .exec_first(
+            "SELECT `id`, CAST(`name` AS CHAR) FROM `_lazyview` WHERE `name` = ?",
+            (name,),
+        )
         .await?)
 }
 

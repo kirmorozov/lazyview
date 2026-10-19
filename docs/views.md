@@ -29,6 +29,10 @@ UPDATE _lazyview SET rebuild = 1 WHERE name = 'paid_orders';
   statement counts: `name` is filled in or updated to it, so changing the name in the statement
   renames the view online. If another row already has that name, the view goes into error:
   ``name `x` already used by row #N``. A bare SELECT takes its name from `name`.
+* `name` ignores letter case. A view whose name differs from another row's only in case
+  (`lz_case` next to `Lz_Case`) goes into error, keeping its own name:
+  ``name `lz_case` is already used by row #N as `Lz_Case`: … remove this row with DELETE FROM
+  _lazyview WHERE id = M``. Delete it by `id`: `WHERE name = 'lz_case'` matches the other row.
 * The `CREATE VIEW` form accepts what `SHOW CREATE VIEW` prints:
   `CREATE [OR REPLACE] [ALGORITHM=…] [DEFINER=…] [SQL SECURITY …] VIEW name [(columns)] AS SELECT …
   [WITH CHECK OPTION]`.
@@ -42,7 +46,9 @@ UPDATE _lazyview SET rebuild = 1 WHERE name = 'paid_orders';
   starting with `_lv_` and names ending in `__lv_new` or `__lv_old`. The metadata tables cannot be
   read by a view either.
 * Not allowed: a view that reads itself or forms a cycle with other views, and calls to stored
-  functions or loadable functions (UDFs). lazyview cannot see the tables those functions read, so
+  functions or loadable functions (UDFs). A view named like a table it reads (`orders` over
+  `orders`) is refused like any table lazyview does not manage: ``refusing to replace existing
+  base table … that lazyview does not manage (the view reads it: give the view another name)``. lazyview cannot see the tables those functions read, so
   it could not keep the view correct.
 * To check definitions without changing anything (for example in CI), run lazyview with
   `LAZYVIEW_SYNC=false`. It logs ``definition #N: `name` ok — <mode> → <targets>`` for each

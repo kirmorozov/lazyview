@@ -383,6 +383,31 @@ impl std::fmt::Display for WaitingFor {
 
 impl std::error::Error for WaitingFor {}
 
+/// The view name differs only in letter case from another row's: `_lazyview.name` ignores
+/// case, so the row cannot record it. The view keeps its own name (its state row is keyed
+/// case-sensitively), not a `#<id>` placeholder.
+#[derive(Debug)]
+struct CaseClash {
+    name: String,
+    id: u64,
+    other: String,
+    other_id: u64,
+}
+
+impl std::fmt::Display for CaseClash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "name `{}` is already used by row #{} as `{}`: view names that differ only in letter case \
+             are the same name to lazyview; rename this view, or remove this row with \
+             DELETE FROM _lazyview WHERE id = {}",
+            self.name, self.other_id, self.other, self.id
+        )
+    }
+}
+
+impl std::error::Error for CaseClash {}
+
 /// A state row as last written (see [`Engine::restore_state_rows`]).
 #[derive(Debug, Clone)]
 struct ShownState {
@@ -804,6 +829,36 @@ impl Engine {
         let mut infos = HashMap::new();
         for t in &tables {
             if t.0 == self.schema && t.1 == parsed.name {
+                // Named like a table it reads that lazyview did not build: that is a name clash
+                // (the documented refusal), not a view reading itself.
+                let marker = own_def.map(|id| mv::marker(&parsed.name, id));
+                let ours = self
+                    .owned
+                    .contains_key(&(parsed.name.clone(), SOURCE_TARGET.to_string()))
+                    || (marker.is_some()
+                        && mv::table_marker(&mut self.src, &self.schema, &parsed.name).await?
+                            == marker);
+                if !ours {
+                    if let Some(kind) =
+                        mv::table_kind(&mut self.src, &self.schema, &parsed.name).await?
+                    {
+                        if targets.iter().any(|t| t == SOURCE_TARGET) {
+                            bail!(
+                                "refusing to replace existing {} `{}`.`{}` on target {SOURCE_TARGET} that lazyview does not manage (the view reads it: give the view another name)",
+                                kind.to_lowercase(),
+                                self.schema,
+                                parsed.name
+                            );
+                        }
+                        bail!(
+                            "view `{}` is named like the {} `{}`.`{}` it reads: give the view another name",
+                            parsed.name,
+                            kind.to_lowercase(),
+                            self.schema,
+                            parsed.name
+                        );
+                    }
+                }
                 bail!("view `{}` cannot read itself", parsed.name);
             }
             // Chained views: an upstream MV must exist on the source to be watched.
@@ -1001,11 +1056,22 @@ impl Engine {
                     .await
                     .ok()
                     .flatten();
-                bail!(
-                    "name `{}` already used by row #{}",
-                    plan.name,
-                    other.map(|i| i.to_string()).unwrap_or_else(|| "?".into())
-                )
+                match other {
+                    Some((other_id, other)) if other != plan.name => Err(CaseClash {
+                        name: plan.name.clone(),
+                        id: d.id,
+                        other,
+                        other_id,
+                    }
+                    .into()),
+                    other => bail!(
+                        "name `{}` already used by row #{}",
+                        plan.name,
+                        other
+                            .map(|(i, _)| i.to_string())
+                            .unwrap_or_else(|| "?".into())
+                    ),
+                }
             }
             Err(e) => {
                 warn!("recording _lazyview.name for #{}: {e:#}", d.id);
@@ -1288,7 +1354,9 @@ impl Engine {
             Ok(()) => None,
         };
         if let Some(e) = clash {
-            if self.slots[idx].live.is_none() {
+            // The name belongs to another view (its state rows): this one shows as `#<id>`,
+            // unless only the letter case differs.
+            if self.slots[idx].live.is_none() && e.downcast_ref::<CaseClash>().is_none() {
                 self.slots[idx].name = format!("#{id}");
             }
             self.slot_error(idx, &e).await;

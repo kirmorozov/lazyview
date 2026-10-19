@@ -2699,6 +2699,143 @@ fn reg_truncated_view_table_is_rebuilt() {
     });
 }
 
+/// Two definitions whose view names differ only in letter case (`Lz_Case`, `lz_case`): the
+/// second one was shown as `#<id>` with "name `lz_case` already used by row #N" (`_lazyview.name`
+/// ignores case, the tables do not). It keeps its name, the error names both rows and how to
+/// remove this one, and the first view is unaffected (its state row is not overwritten).
+#[test]
+fn reg_case_only_name_clash() {
+    scenario("reg_case_clash", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "Lz_Case",
+            Kind::Incremental,
+            "SELECT id, status FROM orders",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_case_clash", &[], &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let first: u64 = c
+            .query_first("SELECT id FROM _lazyview WHERE name = 'Lz_Case'")
+            .await?
+            .context("no Lz_Case row")?;
+        exec(
+            &mut c,
+            "INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW lz_case AS SELECT id, customer_id FROM orders')",
+        )
+        .await?;
+        let second: u64 = c
+            .query_first("SELECT LAST_INSERT_ID()")
+            .await?
+            .context("no id")?;
+        let row = wait_state(&mut c, &mut eng, "lz_case", "error", t_ready()).await?;
+        let expected = format!(
+            "name `lz_case` is already used by row #{first} as `Lz_Case`: view names that differ \
+             only in letter case are the same name to lazyview; rename this view, or remove this \
+             row with DELETE FROM _lazyview WHERE id = {second}"
+        );
+        ensure!(
+            row.last_error.as_deref() == Some(expected.as_str()),
+            "lz_case: {row:?}"
+        );
+        let shown: Vec<(u64, String, Option<String>)> = c
+            .query("SELECT id, CAST(name AS CHAR), CAST(state AS CHAR) FROM _lazyview_overview ORDER BY id")
+            .await?;
+        ensure!(
+            shown
+                == vec![
+                    (first, "Lz_Case".to_string(), Some("ready".to_string())),
+                    (second, "lz_case".to_string(), Some("error".to_string())),
+                ],
+            "overview: {shown:?}"
+        );
+        exec(&mut c, "INSERT INTO orders VALUES (14, 2, 'new')").await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "Lz_Case next to the clashing row",
+        )
+        .await?;
+        // Removed as the message says: only lz_case's row goes.
+        exec(
+            &mut c,
+            &format!("DELETE FROM _lazyview WHERE id = {second}"),
+        )
+        .await?;
+        let t = std::time::Instant::now();
+        loop {
+            let n: Option<i64> = c
+                .query_first("SELECT COUNT(*) FROM _lazyview_state WHERE name = 'lz_case'")
+                .await?;
+            if n == Some(0) {
+                break;
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(15),
+                "lz_case's state row stayed after its definition was deleted"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_ready(&mut c, &["Lz_Case"]).await?;
+        eng.stop().await
+    });
+}
+
+/// A view named like the source table it reads (`orders`) said "view `orders` cannot read
+/// itself", which reads like recursion. It gets the documented refusal for a table lazyview
+/// does not manage, other views over `orders` keep working, and a definition that really
+/// reads its own view still gets "cannot read itself".
+#[test]
+fn reg_view_named_like_its_source_table() {
+    scenario("reg_self_named", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_orders",
+            Kind::Incremental,
+            "SELECT id, status FROM orders",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_self_named", &[], &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &[
+                "INSERT INTO _lazyview (name, definition) VALUES ('orders', 'SELECT id FROM orders')",
+                "INSERT INTO _lazyview (name, definition) VALUES ('r_self', 'SELECT * FROM r_self')",
+            ],
+        )
+        .await?;
+        let row = wait_state(&mut c, &mut eng, "orders", "error", t_ready()).await?;
+        let expected = format!(
+            "refusing to replace existing base table `{}`.`orders` on target source that \
+             lazyview does not manage (the view reads it: give the view another name)",
+            db.name
+        );
+        ensure!(
+            row.last_error.as_deref() == Some(expected.as_str()),
+            "orders: {row:?}"
+        );
+        let row = wait_state(&mut c, &mut eng, "r_self", "error", t_ready()).await?;
+        ensure!(
+            row.last_error.as_deref() == Some("view `r_self` cannot read itself"),
+            "r_self: {row:?}"
+        );
+        exec(&mut c, "UPDATE orders SET status = 'paid' WHERE id = 10").await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "a view over orders next to them",
+        )
+        .await?;
+        let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM orders").await?;
+        ensure!(
+            n == Some(4),
+            "the source table orders was touched: {n:?} rows"
+        );
+        eng.stop().await
+    });
+}
+
 /// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
 /// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
 /// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed
