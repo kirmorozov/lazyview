@@ -22,14 +22,12 @@ use crate::catalog::{TableInfo, TableRef};
 /// Why a flat block was not planned incrementally as rewritten.
 pub(crate) enum Refused {
     Reason(String),
-    /// The table of this semi-join cannot be traced to the view's units directly.
-    Semi(usize, String),
 }
 
 impl Refused {
     pub(crate) fn reason(self) -> String {
         match self {
-            Refused::Reason(r) | Refused::Semi(_, r) => r,
+            Refused::Reason(r) => r,
         }
     }
 }
@@ -104,7 +102,7 @@ pub(crate) fn plan_block(
     if let Mode::Full(r) = &plan.mode {
         return Ok(Err(Refused::Reason(r.clone())));
     }
-    if let Err(why) = attach_semis(&mut plan, b) {
+    if let Err(why) = attach_semis(&mut plan, b, tables) {
         return Ok(Err(why));
     }
     Ok(Ok(plan))
@@ -115,7 +113,11 @@ pub(crate) fn plan_block(
 /// single-row aggregate, mark it for recomputation). The lookup template of a table of a
 /// subquery over several tables names the others by [`analyze::semi_table_marker`]: a lookup
 /// that substitutes several of them evaluates one subquery over all their rows.
-fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refused> {
+fn attach_semis(
+    plan: &mut ViewPlan,
+    b: &Block,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> std::result::Result<(), Refused> {
     if b.semis.is_empty() {
         return Ok(());
     }
@@ -191,15 +193,31 @@ fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refus
                 Mode::Spj | Mode::Grouped if !s.not_in => direct_columns(plan, s, ti, &args).ok(),
                 _ => None,
             };
+            // A child of a cascading foreign key changes without binlog rows (C3): its parents'
+            // deletes / key updates route to the units their image gives (the subquery is
+            // correlated on the unit through the FK columns) or rebuild the view.
             if !t.info.cascades.is_empty() {
-                return Err(Refused::Semi(
-                    s.id,
-                    format!(
-                        "{} over `{}`, a child of a cascading foreign key",
-                        semi_kind(s),
-                        t.info.name
-                    ),
-                ));
+                let child = (t.info.schema.clone(), t.info.name.clone());
+                for mut r in analyze::cascade_routes(&[(t.info.clone(), direct.clone())], tables) {
+                    // (A cascade that continues out of the child reaches rows no image gives.)
+                    let continues = r.child != child
+                        || plan
+                            .cascades
+                            .iter()
+                            .any(|c| (c.parent.schema.clone(), c.parent.name.clone()) == child);
+                    if continues {
+                        r.unit_from_parent = None;
+                    }
+                    if r.unit_from_parent.is_none() {
+                        r.untraced = Some(format!(
+                            "{} over `{}`: the units a cascade from `{}` changes are not known",
+                            semi_kind(s),
+                            t.info.name,
+                            r.parent.name
+                        ));
+                    }
+                    plan.cascades.push(r);
+                }
             }
             let image_cols = (0..t.referenced.len())
                 .filter(|&c| t.referenced[c])

@@ -642,6 +642,159 @@ fn not_in_is_rendered_as_not_exists() {
     );
 }
 
+/// Schema part 2: NOT IN over columns that are never NULL is NOT EXISTS (direct units, no
+/// all-units NULL trace); a UNIQUE NOT NULL key makes a semi-join an inner join like the PK.
+#[test]
+fn not_null_columns_and_unique_keys_in_semi_joins() {
+    let mut cat = catalog();
+    let set = |cat: &mut HashMap<TableRef, Arc<TableInfo>>, t: &str, f: &dyn Fn(&mut TableInfo)| {
+        let k = ("db".to_string(), t.to_string());
+        let mut info = (*cat[&k]).clone();
+        f(&mut info);
+        cat.insert(k, Arc::new(info));
+    };
+    set(&mut cat, "customers", &|t| t.columns[0].nullable = false);
+    let plan = |cat: &HashMap<TableRef, Arc<TableInfo>>, sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let sql = "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT o.customer_id FROM orders o WHERE o.total > 5)";
+    // orders.customer_id nullable: NOT IN (its exact NOT EXISTS form in the refresh), lookups.
+    let v = plan(&cat, sql);
+    assert_eq!(v.tracing(), "c:unit,o:lookup");
+    assert!(
+        v.lookup_sql(1, "(O)").contains("IS NULL"),
+        "{}",
+        v.lookup_sql(1, "(O)")
+    );
+    // NOT NULL on both sides: NOT EXISTS, direct units.
+    set(&mut cat, "orders", &|t| t.columns[1].nullable = false);
+    let v = plan(&cat, sql);
+    assert_eq!(v.tracing(), "c:unit,o:unit");
+    assert_eq!(
+        v.where_sql.as_deref(),
+        Some("(NOT EXISTS (SELECT 1 FROM orders o WHERE (`o`.total > 5) AND (`o`.customer_id = c.id)))")
+    );
+    // The outer column on the NULL side of a LEFT JOIN can be NULL: stays NOT IN.
+    let v = plan(
+        &cat,
+        "SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id \
+         WHERE c.id NOT IN (SELECT r.id FROM regions r)",
+    );
+    assert!(
+        v.where_sql
+            .as_deref()
+            .unwrap()
+            .contains("IS NOT NULL AND NOT EXISTS"),
+        "{:?}",
+        v.where_sql
+    );
+    // A UNIQUE NOT NULL key (no PK): IN over it is an inner join.
+    set(&mut cat, "codes", &|t| {
+        t.pk.clear();
+        t.columns[0].nullable = false;
+        t.unique_keys = vec![vec![0]];
+    });
+    let v = plan(
+        &cat,
+        "SELECT r.id FROM refs r WHERE r.code IN (SELECT c.code FROM codes c WHERE c.v > 1)",
+    );
+    assert!(
+        v.aliases.iter().all(|a| a.pos.0 != usize::MAX),
+        "{}",
+        v.tracing()
+    );
+    assert!(v.from_sql.contains("codes"), "{}", v.from_sql);
+}
+
+/// The VIEW_DEFINITION validator: the server's canonical text (MySQL and MariaDB printing)
+/// reads the same tables and column count; a different reading is an error naming it.
+#[test]
+fn validate_against_the_canonical_definition() {
+    let cat = catalog();
+    let check = |sql: &str, canonical: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        super::validate(&d, canonical, "db", &cat)
+    };
+    for (sql, canonical) in [
+        (
+            "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id",
+            "select `o`.`id` AS `id`,`c`.`name` AS `name` from (`db`.`orders` `o` join `db`.`customers` `c` on((`c`.`id` = `o`.`customer_id`)))",
+        ),
+        (
+            "SELECT * FROM regions",
+            "select `db`.`regions`.`id` AS `id`,`db`.`regions`.`name` AS `name` from `db`.`regions`",
+        ),
+        (
+            "WITH t AS (SELECT id FROM orders WHERE total > 5) SELECT id FROM t",
+            "with `t` as (select `db`.`orders`.`id` AS `id` from `db`.`orders` where (`db`.`orders`.`total` > 5)) select `t`.`id` AS `id` from `t`",
+        ),
+        (
+            "SELECT d.id FROM (SELECT id FROM orders) d WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = d.id)",
+            "select `d`.`id` AS `id` from (select `db`.`orders`.`id` AS `id` from `db`.`orders`) `d` where exists(select 1 from `db`.`customers` `c` where (`c`.`id` = `d`.`id`))",
+        ),
+    ] {
+        assert!(check(sql, canonical).is_ok(), "{sql}: {:?}", check(sql, canonical));
+    }
+    let e = check(
+        "SELECT id FROM orders",
+        "select `db`.`customers`.`id` AS `id` from `db`.`customers`",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("`db`.`customers`") && e.contains("`db`.`orders`"),
+        "{e}"
+    );
+    let e = check(
+        "SELECT * FROM regions",
+        "select `db`.`regions`.`id` AS `id` from `db`.`regions`",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("1 columns where lazyview reads 2"), "{e}");
+    // Unreadable printing: not checked.
+    assert!(check("SELECT id FROM orders", "select ??? garbage").is_ok());
+}
+
+/// C4: a top-N over a set operation names the ORDER BY … LIMIT and the operator.
+#[test]
+fn top_n_over_a_union_is_named() {
+    assert_eq!(
+        reason("CREATE VIEW v AS (SELECT id, total FROM orders) UNION ALL (SELECT id, price FROM order_items) ORDER BY total DESC LIMIT 5"),
+        "ORDER BY … LIMIT over a UNION ALL (needs internal views)"
+    );
+    assert_eq!(
+        reason("CREATE VIEW v AS SELECT id FROM orders UNION SELECT id FROM customers ORDER BY id LIMIT 5"),
+        "ORDER BY … LIMIT over a UNION (needs internal views)"
+    );
+    assert_eq!(
+        reason("CREATE VIEW v AS SELECT id FROM orders UNION SELECT id FROM customers"),
+        "set operation (UNION/INTERSECT/EXCEPT)"
+    );
+}
+
+/// C6: an aggregate scalar subquery names itself and its place instead of "subquery".
+#[test]
+fn aggregate_scalar_subqueries_are_named() {
+    for (sql, why) in [
+        (
+            "SELECT c.id, (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS n FROM customers c",
+            "correlated aggregate subquery in the SELECT list (needs internal views)",
+        ),
+        (
+            "SELECT o.id, (SELECT SUM(i.price) FROM order_items i WHERE i.order_id = o.id AND i.qty > 1) AS paid FROM orders o",
+            "correlated aggregate subquery in the SELECT list (needs internal views)",
+        ),
+        (
+            "SELECT id FROM orders o WHERE o.total > (SELECT AVG(total) FROM orders)",
+            "uncorrelated aggregate subquery in the WHERE clause (needs internal views)",
+        ),
+    ] {
+        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
+    }
+}
+
 /// L6: the budget applies to each join block on its own (a UNION ALL branch is planned alone):
 /// wide unions of small branches plan, a plain wide join is the server's to refuse, and the
 /// reason names the block that exceeds it and what it inlines.
@@ -1377,9 +1530,11 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
 
 /// A semi-join whose table maps to the units neither directly nor through a unique key: an
 /// inner join with the internal view of its distinct keys.
+/// C3: a semi-join over a child of a cascading foreign key stays incremental: the parent's
+/// deletes / key updates give the units where the subquery is correlated on the unit through
+/// the FK columns, else they rebuild the view (cascaded child rows have no binlog rows).
 #[test]
-fn internal_views_for_untraceable_semi_joins() {
-    // A cascading foreign key changes order_items rows without binlog rows of their own.
+fn semi_joins_over_cascading_children() {
     let mut cat = catalog();
     let key = ("db".to_string(), "order_items".to_string());
     let mut items = (*cat[&key]).clone();
@@ -1391,37 +1546,21 @@ fn internal_views_for_untraceable_semi_joins() {
         on_update: crate::catalog::FkAction::Cascade,
     }];
     cat.insert(key, Arc::new(items));
-    let sql = "SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT qty FROM order_items WHERE price > 1)";
-    let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
-    assert_eq!(
-        analyzer_plan(&d, "db", &cat).unwrap().mode,
-        Mode::Full("IN subquery over `order_items`, a child of a cascading foreign key".into())
-    );
-    let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
-        panic!("expected an internal view")
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap()
     };
-    assert_eq!(
-        ivs[0].sql,
-        format!(
-            "CREATE VIEW `{}` AS SELECT `order_items`.`qty` AS `qty` FROM `db`.`order_items` AS `order_items` \
-             WHERE (`order_items`.price > 1) GROUP BY `order_items`.`qty`",
-            ivs[0].name
-        )
-    );
-    assert_eq!(ivs[0].key, vec!["qty".to_string()]);
-    let (k, t) = internal_table(&ivs[0], &[("qty", "int")], &[0]);
-    cat.insert(k, t);
-    let super::Outcome::Plan(v) = outcome(sql, &cat) else {
-        panic!("expected a plan")
-    };
+    // Correlated on the unit through the FK column: the parent's image gives the units.
+    let v = plan("SELECT o.id, o.status FROM orders o WHERE EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.qty > 5)");
     assert_eq!(v.mode, Mode::Spj);
-    assert_eq!(v.aliases.len(), 2);
-    assert!(
-        v.where_sql
-            .as_deref()
-            .is_some_and(|w| w.contains("`order_items_keys`.`qty` = `o`.customer_id")),
-        "{:?}",
-        v.where_sql
+    assert_eq!(v.tracing(), "o:unit,i:unit,^orders:unit");
+    // Not on the unit: the parent's deletes rebuild the view; everything else is incremental.
+    let v = plan("SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT qty FROM order_items WHERE price > 1)");
+    assert_eq!(v.mode, Mode::Spj);
+    assert_eq!(v.tracing(), "o:unit,order_items:lookup,^orders:rebuild");
+    assert_eq!(
+        v.cascades[0].untraced.as_deref(),
+        Some("IN subquery over `order_items`: the units a cascade from `orders` changes are not known")
     );
 }
 
@@ -1590,10 +1729,9 @@ fn semi_joins_over_joined_subqueries() {
          (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id)",
     )
     .unwrap();
-    assert_eq!(
-        analyzer_plan(&d, "db", &cat).unwrap().mode,
-        Mode::Full("IN subquery over `order_items`, a child of a cascading foreign key".into())
-    );
+    let v = analyzer_plan(&d, "db", &cat).unwrap();
+    assert_eq!(v.mode, Mode::Spj);
+    assert_eq!(v.tracing(), "c:unit,o:unit,i:lookup,^orders:rebuild");
 }
 
 /// Window and top-N CTEs are isolated too: the parent filters or joins their table.
@@ -1738,12 +1876,18 @@ fn scalar_lookups_unnested() {
         "`c`.`name` AS `(SELECT name FROM customers c WHERE c.id = o.customer_id)`"
     );
     assert_eq!(w.aliases.len(), 3);
-    // Not a key lookup, or an aggregate: still a subquery.
-    for sql in [
-        "SELECT o.id, (SELECT name FROM customers c WHERE c.region_id = o.customer_id) AS n FROM orders o",
-        "SELECT o.id, (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS n FROM orders o",
+    // Not a key lookup, or an aggregate (named, C6): still a subquery.
+    for (sql, why) in [
+        (
+            "SELECT o.id, (SELECT name FROM customers c WHERE c.region_id = o.customer_id) AS n FROM orders o",
+            "subquery",
+        ),
+        (
+            "SELECT o.id, (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS n FROM orders o",
+            "correlated aggregate subquery in the SELECT list (needs internal views)",
+        ),
     ] {
-        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), "subquery", "{sql}");
+        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
     }
 }
 

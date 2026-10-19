@@ -8,9 +8,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    visit_expressions, visit_expressions_mut, BinaryOperator, DataType, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
-    NamedWindowExpr, ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
+    visit_expressions, visit_expressions_mut, BinaryOperator, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator, NamedWindowExpr,
+    ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, TableAlias, TableFactor, TableWithJoins,
     UnaryOperator, Value, Visit, Visitor, WindowType,
 };
@@ -267,26 +267,6 @@ const NULL_STRICT: &[&str] = &[
     "JSON_VALUE",
 ];
 
-/// Functions returning JSON values (JSON group keys never match their own refresh filter).
-const JSON_PRODUCING: &[&str] = &[
-    "JSON_EXTRACT",
-    "JSON_OBJECT",
-    "JSON_ARRAY",
-    "JSON_ARRAYAGG",
-    "JSON_OBJECTAGG",
-    "JSON_SET",
-    "JSON_INSERT",
-    "JSON_REPLACE",
-    "JSON_REMOVE",
-    "JSON_MERGE",
-    "JSON_MERGE_PATCH",
-    "JSON_MERGE_PRESERVE",
-    "JSON_KEYS",
-    "JSON_ARRAY_APPEND",
-    "JSON_ARRAY_INSERT",
-    "JSON_QUOTE",
-];
-
 /// SELECT modifiers that may precede the first projection item.
 const SELECT_MODIFIERS: &[&str] = &[
     "ALL",
@@ -350,12 +330,16 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
         .collect();
     let word = |i: usize| words.get(i).map(|&w| &tokens[w].token);
     let kw = |t: &Token, k: &str| matches!(t, Token::Word(Word { value, quote_style: None, .. }) if value.eq_ignore_ascii_case(k));
+    // (Comments are whitespace tokens: a definition of only comments is empty too.)
+    if words.is_empty() {
+        bail!("the definition is empty: {SINGLE_SELECT}");
+    }
     if word(0).map(|t| kw(t, "CREATE")) != Some(true) {
-        bail!("definition must start with CREATE ... VIEW");
+        bail!("{SINGLE_SELECT}; found `{}` …", tokens[words[0]].token);
     }
     let view_at = (0..words.len())
         .position(|i| kw(&tokens[words[i]].token, "VIEW"))
-        .ok_or_else(|| anyhow!("definition must be a CREATE VIEW statement"))?;
+        .ok_or_else(|| anyhow!("{SINGLE_SELECT}; found CREATE without VIEW"))?;
     let mut i = view_at + 1;
     let mut parts = Vec::new();
     loop {
@@ -391,8 +375,50 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
     }
     // Hand the remaining tokens (with their locations in `def`) to the query parser.
     let rest = &tokens[words[i] + 1..];
+    match word(i + 1) {
+        None => bail!("the definition is empty after AS: {SINGLE_SELECT}"),
+        Some(t)
+            if ["SELECT", "WITH", "VALUES", "TABLE"]
+                .iter()
+                .all(|k| !kw(t, k))
+                && !matches!(t, Token::LParen) =>
+        {
+            bail!("{SINGLE_SELECT}; found `{t}` … after AS")
+        }
+        _ => {}
+    }
+    let statements = 1
+        + (0..words.len())
+            .filter(|&k| {
+                matches!(word(k), Some(Token::SemiColon))
+                    && word(k + 1).is_some_and(|t| !matches!(t, Token::SemiColon))
+            })
+            .count();
+    if statements > 1 {
+        bail!("the definition contains {statements} statements: {SINGLE_SELECT}");
+    }
     let mut parser = Parser::new(&dialect).with_tokens_with_locations(rest.to_vec());
     let query = parser.parse_query().context("parse SELECT")?;
+    // The servers refuse variables in a view (ERROR 1351) and their values change without a
+    // source change.
+    let mut variable = None;
+    let _ = visit_expressions(&query, |e: &Expr| {
+        let id = match e {
+            Expr::Identifier(i) => Some(i),
+            Expr::CompoundIdentifier(parts) => parts.first(),
+            _ => None,
+        };
+        if id.is_some_and(|i| i.quote_style.is_none() && i.value.starts_with('@')) {
+            variable = Some(e.to_string());
+            return ControlFlow::Break(());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if let Some(v) = variable {
+        bail!(
+            "a view cannot read user or system variables (`{v}`): the servers refuse them in views"
+        );
+    }
     // The servers read `||` as OR unless sql_mode has PIPES_AS_CONCAT; the parser reads it as
     // concatenation. Neither reading can be trusted: ask for the explicit form.
     let mut pipes = false;
@@ -421,7 +447,7 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
                 if ["WITH", "CASCADED", "LOCAL", "CHECK", "OPTION"]
                     .iter()
                     .any(|k| w.value.eq_ignore_ascii_case(k)) => {}
-            t => bail!("unexpected token after SELECT: {t}"),
+            t => bail!("unexpected `{t}` after the end of the SELECT statement"),
         }
     }
     let offsets = Offsets::new(def);
@@ -458,6 +484,10 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
         item_sql,
     })
 }
+
+/// What a definition must be, for errors.
+const SINGLE_SELECT: &str =
+    "the definition must be a single SELECT statement (or CREATE VIEW name AS SELECT …)";
 
 /// Definitions are tokenized without unescaping: string literals keep their escapes (`'a\'b'`,
 /// `'x\_y'`), so rendered SQL means what was written, and quoted identifiers keep doubled quote
@@ -1458,16 +1488,33 @@ fn col_refs(e: &Expr, scope: &Scope) -> Vec<ColRef> {
     out
 }
 
-/// Whether a unit (group) expression yields JSON values.
-fn json_valued(e: &Expr, scope: &Scope) -> bool {
+/// Functions returning JSON values.
+const JSON_PRODUCING: &[&str] = &[
+    "JSON_EXTRACT",
+    "JSON_OBJECT",
+    "JSON_ARRAY",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECTAGG",
+    "JSON_SET",
+    "JSON_INSERT",
+    "JSON_REPLACE",
+    "JSON_REMOVE",
+    "JSON_MERGE",
+    "JSON_MERGE_PATCH",
+    "JSON_MERGE_PRESERVE",
+    "JSON_KEYS",
+    "JSON_ARRAY_APPEND",
+    "JSON_ARRAY_INSERT",
+    "JSON_QUOTE",
+    "JSON_QUERY",
+];
+
+/// Whether a unit (group) expression is a JSON value computed by a function, `->` or a CAST.
+fn json_computed(e: &Expr) -> bool {
     match e {
-        Expr::Nested(x) => json_valued(x, scope),
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => scope
-            .resolve(e)
-            .map(|(a, c)| scope.aliases[a].1.columns[c].kind == ColKind::Json)
-            .unwrap_or(false),
+        Expr::Nested(x) => json_computed(x),
         Expr::Function(f) => JSON_PRODUCING.contains(&function_name(f).as_str()),
-        Expr::Cast { data_type, .. } => matches!(data_type, DataType::JSON),
+        Expr::Cast { data_type, .. } => data_type.to_string().eq_ignore_ascii_case("JSON"),
         Expr::BinaryOp {
             op: BinaryOperator::Arrow,
             ..
@@ -1707,6 +1754,25 @@ pub fn plan_block(
     };
     let select: &mut Select = match query.body.as_mut() {
         SetExpr::Select(s) => s,
+        // C4: name what blocks a top-N over a set operation (its rows are a bounded recompute
+        // of an internal view of the union).
+        SetExpr::SetOperation {
+            op, set_quantifier, ..
+        } if top_n_limit.is_some() => {
+            let all = matches!(
+                set_quantifier,
+                sqlparser::ast::SetQuantifier::All | sqlparser::ast::SetQuantifier::AllByName
+            );
+            let op = match op {
+                sqlparser::ast::SetOperator::Union if all => "UNION ALL",
+                sqlparser::ast::SetOperator::Union => "UNION",
+                sqlparser::ast::SetOperator::Intersect => "INTERSECT",
+                _ => "EXCEPT",
+            };
+            return Ok(full(&format!(
+                "ORDER BY … LIMIT over a {op} (needs internal views)"
+            )));
+        }
         _ => return Ok(full("set operation (UNION/INTERSECT/EXCEPT)")),
     };
     if select.distinct.is_some() {
@@ -2233,8 +2299,14 @@ pub fn plan_block(
             lookup_where = Some(kept);
         }
     }
-    if unit_refs.iter().any(|u| json_valued(u, &scope)) {
-        return Ok(full("JSON group key (needs typed unit filters)"));
+    // JSON unit keys: a JSON column is a plain unit (the engine binds it as `CAST(? AS JSON)`,
+    // typed by the materialized column, on MySQL; MariaDB JSON is text). A JSON value computed by
+    // a function is not: MariaDB compares it as JSON (`JSON_EXTRACT(d, '$.a') = '"x"'` is false
+    // for "x") while its unit filter binds the text, so its groups would be refreshed empty.
+    if let Some(u) = unit_refs.iter().find(|u| json_computed(u)) {
+        return Ok(full(&format!(
+            "group key `{u}` is a JSON value computed by a function (MariaDB compares it as JSON, its unit filter as text): group by the column, or by its text with ->> / JSON_UNQUOTE"
+        )));
     }
     // (BIT unit keys: binlog values become unsigned integers and are bound as such; both sides
     // of every comparison see the same number.)
@@ -3489,7 +3561,7 @@ fn cascade_joined(
 }
 
 /// Cascading-FK parents (and, conservatively, their ancestors) of the given child tables.
-fn cascade_routes(
+pub(crate) fn cascade_routes(
     children: &[(Arc<TableInfo>, Option<Vec<usize>>)],
     tables: &HashMap<TableRef, Arc<TableInfo>>,
 ) -> Vec<CascadeRoute> {
@@ -3800,6 +3872,69 @@ mod tests {
         assert_eq!(d.columns, vec!["a", "b"]);
         assert_eq!(d.query_sql, "SELECT id, status FROM orders");
         assert!(parse_definition("SELECT 1").is_err());
+        // L-06 / L-07: what is wrong, in the user's terms (a plan error is final: no retries).
+        let err = |sql: &str| format!("{:#}", parse_definition(sql).unwrap_err());
+        let one =
+            "the definition must be a single SELECT statement (or CREATE VIEW name AS SELECT …)";
+        assert_eq!(err(""), format!("the definition is empty: {one}"));
+        assert_eq!(
+            err("  -- a comment\n/* only */ "),
+            format!("the definition is empty: {one}")
+        );
+        assert_eq!(
+            err("CREATE VIEW `v` AS "),
+            format!("the definition is empty after AS: {one}")
+        );
+        assert_eq!(
+            err("CREATE VIEW `lz_insert` AS INSERT INTO orders VALUES (9,'z',1)"),
+            format!("{one}; found `INSERT` … after AS")
+        );
+        for (sql, word) in [
+            ("CREATE VIEW `v` AS UPDATE orders SET a = 1", "UPDATE"),
+            ("CREATE VIEW `v` AS DELETE FROM orders", "DELETE"),
+            ("CREATE VIEW `v` AS CREATE TABLE t (a INT)", "CREATE"),
+            ("CREATE VIEW `v` AS DROP TABLE orders", "DROP"),
+        ] {
+            assert_eq!(
+                err(sql),
+                format!("{one}; found `{word}` … after AS"),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            err("INSERT INTO orders VALUES (1)"),
+            format!("{one}; found `INSERT` …")
+        );
+        assert_eq!(
+            err("CREATE TABLE t (a int)"),
+            format!("{one}; found CREATE without VIEW")
+        );
+        assert_eq!(
+            err("CREATE VIEW `v` AS SELECT id FROM orders; SELECT id FROM orders"),
+            format!("the definition contains 2 statements: {one}")
+        );
+        assert_eq!(
+            err("CREATE VIEW `v` AS SELECT 1 FROM t; SELECT 2 FROM t;\n SELECT 3 FROM t;"),
+            format!("the definition contains 3 statements: {one}")
+        );
+        assert_eq!(
+            err("CREATE VIEW v AS SELECT id, @@session.sql_mode AS m FROM t"),
+            "a view cannot read user or system variables (`@@session.sql_mode`): the servers refuse them in views"
+        );
+        assert!(err("CREATE VIEW v AS SELECT id, @x AS x FROM t").contains("`@x`"));
+        assert_eq!(
+            err("CREATE VIEW v AS SELECT id FROM t LIMIT 2 ROWS EXAMINED 100"),
+            "unexpected `ROWS` after the end of the SELECT statement"
+        );
+        // Accepted: CRLF line ends, a trailing semicolon (or two), comments, a string with `;`.
+        for sql in [
+            "CREATE VIEW v AS\r\nSELECT id\r\nFROM t\r\nWHERE id > 1;\r\n",
+            "CREATE VIEW v AS SELECT id FROM t;;",
+            "CREATE VIEW v AS SELECT id, 'a;b' AS s FROM t -- trailing; comment",
+            "CREATE VIEW v AS SELECT `@x` FROM t",
+        ] {
+            assert!(parse_definition(sql).is_ok(), "{sql}");
+        }
         assert!(parse_definition("CREATE TABLE t (a int)").is_err());
         assert!(parse_definition("CREATE VIEW v AS SELECT 1 garbage garbage").is_err());
     }
@@ -4934,14 +5069,25 @@ mod tests {
                 .unwrap()
                 .mode
         };
-        for sql in [
-            "CREATE VIEW v AS SELECT doc, COUNT(*) FROM docs GROUP BY doc",
-            "CREATE VIEW v AS SELECT JSON_EXTRACT(doc, '$.a') k, COUNT(*) FROM docs GROUP BY k",
-            "CREATE VIEW v AS SELECT doc->'$.a' k, COUNT(*) FROM docs GROUP BY k",
+        // A JSON column is a plain unit (the engine binds it typed, `CAST(? AS JSON)`).
+        assert_eq!(
+            pl("CREATE VIEW v AS SELECT doc, COUNT(*) FROM docs GROUP BY doc"),
+            Mode::Grouped
+        );
+        // A JSON value computed by a function: MariaDB compares it as JSON, the filter as text.
+        for (sql, key) in [
+            (
+                "CREATE VIEW v AS SELECT JSON_EXTRACT(doc, '$.a') k, COUNT(*) FROM docs GROUP BY k",
+                "JSON_EXTRACT(doc, '$.a')",
+            ),
+            (
+                "CREATE VIEW v AS SELECT doc->'$.a' k, COUNT(*) FROM docs GROUP BY k",
+                "doc -> '$.a'",
+            ),
         ] {
             assert_eq!(
                 pl(sql),
-                Mode::Full("JSON group key (needs typed unit filters)".into()),
+                Mode::Full(format!("group key `{key}` is a JSON value computed by a function (MariaDB compares it as JSON, its unit filter as text): group by the column, or by its text with ->> / JSON_UNQUOTE")),
                 "{sql}"
             );
         }
