@@ -2997,6 +2997,54 @@ fn reg_not_in_prepared_statement_canary() {
     });
 }
 
+/// A view that rebuilds on a parent's cascading deletes logged only that it does, not why the
+/// cascade cannot be traced through the parent. The warning carries the analyzer's reason (here:
+/// the parent on the NULL side of a LEFT JOIN with a condition beyond the foreign-key equality),
+/// and the view stays correct through the cascades.
+#[test]
+fn reg_untraced_cascade_reason_is_logged() {
+    scenario("reg_fk_untraced", |ctx| async move {
+        let ddl = [
+            "CREATE TABLE pars (id INT PRIMARY KEY, label VARCHAR(20) NOT NULL)",
+            "CREATE TABLE kids (par_id INT NOT NULL, seq INT NOT NULL, qty INT NOT NULL, PRIMARY KEY (par_id, seq),
+             FOREIGN KEY (par_id) REFERENCES pars (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "INSERT INTO pars VALUES (10, 'a'), (11, 'zz'), (12, 'c')",
+            "INSERT INTO kids VALUES (10, 1, 5), (10, 2, 6), (11, 1, 7), (12, 1, 8)",
+        ];
+        let specs = vec![ViewSpec::new(
+            "r_kids_left",
+            Kind::Incremental,
+            "SELECT k.par_id, k.seq, k.qty, p.label FROM kids k \
+             LEFT JOIN pars p ON p.id = k.par_id AND p.label <> 'zz'",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_fk_untraced", &ddl, &specs, &[]).await?;
+        let log = std::fs::read_to_string(&eng.log_path)?;
+        let line = log
+            .lines()
+            .find(|l| l.contains("reads a child of a cascading foreign key"))
+            .context("no cascade warning in the engine log")?;
+        ensure!(
+            line.contains("reasons=")
+                && line.contains(
+                    "is on the NULL side of a LEFT JOIN whose condition is not the foreign-key equality alone"
+                ),
+            "the cascade warning does not say why: {line}"
+        );
+        let mut c = db.conn().await?;
+        for (what, stmt) in [
+            (
+                "parent deleted (children cascade)",
+                "DELETE FROM pars WHERE id = 10",
+            ),
+            ("parent key moved", "UPDATE pars SET id = 20 WHERE id = 12"),
+        ] {
+            exec(&mut c, stmt).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}
+
 /// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
 /// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
 /// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed

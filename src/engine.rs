@@ -1005,13 +1005,24 @@ impl Engine {
             }
         }
         let plan = self.plan_bounded(definition, &parsed, infos).await?;
-        if plan
+        // Why each cascade the view rebuilds on cannot be traced (the analyzer's reason).
+        let mut reasons: Vec<String> = plan
             .cascades
             .iter()
-            .any(|c| c.unit_from_parent.is_none() && !c.traced)
-            && plan.is_incremental()
-        {
-            warn!(view = %plan.name, "reads a child of a cascading foreign key whose units cannot be derived from the parent; parent deletes/updates trigger an online rebuild");
+            .filter(|c| c.unit_from_parent.is_none() && !c.traced)
+            .map(|c| {
+                c.untraced.clone().unwrap_or_else(|| {
+                    format!(
+                        "`{}` cascades into `{}`.`{}`",
+                        c.parent.name, c.child.0, c.child.1
+                    )
+                })
+            })
+            .collect();
+        reasons.sort();
+        reasons.dedup();
+        if !reasons.is_empty() && plan.is_incremental() {
+            warn!(view = %plan.name, reasons = %reasons.join("; "), "reads a child of a cascading foreign key whose units cannot be derived from the parent; parent deletes/updates trigger an online rebuild");
         }
         Ok(plan)
     }
