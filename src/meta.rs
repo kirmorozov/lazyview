@@ -299,6 +299,13 @@ pub async fn touch_refreshed(conn: &mut Conn, names: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `(name, target)` of every state row.
+pub async fn state_keys(conn: &mut Conn) -> Result<Vec<(String, String)>> {
+    Ok(conn
+        .query("SELECT CAST(`name` AS CHAR), CAST(`target` AS CHAR) FROM `_lazyview_state`")
+        .await?)
+}
+
 pub async fn delete_state(conn: &mut Conn, name: &str, target: &str) -> Result<()> {
     conn.exec_drop(
         "DELETE FROM `_lazyview_state` WHERE `name` = ? AND `target` = ?",

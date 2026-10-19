@@ -2354,6 +2354,199 @@ fn reg_first_build_swap_does_not_stall_other_views() {
     });
 }
 
+/// `(state, mode, detail, last_error)` of a view's state row on target `source`.
+async fn state_detail(
+    c: &mut mysql_async::Conn,
+    name: &str,
+) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
+    Ok(c
+        .exec_first(
+            "SELECT CAST(state AS CHAR), CAST(mode AS CHAR), CAST(detail AS CHAR), CAST(last_error AS CHAR) \
+             FROM _lazyview_state WHERE name = ? AND target = 'source'",
+            (name,),
+        )
+        .await?)
+}
+
+/// A view reading a view in `error` said `waiting for upstream view ... to be built` forever,
+/// so the troubleshooting query `WHERE state = 'error'` missed it. It is in `error` naming the
+/// upstream's error (down a chain of such views) and is built once the upstream is fixed.
+#[test]
+fn reg_dependent_of_view_in_error_shows_its_error() {
+    scenario("reg_blocked", |ctx| async move {
+        let db = ctx.new_db("reg_blocked").await?;
+        let mut c = db.conn().await?;
+        run(&mut c, DDL).await?;
+        ensure_lazyview_table(&mut c).await?;
+        run(
+            &mut c,
+            &[
+                "INSERT INTO _lazyview (name, definition) VALUES ('lz_bad', 'SELECT nope FROM orders')",
+                "INSERT INTO _lazyview (name, definition) VALUES ('lz_dep', 'SELECT * FROM lz_bad')",
+                "INSERT INTO _lazyview (name, definition) VALUES ('lz_dep2', 'SELECT * FROM lz_dep')",
+            ],
+        )
+        .await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        let bad = wait_state(&mut c, &mut eng, "lz_bad", "error", t_ready()).await?;
+        let bad_err = bad.last_error.clone().unwrap_or_default();
+        let dep = wait_state(&mut c, &mut eng, "lz_dep", "error", t_ready()).await?;
+        let dep_err = dep.last_error.clone().unwrap_or_default();
+        ensure!(
+            dep_err == format!("upstream view `lz_bad` is in error: {bad_err}"),
+            "lz_dep: {dep:?}"
+        );
+        let dep2 = wait_state(&mut c, &mut eng, "lz_dep2", "error", t_ready()).await?;
+        ensure!(
+            dep2.last_error.as_deref()
+                == Some(format!("upstream view `lz_dep` is in error: {dep_err}").as_str()),
+            "lz_dep2: {dep2:?}"
+        );
+        let listed: i64 = c
+            .query_first("SELECT COUNT(*) FROM _lazyview_overview WHERE state = 'error'")
+            .await?
+            .unwrap_or(0);
+        ensure!(
+            listed == 3,
+            "the troubleshooting query lists {listed} of the 3 views in error"
+        );
+        // Fixing the upstream builds the whole chain.
+        exec(
+            &mut c,
+            "UPDATE _lazyview SET definition = 'SELECT id, status FROM orders' WHERE name = 'lz_bad'",
+        )
+        .await?;
+        let specs = vec![
+            ViewSpec::new("lz_bad", Kind::Incremental, "SELECT id, status FROM orders"),
+            ViewSpec::new("lz_dep", Kind::Chained, "SELECT * FROM lz_bad"),
+            ViewSpec::new("lz_dep2", Kind::Chained, "SELECT * FROM lz_dep"),
+        ];
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        exec(&mut c, "INSERT INTO orders VALUES (14, 2, 'new')").await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "chain after the upstream was fixed",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
+/// A `_lazyview_state` row deleted by hand left the view maintained but with NULL state, mode
+/// and detail in `_lazyview_overview` until a restart, which then rebuilt it. The row is written
+/// back as it was (also for a view in error), and it still lets a restart resume the table.
+#[test]
+fn reg_deleted_state_row_is_written_back() {
+    scenario("reg_state_row", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_state",
+            Kind::Incremental,
+            "SELECT id, status FROM orders",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_state_row", &[], &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        exec(
+            &mut c,
+            "INSERT INTO _lazyview (name, definition) VALUES ('r_err', 'SELECT nope FROM orders')",
+        )
+        .await?;
+        wait_state(&mut c, &mut eng, "r_err", "error", t_ready()).await?;
+        let before = (
+            state_detail(&mut c, "r_state").await?,
+            state_detail(&mut c, "r_err").await?,
+        );
+        exec(
+            &mut c,
+            "DELETE FROM _lazyview_state WHERE name IN ('r_state', 'r_err')",
+        )
+        .await?;
+        let t = std::time::Instant::now();
+        loop {
+            let now = (
+                state_detail(&mut c, "r_state").await?,
+                state_detail(&mut c, "r_err").await?,
+            );
+            if now == before {
+                break;
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(15),
+                "deleted state rows not written back within 15 s: {now:?}, before {before:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let managed: Option<i64> = c
+            .query_first("SELECT managed FROM _lazyview_state WHERE name = 'r_state'")
+            .await?;
+        ensure!(
+            managed == Some(1),
+            "r_state's table is no longer recorded as lazyview's"
+        );
+        exec(&mut c, "INSERT INTO orders VALUES (14, 2, 'new')").await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the state row came back").await?;
+        // The row written back is a valid resume record: a restart resumes the table.
+        eng.stop().await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        let d = eng.snapshot();
+        ensure!(
+            d.full_rebuilds == 0,
+            "restart rebuilt instead of resuming: {}",
+            fmt_snapshot(&d)
+        );
+        verify(&ctx, &mut eng, &db, &specs, "resumed").await?;
+        eng.stop().await
+    });
+}
+
+/// A view whose build fails keeps the mode and detail it was planned with, the reason in
+/// `last_error` (here: a table of that name that lazyview does not manage); only a definition
+/// that cannot be planned shows mode `unknown`.
+#[test]
+fn reg_failed_build_keeps_planned_mode() {
+    scenario("reg_err_mode", |ctx| async move {
+        let db = ctx.new_db("reg_err_mode").await?;
+        let mut c = db.conn().await?;
+        run(&mut c, DDL).await?;
+        ensure_lazyview_table(&mut c).await?;
+        run(
+            &mut c,
+            &[
+                "CREATE TABLE manual (id INT PRIMARY KEY)",
+                "INSERT INTO _lazyview (name, definition) VALUES ('manual', 'SELECT id, status FROM orders')",
+                "INSERT INTO _lazyview (name, definition) VALUES ('r_unplannable', 'SELECT nope FROM orders')",
+            ],
+        )
+        .await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_state(&mut c, &mut eng, "manual", "error", t_ready()).await?;
+        let (state, mode, detail, err) = state_detail(&mut c, "manual")
+            .await?
+            .context("no state row for manual")?;
+        ensure!(
+            (state.as_str(), mode.as_str(), detail.as_deref())
+                == ("error", "incremental", Some("spj")),
+            "manual: {state} {mode} {detail:?}"
+        );
+        let err = err.unwrap_or_default();
+        ensure!(
+            err.contains("refusing to replace existing base table")
+                && err.contains("that lazyview does not manage"),
+            "manual: last_error {err}"
+        );
+        wait_state(&mut c, &mut eng, "r_unplannable", "error", t_ready()).await?;
+        let row = state_detail(&mut c, "r_unplannable").await?;
+        ensure!(
+            matches!(&row, Some((s, m, None, Some(_))) if s == "error" && m == "unknown"),
+            "r_unplannable: {row:?}"
+        );
+        eng.stop().await
+    });
+}
+
 /// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
 /// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
 /// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed

@@ -238,7 +238,10 @@ upstream view is rebuilt and swapped, its dependent views are rebuilt online too
 
 The upstream may be defined in the same transaction, or after the dependent view. Until the
 upstream table is live, the dependent view has `state = 'waiting'` (``waiting for upstream view
-`x` to be built``); it is built as soon as the upstream is swapped in.
+`x` to be built``); it is built as soon as the upstream is swapped in. While the upstream view is
+in error, the dependent view is in `error` too, with ``upstream view `x` is in error: <its
+error>`` in `last_error` (also further down a chain of views). It goes back to `waiting` when the
+upstream is built again, and is built once the upstream is live.
 
 A plain SQL view (`CREATE VIEW` run directly on the server) can also be a source. It has no binlog
 rows of its own, so lazyview watches its base tables and maintains the view in full mode.
@@ -308,6 +311,9 @@ lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing column
 | `last_error` | the error message in state `error` |
 | `refreshed_at` | last time the table was built or refreshed |
 | `updated_at` | last change of this row |
+
+A state row deleted by hand is written back as it was within moments (`refreshed_at` restarts).
+The state rows are lazyview's record of which tables it built: do not edit them.
 
 `_lazyview_status`: the saved binlog position per `LAZYVIEW_INSTANCE_ID` (`binlog_file`,
 `binlog_pos`) and the fencing `epoch`, which grows each time an instance takes over.

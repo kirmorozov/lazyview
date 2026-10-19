@@ -315,6 +315,8 @@ struct Slot {
     stale_since: Option<Position>,
     /// Chained view waiting for its upstream lazyview table to be built first.
     waiting: Option<String>,
+    /// The upstream it waits for is in error (or blocked itself): the message its state shows.
+    blocked: Option<String>,
     /// Failed refreshes: the next attempt waits until then (exponential backoff).
     retry_at: Option<Instant>,
     /// Targets the view could not be built on.
@@ -378,6 +380,17 @@ impl std::fmt::Display for WaitingFor {
 
 impl std::error::Error for WaitingFor {}
 
+/// A state row as last written (see [`Engine::restore_state_rows`]).
+#[derive(Debug, Clone)]
+struct ShownState {
+    definition_id: u64,
+    hash: String,
+    mode: String,
+    detail: Option<String>,
+    state: String,
+    error: Option<String>,
+}
+
 /// A finished build: its layout, the targets it could not be built on and those it already
 /// swapped in itself (routine rebuilds of full-mode views).
 struct Built {
@@ -420,6 +433,10 @@ struct Engine {
     /// Prepared XA transactions awaiting XA COMMIT / ROLLBACK.
     xa_pending: HashMap<String, XaTxn>,
     defs_dirty: bool,
+    /// A `_lazyview_state` row was deleted: write back those of current views.
+    state_check: bool,
+    /// Last state written per (name, target), to write a row deleted by hand back.
+    shown: HashMap<(String, String), ShownState>,
     /// Definitions to re-plan and rebuild: def_id → (due, freeze the live version).
     replan: HashMap<u64, (Instant, bool)>,
     /// Consecutive failures per definition (exponential retry backoff).
@@ -615,6 +632,8 @@ impl Engine {
             xa_current: None,
             xa_pending: HashMap::new(),
             defs_dirty: false,
+            state_check: false,
+            shown: HashMap::new(),
             replan: HashMap::new(),
             failures: HashMap::new(),
             defs_recheck: None,
@@ -926,6 +945,17 @@ impl Engine {
         err: Option<&str>,
     ) {
         let (mode, detail) = plan.map(mode_name).unwrap_or(("unknown", None));
+        self.shown.insert(
+            (name.to_string(), target.to_string()),
+            ShownState {
+                definition_id: def_id,
+                hash: hash.to_string(),
+                mode: mode.to_string(),
+                detail: detail.clone(),
+                state: state.to_string(),
+                error: err.map(str::to_string),
+            },
+        );
         let r = meta::set_state(
             &mut self.meta,
             StateUpdate {
@@ -1079,6 +1109,7 @@ impl Engine {
         let s = &mut self.slots[idx];
         s.error = Some(msg.clone());
         s.waiting = None;
+        s.blocked = None;
         s.stale_since = None;
         let (name, id, hash, targets, plan) = (
             s.name.clone(),
@@ -1091,10 +1122,13 @@ impl Engine {
             self.set_state(&name, &t, id, &hash, plan.as_deref(), "error", Some(&msg))
                 .await;
         }
+        self.update_blocked(&name, 0).await;
     }
 
     /// A chained view whose upstream lazyview table is not built yet: state `waiting` (not an
-    /// error); it is planned when the upstream is swapped in (see [`Self::wake_waiting`]).
+    /// error); it is planned when the upstream is swapped in (see [`Self::wake_waiting`]). While
+    /// the upstream is in error (or blocked itself) the state is `error`, naming the upstream's
+    /// error, and goes back to `waiting` when the upstream is built again.
     async fn slot_waiting(&mut self, idx: usize, upstream: &str) {
         let s = &mut self.slots[idx];
         if s.waiting.as_deref() != Some(upstream) {
@@ -1103,13 +1137,91 @@ impl Engine {
         s.waiting = Some(upstream.to_string());
         s.error = None;
         s.stale_since = None;
-        let msg = WaitingFor(upstream.to_string()).to_string();
+        s.blocked = None;
+        self.show_waiting(idx, true, 0).await;
+    }
+
+    /// Writes the state of waiting view `idx`: `waiting`, or `error` while its upstream is in
+    /// error. `force`: also when that did not change.
+    async fn show_waiting(&mut self, idx: usize, force: bool, depth: usize) {
+        let s = &self.slots[idx];
+        let Some(upstream) = s.waiting.clone() else {
+            return;
+        };
+        let blocked = self
+            .slots
+            .iter()
+            .find(|o| o.def_id != s.def_id && o.name == upstream)
+            .and_then(|o| o.error.as_deref().or(o.blocked.as_deref()))
+            .map(|e| format!("upstream view `{upstream}` is in error: {e}"));
+        if !force && blocked == s.blocked {
+            return;
+        }
         let (name, id, hash, targets) =
             (s.name.clone(), s.def_id, s.hash.clone(), s.targets.clone());
+        if let Some(b) = &blocked {
+            warn!(view = %name, "{b}");
+        }
+        self.slots[idx].blocked = blocked.clone();
+        let (state, msg) = match blocked {
+            Some(b) => ("error", b),
+            None => ("waiting", WaitingFor(upstream).to_string()),
+        };
         for t in targets {
-            self.set_state(&name, &t, id, &hash, None, "waiting", Some(&msg))
+            self.set_state(&name, &t, id, &hash, None, state, Some(&msg))
                 .await;
         }
+        self.update_blocked(&name, depth + 1).await;
+    }
+
+    /// Updates the views waiting for `upstream` after its error state changed (down the chain
+    /// of views waiting for those).
+    async fn update_blocked(&mut self, upstream: &str, depth: usize) {
+        if depth > 16 {
+            return;
+        }
+        let waiting: Vec<usize> = (0..self.slots.len())
+            .filter(|&i| self.slots[i].waiting.as_deref() == Some(upstream))
+            .collect();
+        for i in waiting {
+            Box::pin(self.show_waiting(i, false, depth)).await;
+        }
+    }
+
+    /// Writes the state rows of current views that were deleted (by hand: lazyview deletes only
+    /// those of removed tables and names) back as last written, so `_lazyview_overview` does not
+    /// show NULL until a restart.
+    async fn restore_state_rows(&mut self) -> Result<()> {
+        let present: HashSet<(String, String)> = meta::state_keys(&mut self.meta)
+            .await?
+            .into_iter()
+            .collect();
+        let missing: Vec<((String, String), ShownState)> = self
+            .slots
+            .iter()
+            .flat_map(|s| s.targets.iter().map(|t| (s.name.clone(), t.clone())))
+            .filter(|k| !present.contains(k))
+            .filter_map(|k| self.shown.get(&k).cloned().map(|v| (k, v)))
+            .collect();
+        for ((name, target), v) in missing {
+            info!(view = %name, %target, "state row was deleted; writing it again");
+            meta::set_state(
+                &mut self.meta,
+                StateUpdate {
+                    name: &name,
+                    target: &target,
+                    definition_id: v.definition_id,
+                    hash: &v.hash,
+                    mode: &v.mode,
+                    detail: v.detail.as_deref(),
+                    state: &v.state,
+                    error: v.error.as_deref(),
+                    managed: self.owned.contains_key(&(name.clone(), target.clone())),
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Plans views waiting for `upstream` (just swapped in on the source).
@@ -1301,6 +1413,7 @@ impl Engine {
             last_full: None,
             stale_since: None,
             waiting: None,
+            blocked: None,
             retry_at: None,
             down: BTreeMap::new(),
             last_plan: None,
@@ -1404,6 +1517,19 @@ impl Engine {
             .cloned()
             .collect();
         info!(view = %name, targets = %resumed.join(","), "resuming existing materialized table");
+        // The state rows say `ready` already (as written by the run that built them).
+        let (mode, detail) = mode_name(plan);
+        for t in &resumed {
+            let shown = ShownState {
+                definition_id: self.slots[idx].def_id,
+                hash: hash.clone(),
+                mode: mode.to_string(),
+                detail: detail.clone(),
+                state: "ready".to_string(),
+                error: None,
+            };
+            self.shown.insert((name.clone(), t.clone()), shown);
+        }
         self.slots[idx].live = Some(Version {
             plan: plan.clone(),
             layout,
@@ -1520,7 +1646,9 @@ impl Engine {
         }
         Metrics::add(&self.metrics.full_rebuilds, 1);
         self.slots[idx].last_full = Some(Instant::now());
-        self.slots[idx].error = None;
+        // Building again: views waiting for this one no longer show its error.
+        let unblocked =
+            self.slots[idx].error.take().is_some() | self.slots[idx].blocked.take().is_some();
         self.slots[idx].next = Some(Next {
             dirty: ViewDirty {
                 images: vec![HashSet::new(); plan.aliases.len()],
@@ -1543,6 +1671,10 @@ impl Engine {
             swapping: false,
         });
         self.rebuild_routes();
+        if unblocked {
+            let name = self.slots[idx].name.clone();
+            self.update_blocked(&name, 0).await;
+        }
     }
 
     /// Re-reads `_lazyview` and reconciles slots: new, changed, renamed, retargeted, removed.
@@ -2065,7 +2197,9 @@ impl Engine {
                 self.table_ids.insert(table_id, (key, route));
             }
             Item::Rows {
-                table_id, event, ..
+                table_id,
+                kind,
+                event,
             } => {
                 self.in_txn = true;
                 let Some((key, route)) = self.table_ids.get(&table_id).cloned() else {
@@ -2074,6 +2208,14 @@ impl Engine {
                 if key.0 == self.schema && key.1 == meta::DEFS {
                     self.defs_dirty = true;
                     self.first_dirty.get_or_insert_with(Instant::now);
+                    return Ok(());
+                }
+                if key.0 == self.schema && key.1 == meta::STATE {
+                    // A state row deleted by hand is written back (see `restore_state_rows`).
+                    if kind == binlog::RowsKind::Delete {
+                        self.state_check = true;
+                        self.first_dirty.get_or_insert_with(Instant::now);
+                    }
                     return Ok(());
                 }
                 let Some(route) = route else {
@@ -2232,7 +2374,7 @@ impl Engine {
         let (total, ready, errors) = (
             self.slots.len() as u64,
             n(&|s| s.live.is_some() && s.error.is_none()),
-            n(&|s| s.error.is_some()),
+            n(&|s| s.error.is_some() || s.blocked.is_some()),
         );
         Metrics::set(&g.views, total);
         Metrics::set(&g.views_ready, ready);
@@ -2569,6 +2711,18 @@ impl Engine {
                     // Read again once the metadata connection is back.
                     self.defs_dirty = true;
                     self.meta_failed(e, "reading _lazyview").await?;
+                }
+            } else {
+                self.first_dirty = Some(Instant::now());
+            }
+        }
+        if self.state_check {
+            // The DELETE must be visible before we look for the rows.
+            if self.fence().await {
+                self.state_check = false;
+                if let Err(e) = self.restore_state_rows().await {
+                    self.state_check = true;
+                    self.meta_failed(e, "reading _lazyview_state").await?;
                 }
             } else {
                 self.first_dirty = Some(Instant::now());
