@@ -1495,9 +1495,11 @@ impl Engine {
                     .await;
             }
         }
-        // A full-mode view has nothing to apply to the shadow table: the build swaps it in
-        // itself, keeping the DDL off the binlog loop.
-        let swap = routine && matches!(plan.mode, Mode::Full(_));
+        // A full-mode view has nothing to apply to the shadow table: a rebuild, or the first
+        // build of a view without a live version, swaps it in itself, keeping the DDL off the
+        // binlog loop.
+        let first = self.slots[idx].live.is_none() && !partial;
+        let swap = (routine || first) && matches!(plan.mode, Mode::Full(_));
         let task = tokio::spawn(build_task(
             self.src_opts.clone(),
             self.schema.clone(),
@@ -2979,16 +2981,27 @@ impl Engine {
                     return;
                 }
             }
-            // A routine rebuild swaps off the binlog loop (DDL takes seconds on some servers).
-            // The live version pauses meanwhile: its changes are buffered for this version and
-            // applied right after the swap, so readers never see older data after it.
-            if n.routine && !n.swapping && !n.targets.is_empty() {
+            // A routine rebuild, or the first build of a view without a live version, swaps off
+            // the binlog loop (DDL takes seconds on some servers). A live version pauses
+            // meanwhile: the changes are buffered for this version and applied right after the
+            // swap, so readers never see older data after it.
+            let first = self.slots[i].live.is_none() && !n.partial;
+            if (n.routine || first) && !n.swapping && !n.targets.is_empty() {
+                let marker = mv::marker(&n.name, self.slots[i].def_id);
                 let specs = n
                     .targets
                     .iter()
                     .map(|t| {
                         let target = &self.targets[t];
-                        (t.clone(), target.opts.clone(), target.schema.clone())
+                        // The ownership check of the swap on the loop (below), right before it.
+                        let live_has = self.slots[i]
+                            .live
+                            .as_ref()
+                            .is_some_and(|l| l.name == n.name && l.targets.contains(t));
+                        let check = (!live_has
+                            && !self.owned.contains_key(&(n.name.clone(), t.clone())))
+                        .then(|| marker.clone());
+                        (t.clone(), target.opts.clone(), target.schema.clone(), check)
                     })
                     .collect();
                 n.task = tokio::spawn(swap_task(
@@ -3021,15 +3034,7 @@ impl Engine {
             if !live_has && !self.owned.contains_key(&(n.name.clone(), t.clone())) {
                 let marker = mv::marker(&n.name, self.slots[i].def_id);
                 let exists = match self.target_conn(&t).await {
-                    Ok(c) => {
-                        mv::table_kind(c, &ts, &n.name)
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some()
-                            && mv::table_marker(c, &ts, &n.name).await.ok().flatten()
-                                != Some(marker)
-                    }
+                    Ok(c) => foreign_table(c, &ts, &n.name, &marker).await,
                     Err(_) => false,
                 };
                 if exists {
@@ -3864,6 +3869,23 @@ impl Engine {
                 self.finish_next(i).await;
             }
         }
+        // First builds swap in the background (see `finish_next`): wait for those swaps too.
+        let swapping = |s: &Slot| s.next.as_ref().is_some_and(|n| n.swapping);
+        while self
+            .slots
+            .iter()
+            .any(|s| swapping(s) && s.next.as_ref().is_some_and(|n| n.done.is_none()))
+        {
+            match rx.recv().await {
+                Some(done) => self.on_build_done(done),
+                None => break,
+            }
+        }
+        for i in 0..self.slots.len() {
+            if swapping(&self.slots[i]) {
+                self.finish_next(i).await;
+            }
+        }
         if self
             .slots
             .iter()
@@ -3909,23 +3931,31 @@ struct BuildSpec {
     check_table: bool,
 }
 
-/// Swaps the shadow tables of a routine rebuild in, off the binlog loop (see `finish_next`).
-/// A target where that fails is left to the engine, which retries it as for any build.
+/// Swaps the shadow tables of a routine rebuild or a first build in, off the binlog loop (see
+/// `finish_next`); `Some(marker)`: first check that no table lazyview did not create appeared
+/// under the view's name. A target where that fails is left to the engine, which checks again
+/// and retries it as for any build.
 async fn swap_task(
-    targets: Vec<(String, Opts, String)>,
+    targets: Vec<(String, Opts, String, Option<String>)>,
     name: String,
     layout: Layout,
     tx: mpsc::UnboundedSender<BuildDone>,
     (def_id, generation): (u64, u64),
 ) {
     let mut swapped = Vec::new();
-    for (t, opts, schema) in targets {
+    for (t, opts, schema, check) in targets {
         let r = async {
             let mut c = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT * 3, connect(&opts)).await
             {
                 Ok(r) => r?,
                 Err(_) => bail!("connecting to target {t}: timed out"),
             };
+            if let Some(marker) = &check {
+                if foreign_table(&mut c, &schema, &name, marker).await {
+                    let _ = c.disconnect().await;
+                    bail!("a table `{name}` appeared during the build");
+                }
+            }
             // A reader holding the old table's metadata lock: wait for it a while.
             let mut attempts = 0;
             let r = loop {
@@ -3955,6 +3985,22 @@ async fn swap_task(
             swapped,
         }),
     });
+}
+
+/// Whether a table `name` exists that lazyview did not create for this view (`marker`, see
+/// [`mv::marker`]): a swap must never replace it.
+async fn foreign_table(c: &mut Conn, schema: &str, name: &str, marker: &str) -> bool {
+    mv::table_kind(c, schema, name)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+        && mv::table_marker(c, schema, name)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(marker)
 }
 
 /// Connects to a build target, runs its ownership checks and creates the shadow table.
@@ -4041,6 +4087,10 @@ async fn build_task(
         ) {
             if !swap {
                 break;
+            }
+            if spec.check_table && foreign_table(c, ts, &name, &spec.marker).await {
+                debug!(view = %name, target = %spec.target, "swap left to the engine: a table appeared during the build");
+                continue;
             }
             match mv::swap(c, ts, &name).await {
                 Ok(()) => swapped.push(spec.target.clone()),

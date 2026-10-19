@@ -2270,6 +2270,90 @@ fn reg_json_decimal_values_converge() {
     });
 }
 
+/// The first build of a view (here: rebuilt at startup) swaps its table in off the binlog loop:
+/// an open reader transaction on the old table holds its metadata lock, and the swap waits and
+/// retries for as long as it is open. On the loop, every attempt stalled the engine for up to
+/// `lock_wait_timeout` (5 s), so no other view was refreshed meanwhile (brutal `window_0ms`:
+/// 30 first builds serialized at 5-21 s per swap on slow servers).
+#[test]
+fn reg_first_build_swap_does_not_stall_other_views() {
+    scenario("reg_swap_bg", |ctx| async move {
+        use std::time::Instant;
+        let specs = vec![
+            ViewSpec::new(
+                "r_names",
+                Kind::Incremental,
+                "SELECT id, name FROM customers",
+            ),
+            ViewSpec::new(
+                "r_locked",
+                Kind::Incremental,
+                "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+            ),
+        ];
+        let (db, eng) = setup(&ctx, "reg_swap_bg", &[], &specs, &[]).await?;
+        eng.stop().await?;
+        // A reader transaction on r_locked: the swap's RENAME waits for its metadata lock.
+        let mut reader = db.conn().await?;
+        exec(&mut reader, "START TRANSACTION").await?;
+        let _: Option<i64> = reader.query_first("SELECT COUNT(*) FROM r_locked").await?;
+        let mut c = db.conn().await?;
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_START_MODE", "rebuild")])?;
+        let r = async {
+            // Both builds started (their state rows say `building`), then r_names is live.
+            let t = Instant::now();
+            while eng.snapshot().full_rebuilds < 2 {
+                ensure!(
+                    t.elapsed() < t_ready(),
+                    "the startup rebuilds did not start"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            wait_ready(&mut c, &mut eng, &["r_names"], t_ready()).await?;
+            // While r_locked's swap waits, changes to r_names are applied promptly.
+            for k in 0..6 {
+                let id = 100 + k;
+                let t = Instant::now();
+                exec(
+                    &mut c,
+                    &format!("INSERT INTO customers VALUES ({id}, 'n{id}', NULL)"),
+                )
+                .await?;
+                loop {
+                    let n: Option<i64> = c
+                        .query_first(format!("SELECT COUNT(*) FROM r_names WHERE id = {id}"))
+                        .await?;
+                    if n == Some(1) {
+                        break;
+                    }
+                    ensure!(
+                        t.elapsed() < Duration::from_secs(3),
+                        "insert {k}: r_names not refreshed within 3 s while r_locked's swap waits \
+                         for a metadata lock; metrics {}",
+                        fmt_snapshot(&eng.snapshot())
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+            let state: Option<String> = c
+                .query_first("SELECT state FROM _lazyview_state WHERE name = 'r_locked'")
+                .await?;
+            ensure!(
+                state.as_deref() == Some("building"),
+                "r_locked went live although its table is locked: {state:?}"
+            );
+            Ok(())
+        }
+        .await;
+        exec(&mut reader, "COMMIT").await?;
+        r?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the swap").await?;
+        eng.stop().await
+    });
+}
+
 /// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
 /// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
 /// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed
