@@ -27,7 +27,7 @@ use super::ast::{
     qident, table_factor, JoinKind,
 };
 use super::build::{star_with_using, Builder, Res, Resolver};
-use super::ir::{Block, Item, Origin, Rel, Semi, Source};
+use super::ir::{Block, Item, Origin, Rel, Semi, SemiTable, Source};
 use super::names::ident_name;
 use super::scope::Scope;
 use crate::analyze::null_propagating;
@@ -118,6 +118,23 @@ fn windowed(b: &Block) -> bool {
 fn block_has_subquery(b: &Block) -> bool {
     exprs_of(&b.select).into_iter().any(has_subquery)
         || b.outputs.iter().any(|o| has_subquery(&o.expr))
+        || tail_has_subquery(b)
+}
+
+/// The ORDER BY kept with a LIMIT holds a subquery (its names are not rewritten: they resolve in
+/// the subquery's own FROM first).
+pub(crate) fn tail_has_subquery(b: &Block) -> bool {
+    match b
+        .tail
+        .as_ref()
+        .and_then(|t| t.order_by.as_ref())
+        .map(|o| &o.kind)
+    {
+        Some(sqlparser::ast::OrderByKind::Expressions(es)) => {
+            es.iter().any(|e| has_subquery(&e.expr))
+        }
+        _ => false,
+    }
 }
 
 /// The construct that keeps a derived block from being merged into its parent as a plain
@@ -173,6 +190,9 @@ pub(crate) fn unmerged_reason(b: &Block, it: &Item) -> String {
     let what = it.origin.describe(&it.alias);
     if star_with_using(&b.select) {
         return "SELECT * over a USING join".into();
+    }
+    if tail_has_subquery(b) {
+        return format!("subquery in the ORDER BY of a top-N view over {what}");
     }
     let Source::Derived(rel) = &it.source else {
         return format!("{what} could not be merged");
@@ -348,7 +368,7 @@ fn rewrite(b: &mut Block, r: &Resolver, subst: &HashMap<(usize, usize), Expr>) -
     {
         for e in es.iter_mut() {
             let alias = matches!(&e.expr, Expr::Identifier(id) if names.contains(&ident_name(id).to_lowercase()));
-            if !alias && !matches!(&e.expr, Expr::Value(_)) {
+            if !alias && !matches!(&e.expr, Expr::Value(_)) && !has_subquery(&e.expr) {
                 rewrite_expr(&mut e.expr, r, &aliases, subst)?;
             }
         }
@@ -1397,8 +1417,9 @@ fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
     let outer = Resolver::new(b);
     let mut kept = Vec::new();
     let mut found = false;
+    let mut blockers = Vec::new();
     for c in parts {
-        match semi(bld, &outer, &c, scope)? {
+        match semi(bld, &outer, &c, scope, &mut blockers)? {
             Some(s) => {
                 kept.push(s.1);
                 b.semis.push(s.0);
@@ -1407,6 +1428,7 @@ fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
             None => kept.push(c),
         }
     }
+    b.semi_blockers.extend(blockers);
     if found {
         b.select.selection = and_all(kept);
         b.rewritten = true;
@@ -1414,8 +1436,67 @@ fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
     Ok(())
 }
 
-/// A semi-join for conjunct `c`, with the marker that replaces it.
-fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Option<(Semi, Expr)>> {
+/// Why a subquery block cannot be a semi-join alias (precise fallback reason).
+fn semi_blocker(kind: &str, sb: &Block) -> String {
+    if sb.items.is_empty() {
+        return format!("{kind} without a FROM clause");
+    }
+    if let Some(it) = sb
+        .items
+        .iter()
+        .find(|i| !matches!(i.source, Source::Table(..)))
+    {
+        return format!(
+            "{kind} over {} (needs internal views)",
+            it.origin.describe(&it.alias)
+        );
+    }
+    if sb.limit {
+        return format!("{kind} with LIMIT");
+    }
+    if windowed(sb) {
+        return format!("{kind} with a window function (needs internal views)");
+    }
+    if !sb.semis.is_empty() || block_has_subquery(sb) {
+        return format!("{kind} containing a subquery (needs internal views)");
+    }
+    format!("{kind} with an aggregate (needs internal views)")
+}
+
+/// The ON conditions of a subquery's FROM when its tables are joined by inner joins only (each
+/// becomes a conjunct of its WHERE); the reason otherwise.
+fn inner_join_conditions(kind: &str, sb: &Block) -> std::result::Result<Vec<Expr>, String> {
+    let mut on = Vec::new();
+    for j in sb.select.from.iter().flat_map(|t| &t.joins) {
+        match &j.join_operator {
+            JoinOperator::Join(c) | JoinOperator::Inner(c) | JoinOperator::CrossJoin(c) => {
+                match c {
+                    JoinConstraint::On(e) => on.push(e.clone()),
+                    JoinConstraint::None => {}
+                    _ => {
+                        return Err(format!(
+                            "{kind} with a join USING columns of several tables"
+                        ))
+                    }
+                }
+            }
+            // A lookup of the NULL side would have to drop the conditions that keep
+            // NULL-extended rows (as the block planner does for the view's own FROM).
+            _ => return Err(format!("{kind} with an outer join (needs internal views)")),
+        }
+    }
+    Ok(on)
+}
+
+/// A semi-join for conjunct `c`, with the marker that replaces it. A subquery that stays one
+/// leaves its reason in `blockers`.
+fn semi(
+    bld: &Builder,
+    outer: &Resolver,
+    c: &Expr,
+    scope: &Scope,
+    blockers: &mut Vec<String>,
+) -> Result<Option<(Semi, Expr)>> {
     let (lhs, subquery, negated) = match c {
         Expr::Exists { subquery, negated } => (None, subquery, *negated),
         Expr::InSubquery {
@@ -1425,17 +1506,27 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
         } => (Some(expr), subquery, *negated),
         _ => return Ok(None),
     };
+    let kind = match (lhs.is_some(), negated) {
+        (true, false) => "IN subquery",
+        (true, true) => "NOT IN subquery",
+        (false, false) => "EXISTS subquery",
+        (false, true) => "NOT EXISTS subquery",
+    };
     let not_in = lhs.is_some() && negated;
     if not_in && matches!(lhs.map(|e| &**e), Some(Expr::Tuple(_))) {
+        blockers.push("NOT IN over a row constructor".into());
         return Ok(None);
     }
     let Rel::Block(sb) = bld.nested(subquery, scope)? else {
+        blockers.push(format!("{kind} over a set operation or VALUES"));
         return Ok(None);
     };
     let mut sb = *sb;
-    let simple = sb.items.len() == 1
-        && matches!(sb.items[0].source, Source::Table(..))
-        && single_table(&sb)
+    let simple = !sb.items.is_empty()
+        && sb
+            .items
+            .iter()
+            .all(|i| matches!(i.source, Source::Table(..)))
         && !sb.limit
         && !windowed(&sb)
         && sb.semis.is_empty()
@@ -1443,55 +1534,117 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
         && !sb.outputs.iter().any(|o| has_aggregate(&o.expr))
         && !block_has_subquery(&sb);
     if !simple {
+        blockers.push(semi_blocker(kind, &sb));
         return Ok(None);
     }
-    let Source::Table(tref, info) = sb.items[0].source.clone() else {
-        unreachable!()
+    // Several tables: joined by inner joins, whose ON conditions are WHERE conjuncts.
+    let several = !single_table(&sb);
+    if several {
+        let r = Resolver::new(&sb);
+        using_to_on(&mut sb, &r);
+    }
+    let mut on = match inner_join_conditions(kind, &sb) {
+        Ok(on) => on,
+        Err(why) => {
+            blockers.push(why);
+            return Ok(None);
+        }
     };
-    let alias = sb.items[0].alias.clone();
-    // Inner columns are qualified with the alias, outer references become placeholders.
+    let mut tables: Vec<SemiTable> = sb
+        .items
+        .iter()
+        .map(|it| match &it.source {
+            Source::Table(t, info) => SemiTable {
+                table: t.clone(),
+                info: info.clone(),
+                alias: it.alias.clone(),
+                referenced: vec![false; info.columns.len()],
+            },
+            Source::Derived(_) => unreachable!(),
+        })
+        .collect();
     let inner = Resolver::new(&sb);
-    let mut outer_exprs: Vec<Expr> = Vec::new();
-    let mut ok = true;
-    let mut referenced = vec![false; info.columns.len()];
-    let mut localize = |e: &mut Expr, outer_exprs: &mut Vec<Expr>, referenced: &mut Vec<bool>| {
+    let mut where_ = sb.select.selection.take();
+    let mut proj: Vec<Expr> = sb.outputs.iter().map(|o| o.expr.clone()).collect();
+    // VIRTUAL generated columns of the subquery's tables have no value in the row images its
+    // lookups substitute: their expressions, converted to their types, stand in (B2).
+    let mut virtual_failed = None;
+    for e in on
+        .iter_mut()
+        .chain(where_.iter_mut())
+        .chain(proj.iter_mut())
+    {
         let _ = visit_expressions_mut(e, |x: &mut Expr| {
-            if matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-                && placeholder_index(x).is_none()
-            {
-                match inner.resolve(x) {
-                    Res::Col(_, col) => {
-                        referenced[col] = true;
-                        let id = match &*x {
-                            Expr::Identifier(id) => id.clone(),
-                            Expr::CompoundIdentifier(p) => p.last().unwrap().clone(),
-                            _ => unreachable!(),
-                        };
-                        *x = qcol(&alias, &id);
-                    }
-                    Res::Ambiguous(_) => ok = false,
-                    Res::Unknown => match outer.resolve(x) {
-                        Res::Col(..) => {
-                            outer_exprs.push(x.clone());
-                            *x = placeholder(outer_exprs.len() - 1);
+            if let Res::Col(i, col) = inner.resolve(x) {
+                let t = &tables[i];
+                if t.info.columns[col]
+                    .generated
+                    .as_ref()
+                    .is_some_and(|g| !g.stored)
+                {
+                    match crate::analyze::virtual_expansion(&t.alias, &t.info, col) {
+                        Ok(v) => *x = v,
+                        Err(r) => {
+                            virtual_failed.get_or_insert(r);
                         }
-                        _ => ok = false,
-                    },
+                    }
                 }
             }
             ControlFlow::<()>::Continue(())
         });
-    };
-    let mut where_ = sb.select.selection.take();
+    }
+    if let Some(why) = virtual_failed {
+        blockers.push(format!("{kind} reading {why}"));
+        return Ok(None);
+    }
+    // Inner columns are qualified with their alias, outer references become placeholders.
+    let aliases: Vec<String> = tables.iter().map(|t| t.alias.clone()).collect();
+    let mut outer_exprs: Vec<Expr> = Vec::new();
+    let mut ok = true;
+    let mut referenced: Vec<Vec<bool>> = tables.iter().map(|t| t.referenced.clone()).collect();
+    let mut localize =
+        |e: &mut Expr, outer_exprs: &mut Vec<Expr>, referenced: &mut Vec<Vec<bool>>| {
+            let _ = visit_expressions_mut(e, |x: &mut Expr| {
+                if matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                    && placeholder_index(x).is_none()
+                {
+                    match inner.resolve(x) {
+                        Res::Col(i, col) => {
+                            referenced[i][col] = true;
+                            let id = match &*x {
+                                Expr::Identifier(id) => id.clone(),
+                                Expr::CompoundIdentifier(p) => p.last().unwrap().clone(),
+                                _ => unreachable!(),
+                            };
+                            *x = qcol(&aliases[i], &id);
+                        }
+                        Res::Ambiguous(_) => ok = false,
+                        Res::Unknown => match outer.resolve(x) {
+                            Res::Col(..) => {
+                                outer_exprs.push(x.clone());
+                                *x = placeholder(outer_exprs.len() - 1);
+                            }
+                            _ => ok = false,
+                        },
+                    }
+                }
+                ControlFlow::<()>::Continue(())
+            });
+        };
+    for e in &mut on {
+        localize(e, &mut outer_exprs, &mut referenced);
+    }
     if let Some(w) = &mut where_ {
         localize(w, &mut outer_exprs, &mut referenced);
     }
-    let mut proj: Vec<Expr> = sb.outputs.iter().map(|o| o.expr.clone()).collect();
     for p in &mut proj {
         localize(p, &mut outer_exprs, &mut referenced);
     }
     if !ok {
         return Ok(None);
+    }
+    for (t, r) in tables.iter_mut().zip(referenced) {
+        t.referenced = r;
     }
     let mut correlation = Vec::new();
     let mut join_conditions = Vec::new();
@@ -1515,10 +1668,10 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
             return Ok(None);
         }
         for (p, ph) in proj.iter().zip(&lhs_ph) {
-            let Res::Col(_, col) = inner.resolve(p) else {
-                return Ok(None);
-            };
-            correlation.push((col, placeholder_index(ph).unwrap()));
+            // (An expression relates rows by its value too; only a column can be a key.)
+            if let Res::Col(t, col) = inner.resolve(p) {
+                correlation.push((t, col, placeholder_index(ph).unwrap()));
+            }
             let eq = Expr::BinaryOp {
                 left: Box::new(p.clone()),
                 op: BinaryOperator::Eq,
@@ -1534,7 +1687,12 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
             join_conditions.push(eq);
         }
     }
-    for cj in where_.iter().flat_map(conjuncts) {
+    let conds: Vec<Expr> = on
+        .iter()
+        .flat_map(conjuncts)
+        .chain(where_.iter().flat_map(conjuncts))
+        .collect();
+    for cj in conds {
         if let Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
@@ -1542,8 +1700,8 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
         } = &cj
         {
             for (a, z) in [(left, right), (right, left)] {
-                if let (Res::Col(_, col), Some(k)) = (inner.resolve(a), placeholder_index(z)) {
-                    correlation.push((col, k));
+                if let (Res::Col(t, col), Some(k)) = (inner.resolve(a), placeholder_index(z)) {
+                    correlation.push((t, col, k));
                 }
             }
         }
@@ -1554,8 +1712,26 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
         correlation.clear();
     }
     let mut sel = sb.select.clone();
-    sel.selection = where_;
     sel.distinct = None;
+    if several {
+        // `t1 AS a, t2 AS b WHERE <ON conditions> AND <WHERE>`: inner joins associate.
+        sel.from = tables
+            .iter()
+            .map(|t| TableWithJoins {
+                relation: table_factor(
+                    ObjectName(vec![
+                        ObjectNamePart::Identifier(qident(&t.table.0)),
+                        ObjectNamePart::Identifier(qident(&t.table.1)),
+                    ]),
+                    Some(&t.alias),
+                ),
+                joins: vec![],
+            })
+            .collect();
+        sel.selection = and_all(on.into_iter().chain(where_).collect());
+    } else {
+        sel.selection = where_;
+    }
     sel.projection = if lhs.is_some() {
         proj.into_iter().map(SelectItem::UnnamedExpr).collect()
     } else {
@@ -1584,29 +1760,29 @@ fn semi(bld: &Builder, outer: &Resolver, c: &Expr, scope: &Scope) -> Result<Opti
         Semi {
             id,
             negated,
-            table: tref,
-            info,
-            alias,
+            tables,
             predicate,
             join_conditions,
             lookup_conditions,
             not_in,
             correlation,
-            referenced,
         },
         marker,
     )))
 }
 
-/// Whether the semi-join's correlation covers the table's primary key (each outer row matches
-/// at most one row of the table: the semi-join is an inner join).
+/// Whether the semi-join is over one table and its correlation covers the table's primary key
+/// (each outer row matches at most one row of the table: the semi-join is an inner join).
 fn unique(s: &Semi) -> bool {
+    let [t] = s.tables.as_slice() else {
+        return false;
+    };
     !s.negated
-        && !s.info.pk.is_empty()
-        && s.info
+        && !t.info.pk.is_empty()
+        && t.info
             .pk
             .iter()
-            .all(|c| s.correlation.iter().any(|(sc, _)| sc == c))
+            .all(|c| s.correlation.iter().any(|(_, sc, _)| sc == c))
 }
 
 fn semis_to_joins(b: &mut Block) -> Result<()> {
@@ -1628,16 +1804,17 @@ fn semis_to_joins(b: &mut Block) -> Result<()> {
             .as_ref()
             .and_then(|w| marker_args(w, s.id))
             .ok_or_else(|| anyhow!("internal: semi-join marker missing"))?;
-        let mut alias = s.alias.clone();
+        let t = s.tables.into_iter().next().unwrap();
+        let mut alias = t.alias.clone();
         if taken.contains(&alias.to_lowercase()) {
             let mut n = 2;
-            while taken.contains(&format!("{}_{n}", s.alias).to_lowercase()) {
+            while taken.contains(&format!("{}_{n}", t.alias).to_lowercase()) {
                 n += 1;
             }
-            alias = format!("{}_{n}", s.alias);
+            alias = format!("{}_{n}", t.alias);
         }
         taken.insert(alias.to_lowercase());
-        let renames: HashMap<String, String> = [(s.alias.to_lowercase(), alias.clone())]
+        let renames: HashMap<String, String> = [(t.alias.to_lowercase(), alias.clone())]
             .into_iter()
             .collect();
         for mut c in s.join_conditions {
@@ -1657,8 +1834,8 @@ fn semis_to_joins(b: &mut Block) -> Result<()> {
             .collect();
         b.select.selection = and_all(kept);
         let name = ObjectName(vec![
-            ObjectNamePart::Identifier(qident(&s.table.0)),
-            ObjectNamePart::Identifier(qident(&s.table.1)),
+            ObjectNamePart::Identifier(qident(&t.table.0)),
+            ObjectNamePart::Identifier(qident(&t.table.1)),
         ]);
         b.select.from.push(TableWithJoins {
             relation: table_factor(name, Some(&alias)),
@@ -1668,7 +1845,7 @@ fn semis_to_joins(b: &mut Block) -> Result<()> {
             alias,
             pos: (b.select.from.len() - 1, None),
             origin: Origin::Table,
-            source: Source::Table(s.table, s.info),
+            source: Source::Table(t.table, t.info),
         });
     }
     let mut all: Vec<Expr> = b

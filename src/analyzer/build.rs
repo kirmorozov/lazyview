@@ -40,14 +40,14 @@ impl<'a> Builder<'a> {
         let ordered = q.order_by.is_some();
         match q.body.as_ref() {
             SetExpr::Select(s) => {
-                let mut r = self.select(s, ordered, limit, &scope)?;
-                if let (Rel::Block(b), true) = (&mut r, limit) {
-                    // Only the clauses after the body are kept (no WITH, no body).
+                // ORDER BY … LIMIT: kept with the block (only the clauses after the body are
+                // used), so the normalizer rewrites it with the block (merged FROM items).
+                let tail = limit.then(|| {
                     let mut tail = q.clone();
                     tail.with = None;
-                    b.tail = Some(Box::new(tail));
-                }
-                Ok(r)
+                    Box::new(tail)
+                });
+                self.select(s, ordered, limit, tail, &scope)
             }
             SetExpr::Query(inner) => Ok(match self.query(inner, &scope)? {
                 Rel::Block(mut b) => {
@@ -73,7 +73,7 @@ impl<'a> Builder<'a> {
 
     /// Builds one branch of a set operation at the top of the statement.
     pub(crate) fn branch<'q>(&self, s: &'q Select, scope: &Scope<'q>) -> Result<Rel> {
-        self.select(s, false, false, scope)
+        self.select(s, false, false, None, scope)
     }
 
     /// Builds a relation nested in the current one (a derived table, CTE body or subquery).
@@ -89,6 +89,7 @@ impl<'a> Builder<'a> {
         s: &'q Select,
         ordered: bool,
         limit: bool,
+        tail: Option<Box<Query>>,
         scope: &Scope<'q>,
     ) -> Result<Rel> {
         let mut items = Vec::new();
@@ -127,9 +128,10 @@ impl<'a> Builder<'a> {
             ordered,
             limit,
             semis: Vec::new(),
+            semi_blockers: Vec::new(),
             qualified: false,
             distinct_was: false,
-            tail: None,
+            tail,
         };
         normalize::block(self, &mut b, scope)?;
         Ok(Rel::Block(Box::new(b)))

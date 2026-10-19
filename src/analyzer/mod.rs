@@ -76,12 +76,12 @@ pub fn plan(
     }
 }
 
-/// Plans a definition, isolating subtrees into internal views where `opts` allows it.
-/// Most base-table references the inlined (flat) form of a definition may have. The servers
-/// allow 61 tables in a join; beyond this budget a multiply-referenced CTE belongs in an
-/// internal view instead of being copied.
+/// Most base-table references one join block of the inlined (flat) form may have (each UNION
+/// branch is a block). The servers allow 61 tables in a join; beyond this budget a
+/// multiply-referenced CTE belongs in an internal view instead of being copied.
 pub(crate) const INLINE_BUDGET: usize = 32;
 
+/// Plans a definition, isolating subtrees into internal views where `opts` allows it.
 pub fn analyze(
     def: &ParsedDef,
     default_schema: &str,
@@ -118,16 +118,25 @@ pub fn analyze(
     let Some((mut query, tokens)) = source::parse_query(&def.query_sql) else {
         return plan_as_written();
     };
-    // Every CTE reference is inlined as a copy: bound the size of the flat form before building
-    // it (a chain of CTEs each referencing the previous one twice is 2^n copies).
+    // Every CTE reference is inlined as a copy: bound the size of each flat join block before
+    // building it (a chain of CTEs each referencing the previous one twice is 2^n copies).
     let size = scope::inlined_size(&query, &scope::Scope::default());
     if size.refs > INLINE_BUDGET {
+        let what = match (size.ctes, size.derived) {
+            (true, true) => "the WITH clause and derived tables",
+            (true, false) => "the WITH clause",
+            _ => "derived tables",
+        };
+        let place = match size.branch {
+            Some(b) => format!("UNION branch {b}"),
+            None => "one SELECT".into(),
+        };
         let culprit = match &size.worst {
-            Some((name, n)) => format!(": CTE `{name}` is referenced {n} times"),
-            None => String::new(),
+            Some((name, n)) if size.ctes => format!(": CTE `{name}` is referenced {n} times"),
+            _ => String::new(),
         };
         return full(&format!(
-            "inlining the WITH clause and derived tables reads {} table references (budget {INLINE_BUDGET}){culprit} (needs internal views)",
+            "inlining {what} reads {} table references in {place} (budget {INLINE_BUDGET}){culprit} (needs internal views)",
             size.refs
         ));
     }
@@ -190,11 +199,18 @@ pub fn analyze(
             Err(why) => return full(&why),
         }
     }
+    // The names in an ORDER BY subquery resolve in its own FROM first: the analyzer leaves it as
+    // written, which is only valid over the FROM and WHERE as written.
+    if b.rewritten && normalize::tail_has_subquery(&b) {
+        return full(
+            "subquery in the ORDER BY of a top-N view whose other subqueries, DISTINCT or joins are rewritten",
+        );
+    }
     // (A WITH clause whose CTEs are all merged or unreferenced is dropped.)
     let planned: std::result::Result<ViewPlan, String> = if !b.rewritten && query.with.is_none() {
         let p = analyze::plan_block(def, default_schema, tables)?;
         match &p.mode {
-            Mode::Full(r) if r == NULL_SIDE_KEY => Err(r.clone()),
+            Mode::Full(r) if r == NULL_SIDE_KEY || r == "subquery" => Err(r.clone()),
             _ => Ok(p),
         }
     } else {
@@ -236,6 +252,10 @@ pub fn analyze(
                 Some(_) => full(&format!("{why} (needs internal views)")),
                 None => full(&why),
             };
+        }
+        // A subquery that stayed one: the reason the semi-join extraction recorded.
+        Err(why) if why == "subquery" && !b.semi_blockers.is_empty() => {
+            return full(&b.semi_blockers.join("; "));
         }
         Err(why) => return full(&why),
     };

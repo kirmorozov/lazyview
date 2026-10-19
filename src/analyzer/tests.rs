@@ -255,7 +255,7 @@ fn cte_inlining_is_bounded() {
     assert_eq!(
         p.mode,
         Mode::Full(
-            "inlining the WITH clause and derived tables reads 64 table references (budget 32): \
+            "inlining the WITH clause reads 64 table references in one SELECT (budget 32): \
              CTE `t5` is referenced 2 times (needs internal views)"
                 .into()
         )
@@ -270,6 +270,298 @@ fn cte_inlining_is_bounded() {
         );
         assert!(dt.as_millis() < 500, "n={n}: {dt:?}");
         assert_eq!(p.tables.len(), 1);
+    }
+}
+
+/// B1/B2: a VIRTUAL generated column is inlined everywhere as its expression converted to the
+/// declared type exactly as the server reads it (nested ones through their own conversion), in
+/// window partitions and units derived after the inlining and inside semi-join subqueries; a type
+/// without an exact SQL conversion is Full with the column and type named.
+#[test]
+fn virtual_columns_convert_to_their_declared_type() {
+    use crate::catalog::Generated;
+    let col = |n: &str, dt: &str, ct: &str| {
+        let text = matches!(dt, "varchar" | "char");
+        Column::new(
+            n,
+            dt,
+            ct,
+            text.then_some("utf8mb4"),
+            text.then_some("utf8mb4_general_ci"),
+            None,
+            false,
+        )
+    };
+    let gen = |mut c: Column, expr: &str, deps: Vec<usize>| {
+        c.generated = Some(Generated {
+            expr: expr.into(),
+            stored: false,
+            deps: Some(deps),
+        });
+        c
+    };
+    let mut gbin = col("gbin", "varchar", "varchar(20)");
+    gbin.collation = Some("utf8mb4_bin".into());
+    let mut cat = catalog();
+    for (k, t) in [
+        typed(
+            "g1",
+            vec![
+                col("id", "int", "int"),
+                col("a", "int", "int"),
+                col("b", "int", "int"),
+                col("name", "varchar", "varchar(20)"),
+                col("dt", "datetime", "datetime"),
+                gen(col("gi", "int", "int"), "(`a` / 3)", vec![1]),
+                gen(col("gd", "decimal", "decimal(6,1)"), "(`a` / 3)", vec![1]),
+                gen(gbin, "`name`", vec![3]),
+                gen(col("gdate", "date", "date"), "`dt`", vec![4]),
+                gen(col("gchain", "int", "int"), "(`gi` * 10)", vec![5]),
+                gen(col("gsum", "int", "int"), "(`a` + `b`)", vec![1, 2]),
+                gen(col("gf", "float", "float"), "`a`", vec![1]),
+                gen(col("gshort", "varchar", "varchar(3)"), "(`a` / 3)", vec![1]),
+            ],
+            &[0],
+        ),
+        typed(
+            "r",
+            vec![col("id", "int", "int"), col("w", "int", "int")],
+            &[0],
+        ),
+    ] {
+        cat.insert(k, t);
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let gi = "(LEAST(GREATEST(CAST((`g1`.`a` / 3) AS SIGNED), -2147483648), 2147483647))";
+    let v = plan("SELECT id, gi, gd FROM g1 WHERE gi = 0");
+    assert_eq!(
+        v.projection,
+        [
+            "id".to_string(),
+            format!("{gi} AS `gi`"),
+            "(CAST((`g1`.`a` / 3) AS DECIMAL(6,1))) AS `gd`".into()
+        ]
+    );
+    assert_eq!(v.where_sql.as_deref(), Some(format!("{gi} = 0").as_str()));
+    let v = plan("SELECT gbin, COUNT(*) AS n FROM g1 GROUP BY gbin");
+    assert_eq!(v.mode, Mode::Grouped);
+    assert_eq!(
+        v.unit_exprs,
+        ["(LEFT(CONVERT((`g1`.`name`) USING utf8mb4), 20) COLLATE utf8mb4_bin)"]
+    );
+    let v = plan("SELECT id FROM g1 WHERE gdate = '2026-01-01'");
+    assert_eq!(
+        v.where_sql.as_deref(),
+        Some("(CAST(CAST((`g1`.`dt`) AS DATETIME) AS DATE)) = '2026-01-01'")
+    );
+    // Nested: gchain reads gi through gi's conversion, the same text everywhere (MySQL's
+    // ONLY_FULL_GROUP_BY compares the projection with the GROUP BY).
+    let v = plan("SELECT gchain, COUNT(*) AS n FROM g1 GROUP BY gchain");
+    let chain = format!("(LEAST(GREATEST(CAST(({gi} * 10) AS SIGNED), -2147483648), 2147483647))");
+    assert_eq!(v.unit_exprs, std::slice::from_ref(&chain));
+    assert_eq!(v.projection[0], format!("{chain} AS `gchain`"));
+    assert_eq!(v.group_sql.as_deref(), Some(chain.as_str()));
+    // An unaliased expression keeps the server's name for it as an alias.
+    let v = plan("SELECT gi + 1, COUNT(*) AS n FROM g1 GROUP BY gi + 1");
+    assert_eq!(v.projection[0], format!("{gi} + 1 AS `gi + 1`"));
+    assert_eq!(v.group_sql, Some(format!("{gi} + 1")));
+    // Window partitions (and the units taken from them) after the inlining.
+    let v = plan("SELECT id, SUM(a) OVER (PARTITION BY gsum) AS s FROM g1");
+    assert_eq!(v.mode, Mode::Grouped);
+    assert!(
+        v.unit_exprs[0].contains("`g1`.`a` + `g1`.`b`") && !v.unit_exprs[0].contains("gsum"),
+        "{:?}",
+        v.unit_exprs
+    );
+    // Inside IN / EXISTS / NOT IN subqueries: the lookups evaluate the expression.
+    for sql in [
+        "SELECT r.id, r.w FROM r WHERE r.w IN (SELECT g.gsum FROM g1 g)",
+        "SELECT r.id, r.w FROM r WHERE EXISTS (SELECT 1 FROM g1 g WHERE g.gsum = r.w)",
+        "SELECT r.id, r.w FROM r WHERE r.w NOT IN (SELECT g.gsum FROM g1 g)",
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.tracing(), "r:unit,g:lookup", "{sql}");
+        let look = v.lookup_sql(1, "(G)");
+        assert!(
+            !look.contains("gsum") && look.contains("`g`.`a` + `g`.`b`"),
+            "{sql}: {look}"
+        );
+        assert!(!v.where_sql.as_deref().unwrap().contains("gsum"), "{sql}");
+        assert_eq!(v.aliases[1].image_cols, vec![1, 2], "{sql}");
+    }
+    // No exact conversion: Full, naming the column and its type.
+    for (sql, why) in [
+        (
+            "SELECT id, gf FROM g1",
+            "VIRTUAL generated column `g1`.`gf` of type float: no exact SQL conversion of its expression (an exact number) to that type",
+        ),
+        (
+            "SELECT gshort, COUNT(*) FROM g1 GROUP BY gshort",
+            "VIRTUAL generated column `g1`.`gshort` of type varchar(3): no exact SQL conversion of its expression (an exact number) to that type",
+        ),
+        (
+            "SELECT r.id FROM r WHERE r.w IN (SELECT g.gf FROM g1 g)",
+            "IN subquery reading VIRTUAL generated column `g1`.`gf` of type float: no exact SQL conversion of its expression (an exact number) to that type",
+        ),
+        (
+            "SELECT id FROM g1 WHERE gbin = 'x' COLLATE utf8mb4_general_ci",
+            "VIRTUAL generated column `g1`.`gbin` next to an explicit COLLATE (its inlined form has an explicit collation)",
+        ),
+    ] {
+        match plan(sql).mode {
+            Mode::Full(r) => assert_eq!(r, why, "{sql}"),
+            m => panic!("{sql}: expected Full, got {m:?}"),
+        }
+    }
+}
+
+/// L6: the budget applies to each join block on its own (a UNION ALL branch is planned alone):
+/// wide unions of small branches plan, a plain wide join is the server's to refuse, and the
+/// reason names the block that exceeds it and what it inlines.
+#[test]
+fn inlining_budget_is_per_join_block() {
+    let opts = super::Options {
+        branch_plans: true,
+        ..Default::default()
+    };
+    let go = |sql: &str, opts: &super::Options| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        super::analyze(&d, "db", &catalog(), opts).unwrap()
+    };
+    let union = |n: usize, branch: &str| vec![branch; n].join(" UNION ALL ");
+    // 33 one-table branches, no WITH: 33 branch plans (without branch plans: the construct,
+    // not the budget).
+    let u33 = union(33, "SELECT id, customer_id FROM orders WHERE total > 1");
+    let super::Outcome::Branches(b) = go(&u33, &opts) else {
+        panic!("expected branch plans")
+    };
+    assert_eq!(b.plans.len(), 33);
+    assert!(b.plans.iter().all(|p| p.mode == Mode::Spj));
+    assert_eq!(
+        reason(&format!("CREATE VIEW v AS {u33}")),
+        "set operation (UNION/INTERSECT/EXCEPT)"
+    );
+    // 40 branches over one shared CTE: each branch inlines one copy.
+    let u40 = format!(
+        "WITH c AS (SELECT id, customer_id FROM orders WHERE status = 'paid') {}",
+        union(40, "SELECT id, customer_id FROM c")
+    );
+    let super::Outcome::Branches(b) = go(&u40, &opts) else {
+        panic!("expected branch plans")
+    };
+    assert_eq!(b.plans.len(), 40);
+    // A branch that exceeds the budget is named.
+    let d = parse_definition(&cte_chain(6)).unwrap();
+    let chain_body = d.query_sql.clone();
+    let wide = chain_body.replacen(
+        "SELECT id, total FROM t6",
+        "SELECT id, total FROM orders UNION ALL SELECT id, total FROM t6",
+        1,
+    );
+    assert_eq!(
+        reason(&format!("CREATE VIEW v AS {wide}")),
+        "inlining the WITH clause reads 64 table references in UNION branch 2 (budget 32): \
+         CTE `t5` is referenced 2 times (needs internal views)"
+    );
+    // A 33-way join written out inlines nothing: planned as written.
+    let mut join = "SELECT o0.id FROM orders o0".to_string();
+    for k in 1..33 {
+        join.push_str(&format!(" JOIN orders o{k} ON o{k}.id = o0.id"));
+    }
+    assert_eq!(p(&format!("CREATE VIEW v AS {join}")).mode, Mode::Spj);
+    // Derived tables alone: named as such.
+    let mut derived = "SELECT d0.id FROM (SELECT id FROM orders) d0".to_string();
+    for k in 1..33 {
+        derived.push_str(&format!(
+            " JOIN (SELECT id FROM orders) d{k} ON d{k}.id = d0.id"
+        ));
+    }
+    assert_eq!(
+        reason(&format!("CREATE VIEW v AS {derived}")),
+        "inlining derived tables reads 33 table references in one SELECT (budget 32) (needs internal views)"
+    );
+}
+
+/// L5: ORDER BY … LIMIT goes through derived-table / CTE merges like the projection (Global,
+/// ORDER BY over the merged columns); subqueries in such an ORDER BY are traced (their tables
+/// recompute the view) when the FROM and WHERE stay as written, else Full with the reason.
+#[test]
+fn order_by_through_merges_and_subqueries() {
+    let v = |sql: &str| p(&format!("CREATE VIEW v AS {sql}"));
+    for (sql, select) in [
+        (
+            "SELECT d.id FROM (SELECT id, total FROM orders) d ORDER BY d.total DESC LIMIT 2",
+            "SELECT `orders`.id AS `id` FROM orders ORDER BY `orders`.total DESC LIMIT 2",
+        ),
+        (
+            "WITH c AS (SELECT id, total, customer_id FROM orders) SELECT c.id FROM c ORDER BY c.total DESC LIMIT 2",
+            "SELECT `orders`.id AS `id` FROM orders ORDER BY `orders`.total DESC LIMIT 2",
+        ),
+        (
+            "SELECT d.customer_id, COUNT(*) AS n FROM (SELECT customer_id, total FROM orders) d \
+             GROUP BY d.customer_id ORDER BY SUM(d.total) DESC LIMIT 2",
+            "SELECT `orders`.customer_id AS `customer_id`, COUNT(*) AS n FROM orders GROUP BY `orders`.customer_id \
+             ORDER BY SUM(`orders`.total) DESC LIMIT 2",
+        ),
+    ] {
+        let p = v(sql);
+        assert_eq!(p.mode, Mode::Global, "{sql}");
+        assert_eq!(p.select_sql(&[], None), select, "{sql}");
+        // The ORDER BY column is read (an UPDATE of it alone recomputes the view).
+        let total = p.aliases[0].table.col_index("total").unwrap();
+        assert!(p.aliases[0].referenced[total], "{sql}");
+    }
+    // Subqueries in the ORDER BY: their tables recompute the view on changes of the columns
+    // they name; the view's own correlated columns are read.
+    let c = v(
+        "SELECT o.id FROM orders o ORDER BY \
+               (SELECT MAX(i.price) FROM order_items i WHERE i.order_id = o.id) DESC, o.id LIMIT 2",
+    );
+    assert_eq!(c.mode, Mode::Global);
+    assert_eq!(c.tracing(), "o:recompute,order_items:recompute");
+    assert_eq!(c.aliases[1].referenced, vec![true, false, false, true]);
+    let s = v("SELECT o.id FROM orders o ORDER BY \
+               (SELECT c.name FROM customers c WHERE c.id = o.customer_id), o.id LIMIT 2");
+    assert_eq!(s.tracing(), "o:recompute,customers:recompute");
+    assert!(s.aliases[0].referenced[1], "o.customer_id is read");
+    let u = v("SELECT o.id FROM orders o ORDER BY o.total = (SELECT MAX(i.price) FROM order_items i), o.id LIMIT 2");
+    assert_eq!(u.tracing(), "o:recompute,order_items:recompute");
+    let star = v("SELECT o.id FROM orders o ORDER BY (SELECT COUNT(*) FROM (SELECT * FROM order_items) x) LIMIT 2");
+    assert_eq!(star.aliases[1].referenced, vec![true; 4]);
+    // A value that changes without a source change decides the rows: nothing to trace.
+    for (sql, f) in [
+        ("SELECT id FROM orders ORDER BY RAND() LIMIT 2", "RAND"),
+        ("SELECT id FROM orders ORDER BY id + 0 * UNIX_TIMESTAMP(), id LIMIT 2", "UNIX_TIMESTAMP"),
+        (
+            "SELECT o.id FROM orders o ORDER BY (SELECT MAX(i.price) FROM order_items i WHERE i.qty > RAND()) LIMIT 2",
+            "RAND",
+        ),
+    ] {
+        assert_eq!(
+            reason(&format!("CREATE VIEW v AS {sql}")),
+            format!("non-deterministic function {f} in the ORDER BY of a top-N view"),
+            "{sql}"
+        );
+    }
+    // Without LIMIT the ORDER BY does not decide the rows: not traced.
+    let n = v("SELECT o.id FROM orders o ORDER BY (SELECT MAX(i.price) FROM order_items i WHERE i.order_id = o.id)");
+    assert_eq!(n.tracing(), "o:unit");
+    for (sql, why) in [
+        (
+            "SELECT d.id FROM (SELECT id, total FROM orders) d ORDER BY (SELECT MAX(i.price) FROM order_items i WHERE i.order_id = d.id) LIMIT 2",
+            "subquery in the ORDER BY of a top-N view over derived table `d`",
+        ),
+        (
+            "SELECT o.id FROM orders o WHERE o.customer_id IN (SELECT id FROM customers) \
+             ORDER BY (SELECT MAX(i.price) FROM order_items i WHERE i.order_id = o.id), o.id LIMIT 2",
+            "subquery in the ORDER BY of a top-N view whose other subqueries, DISTINCT or joins are rewritten",
+        ),
+    ] {
+        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
     }
 }
 
@@ -953,6 +1245,131 @@ fn semi_join_lookups() {
             .ends_with("(EXISTS (SELECT 1 FROM (R) AS `regions` WHERE (`regions`.name = 'x')))"),
         "{}",
         u.lookup_sql(1, "(R)")
+    );
+}
+
+/// Subqueries over inner joins (L4: the workload's `v_big_spenders`): every table of the
+/// subquery is a semi-join alias, traced by direct units where it carries the correlation to the
+/// unit, else by lookups that substitute it among the subquery's other tables (several of them
+/// together share one EXISTS). Outer joins, LIMIT, aggregates and derived tables inside the
+/// subquery keep it a subquery, with a reason naming the construct.
+#[test]
+fn semi_joins_over_joined_subqueries() {
+    let v = |sql: &str| p(&format!("CREATE VIEW v AS {sql}"));
+    let a = v("SELECT c.id, c.name FROM customers c WHERE c.id IN \
+               (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id WHERE i.qty > 4)");
+    assert_eq!(a.mode, Mode::Spj);
+    assert_eq!(a.tracing(), "c:unit,o:unit,i:lookup");
+    assert_eq!(a.aliases[1].direct_unit, Some(vec![1]));
+    assert_eq!(
+        a.where_sql.as_deref(),
+        Some("(c.id IN (SELECT `o`.customer_id FROM `db`.`orders` AS `o`, `db`.`order_items` AS `i` \
+              WHERE (`i`.order_id = `o`.id) AND (`i`.qty > 4)))")
+    );
+    assert_eq!(
+        a.lookup_sql(2, "(I)"),
+        "SELECT DISTINCT `c`.`id` FROM customers c WHERE (TRUE) AND (EXISTS (SELECT 1 FROM `db`.`orders` AS `o`, \
+         (I) AS `i` WHERE (`o`.customer_id = c.id) AND (`i`.order_id = `o`.id) AND (`i`.qty > 4)))"
+    );
+    assert_eq!(a.aliases[2].image_cols, vec![0, 2]);
+    // Neither table carries the unit: both are looked up, and a lookup of both at once
+    // evaluates one subquery over both rows (an old row of one may only have joined an old row
+    // of the other).
+    let g = v("SELECT c.region_id, COUNT(*) AS n FROM customers c WHERE EXISTS \
+               (SELECT 1 FROM orders o, order_items i WHERE i.order_id = o.id AND o.customer_id = c.id AND i.qty > 4) \
+               GROUP BY c.region_id");
+    assert_eq!(g.mode, Mode::Grouped);
+    assert_eq!(g.tracing(), "c:unit,o:lookup,i:lookup");
+    let (sql, order) = g
+        .lookup_sql_multi(&[(2, "(I)".into()), (1, "(O)".into())])
+        .unwrap();
+    assert_eq!(
+        sql,
+        "SELECT DISTINCT c.region_id FROM customers c WHERE (TRUE) AND (EXISTS (SELECT 1 FROM (O) AS `o`, (I) AS `i` \
+         WHERE (`i`.order_id = `o`.id) AND (`o`.customer_id = c.id) AND (`i`.qty > 4)))"
+    );
+    assert_eq!(order, vec![1, 0]);
+    assert!(
+        g.lookup_sql(1, "(O)")
+            .contains("FROM (O) AS `o`, `db`.`order_items` AS `i` WHERE"),
+        "{}",
+        g.lookup_sql(1, "(O)")
+    );
+    // With a table of the view's FROM: its own substitution, the subquery's EXISTS.
+    let (sql, order) = g
+        .lookup_sql_multi(&[(1, "(O)".into()), (0, "(C)".into())])
+        .unwrap();
+    assert!(
+        sql.starts_with("SELECT DISTINCT c.region_id FROM (C) AS `c` WHERE (TRUE) AND (EXISTS (SELECT 1 FROM (O) AS `o`, `db`.`order_items` AS `i` "),
+        "{sql}"
+    );
+    assert_eq!(order, vec![1, 0]);
+    // NOT EXISTS: the correlated table's changes are direct units too.
+    let n = v("SELECT c.id FROM customers c WHERE NOT EXISTS \
+               (SELECT 1 FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.customer_id = c.id)");
+    assert_eq!(n.tracing(), "c:unit,o:unit,i:lookup");
+    // NOT IN: never direct; a NULL key from any combination relates every row.
+    let ni = v("SELECT c.id FROM customers c WHERE c.id NOT IN \
+                (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id)");
+    assert_eq!(ni.tracing(), "c:unit,o:lookup,i:lookup");
+    assert!(
+        ni.lookup_sql(2, "(I)")
+            .contains("(`o`.customer_id = c.id OR c.id IS NULL OR `o`.customer_id IS NULL)"),
+        "{}",
+        ni.lookup_sql(2, "(I)")
+    );
+    // USING inside the subquery becomes ON.
+    let u = v("SELECT c.id FROM customers c WHERE c.region_id IN \
+               (SELECT r.id FROM regions r JOIN customers c2 USING (id, name))");
+    assert_eq!(u.mode, Mode::Spj);
+    assert!(
+        u.where_sql
+            .as_deref()
+            .is_some_and(|w| w.contains("WHERE ((`r`.id = `c2`.id) AND (`r`.name = `c2`.name))")),
+        "{:?}",
+        u.where_sql
+    );
+    // What keeps a subquery a subquery.
+    for (sql, why) in [
+        (
+            "SELECT c.id FROM customers c WHERE c.id IN (SELECT o.customer_id FROM orders o LEFT JOIN order_items i ON i.order_id = o.id WHERE i.qty IS NULL)",
+            "IN subquery with an outer join (needs internal views)",
+        ),
+        (
+            "SELECT id FROM orders WHERE NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = orders.id LIMIT 1)",
+            "NOT EXISTS subquery with LIMIT",
+        ),
+        (
+            "SELECT c.id FROM customers c WHERE c.id IN (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id GROUP BY o.customer_id HAVING SUM(i.qty) > 4)",
+            "IN subquery with an aggregate (needs internal views)",
+        ),
+        (
+            "SELECT c.id FROM customers c WHERE c.id IN (SELECT d.customer_id FROM (SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id) d WHERE d.n > 2)",
+            "IN subquery with an aggregate (needs internal views)",
+        ),
+    ] {
+        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
+    }
+    // A cascading child among the subquery's tables (no binlog rows for cascaded changes).
+    let mut cat = catalog();
+    let key = ("db".to_string(), "order_items".to_string());
+    let mut items = (*cat[&key]).clone();
+    items.cascades = vec![crate::catalog::ForeignKey {
+        parent: ("db".into(), "orders".into()),
+        child_cols: vec![0],
+        parent_cols: vec!["id".into()],
+        on_delete: crate::catalog::FkAction::Cascade,
+        on_update: crate::catalog::FkAction::Cascade,
+    }];
+    cat.insert(key, Arc::new(items));
+    let d = parse_definition(
+        "CREATE VIEW v AS SELECT c.id FROM customers c WHERE c.id IN \
+         (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id)",
+    )
+    .unwrap();
+    assert_eq!(
+        analyzer_plan(&d, "db", &cat).unwrap().mode,
+        Mode::Full("IN subquery over `order_items`, a child of a cascading foreign key".into())
     );
 }
 

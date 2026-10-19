@@ -207,24 +207,69 @@ fn walk_factor(f: &TableFactor, scope: &Scope, schema: &str, out: &mut BTreeSet<
     }
 }
 
-/// Table references of the statement once every CTE and derived table is inlined (each
-/// reference of a CTE copies its body): the size of the flat form, and the CTE referenced the
-/// most times among those that make it grow. Computed without building anything, in time linear
-/// in the statement (bodies are measured once), so a chain of CTEs that each reference the
-/// previous one twice (2^n copies) is refused before any work is done (A5).
+/// The largest join block of the statement once every CTE and derived table is inlined (each
+/// reference of a CTE copies its body): a SELECT with what is merged into it (derived tables,
+/// CTE copies, subqueries), measured per branch of a set operation (each UNION ALL branch is
+/// planned on its own). Computed without building anything, in time linear in the statement
+/// (bodies are measured once, sizes saturate), so a chain of CTEs that each reference the previous
+/// one twice (2^n copies) is refused before any work is done (A5). Only blocks that inline
+/// something count: a join written out in full is the server's to accept or refuse.
 pub(crate) struct InlinedSize {
+    /// Base-table references of the largest block that inlines a CTE or derived table.
     pub refs: usize,
+    /// That block inlines CTEs / derived tables.
+    pub ctes: bool,
+    pub derived: bool,
+    /// The top-level set operation's branch (1-based) holding that block.
+    pub branch: Option<usize>,
     /// (CTE name, number of references), for the reason text.
     pub worst: Option<(String, usize)>,
 }
 
+/// Size of a relation: its flat references, what its block inlines, and the largest inlining
+/// block among its separately planned parts (set-operation branches).
+#[derive(Clone, Copy, Default)]
+struct Measure {
+    refs: usize,
+    ctes: bool,
+    derived: bool,
+    /// (references, ctes, derived) of the largest inlining block nested below as its own block.
+    worst: Option<(usize, bool, bool)>,
+}
+
+impl Measure {
+    fn add(&mut self, m: Measure) {
+        self.refs = self.refs.saturating_add(m.refs);
+        self.ctes |= m.ctes;
+        self.derived |= m.derived;
+        self.worst = max_block(self.worst, m.worst);
+    }
+
+    /// The largest inlining block, this one included.
+    fn largest(&self) -> Option<(usize, bool, bool)> {
+        let own = (self.ctes || self.derived).then_some((self.refs, self.ctes, self.derived));
+        max_block(self.worst, own)
+    }
+}
+
+fn max_block(
+    a: Option<(usize, bool, bool)>,
+    b: Option<(usize, bool, bool)>,
+) -> Option<(usize, bool, bool)> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if y.0 > x.0 { y } else { x }),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
 pub(crate) fn inlined_size(root: &Query, scope: &Scope) -> InlinedSize {
     struct Count {
-        memo: HashMap<*const Query, usize>,
+        memo: HashMap<*const Query, Measure>,
         /// Per CTE name: references and inlined size of one copy.
         times: HashMap<String, (usize, usize)>,
     }
-    fn query(q: &Query, scope: &Scope, c: &mut Count) -> usize {
+    fn query(q: &Query, scope: &Scope, c: &mut Count) -> Measure {
         let inner = match &q.with {
             Some(w) => scope.with_clause(w),
             None => scope.clone(),
@@ -234,45 +279,62 @@ pub(crate) fn inlined_size(root: &Query, scope: &Scope) -> InlinedSize {
             if let sqlparser::ast::OrderByKind::Expressions(es) = &o.kind {
                 for e in es {
                     for sq in subqueries(&e.expr) {
-                        n += query(&sq, &inner, c);
+                        n.add(query(&sq, &inner, c));
                     }
                 }
             }
         }
         n
     }
-    fn set(s: &SetExpr, scope: &Scope, c: &mut Count) -> usize {
+    fn set(s: &SetExpr, scope: &Scope, c: &mut Count) -> Measure {
         match s {
             SetExpr::Select(sel) => {
                 let mut n = from(&sel.from, scope, c);
                 for e in exprs_of(sel) {
                     for sq in subqueries(e) {
-                        n += query(&sq, scope, c);
+                        n.add(query(&sq, scope, c));
                     }
                 }
                 n
             }
             SetExpr::Query(q) => query(q, scope, c),
-            SetExpr::SetOperation { left, right, .. } => set(left, scope, c) + set(right, scope, c),
-            _ => 1,
+            // Each branch is a block of its own; as a FROM item the operation is (at most) its
+            // largest branch.
+            SetExpr::SetOperation { left, right, .. } => {
+                let (l, r) = (set(left, scope, c), set(right, scope, c));
+                Measure {
+                    refs: l.refs.max(r.refs),
+                    ctes: false,
+                    derived: false,
+                    worst: max_block(l.largest(), r.largest()),
+                }
+            }
+            _ => Measure {
+                refs: 1,
+                ..Measure::default()
+            },
         }
     }
-    fn from(from: &[TableWithJoins], scope: &Scope, c: &mut Count) -> usize {
-        let mut n = 0;
+    fn from(from: &[TableWithJoins], scope: &Scope, c: &mut Count) -> Measure {
+        let mut n = Measure::default();
         for twj in from {
-            n += factor(&twj.relation, scope, c);
+            n.add(factor(&twj.relation, scope, c));
             for j in &twj.joins {
-                n += factor(&j.relation, scope, c);
+                n.add(factor(&j.relation, scope, c));
                 if let Some(JoinConstraint::On(e)) = join_constraint(&j.join_operator) {
                     for sq in subqueries(e) {
-                        n += query(&sq, scope, c);
+                        n.add(query(&sq, scope, c));
                     }
                 }
             }
         }
         n
     }
-    fn factor(f: &TableFactor, scope: &Scope, c: &mut Count) -> usize {
+    fn factor(f: &TableFactor, scope: &Scope, c: &mut Count) -> Measure {
+        let one = Measure {
+            refs: 1,
+            ..Measure::default()
+        };
         match f {
             TableFactor::Table { name, .. } => match scope.cte_for(name) {
                 Some(cte) => {
@@ -286,30 +348,76 @@ pub(crate) fn inlined_size(root: &Query, scope: &Scope) -> InlinedSize {
                             n
                         }
                     };
-                    let e = c.times.entry(cte.name.clone()).or_insert((0, n));
+                    let e = c.times.entry(cte.name.clone()).or_insert((0, n.refs));
                     e.0 += 1;
-                    n
+                    Measure { ctes: true, ..n }
                 }
-                None => 1,
+                None => one,
             },
-            TableFactor::Derived { subquery, .. } => query(subquery, scope, c),
+            TableFactor::Derived { subquery, .. } => Measure {
+                derived: true,
+                ..query(subquery, scope, c)
+            },
             TableFactor::NestedJoin {
                 table_with_joins, ..
             } => from(std::slice::from_ref(table_with_joins), scope, c),
-            _ => 1,
+            _ => one,
         }
     }
     let mut c = Count {
         memo: HashMap::new(),
         times: HashMap::new(),
     };
-    let refs = query(root, scope, &mut c);
+    // The top-level set operation's branches, each measured on its own.
+    fn leaves<'q>(s: &'q SetExpr, out: &mut Vec<&'q SetExpr>) {
+        match s {
+            SetExpr::SetOperation { left, right, .. } => {
+                leaves(left, out);
+                leaves(right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let inner = match &root.with {
+        Some(w) => scope.with_clause(w),
+        None => scope.clone(),
+    };
+    let mut parts = Vec::new();
+    leaves(&root.body, &mut parts);
+    let mut largest: Option<(usize, bool, bool)> = None;
+    let mut branch = None;
+    for (i, part) in parts.iter().enumerate() {
+        let mut m = set(part, &inner, &mut c);
+        if parts.len() == 1 {
+            if let Some(o) = &root.order_by {
+                if let sqlparser::ast::OrderByKind::Expressions(es) = &o.kind {
+                    for e in es {
+                        for sq in subqueries(&e.expr) {
+                            m.add(query(&sq, &inner, &mut c));
+                        }
+                    }
+                }
+            }
+        }
+        let l = m.largest();
+        if l.is_some_and(|l| largest.is_none_or(|x| l.0 > x.0)) {
+            largest = l;
+            branch = (parts.len() > 1).then_some(i + 1);
+        }
+    }
+    let (refs, ctes, derived) = largest.unwrap_or_default();
     // The multiply-referenced CTE whose copies take the most room.
     let worst = c
         .times
         .into_iter()
         .filter(|(_, (n, _))| *n > 1)
-        .max_by_key(|(name, (n, size))| (n * size, std::cmp::Reverse(name.clone())))
+        .max_by_key(|(name, (n, size))| (n.saturating_mul(*size), std::cmp::Reverse(name.clone())))
         .map(|(name, (n, _))| (name, n));
-    InlinedSize { refs, worst }
+    InlinedSize {
+        refs,
+        ctes,
+        derived,
+        branch,
+        worst,
+    }
 }

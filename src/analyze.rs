@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use sqlparser::ast::{
     visit_expressions, visit_expressions_mut, BinaryOperator, DataType, Expr, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
-    NamedWindowExpr, ObjectName, ObjectNamePart, Query, Select, SelectItem,
+    NamedWindowExpr, ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, TableAlias, TableFactor, TableWithJoins,
     UnaryOperator, Value, Visit, Visitor, WindowType,
 };
@@ -22,6 +22,13 @@ use crate::catalog::{ColKind, FkAction, TableInfo, TableRef};
 
 /// Placeholder table name used to render "FROM with one table replaced by literal rows".
 pub(crate) const SUBST_MARKER: &str = "__lv_subst_marker__";
+
+/// In the lookup template of a table of a semi-join subquery over several tables
+/// ([`AliasPlan::semi`]), the place of the subquery's table that is alias `alias` of the plan:
+/// that table, or its rows when a lookup substitutes it too.
+pub(crate) fn semi_table_marker(alias: usize) -> String {
+    format!("__lv_semi_table_{alias}__")
+}
 
 const AGGREGATES: &[&str] = &[
     "COUNT",
@@ -726,7 +733,8 @@ pub struct AliasPlan {
     pub pos: (usize, Option<usize>),
     /// The table of a semi-/anti-join subquery (not in FROM): `EXISTS (SELECT 1 FROM <rows> AS
     /// alias WHERE …)` relating its rows to the view's rows, with `SUBST_MARKER` where the rows
-    /// go. Its lookups add this to the view's FROM and [`ViewPlan::lookup_where_sql`].
+    /// go (and [`semi_table_marker`]s for the subquery's other tables). Its lookups add this to
+    /// the view's FROM and [`ViewPlan::lookup_where_sql`].
     pub semi: Option<String>,
     /// Lookups of this alias use [`ViewPlan::lookup_where_sql`] (semi-join tables, and NULL-side
     /// tables whose WHERE conjuncts keep NULL-extended rows).
@@ -921,16 +929,41 @@ impl ViewPlan {
         sql
     }
 
+    /// The semi-join template of `alias` with its rows `own` and, for the subquery's other
+    /// tables, the rows `others` gives (`None`: the table itself).
+    fn semi_exists(
+        &self,
+        alias: usize,
+        own: &str,
+        mut others: impl FnMut(usize) -> Option<String>,
+    ) -> String {
+        let mut exists = self.aliases[alias].semi.clone().unwrap_or_default();
+        for (j, a) in self.aliases.iter().enumerate() {
+            let marker = semi_table_marker(j);
+            if exists.contains(&marker) {
+                let rows = others(j).unwrap_or_else(|| {
+                    format!(
+                        "{}.{}",
+                        quote_ident(&a.table.schema),
+                        quote_ident(&a.table.name)
+                    )
+                });
+                exists = exists.replacen(&marker, &rows, 1);
+            }
+        }
+        exists.replacen(SUBST_MARKER, own, 1)
+    }
+
     /// `SELECT DISTINCT <units> FROM <from with alias replaced by derived rows> WHERE ...`
     pub fn lookup_sql(&self, alias: usize, derived: &str) -> String {
         let a = &self.aliases[alias];
-        if let Some(exists) = &a.semi {
+        if a.semi.is_some() {
             let mut sql = format!(
                 "SELECT DISTINCT {} FROM {}",
                 self.unit_exprs.join(", "),
                 self.from_sql
             );
-            let exists = exists.replacen(SUBST_MARKER, derived, 1);
+            let exists = self.semi_exists(alias, derived, |_| None);
             push_where(&mut sql, self.lookup_where_sql.as_deref(), Some(&exists));
             return sql;
         }
@@ -956,13 +989,20 @@ impl ViewPlan {
     pub fn lookup_sql_multi(&self, subst: &[(usize, String)]) -> Result<(String, Vec<usize>)> {
         let mut from = self.from_items.clone();
         let marker = |k: usize| format!("__lv_subst_{k}__");
-        // Tables of the FROM clause are replaced in place; semi-join tables join as EXISTS.
+        // Tables of the FROM clause are replaced in place; semi-join tables join as EXISTS, one
+        // per subquery: tables of one subquery substituted together share it.
         let mut exists = Vec::new();
+        let mut done = vec![false; subst.len()];
         for (k, (a, _)) in subst.iter().enumerate() {
-            let a = &self.aliases[*a];
-            match &a.semi {
-                Some(e) => exists.push(e.replacen(SUBST_MARKER, &marker(k), 1)),
-                None => substitute_factor(&mut from, a.pos, &a.name, &marker(k)),
+            let ap = &self.aliases[*a];
+            match &ap.semi {
+                Some(_) if done[k] => {}
+                Some(_) => exists.push(self.semi_exists(*a, &marker(k), |j| {
+                    let kj = subst.iter().position(|(b, _)| *b == j)?;
+                    done[kj] = true;
+                    Some(marker(kj))
+                })),
+                None => substitute_factor(&mut from, ap.pos, &ap.name, &marker(k)),
             }
         }
         let from_sql = from
@@ -1068,6 +1108,13 @@ struct Usage<'s> {
 }
 
 impl Usage<'_> {
+    /// Marks the columns of the FROM clause that `root` names, leaving other names alone.
+    fn mark_known(&mut self, root: &Expr) {
+        let unresolved = self.unresolved.take();
+        self.mark(root, false, true);
+        self.unresolved = unresolved;
+    }
+
     fn mark<V: Visit>(&mut self, root: &V, set_membership: bool, allow_select_alias: bool) {
         let _ = visit_expressions(root, |e: &Expr| {
             if matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
@@ -1105,6 +1152,118 @@ impl Usage<'_> {
             ControlFlow::<()>::Continue(())
         });
     }
+}
+
+fn has_subquery(e: &Expr) -> bool {
+    let mut found = false;
+    let _ = visit_expressions(e, |x: &Expr| {
+        if matches!(
+            x,
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }
+        ) {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// The tables the subqueries of an ORDER BY read, each with the columns those subqueries may
+/// read: every column they name (whatever the qualifier), all of them under `*` or a USING /
+/// NATURAL join, and the base columns of the generated ones.
+fn order_subquery_tables(
+    o: &OrderBy,
+    schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> Vec<(Arc<TableInfo>, Vec<bool>)> {
+    struct Names {
+        names: BTreeSet<String>,
+        all: bool,
+    }
+    impl Visitor for Names {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            fn set(s: &SetExpr, all: &mut bool) {
+                match s {
+                    SetExpr::Select(sel) => {
+                        *all |= sel.projection.iter().any(|p| {
+                            matches!(
+                                p,
+                                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+                            )
+                        }) || sel.from.iter().flat_map(|t| &t.joins).any(|j| {
+                            matches!(
+                                join_constraint(&j.join_operator),
+                                Some(JoinConstraint::Using(_) | JoinConstraint::Natural)
+                            )
+                        });
+                    }
+                    SetExpr::SetOperation { left, right, .. } => {
+                        set(left, all);
+                        set(right, all);
+                    }
+                    SetExpr::Query(q) => set(&q.body, all),
+                    _ => {}
+                }
+            }
+            set(&q.body, &mut self.all);
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            let id = match e {
+                Expr::Identifier(id) => Some(id),
+                Expr::CompoundIdentifier(parts) => parts.last(),
+                _ => None,
+            };
+            if let Some(id) = id {
+                self.names.insert(ident_name(id).to_lowercase());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut out: Vec<(Arc<TableInfo>, Vec<bool>)> = Vec::new();
+    let OrderByKind::Expressions(es) = &o.kind else {
+        return out;
+    };
+    for e in es {
+        let _ = visit_expressions(&e.expr, |x: &Expr| {
+            let q = match x {
+                Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => q,
+                Expr::InSubquery { subquery, .. } => subquery,
+                _ => return ControlFlow::<()>::Continue(()),
+            };
+            let mut n = Names {
+                names: BTreeSet::new(),
+                all: false,
+            };
+            let _ = q.visit(&mut n);
+            for t in referenced_tables(q, schema) {
+                let Some(info) = tables.get(&t) else {
+                    continue;
+                };
+                let mut cols: Vec<bool> = info
+                    .columns
+                    .iter()
+                    .map(|c| n.all || n.names.contains(&c.name.to_lowercase()))
+                    .collect();
+                for c in 0..cols.len() {
+                    if let (true, Some(g)) = (cols[c], &info.columns[c].generated) {
+                        match &g.deps {
+                            Some(d) => d.iter().for_each(|&d| cols[d] = true),
+                            None => cols.iter_mut().for_each(|x| *x = true),
+                        }
+                    }
+                }
+                match out.iter_mut().find(|(i, _)| Arc::ptr_eq(i, info)) {
+                    Some((_, r)) => r.iter_mut().zip(&cols).for_each(|(a, b)| *a |= *b),
+                    None => out.push((info.clone(), cols)),
+                }
+            }
+            ControlFlow::Continue(())
+        });
+    }
+    out
 }
 
 /// Union-find over (alias, column).
@@ -1535,18 +1694,15 @@ pub fn plan_block(
     }
 
     let mut query = def.query.clone();
-    let order_by = query.order_by.take();
-    // Top-N rows are chosen by the ORDER BY: its columns (also of joined aliases, also as
-    // aggregate inputs) are read columns, whether or not they are projected (L1).
-    let order_usage = order_by.clone();
+    let mut order_by = query.order_by.take();
     if query.with.is_some() {
         return Ok(full("WITH clause"));
     }
     // ORDER BY … LIMIT n: the first n rows are one unit, recomputed with one bounded query per
     // batch. Without ORDER BY the rows are not a function of the data: nothing to converge to.
-    let top_n = match (order_by, query.limit_clause.take(), query.fetch.is_some()) {
+    let top_n_limit = match (&order_by, query.limit_clause.take(), query.fetch.is_some()) {
         (_, None, false) => None,
-        (Some(o), Some(l), false) => Some(format!("{o}{l}")),
+        (Some(_), Some(l), false) => Some(l),
         _ => return Ok(full("LIMIT without ORDER BY")),
     };
     let select: &mut Select = match query.body.as_mut() {
@@ -1719,9 +1875,88 @@ pub fn plan_block(
     }
     select.projection = projection;
 
+    let scope = Scope { aliases: &aliases };
+    strip_column_schemas(select, &scope);
+    // VIRTUAL generated columns have no value in the row images (lookups substitute literal
+    // rows): every reference becomes the column's own expression over its base columns, before
+    // anything (window partitions, units) is derived from the expressions.
+    // An unaliased expression over a VIRTUAL column is named after its text by the server; once
+    // inlined it carries that name as an alias (a GROUP BY sees the same inlined text, which
+    // MySQL's ONLY_FULL_GROUP_BY compares).
+    for (item, src) in select.projection.iter_mut().zip(item_sql.iter_mut()) {
+        let SelectItem::UnnamedExpr(e) = item else {
+            continue;
+        };
+        if matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            continue;
+        }
+        let mut reads_virtual = false;
+        let _ = visit_expressions(&*e, |x: &Expr| {
+            if let Some((a, c)) = scope.resolve(x) {
+                if scope.aliases[a].1.columns[c]
+                    .generated
+                    .as_ref()
+                    .is_some_and(|g| !g.stored)
+                {
+                    reads_virtual = true;
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if !reads_virtual {
+            continue;
+        }
+        match src.filter(|t| t.chars().count() <= 64 && !t.ends_with(' ') && !t.contains('\n')) {
+            Some(t) => {
+                *item = SelectItem::ExprWithAlias {
+                    expr: e.clone(),
+                    alias: qident(t),
+                };
+                *src = None;
+            }
+            None => {
+                return Ok(full(&format!(
+                    "unaliased column `{e}` reads a VIRTUAL generated column: give it an alias"
+                )))
+            }
+        }
+    }
+    let top_n_order = if top_n_limit.is_some() {
+        order_by.as_mut()
+    } else {
+        None
+    };
+    if let Some(reason) = inline_virtual_columns(select, top_n_order, &scope)? {
+        return Ok(full(&reason));
+    }
+    // Top-N rows are chosen by the ORDER BY: its columns (also of joined aliases, also as
+    // aggregate inputs) are read columns, whether or not they are projected (L1).
+    let order_usage = order_by.clone();
+    let top_n = top_n_limit.map(|l| format!("{}{l}", order_by.as_ref().unwrap()));
     let (reason, has_agg, windows) = scan_exprs(select);
     if let Some(r) = reason {
         return Ok(full(&r));
+    }
+    // The ORDER BY of a top-N view decides which rows it holds: a value that changes without a
+    // source change (RAND(), NOW(), …; also inside its subqueries) leaves nothing to trace.
+    if let (Some(o), Some(_)) = (&order_by, &top_n) {
+        let mut why = None;
+        let _ = visit_expressions(o, |e: &Expr| {
+            if let Expr::Function(f) = e {
+                let n = function_name(f);
+                if f.over.is_none() && NONDETERMINISTIC.contains(&n.as_str()) {
+                    why = Some(format!(
+                        "non-deterministic function {n} in the ORDER BY of a top-N view"
+                    ));
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if let Some(r) = why {
+            return Ok(full(&r));
+        }
     }
     // A window's values depend on its whole partition: the unit is the PARTITION BY expressions
     // every window shares (filtering on them keeps whole partitions); without any, one unit.
@@ -1738,13 +1973,6 @@ pub fn plan_block(
         None => Vec::new(),
     };
 
-    let scope = Scope { aliases: &aliases };
-    strip_column_schemas(select, &scope);
-    // VIRTUAL generated columns have no value in the row images (lookups substitute literal
-    // rows): every reference becomes the column's own expression over its base columns.
-    if let Some(reason) = inline_virtual_columns(select, &scope)? {
-        return Ok(full(&reason));
-    }
     let n_alias = aliases.len();
     let referenced: Vec<Vec<bool>> = aliases
         .iter()
@@ -1779,8 +2007,20 @@ pub fn plan_block(
     }
     usage.mark(&select.having, false, true);
     usage.mark(&select.named_window, false, false);
-    if let Some(o) = &order_usage {
-        usage.mark(o, false, true);
+    // (ORDER BY without LIMIT does not decide which rows the view holds.)
+    if let (Some(o), Some(_)) = (&order_usage, &top_n) {
+        if let OrderByKind::Expressions(es) = &o.kind {
+            for e in es {
+                if has_subquery(&e.expr) {
+                    // In a subquery a name resolves in its own FROM first: only the view's
+                    // columns it names are marked (a name of both marks one column too many,
+                    // never too few); its tables are traced below.
+                    usage.mark_known(&e.expr);
+                } else {
+                    usage.mark(&e.expr, false, true);
+                }
+            }
+        }
     }
     for e in &partition {
         usage.mark(e, true, false);
@@ -2107,10 +2347,17 @@ pub fn plan_block(
         Mode::Grouped => !windowed,
         _ => false,
     };
+    // Tables read by subqueries in the ORDER BY of a top-N view: a change of a column they name
+    // recomputes it, like a change of its own tables (cascades into them too).
+    let order_tables = match (&order_usage, &top_n) {
+        (Some(o), Some(_)) => order_subquery_tables(o, default_schema, tables),
+        _ => Vec::new(),
+    };
     let mut cascades = cascade_routes(
         &alias_plans
             .iter()
             .map(|a| (a.table.clone(), a.direct_unit.clone()))
+            .chain(order_tables.iter().map(|(t, _)| (t.clone(), None)))
             .collect::<Vec<_>>(),
         tables,
     );
@@ -2239,6 +2486,21 @@ pub fn plan_block(
                 Err(r) => c.untraced = Some(r),
             }
         }
+    }
+    for (t, cols) in order_tables {
+        alias_plans.push(AliasPlan {
+            name: t.name.clone(),
+            table: t,
+            referenced: cols.clone(),
+            membership: cols,
+            direct_unit: None,
+            image_cols: Vec::new(),
+            // Not in FROM: never looked up (one unit, recomputed).
+            subst_from: (String::new(), String::new()),
+            pos: (usize::MAX, None),
+            semi: None,
+            lookup_where: false,
+        });
     }
     let window_sql = if select.named_window.is_empty() {
         None
@@ -2442,52 +2704,431 @@ pub(crate) fn expand_star_over_using(
     Ok(true)
 }
 
-/// Replaces every reference to a VIRTUAL generated column by its expression (parenthesized,
-/// base columns qualified with the alias); a plain projection item keeps the column's name as
-/// its alias. `Some(reason)` when an expression cannot be read.
-fn inline_virtual_columns(select: &mut Select, scope: &Scope) -> Result<Option<String>> {
-    let virtual_of = |e: &Expr| -> Option<(usize, usize)> {
-        let (a, c) = scope.resolve(e)?;
-        let col = &scope.aliases[a].1.columns[c];
-        col.generated.as_ref().filter(|g| !g.stored).map(|_| (a, c))
+/// What an expression's value is, as far as converting it to a column type goes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ValueKind {
+    /// Integer or DECIMAL.
+    Num,
+    Dbl,
+    Str,
+    Date,
+    DateTime,
+    Time,
+    Null,
+    Unknown,
+}
+
+impl std::fmt::Display for ValueKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ValueKind::Num => "an exact number",
+            ValueKind::Dbl => "a floating-point number",
+            ValueKind::Str => "a string",
+            ValueKind::Date => "a date",
+            ValueKind::DateTime => "a datetime",
+            ValueKind::Time => "a time",
+            ValueKind::Null => "NULL",
+            ValueKind::Unknown => "a value of unknown type",
+        })
+    }
+}
+
+fn column_value_kind(c: &crate::catalog::Column) -> ValueKind {
+    match c.data_type.as_str() {
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "decimal"
+        | "numeric" => ValueKind::Num,
+        "float" | "double" | "real" => ValueKind::Dbl,
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => ValueKind::Str,
+        "date" => ValueKind::Date,
+        "datetime" => ValueKind::DateTime,
+        "time" => ValueKind::Time,
+        _ => ValueKind::Unknown,
+    }
+}
+
+/// The kind of value of a generation expression over the columns of `t` (named unqualified).
+fn value_kind(e: &Expr, t: &TableInfo) -> ValueKind {
+    use ValueKind::*;
+    let numeric = |k: ValueKind| match k {
+        Num | Dbl | Null => k,
+        // Strings take part in arithmetic as doubles.
+        Str => Dbl,
+        _ => Unknown,
     };
-    let expansion = |a: usize, c: usize| -> std::result::Result<Expr, String> {
-        let (alias, t) = &scope.aliases[a];
+    let common = |ks: Vec<ValueKind>| {
+        let mut it = ks.into_iter().filter(|k| *k != Null);
+        match it.next() {
+            None => Null,
+            Some(first) => {
+                if it.all(|k| k == first) {
+                    first
+                } else {
+                    Unknown
+                }
+            }
+        }
+    };
+    let args = |f: &sqlparser::ast::Function| -> Vec<Expr> {
+        match &f.args {
+            FunctionArguments::List(l) => l
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    match e {
+        Expr::Nested(x) => value_kind(x, t),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let name = match e {
+                Expr::Identifier(i) => ident_name(i),
+                Expr::CompoundIdentifier(p) => p.last().map(ident_name).unwrap_or_default(),
+                _ => unreachable!(),
+            };
+            t.col_index(&name)
+                .map(|c| column_value_kind(&t.columns[c]))
+                .unwrap_or(Unknown)
+        }
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) if n.contains(['e', 'E']) => Dbl,
+            Value::Number(..) | Value::Boolean(_) => Num,
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => Str,
+            Value::Null => Null,
+            _ => Unknown,
+        },
+        Expr::Prefixed { value, .. } => match value_kind(value, t) {
+            Str => Str,
+            _ => Unknown,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => numeric(value_kind(expr, t)),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            ..
+        } => Num,
+        Expr::BinaryOp { left, op, right } => {
+            let (l, r) = (value_kind(left, t), value_kind(right, t));
+            match op {
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo => match (numeric(l), numeric(r)) {
+                    (Unknown, _) | (_, Unknown) => Unknown,
+                    (Dbl, _) | (_, Dbl) => Dbl,
+                    (Null, Null) => Null,
+                    _ => Num,
+                },
+                BinaryOperator::MyIntegerDivide => match (numeric(l), numeric(r)) {
+                    (Unknown, _) | (_, Unknown) => Unknown,
+                    _ => Num,
+                },
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+                | BinaryOperator::Spaceship
+                | BinaryOperator::And
+                | BinaryOperator::Or
+                | BinaryOperator::Xor => Num,
+                _ => Unknown,
+            }
+        }
+        Expr::Function(f) => {
+            let a = args(f);
+            let kinds = |xs: &[Expr]| xs.iter().map(|x| value_kind(x, t)).collect::<Vec<_>>();
+            match function_name(f).as_str() {
+                "CONCAT" | "CONCAT_WS" | "LOWER" | "LCASE" | "UPPER" | "UCASE" | "SUBSTRING"
+                | "SUBSTR" | "LEFT" | "RIGHT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "LPAD"
+                | "RPAD" | "REVERSE" | "JSON_UNQUOTE" | "JSON_VALUE" => Str,
+                "ABS" | "ROUND" | "TRUNCATE" | "FLOOR" | "CEIL" | "CEILING" => a
+                    .first()
+                    .map(|x| numeric(value_kind(x, t)))
+                    .unwrap_or(Unknown),
+                "SIGN" => Num,
+                "IFNULL" | "COALESCE" | "GREATEST" | "LEAST" => common(kinds(&a)),
+                "IF" if a.len() == 3 => common(kinds(&a[1..])),
+                "DATE" => Date,
+                _ => Unknown,
+            }
+        }
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => common(
+            conditions
+                .iter()
+                .map(|w| value_kind(&w.result, t))
+                .chain(else_result.iter().map(|x| value_kind(x, t)))
+                .collect(),
+        ),
+        Expr::Cast { data_type, .. } => {
+            let ty = data_type.to_string().to_ascii_uppercase();
+            if ["SIGNED", "UNSIGNED", "DECIMAL", "INT"]
+                .iter()
+                .any(|p| ty.starts_with(p))
+            {
+                Num
+            } else if ["DOUBLE", "FLOAT", "REAL"]
+                .iter()
+                .any(|p| ty.starts_with(p))
+            {
+                Dbl
+            } else if ty.starts_with("CHAR") || ty.starts_with("VARCHAR") {
+                Str
+            } else if ty.starts_with("DATETIME") {
+                DateTime
+            } else if ty.starts_with("DATE") {
+                Date
+            } else if ty.starts_with("TIME") && !ty.starts_with("TIMESTAMP") {
+                Time
+            } else {
+                Unknown
+            }
+        }
+        _ => Unknown,
+    }
+}
+
+/// How the server converts a value of `kind` (`?`) to `c`'s declared type when it reads a
+/// VIRTUAL column, as SQL; `None` where no exact SQL form is known. Measured on MySQL 8.4 / 26.7 /
+/// 26.10, Percona 8.4 / 9.7 and MariaDB 10.11 / 13.0 / 13.2 (B1): integer columns round a DOUBLE
+/// half to even (as `CAST(… AS SIGNED)` does) and a string through DECIMAL, and clip to their
+/// range; DECIMAL(p,s) and DOUBLE are their CAST; DATE from a DATETIME rounds (MySQL) or
+/// truncates (MariaDB) the time like `CAST(… AS DATETIME)`; strings take the length, charset and
+/// collation (CHAR drops trailing spaces). Not exact: FLOAT (MySQL refuses out-of-range CASTs),
+/// BIGINT UNSIGNED from a DOUBLE or string, a number into a string (`i / 3` prints 9 decimals in
+/// the column on MySQL 8.4 and MariaDB, 4 on MySQL 9, 4 by CONVERT everywhere), a temporal value
+/// into a string short enough to cut it, DATE from a string (MySQL stores zero dates), TEXT /
+/// TINYTEXT byte limits, other types.
+fn virtual_conversion(c: &crate::catalog::Column, kind: ValueKind) -> Option<String> {
+    use ValueKind::*;
+    let ct = &c.column_type;
+    let unsigned = ct.contains("unsigned");
+    let type_args: Vec<u64> = ct
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(a, _)| a.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    let range = |bits: u32| -> (i128, i128) {
+        if unsigned {
+            (0, (1i128 << bits) - 1)
+        } else {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        }
+    };
+    let text = |cs: &str, co: &str, len: Option<u64>, trim: bool| {
+        let cast = match len {
+            Some(n) => format!("LEFT(CONVERT(? USING {cs}), {n})"),
+            None => format!("CONVERT(? USING {cs})"),
+        };
+        if trim {
+            format!("TRIM(TRAILING ' ' FROM {cast}) COLLATE {co}")
+        } else {
+            format!("{cast} COLLATE {co}")
+        }
+    };
+    Some(match c.data_type.as_str() {
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => {
+            let base = match kind {
+                Num | Dbl | Null => "CAST(? AS SIGNED)",
+                Str => "CAST(CAST(? AS DECIMAL(65,30)) AS SIGNED)",
+                _ => return None,
+            };
+            let bits = match c.data_type.as_str() {
+                "tinyint" => 8,
+                "smallint" => 16,
+                "mediumint" => 24,
+                "bigint" => 64,
+                _ => 32,
+            };
+            match (bits, unsigned) {
+                (64, false) => base.to_string(),
+                (64, true) if matches!(kind, Num | Null) => {
+                    "IF(? < 0, 0, CAST(? AS UNSIGNED))".into()
+                }
+                (64, true) => return None,
+                _ => {
+                    let (min, max) = range(bits);
+                    format!("LEAST(GREATEST({base}, {min}), {max})")
+                }
+            }
+        }
+        "decimal" | "numeric" if matches!(kind, Num | Dbl | Str | Null) => {
+            let (p, s) = match type_args.as_slice() {
+                [p, s] => (*p, *s),
+                [p] => (*p, 0),
+                _ => (10, 0),
+            };
+            let cast = format!("CAST(? AS DECIMAL({p},{s}))");
+            if unsigned {
+                format!("GREATEST({cast}, 0)")
+            } else {
+                cast
+            }
+        }
+        "double" | "real"
+            if !unsigned && type_args.is_empty() && matches!(kind, Num | Dbl | Str | Null) =>
+        {
+            "CAST(? AS DOUBLE)".into()
+        }
+        "date" => match kind {
+            Date | Null => "CAST(? AS DATE)".into(),
+            DateTime => "CAST(CAST(? AS DATETIME) AS DATE)".into(),
+            _ => return None,
+        },
+        "datetime" if matches!(kind, Date | DateTime | Null) => {
+            format!("CAST(? AS DATETIME({}))", type_args.first().unwrap_or(&0))
+        }
+        "time" if matches!(kind, DateTime | Time | Null) => {
+            format!("CAST(? AS TIME({}))", type_args.first().unwrap_or(&0))
+        }
+        "char" | "varchar" => {
+            let (Some(cs), Some(co), Some(&n)) = (&c.charset, &c.collation, type_args.first())
+            else {
+                return None;
+            };
+            let fits = match kind {
+                Str | Null => true,
+                Date | DateTime | Time => n >= 26,
+                Num | Dbl | Unknown => false,
+            };
+            if !fits {
+                return None;
+            }
+            text(cs, co, Some(n), c.data_type == "char")
+        }
+        "mediumtext" | "longtext" if !matches!(kind, Num | Dbl | Unknown) => {
+            let (Some(cs), Some(co)) = (&c.charset, &c.collation) else {
+                return None;
+            };
+            text(cs, co, None, false)
+        }
+        _ => return None,
+    })
+}
+
+/// What a reference to VIRTUAL column `c` of `t` (named `alias` in the query) stands for: its
+/// generation expression over the alias's columns, nested VIRTUAL columns expanded the same
+/// way, converted to the declared type ([`virtual_conversion`]). `Err`: why it cannot be.
+pub(crate) fn virtual_expansion(
+    alias: &str,
+    t: &TableInfo,
+    c: usize,
+) -> std::result::Result<Expr, String> {
+    fn expand(
+        alias: &str,
+        t: &TableInfo,
+        c: usize,
+        depth: usize,
+    ) -> std::result::Result<Expr, String> {
         let col = &t.columns[c];
-        let g = col.generated.as_ref().expect("virtual column");
+        let g = col.generated.as_ref().expect("generated column");
         let unreadable = || {
             format!(
                 "VIRTUAL generated column `{}`.`{}` with an expression the parser cannot read: {}",
                 t.name, col.name, g.expr
             )
         };
-        if g.deps.is_none() {
+        if g.deps.is_none() || depth > 16 {
             return Err(unreadable());
         }
         let mut e = parse_sql(&g.expr, |p| p.parse_expr()).ok_or_else(unreadable)?;
+        let kind = value_kind(&e, t);
+        let conversion = virtual_conversion(col, kind).ok_or_else(|| {
+            format!(
+                "VIRTUAL generated column `{}`.`{}` of type {}: no exact SQL conversion of its expression ({kind}) to that type",
+                t.name, col.name, col.column_type
+            )
+        })?;
+        let mut failed = None;
         let _ = visit_expressions_mut(&mut e, |x: &mut Expr| {
             let name = match &*x {
                 Expr::Identifier(i) => Some(ident_name(i)),
                 Expr::CompoundIdentifier(parts) => parts.last().map(ident_name),
                 _ => None,
             };
-            if let Some(n) = name {
-                if t.col_index(&n).is_some() {
-                    *x = Expr::CompoundIdentifier(vec![qident(alias), qident(&n)]);
-                }
+            if let Some(i) = name.and_then(|n| t.col_index(&n)) {
+                let nested_virtual = t.columns[i].generated.as_ref().is_some_and(|g| !g.stored);
+                *x = if nested_virtual {
+                    match expand(alias, t, i, depth + 1) {
+                        Ok(v) => v,
+                        Err(r) => {
+                            failed.get_or_insert(r);
+                            return ControlFlow::Break(());
+                        }
+                    }
+                } else {
+                    Expr::CompoundIdentifier(vec![qident(alias), qident(&t.columns[i].name)])
+                };
             }
-            ControlFlow::<()>::Continue(())
+            ControlFlow::Continue(())
         });
-        Ok(match e {
-            Expr::Nested(_) => e,
-            e => Expr::Nested(Box::new(e)),
-        })
+        if let Some(r) = failed {
+            return Err(r);
+        }
+        let value = match &e {
+            Expr::Nested(_) => e.to_string(),
+            _ => format!("({e})"),
+        };
+        let sql = conversion.replace('?', &value);
+        let e = parse_sql(&sql, |p| p.parse_expr()).ok_or_else(unreadable)?;
+        Ok(Expr::Nested(Box::new(e)))
+    }
+    expand(alias, t, c, 0)
+}
+
+/// Replaces every reference to a VIRTUAL generated column in the SELECT (and in the top-N
+/// ORDER BY) by [`virtual_expansion`]; a bare projection item keeps the column's name. `Some`:
+/// why one cannot be. Names inside subqueries of the ORDER BY are left alone (their own FROM
+/// comes first).
+fn inline_virtual_columns(
+    select: &mut Select,
+    order_by: Option<&mut OrderBy>,
+    scope: &Scope,
+) -> Result<Option<String>> {
+    let virtual_of = |e: &Expr| -> Option<(usize, usize)> {
+        let (a, c) = scope.resolve(e)?;
+        let col = &scope.aliases[a].1.columns[c];
+        col.generated.as_ref().filter(|g| !g.stored).map(|_| (a, c))
     };
+    let expansion =
+        |a: usize, c: usize| virtual_expansion(&scope.aliases[a].0, &scope.aliases[a].1, c);
+    // (Checked as written: the inlined strings carry a COLLATE of their own.)
+    let mut collate = false;
+    let mut find_collate = |x: &Expr| {
+        if matches!(x, Expr::Collate { .. }) {
+            collate = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    };
+    let _ = visit_expressions(&*select, &mut find_collate);
+    if let Some(o) = &order_by {
+        let _ = visit_expressions(&**o, &mut find_collate);
+    }
     let mut failed: Option<String> = None;
+    let mut text = None;
+    let mut note = |a: usize, c: usize| {
+        let col = &scope.aliases[a].1.columns[c];
+        if col.charset.is_some() {
+            text.get_or_insert_with(|| format!("`{}`.`{}`", scope.aliases[a].1.name, col.name));
+        }
+    };
     // Projection: a bare column keeps its name.
     for item in &mut select.projection {
         if let SelectItem::UnnamedExpr(e) = item {
             if let Some((a, c)) = virtual_of(e) {
+                note(a, c);
                 match expansion(a, c) {
                     Ok(x) => {
                         let name = scope.aliases[a].1.columns[c].name.clone();
@@ -2503,8 +3144,9 @@ fn inline_virtual_columns(select: &mut Select, scope: &Scope) -> Result<Option<S
             }
         }
     }
-    let _ = visit_expressions_mut(select, |e: &mut Expr| {
+    let mut replace = |e: &mut Expr| {
         if let Some((a, c)) = virtual_of(e) {
+            note(a, c);
             match expansion(a, c) {
                 Ok(x) => *e = x,
                 Err(r) => {
@@ -2513,8 +3155,24 @@ fn inline_virtual_columns(select: &mut Select, scope: &Scope) -> Result<Option<S
             }
         }
         ControlFlow::<()>::Continue(())
-    });
-    Ok(failed)
+    };
+    let _ = visit_expressions_mut(select, &mut replace);
+    if let Some(OrderByKind::Expressions(es)) = order_by.map(|o| &mut o.kind) {
+        for e in es.iter_mut().filter(|e| !has_subquery(&e.expr)) {
+            let _ = visit_expressions_mut(&mut e.expr, &mut replace);
+        }
+    }
+    if failed.is_some() {
+        return Ok(failed);
+    }
+    // The inlined string carries an EXPLICIT collation where the column had an IMPLICIT one: next
+    // to another explicit COLLATE the server would refuse the mix (or pick another collation).
+    if let (Some(col), true) = (text, collate) {
+        return Ok(Some(format!(
+            "VIRTUAL generated column {col} next to an explicit COLLATE (its inlined form has an explicit collation)"
+        )));
+    }
+    Ok(None)
 }
 
 /// `db.t.col` -> `t`.`col` for columns of the FROM clause: lookups replace a table by derived
@@ -3809,19 +4467,26 @@ mod tests {
             &cat,
         );
         assert_eq!(v.unit_exprs, vec!["a", "b"]);
-        // A VIRTUAL generated column is inlined as its expression (no image value exists);
-        // a STORED one is an ordinary column that reads its base column too.
+        // A VIRTUAL generated column is inlined as its expression converted to its type (no
+        // image value exists, B1); a STORED one is an ordinary column that reads its base
+        // column too.
         let v = plan("CREATE VIEW v AS SELECT g, s FROM skus WHERE g > 1", &cat);
-        assert_eq!(v.projection, vec!["(`skus`.`a` + `skus`.`b`) AS `g`", "s"]);
+        assert_eq!(
+            v.projection,
+            vec![
+                "(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS SIGNED), -2147483648), 2147483647)) AS `g`",
+                "s"
+            ]
+        );
         assert_eq!(
             v.where_sql.as_deref(),
-            Some("(`skus`.`a` + `skus`.`b`) > 1")
+            Some("(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS SIGNED), -2147483648), 2147483647)) > 1")
         );
         let a = &v.aliases[0];
         assert!(a.referenced[1] && a.referenced[2] && a.referenced[4] && !a.referenced[3]);
         assert!(a.membership[1] && a.membership[2]);
         let v = plan("CREATE VIEW v AS SELECT DISTINCT g FROM skus", &cat);
-        assert_eq!(v.unit_exprs, vec!["(`skus`.`a` + `skus`.`b`)"]);
+        assert_eq!(v.unit_exprs, vec!["(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS SIGNED), -2147483648), 2147483647))"]);
         let mut keyless = (*cat[&("db".to_string(), "skus".to_string())]).clone();
         keyless.unique_keys.clear();
         cat.insert(("db".into(), "skus".into()), Arc::new(keyless));

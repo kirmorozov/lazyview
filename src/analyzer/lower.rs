@@ -110,7 +110,9 @@ pub(crate) fn plan_block(
 
 /// The semi-joins left in the block: their predicates replace the markers in the plan's WHERE,
 /// and their tables become aliases whose changes map straight to the view's units (or, for a
-/// single-row aggregate, mark it for recomputation).
+/// single-row aggregate, mark it for recomputation). The lookup template of a table of a
+/// subquery over several tables names the others by [`analyze::semi_table_marker`]: a lookup
+/// that substitutes several of them evaluates one subquery over all their rows.
 fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refused> {
     if b.semis.is_empty() {
         return Ok(());
@@ -133,52 +135,66 @@ fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refus
             .ok_or_else(missing)?;
         lookup_where =
             replace_call(&lookup_where, &marker_name(s.id), "TRUE").ok_or_else(missing)?;
+        if matches!(plan.mode, Mode::Full(_)) {
+            continue;
+        }
         let mut conds = s.lookup_conditions.clone();
         conds.iter_mut().for_each(|c| fill_placeholders(c, &args));
-        let exists = format!(
-            "EXISTS (SELECT 1 FROM {} AS {}{})",
-            analyze::SUBST_MARKER,
-            qident(&s.alias),
-            and_all(conds)
-                .map(|c| format!(" WHERE {c}"))
-                .unwrap_or_default()
-        );
-        // Direct units where the correlation equals the unit, else forward lookups.
-        let direct = match &plan.mode {
-            Mode::Full(_) => continue,
-            Mode::Global => None,
-            Mode::Spj | Mode::Grouped if s.not_in => None,
-            Mode::Spj | Mode::Grouped => direct_columns(plan, s, &args).ok(),
-        };
-        if !s.info.cascades.is_empty() {
-            return Err(Refused::Semi(
-                s.id,
-                format!(
-                    "{} over `{}`, a child of a cascading foreign key",
-                    semi_kind(s),
-                    s.info.name
-                ),
-            ));
-        }
-        let image_cols = (0..s.referenced.len())
-            .filter(|&c| s.referenced[c])
-            .collect();
-        plan.aliases.push(AliasPlan {
-            name: s.alias.clone(),
-            table: s.info.clone(),
-            referenced: s.referenced.clone(),
-            membership: s.referenced.clone(),
-            direct_unit: direct,
-            image_cols,
-            // Not in FROM: lookups use `semi`.
-            subst_from: (String::new(), String::new()),
-            pos: (usize::MAX, None),
-            semi: Some(exists),
-            lookup_where: true,
-        });
-        if !plan.tables.contains(&s.table) {
-            plan.tables.push(s.table.clone());
-            plan.table_columns.push(None);
+        let conds = and_all(conds)
+            .map(|c| format!(" WHERE {c}"))
+            .unwrap_or_default();
+        // The subquery's tables become the aliases `first..`.
+        let first = plan.aliases.len();
+        for (ti, t) in s.tables.iter().enumerate() {
+            let from: Vec<String> = s
+                .tables
+                .iter()
+                .enumerate()
+                .map(|(tj, u)| {
+                    let rows = if tj == ti {
+                        analyze::SUBST_MARKER.to_string()
+                    } else {
+                        analyze::semi_table_marker(first + tj)
+                    };
+                    format!("{rows} AS {}", qident(&u.alias))
+                })
+                .collect();
+            let exists = format!("EXISTS (SELECT 1 FROM {}{conds})", from.join(", "));
+            // Direct units where the correlation equals the unit, else forward lookups.
+            let direct = match &plan.mode {
+                Mode::Spj | Mode::Grouped if !s.not_in => direct_columns(plan, s, ti, &args).ok(),
+                _ => None,
+            };
+            if !t.info.cascades.is_empty() {
+                return Err(Refused::Semi(
+                    s.id,
+                    format!(
+                        "{} over `{}`, a child of a cascading foreign key",
+                        semi_kind(s),
+                        t.info.name
+                    ),
+                ));
+            }
+            let image_cols = (0..t.referenced.len())
+                .filter(|&c| t.referenced[c])
+                .collect();
+            plan.aliases.push(AliasPlan {
+                name: t.alias.clone(),
+                table: t.info.clone(),
+                referenced: t.referenced.clone(),
+                membership: t.referenced.clone(),
+                direct_unit: direct,
+                image_cols,
+                // Not in FROM: lookups use `semi`.
+                subst_from: (String::new(), String::new()),
+                pos: (usize::MAX, None),
+                semi: Some(exists),
+                lookup_where: true,
+            });
+            if !plan.tables.contains(&t.table) {
+                plan.tables.push(t.table.clone());
+                plan.table_columns.push(None);
+            }
         }
     }
     plan.where_sql = Some(where_sql);
@@ -194,11 +210,12 @@ fn semi_kind(s: &Semi) -> &'static str {
     }
 }
 
-/// For each unit expression, the column of the subquery's table equal to it: a correlation
+/// For each unit expression, the column of the subquery's table `ti` equal to it: a correlation
 /// `t.k = outer` whose outer side is a column that equals that unit on every row of its alias.
 fn direct_columns(
     plan: &ViewPlan,
     s: &Semi,
+    ti: usize,
     args: &[Expr],
 ) -> std::result::Result<Vec<usize>, String> {
     let resolve = |mut e: &Expr| -> Option<(usize, usize)> {
@@ -223,13 +240,17 @@ fn direct_columns(
             ap.table.col_index(&col).map(|c| (a, c))
         })
     };
+    let info = &s.tables[ti].info;
     (0..plan.unit_exprs.len())
         .map(|u| {
-            s.correlation.iter().find_map(|&(sc, k)| {
+            s.correlation.iter().find_map(|&(t, sc, k)| {
+                if t != ti {
+                    return None;
+                }
                 let (a, c) = resolve(args.get(k)?)?;
                 let ap = &plan.aliases[a];
                 let tc = &ap.table.columns[c];
-                let sc_col = &s.info.columns[sc];
+                let sc_col = &info.columns[sc];
                 (ap.direct_unit.as_ref()?.get(u) == Some(&c)
                     && tc.exact_key()
                     && sc_col.exact_key()
@@ -242,7 +263,7 @@ fn direct_columns(
             format!(
                 "{} over `{}` is not correlated on the view's unit key",
                 semi_kind(s),
-                s.info.name
+                info.name
             )
         })
 }

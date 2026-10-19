@@ -369,9 +369,10 @@ pub(crate) fn semi_view(
 ) -> Result<Option<InternalView>, ()> {
     let k = b.semis.iter().position(|s| s.id == id).ok_or(())?;
     let s = b.semis[k].clone();
-    if s.negated {
+    // (Over several tables the distinct keys come from a join: not this shape.)
+    let ([t], false) = (s.tables.as_slice(), s.negated) else {
         return Err(());
-    }
+    };
     let placeholder = |e: &Expr| super::normalize::placeholder_of(e);
     // Key equalities `s.col = <outer>`, and the subquery's own conditions.
     let (mut keys, mut local): (Vec<(usize, usize)>, Vec<Expr>) = (Vec::new(), Vec::new());
@@ -386,7 +387,7 @@ pub(crate) fn semi_view(
                 .find_map(|(a, z)| {
                     let col = match &**a {
                         Expr::CompoundIdentifier(p) if p.len() == 2 => {
-                            s.info.col_index(&super::names::ident_name(&p[1]))
+                            t.info.col_index(&super::names::ident_name(&p[1]))
                         }
                         _ => None,
                     }?;
@@ -406,16 +407,16 @@ pub(crate) fn semi_view(
     if cols.is_empty() {
         return Err(());
     }
-    let col = |c: usize| qcol(&s.alias, &qident(&s.info.columns[c].name));
+    let col = |c: usize| qcol(&t.alias, &qident(&t.info.columns[c].name));
     let sel = format!(
         "SELECT {} FROM {}.{} AS {}{} GROUP BY {}",
         cols.iter()
-            .map(|&c| format!("{} AS {}", col(c), qident(&s.info.columns[c].name)))
+            .map(|&c| format!("{} AS {}", col(c), qident(&t.info.columns[c].name)))
             .collect::<Vec<_>>()
             .join(", "),
-        qident(&s.table.0),
-        qident(&s.table.1),
-        qident(&s.alias),
+        qident(&t.table.0),
+        qident(&t.table.1),
+        qident(&t.alias),
         and_all(local)
             .map(|w| format!(" WHERE {w}"))
             .unwrap_or_default(),
@@ -426,12 +427,12 @@ pub(crate) fn semi_view(
     );
     let key: Vec<String> = cols
         .iter()
-        .map(|&c| s.info.columns[c].name.clone())
+        .map(|&c| t.info.columns[c].name.clone())
         .collect();
     let iv = view(
         schema,
         sel,
-        format!("distinct keys of a subquery over `{}`", s.info.name),
+        format!("distinct keys of a subquery over `{}`", t.info.name),
         key,
     );
     let tref = (schema.to_string(), iv.name.clone());
@@ -445,7 +446,7 @@ pub(crate) fn semi_view(
         .as_ref()
         .and_then(|w| super::normalize::marker_args(w, id))
         .ok_or(())?;
-    let mut alias = format!("{}_keys", s.alias);
+    let mut alias = format!("{}_keys", t.alias);
     while b.items.iter().any(|i| i.alias.eq_ignore_ascii_case(&alias)) {
         alias.push('_');
     }
@@ -460,7 +461,7 @@ pub(crate) fn semi_view(
         .collect();
     for (c, ph) in keys {
         conds.push(Expr::BinaryOp {
-            left: Box::new(qcol(&alias, &qident(&s.info.columns[c].name))),
+            left: Box::new(qcol(&alias, &qident(&t.info.columns[c].name))),
             op: sqlparser::ast::BinaryOperator::Eq,
             right: Box::new(super::ast::nested(args.get(ph).ok_or(())?.clone())),
         });

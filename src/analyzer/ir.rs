@@ -100,22 +100,31 @@ pub(crate) struct Output {
 pub(crate) struct Semi {
     pub id: usize,
     pub negated: bool,
-    /// The subquery's only table and the alias it uses there.
-    pub table: TableRef,
-    pub info: Arc<TableInfo>,
-    pub alias: String,
+    /// The subquery's tables: one, or several joined by inner joins (their ON conditions are
+    /// conjuncts of `join_conditions` / `lookup_conditions`).
+    pub tables: Vec<SemiTable>,
     /// The predicate with outer expressions replaced by placeholders `__lv_outer_<n>__`.
     pub predicate: Expr,
     /// Conditions equivalent to the predicate when it joins at most one row of the table
-    /// (correlation equalities and the subquery's WHERE), with the same placeholders.
+    /// (correlation equalities, the subquery's WHERE and ON conditions), with the same
+    /// placeholders.
     pub join_conditions: Vec<Expr>,
-    /// The conditions relating one row of the table to the outer row for lookups: the join
+    /// The conditions relating rows of the tables to the outer row for lookups: the join
     /// conditions, except that `x NOT IN (…)` also relates every row when `x` or the key is NULL.
     pub lookup_conditions: Vec<Expr>,
     /// `x NOT IN (SELECT k …)` (never traced by direct units: a NULL key affects every row).
     pub not_in: bool,
-    /// (table column, index of the outer expression it equals).
-    pub correlation: Vec<(usize, usize)>,
+    /// (index in `tables`, table column, index of the outer expression it equals).
+    pub correlation: Vec<(usize, usize, usize)>,
+}
+
+/// A table of a semi-join subquery.
+#[derive(Debug, Clone)]
+pub(crate) struct SemiTable {
+    pub table: TableRef,
+    pub info: Arc<TableInfo>,
+    /// The alias the subquery uses for it.
+    pub alias: String,
     /// Columns of the table the subquery uses.
     pub referenced: Vec<bool>,
 }
@@ -131,6 +140,8 @@ pub(crate) struct Block {
     /// That ORDER BY / LIMIT, to render the block as an internal view.
     pub tail: Option<Box<Query>>,
     pub semis: Vec<Semi>,
+    /// Why IN / EXISTS subqueries of the WHERE stayed subqueries (precise fallback reasons).
+    pub semi_blockers: Vec<String>,
     /// Whether column references are all qualified with their item's alias.
     pub qualified: bool,
     /// DISTINCT was turned into GROUP BY (reasons still name DISTINCT).

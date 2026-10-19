@@ -44,6 +44,8 @@ pub struct Column {
     pub invisible: bool,
     /// Lower-case `DATA_TYPE`.
     pub data_type: String,
+    /// Lower-case `COLUMN_TYPE` (length, precision, `unsigned`).
+    pub column_type: String,
     pub charset: Option<String>,
     pub collation: Option<String>,
     /// `CHARACTER_OCTET_LENGTH` (declared byte length of fixed-length BINARY(n)).
@@ -144,6 +146,7 @@ impl Column {
             exact,
             invisible: false,
             data_type: dt,
+            column_type: column_type.to_ascii_lowercase(),
             charset: charset.map(|c| c.to_ascii_lowercase()),
             collation: collation.map(|c| c.to_ascii_lowercase()),
             octet_len,
@@ -387,7 +390,12 @@ pub async fn load_table(
                 let generated = gen
                     .filter(|g| !g.trim().is_empty() && extra_uc.contains("GENERATED"))
                     .map(|expr| Generated {
-                        expr,
+                        // MySQL / Percona print it string-escaped (`_utf8mb4\'$.a\'`), MariaDB as SQL.
+                        expr: if mariadb {
+                            expr
+                        } else {
+                            unescape_generation_expression(&expr)
+                        },
                         stored: extra_uc.contains("STORED"),
                         deps: None,
                     });
@@ -540,6 +548,20 @@ fn unique_keys_from(
 
 /// Ordinals of the columns a generated column's expression reads (parsed with the MySQL
 /// dialect; `None` if the text does not parse).
+/// MySQL's `GENERATION_EXPRESSION` is the expression escaped like a string literal's content
+/// (`\'` for a quote, `\\` for a backslash): the SQL text it stands for.
+fn unescape_generation_expression(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn generated_deps(expr: &str, names: &[String]) -> Option<Vec<usize>> {
     use sqlparser::ast::{visit_expressions, Expr};
     use sqlparser::dialect::MySqlDialect;
@@ -691,6 +713,23 @@ mod tests {
             Some(vec![1])
         );
         assert_eq!(generated_deps("((", &names), None);
+        // MySQL / Percona print the expression string-escaped (B3; measured on 8.4).
+        let mysql = r#"concat(`code`,_latin1\'it\\\'s\',_latin1\'\\\\x\',_latin1\'q"d\')"#;
+        assert_eq!(
+            unescape_generation_expression(mysql),
+            r#"concat(`code`,_latin1'it\'s',_latin1'\\x',_latin1'q"d')"#
+        );
+        assert_eq!(
+            generated_deps(&unescape_generation_expression(mysql), &names),
+            Some(vec![1])
+        );
+        assert_eq!(
+            generated_deps(
+                &unescape_generation_expression(r"json_unquote(json_extract(`a`,_utf8mb4\'$.a\'))"),
+                &names
+            ),
+            Some(vec![3])
+        );
         let mut g = Column::simple("g", "int");
         g.generated = Some(Generated {
             expr: "a".into(),
