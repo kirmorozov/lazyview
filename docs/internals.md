@@ -2,7 +2,9 @@
 
 * **Units.** Each definition is parsed (MySQL dialect) into its source tables, joins, filters and
   grouping. It gets a *unit*: the key of a group of materialized rows. That is the first table's
-  primary key for select/join views and the GROUP BY key for aggregates (see
+  primary key (or a key reduced from it) for select/join views, the GROUP BY key for aggregates,
+  the PARTITION BY key for window functions, and a single unit for aggregates without GROUP BY
+  and top-N views (see
   [incremental or full](views.md#incremental-or-full)).
 * **One binlog read, fanned out.** Each binlog row is decoded once and routed to every view that
   reads the table. Updates that touch no column a view uses are dropped. A row maps to its units

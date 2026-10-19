@@ -95,6 +95,16 @@ LAZYVIEW_TARGET_REPORTING_DSN=mysql://lazyview:change-me@reporting-db:3306/repor
 | `LAZYVIEW_HEARTBEAT_MS` | `5000` | replication heartbeat period (minimum `100`) |
 | `LAZYVIEW_POSITION_PERSIST_MS` | `5000` | how often the binlog position is saved when nothing else is written |
 
+### Reserved
+
+`LAZYVIEW_SUPERVISOR`, `LAZYVIEW_MAX_SOURCE_CONCURRENCY`, `LAZYVIEW_MAX_TARGET_CONCURRENCY`,
+`LAZYVIEW_TARGET_<NAME>_MAX_CONCURRENCY`, `LAZYVIEW_MAX_INFLIGHT_ROWS`, `LAZYVIEW_CPU_WORKERS`
+and `LAZYVIEW_STALE_AFTER_MS` are accepted (and validated) but have no effect yet: the engine
+flushes sequentially, over one connection per target. What does apply to the write path is
+`LAZYVIEW_QUERY_CHUNK` (unit keys per read query) and `LAZYVIEW_WRITE_BATCH_ROWS` (rows per
+multi-row `INSERT`; a chunk is written as one transaction: `DELETE` of the changed units, then the
+`INSERT`).
+
 ## Health and logging
 
 | variable | default | meaning |

@@ -148,7 +148,7 @@ per line. The default level `info` logs lifecycle events and problems only:
 | `waiting for source database at host:port: …; retrying in …` | the database is unreachable; lazyview keeps retrying (backoff up to 30 s) |
 | `another lazyview instance … is active on schema …; standing by` | hot standby (see [below](#duplicate-instances-and-hot-standby)) |
 | `took over as active instance` | a standby became active |
-| `building view=… targets=… mode=…` | a view is being built; `mode` is, for example, `incremental (grouped)` or `full rebuild (DISTINCT)` |
+| `building view=… targets=… mode=…` | a view is being built; `mode` is, for example, `incremental (grouped)` or `full rebuild (non-deterministic function NOW)` |
 | `live view=… targets=…` | a newly built table was swapped in |
 | `ready: N view(s) live` | every view has a table (`, M in error` if some failed) |
 | `streaming binlog position=…` | reading the binlog from that position |
@@ -234,7 +234,7 @@ schema: each would maintain the same views.
 | `unknown target …` | configure `LAZYVIEW_TARGET_<NAME>_*`, or fix `_lazyview.targets` |
 | ``chained views need the upstream view on target `source` `` | add `source` to the upstream view's `targets` |
 | `view calls stored function …` | stored and loadable functions are not supported; inline the logic |
-| a view is `full` but should be incremental | `detail` names the construct; see [views](views.md#what-makes-a-view-full) |
+| a view is `full` but should be incremental | `detail` names the construct; see [views](views.md#what-makes-a-view-full). `SELECT name, detail FROM _lazyview_overview WHERE mode = 'full' AND state <> 'error'` lists them (a view in `error` keeps the mode of its plan) |
 | a full-mode view lags | it is rebuilt at most once per `LAZYVIEW_FULL_REFRESH_MS`; lower it, or make the view incremental |
 | the container is `unhealthy` with `LAZYVIEW_HEALTH_ADDR=off` | run it with `--no-healthcheck` |
 | `/readyz` stays 503 on an otherwise fine instance | `curl 'localhost:8080/readyz?verbose'` names the failing check |

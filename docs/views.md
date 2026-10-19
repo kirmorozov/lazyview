@@ -40,8 +40,9 @@ UPDATE _lazyview SET rebuild = 1 WHERE name = 'paid_orders';
   must have as many names as the SELECT has columns.
 * Unqualified table names refer to `LAZYVIEW_DATABASE`. Other schemas work when qualified
   (`other.customers`) and when the user may read them.
-* The view is always created in `LAZYVIEW_DATABASE` (and in each target's schema). A
-  schema-qualified view name is rejected.
+* The view is always created in `LAZYVIEW_DATABASE` (and in each target's schema). A view name
+  qualified with that schema (`CREATE VIEW app.x AS …`) is accepted; a name qualified with any
+  other schema is rejected: ``schema-qualified view name `other`.`x` is not supported``.
 * Reserved names: `_lazyview`, `_lazyview_state`, `_lazyview_status`, `_lazyview_overview`, names
   starting with `_lv_` and names ending in `__lv_new` or `__lv_old`. The metadata tables cannot be
   read by a view either.
@@ -120,40 +121,70 @@ SELECT name, target, state, mode, detail FROM _lazyview_overview;
 
 | `mode` | `detail` | how it is maintained |
 |---|---|---|
-| `incremental` | `spj` | select / join. Unit: primary key of the first table in FROM. Only changed units are re-read and rewritten |
-| `incremental` | `grouped` | GROUP BY. Unit: the group key. Only changed groups are recomputed |
-| `incremental` | `global` | aggregates without GROUP BY (a single row). Recomputed with one query per batch when a source changes |
+| `incremental` | `spj` | select / join (also with subqueries, CTEs, derived tables and `ORDER BY` without `LIMIT`). Unit: the primary key of the first table in FROM, a key reduced from it by unique keys, or the whole row of a table without a primary key. Only changed units are re-read and rewritten |
+| `incremental` | `grouped` | `GROUP BY`, `DISTINCT` (unit: the row, or a source key that determines it) and window functions with `PARTITION BY` (unit: the partition). Only changed groups are recomputed |
+| `incremental` | `global` | aggregates without `GROUP BY` (a single row), top-N (`ORDER BY … LIMIT n`) and windows without `PARTITION BY`. One unit, recomputed with one query per batch when a source changes |
 | `full` | the reason (see below) | rebuilt completely into a shadow table and swapped in, at most once per `LAZYVIEW_FULL_REFRESH_MS` |
-| `unknown` | NULL | shown for every view in state `error`, also when the definition itself is valid (for example a failed build or a name clash). For a definition that parses, `LAZYVIEW_SYNC=false` still prints the mode, and so does the `building` log line if a build started |
+| `unknown` | NULL | the definition could not be planned (for example it reads a lazyview metadata table or names a schema-qualified view). `LAZYVIEW_SYNC=false` still reports such a definition as invalid |
+
+A view in state `error` keeps the `mode` and `detail` of its plan, also when the definition is
+fine and only the build failed (a missing table, a name clash, a server error), so `mode = 'full'`
+also lists broken views. Filter with `state <> 'error'` (see [metadata tables](#metadata-tables)).
+
+### What makes a view incremental
+
+lazyview keeps a view incremental whenever a change to a source row can be traced to the output
+rows it affects. That covers:
+
+* select / join views over any number of tables (`JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `NATURAL`,
+  `STRAIGHT_JOIN`, `USING`, comma joins), also over tables without a primary key;
+* `GROUP BY` and aggregates (`COUNT(DISTINCT …)`, `GROUP_CONCAT`, `HAVING` included);
+* `DISTINCT` (it groups by the selected columns, or by a source key that determines them);
+* subqueries: `IN`, `NOT IN`, `EXISTS`, `NOT EXISTS` and comparisons against them (semi-joins and
+  anti-joins), also over joined subqueries;
+* CTEs (non-recursive) and derived tables, merged into the outer query;
+* window functions (the unit is the `PARTITION BY` group; without it the whole window is
+  recomputed) and top-N (`ORDER BY … LIMIT n`: the `ORDER BY` columns count as read columns, so
+  changing one that is not selected is noticed too);
+* generated columns: `STORED` ones are plain columns; a `VIRTUAL` one is replaced by its
+  expression, with the column keeping its name;
+* primary and unique keys, `NOT NULL` and column types come from the server's schema, so a key
+  that is unique and not null lets lazyview trace a join without a lookup.
 
 ### What makes a view full
 
-These constructs switch a view to `full`. `detail` shows the text in the first column.
+These constructs switch a view to `full`: no usable trace exists, or lazyview does not trace it
+yet. `detail` shows the text in the first column.
 
 | `detail` | example |
 |---|---|
-| `DISTINCT` | `SELECT DISTINCT customer_id FROM orders` |
-| `LIMIT` | `… ORDER BY total DESC LIMIT 10` (also `FETCH`) |
-| `set operation (UNION/INTERSECT/EXCEPT)` | `SELECT … UNION SELECT …` |
-| `WITH clause` | `WITH x AS (…) SELECT …` |
-| `subquery` | `WHERE id IN (SELECT …)`, `EXISTS (…)`, a scalar subquery |
-| `derived table in FROM` | `FROM (SELECT …) t` |
-| `unsupported FROM item` | other FROM items, such as table functions or parenthesized joins |
-| `RIGHT/FULL/other join` | `RIGHT JOIN`, `STRAIGHT_JOIN` and other join types |
-| `NATURAL join` | `NATURAL JOIN` |
-| `window function` | `ROW_NUMBER() OVER (…)` |
+| `set operation (UNION/INTERSECT/EXCEPT)` | `SELECT … UNION SELECT …`, also `UNION ALL` today |
+| `LIMIT without ORDER BY` | `… LIMIT 10` (which rows are returned is up to the server) |
+| `recursive CTE `x`` | `WITH RECURSIVE x AS (…)` |
+| `LATERAL derived table `x`` | `JOIN LATERAL (SELECT …) x` |
+| `subquery` | a scalar subquery in the SELECT list |
+| `unsupported FROM item` | other FROM items, such as table functions |
 | `MATCH ... AGAINST` | full-text search |
-| `non-deterministic function <NAME>` | `NOW`, `SYSDATE`, `CURDATE`, `CURTIME`, `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`, `UTC_DATE`, `UTC_TIME`, `UTC_TIMESTAMP`, `UNIX_TIMESTAMP`, `RAND`, `UUID`, `UUID_SHORT`, `CONNECTION_ID`, `USER`, `CURRENT_USER`, `SESSION_USER`, `SYSTEM_USER`, `LAST_INSERT_ID`, `FOUND_ROWS`, `ROW_COUNT`, `SLEEP`, `BENCHMARK` |
+| `non-deterministic function <NAME>` | `NOW`, `SYSDATE`, `CURDATE`, `CURTIME`, `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`, `UTC_DATE`, `UTC_TIME`, `UTC_TIMESTAMP`, `UNIX_TIMESTAMP`, `RAND`, `UUID`, `UUID_SHORT`, `CONNECTION_ID`, `USER`, `CURRENT_USER`, `SESSION_USER`, `SYSTEM_USER`, `LAST_INSERT_ID`, `FOUND_ROWS`, `ROW_COUNT`, `SLEEP`, `BENCHMARK` (also inside the `ORDER BY` of a top-N view) |
 | `GROUP BY modifiers (ROLLUP)` | `GROUP BY a WITH ROLLUP` |
-| `GROUP BY ALL` | `GROUP BY ALL` |
+| `GROUP BY ALL` | `GROUP BY ALL` (MySQL and MariaDB reject it: the view is in `error`) |
 | `no FROM clause` | `SELECT 1` |
-| ``first table `t` has no primary key`` | a select/join view whose first table has no primary key |
 | ``table `t` contributes to every row (no join condition)`` | `FROM orders o JOIN regions r` without a condition, `CROSS JOIN` |
-| `group key on the NULL side of a LEFT JOIN` | see [LEFT JOIN](#left-join) |
-| `WHERE condition that keeps NULL-extended rows of a LEFT JOIN` | see [LEFT JOIN](#left-join) |
-| `JSON group key` | `GROUP BY JSON_EXTRACT(doc, '$.type')`, or a `JSON` column |
-| `BIT unit key` | grouping by, or a first-table primary key of, a `BIT` column |
+| ``first table `t` has no primary key`` | a first table without a primary key and without any column lazyview can compare exactly |
+| `SELECT * over a USING or NATURAL join …` | list the columns instead: the server coalesces the shared ones |
+| ``unaliased column `…` reads a VIRTUAL generated column: give it an alias`` | a select item over a `VIRTUAL` column whose text is longer than 64 characters (or ends in a space or contains a newline) and has no `AS` alias |
+| ``<TYPE> column `t`.`c` decides which rows match, but its binlog value cannot be compared with its SQL value`` | a filter or join on a column type whose binlog form differs from its SQL form |
+| ``IN subquery over `t`, a child of a cascading foreign key`` | `WHERE id IN (SELECT parent_id FROM child)` where `child` is a child of a cascading foreign key (see [foreign-key cascades](#foreign-key-cascades)) |
 | ``reads SQL view `v` `` | the definition reads a plain SQL view; lazyview watches the view's base tables |
+
+**Planned, still full today.** These reasons name a missing piece of lazyview, not a limit of the
+idea. The view is correct, only rebuilt instead of maintained:
+
+| `detail` | example | waits for |
+|---|---|---|
+| `JSON group key (needs typed unit filters)` | `GROUP BY JSON_EXTRACT(doc, '$.type')`, or a `JSON` column | JSON-aware group keys |
+| reasons ending in `(needs internal views)` | a group key on the NULL side of a `LEFT JOIN`; an aggregated or `DISTINCT` CTE joined to other tables; an aggregate or window inside a derived table on the NULL side of a `LEFT JOIN`; a parenthesized join that cannot be flattened | internal views (an invisible chained view) |
+| reasons ending in `(needs branch plans)`, and `UNION ALL` | `SELECT … UNION ALL SELECT …` | branch plans for `UNION ALL` |
 
 How full mode behaves:
 
@@ -169,43 +200,45 @@ How full mode behaves:
   interval plus one build behind. `0` rebuilds as soon as possible.
 * Views are only refreshed when a source table changes, never because time passes. A view that
   filters on `NOW()` is not updated while its tables are idle.
-* A rebuild runs the whole query, so keep full-mode views cheap or make them incremental. Often a
-  rewrite helps: `SELECT DISTINCT customer_id FROM orders` and
-  `SELECT customer_id FROM orders GROUP BY customer_id` return the same rows, but the second one
-  is incremental.
+* A rebuild runs the whole query, so keep full-mode views cheap, or remove the construct that
+  makes them full: for example filter on a column instead of `NOW()`.
 
 ## Joins
 
-* Supported incrementally: `JOIN` / `INNER JOIN`, `LEFT [OUTER] JOIN`, comma joins and `CROSS JOIN`
-  with the condition in `WHERE`, and `USING (…)`.
-* For select/join views, the first table in FROM is the anchor: its primary key is the unit, so
-  put the table you want one row per first.
+* Supported incrementally: `JOIN` / `INNER JOIN`, `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`,
+  `NATURAL` joins, `STRAIGHT_JOIN`, comma joins and `CROSS JOIN` with the condition in `WHERE`,
+  and `USING (…)`. `SELECT *` over `USING` or `NATURAL` needs the columns listed.
+* For select/join views, the first table in FROM is the anchor: its primary key is the unit (or a
+  key reduced from it by unique keys), so put the table you want one row per first.
 * Equalities between columns (`i.order_id = o.id`) let lazyview map a changed row to its units
   straight from the binlog row, without a query. This needs columns of the same type family
   (integers with integers, decimals with decimals, strings with the same character set and
   collation). `TIMESTAMP`, `JSON`, `FLOAT`, `DOUBLE` and `YEAR` keys always use a lookup query.
+* A join without any condition between a table and the rest (`FROM orders o JOIN regions r`,
+  `CROSS JOIN`) makes the view full: every row of that table belongs to every output row.
 
 ### LEFT JOIN
 
-The rows a LEFT JOIN adds with NULLs (NULL-extended rows) need care:
+The rows a LEFT JOIN adds with NULLs (NULL-extended rows) are traced too, so these are all
+incremental: conditions on the NULL side such as `IS NULL`, `IFNULL()`, `COALESCE()` and `OR`, and
+the anti-join
 
-* A GROUP BY key must not come from the NULL side. `… LEFT JOIN order_items i … GROUP BY
-  i.order_id` is full; group by `o.id` instead.
-* A WHERE condition on a NULL-side column must reject NULLs: `=`, `<>`, `<`, `>`, `LIKE`,
-  `IN (list)`, `BETWEEN` and `IS NOT NULL` are fine, also combined with `AND`. `IS NULL`,
-  `IFNULL()`, `COALESCE()` and `OR` make the view full (write `c.name IN ('a', 'b')` rather than
-  `c.name = 'a' OR c.name = 'b'`).
-* An anti-join written with `WHERE i.order_id IS NULL` is therefore full. The same result as an
-  incremental view:
+```sql
+SELECT o.id FROM orders o LEFT JOIN customers c ON c.name = o.customer WHERE c.id IS NULL
+```
 
-  ```sql
-  SELECT o.id, COUNT(i.order_id) AS n
-    FROM orders o LEFT JOIN order_items i ON i.order_id = o.id
-   GROUP BY o.id
-  HAVING COUNT(i.order_id) = 0
-  ```
+The exception is a `GROUP BY` key taken from the NULL side: `… LEFT JOIN order_items i … GROUP BY
+i.order_id` is full (`group key on the NULL side of a LEFT JOIN (needs internal views)`; planned).
+Group by `o.id` instead:
 
-  `HAVING` is evaluated on refresh, so NULL-side columns are fine there.
+```sql
+SELECT o.id, COUNT(i.order_id) AS n
+  FROM orders o LEFT JOIN order_items i ON i.order_id = o.id
+ GROUP BY o.id
+HAVING COUNT(i.order_id) = 0
+```
+
+`HAVING` is evaluated on refresh, so NULL-side columns are fine there.
 
 ## Foreign-key cascades
 
@@ -225,7 +258,7 @@ reads.
   parent's row does not lead to it: such a view is rebuilt as described below.
 * Otherwise a delete or key update on the parent triggers an online rebuild of the view (at most
   once per `LAZYVIEW_FULL_REFRESH_MS`, never more than one at a time). lazyview logs a warning
-  when such a view is created: `reads a child of a cascading foreign key whose units cannot be
+  when such a view is created (with the `reasons` that apply): `reads a child of a cascading foreign key whose units cannot be
   derived from the parent`. Group or join by the foreign-key column to avoid the rebuilds.
 
 The same rate-limited online rebuild is used when too many changed keys were buffered to track
@@ -322,7 +355,7 @@ lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing column
 |---|---|
 | `name`, `target` | primary key |
 | `definition_id`, `definition_hash` | which definition the table was built from |
-| `mode`, `detail` | `incremental` / `full` / `unknown` (every view in `error`), and the kind or reason (see [above](#incremental-or-full)) |
+| `mode`, `detail` | `incremental` / `full` / `unknown` (not planned), and the kind or reason (see [above](#incremental-or-full)); a view in `error` keeps those of its plan |
 | `state` | `building`, `ready`, `waiting` (a chained view whose upstream view is not built yet) or `error` |
 | `managed` | `1` once lazyview created the table; only such tables are ever replaced or dropped |
 | `last_error` | the error message in state `error` |
@@ -342,5 +375,5 @@ The state rows are lazyview's record of which tables it built: do not edit them.
 ```sql
 SELECT * FROM _lazyview_overview;
 SELECT name, target, last_error FROM _lazyview_overview WHERE state = 'error';
-SELECT name, detail FROM _lazyview_overview WHERE mode = 'full';
+SELECT name, detail FROM _lazyview_overview WHERE mode = 'full' AND state <> 'error';
 ```

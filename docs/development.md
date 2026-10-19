@@ -138,6 +138,15 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
 * `LAZYVIEW_TEST_PLAN_DELAY=<marker>:<ms>` (an engine setting, for tests only): planning a
   definition whose text contains `marker` first sleeps `ms` milliseconds
   (`reg_slow_planning_is_bounded` uses it to test `LAZYVIEW_PLAN_TIMEOUT_MS`).
+* `LAZYVIEW_TEST_GLOBAL_SQL_MODE=1` enables the regression test that changes the servers' GLOBAL
+  `sql_mode` (`tests/regressions.rs`, ANSI quotes); same rule: no other suite on the same servers
+  at the same time.
+* `LAZYVIEW_TEST_SKIP_VIEWS` and `LAZYVIEW_TEST_ONLY_VIEWS` (comma-separated view names) drop or
+  keep views of the shared view sets, to look past a known bug in one view or to reduce a failure
+  to a minimal reproduction. The run prints what was filtered.
+* `LAZYVIEW_TEST_FULL_REFRESH_MS` is the `LAZYVIEW_FULL_REFRESH_MS` the test engines get
+  (default `0`: full-mode views are rebuilt on every flush, so checks are exact right after
+  catch-up). With a larger value the checks poll the lazily rebuilt views for up to twice that.
 
 Suites in `tests/`: `binlog_stream`, `brutal` (randomized correctness with many overlapping
 views), `ddl`, `efficiency`, `harness_selftest`, `health`, `lifecycle`, `migration`, `regressions`,

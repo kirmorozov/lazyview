@@ -54,9 +54,9 @@ SELECT * FROM customer_totals;      -- a plain table, once built
 ```
 
 `state` is `building`, `ready` or `error` (see `last_error`). `mode` is `incremental` or `full`,
-and `detail` says how (`spj`, `grouped`, `global`) or why (for example `DISTINCT`). The mode is
-known as soon as the definition is parsed, before the table is built; a view in `error` shows
-`unknown`. Once every view has a table, the log says `ready: N view(s) live`
+and `detail` says how (`spj`, `grouped`, `global`) or why (for example `non-deterministic function
+NOW`). The mode is known as soon as the definition is parsed, before the table is built. A view in
+`error` keeps the mode of its plan; it shows `unknown` only when the definition could not be planned. Once every view has a table, the log says `ready: N view(s) live`
 (`docker logs -f lazyview`).
 
 Later, change the view (the old version stays readable until the new one is ready) or remove it
@@ -72,10 +72,13 @@ DELETE FROM _lazyview WHERE name = 'customer_totals';
 
 * The binlog says which rows changed; lazyview re-reads only the affected units (rows or groups)
   with plain, non-locking `SELECT`s and writes only what differs.
-* Incremental by default. DISTINCT, UNION, LIMIT, subqueries, window functions, `NOW()` and
-  [a few more](docs/views.md#what-makes-a-view-full) make a view `full`: it is rebuilt into a shadow
-  table and swapped in, so changes reach it within about `LAZYVIEW_FULL_REFRESH_MS` (60 s) plus
-  one build.
+* Incremental by default: select/join views (also with `DISTINCT`, subqueries, CTEs and derived
+  tables), `GROUP BY`, aggregates, window functions and top-N (`ORDER BY … LIMIT`) are all
+  maintained from the binlog. A view is `full` only where a source change cannot be traced to the
+  rows it affects (`NOW()` and other non-deterministic functions, `UNION`, a few more, see
+  [what makes a view full](docs/views.md#what-makes-a-view-full)). A full view is rebuilt into a
+  shadow table and swapped in, so changes reach it within about `LAZYVIEW_FULL_REFRESH_MS` (60 s)
+  plus one build.
 * Changed definitions and `ALTER`, `TRUNCATE` or `RENAME` of a source table are handled online: a
   new table is built next to the live one and swapped in with an atomic `RENAME TABLE`.
 * After a crash or restart, lazyview resumes from the binlog position saved in `_lazyview_status`.
