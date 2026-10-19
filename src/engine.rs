@@ -327,6 +327,9 @@ struct Slot {
     refresh_failures: u32,
     /// Re-plan once the build in flight is done (its source data was replaced meanwhile).
     replan_after: bool,
+    /// `_lazyview.rebuild` was set when the binlog was here: cleared once a build started at or
+    /// after this position is live.
+    rebuild_asked: Option<Position>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1307,7 +1310,10 @@ impl Engine {
             };
             self.slots[idx].name = plan.name.clone();
             let mut build = d.targets.clone();
-            if resume {
+            if d.rebuild {
+                info!(view = %plan.name, "rebuild requested (_lazyview.rebuild = 1)");
+                self.slots[idx].rebuild_asked = Some(self.boundary.clone());
+            } else if resume {
                 match self.try_resume(idx, &plan).await {
                     Ok(rest) => build = rest,
                     Err(e) => warn!(view = %plan.name, "cannot resume, rebuilding: {e:#}"),
@@ -1419,6 +1425,7 @@ impl Engine {
             last_plan: None,
             refresh_failures: 0,
             replan_after: false,
+            rebuild_asked: None,
         });
         self.slots.len() - 1
     }
@@ -1725,6 +1732,11 @@ impl Engine {
                 Some(idx) => {
                     let s = &self.slots[idx];
                     if s.hash == hash && s.targets == d.targets {
+                        if d.rebuild && s.rebuild_asked.is_none() {
+                            info!(view = %s.name, "rebuild requested (_lazyview.rebuild = 1)");
+                            self.slots[idx].rebuild_asked = Some(self.boundary.clone());
+                            self.schedule_replan(id, false, false);
+                        }
                         continue;
                     }
                     idx
@@ -1733,6 +1745,9 @@ impl Engine {
             };
             let is_new = self.slots[idx].live.is_none() && self.slots[idx].next.is_none();
             let s = &mut self.slots[idx];
+            if d.rebuild && s.rebuild_asked.is_none() {
+                s.rebuild_asked = Some(self.boundary.clone());
+            }
             s.definition = d.effective_definition();
             s.hash = hash;
             s.targets = d.targets.clone();
@@ -2307,6 +2322,9 @@ impl Engine {
                 if !tables.is_empty() {
                     tracing::trace!(%query, "statement affects tables {tables:?}");
                     self.on_tables_changed(&tables, &before);
+                    if first_keyword(&query).eq_ignore_ascii_case("TRUNCATE") {
+                        self.on_view_table_truncated(&tables, &before);
+                    }
                 }
                 self.after_boundary();
             }
@@ -2600,6 +2618,27 @@ impl Engine {
         }
         if !self.replan.is_empty() || self.defs_dirty {
             self.first_dirty.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// A view's own table on the source was emptied by `TRUNCATE` (lazyview never truncates
+    /// one): rebuild the view online, as for a source schema change.
+    fn on_view_table_truncated(&mut self, tables: &[TableRef], since: &Position) {
+        let hit: Vec<(u64, String)> = self
+            .slots
+            .iter()
+            .filter_map(|s| {
+                let l = s.live.as_ref()?;
+                let on_source = l.targets.iter().any(|t| t == SOURCE_TARGET);
+                tables
+                    .iter()
+                    .any(|t| on_source && t.0 == self.schema && t.1 == l.name)
+                    .then(|| (s.def_id, l.name.clone()))
+            })
+            .collect();
+        for (id, name) in hit {
+            warn!(view = %name, "the view's table was truncated outside lazyview; rebuilding it online");
+            self.schedule_replan_at(id, false, false, since);
         }
     }
 
@@ -3275,6 +3314,14 @@ impl Engine {
             if s.stale_since.as_ref().is_some_and(|p| *p <= n.started) {
                 s.stale_since = None;
             }
+            // So does a rebuild asked for with `_lazyview.rebuild = 1`: the request is done.
+            if s.rebuild_asked.as_ref().is_some_and(|p| *p <= n.started) {
+                s.rebuild_asked = None;
+                if let Err(e) = meta::clear_rebuild(&mut self.meta, def_id).await {
+                    warn!(view = %n.name, "clearing _lazyview.rebuild: {e:#}");
+                }
+            }
+            let s = &mut self.slots[i];
             let retired = std::mem::take(&mut s.retired);
             for (name, t) in retired {
                 if (name == n.name && n.targets.contains(&t))
@@ -4083,6 +4130,34 @@ struct BuildSpec {
     check_side: bool,
     /// Refuse if a table `<name>` exists (one lazyview did not create).
     check_table: bool,
+}
+
+/// The first keyword of a statement, after leading comments (`/*! … */` executable comments
+/// excluded: their content counts).
+fn first_keyword(query: &str) -> &str {
+    let mut s = query.trim_start();
+    loop {
+        if let Some(r) = s
+            .strip_prefix("/*")
+            .filter(|r| !r.starts_with('!') && !r.starts_with("M!"))
+        {
+            match r.find("*/") {
+                Some(e) => s = r[e + 2..].trim_start(),
+                None => return "",
+            }
+        } else if s.starts_with("--") || s.starts_with('#') {
+            match s.find('\n') {
+                Some(e) => s = s[e + 1..].trim_start(),
+                None => return "",
+            }
+        } else {
+            break;
+        }
+    }
+    let end = s
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(s.len());
+    &s[..end]
 }
 
 /// Swaps the shadow tables of a routine rebuild or a first build in, off the binlog loop (see

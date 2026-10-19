@@ -20,6 +20,9 @@ UPDATE _lazyview SET definition = 'SELECT id, total, status FROM orders' WHERE n
 UPDATE _lazyview SET enabled = 0 WHERE name = 'paid_orders';
 UPDATE _lazyview SET enabled = 1 WHERE name = 'paid_orders';
 DELETE FROM _lazyview WHERE name = 'paid_orders';
+
+-- rebuild one view from scratch (online)
+UPDATE _lazyview SET rebuild = 1 WHERE name = 'paid_orders';
 ```
 
 * `name` is unique (enforced by the table). In a `CREATE VIEW` statement the view name of the
@@ -277,12 +280,18 @@ maintained) until an atomic `RENAME TABLE` swap.
 | new `name` for the same `_lazyview.id`, or another view name in its `CREATE VIEW` statement | the new table is built; the old one is dropped after the new one is live. `name` follows the statement's view name |
 | `targets` changed | built on the new targets; removed targets are dropped after the swap |
 | `enabled = 0` or row deleted | the table is dropped (with `LAZYVIEW_DROP_REMOVED=true`, the default) |
+| `UPDATE _lazyview SET rebuild = 1` | the view is rebuilt online like a changed definition; `rebuild` goes back to `0` once the new table is live. Set while lazyview is stopped, the view is rebuilt at startup instead of resumed |
+| `TRUNCATE` of a view's table on the source | the view is rebuilt online (lazyview never truncates its tables) |
 | `ALTER TABLE`, `TRUNCATE` or `RENAME TABLE` of a source table, or an online schema change tool's table swap (`RENAME TABLE t TO t_old, t_new TO t`) | the view is re-planned and rebuilt online. The old table stays readable but is not maintained until the swap |
 | `DROP TABLE` of a source table | the view goes into error (`table … does not exist`); the old table stays readable. It is rebuilt once the table exists again |
 | an upstream lazyview table is swapped (chained view) | the dependent view is rebuilt online; the old version stays maintained |
 
 If a re-plan fails (for example, the source table is gone), the view goes into error and is
 retried with exponential backoff of up to 5 minutes.
+
+Other hand edits of a view's table (`DELETE`, `UPDATE`, `INSERT`, or any change on a target) are
+not noticed: lazyview keeps maintaining the table on top of them, so rows that are not changed
+again stay wrong. Repair such a view with `rebuild = 1`.
 
 ## Metadata tables
 
@@ -297,6 +306,7 @@ lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing column
 | `definition` | a `SELECT` (with `name`) or a complete `CREATE VIEW` statement |
 | `targets` | comma-separated target names; NULL means `source` |
 | `enabled` | `1` (default) or `0` |
+| `rebuild` | set to `1` to rebuild the view once; lazyview sets it back to `0` when the new table is live |
 | `created_at`, `updated_at` | timestamps |
 
 `_lazyview_state`: one row per view and target.

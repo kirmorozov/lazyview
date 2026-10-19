@@ -22,6 +22,7 @@ const CREATE_DEFS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview` (
   `definition` MEDIUMTEXT NOT NULL,
   `targets` VARCHAR(255) NULL DEFAULT NULL,
   `enabled` TINYINT(1) NOT NULL DEFAULT 1,
+  `rebuild` TINYINT(1) NOT NULL DEFAULT 0,
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY `uq_lazyview_name` (`name`)
@@ -60,6 +61,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "VARCHAR(255) NULL DEFAULT NULL AFTER `definition`",
     ),
     (DEFS, "enabled", "TINYINT(1) NOT NULL DEFAULT 1"),
+    (
+        DEFS,
+        "rebuild",
+        "TINYINT(1) NOT NULL DEFAULT 0 AFTER `enabled`",
+    ),
     (
         DEFS,
         "created_at",
@@ -144,6 +150,8 @@ pub struct DefRow {
     pub definition: String,
     pub targets: Vec<String>,
     pub enabled: bool,
+    /// `rebuild = 1`: rebuild the view once (cleared by lazyview when the new table is live).
+    pub rebuild: bool,
 }
 
 pub fn parse_targets(s: Option<&str>) -> Vec<String> {
@@ -192,6 +200,17 @@ pub async fn set_name(conn: &mut Conn, id: u64, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Clears the `rebuild` request of definition `id` (its rebuilt table is live). Leaves
+/// `updated_at` alone: the definition did not change.
+pub async fn clear_rebuild(conn: &mut Conn, id: u64) -> Result<()> {
+    conn.exec_drop(
+        "UPDATE `_lazyview` SET `rebuild` = 0, `updated_at` = `updated_at` WHERE `id` = ? AND `rebuild` <> 0",
+        (id,),
+    )
+    .await?;
+    Ok(())
+}
+
 /// The id of the `_lazyview` row named `name`.
 pub async fn definition_named(conn: &mut Conn, name: &str) -> Result<Option<u64>> {
     Ok(conn
@@ -200,17 +219,18 @@ pub async fn definition_named(conn: &mut Conn, name: &str) -> Result<Option<u64>
 }
 
 pub async fn load_definitions(conn: &mut Conn) -> Result<Vec<DefRow>> {
-    let rows: Vec<(u64, Option<String>, String, Option<String>, i64)> = conn
-        .query("SELECT `id`, CAST(`name` AS CHAR), CAST(`definition` AS CHAR), CAST(`targets` AS CHAR), `enabled` FROM `_lazyview` ORDER BY `id`")
+    let rows: Vec<(u64, Option<String>, String, Option<String>, i64, i64)> = conn
+        .query("SELECT `id`, CAST(`name` AS CHAR), CAST(`definition` AS CHAR), CAST(`targets` AS CHAR), `enabled`, `rebuild` FROM `_lazyview` ORDER BY `id`")
         .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, name, definition, targets, enabled)| DefRow {
+        .map(|(id, name, definition, targets, enabled, rebuild)| DefRow {
             id,
             name: name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
             definition,
             targets: parse_targets(targets.as_deref()),
             enabled: enabled != 0,
+            rebuild: rebuild != 0,
         })
         .collect())
 }
@@ -387,6 +407,7 @@ mod tests {
             definition: def.to_string(),
             targets: vec![],
             enabled: true,
+            rebuild: false,
         };
         assert_eq!(
             row(Some("v"), " SELECT 1 ").effective_definition(),

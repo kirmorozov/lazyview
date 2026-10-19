@@ -2547,6 +2547,158 @@ fn reg_failed_build_keeps_planned_mode() {
     });
 }
 
+/// `_lazyview.rebuild` of view `name` (0 once lazyview has done the requested rebuild).
+async fn rebuild_flag(c: &mut mysql_async::Conn, name: &str) -> Result<i64> {
+    c.exec_first("SELECT rebuild FROM _lazyview WHERE name = ?", (name,))
+        .await?
+        .context("no _lazyview row")
+}
+
+/// Waits until lazyview cleared `_lazyview.rebuild` of `name`.
+async fn wait_rebuilt(c: &mut mysql_async::Conn, eng: &mut Engine, name: &str) -> Result<()> {
+    let t = std::time::Instant::now();
+    while rebuild_flag(c, name).await? != 0 {
+        eng.check_alive()?;
+        ensure!(
+            t.elapsed() < t_ready(),
+            "{name}: _lazyview.rebuild still set after {:?}",
+            t_ready()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// There was no way to rebuild one view (hand edits of its table are not noticed, and the
+/// tricks a user tries, `SET definition = definition`, do nothing). `UPDATE _lazyview SET
+/// rebuild = 1` rebuilds that view online and is cleared once the new table is live, also when
+/// set while lazyview is stopped; the other views are left alone.
+#[test]
+fn reg_rebuild_flag_rebuilds_one_view() {
+    scenario("reg_rebuild_flag", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_counts",
+                Kind::Incremental,
+                "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+            ),
+            ViewSpec::new(
+                "r_names",
+                Kind::Incremental,
+                "SELECT id, name FROM customers",
+            ),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_rebuild_flag", &[], &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        ensure!(
+            rebuild_flag(&mut c, "r_counts").await? == 0,
+            "rebuild set without a request"
+        );
+        for restart in [false, true] {
+            // A hand edit lazyview cannot notice.
+            exec(&mut c, "DELETE FROM r_counts WHERE customer_id = 1").await?;
+            let ask = "UPDATE _lazyview SET rebuild = 1 WHERE name = 'r_counts'";
+            let updated_sql =
+                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE name = 'r_counts'";
+            let updated: Option<String> = if restart {
+                // Set while lazyview is stopped: the restart rebuilds instead of resuming.
+                let running = eng;
+                running.stop().await?;
+                exec(&mut c, ask).await?;
+                let u = c.query_first(updated_sql).await?;
+                eng = ctx.start_engine(&db, &[])?;
+                u
+            } else {
+                exec(&mut c, ask).await?;
+                c.query_first(updated_sql).await?
+            };
+            let before = eng.snapshot();
+            wait_rebuilt(&mut c, &mut eng, "r_counts").await?;
+            wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+            let what = if restart { "restart" } else { "running" };
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                &format!("rebuild flag ({what})"),
+            )
+            .await?;
+            let d = eng.snapshot().since(&before);
+            ensure!(
+                d.full_rebuilds == 1,
+                "{what}: expected one rebuild (r_counts only): {}",
+                fmt_snapshot(&d)
+            );
+            let after: Option<String> = c
+                .query_first(
+                    "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE name = 'r_counts'",
+                )
+                .await?;
+            ensure!(
+                after == updated,
+                "{what}: clearing the flag moved updated_at ({updated:?} -> {after:?})"
+            );
+            exec(&mut c, "INSERT INTO orders VALUES (20 + 1, 1, 'new')").await?;
+            exec(&mut c, "DELETE FROM orders WHERE id = 21").await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                &format!("after the rebuild ({what})"),
+            )
+            .await?;
+        }
+        eng.stop().await
+    });
+}
+
+/// `TRUNCATE` of a view's table (the lazy user's "reset") went unnoticed: the view stayed
+/// `ready` and groups that were not touched again were missing for good. lazyview never
+/// truncates its tables, so it rebuilds the view online.
+#[test]
+fn reg_truncated_view_table_is_rebuilt() {
+    scenario("reg_truncate_mv", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_counts",
+            Kind::Incremental,
+            "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_truncate_mv", &[], &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let before = eng.snapshot();
+        run(
+            &mut c,
+            &[
+                "TRUNCATE r_counts",
+                "INSERT INTO orders VALUES (14, 1, 'new')",
+            ],
+        )
+        .await?;
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &db,
+            &std::collections::HashMap::new(),
+            &specs,
+            t_ready(),
+            "after TRUNCATE of the view table",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds >= 1,
+            "the truncated view converged without a rebuild?: {}",
+            fmt_snapshot(&d)
+        );
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        exec(&mut c, "UPDATE orders SET customer_id = 3 WHERE id = 10").await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the rebuild").await?;
+        eng.stop().await
+    });
+}
+
 /// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
 /// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
 /// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed
