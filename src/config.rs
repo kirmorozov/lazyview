@@ -108,6 +108,13 @@ pub struct Config {
     /// Upper bound for one write round-trip to a target (an unresponsive target must not stall
     /// the binlog loop).
     pub target_timeout: Duration,
+    /// Upper bound for planning one definition (`LAZYVIEW_PLAN_TIMEOUT_MS`). Planning runs off
+    /// the binlog loop; a definition that takes longer goes into error and is not planned again
+    /// until it changes.
+    pub plan_timeout: Duration,
+    /// Test hook `LAZYVIEW_TEST_PLAN_DELAY=<marker>:<ms>`: planning a definition whose text
+    /// contains `marker` first sleeps that long.
+    pub test_plan_delay: Option<(String, Duration)>,
     /// Background builds running at once (each holds 1 + targets connections).
     pub build_concurrency: usize,
     /// Wait before reading sources when no GTID fence is available (binlog events can arrive
@@ -258,6 +265,21 @@ impl Config {
             target_timeout: Duration::from_millis(
                 num("LAZYVIEW_TARGET_TIMEOUT_MS", 60_000)?.max(1_000),
             ),
+            plan_timeout: Duration::from_millis(num("LAZYVIEW_PLAN_TIMEOUT_MS", 10_000)?.max(1)),
+            test_plan_delay: match get("LAZYVIEW_TEST_PLAN_DELAY") {
+                None => None,
+                Some(v) => {
+                    let (marker, ms) = v
+                        .rsplit_once(':')
+                        .filter(|(m, _)| !m.is_empty())
+                        .context("LAZYVIEW_TEST_PLAN_DELAY must be <marker>:<ms>")?;
+                    let ms: u64 = ms
+                        .trim()
+                        .parse()
+                        .context("LAZYVIEW_TEST_PLAN_DELAY must be <marker>:<ms>")?;
+                    Some((marker.to_string(), Duration::from_millis(ms)))
+                }
+            },
             heartbeat: Duration::from_millis(num("LAZYVIEW_HEARTBEAT_MS", 5_000)?.max(100)),
             visibility_delay: Duration::from_millis(num("LAZYVIEW_VISIBILITY_DELAY_MS", 20)?),
             position_persist_interval: Duration::from_millis(num(
@@ -401,6 +423,30 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         Config::from_lookup(|k| m.get(k).cloned())
+    }
+
+    #[test]
+    fn plan_budget() {
+        let c = cfg(&[("LAZYVIEW_DSN", "x")]).unwrap();
+        assert_eq!(c.plan_timeout, Duration::from_secs(10));
+        assert_eq!(c.test_plan_delay, None);
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_PLAN_TIMEOUT_MS", "1500"),
+            ("LAZYVIEW_TEST_PLAN_DELAY", "/*slow:x*/:250"),
+        ])
+        .unwrap();
+        assert_eq!(c.plan_timeout, Duration::from_millis(1500));
+        assert_eq!(
+            c.test_plan_delay,
+            Some(("/*slow:x*/".to_string(), Duration::from_millis(250)))
+        );
+        for bad in ["250", ":250", "m:x"] {
+            assert!(
+                cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_TEST_PLAN_DELAY", bad)]).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

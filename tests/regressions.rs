@@ -2836,6 +2836,83 @@ fn reg_view_named_like_its_source_table() {
     });
 }
 
+/// A definition that plans pathologically slowly stalled the binlog loop (every view) and, past
+/// `LAZYVIEW_LIVENESS_STALL_SECS`, `/livez` restarted the process, which planned it again.
+/// Planning runs off the loop within `LAZYVIEW_PLAN_TIMEOUT_MS`: the definition goes into error
+/// in time, the other views keep being maintained while the abandoned planner still runs, and it
+/// is not planned again until it changes (the hook `LAZYVIEW_TEST_PLAN_DELAY` makes it slow).
+#[test]
+fn reg_slow_planning_is_bounded() {
+    scenario("reg_plan_budget", |ctx| async move {
+        use std::time::Instant;
+        let mut specs = vec![ViewSpec::new(
+            "r_fast",
+            Kind::Incremental,
+            "SELECT id, status FROM orders",
+        )];
+        let ov = [
+            ("LAZYVIEW_PLAN_TIMEOUT_MS", "1000"),
+            ("LAZYVIEW_TEST_PLAN_DELAY", "/*slow*/:12000"),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_plan_budget", &[], &specs, &ov).await?;
+        let mut c = db.conn().await?;
+        let t = Instant::now();
+        exec(
+            &mut c,
+            "INSERT INTO _lazyview (name, definition) VALUES ('r_slow', 'SELECT id FROM orders /*slow*/')",
+        )
+        .await?;
+        let row = wait_state(&mut c, &mut eng, "r_slow", "error", Duration::from_secs(8)).await?;
+        ensure!(
+            row.last_error.as_deref()
+                == Some("planning took longer than 1 s; simplify the definition or raise LAZYVIEW_PLAN_TIMEOUT_MS"),
+            "r_slow: {row:?}"
+        );
+        // While the abandoned planner still sleeps, r_fast follows its source promptly.
+        let t1 = Instant::now();
+        exec(&mut c, "UPDATE orders SET status = 'held' WHERE id = 11").await?;
+        loop {
+            let s: Option<String> = c
+                .query_first("SELECT status FROM r_fast WHERE id = 11")
+                .await?;
+            if s.as_deref() == Some("held") {
+                break;
+            }
+            ensure!(
+                t1.elapsed() < Duration::from_secs(3),
+                "r_fast not refreshed within 3 s while a planner is stuck"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        ensure!(
+            t.elapsed() < Duration::from_secs(11),
+            "the stuck planner held the engine up ({:?})",
+            t.elapsed()
+        );
+        // A change to a table it reads re-plans views in error, but not this one.
+        exec(&mut c, "ALTER TABLE orders ADD COLUMN extra INT NULL").await?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "after ALTER").await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let n = eng.snapshot().plans_timed_out;
+        ensure!(n == 1, "planned again after timing out: {n} timeouts");
+        // A new definition is planned (and built) again.
+        exec(
+            &mut c,
+            "UPDATE _lazyview SET definition = 'SELECT id FROM orders' WHERE name = 'r_slow'",
+        )
+        .await?;
+        specs.push(ViewSpec::new(
+            "r_slow",
+            Kind::Incremental,
+            "SELECT id FROM orders",
+        ));
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the definition changed").await?;
+        eng.stop().await
+    });
+}
+
 /// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
 /// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
 /// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed

@@ -55,6 +55,8 @@ counters!(
     mv_rows_deleted,
     full_rebuilds,
     definition_reloads,
+    // Definitions whose planning took longer than LAZYVIEW_PLAN_TIMEOUT_MS.
+    plans_timed_out,
     // Lookups of several lookup tables gave up (too many combinations or remembered images):
     // the view was rebuilt instead (see src/lookback.rs).
     lookback_overflows,

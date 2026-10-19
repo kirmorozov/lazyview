@@ -55,7 +55,8 @@ UPDATE _lazyview SET rebuild = 1 WHERE name = 'paid_orders';
   definition and exits with code `1` if any is invalid.
 
 A definition that cannot be planned does not stop the service. The view gets `state = 'error'`
-with the reason in `last_error`, and the other views keep working. A view in error because a table
+with the reason in `last_error`, and the other views keep working. Planning one definition may
+take at most `LAZYVIEW_PLAN_TIMEOUT_MS` (10 s); past that it is in error until it changes. A view in error because a table
 was missing is retried when the table appears.
 
 ## The materialized table

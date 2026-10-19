@@ -135,6 +135,9 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
 * `LAZYVIEW_TEST_GLOBAL_TZ=1` enables `values_timestamp_dst_fall_back`, which changes the servers'
   GLOBAL `time_zone` while it runs. Only set it when no other suite uses the same servers at the
   same time (CI sets it; it runs one test binary at a time).
+* `LAZYVIEW_TEST_PLAN_DELAY=<marker>:<ms>` (an engine setting, for tests only): planning a
+  definition whose text contains `marker` first sleeps `ms` milliseconds
+  (`reg_slow_planning_is_bounded` uses it to test `LAZYVIEW_PLAN_TIMEOUT_MS`).
 
 Suites in `tests/`: `binlog_stream`, `brutal` (randomized correctness with many overlapping
 views), `ddl`, `efficiency`, `harness_selftest`, `health`, `lifecycle`, `migration`, `regressions`,

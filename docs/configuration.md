@@ -55,6 +55,7 @@ with the prefix `LAZYVIEW_TARGET_<NAME>_`:
 | `LAZYVIEW_TARGET_<NAME>_TLS`, `_TLS_CA` | `LAZYVIEW_TLS`, `LAZYVIEW_TLS_CA` | TLS for this target; the source's settings apply when unset |
 | `LAZYVIEW_TARGETS` | discovered | comma-separated target names. When unset, every `LAZYVIEW_TARGET_<NAME>_DSN` or `_HOST` variable defines a target |
 | `LAZYVIEW_TARGET_TIMEOUT_MS` | `60000` | upper bound for one write round trip to a target (minimum `1000`), so an unresponsive target cannot stall the binlog loop |
+| `LAZYVIEW_PLAN_TIMEOUT_MS` | `10000` | upper bound for planning one definition. Planning runs off the binlog loop; a definition that takes longer goes into error (``planning took longer than 10 s; simplify the definition or raise LAZYVIEW_PLAN_TIMEOUT_MS``) and is not planned again until it changes, `rebuild = 1` is set, or lazyview restarts |
 
 Discovered targets get lower-case names: `LAZYVIEW_TARGET_ANALYTICS_HOST` defines `analytics`.
 Names listed in `LAZYVIEW_TARGETS` are used as written; their variables use the name in upper

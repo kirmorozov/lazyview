@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, Value};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -330,6 +330,8 @@ struct Slot {
     /// `_lazyview.rebuild` was set when the binlog was here: cleared once a build started at or
     /// after this position is live.
     rebuild_asked: Option<Position>,
+    /// Hash of the definition whose planning timed out: not planned again until it changes.
+    plan_timed_out: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -407,6 +409,28 @@ impl std::fmt::Display for CaseClash {
 }
 
 impl std::error::Error for CaseClash {}
+
+/// Planning a definition took longer than `LAZYVIEW_PLAN_TIMEOUT_MS`: the definition is not
+/// planned again until it changes (the abandoned planner may still be running).
+#[derive(Debug)]
+struct PlanTimedOut(Duration);
+
+impl std::fmt::Display for PlanTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = self.0.as_millis();
+        let took = if ms.is_multiple_of(1000) {
+            format!("{} s", ms / 1000)
+        } else {
+            format!("{ms} ms")
+        };
+        write!(
+            f,
+            "planning took longer than {took}; simplify the definition or raise LAZYVIEW_PLAN_TIMEOUT_MS"
+        )
+    }
+}
+
+impl std::error::Error for PlanTimedOut {}
 
 /// A state row as last written (see [`Engine::restore_state_rows`]).
 #[derive(Debug, Clone)]
@@ -980,7 +1004,7 @@ impl Engine {
                 infos.insert(t, info);
             }
         }
-        let plan = analyze::plan(&parsed, &self.schema, &infos)?;
+        let plan = self.plan_bounded(definition, &parsed, infos).await?;
         if plan
             .cascades
             .iter()
@@ -990,6 +1014,48 @@ impl Engine {
             warn!(view = %plan.name, "reads a child of a cascading foreign key whose units cannot be derived from the parent; parent deletes/updates trigger an online rebuild");
         }
         Ok(plan)
+    }
+
+    /// Plans off the loop's thread, within `LAZYVIEW_PLAN_TIMEOUT_MS`: a definition that plans
+    /// pathologically slowly must not stall every view (and, past
+    /// `LAZYVIEW_LIVENESS_STALL_SECS`, make `/livez` restart the process, which plans it again).
+    async fn plan_bounded(
+        &mut self,
+        definition: &str,
+        parsed: &analyze::ParsedDef,
+        infos: HashMap<TableRef, Arc<TableInfo>>,
+    ) -> Result<ViewPlan> {
+        let (parsed, schema) = (parsed.clone(), self.schema.clone());
+        let delay = self
+            .cfg
+            .test_plan_delay
+            .as_ref()
+            .filter(|(marker, _)| definition.contains(marker.as_str()))
+            .map(|(_, d)| *d);
+        // A detached thread, not `spawn_blocking`: the runtime would wait for an abandoned
+        // planner at shutdown.
+        let (tx, rx) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("lazyview-plan".into())
+            .stack_size(8 << 20)
+            .spawn(move || {
+                if let Some(d) = delay {
+                    std::thread::sleep(d);
+                }
+                let _ = tx.send(analyze::plan(&parsed, &schema, &infos));
+            })
+            .context("starting the planner thread")?;
+        self.metrics.beat();
+        let r = tokio::time::timeout(self.cfg.plan_timeout, rx).await;
+        self.metrics.beat();
+        match r {
+            Ok(Ok(plan)) => plan,
+            Ok(Err(_)) => Err(anyhow!("planning failed: the planner panicked")),
+            Err(_) => {
+                Metrics::add(&self.metrics.plans_timed_out, 1);
+                Err(PlanTimedOut(self.cfg.plan_timeout).into())
+            }
+        }
     }
 
     async fn set_state(
@@ -1308,6 +1374,9 @@ impl Engine {
 
     /// A definition that cannot be planned (yet).
     async fn plan_failed(&mut self, idx: usize, e: &anyhow::Error) {
+        if e.downcast_ref::<PlanTimedOut>().is_some() {
+            self.slots[idx].plan_timed_out = Some(self.slots[idx].hash.clone());
+        }
         match e.downcast_ref::<WaitingFor>() {
             Some(w) => {
                 let up = w.0.clone();
@@ -1494,6 +1563,7 @@ impl Engine {
             refresh_failures: 0,
             replan_after: false,
             rebuild_asked: None,
+            plan_timed_out: None,
         });
         self.slots.len() - 1
     }
@@ -1803,6 +1873,8 @@ impl Engine {
                         if d.rebuild && s.rebuild_asked.is_none() {
                             info!(view = %s.name, "rebuild requested (_lazyview.rebuild = 1)");
                             self.slots[idx].rebuild_asked = Some(self.boundary.clone());
+                            // Also plans a definition again whose planning timed out.
+                            self.slots[idx].plan_timed_out = None;
                             self.schedule_replan(id, false, false);
                         }
                         continue;
@@ -3039,6 +3111,11 @@ impl Engine {
             let s = &self.slots[i];
             (s.definition.clone(), s.targets.clone(), s.def_id)
         };
+        // Planning it timed out: not again until the definition changes.
+        if self.slots[i].plan_timed_out.as_ref() == Some(&self.slots[i].hash) {
+            debug!(view = %self.slots[i].name, "not re-planned: planning timed out before");
+            return;
+        }
         if !freeze {
             // Upstream data replaced / retry of a failed build: if a build is already running,
             // let it finish and re-plan once more afterwards instead of restarting it.
@@ -3067,7 +3144,12 @@ impl Engine {
                 }
                 self.start_next(i, plan, name, targets, false).await;
             }
-            Err(e) if e.downcast_ref::<WaitingFor>().is_some() => self.plan_failed(i, &e).await,
+            Err(e)
+                if e.downcast_ref::<WaitingFor>().is_some()
+                    || e.downcast_ref::<PlanTimedOut>().is_some() =>
+            {
+                self.plan_failed(i, &e).await
+            }
             Err(e) => {
                 self.slot_error(i, &e).await;
                 // Transient causes (connection loss, table briefly missing) heal on retry.
