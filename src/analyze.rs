@@ -2901,15 +2901,17 @@ fn value_kind(e: &Expr, t: &TableInfo) -> ValueKind {
 
 /// How the server converts a value of `kind` (`?`) to `c`'s declared type when it reads a
 /// VIRTUAL column, as SQL; `None` where no exact SQL form is known. Measured on MySQL 8.4 / 26.7 /
-/// 26.10, Percona 8.4 / 9.7 and MariaDB 10.11 / 13.0 / 13.2 (B1): integer columns round a DOUBLE
-/// half to even (as `CAST(… AS SIGNED)` does) and a string through DECIMAL, and clip to their
-/// range; DECIMAL(p,s) and DOUBLE are their CAST; DATE from a DATETIME rounds (MySQL) or
-/// truncates (MariaDB) the time like `CAST(… AS DATETIME)`; strings take the length, charset and
-/// collation (CHAR drops trailing spaces). Not exact: FLOAT (MySQL refuses out-of-range CASTs),
-/// BIGINT UNSIGNED from a DOUBLE or string, a number into a string (`i / 3` prints 9 decimals in
-/// the column on MySQL 8.4 and MariaDB, 4 on MySQL 9, 4 by CONVERT everywhere), a temporal value
-/// into a string short enough to cut it, DATE from a string (MySQL stores zero dates), TEXT /
-/// TINYTEXT byte limits, other types.
+/// 26.10, Percona 8.4 / 9.7 and MariaDB 10.11 / 13.0 / 13.2 (B1, F1, F2): integer columns round
+/// a DOUBLE half to even (as `CAST(… AS SIGNED)` does) and an exact number or a string half away
+/// from zero (through `DECIMAL(65,0)`), and clip to their range (before the CAST, which wraps an
+/// unsigned value >= 2^63 and raises ERROR 1690 for an out-of-range function result on MySQL);
+/// DECIMAL(p,s) and DOUBLE are their CAST; DATE from a DATETIME rounds (MySQL) or truncates
+/// (MariaDB) the time like `CAST(… AS DATETIME)`; strings take the length, charset and collation
+/// (CHAR drops trailing spaces). Not exact: FLOAT (MySQL refuses out-of-range CASTs), BIGINT
+/// UNSIGNED from a DOUBLE (MySQL raises 1690 inside any clip), a number into a string (`i / 3`
+/// prints 9 decimals in the column on MySQL 8.4 and MariaDB, 4 on MySQL 9, 4 by CONVERT
+/// everywhere), a temporal value into a string short enough to cut it, DATE from a string (MySQL
+/// stores zero dates), TEXT / TINYTEXT byte limits, other types.
 fn virtual_conversion(c: &crate::catalog::Column, kind: ValueKind) -> Option<String> {
     use ValueKind::*;
     let ct = &c.column_type;
@@ -2939,11 +2941,6 @@ fn virtual_conversion(c: &crate::catalog::Column, kind: ValueKind) -> Option<Str
     };
     Some(match c.data_type.as_str() {
         "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => {
-            let base = match kind {
-                Num | Dbl | Null => "CAST(? AS SIGNED)",
-                Str => "CAST(CAST(? AS DECIMAL(65,30)) AS SIGNED)",
-                _ => return None,
-            };
             let bits = match c.data_type.as_str() {
                 "tinyint" => 8,
                 "smallint" => 16,
@@ -2951,16 +2948,26 @@ fn virtual_conversion(c: &crate::catalog::Column, kind: ValueKind) -> Option<Str
                 "bigint" => 64,
                 _ => 32,
             };
-            match (bits, unsigned) {
-                (64, false) => base.to_string(),
-                (64, true) if matches!(kind, Num | Null) => {
-                    "IF(? < 0, 0, CAST(? AS UNSIGNED))".into()
-                }
-                (64, true) => return None,
-                _ => {
-                    let (min, max) = range(bits);
-                    format!("LEAST(GREATEST({base}, {min}), {max})")
-                }
+            let (min, max) = range(bits);
+            match kind {
+                // Clipped in the DECIMAL domain, then cast: DECIMAL(65,0) rounds half away from
+                // zero and parses a string like the column, and the CAST never sees a value out
+                // of its range (CAST(… AS SIGNED) of an unsigned value >= 2^63 wraps, F1).
+                Num | Str | Null => format!(
+                    "CAST(LEAST(GREATEST(CAST(? AS DECIMAL(65,0)), {min}), {max}) AS {})",
+                    if unsigned && bits == 64 {
+                        "UNSIGNED"
+                    } else {
+                        "SIGNED"
+                    }
+                ),
+                // A DOUBLE rounds half to even as CAST does; it is clipped first because MySQL
+                // raises ERROR 1690 for a function result out of BIGINT range (F2).
+                Dbl if bits < 64 => format!("CAST(LEAST(GREATEST(?, {min}), {max}) AS SIGNED)"),
+                Dbl if !unsigned => "IF(? >= 9.223372036854775807e18, 9223372036854775807, \
+                     CAST(GREATEST(?, -9.223372036854775808e18) AS SIGNED))"
+                    .into(),
+                _ => return None,
             }
         }
         "decimal" | "numeric" if matches!(kind, Num | Dbl | Str | Null) => {
@@ -3017,6 +3024,9 @@ fn virtual_conversion(c: &crate::catalog::Column, kind: ValueKind) -> Option<Str
     })
 }
 
+/// Most base-column references the inlined form of one VIRTUAL column may have.
+const VIRTUAL_BUDGET: usize = 256;
+
 /// What a reference to VIRTUAL column `c` of `t` (named `alias` in the query) stands for: its
 /// generation expression over the alias's columns, nested VIRTUAL columns expanded the same
 /// way, converted to the declared type ([`virtual_conversion`]). `Err`: why it cannot be.
@@ -3025,6 +3035,54 @@ pub(crate) fn virtual_expansion(
     t: &TableInfo,
     c: usize,
 ) -> std::result::Result<Expr, String> {
+    // Nested VIRTUAL columns are copied per reference (fan-out^depth, F4): the size is measured
+    // first, memoized per column, so an expansion past the budget is refused before it is built.
+    fn size(
+        t: &TableInfo,
+        c: usize,
+        memo: &mut HashMap<usize, Option<usize>>,
+        depth: usize,
+    ) -> Option<usize> {
+        if let Some(&n) = memo.get(&c) {
+            return n;
+        }
+        let g = t.columns[c].generated.as_ref()?;
+        let n = if depth > 16 {
+            None
+        } else {
+            parse_sql(&g.expr, |p| p.parse_expr()).and_then(|e| {
+                let mut n = 0usize;
+                let mut ok = true;
+                let _ = visit_expressions(&e, |x: &Expr| {
+                    let name = match x {
+                        Expr::Identifier(i) => Some(ident_name(i)),
+                        Expr::CompoundIdentifier(parts) => parts.last().map(ident_name),
+                        _ => None,
+                    };
+                    if let Some(i) = name.and_then(|n| t.col_index(&n)) {
+                        let nested = t.columns[i].generated.as_ref().is_some_and(|g| !g.stored);
+                        match nested.then(|| size(t, i, memo, depth + 1)) {
+                            Some(Some(k)) => n = n.saturating_add(k),
+                            Some(None) => ok = false,
+                            None => n = n.saturating_add(1),
+                        }
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
+                ok.then_some(n)
+            })
+        };
+        memo.insert(c, n);
+        n
+    }
+    if let Some(n) = size(t, c, &mut HashMap::new(), 0) {
+        if n > VIRTUAL_BUDGET {
+            return Err(format!(
+                "VIRTUAL generated column `{}`.`{}` expands to {n} base-column references (budget {VIRTUAL_BUDGET}): its nested VIRTUAL columns are copied per reference",
+                t.name, t.columns[c].name
+            ));
+        }
+    }
     fn expand(
         alias: &str,
         t: &TableInfo,
@@ -4474,19 +4532,19 @@ mod tests {
         assert_eq!(
             v.projection,
             vec![
-                "(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS SIGNED), -2147483648), 2147483647)) AS `g`",
+                "(CAST(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS DECIMAL(65,0)), -2147483648), 2147483647) AS SIGNED)) AS `g`",
                 "s"
             ]
         );
         assert_eq!(
             v.where_sql.as_deref(),
-            Some("(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS SIGNED), -2147483648), 2147483647)) > 1")
+            Some("(CAST(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS DECIMAL(65,0)), -2147483648), 2147483647) AS SIGNED)) > 1")
         );
         let a = &v.aliases[0];
         assert!(a.referenced[1] && a.referenced[2] && a.referenced[4] && !a.referenced[3]);
         assert!(a.membership[1] && a.membership[2]);
         let v = plan("CREATE VIEW v AS SELECT DISTINCT g FROM skus", &cat);
-        assert_eq!(v.unit_exprs, vec!["(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS SIGNED), -2147483648), 2147483647))"]);
+        assert_eq!(v.unit_exprs, vec!["(CAST(LEAST(GREATEST(CAST((`skus`.`a` + `skus`.`b`) AS DECIMAL(65,0)), -2147483648), 2147483647) AS SIGNED))"]);
         let mut keyless = (*cat[&("db".to_string(), "skus".to_string())]).clone();
         keyless.unique_keys.clear();
         cat.insert(("db".into(), "skus".into()), Arc::new(keyless));

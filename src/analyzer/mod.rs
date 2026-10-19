@@ -81,8 +81,33 @@ pub fn plan(
 /// multiply-referenced CTE belongs in an internal view instead of being copied.
 pub(crate) const INLINE_BUDGET: usize = 32;
 
+/// Largest refresh SELECT a plan may render (the budgets above bound the analyzer's work; this
+/// is the last guard before a statement the engine would send on every refresh).
+const MAX_PLANNED_SQL: usize = 1 << 20;
+
 /// Plans a definition, isolating subtrees into internal views where `opts` allows it.
 pub fn analyze(
+    def: &ParsedDef,
+    default_schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+    opts: &Options,
+) -> Result<Outcome> {
+    let out = analyze_block(def, default_schema, tables, opts)?;
+    if let Outcome::Plan(p) = &out {
+        if !matches!(p.mode, Mode::Full(_)) {
+            let n = p.select_sql(&[], None).len();
+            if n > MAX_PLANNED_SQL {
+                let why = format!(
+                    "the planned SELECT is {n} bytes (limit {MAX_PLANNED_SQL}): too large to run on every refresh"
+                );
+                return lower::full_plan(def, default_schema, tables, &why).map(Outcome::Plan);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn analyze_block(
     def: &ParsedDef,
     default_schema: &str,
     tables: &HashMap<TableRef, Arc<TableInfo>>,

@@ -1771,6 +1771,65 @@ fn semi(
     )))
 }
 
+/// `s` with the aliases of its subquery's tables renamed away from `taken` (the lower-case
+/// aliases of the block it belongs to, after every merge and rewrite): the outer expressions
+/// filled into its predicate and lookup conditions must not be captured by a subquery table of
+/// the same name (F3: `d.customer_id` merged into `o.customer_id` against the subquery's own
+/// `o`; also an unqualified outer column qualified with an alias the subquery declares).
+pub(crate) fn semi_renamed(s: &Semi, taken: &HashSet<String>) -> Semi {
+    let mut used: HashSet<String> = taken.clone();
+    used.extend(s.tables.iter().map(|t| t.alias.to_lowercase()));
+    let mut out = s.clone();
+    let mut renames: HashMap<String, String> = HashMap::new();
+    for t in &mut out.tables {
+        if !taken.contains(&t.alias.to_lowercase()) {
+            continue;
+        }
+        let mut n = 1;
+        let fresh = loop {
+            let a = if t.alias.chars().count() <= 58 {
+                format!("{}__m{n}", t.alias)
+            } else {
+                // (`_lv_` names are reserved for lazyview: no user alias collides.)
+                format!("_lv_m{n}")
+            };
+            if !used.contains(&a.to_lowercase()) {
+                break a;
+            }
+            n += 1;
+        };
+        used.insert(fresh.to_lowercase());
+        renames.insert(t.alias.to_lowercase(), fresh.clone());
+        t.alias = fresh;
+    }
+    if renames.is_empty() {
+        return out;
+    }
+    rename_refs(&mut out.predicate, &renames);
+    if let Expr::InSubquery { subquery, .. } | Expr::Exists { subquery, .. } = &mut out.predicate {
+        if let SetExpr::Select(sel) = subquery.body.as_mut() {
+            for twj in &mut sel.from {
+                for f in std::iter::once(&mut twj.relation)
+                    .chain(twj.joins.iter_mut().map(|j| &mut j.relation))
+                {
+                    if let Some(new) = factor_name(f).and_then(|n| renames.get(&n.to_lowercase())) {
+                        let new = new.clone();
+                        set_factor_alias(f, &new);
+                    }
+                }
+            }
+        }
+    }
+    for c in out
+        .join_conditions
+        .iter_mut()
+        .chain(out.lookup_conditions.iter_mut())
+    {
+        rename_refs(c, &renames);
+    }
+    out
+}
+
 /// Whether the semi-join is over one table and its correlation covers the table's primary key
 /// (each outer row matches at most one row of the table: the semi-join is an inner join).
 fn unique(s: &Semi) -> bool {

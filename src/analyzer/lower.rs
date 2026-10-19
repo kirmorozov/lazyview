@@ -2,7 +2,7 @@
 //! (`analyze::plan`) turns into the executor's [`ViewPlan`]; semi-join aliases are attached
 //! afterwards. Full plans keep the statement exactly as written.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -12,7 +12,7 @@ use sqlparser::tokenizer::Token;
 use super::ast::{and_all, qident};
 use super::ir::{Block, Semi};
 use super::names::{finish_view_names, ident_name};
-use super::normalize::{fill_placeholders, marker_args, marker_name, query_of};
+use super::normalize::{fill_placeholders, marker_args, marker_name, query_of, semi_renamed};
 use super::source::tokenize;
 use crate::analyze::{self, AliasPlan, Mode, ParsedDef, ViewPlan};
 use crate::catalog::{TableInfo, TableRef};
@@ -127,7 +127,10 @@ fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refus
         .lookup_where_sql
         .clone()
         .unwrap_or_else(|| where_sql.clone());
+    // The subquery's own aliases must not capture the outer expressions filled in (F3).
+    let taken: HashSet<String> = b.items.iter().map(|i| i.alias.to_lowercase()).collect();
     for s in &b.semis {
+        let s = &semi_renamed(s, &taken);
         let args = marker_args(w, s.id).ok_or_else(missing)?;
         let mut pred = s.predicate.clone();
         fill_placeholders(&mut pred, &args);

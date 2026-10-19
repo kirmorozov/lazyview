@@ -1879,3 +1879,283 @@ fn cte_virtual_columns_match_their_oracles() {
         Ok(())
     });
 }
+
+// --- F1 / F2 / F4: integer VIRTUAL columns at the edges of their range, nesting fan-out.
+
+const VIRTUAL_INT_DDL: &[&str] = &[
+    // Values as stored: the rows are written in a non-strict sql_mode (strict mode refuses them).
+    "SET SESSION sql_mode = ''",
+    "CREATE TABLE vu (id INT NOT NULL PRIMARY KEY, u BIGINT UNSIGNED NULL, cat INT NULL,
+     gi INT AS (u) VIRTUAL, giu INT UNSIGNED AS (u) VIRTUAL, gb BIGINT AS (u) VIRTUAL, gsum INT AS (u + 0) VIRTUAL)",
+    "INSERT INTO vu (id, u, cat) VALUES (1, 5, 1), (2, 18446744073709551615, 1), (3, 9223372036854775808, 2),
+     (4, 2147483648, 2), (5, NULL, 3)",
+    "CREATE TABLE vd (id INT NOT NULL PRIMARY KEY, dbl DOUBLE NULL,
+     gr INT AS (ROUND(dbl, 1)) VIRTUAL, gn BIGINT AS (-dbl) VIRTUAL, gm INT AS (dbl * 2) VIRTUAL)",
+    "INSERT INTO vd (id, dbl) VALUES (1, 2.5), (2, -3.5), (3, NULL)",
+    // 8-way fan-out per level: h2 inlines 64 base-column references, h6 262144.
+    "CREATE TABLE vg (id INT NOT NULL PRIMARY KEY, a BIGINT NULL, h0 BIGINT AS (a) VIRTUAL,
+     h1 BIGINT AS (GREATEST(h0, h0, h0, h0, h0, h0, h0, h0)) VIRTUAL,
+     h2 BIGINT AS (GREATEST(h1, h1, h1, h1, h1, h1, h1, h1)) VIRTUAL,
+     h3 BIGINT AS (GREATEST(h2, h2, h2, h2, h2, h2, h2, h2)) VIRTUAL,
+     h4 BIGINT AS (GREATEST(h3, h3, h3, h3, h3, h3, h3, h3)) VIRTUAL,
+     h5 BIGINT AS (GREATEST(h4, h4, h4, h4, h4, h4, h4, h4)) VIRTUAL,
+     h6 BIGINT AS (GREATEST(h5, h5, h5, h5, h5, h5, h5, h5)) VIRTUAL)",
+    "INSERT INTO vg (id, a) VALUES (1, 10), (2, NULL), (3, -4)",
+];
+
+fn virtual_int_cases() -> Vec<Case> {
+    vec![
+        // F1: an unsigned value >= 2^63 clips like the column (CAST AS SIGNED would wrap).
+        case("vu_proj", "incremental", "spj", "SELECT id, gi, giu, gb, gsum FROM vu"),
+        case("vu_where", "incremental", "spj", "SELECT id FROM vu WHERE gi = 2147483647"),
+        case("vu_group", "incremental", "grouped", "SELECT gi, COUNT(*) AS n FROM vu GROUP BY gi"),
+        case(
+            "vu_sum",
+            "incremental",
+            "grouped",
+            "SELECT cat, SUM(gb) AS s, MIN(giu) AS m FROM vu GROUP BY cat",
+        ),
+        // F2: a DOUBLE function result out of BIGINT range clips (MySQL's CAST would raise 1690).
+        case("vd_round", "incremental", "spj", "SELECT id, gr FROM vd"),
+        case("vd_neg", "incremental", "spj", "SELECT id, gn FROM vd"),
+        case("vd_group", "incremental", "grouped", "SELECT gm, COUNT(*) AS n FROM vd GROUP BY gm"),
+        // F4: within the budget the nesting is inlined, past it Full naming the column (fast).
+        case("vg_h2", "incremental", "spj", "SELECT id, h2 FROM vg"),
+        case(
+            "vg_h6",
+            "full",
+            "VIRTUAL generated column `vg`.`h6` expands to 262144 base-column references (budget 256): its nested VIRTUAL columns are copied per reference",
+            "SELECT id, h6 FROM vg",
+        ),
+    ]
+}
+
+fn virtual_int_steps() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "u to 2^63 - 1",
+            "UPDATE vu SET u = 9223372036854775807 WHERE id = 3",
+        ),
+        (
+            "u past 2^63",
+            "UPDATE vu SET u = 9223372036854775809 WHERE id = 3",
+        ),
+        (
+            "u near 2^64 inserted",
+            "INSERT INTO vu (id, u, cat) VALUES (6, 18446744073709551614, 3)",
+        ),
+        ("u max deleted", "DELETE FROM vu WHERE id = 2"),
+        ("double 1e300", "INSERT INTO vd (id, dbl) VALUES (4, 1e300)"),
+        ("double -1e19", "INSERT INTO vd (id, dbl) VALUES (5, -1e19)"),
+        ("both deleted", "DELETE FROM vd WHERE id IN (4, 5)"),
+        ("double 7.25", "INSERT INTO vd (id, dbl) VALUES (6, 7.25)"),
+        ("nested base column", "UPDATE vg SET a = 7 WHERE id = 1"),
+    ]
+}
+
+async fn run_virtual_int(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
+    let db = ctx.new_db(&format!("cte_vint_{label}")).await?;
+    let mut c = db.conn().await?;
+    for s in VIRTUAL_INT_DDL {
+        exec(&mut c, s).await?;
+    }
+    let started = std::time::Instant::now();
+    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), virtual_int_cases()).await?;
+    anyhow::ensure!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "planning took {:?}",
+        started.elapsed()
+    );
+    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        &format!("{label}: initial build"),
+    )
+    .await?;
+    for (what, stmt) in virtual_int_steps() {
+        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
+        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
+    }
+    assert_ready(&mut c, &names(&specs)).await?;
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// F1 / F2 / F4: integer VIRTUAL columns over unsigned values >= 2^63 and out-of-range DOUBLE
+/// function results clip like the column; a nested fan-out past the budget is Full, quickly.
+#[test]
+fn cte_virtual_integers_match_their_oracles() {
+    scenario("cte_vint", |ctx| async move {
+        run_virtual_int(&ctx, "w0", "0").await?;
+        run_virtual_int(&ctx, "w50", "50").await?;
+        Ok(())
+    });
+}
+
+// --- F3: no alias capture between a semi-join subquery and merged outer aliases.
+
+const CAPTURE_DDL: &[&str] = &[
+    "CREATE TABLE customers (id INT NOT NULL PRIMARY KEY, name VARCHAR(20) NOT NULL, ref INT NULL)",
+    "CREATE TABLE orders (id INT NOT NULL PRIMARY KEY, customer_id INT NULL, total DECIMAL(10,2) NOT NULL)",
+    "CREATE TABLE payments (id INT NOT NULL PRIMARY KEY, order_id INT NULL, amount DECIMAL(10,2) NOT NULL)",
+    "INSERT INTO customers VALUES (1,'ann',2),(2,'bob',NULL),(3,'cy',1),(4,'dee',4)",
+    "INSERT INTO orders VALUES (10,1,100),(11,1,700),(20,2,450),(30,3,50),(31,3,300),(40,4,900)",
+    "INSERT INTO payments VALUES (100,10,100),(110,11,500),(200,20,450),(300,30,50),(310,31,300)",
+];
+
+/// (name, detail, template): `{D}` derived / CTE alias, `{I}` its inner alias, `{S}` / `{T}` the
+/// subquery's aliases.
+const CAPTURE_TEMPLATES: &[(&str, &str, &str)] = &[
+    (
+        "exists_join",
+        "spj",
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE EXISTS
+         (SELECT 1 FROM orders {S} JOIN payments {T} ON {T}.order_id = {S}.id WHERE {S}.customer_id = {D}.customer_id AND {T}.amount > 400)",
+    ),
+    (
+        "not_exists_join",
+        "spj",
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE NOT EXISTS
+         (SELECT 1 FROM orders {S} JOIN payments {T} ON {T}.order_id = {S}.id WHERE {S}.customer_id = {D}.customer_id AND {T}.amount > 400)",
+    ),
+    (
+        "cte_exists_join",
+        "spj",
+        "WITH {D} AS (SELECT {I}.id, {I}.customer_id FROM orders {I}) SELECT {D}.id FROM {D} WHERE EXISTS
+         (SELECT 1 FROM orders {S} JOIN payments {T} ON {T}.order_id = {S}.id WHERE {S}.customer_id = {D}.customer_id AND {T}.amount > 400)",
+    ),
+    (
+        "exists_self",
+        "spj",
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.ref FROM customers {I}) {D} WHERE EXISTS
+         (SELECT 1 FROM customers {S} WHERE {S}.ref = {D}.id)",
+    ),
+    (
+        "exists_other",
+        "spj",
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE EXISTS
+         (SELECT 1 FROM payments {S} WHERE {S}.order_id = {D}.id AND {S}.amount > 400)",
+    ),
+    (
+        "exists_other_grouped",
+        "grouped",
+        "SELECT {D}.customer_id, COUNT(*) AS n FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE EXISTS
+         (SELECT 1 FROM payments {S} WHERE {S}.order_id = {D}.id AND {S}.amount > 400) GROUP BY {D}.customer_id",
+    ),
+    (
+        "in_join",
+        "spj",
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE {D}.customer_id IN
+         (SELECT {S}.customer_id FROM orders {S} JOIN payments {T} ON {T}.order_id = {S}.id WHERE {T}.amount > 400)",
+    ),
+    (
+        "nested_derived",
+        "spj",
+        "SELECT {D}.id FROM (SELECT e.id, e.customer_id FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) e) {D}
+         WHERE EXISTS (SELECT 1 FROM payments {S} WHERE {S}.order_id = {D}.id AND {S}.amount > 400)",
+    ),
+];
+
+/// The reviewer's aliases (`d`, `o`, `o`, `p`), a control without collisions, and seeded random
+/// renamings from a small pool (collisions are likely).
+fn capture_cases() -> Vec<Case> {
+    let pool = ["o", "d", "p", "s", "x", "O", "e2"];
+    let mut seed: u64 = std::env::var("LAZYVIEW_TEST_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0xf3f3);
+    let mut pick = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        pool[(seed % pool.len() as u64) as usize]
+    };
+    let mut out = Vec::new();
+    for (name, detail, t) in CAPTURE_TEMPLATES {
+        let mut variants = vec![("d", "o", "o", "p"), ("x", "o", "s", "q")];
+        while variants.len() < 5 {
+            let v = (pick(), pick(), pick(), pick());
+            if !v.2.eq_ignore_ascii_case(v.3) && !v.0.eq_ignore_ascii_case("e") {
+                variants.push(v);
+            }
+        }
+        for (k, (d, i, s, x)) in variants.into_iter().enumerate() {
+            let select = t
+                .replace("{D}", d)
+                .replace("{I}", i)
+                .replace("{S}", s)
+                .replace("{T}", x);
+            let name: &'static str = Box::leak(format!("cap_{name}_{k}").into_boxed_str());
+            let select: &'static str = Box::leak(select.into_boxed_str());
+            out.push(case(name, "incremental", detail, select));
+        }
+    }
+    out
+}
+
+fn capture_steps() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "payment over the threshold",
+            "UPDATE payments SET amount = 401 WHERE id = 310",
+        ),
+        (
+            "payment under the threshold",
+            "UPDATE payments SET amount = 1 WHERE id = 110",
+        ),
+        (
+            "order moved",
+            "UPDATE orders SET customer_id = 2 WHERE id = 31",
+        ),
+        ("payment deleted", "DELETE FROM payments WHERE id = 200"),
+        (
+            "payment added",
+            "INSERT INTO payments VALUES (400, 40, 900)",
+        ),
+        (
+            "referrer changed",
+            "UPDATE customers SET ref = 3 WHERE id = 2",
+        ),
+    ]
+}
+
+async fn run_capture(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
+    let db = ctx.new_db(&format!("cte_capture_{label}")).await?;
+    let mut c = db.conn().await?;
+    for s in CAPTURE_DDL {
+        exec(&mut c, s).await?;
+    }
+    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), capture_cases()).await?;
+    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        &format!("{label}: initial build"),
+    )
+    .await?;
+    for (what, stmt) in capture_steps() {
+        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
+        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
+    }
+    assert_ready(&mut c, &names(&specs)).await?;
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// F3: correlated subqueries over a merged derived table / CTE keep their meaning whatever the
+/// aliases (the reviewer's colliding ones, a control, seeded random renamings).
+#[test]
+fn cte_semi_joins_never_capture_aliases() {
+    scenario("cte_capture", |ctx| async move {
+        run_capture(&ctx, "w0", "0").await?;
+        run_capture(&ctx, "w50", "50").await?;
+        Ok(())
+    });
+}

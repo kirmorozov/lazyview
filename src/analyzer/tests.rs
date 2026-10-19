@@ -335,7 +335,7 @@ fn virtual_columns_convert_to_their_declared_type() {
         let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
         analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
     };
-    let gi = "(LEAST(GREATEST(CAST((`g1`.`a` / 3) AS SIGNED), -2147483648), 2147483647))";
+    let gi = "(CAST(LEAST(GREATEST(CAST((`g1`.`a` / 3) AS DECIMAL(65,0)), -2147483648), 2147483647) AS SIGNED))";
     let v = plan("SELECT id, gi, gd FROM g1 WHERE gi = 0");
     assert_eq!(
         v.projection,
@@ -360,7 +360,7 @@ fn virtual_columns_convert_to_their_declared_type() {
     // Nested: gchain reads gi through gi's conversion, the same text everywhere (MySQL's
     // ONLY_FULL_GROUP_BY compares the projection with the GROUP BY).
     let v = plan("SELECT gchain, COUNT(*) AS n FROM g1 GROUP BY gchain");
-    let chain = format!("(LEAST(GREATEST(CAST(({gi} * 10) AS SIGNED), -2147483648), 2147483647))");
+    let chain = format!("(CAST(LEAST(GREATEST(CAST(({gi} * 10) AS DECIMAL(65,0)), -2147483648), 2147483647) AS SIGNED))");
     assert_eq!(v.unit_exprs, std::slice::from_ref(&chain));
     assert_eq!(v.projection[0], format!("{chain} AS `gchain`"));
     assert_eq!(v.group_sql.as_deref(), Some(chain.as_str()));
@@ -417,6 +417,187 @@ fn virtual_columns_convert_to_their_declared_type() {
             m => panic!("{sql}: expected Full, got {m:?}"),
         }
     }
+}
+
+/// F1 / F2: integer targets clip before the CAST (an unsigned value >= 2^63 would wrap, an
+/// out-of-range DOUBLE function result raises ERROR 1690 on MySQL); F4: nested VIRTUAL columns
+/// (copied per reference) are measured before they are built and refused past the budget.
+#[test]
+fn virtual_integers_clip_and_nesting_is_bounded() {
+    use crate::catalog::Generated;
+    let col = |n: &str, dt: &str, ct: &str| Column::new(n, dt, ct, None, None, None, false);
+    let gen = |mut c: Column, expr: &str, deps: Vec<usize>| {
+        c.generated = Some(Generated {
+            expr: expr.into(),
+            stored: false,
+            deps: Some(deps),
+        });
+        c
+    };
+    let mut vg = vec![
+        col("id", "int", "int"),
+        col("a", "bigint", "bigint"),
+        gen(col("h0", "bigint", "bigint"), "`a`", vec![1]),
+    ];
+    for k in 1..8 {
+        let prev = format!("`h{}`", k - 1);
+        vg.push(gen(
+            col(&format!("h{k}"), "bigint", "bigint"),
+            &format!("greatest({})", vec![prev; 8].join(",")),
+            vec![k + 1],
+        ));
+    }
+    let mut cat = catalog();
+    for (k, t) in [
+        typed(
+            "vu",
+            vec![
+                col("id", "int", "int"),
+                col("u", "bigint", "bigint unsigned"),
+                col("dbl", "double", "double"),
+                gen(col("gi", "int", "int"), "`u`", vec![1]),
+                gen(col("gb", "bigint", "bigint unsigned"), "(`u` + 0)", vec![1]),
+                gen(col("gr", "int", "int"), "round(`dbl`,1)", vec![2]),
+                gen(col("gn", "bigint", "bigint"), "-(`dbl`)", vec![2]),
+                gen(col("gbu", "bigint", "bigint unsigned"), "`dbl`", vec![2]),
+            ],
+            &[0],
+        ),
+        typed("vg", vg, &[0]),
+    ] {
+        cat.insert(k, t);
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        let t = std::time::Instant::now();
+        let p = analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+        assert!(t.elapsed().as_millis() < 1000, "{sql}: {:?}", t.elapsed());
+        p
+    };
+    let v = plan("SELECT id, gi, gb, gr, gn FROM vu");
+    assert_eq!(
+        v.projection,
+        [
+            "id",
+            "(CAST(LEAST(GREATEST(CAST((`vu`.`u`) AS DECIMAL(65,0)), -2147483648), 2147483647) AS SIGNED)) AS `gi`",
+            "(CAST(LEAST(GREATEST(CAST((`vu`.`u` + 0) AS DECIMAL(65,0)), 0), 18446744073709551615) AS UNSIGNED)) AS `gb`",
+            "(CAST(LEAST(GREATEST((round(`vu`.`dbl`, 1)), -2147483648), 2147483647) AS SIGNED)) AS `gr`",
+            "(IF((-(`vu`.`dbl`)) >= 9.223372036854775807e18, 9223372036854775807, CAST(GREATEST((-(`vu`.`dbl`)), -9.223372036854775808e18) AS SIGNED))) AS `gn`",
+        ]
+    );
+    assert_eq!(
+        plan("SELECT id, gbu FROM vu").mode,
+        Mode::Full("VIRTUAL generated column `vu`.`gbu` of type bigint unsigned: no exact SQL conversion of its expression (a floating-point number) to that type".into())
+    );
+    // The last guard: a refresh SELECT past 1 MiB is not planned incrementally.
+    let big = format!(
+        "CREATE VIEW v AS SELECT id, '{}' AS pad FROM orders",
+        "x".repeat(1 << 20)
+    );
+    match p(&big).mode {
+        Mode::Full(r) => assert!(
+            r.starts_with("the planned SELECT is ") && r.contains("bytes (limit 1048576)"),
+            "{r}"
+        ),
+        m => panic!("{m:?}"),
+    }
+    // 8-way fan-out per level: h2 is 64 references, h3 512.
+    assert_eq!(plan("SELECT id, h2 FROM vg").mode, Mode::Spj);
+    for k in [3, 6, 7] {
+        let n = 8usize.pow(k);
+        match plan(&format!("SELECT id, h{k} FROM vg")).mode {
+            Mode::Full(r) => assert_eq!(
+                r,
+                format!("VIRTUAL generated column `vg`.`h{k}` expands to {n} base-column references (budget 256): its nested VIRTUAL columns are copied per reference")
+            ),
+            m => panic!("h{k}: {m:?}"),
+        }
+    }
+}
+
+/// F3: alias renamings that make a subquery's alias equal to an outer alias (after a derived
+/// table / CTE merge, or after qualifying an unqualified outer column) never let the subquery
+/// capture the outer expressions filled into it: its tables are renamed away from the block's.
+#[test]
+fn semi_join_subqueries_never_capture_outer_aliases() {
+    let templates = [
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE EXISTS \
+         (SELECT 1 FROM orders {S} JOIN order_items {T} ON {T}.order_id = {S}.id WHERE {S}.customer_id = {D}.customer_id AND {T}.qty > 4)",
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE NOT EXISTS \
+         (SELECT 1 FROM orders {S} JOIN order_items {T} ON {T}.order_id = {S}.id WHERE {S}.customer_id = {D}.customer_id AND {T}.qty > 4)",
+        "WITH {D} AS (SELECT {I}.id, {I}.customer_id FROM orders {I}) SELECT {D}.id FROM {D} WHERE EXISTS \
+         (SELECT 1 FROM orders {S} JOIN order_items {T} ON {T}.order_id = {S}.id WHERE {S}.customer_id = {D}.customer_id)",
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.region_id FROM customers {I}) {D} WHERE EXISTS \
+         (SELECT 1 FROM customers {S} WHERE {S}.region_id = {D}.id)",
+        "SELECT {D}.customer_id, COUNT(*) AS n FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE EXISTS \
+         (SELECT 1 FROM order_items {S} WHERE {S}.order_id = {D}.id AND {S}.qty > 4) GROUP BY {D}.customer_id",
+        "SELECT {D}.id FROM (SELECT {I}.id, {I}.customer_id FROM orders {I}) {D} WHERE {D}.customer_id IN \
+         (SELECT {S}.customer_id FROM orders {S} JOIN order_items {T} ON {T}.order_id = {S}.id WHERE {T}.qty > 4)",
+        // An unqualified outer column, qualified with the outer alias by the analyzer.
+        "SELECT {I}.id FROM orders {I} WHERE EXISTS (SELECT 1 FROM order_items {S} WHERE {S}.order_id = {I}.id AND {S}.price > total)",
+    ];
+    let pool = ["o", "d", "p", "s", "x", "i", "T", "O"];
+    let mut seed: u64 = 0x005e_edf3;
+    let mut pick = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        pool[(seed % pool.len() as u64) as usize]
+    };
+    let mut checked = 0;
+    for t in templates {
+        for round in 0..24 {
+            let (d, i, s, x) = if round == 0 {
+                ("d", "o", "o", "p")
+            } else {
+                (pick(), pick(), pick(), pick())
+            };
+            if s.eq_ignore_ascii_case(x)
+                || (t.starts_with("SELECT {I}") && i.eq_ignore_ascii_case(s))
+            {
+                continue;
+            }
+            let sql = t
+                .replace("{D}", d)
+                .replace("{I}", i)
+                .replace("{S}", s)
+                .replace("{T}", x);
+            let v = p(&format!("CREATE VIEW v AS {sql}"));
+            assert!(v.is_incremental(), "{sql}: {:?}", v.mode);
+            let from: Vec<String> = v
+                .aliases
+                .iter()
+                .filter(|a| a.pos.0 != usize::MAX)
+                .map(|a| a.name.to_lowercase())
+                .collect();
+            for a in v.aliases.iter().filter(|a| a.pos.0 == usize::MAX) {
+                assert!(
+                    !from.contains(&a.name.to_lowercase()),
+                    "{sql}: {} captures",
+                    a.name
+                );
+                let template = a.semi.as_deref().unwrap();
+                assert!(
+                    template.contains(&format!("AS {}", super::ast::qident(&a.name))),
+                    "{sql}: {template}"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "{checked}");
+    // The reviewer's shape, rendered: the correlation compares the subquery's renamed `o` with
+    // the merged outer `o`.
+    let v = p("CREATE VIEW v AS SELECT d.id FROM (SELECT o.id, o.customer_id FROM orders o) d WHERE EXISTS \
+               (SELECT 1 FROM orders o JOIN order_items p ON p.order_id = o.id WHERE o.customer_id = d.customer_id AND p.qty > 4)");
+    assert!(
+        v.where_sql
+            .as_deref()
+            .unwrap()
+            .contains("`o__m1`.customer_id = `o`.customer_id AND"),
+        "{:?}",
+        v.where_sql
+    );
 }
 
 /// L6: the budget applies to each join block on its own (a UNION ALL branch is planned alone):
