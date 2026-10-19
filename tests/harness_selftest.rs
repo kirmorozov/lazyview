@@ -244,6 +244,90 @@ fn selftest_diff_and_dsn() {
     assert_eq!(q("a'b\\c"), "'a\\'b\\\\c'");
 }
 
+/// A multi-server scenario with too few servers: a visible, counted `SKIP` on stderr outside CI,
+/// a failure in CI (`CI=true`) or with `LAZYVIEW_TEST_REQUIRE_MULTI=1`. Runs
+/// `selftest_multi_skip_probe` in a child test process (the only way to control its environment
+/// and to see past the harness's output capture).
+#[test]
+fn selftest_multi_skip_or_fail() {
+    let run = |ci: Option<&str>, require: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "--ignored", "selftest_multi_skip_probe"])
+            .env_remove("LAZYVIEW_TEST_DSNS")
+            .env_remove("CI")
+            .env_remove("LAZYVIEW_TEST_REQUIRE_MULTI");
+        if let Some(v) = ci {
+            cmd.env("CI", v);
+        }
+        if let Some(v) = require {
+            cmd.env("LAZYVIEW_TEST_REQUIRE_MULTI", v);
+        }
+        let out = cmd.output().expect("run the probe");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+    let skip_line = "SKIP selftest_multi: needs 3 servers in LAZYVIEW_TEST_DSNS, have 0";
+    // Outside CI: skipped, and the SKIP line shows without --nocapture.
+    let (ok, text) = run(None, None);
+    assert!(ok, "skip outside CI should pass:\n{text}");
+    assert!(text.contains(skip_line), "no visible SKIP line:\n{text}");
+    assert!(
+        text.contains("[multi-server scenario 1 skipped"),
+        "no count:\n{text}"
+    );
+    // ...and once more after the harness's summary, which counts it as passed.
+    let summary = "SKIPPED 1 multi-server scenario(s), counted as passed above: \
+                   selftest_multi (needs 3, have 0)";
+    assert!(
+        text.find("test result: ok")
+            .zip(text.find(summary))
+            .is_some_and(|(result, skipped)| skipped > result),
+        "no skip summary after the test result:\n{text}"
+    );
+    let (ok, text) = run(Some("false"), None);
+    assert!(
+        ok && text.contains(skip_line),
+        "CI=false should skip:\n{text}"
+    );
+    // CI, or an explicit requirement: a failure naming the rule.
+    for (ci, require) in [
+        (Some("true"), None),
+        (None, Some("1")),
+        (Some("1"), Some("1")),
+    ] {
+        let (ok, text) = run(ci, require);
+        assert!(!ok, "CI={ci:?} REQUIRE={require:?} should fail:\n{text}");
+        assert!(
+            text.contains("selftest_multi: needs 3 servers")
+                && text.contains("multi-server scenarios must run here"),
+            "CI={ci:?} REQUIRE={require:?}: wrong failure:\n{text}"
+        );
+        assert!(
+            !text.contains("SKIP selftest_multi") && !text.contains("SKIPPED"),
+            "failed AND skipped:\n{text}"
+        );
+    }
+    // An explicit `0` allows the skip even in CI (the single-server matrix jobs).
+    let (ok, text) = run(Some("true"), Some("0"));
+    assert!(
+        ok && text.contains(skip_line),
+        "REQUIRE=0 should skip in CI:\n{text}"
+    );
+}
+
+/// Child of `selftest_multi_skip_or_fail` (never runs on its own: `--ignored`).
+#[test]
+#[ignore]
+fn selftest_multi_skip_probe() {
+    scenario_multi("selftest_multi", 2, |_ctx| async move {
+        bail!("the probe must not run against servers")
+    });
+}
+
 /// Drops leftover `lvt_*` schemas on every server (run explicitly with `--ignored`).
 #[test]
 #[ignore]

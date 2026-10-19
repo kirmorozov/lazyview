@@ -103,6 +103,28 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
 ```
 
 * Without `LAZYVIEW_TEST_DSNS`, every scenario passes with a printed note.
+* Multi-server scenarios need two or three servers in `LAZYVIEW_TEST_DSNS` (every listed server
+  is the source once, the next ones in the list are its targets):
+
+  | test | suite | servers |
+  |---|---|---|
+  | `targets_fan_out_and_retarget` | `targets` | 3 |
+  | `targets_invalid_configurations_error` | `targets` | 2 |
+  | `targets_one_target_down` | `targets` | 2 |
+  | `reg_multi_target_with_one_down` | `regressions` | 2 |
+
+  With fewer servers they print `SKIP <tag>: needs N servers ...` on stderr (past the
+  harness's output capture, numbered per test binary), pass, and are listed once more after the
+  binary's `test result:` line (`SKIPPED n multi-server scenario(s) ...`). They fail instead of
+  skipping when `CI` is set (GitHub Actions) or `LAZYVIEW_TEST_REQUIRE_MULTI=1`;
+  `LAZYVIEW_TEST_REQUIRE_MULTI=0` allows the skip even in CI (the single-server matrix jobs; a
+  separate job runs these four against three servers). To run them locally:
+
+  ```sh
+  LAZYVIEW_TEST_REQUIRE_MULTI=1 \
+  LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest,mariadb1011=mysql://lv:lv@127.0.0.1:33111/lvtest,percona84=mysql://lv:lv@127.0.0.1:33184/lvtest \
+  cargo test --test targets --test regressions -- --test-threads=1 targets_ reg_multi_target_with_one_down
+  ```
 * Every scenario runs against every listed server in parallel, in fresh schemas
   (`lvt_<tag>_<random>`). These are dropped on success and kept on failure for debugging.
 * Engine logs go to `tmp/out/test-logs/<schema>/engine-<n>.log` (kept on failure).

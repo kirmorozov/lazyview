@@ -2,6 +2,8 @@
 //!
 //! * Servers come from `LAZYVIEW_TEST_DSNS` (`name=mysql://...,name2=mysql://...`, e.g. the output
 //!   of `scripts/test-servers.sh dsns`). If unset every scenario passes with a printed note.
+//!   Multi-server scenarios ([`scenario_multi`]) skip visibly with too few servers, or fail when
+//!   `CI` is set or `LAZYVIEW_TEST_REQUIRE_MULTI=1` (`=0` allows the skip in CI too).
 //! * Every scenario runs against every listed flavor (in parallel, one tokio task per flavor);
 //!   each run works in its own fresh schemas (`lvt_<tag>_<random>`), dropped on success and kept
 //!   on failure for debugging.
@@ -550,22 +552,18 @@ where
 }
 
 /// Runs `f` once per source flavor with `n_peers` other flavors as peers (rotating through the
-/// list: source i gets peers i+1, i+2, …). Skips if fewer than `n_peers + 1` servers are listed.
+/// list: source i gets peers i+1, i+2, …). With fewer than `n_peers + 1` servers listed the
+/// scenario is skipped (see [`skip_multi`]): a visible, counted `SKIP` line, or a failure when
+/// skipping is not allowed (`CI=true` without `LAZYVIEW_TEST_REQUIRE_MULTI=0`, or
+/// `LAZYVIEW_TEST_REQUIRE_MULTI=1`).
 pub fn scenario_multi<F, Fut>(test: &str, n_peers: usize, f: F)
 where
     F: Fn(Arc<Ctx>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    let Some(servers) = servers() else {
-        println!("SKIP {test}: LAZYVIEW_TEST_DSNS is not set");
-        return;
-    };
+    let servers = servers().unwrap_or_default();
     if servers.len() < n_peers + 1 {
-        println!(
-            "SKIP {test}: needs {} servers in LAZYVIEW_TEST_DSNS, have {}",
-            n_peers + 1,
-            servers.len()
-        );
+        skip_multi(test, n_peers + 1, servers.len());
         return;
     }
     let n = servers.len();
@@ -577,6 +575,73 @@ where
         })
         .collect();
     run_groups(test, groups, f);
+}
+
+/// Multi-server scenarios skipped so far in this test binary, with what they needed (see
+/// [`skip_multi`]).
+static MULTI_SKIPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Number of multi-server scenarios skipped so far in this test binary.
+pub fn multi_skipped() -> usize {
+    MULTI_SKIPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
+/// Repeats the skipped multi-server scenarios after the test harness's own summary, which counts
+/// them as passed. Runs at process exit (registered with `atexit` by the first skip).
+extern "C" fn print_multi_skipped() {
+    let skipped = MULTI_SKIPPED.lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr(),
+        "SKIPPED {} multi-server scenario(s), counted as passed above: {}",
+        skipped.len(),
+        skipped.join(", ")
+    );
+}
+
+/// Whether a multi-server scenario may be skipped for lack of servers: never with
+/// `LAZYVIEW_TEST_REQUIRE_MULTI=1`, always with `LAZYVIEW_TEST_REQUIRE_MULTI=0`, otherwise only
+/// outside CI (`CI` unset, empty, `0` or `false`).
+pub fn multi_skip_allowed() -> bool {
+    let truthy = |v: &str| !matches!(v.trim(), "" | "0" | "false" | "FALSE" | "no");
+    match std::env::var("LAZYVIEW_TEST_REQUIRE_MULTI") {
+        Ok(v) if !v.trim().is_empty() => !truthy(&v),
+        _ => !std::env::var("CI").is_ok_and(|v| truthy(&v)),
+    }
+}
+
+/// Records that the multi-server scenario `test` cannot run with `have` servers: the line goes
+/// to the real stderr (past the test harness's capture, so it shows for passing tests too) and
+/// is counted in [`MULTI_SKIPPED`], which is printed once more at exit; the scenario fails
+/// instead when skipping is not allowed.
+pub fn skip_multi(test: &str, need: usize, have: usize) {
+    let msg = format!(
+        "needs {need} servers in LAZYVIEW_TEST_DSNS, have {have} \
+         (e.g. export LAZYVIEW_TEST_DSNS=$(scripts/test-servers.sh dsns))"
+    );
+    if !multi_skip_allowed() {
+        panic!("{test}: {msg}; multi-server scenarios must run here (CI=true or LAZYVIEW_TEST_REQUIRE_MULTI=1)");
+    }
+    let n = {
+        let mut skipped = MULTI_SKIPPED.lock().unwrap_or_else(|e| e.into_inner());
+        skipped.push(format!("{test} (needs {need}, have {have})"));
+        if skipped.len() == 1 {
+            extern "C" {
+                fn atexit(f: extern "C" fn()) -> std::os::raw::c_int;
+            }
+            // SAFETY: atexit only records the function pointer; the callback does not unwind.
+            unsafe { atexit(print_multi_skipped) };
+        }
+        skipped.len()
+    };
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr(),
+        "SKIP {test}: {msg} [multi-server scenario {n} skipped in this binary; LAZYVIEW_TEST_REQUIRE_MULTI=1 fails instead]"
+    );
 }
 
 fn run_groups<F, Fut>(test: &str, groups: Vec<Vec<Server>>, f: F)
