@@ -208,6 +208,11 @@ reads.
 * If the view joins the parent on the foreign key (`JOIN customers c ON c.id = a.customer_id`),
   the rows a cascade changes are found through the parent's row as well, also over several
   levels (groups → parents → children) when every level is joined.
+* Through a `LEFT JOIN` with the parent on the NULL side, the parent is traced only when the join
+  condition is the foreign-key equality and nothing else (`LEFT JOIN customers c ON c.id =
+  a.customer_id`, or `USING`). With any other condition (`… ON c.id = a.customer_id AND
+  c.active = 1`), a child row whose parent fails it stays in the view without its parent, so the
+  parent's row does not lead to it: such a view is rebuilt as described below.
 * Otherwise a delete or key update on the parent triggers an online rebuild of the view (at most
   once per `LAZYVIEW_FULL_REFRESH_MS`, never more than one at a time). lazyview logs a warning
   when such a view is created: `reads a child of a cascading foreign key whose units cannot be
