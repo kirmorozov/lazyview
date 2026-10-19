@@ -7,6 +7,10 @@ use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
 use common::*;
+use lazyview::accumulate::UnitChunk;
+use lazyview::mv::{Layout, MvCol};
+use mysql_async::prelude::Queryable;
+use mysql_async::Value;
 
 /// Tiny schema used by most reproductions.
 const DDL: &[&str] = &[
@@ -1771,6 +1775,89 @@ fn reg_lineage_without_primary_key() {
     });
 }
 
+// Helpers of the mv-level JSON unit tests (they drive `mv::apply` directly).
+
+/// The MV layout as `mv::probe` builds it: column types from information_schema (`json`
+/// on MySQL/Percona, `longtext` on MariaDB), the first `units` columns as the unit.
+async fn probe(
+    c: &mut mysql_async::Conn,
+    schema: &str,
+    table: &str,
+    units: usize,
+) -> Result<Layout> {
+    let rows: Vec<(String, String, String, String)> = c
+        .exec(
+            "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(IS_NULLABLE AS CHAR) \
+             FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            (schema, table),
+        )
+        .await?;
+    let cols: Vec<MvCol> = rows
+        .into_iter()
+        .map(|(name, column_type, data_type, nullable)| MvCol {
+            src_name: name.clone(),
+            name,
+            column_type,
+            data_type: data_type.to_ascii_lowercase(),
+            charset: None,
+            collation: None,
+            nullable: nullable == "YES",
+        })
+        .collect();
+    Ok(Layout {
+        n_visible: cols.len(),
+        hidden: Vec::new(),
+        unit_pos: (0..units).collect(),
+        primary: false,
+        lineage: Vec::new(),
+        epoch: Vec::new(),
+        cols,
+    })
+}
+
+/// Rows of the view's query for the chunk's units (what `mv::read_source` does).
+async fn rows(
+    c: &mut mysql_async::Conn,
+    layout: &Layout,
+    select: &str,
+    unit_exprs: &[&str],
+    chunk: Option<&UnitChunk>,
+) -> Result<Vec<Vec<Value>>> {
+    let exprs: Vec<String> = unit_exprs.iter().map(|e| e.to_string()).collect();
+    let (f, p) = match chunk {
+        Some(ch) => ch.filter_typed(&exprs, &layout.unit_kinds()),
+        None => ("TRUE".into(), Vec::new()),
+    };
+    let sql = select.replace("{F}", &f);
+    let rows: Vec<mysql_async::Row> = c.exec(sql, p).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| layout.normalize_source(r.unwrap()))
+        .collect())
+}
+
+/// The MV must hold exactly the oracle's groups (JSON-equal keys, equal counts).
+async fn check(
+    c: &mut mysql_async::Conn,
+    mv: &str,
+    oracle: &str,
+    on: &str,
+    what: &str,
+) -> Result<()> {
+    let (a, b, both): (i64, i64, i64) = c
+        .query_first(format!(
+            "SELECT (SELECT COUNT(*) FROM {mv}), (SELECT COUNT(*) FROM ({oracle}) o), \
+             (SELECT COUNT(*) FROM {mv} m JOIN ({oracle}) o ON {on} AND o.n = m.n)"
+        ))
+        .await?
+        .context("counts")?;
+    ensure!(
+        a == b && b == both,
+        "{what}: {mv} has {a} rows, the oracle {b}, {both} agree"
+    );
+    Ok(())
+}
+
 /// JSON unit keys (MySQL/Percona) must be matched as JSON values: the server groups JSON-equal
 /// values (`{"a": 1}` with `{"a": 1.0}`) but compares a JSON column with a plain string
 /// parameter as text, so the refresh filters (source read, MV read and the DELETE) never found a
@@ -1780,12 +1867,10 @@ fn reg_lineage_without_primary_key() {
 #[test]
 fn reg_json_unit_filters_match_json_equal_groups() {
     scenario("reg_json_units", |ctx| async move {
-        use lazyview::accumulate::{UnitChunk, UnitKind};
+        use lazyview::accumulate::UnitKind;
         use lazyview::datum::Datum;
-        use lazyview::mv::{self, Layout, MvCol};
+        use lazyview::mv;
         use lazyview::Metrics;
-        use mysql_async::prelude::Queryable;
-        use mysql_async::Value;
 
         let db = ctx.new_db("reg_json_units").await?;
         let mut c = db.conn().await?;
@@ -1799,43 +1884,6 @@ fn reg_json_unit_filters_match_json_equal_groups() {
             ],
         )
         .await?;
-        // The MV layout as `mv::probe` builds it: column types from information_schema (`json`
-        // on MySQL/Percona, `longtext` on MariaDB), the first `units` columns as the unit.
-        async fn probe(
-            c: &mut mysql_async::Conn,
-            schema: &str,
-            table: &str,
-            units: usize,
-        ) -> Result<Layout> {
-            let rows: Vec<(String, String, String, String)> = c
-                .exec(
-                    "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(IS_NULLABLE AS CHAR) \
-                     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-                    (schema, table),
-                )
-                .await?;
-            let cols: Vec<MvCol> = rows
-                .into_iter()
-                .map(|(name, column_type, data_type, nullable)| MvCol {
-                    src_name: name.clone(),
-                    name,
-                    column_type,
-                    data_type: data_type.to_ascii_lowercase(),
-                    charset: None,
-                    collation: None,
-                    nullable: nullable == "YES",
-                })
-                .collect();
-            Ok(Layout {
-                n_visible: cols.len(),
-                hidden: Vec::new(),
-                unit_pos: (0..units).collect(),
-                primary: false,
-                lineage: Vec::new(),
-                epoch: Vec::new(),
-                cols,
-            })
-        }
         let is_json = |l: &Layout| l.unit_kinds().contains(&UnitKind::Json);
         let l_j = probe(&mut c, &db.name, "mv_j", 1).await?;
         let l_gj = probe(&mut c, &db.name, "mv_gj", 2).await?;
@@ -1845,47 +1893,6 @@ fn reg_json_unit_filters_match_json_equal_groups() {
             l_j.unit_kinds()
         );
         let metrics = Metrics::default();
-        // Rows of the view's query for the chunk's units (what `mv::read_source` does).
-        async fn rows(
-            c: &mut mysql_async::Conn,
-            layout: &Layout,
-            select: &str,
-            unit_exprs: &[&str],
-            chunk: Option<&UnitChunk>,
-        ) -> Result<Vec<Vec<Value>>> {
-            let exprs: Vec<String> = unit_exprs.iter().map(|e| e.to_string()).collect();
-            let (f, p) = match chunk {
-                Some(ch) => ch.filter_typed(&exprs, &layout.unit_kinds()),
-                None => ("TRUE".into(), Vec::new()),
-            };
-            let sql = select.replace("{F}", &f);
-            let rows: Vec<mysql_async::Row> = c.exec(sql, p).await?;
-            Ok(rows
-                .into_iter()
-                .map(|r| layout.normalize_source(r.unwrap()))
-                .collect())
-        }
-        // The MV must hold exactly the oracle's groups (JSON-equal keys, equal counts).
-        async fn check(
-            c: &mut mysql_async::Conn,
-            mv: &str,
-            oracle: &str,
-            on: &str,
-            what: &str,
-        ) -> Result<()> {
-            let (a, b, both): (i64, i64, i64) = c
-                .query_first(format!(
-                    "SELECT (SELECT COUNT(*) FROM {mv}), (SELECT COUNT(*) FROM ({oracle}) o), \
-                     (SELECT COUNT(*) FROM {mv} m JOIN ({oracle}) o ON {on} AND o.n = m.n)"
-                ))
-                .await?
-                .context("counts")?;
-            ensure!(
-                a == b && b == both,
-                "{what}: {mv} has {a} rows, the oracle {b}, {both} agree"
-            );
-            Ok(())
-        }
         let j = |s: &str| Datum::Bytes(s.as_bytes().to_vec());
         let sel_j = "SELECT doc, COUNT(*) AS n FROM jt WHERE {F} GROUP BY doc";
         let orc_j = "SELECT doc, COUNT(*) AS n FROM jt GROUP BY doc";
@@ -2054,6 +2061,210 @@ fn reg_json_group_key_view() {
                 "{what}: an incremental JSON group key view fell back to a rebuild: {}",
                 fmt_snapshot(&d)
             );
+        }
+        eng.stop().await
+    });
+}
+
+/// A JSON unit key in a layout that also reads TIMESTAMP columns as epochs: the DELETE of a
+/// changed unit runs in the `+00:00` session with the keys from the rows and bound JSON keys as
+/// plain strings, which a MySQL JSON column never equals, so the unit's old row stayed next to
+/// the new one. Drives `mv::apply` directly (the planner runs JSON group keys in full mode).
+#[test]
+fn reg_json_unit_delete_with_epoch_timestamps() {
+    scenario("reg_json_epoch", |ctx| async move {
+        use lazyview::datum::Datum;
+        use lazyview::mv;
+        use lazyview::Metrics;
+
+        let db = ctx.new_db("reg_json_epoch").await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &[
+                "CREATE TABLE jt (id INT PRIMARY KEY, doc JSON NULL, ts TIMESTAMP(6) NULL)",
+                "CREATE TABLE mv_jt (doc JSON NULL, mx TIMESTAMP(6) NULL, n BIGINT NOT NULL)",
+                r#"INSERT INTO jt VALUES (1, '{"a": 1}', '2024-01-01 10:00:00.5'), (2, '{"a": 1.0}', '2024-01-02 10:00:00'), (3, '[1, 2]', '2024-01-03 10:00:00'), (4, NULL, NULL)"#,
+            ],
+        )
+        .await?;
+        let mut l = probe(&mut c, &db.name, "mv_jt", 1).await?;
+        l.epoch = vec![(1, "MAX(ts)".to_string())];
+        let sel = "SELECT UNIX_TIMESTAMP(MAX(ts)) AS `_lv_ts0`, doc, MAX(ts) AS mx, COUNT(*) AS n \
+                   FROM jt WHERE {F} GROUP BY doc";
+        let orc = "SELECT doc, MAX(ts) AS mx, COUNT(*) AS n FROM jt GROUP BY doc";
+        let on = "o.doc <=> m.doc AND o.mx <=> m.mx";
+        let metrics = Metrics::default();
+        let r = rows(&mut c, &l, sel, &["doc"], None).await?;
+        mv::apply(&mut c, &db.name, "mv_jt", &l, None, &r, 1000, &metrics).await?;
+        check(&mut c, "mv_jt", orc, on, "initial fill").await?;
+        // Dirty keys as the binlog decoder renders them on MySQL; the text as stored on MariaDB.
+        let key = |mysql: &str, mariadb: &str| {
+            let k = if ctx.servers[0].is_mariadb() {
+                mariadb
+            } else {
+                mysql
+            };
+            Datum::Bytes(k.as_bytes().to_vec())
+        };
+        for (what, stmt, keys) in [
+            (
+                "newer timestamp in a JSON group",
+                "UPDATE jt SET ts = '2024-02-01 10:00:00.25' WHERE id = 2",
+                vec![key(r#"{"a":1.0}"#, r#"{"a": 1.0}"#)],
+            ),
+            (
+                "row moves between JSON groups",
+                r#"UPDATE jt SET doc = '[1, 2.0]' WHERE id = 1"#,
+                vec![key(r#"{"a":1}"#, r#"{"a": 1}"#), key("[1,2.0]", "[1, 2.0]")],
+            ),
+            (
+                "NULL group gets a timestamp",
+                "UPDATE jt SET ts = '2024-03-01 00:00:00' WHERE id = 4",
+                vec![Datum::Null],
+            ),
+        ] {
+            exec(&mut c, stmt).await?;
+            let chunk = UnitChunk::Keys(keys.into_iter().map(|k| Box::new([k]) as _).collect());
+            let r = rows(&mut c, &l, sel, &["doc"], Some(&chunk)).await?;
+            mv::apply(
+                &mut c,
+                &db.name,
+                "mv_jt",
+                &l,
+                Some(&chunk),
+                &r,
+                1000,
+                &metrics,
+            )
+            .await?;
+            check(&mut c, "mv_jt", orc, on, what).await?;
+        }
+        Ok(())
+    });
+}
+
+/// DECIMALs inside JSON values a view computes (`JSON_ARRAYAGG(amount)`, `JSON_OBJECT(..,
+/// SUM(amount))`, `CAST(MIN(amount) AS JSON)`): MySQL stores every number of a JSON text that
+/// is not an integer as a DOUBLE, so the MV holds `[10.0, 20.5]` where the view returns
+/// `[10.00, 20.50]` (no client can write a DECIMAL into JSON; docs/views.md "JSON values"). The
+/// MV must hold exactly what the server stores for the view's JSON text, and refreshes that
+/// re-read such units must not rewrite them: the diff compared the texts and rewrote every
+/// re-read unit on every refresh. MariaDB (JSON is LONGTEXT) keeps the text as computed.
+#[test]
+fn reg_json_decimal_values_converge() {
+    scenario("reg_json_dec", |ctx| async move {
+        let maria = ctx.servers[0].is_mariadb();
+        let select = format!(
+            "SELECT g, JSON_ARRAYAGG(amount) AS amts, \
+             JSON_OBJECT('sum', SUM(amount), 'big', MAX(big)) AS tot, {} AS mn, COUNT(*) AS n \
+             FROM amounts WHERE flag > 0 GROUP BY g",
+            if maria {
+                "JSON_ARRAY(MIN(amount))"
+            } else {
+                "CAST(MIN(amount) AS JSON)"
+            }
+        );
+        let specs = vec![ViewSpec::new("r_json_dec", Kind::Incremental, &select)];
+        let db = ctx.new_db("reg_json_dec").await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &[
+                "CREATE TABLE amounts (id INT PRIMARY KEY, g INT NOT NULL, amount DECIMAL(10,2) NOT NULL, \
+                 big DECIMAL(30,10) NOT NULL, flag INT NOT NULL)",
+                "INSERT INTO amounts VALUES (1, 1, 10.00, 12345678901234567890.1234567890, 1), \
+                 (2, 1, 20.50, 0.0000000001, 1), (3, 2, 3.25, 1.5, 1), (4, 2, 0.10, -99999999999999999999.9999999999, 1), \
+                 (5, 3, 100.00, 0, 1)",
+            ],
+        )
+        .await?;
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        let mode: Option<String> = c
+            .query_first("SELECT `mode` FROM _lazyview_state WHERE name = 'r_json_dec'")
+            .await?;
+        ensure!(
+            mode.as_deref() == Some("incremental"),
+            "r_json_dec is not incremental: {mode:?}"
+        );
+        // The view's rows with every JSON value as the server stores it (MySQL: re-parsed from
+        // its text; MariaDB: the text), compared as strings with the MV's.
+        type Rows = Vec<(i64, String, String, String, i64)>;
+        let stored = |e: &str| {
+            if maria {
+                format!("CAST({e} AS CHAR)")
+            } else {
+                format!("CAST(CAST(CAST({e} AS CHAR) AS JSON) AS CHAR)")
+            }
+        };
+        let expected_sql = format!(
+            "SELECT g, {}, {}, {}, n FROM ({select}) o ORDER BY g",
+            stored("amts"),
+            stored("tot"),
+            stored("mn")
+        );
+        let computed_sql = format!(
+            "SELECT g, CAST(amts AS CHAR), CAST(tot AS CHAR), CAST(mn AS CHAR), n FROM ({select}) o ORDER BY g"
+        );
+        let mv_sql = "SELECT g, CAST(amts AS CHAR), CAST(tot AS CHAR), CAST(mn AS CHAR), n \
+                      FROM r_json_dec ORDER BY g";
+        let mut sc = db.conn().await?;
+        let mut touches = 0;
+        for (what, stmt) in [
+            ("initial", None),
+            (
+                "insert",
+                Some("INSERT INTO amounts VALUES (6, 1, 7.10, 0.5, 1), (7, 4, 0.05, 1234.5678900000, 1)"),
+            ),
+            (
+                "update",
+                Some("UPDATE amounts SET amount = 3.30, big = 2.25 WHERE id = 3"),
+            ),
+            ("delete", Some("DELETE FROM amounts WHERE id IN (4, 7)")),
+        ] {
+            if let Some(stmt) = stmt {
+                exec(&mut c, stmt).await?;
+            }
+            eng.wait_caught_up(&mut sc, t_catchup()).await?;
+            let expected: Rows = c.query(expected_sql.as_str()).await?;
+            let actual: Rows = c.query(mv_sql).await?;
+            ensure!(
+                actual == expected,
+                "{what}: r_json_dec\n  {actual:?}\nis not the view's rows as stored\n  {expected:?}"
+            );
+            let computed: Rows = c.query(computed_sql.as_str()).await?;
+            ensure!(
+                maria || computed != expected,
+                "{what}: the view's JSON text is stored unchanged ({computed:?}): the server keeps \
+                 DECIMALs in JSON text now; docs/views.md \"JSON values\" is out of date"
+            );
+            // Refreshes that re-read every unit (the WHERE column changes, the rows do not) must
+            // leave the MV alone, every time.
+            for _ in 0..2 {
+                touches += 1;
+                let before = eng.snapshot();
+                exec(&mut c, "UPDATE amounts SET flag = flag + 1").await?;
+                eng.wait_caught_up(&mut sc, t_catchup()).await?;
+                let d = eng.snapshot().since(&before);
+                ensure!(
+                    d.units_refreshed >= expected.len() as u64
+                        && d.units_changed == 0
+                        && d.mv_rows_deleted == 0
+                        && d.mv_rows_inserted == 0,
+                    "{what}, refresh {touches} of unchanged units: expected {} units re-read and none \
+                     written: {}",
+                    expected.len(),
+                    fmt_snapshot(&d)
+                );
+                let actual: Rows = c.query(mv_sql).await?;
+                ensure!(
+                    actual == expected,
+                    "{what}, refresh {touches}: r_json_dec changed\n  {actual:?}\n  {expected:?}"
+                );
+            }
         }
         eng.stop().await
     });

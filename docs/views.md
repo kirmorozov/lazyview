@@ -66,6 +66,33 @@ was missing is retried when the table appears.
   exists, the view goes into error: `refusing to replace existing base table … that lazyview does
   not manage`. Ownership is recorded in `_lazyview_state.managed`.
 
+### JSON values
+
+On MySQL and Percona a `JSON` column of the materialized table holds the value the server
+stores for the JSON text the view returns. The server parses that text: integers stay integers,
+every other number becomes a `DOUBLE`, and object keys are sorted. JSON copied from a `JSON`
+column of a source table is unchanged, because it was parsed the same way when it was stored.
+
+A `DECIMAL` inside a JSON value the view computes is different. `JSON_ARRAYAGG(amount)`,
+`JSON_OBJECTAGG(k, amount)`, `JSON_OBJECT('sum', SUM(amount))` and `CAST(amount AS JSON)` keep
+the `DECIMAL` while the value stays inside the server, but no client can write it back as one.
+The materialized table stores it as a `DOUBLE`:
+
+| the view returns | the materialized table holds |
+|---|---|
+| `[10.00, 20.50]` | `[10.0, 20.5]` |
+| `{"sum": 30.50}` | `{"sum": 30.5}` |
+| `12345678901234567890.1234567890` | `1.2345678901234567e19` |
+
+The values are numerically equal, and JSON comparisons (`=`, `JSON_CONTAINS`, `GROUP BY`) treat
+them as equal, but the text differs (`->>` returns `10.0`). Precision beyond a `DOUBLE`'s 15-17
+significant digits is lost. To keep the exact decimal text, select it as a string instead, for
+example `GROUP_CONCAT(amount)` or `CAST(amount AS CHAR)` inside `JSON_ARRAYAGG`.
+
+lazyview compares JSON columns by the value the server stores, so such a view does not rewrite
+its rows on every refresh. On MariaDB `JSON` is a `LONGTEXT` alias: the text is stored exactly
+as the view returns it, and it is compared as text.
+
 ## Incremental or full
 
 Each definition is classified when it is parsed, before anything is built. The result is in

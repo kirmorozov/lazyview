@@ -1050,8 +1050,31 @@ pub async fn read_source_filtered(
         .collect())
 }
 
-fn to_datums(r: &[Value]) -> Vec<Datum> {
-    r.iter().cloned().map(Datum::from_value).collect()
+/// The datums a row is compared and grouped by in [`diff`]: JSON values (MySQL/Percona `json`
+/// columns) as [`json_canonical`] text, everything else as read.
+fn to_datums(layout: &Layout, r: &[Value]) -> Vec<Datum> {
+    r.iter()
+        .zip(&layout.cols)
+        .map(|(v, c)| match v {
+            Value::Bytes(b) if c.data_type == "json" => Datum::Bytes(json_canonical(b)),
+            v => Datum::from_value(v.clone()),
+        })
+        .collect()
+}
+
+/// A JSON text in the form the server stores it, for comparisons. MySQL parses JSON text into
+/// its binary format: integers stay integers, every other number becomes a DOUBLE, object keys
+/// are sorted and the last of duplicate keys wins. So a DECIMAL inside a JSON value the view
+/// computes (`JSON_ARRAYAGG(amount)` gives `[10.00, 20.50]`) is stored as `[10.0, 20.5]`: no
+/// client can write it back as a DECIMAL. Two texts get the same result here when the server
+/// stores the same value for them (numbers parsed with correct rounding, like the server's
+/// parser); the result is JSON-equal to the input, so it also binds as a `CAST(? AS JSON)`
+/// unit key. Text that does not parse is kept as it is.
+pub fn json_canonical(text: &[u8]) -> Vec<u8> {
+    serde_json::from_slice::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| serde_json::to_vec(&v).ok())
+        .unwrap_or_else(|| text.to_vec())
 }
 
 /// Rows of one or more units, grouped by unit key: `(datums, original values)` per row.
@@ -1088,7 +1111,9 @@ pub fn prepare(layout: &Layout, rows: Vec<Vec<Value>>) -> Prepared {
     Prepared {
         groups: group(
             layout,
-            rows.into_iter().map(|v| (to_datums(&v), v)).collect(),
+            rows.into_iter()
+                .map(|v| (to_datums(layout, &v), v))
+                .collect(),
         ),
         rows: n,
         datums,
@@ -1151,7 +1176,9 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
     let compared = old.len() + new.rows;
     let old = group(
         layout,
-        old.into_iter().map(|v| (to_datums(&v), v)).collect(),
+        old.into_iter()
+            .map(|v| (to_datums(layout, &v), v))
+            .collect(),
     );
     let mut changed: Vec<Key> = Vec::new();
     for (k, rows) in &new.groups {
@@ -1242,8 +1269,17 @@ async fn write_tx(
         let del_filter = if layout.unit_pos.is_empty() {
             ("TRUE".to_string(), Vec::new())
         } else if layout.epoch_timestamps() {
-            // Keys from the rows: TIMESTAMPs as UTC datetimes, exact in the `+00:00` session.
-            keys_chunk(d.changed.clone()).filter(&layout.unit_cols())
+            // Keys from the rows: TIMESTAMPs as UTC datetimes, exact in the `+00:00` session
+            // (JSON keys still bind as JSON values).
+            let kinds: Vec<UnitKind> = layout
+                .unit_kinds()
+                .into_iter()
+                .map(|k| match k {
+                    UnitKind::Timestamp => UnitKind::Plain,
+                    k => k,
+                })
+                .collect();
+            keys_chunk(d.changed.clone()).filter_typed(&layout.unit_cols(), &kinds)
         } else {
             keys_chunk(d.changed.clone()).filter_typed(&layout.unit_cols(), &layout.unit_kinds())
         };
@@ -1548,6 +1584,95 @@ mod tests {
             "JSON units get no index"
         );
         assert!(!l.has_unit_index());
+    }
+
+    /// JSON texts compare as the server stores them: a DECIMAL's scale and the formatting are
+    /// lost, integers and doubles stay apart.
+    #[test]
+    fn json_texts_compare_as_stored() {
+        let c = |s: &str| String::from_utf8(json_canonical(s.as_bytes())).unwrap();
+        // The text a view computes vs. what the MV table returns for it (measured, MySQL 8.4).
+        for (computed, stored) in [
+            ("[10.00, 20.50]", "[10.0, 20.5]"),
+            (r#"{"amt": 1.50}"#, r#"{"amt": 1.5}"#),
+            ("100.000", "100.0"),
+            ("0.000000150", "0.00000015"),
+            ("12345678901234567890.1234567890", "1.2345678901234567e19"),
+            ("18446744073709551616", "1.8446744073709552e19"),
+            (
+                r#"{"b":1,"a":2,"aa":3,"a":4}"#,
+                r#"{"a": 4, "b": 1, "aa": 3}"#,
+            ),
+            ("[0.30000000000000004, 1e20]", "[0.30000000000000004, 1e20]"),
+        ] {
+            assert_eq!(c(computed), c(stored), "{computed} vs {stored}");
+            assert_eq!(c(&c(stored)), c(stored), "canonical text is stable");
+        }
+        // Integers and doubles are different values in the server's format (`1` vs `1.0`).
+        assert_ne!(c("[1]"), c("[1.0]"));
+        assert_ne!(c(r#"{"a": 10}"#), c(r#"{"a": 10.0}"#));
+        assert_eq!(
+            c("[18446744073709551615, -9223372036854775808]"),
+            "[18446744073709551615,-9223372036854775808]"
+        );
+        assert_ne!(c("[10.00]"), c("[10.01]"));
+        assert_ne!(c(r#"["10.00"]"#), c(r#"["10.0"]"#), "strings stay exact");
+        assert_eq!(c("not json"), "not json");
+    }
+
+    /// The diff compares JSON columns as stored: a DECIMAL computed into JSON is rewritten
+    /// once, not on every refresh; JSON unit keys group by the stored value too.
+    #[test]
+    fn diff_compares_json_columns_as_stored() {
+        let l = layout(
+            vec![
+                col("g", "int", "int", None),
+                col("amts", "json", "json", None),
+                col("k", "json", "json", None),
+            ],
+            3,
+            vec![0, 2],
+            true,
+        );
+        let row = |g: i64, amts: &str, k: &str| {
+            vec![
+                Value::Int(g),
+                Value::Bytes(amts.as_bytes().to_vec()),
+                Value::Bytes(k.as_bytes().to_vec()),
+            ]
+        };
+        let source = vec![
+            row(1, "[10.00, 20.50]", r#"{"x": 1.50}"#),
+            row(2, "[3.25]", "[1, 2]"),
+        ];
+        let stored = vec![
+            row(1, "[10.0, 20.5]", r#"{"x": 1.5}"#),
+            row(2, "[3.25]", "[1, 2]"),
+        ];
+        let d = diff(&l, stored.clone(), &prepare(&l, source.clone()));
+        assert!(d.is_empty(), "rewrote equal units: {:?}", d.changed);
+        // A real change of one unit rewrites that unit only.
+        let mut changed = source.clone();
+        changed[1] = row(2, "[3.26]", "[1, 2]");
+        let d = diff(&l, stored.clone(), &prepare(&l, changed));
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(
+            d.changed[0][1],
+            Datum::Bytes(b"[1,2]".to_vec()),
+            "the key binds as canonical JSON"
+        );
+        assert_eq!(
+            d.inserts,
+            vec![row(2, "[3.26]", "[1, 2]")],
+            "inserts keep the source text"
+        );
+        // An integer becoming a double is a change of the stored value.
+        let d = diff(
+            &l,
+            stored,
+            &prepare(&l, vec![source[0].clone(), row(2, "[3.25]", "[1, 2.0]")]),
+        );
+        assert_eq!(d.changed.len(), 2, "old [1,2] and new [1,2.0] units");
     }
 
     #[test]
