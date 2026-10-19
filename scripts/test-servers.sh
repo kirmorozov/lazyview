@@ -2,7 +2,9 @@
 # Manage the local MySQL / MariaDB / Percona test servers, in one of two modes:
 #
 #   compose   the official images pinned in docker-compose.test.yml (the exact builds CI runs,
-#             so local == CI); data in named docker volumes.
+#             so local == CI); data in named docker volumes. On a developer host
+#             docker-compose.local.yml joins it: no fsync per commit (docker/local.cnf), nothing
+#             else differs. LV_COMPOSE_LOCAL=0 (or CI set, as on GitHub Actions) leaves it out.
 #   tarball   official generic Linux x86_64 tarballs extracted under tmp/out/db/<flavor>/,
 #             started directly (no Docker needed); data under tmp/out/servers/<flavor>/.
 #
@@ -49,7 +51,9 @@
 #
 # Env overrides: LV_DB_ROOT (tarball dir), LV_SERVERS_ROOT (instance dir), LV_LIB_DIR (extra
 #                shared libraries for tarball binaries), LV_IMAGES_ROOT (downloaded image
-#                tarballs), LV_START_TIMEOUT (seconds, default 180).
+#                tarballs), LV_START_TIMEOUT (seconds, default 180), LV_COMPOSE_LOCAL (0: compose
+#                mode without docker-compose.local.yml, i.e. exactly the CI servers; default 1
+#                unless CI is set).
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -59,6 +63,7 @@ LIB_DIR=${LV_LIB_DIR:-$REPO/tmp/out/lib}
 IMAGES_ROOT=${LV_IMAGES_ROOT:-$REPO/tmp/out/images}
 START_TIMEOUT=${LV_START_TIMEOUT:-180}
 COMPOSE_FILE_PATH=$REPO/docker-compose.test.yml
+COMPOSE_LOCAL_PATH=$REPO/docker-compose.local.yml
 
 BLOCKING_FLAVORS=(mysql84 mysql267 percona84 percona97 mariadb1011 mariadb130)
 PRE_FLAVORS=(mariadb132-pre mysql2610-pre)
@@ -392,12 +397,24 @@ tarball_running() { available "$1" && pid_alive "$1" && accepting "$1"; }
 
 # ---------------------------------------------------------------------------- compose mode
 
-# `docker compose` on docker-compose.test.yml with both profiles active (so that every verb
-# sees the pre-release services; `compose_up` names the services it starts).
+# Whether docker-compose.local.yml (local speed settings) joins docker-compose.test.yml:
+# LV_COMPOSE_LOCAL decides if set, otherwise yes unless CI is set (CI runs the durable defaults).
+truthy() { [[ -n ${1:-} && $1 != 0 && $1 != false && $1 != no ]]; }
+compose_local() {
+  if [[ -n ${LV_COMPOSE_LOCAL:-} ]]; then truthy "$LV_COMPOSE_LOCAL"; return; fi
+  if truthy "${CI:-}"; then return 1; fi
+  return 0
+}
+
+# `docker compose` on docker-compose.test.yml (+ docker-compose.local.yml) with both profiles
+# active (so that every verb sees the pre-release services; `compose_up` names the services it
+# starts).
 compose() {
+  local files=(-f "$COMPOSE_FILE_PATH")
+  if compose_local; then files+=(-f "$COMPOSE_LOCAL_PATH"); fi
   (
     close_inherited_fds
-    exec docker compose -f "$COMPOSE_FILE_PATH" --profile prerelease "$@"
+    exec docker compose "${files[@]}" --profile prerelease "$@"
   )
 }
 
@@ -446,6 +463,11 @@ compose_up() {
     fi
     if [[ $f == mysql2610-pre ]]; then load_mysql2610_image || return 1; fi
   done
+  if compose_local; then
+    echo "local speed settings on (docker-compose.local.yml: sync_binlog=0, innodb_flush_log_at_trx_commit=2; LV_COMPOSE_LOCAL=0 for the CI configuration)"
+  else
+    echo "CI configuration (durable defaults; docker-compose.local.yml left out)"
+  fi
   compose up -d --wait --wait-timeout "$START_TIMEOUT" "${flavors[@]}"
   for f in "${flavors[@]}"; do echo "[$f] ready on 127.0.0.1:$(port_of "$f"), $(compose_version "$f")"; done
 }

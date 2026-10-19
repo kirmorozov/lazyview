@@ -18,10 +18,19 @@
 # Service names are the flavor names of scripts/test-servers.sh, LAZYVIEW_TEST_DSNS and the CI
 # matrix. Every server: ROW binlog, FULL row image, user lv/lv with ALL PRIVILEGES (created by
 # docker/initdb on the first start), database lvtest, 128M InnoDB buffer pool (several servers
-# share a developer host with the test runs), a 2 GiB memory limit (MySQL and Percona idle at
-# about 850 MiB; with 1 GiB the big-transaction test got mysqld OOM-killed), bound to
-# 127.0.0.1, server id = host port. MySQL and Percona additionally run with GTIDs on. The flag
-# lists are kept identical by hand (YAML cannot splice a shared list into `command`).
+# share a developer host with the test runs), bound to 127.0.0.1, server id = host port. MySQL
+# and Percona additionally run with GTIDs on. The flag lists are kept identical by hand (YAML
+# cannot splice a shared list into `command`).
+#
+# Memory: MySQL and Percona run without performance_schema (about 250 MiB of their ~900 MiB idle
+# footprint; lazyview does not use it) and with temptable_max_ram=1G (8.4 sizes it at 3% of the
+# host's RAM, not the container's: 1.9 GiB on a 62 GB host) under a 3 GiB limit (at 2 GiB they
+# were OOM-killed six times in a day on a shared developer host). MariaDB (performance_schema
+# off by default, idle at 280-540 MiB) keeps 2 GiB.
+#
+# Durability: these are the server defaults (sync_binlog=1, innodb_flush_log_at_trx_commit=1),
+# as in CI. scripts/test-servers.sh adds docker-compose.local.yml on a developer host, which
+# drops the per-commit fsyncs (docs/development.md "Local speed settings").
 #
 # Matrix (one image per flavor, pinned to the exact build; the preview image by digest):
 #   blocking   oldest supported LTS: mysql84 percona84 mariadb1011
@@ -49,7 +58,7 @@ x-mysql-common: &mysql-common
   deploy:
     resources:
       limits:
-        memory: 2g
+        memory: 3g
   restart: "no"
 
 x-mariadb-common: &mariadb-common
@@ -85,6 +94,8 @@ services:
       - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
       - --innodb-buffer-pool-size=128M
       - --max-connections=200
     volumes:
@@ -104,6 +115,8 @@ services:
       - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
       - --innodb-buffer-pool-size=128M
       - --max-connections=200
     volumes:
@@ -124,6 +137,8 @@ services:
       - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
       - --innodb-buffer-pool-size=128M
       - --max-connections=200
     volumes:
@@ -143,6 +158,8 @@ services:
       - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
       - --innodb-buffer-pool-size=128M
       - --max-connections=200
     volumes:
@@ -231,6 +248,8 @@ services:
       - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
       - --innodb-buffer-pool-size=128M
       - --max-connections=200
     volumes:

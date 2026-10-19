@@ -56,7 +56,35 @@ Flavors and ports: `mysql84` 33084, `mysql267` 33267, `percona84` 33184, `percon
 `mariadb1011` 33111, `mariadb130` 33130; advisory `mariadb132-pre` 33132, `mysql2610-pre` 33261.
 Every server listens on 127.0.0.1, has ROW binlogs with FULL row images (GTIDs on MySQL and
 Percona), a 128M InnoDB buffer pool, a user `lv`/`lv` with all privileges and a database
-`lvtest`. Every instance takes up to 1 GB of memory: start only what you test.
+`lvtest`. MySQL and Percona run without `performance_schema` (lazyview does not use it) and with
+`temptable_max_ram=1G` (8.4 would size it from the host's RAM, not the container's); their
+containers are limited to 3 GiB, MariaDB's to 2 GiB. Idle they take 200-400 MiB (MySQL,
+Percona) and about 100 MiB (MariaDB), several times that under the heavy suites: start only what
+you test.
+
+### Local speed settings
+
+On a developer host `scripts/test-servers.sh compose ...` adds `docker-compose.local.yml` to
+`docker-compose.test.yml`. That file mounts `docker/local.cnf` into every server:
+`sync_binlog=0` and `innodb_flush_log_at_trx_commit=2`, so commits no longer wait for an fsync of
+the binlog and the redo log. On a shared host with ZFS-backed Docker volumes this took an
+autocommit from 35-80 ms to 1-4 ms; DDL still syncs (a `RENAME TABLE` takes 0.1-0.6 s). A
+crash of the container can lose the last second of commits, which test servers can afford.
+Images, flags and memory limits stay exactly as in CI.
+
+CI never loads the file: it runs `docker compose` on `docker-compose.test.yml` alone with the
+durable server defaults (`sync_binlog=1`, `innodb_flush_log_at_trx_commit=1`), and the script
+leaves the file out when `CI` is set. To reproduce the CI servers locally, for example when a
+failure only shows up in CI, recreate a flavor without it:
+
+```sh
+LV_COMPOSE_LOCAL=0 scripts/test-servers.sh compose up mysql84
+scripts/test-servers.sh compose up mysql84      # back to the local speed settings
+```
+
+`compose up` prints which of the two configurations it starts and recreates a container whose
+configuration changed (the data volume stays). The other `compose` verbs (`status`, `logs`,
+`down`) see the same containers either way. Tarball instances keep the server defaults.
 
 ## Tests
 
@@ -149,15 +177,19 @@ cargo run --release --example throughput -- --dsn mysql://lv:lv@127.0.0.1:33084/
 Workflows in `.github/workflows/`:
 
 * `ci.yml` runs lint, unit tests, the integration matrix (every service of
-  `docker-compose.test.yml`: the six blocking servers, plus the pre-releases with
-  `continue-on-error`, which only annotate the run when they fail) and the image smoke and
-  end-to-end tests on every push and pull request.
+  `docker-compose.test.yml`, one server per job: the six blocking servers, plus the pre-releases
+  with `continue-on-error`, which only annotate the run when they fail), `integration-multi`
+  (the multi-server scenarios against `mysql84`, `percona97` and `mariadb130` together, with
+  `LAZYVIEW_TEST_REQUIRE_MULTI=1`; the single-server jobs set it to `0`) and the image smoke and
+  end-to-end tests on every push and pull request. The servers run with the durable defaults
+  (no `docker-compose.local.yml`).
 * Every image is built and tested before it is pushed: `--version`, exit code `2` without
   configuration, user `65532`, no shell and the healthcheck, on both architectures (arm64 under
   QEMU). An end-to-end run of `docker-compose.example.yml` against MySQL 8.4 (amd64) follows.
 * `publish-image.yml` is called by `ci.yml`. Pushes to `main` publish `edge` once lint, unit and
   end-to-end tests pass. `v*` tags publish a release, which additionally needs the integration
-  tests on the six blocking servers (the advisory pre-releases cannot block it). Pull requests never get registry credentials and never push.
+  tests on the six blocking servers and `integration-multi` (the advisory pre-releases cannot
+  block it). Pull requests never get registry credentials and never push.
 * `ghcr-cleanup.yml` deletes untagged images and `sha-*` images beyond the newest 20. It runs
   after each publish, daily, and on demand (dry run by default). It never touches the platform and
   attestation manifests of kept multi-arch images.

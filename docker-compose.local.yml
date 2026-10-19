@@ -1,0 +1,30 @@
+# Local-only additions to docker-compose.test.yml for a developer host; CI never loads this file.
+# scripts/test-servers.sh passes it after docker-compose.test.yml (unless LV_COMPOSE_LOCAL=0 or
+# CI is set); by hand:
+#
+#   docker compose -f docker-compose.test.yml -f docker-compose.local.yml up -d --wait mysql84
+#
+# docker/local.cnf drops the fsync per commit (sync_binlog=0, innodb_flush_log_at_trx_commit=2):
+# compose servers on a shared host spend 35-80 ms per autocommit on fsyncs otherwise, which
+# makes the heavy suites 2-3 times slower than the same build outside Docker. Everything else
+# (images, flags, memory limits) stays exactly as in CI. The file goes where each image's
+# server reads it: /etc/mysql/my.cnf is a default option file of every MySQL and Percona build
+# and none of these images ships one; the MariaDB images include /etc/mysql/conf.d/.
+
+x-mysql-local: &mysql-local
+  volumes:
+    - ./docker/local.cnf:/etc/mysql/my.cnf:ro
+
+x-mariadb-local: &mariadb-local
+  volumes:
+    - ./docker/local.cnf:/etc/mysql/conf.d/lazyview-local.cnf:ro
+
+services:
+  mysql84: *mysql-local
+  mysql267: *mysql-local
+  percona84: *mysql-local
+  percona97: *mysql-local
+  mysql2610-pre: *mysql-local
+  mariadb1011: *mariadb-local
+  mariadb130: *mariadb-local
+  mariadb132-pre: *mariadb-local

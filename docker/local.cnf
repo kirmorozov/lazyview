@@ -1,0 +1,8 @@
+# Local speed settings for the integration-test servers on a developer host, mounted by
+# docker-compose.local.yml (scripts/test-servers.sh compose up adds that file; CI never does).
+# Commits stop waiting for an fsync of the binlog and of the redo log: a crash of the container
+# (not of mysqld alone) can lose the last second of commits, which test data can afford. CI
+# keeps the durable server defaults (sync_binlog=1, innodb_flush_log_at_trx_commit=1).
+[mysqld]
+sync_binlog=0
+innodb_flush_log_at_trx_commit=2
