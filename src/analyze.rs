@@ -1943,6 +1943,15 @@ pub fn plan_block(
     if let (Some(o), Some(_)) = (&order_by, &top_n) {
         let mut why = None;
         let _ = visit_expressions(o, |e: &Expr| {
+            // (Not a filter context: no exact NOT EXISTS form, and MariaDB re-uses a stale NOT
+            // IN result when the refresh statement is re-executed, F5.)
+            if matches!(e, Expr::InSubquery { negated: true, .. }) {
+                why = Some(
+                    "NOT IN subquery in the ORDER BY of a top-N view (MariaDB re-executes it with a stale result): write NOT EXISTS"
+                        .to_string(),
+                );
+                return ControlFlow::Break(());
+            }
             if let Expr::Function(f) = e {
                 let n = function_name(f);
                 if f.over.is_none() && NONDETERMINISTIC.contains(&n.as_str()) {

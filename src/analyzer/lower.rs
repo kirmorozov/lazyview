@@ -9,10 +9,12 @@ use anyhow::Result;
 use sqlparser::ast::{Expr, SelectItem};
 use sqlparser::tokenizer::Token;
 
-use super::ast::{and_all, qident};
+use super::ast::{and_all, join_constraint, qident};
 use super::ir::{Block, Semi};
 use super::names::{finish_view_names, ident_name};
-use super::normalize::{fill_placeholders, marker_args, marker_name, query_of, semi_renamed};
+use super::normalize::{
+    fill_placeholders, marker_args, marker_name, not_in_as_not_exists, query_of, semi_renamed,
+};
 use super::source::tokenize;
 use crate::analyze::{self, AliasPlan, Mode, ParsedDef, ViewPlan};
 use crate::catalog::{TableInfo, TableRef};
@@ -118,6 +120,21 @@ fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refus
         return Ok(());
     }
     let missing = || Refused::Reason("internal analyzer error: semi-join marker missing".into());
+    // A semi-join of a derived table merged onto the NULL side of a LEFT JOIN sits in its ON.
+    let in_on = |id: usize| {
+        b.select.from.iter().flat_map(|t| &t.joins).any(|j| {
+            match join_constraint(&j.join_operator) {
+                Some(sqlparser::ast::JoinConstraint::On(e)) => marker_args(e, id).is_some(),
+                _ => false,
+            }
+        })
+    };
+    if let Some(s) = b.semis.iter().find(|s| in_on(s.id)) {
+        return Err(Refused::Reason(format!(
+            "{} in a derived table or CTE on the NULL side of a LEFT JOIN (needs internal views)",
+            semi_kind(s)
+        )));
+    }
     let Some(w) = &b.select.selection else {
         return Err(missing());
     };
@@ -132,7 +149,13 @@ fn attach_semis(plan: &mut ViewPlan, b: &Block) -> std::result::Result<(), Refus
     for s in &b.semis {
         let s = &semi_renamed(s, &taken);
         let args = marker_args(w, s.id).ok_or_else(missing)?;
-        let mut pred = s.predicate.clone();
+        // (The marker is a conjunct of the WHERE: a filter context, where NOT IN has an exact NOT
+        // EXISTS form.)
+        let mut pred = if s.not_in {
+            not_in_as_not_exists(&s.predicate).ok_or_else(missing)?
+        } else {
+            s.predicate.clone()
+        };
         fill_placeholders(&mut pred, &args);
         where_sql = replace_call(&where_sql, &marker_name(s.id), &format!("({pred})"))
             .ok_or_else(missing)?;

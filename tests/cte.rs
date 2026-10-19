@@ -2159,3 +2159,158 @@ fn cte_semi_joins_never_capture_aliases() {
         Ok(())
     });
 }
+
+// --- F5: NOT IN through re-executed refresh statements (MariaDB re-uses a stale NOT IN result
+// of a prepared statement after the subquery flips between empty and non-empty).
+
+const NOT_IN_DDL: &[&str] = &[
+    "CREATE TABLE customers (id INT NOT NULL PRIMARY KEY, ref INT NULL)",
+    "CREATE TABLE orders (id INT NOT NULL PRIMARY KEY, customer_id INT NULL, total INT NOT NULL)",
+    "CREATE TABLE payments (id INT NOT NULL PRIMARY KEY, order_id INT NULL, amount INT NOT NULL)",
+    "INSERT INTO customers VALUES (1, 2), (2, NULL), (3, 1), (4, 4), (5, NULL)",
+    "INSERT INTO orders VALUES (20, 2, 450)",
+    "INSERT INTO payments VALUES (200, 20, 450)",
+];
+
+fn not_in_cases() -> Vec<Case> {
+    vec![
+        case(
+            "nin_single",
+            "incremental",
+            "spj",
+            "SELECT c.id FROM customers c WHERE c.ref NOT IN (SELECT o.customer_id FROM orders o WHERE o.total > 400)",
+        ),
+        // The 3-table form (L4).
+        case(
+            "nin_join",
+            "incremental",
+            "spj",
+            "SELECT c.id FROM customers c WHERE c.ref NOT IN
+             (SELECT o.customer_id FROM orders o JOIN payments p ON p.order_id = o.id WHERE p.amount > 400)",
+        ),
+        case(
+            "nin_grouped",
+            "incremental",
+            "grouped",
+            "SELECT c.ref, COUNT(*) AS n FROM customers c
+             WHERE c.id NOT IN (SELECT o.customer_id FROM orders o WHERE o.total > 400) GROUP BY c.ref",
+        ),
+        // One unit, the same refresh statement every time.
+        case(
+            "nin_global",
+            "incremental",
+            "global",
+            "SELECT COUNT(*) AS n FROM customers c WHERE c.ref NOT IN (SELECT o.customer_id FROM orders o WHERE o.total > 400)",
+        ),
+        case(
+            "nex_control",
+            "incremental",
+            "spj",
+            "SELECT c.id FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.total > 400 AND o.customer_id = c.ref)",
+        ),
+    ]
+}
+
+/// The subqueries flip between empty and non-empty five times, then a NULL key enters and
+/// leaves.
+fn not_in_steps() -> Vec<(String, &'static str)> {
+    let mut out = Vec::new();
+    for round in 1..=5 {
+        out.push((
+            format!("round {round}: orders empty"),
+            "UPDATE orders SET total = 1 WHERE id = 20",
+        ));
+        out.push((
+            format!("round {round}: payments empty"),
+            "UPDATE payments SET amount = 1 WHERE id = 200",
+        ));
+        out.push((
+            format!("round {round}: orders non-empty"),
+            "UPDATE orders SET total = 401 WHERE id = 20",
+        ));
+        out.push((
+            format!("round {round}: payments non-empty"),
+            "UPDATE payments SET amount = 450 WHERE id = 200",
+        ));
+    }
+    out.push((
+        "a NULL key enters".into(),
+        "INSERT INTO orders VALUES (21, NULL, 500)",
+    ));
+    out.push((
+        "the NULL key leaves".into(),
+        "DELETE FROM orders WHERE id = 21",
+    ));
+    out
+}
+
+async fn run_not_in(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
+    let db = ctx.new_db(&format!("cte_nin_{label}")).await?;
+    let mut c = db.conn().await?;
+    for s in NOT_IN_DDL {
+        exec(&mut c, s).await?;
+    }
+    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), not_in_cases()).await?;
+    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        &format!("{label}: initial build"),
+    )
+    .await?;
+    for (what, stmt) in not_in_steps() {
+        exec(&mut c, stmt).await.with_context(|| what.clone())?;
+        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
+    }
+    assert_ready(&mut c, &names(&specs)).await?;
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// Whether the server re-uses a stale NOT IN result in a re-executed prepared statement (the
+/// MariaDB bug F5 works around), for the log: lazyview must be right either way.
+async fn not_in_canary(ctx: &Ctx) -> Result<()> {
+    use mysql_async::prelude::Queryable;
+    let db = ctx.new_db("cte_nin_canary").await?;
+    let mut c = db.conn().await?;
+    for s in [
+        "CREATE TABLE t1 (id INT PRIMARY KEY, ref INT NULL)",
+        "CREATE TABLE t2 (id INT PRIMARY KEY, k INT NULL, amount INT NULL)",
+        "INSERT INTO t1 VALUES (1, 2), (2, NULL), (3, 1)",
+        "INSERT INTO t2 VALUES (20, 2, 1)",
+    ] {
+        exec(&mut c, s).await?;
+    }
+    let sql =
+        "SELECT id FROM t1 WHERE ref NOT IN (SELECT k FROM t2 WHERE amount > 400) ORDER BY id";
+    let st = c.prep(sql).await?;
+    let _: Vec<i64> = c.exec(&st, ()).await?;
+    exec(&mut c, "UPDATE t2 SET amount = 401").await?;
+    let again: Vec<i64> = c.exec(&st, ()).await?;
+    let fresh: Vec<i64> = c.query(sql).await?;
+    ctx.log(format!(
+        "NOT IN canary: re-executed {again:?}, text {fresh:?}{}",
+        if again != fresh {
+            " (the server re-uses a stale NOT IN result)"
+        } else {
+            ""
+        }
+    ));
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// F5: incremental NOT IN views stay equal to their oracles while the subquery flips between
+/// empty and non-empty (their refresh statements carry the NULL-aware NOT EXISTS form).
+#[test]
+fn cte_not_in_survives_reexecution() {
+    scenario("cte_nin", |ctx| async move {
+        not_in_canary(&ctx).await?;
+        run_not_in(&ctx, "w0", "0").await?;
+        run_not_in(&ctx, "w50", "50").await?;
+        Ok(())
+    });
+}

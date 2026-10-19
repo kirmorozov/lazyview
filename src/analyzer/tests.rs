@@ -600,6 +600,48 @@ fn semi_join_subqueries_never_capture_outer_aliases() {
     );
 }
 
+/// F5: NOT IN semi-joins are rendered in the refresh SELECT as their exact NULL-aware NOT EXISTS
+/// form (MariaDB re-uses a stale NOT IN result in re-executed prepared statements); the lookups
+/// keep their NULL-relating conditions.
+#[test]
+fn not_in_is_rendered_as_not_exists() {
+    let v = p(
+        "CREATE VIEW v AS SELECT c.id FROM customers c WHERE c.region_id NOT IN \
+               (SELECT o.customer_id FROM orders o WHERE o.total > 400)",
+    );
+    assert_eq!(v.mode, Mode::Spj);
+    let w = v.where_sql.as_deref().unwrap();
+    assert!(!w.contains("NOT IN"), "{w}");
+    assert_eq!(
+        w,
+        "((NOT EXISTS (SELECT 1 FROM orders o WHERE (`o`.total > 400)) OR (c.region_id IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM orders o WHERE (`o`.total > 400) AND (`o`.customer_id = c.region_id)) \
+         AND NOT EXISTS (SELECT 1 FROM orders o WHERE (`o`.total > 400) AND (`o`.customer_id IS NULL)))))"
+    );
+    // Over a join (L4), without a WHERE in the subquery.
+    for sql in [
+        "SELECT c.id FROM customers c WHERE c.id NOT IN \
+         (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id WHERE i.qty > 4)",
+        "SELECT id FROM orders WHERE customer_id NOT IN (SELECT id FROM customers)",
+    ] {
+        let v = p(&format!("CREATE VIEW v AS {sql}"));
+        let all = format!("{} {}", v.where_sql.as_deref().unwrap_or(""), v.from_sql);
+        assert!(v.is_incremental(), "{sql}: {:?}", v.mode);
+        assert!(!all.contains("NOT IN") && all.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {all}");
+    }
+    // A semi-join merged onto the NULL side of a LEFT JOIN (its marker in the ON) is named.
+    assert_eq!(
+        reason("CREATE VIEW v AS SELECT o.id, d.id AS c FROM orders o LEFT JOIN (SELECT id FROM customers WHERE region_id NOT IN \
+                (SELECT r.id FROM regions r WHERE r.name = 'x')) d ON d.id = o.customer_id"),
+        "IN subquery in a derived table or CTE on the NULL side of a LEFT JOIN (needs internal views)"
+    );
+    // Not a filter context: Full with the reason.
+    assert_eq!(
+        reason("CREATE VIEW v AS SELECT o.id FROM orders o ORDER BY o.customer_id NOT IN (SELECT id FROM customers WHERE region_id = 1), o.id LIMIT 2"),
+        "NOT IN subquery in the ORDER BY of a top-N view (MariaDB re-executes it with a stale result): write NOT EXISTS"
+    );
+}
+
 /// L6: the budget applies to each join block on its own (a UNION ALL branch is planned alone):
 /// wide unions of small branches plan, a plain wide join is the server's to refuse, and the
 /// reason names the block that exceeds it and what it inlines.

@@ -1771,6 +1771,60 @@ fn semi(
     )))
 }
 
+/// `x NOT IN (SELECT k FROM S WHERE p)` (the predicate of a NOT IN semi-join) as its exact form
+/// in a filter context (WHERE / ON: NULL and FALSE both drop the row): `NOT EXISTS (S where p)
+/// OR (x IS NOT NULL AND NOT EXISTS (… AND k = x) AND NOT EXISTS (… AND k IS NULL))`. MariaDB
+/// 10.11 / 13.0 re-use a stale NOT IN result when a prepared statement is re-executed after the
+/// subquery flips between empty and non-empty (F5); NOT EXISTS is not affected.
+pub(crate) fn not_in_as_not_exists(pred: &Expr) -> Option<Expr> {
+    let Expr::InSubquery {
+        expr,
+        subquery,
+        negated: true,
+    } = pred
+    else {
+        return None;
+    };
+    let SetExpr::Select(sel) = subquery.body.as_ref() else {
+        return None;
+    };
+    let [SelectItem::UnnamedExpr(k)] = sel.projection.as_slice() else {
+        return None;
+    };
+    let x = nested((**expr).clone());
+    let k = nested(k.clone());
+    let one = parse_expr("1").ok()?;
+    let not_exists = |extra: Option<Expr>| {
+        let mut s = (**sel).clone();
+        s.projection = vec![SelectItem::UnnamedExpr(one.clone())];
+        s.selection = and_all(s.selection.take().into_iter().chain(extra).collect());
+        Expr::Exists {
+            subquery: Box::new(query_of(s)),
+            negated: true,
+        }
+    };
+    let and = |a: Expr, b: Expr| Expr::BinaryOp {
+        left: Box::new(a),
+        op: BinaryOperator::And,
+        right: Box::new(b),
+    };
+    let none = not_exists(None);
+    let no_match = not_exists(Some(Expr::BinaryOp {
+        left: Box::new(k.clone()),
+        op: BinaryOperator::Eq,
+        right: Box::new(x.clone()),
+    }));
+    let no_null = not_exists(Some(Expr::IsNull(Box::new(k))));
+    Some(Expr::Nested(Box::new(Expr::BinaryOp {
+        left: Box::new(none),
+        op: BinaryOperator::Or,
+        right: Box::new(Expr::Nested(Box::new(and(
+            and(Expr::IsNotNull(Box::new(x)), no_match),
+            no_null,
+        )))),
+    })))
+}
+
 /// `s` with the aliases of its subquery's tables renamed away from `taken` (the lower-case
 /// aliases of the block it belongs to, after every merge and rewrite): the outer expressions
 /// filled into its predicate and lookup conditions must not be captured by a subquery table of
