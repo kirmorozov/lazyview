@@ -96,6 +96,9 @@ pub struct Config {
     pub batch_max_keys: usize,
     pub query_chunk: usize,
     pub write_batch_rows: usize,
+    /// Estimated bytes per INSERT / DELETE statement of a write (at most half of each server's
+    /// `max_allowed_packet`).
+    pub write_batch_bytes: usize,
     pub server_id: u32,
     pub instance_id: String,
     pub drop_removed: bool,
@@ -256,6 +259,11 @@ impl Config {
             batch_max_keys: num("LAZYVIEW_BATCH_MAX_KEYS", 50_000)? as usize,
             query_chunk,
             write_batch_rows: num("LAZYVIEW_WRITE_BATCH_ROWS", 500)?.max(1) as usize,
+            write_batch_bytes: num(
+                "LAZYVIEW_WRITE_BATCH_BYTES",
+                crate::mv::DEFAULT_WRITE_BATCH_BYTES as u64,
+            )?
+            .max(1024) as usize,
             server_id,
             instance_id,
             drop_removed: flag("LAZYVIEW_DROP_REMOVED", true)?,
@@ -458,6 +466,7 @@ mod tests {
         assert!(c.sync && c.drop_removed);
         assert!(c.server_id >= 1 << 30 && !c.server_id_fixed);
         assert_eq!(c.health_addr, Some(([0, 0, 0, 0], 8080).into()));
+        assert_eq!((c.write_batch_rows, c.write_batch_bytes), (500, 4 << 20));
         let c = cfg(&[
             ("LAZYVIEW_DSN", "x"),
             ("LAZYVIEW_START_MODE", "REBUILD"),

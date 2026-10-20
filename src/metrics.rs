@@ -52,6 +52,8 @@ counters!(
     source_queries,
     mv_queries,
     mv_rows_inserted,
+    // Of mv_rows_inserted: rows upserted by their row key (INSERT ... ON DUPLICATE KEY UPDATE).
+    mv_rows_upserted,
     mv_rows_deleted,
     full_rebuilds,
     definition_reloads,

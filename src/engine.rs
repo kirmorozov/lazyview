@@ -220,6 +220,8 @@ struct Target {
     opts: Opts,
     schema: String,
     conn: Option<Conn>,
+    /// Statement limits and upsert syntax of this server (read with the connection).
+    write: Option<mv::WriteOpts>,
     /// Unreachable: connection attempts fail fast until then (backoff), so a dead target never
     /// stalls the binlog loop for more than one connect timeout per period.
     retry_at: Option<Instant>,
@@ -634,6 +636,7 @@ impl Engine {
                 opts: src_opts.clone(),
                 schema: schema.clone(),
                 conn: None,
+                write: None,
                 retry_at: None,
                 failures: 0,
             },
@@ -647,6 +650,7 @@ impl Engine {
                     opts,
                     schema: ts,
                     conn: None,
+                    write: None,
                     retry_at: None,
                     failures: 0,
                 },
@@ -1609,7 +1613,13 @@ impl Engine {
                     (at - Instant::now()).as_secs_f64()
                 );
             }
-            let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, connect(&target.opts)).await
+            let (rows, bytes) = (self.cfg.write_batch_rows, self.cfg.write_batch_bytes);
+            let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, async {
+                let mut c = connect(&target.opts).await?;
+                let w = mv::write_opts(&mut c, rows, bytes).await?;
+                Ok::<_, anyhow::Error>((c, w))
+            })
+            .await
             {
                 Ok(r) => r.with_context(|| format!("connecting to target {t}")),
                 Err(_) => Err(anyhow!(
@@ -1618,8 +1628,9 @@ impl Engine {
             };
             metrics.beat();
             match r {
-                Ok(c) => {
+                Ok((c, w)) => {
                     target.conn = Some(c);
+                    target.write = Some(w);
                     target.failures = 0;
                     target.retry_at = None;
                 }
@@ -1656,11 +1667,20 @@ impl Engine {
         let mut resumed = Vec::new();
         for t in candidates {
             let ts = self.targets[&t].schema.clone();
-            let cols = match self.target_conn(&t).await {
-                Ok(conn) => mv::table_columns(conn, &ts, &name).await.ok(),
-                Err(_) => None,
+            // Columns as the layout's, and the unique index rows are upserted by (tables
+            // built before upserts lack `_lv_row`: rebuilt once).
+            let fits = match self.target_conn(&t).await {
+                Ok(conn) => match mv::table_columns(conn, &ts, &name).await {
+                    Ok(c) if mv::layout_matches(&layout, &c) => {
+                        mv::has_row_index(conn, &ts, &name, &layout)
+                            .await
+                            .unwrap_or(false)
+                    }
+                    _ => false,
+                },
+                Err(_) => false,
             };
-            if cols.is_some_and(|c| mv::layout_matches(&layout, &c)) {
+            if fits {
                 resumed.push(t);
             }
         }
@@ -1788,7 +1808,7 @@ impl Engine {
             specs,
             plan.clone(),
             name.clone(),
-            self.cfg.write_batch_rows,
+            (self.cfg.write_batch_rows, self.cfg.write_batch_bytes),
             self.metrics.clone(),
             self.build_tx.clone(),
             self.build_slots.clone(),
@@ -3877,14 +3897,17 @@ impl Engine {
     ) -> Result<()> {
         let ts = self.targets[t].schema.clone();
         let metrics = self.metrics.clone();
-        let (batch, timeout) = (self.cfg.write_batch_rows, self.cfg.target_timeout);
-        let c = self
-            .target_conn(t)
+        let timeout = self.cfg.target_timeout;
+        self.target_conn(t)
             .await
             .with_context(|| format!("target {t}"))?;
+        let target = self.targets.get_mut(t).unwrap();
+        let (Some(c), Some(w)) = (target.conn.as_mut(), target.write) else {
+            bail!("internal: target {t} has no connection");
+        };
         let r = match tokio::time::timeout(
             timeout,
-            mv::apply(c, &ts, table, layout, chunk, rows, batch, &metrics),
+            mv::apply(c, &ts, table, layout, chunk, rows, &w, &metrics),
         )
         .await
         {
@@ -4407,12 +4430,20 @@ async fn foreign_table(c: &mut Conn, schema: &str, name: &str, marker: &str) -> 
 }
 
 /// Connects to a build target, runs its ownership checks and creates the shadow table.
-async fn prepare_target(spec: &BuildSpec, name: &str, layout: &Layout) -> Result<Conn> {
+async fn prepare_target(
+    spec: &BuildSpec,
+    name: &str,
+    layout: &Layout,
+    (batch_rows, batch_bytes): (usize, usize),
+) -> Result<(Conn, mv::WriteOpts)> {
     let (t, ts) = (&spec.target, &spec.schema);
     let mut c = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT * 3, connect(&spec.opts)).await {
         Ok(r) => r.with_context(|| format!("connecting to target {t}"))?,
         Err(_) => bail!("connecting to target {t}: timed out"),
     };
+    let w = mv::write_opts(&mut c, batch_rows, batch_bytes)
+        .await
+        .with_context(|| format!("target {t}"))?;
     let ours = |m: Option<String>| m.as_deref() == Some(spec.marker.as_str());
     if spec.check_side {
         for side in [mv::shadow_name(name), mv::old_name(name)] {
@@ -4436,7 +4467,7 @@ async fn prepare_target(spec: &BuildSpec, name: &str, layout: &Layout) -> Result
     mv::create_shadow_marked(&mut c, ts, name, layout, &spec.marker)
         .await
         .with_context(|| format!("creating the shadow table on target {t}"))?;
-    Ok(c)
+    Ok((c, w))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4446,7 +4477,7 @@ async fn build_task(
     targets: Vec<BuildSpec>,
     plan: Arc<ViewPlan>,
     name: String,
-    batch_rows: usize,
+    batch: (usize, usize),
     metrics: Arc<Metrics>,
     tx: mpsc::UnboundedSender<BuildDone>,
     slots: Arc<tokio::sync::Semaphore>,
@@ -4461,29 +4492,27 @@ async fn build_task(
         let mut conns = Vec::new();
         let mut failed = Vec::new();
         for spec in &targets {
-            match prepare_target(spec, &name, &layout).await {
-                Ok(c) => conns.push((c, spec.schema.clone())),
+            match prepare_target(spec, &name, &layout, batch).await {
+                Ok((c, w)) => conns.push((c, spec.schema.clone(), w)),
                 Err(e) => failed.push((spec.target.clone(), e)),
             }
         }
         if !conns.is_empty() {
             let mut bt: Vec<BuildTarget> = conns
                 .iter_mut()
-                .map(|(c, s)| BuildTarget {
+                .map(|(c, s, w)| BuildTarget {
                     conn: c,
                     schema: s.clone(),
+                    write: *w,
                 })
                 .collect();
-            let n = mv::fill(
-                &mut src, &plan, &layout, &mut bt, &name, batch_rows, &metrics,
-            )
-            .await?;
+            let n = mv::fill(&mut src, &plan, &layout, &mut bt, &name, batch.0, &metrics).await?;
             debug!(view = %name, rows = n, "build finished");
         }
         // `swap`: swap the shadow tables in right away. A target where that fails is left to
         // the engine, which swaps (and retries) the rest as for any build.
         let mut swapped = Vec::new();
-        for ((c, ts), spec) in conns.iter_mut().zip(
+        for ((c, ts, _), spec) in conns.iter_mut().zip(
             targets
                 .iter()
                 .filter(|s| !failed.iter().any(|(t, _)| *t == s.target)),
@@ -4502,7 +4531,7 @@ async fn build_task(
                 }
             }
         }
-        for (c, _) in conns {
+        for (c, _, _) in conns {
             let _ = c.disconnect().await;
         }
         let _ = src.disconnect().await;

@@ -109,9 +109,11 @@ curl -s 'localhost:8080/readyz?format=json'
 
 Counters (`lazyview_<name>_total`): `events` (binlog events), `rows_seen`, `rows_skipped` (rows
 no view needed), `flushes`, `units_refreshed`, `units_changed`, `lookup_queries`,
-`source_queries`, `mv_queries`, `mv_rows_inserted`, `mv_rows_deleted`, `full_rebuilds` (every
-table build: first builds, changed definitions and full-mode refreshes), `definition_reloads`,
-`plans_timed_out` (definitions whose planning took longer than `LAZYVIEW_PLAN_TIMEOUT_MS`).
+`source_queries`, `mv_queries`, `mv_rows_inserted` (rows written by `INSERT`, upserts
+included), `mv_rows_upserted` (of those, rows upserted by their row key), `mv_rows_deleted`,
+`full_rebuilds` (every table build: first builds, changed definitions and full-mode refreshes),
+`definition_reloads`, `plans_timed_out` (definitions whose planning took longer than
+`LAZYVIEW_PLAN_TIMEOUT_MS`).
 
 Gauges:
 

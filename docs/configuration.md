@@ -90,6 +90,7 @@ LAZYVIEW_TARGET_REPORTING_DSN=mysql://lazyview:change-me@reporting-db:3306/repor
 | `LAZYVIEW_BATCH_MAX_KEYS` | `50000` | flush earlier when this many unit keys are buffered |
 | `LAZYVIEW_QUERY_CHUNK` | `1000` | unit keys per refresh or lookup query (must be greater than `0`) |
 | `LAZYVIEW_WRITE_BATCH_ROWS` | `500` | rows per multi-row `INSERT` into a view table |
+| `LAZYVIEW_WRITE_BATCH_BYTES` | `4194304` | estimated bytes per `INSERT` or `DELETE` statement into a view table (at least `1024`), capped at half of each server's `max_allowed_packet`. A row larger than that is written alone. Statements also stay under 60,000 placeholders |
 | `LAZYVIEW_BUILD_CONCURRENCY` | `2` | view builds running at once; each holds one source connection plus one per target |
 | `LAZYVIEW_VISIBILITY_DELAY_MS` | `20` | wait before reading the sources when no GTID fence is available (MariaDB, or `gtid_mode=OFF`). Binlog events can arrive before their transaction is visible to readers |
 | `LAZYVIEW_HEARTBEAT_MS` | `5000` | replication heartbeat period (minimum `100`) |
@@ -101,9 +102,11 @@ LAZYVIEW_TARGET_REPORTING_DSN=mysql://lazyview:change-me@reporting-db:3306/repor
 `LAZYVIEW_TARGET_<NAME>_MAX_CONCURRENCY`, `LAZYVIEW_MAX_INFLIGHT_ROWS`, `LAZYVIEW_CPU_WORKERS`
 and `LAZYVIEW_STALE_AFTER_MS` are accepted (and validated) but have no effect yet: the engine
 flushes sequentially, over one connection per target. What does apply to the write path is
-`LAZYVIEW_QUERY_CHUNK` (unit keys per read query) and `LAZYVIEW_WRITE_BATCH_ROWS` (rows per
-multi-row `INSERT`; a chunk is written as one transaction: `DELETE` of the changed units, then the
-`INSERT`).
+`LAZYVIEW_QUERY_CHUNK` (unit keys per read query), `LAZYVIEW_WRITE_BATCH_ROWS` and
+`LAZYVIEW_WRITE_BATCH_BYTES` (rows and bytes per statement). A chunk is written as one
+transaction: the rows that vanished are deleted by key and the changed and new rows upserted, or,
+for a view without a row key, the changed units are deleted and inserted again (see
+[internals](internals.md)).
 
 ## Health and logging
 
