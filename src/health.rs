@@ -680,6 +680,30 @@ fn prometheus(m: &Metrics, o: &Observed, s: &Settings) -> String {
             "# HELP lazyview_{name} {help}\n# TYPE lazyview_{name} gauge\nlazyview_{name} {v}"
         );
     }
+    let _ = writeln!(
+        out,
+        "# HELP lazyview_inflight_rows Rows read from the sources and not yet written to every target (concurrent refreshes).\n# TYPE lazyview_inflight_rows gauge\nlazyview_inflight_rows {}",
+        Metrics::get(&m.gauges.inflight_rows)
+    );
+    // Per connection pool of the refresh supervisor (src/supervisor.rs).
+    let pools = m.pool_gauges();
+    if let Some(first) = pools.first() {
+        for (k, (name, help, _)) in first.values().into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "# HELP lazyview_supervisor_{name} {help}\n# TYPE lazyview_supervisor_{name} gauge"
+            );
+            for p in &pools {
+                let _ = writeln!(
+                    out,
+                    "lazyview_supervisor_{name}{{pool=\"{}\",endpoint=\"{}\"}} {}",
+                    escape_label(&p.pool),
+                    escape_label(&p.endpoint),
+                    p.values()[k].2
+                );
+            }
+        }
+    }
     if let Some(p) = m.applied() {
         let _ = writeln!(
             out,
@@ -1816,7 +1840,16 @@ mod tests {
             views_ready: 2,
             ..healthy()
         };
+        let pool = std::sync::Arc::new(crate::metrics::PoolGauges::new("write", "an\"x"));
+        Metrics::set(&pool.max, 4);
+        Metrics::set_f64(&pool.limit, 4.0);
+        m.register_pool(pool);
         let text = prometheus(&m, &o, &Settings::default());
+        assert!(
+            text.contains("lazyview_supervisor_max{pool=\"write\",endpoint=\"an\\\"x\"} 4"),
+            "{text}"
+        );
+        assert!(text.contains("lazyview_inflight_rows 0"), "{text}");
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             let (name, value) = line.rsplit_once(' ').unwrap();
             assert!(name.starts_with("lazyview_"), "{line}");

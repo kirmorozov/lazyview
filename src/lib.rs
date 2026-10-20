@@ -19,3 +19,4 @@ pub use metrics::{Metrics, Snapshot};
 pub mod accumulate;
 pub mod meta;
 pub mod mv;
+pub mod supervisor;

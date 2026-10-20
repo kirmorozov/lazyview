@@ -113,7 +113,15 @@ no view needed), `flushes`, `units_refreshed`, `units_changed`, `lookup_queries`
 included), `mv_rows_upserted` (of those, rows upserted by their row key), `mv_rows_deleted`,
 `full_rebuilds` (every table build: first builds, changed definitions and full-mode refreshes),
 `definition_reloads`, `plans_timed_out` (definitions whose planning took longer than
-`LAZYVIEW_PLAN_TIMEOUT_MS`).
+`LAZYVIEW_PLAN_TIMEOUT_MS`), and for [concurrent refreshes](configuration.md#concurrent-refreshes)
+`supervisor_overload_errors` (ops that failed with an overload error), `supervisor_retries`,
+`supervisor_zombie_kills` (writes killed after a timeout inside their transaction) and
+`supervisor_cpu_offloads` (diffs run off the async threads).
+
+Per connection pool of concurrent refreshes, labelled
+`{pool="read|write", endpoint="source|<target>"}`: `lazyview_supervisor_limit`, `_max` (pool
+size), `_inflight`, `_peak_inflight` and `_queued` (ops waiting for a permit).
+`lazyview_inflight_rows`: rows read from the sources and not yet written to every target.
 
 Gauges:
 

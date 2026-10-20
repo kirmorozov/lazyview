@@ -98,15 +98,41 @@ LAZYVIEW_TARGET_REPORTING_DSN=mysql://lazyview:change-me@reporting-db:3306/repor
 
 ### Reserved
 
-`LAZYVIEW_SUPERVISOR`, `LAZYVIEW_MAX_SOURCE_CONCURRENCY`, `LAZYVIEW_MAX_TARGET_CONCURRENCY`,
-`LAZYVIEW_TARGET_<NAME>_MAX_CONCURRENCY`, `LAZYVIEW_MAX_INFLIGHT_ROWS`, `LAZYVIEW_CPU_WORKERS`
-and `LAZYVIEW_STALE_AFTER_MS` are accepted (and validated) but have no effect yet: the engine
-flushes sequentially, over one connection per target. What does apply to the write path is
-`LAZYVIEW_QUERY_CHUNK` (unit keys per read query), `LAZYVIEW_WRITE_BATCH_ROWS` and
-`LAZYVIEW_WRITE_BATCH_BYTES` (rows and bytes per statement). A chunk is written as one
-transaction: the rows that vanished are deleted by key and the changed and new rows upserted, or,
-for a view without a row key, the changed units are deleted and inserted again (see
-[internals](internals.md)).
+`LAZYVIEW_STALE_AFTER_MS` is accepted (and validated) but has no effect yet (see
+[design: refresh supervisor](design-supervisor.md), §6 I2).
+
+## Concurrent refreshes
+
+Refreshes read the dirty units of a view in chunks from the source and write each chunk to every
+target, several chunks and targets at once, on persistent connection pools: one read pool on the
+source and one write pool per target (the source included). Each unit is in exactly one chunk
+of a refresh, and a refresh finishes every write before the next one of the view starts, so no
+older write lands after a newer one. Each chunk is written to a target as one transaction: the
+rows that vanished are deleted by key and the changed and new rows upserted, or, for a view
+without a row key, the changed units are deleted and inserted again (see
+[internals](internals.md)), in statements of `LAZYVIEW_WRITE_BATCH_ROWS` rows and
+`LAZYVIEW_WRITE_BATCH_BYTES` bytes. Tables without an index on the unit get one write at a time
+per target. Errors of an overloaded or unreachable server (too many connections, lock wait
+timeout, deadlock, lost connection, `LAZYVIEW_TARGET_TIMEOUT_MS`) are retried up to 3 times with
+backoff and never lead to a rebuild. A write that times out after its transaction began is
+killed (`KILL CONNECTION`) and the target takes no further writes until the server no longer
+lists it. See [design: refresh supervisor](design-supervisor.md).
+
+| variable | default | meaning |
+|---|---|---|
+| `LAZYVIEW_SUPERVISOR` | `adaptive` | `adaptive` or `fixed`: concurrent refreshes (`adaptive` uses fixed limits until the adaptive limiter exists, and logs that at startup); `off`: one sequential refresh at a time on single connections (the engine before concurrent refreshes) |
+| `LAZYVIEW_MAX_SOURCE_CONCURRENCY` | `4` | source reads at once (read pool size) |
+| `LAZYVIEW_MAX_TARGET_CONCURRENCY` | `2` | writes at once per target, the source included (write pool size per target) |
+| `LAZYVIEW_TARGET_<NAME>_MAX_CONCURRENCY` | | the same for one target (`SOURCE` for the source) |
+| `LAZYVIEW_MAX_INFLIGHT_ROWS` | `200000` | rows read but not yet written to every target; no further chunk is read while more are in flight |
+| `LAZYVIEW_CPU_WORKERS` | `min(4, max(1, cores/4))` | large diffs (4096 rows or 64k values) running off the async threads at once |
+
+The defaults of the two pool sizes are interim values; they become 8 and 4 with the adaptive
+limiter. Pooled connections take the same session settings as the others (READ COMMITTED, the
+[sql_mode](server-setup.md#sql_mode) lazyview uses) and close after 30 s idle, so lazyview keeps
+at most 4 + `LAZYVIEW_MAX_SOURCE_CONCURRENCY` + `LAZYVIEW_MAX_TARGET_CONCURRENCY` connections on
+the source plus 1 + `LAZYVIEW_MAX_TARGET_CONCURRENCY` on each other target, besides the builds
+(`LAZYVIEW_BUILD_CONCURRENCY`).
 
 ## Health and logging
 

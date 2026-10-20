@@ -508,6 +508,11 @@ impl Ctx {
             "LAZYVIEW_FULL_REFRESH_MS".into(),
             test_full_refresh_ms().to_string(),
         );
+        // The supervisor mode of a CI leg (`LAZYVIEW_SUPERVISOR=off`) reaches every engine unless
+        // a test sets its own.
+        if let Ok(v) = std::env::var("LAZYVIEW_SUPERVISOR") {
+            env.insert("LAZYVIEW_SUPERVISOR".into(), v);
+        }
         for (k, v) in overrides {
             env.insert(k.to_string(), v.to_string());
         }

@@ -66,8 +66,8 @@ impl Default for SupervisorConfig {
     fn default() -> Self {
         SupervisorConfig {
             mode: SupervisorMode::Adaptive,
-            max_source: 8,
-            max_target: 4,
+            max_source: DEFAULT_MAX_SOURCE,
+            max_target: DEFAULT_MAX_TARGET,
             max_target_override: BTreeMap::new(),
             max_inflight_rows: 200_000,
             cpu_workers: default_cpu_workers(),
@@ -75,6 +75,11 @@ impl Default for SupervisorConfig {
         }
     }
 }
+
+/// Interim pool sizes while `adaptive` runs with fixed limits (the design's 8 / 4 come with the
+/// adaptive limiter).
+pub const DEFAULT_MAX_SOURCE: usize = 4;
+pub const DEFAULT_MAX_TARGET: usize = 2;
 
 /// `min(4, max(1, cores / 4))`.
 pub fn default_cpu_workers() -> usize {
@@ -242,8 +247,12 @@ impl Config {
         }
         let supervisor = SupervisorConfig {
             mode: supervisor_mode,
-            max_source: (num("LAZYVIEW_MAX_SOURCE_CONCURRENCY", 8)? as usize).max(1),
-            max_target: (num("LAZYVIEW_MAX_TARGET_CONCURRENCY", 4)? as usize).max(1),
+            max_source: (num("LAZYVIEW_MAX_SOURCE_CONCURRENCY", DEFAULT_MAX_SOURCE as u64)?
+                as usize)
+                .max(1),
+            max_target: (num("LAZYVIEW_MAX_TARGET_CONCURRENCY", DEFAULT_MAX_TARGET as u64)?
+                as usize)
+                .max(1),
             max_target_override,
             max_inflight_rows: (num("LAZYVIEW_MAX_INFLIGHT_ROWS", 200_000)? as usize).max(1),
             cpu_workers: (num("LAZYVIEW_CPU_WORKERS", default_cpu_workers() as u64)? as usize)
@@ -537,11 +546,11 @@ mod tests {
         let c = cfg(&[("LAZYVIEW_DSN", "mysql://a@b/c")]).unwrap();
         let s = &c.supervisor;
         assert_eq!(s.mode, SupervisorMode::Adaptive);
-        assert_eq!((s.max_source, s.max_target), (8, 4));
+        assert_eq!((s.max_source, s.max_target), (4, 2));
         assert_eq!(s.max_inflight_rows, 200_000);
         assert!((1..=4).contains(&s.cpu_workers));
         assert_eq!(s.stale_after, Duration::from_secs(300));
-        assert_eq!(s.max_for_target("source"), 4);
+        assert_eq!(s.max_for_target("source"), 2);
         let c = cfg(&[
             ("LAZYVIEW_DSN", "mysql://a@b/c"),
             ("LAZYVIEW_SUPERVISOR", "Fixed"),
