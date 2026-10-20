@@ -1811,6 +1811,8 @@ async fn probe(
         primary: false,
         lineage: Vec::new(),
         epoch: Vec::new(),
+        // JSON units: no row identity (written per unit).
+        identity: Vec::new(),
         cols,
     })
 }
@@ -1893,6 +1895,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
             l_j.unit_kinds()
         );
         let metrics = Metrics::default();
+        let w = mv::write_opts(&mut c, 1000, mv::DEFAULT_WRITE_BATCH_BYTES).await?;
         let j = |s: &str| Datum::Bytes(s.as_bytes().to_vec());
         let sel_j = "SELECT doc, COUNT(*) AS n FROM jt WHERE {F} GROUP BY doc";
         let orc_j = "SELECT doc, COUNT(*) AS n FROM jt GROUP BY doc";
@@ -1908,7 +1911,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
         let key = |mysql: &str, mariadb: &str| j(if maria { mariadb } else { mysql });
         // Initial fill of the single-column view (the whole view).
         let r = rows(&mut c, &l_j, sel_j, &["doc"], None).await?;
-        mv::apply(&mut c, &db.name, "mv_j", &l_j, None, &r, 1000, &metrics).await?;
+        mv::apply(&mut c, &db.name, "mv_j", &l_j, None, &r, &w, &metrics).await?;
         check(&mut c, "mv_j", orc_j, on_j, "initial fill").await?;
         // Row 3 moves to the {"a": 1} group (a new text group on MariaDB).
         exec(&mut c, r#"UPDATE jt SET doc = '{"a": 1.00}' WHERE id = 3"#).await?;
@@ -1929,7 +1932,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
             &l_j,
             Some(&chunk),
             &r,
-            1000,
+            &w,
             &metrics,
         )
         .await?;
@@ -1965,14 +1968,14 @@ fn reg_json_unit_filters_match_json_equal_groups() {
             &l_j,
             Some(&chunk),
             &r,
-            1000,
+            &w,
             &metrics,
         )
         .await?;
         check(&mut c, "mv_j", orc_j, on_j, "delete of a JSON group").await?;
         // Composite units with NULLs: plain tuples and the null-safe branch bind per position.
         let r = rows(&mut c, &l_gj, sel_gj, &["g", "doc"], None).await?;
-        mv::apply(&mut c, &db.name, "mv_gj", &l_gj, None, &r, 1000, &metrics).await?;
+        mv::apply(&mut c, &db.name, "mv_gj", &l_gj, None, &r, &w, &metrics).await?;
         check(&mut c, "mv_gj", orc_gj, on_gj, "initial fill (composite)").await?;
         run(
             &mut c,
@@ -2002,7 +2005,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
             &l_gj,
             Some(&chunk),
             &r,
-            1000,
+            &w,
             &metrics,
         )
         .await?;
@@ -2095,8 +2098,9 @@ fn reg_json_unit_delete_with_epoch_timestamps() {
         let orc = "SELECT doc, MAX(ts) AS mx, COUNT(*) AS n FROM jt GROUP BY doc";
         let on = "o.doc <=> m.doc AND o.mx <=> m.mx";
         let metrics = Metrics::default();
+        let w = mv::write_opts(&mut c, 1000, mv::DEFAULT_WRITE_BATCH_BYTES).await?;
         let r = rows(&mut c, &l, sel, &["doc"], None).await?;
-        mv::apply(&mut c, &db.name, "mv_jt", &l, None, &r, 1000, &metrics).await?;
+        mv::apply(&mut c, &db.name, "mv_jt", &l, None, &r, &w, &metrics).await?;
         check(&mut c, "mv_jt", orc, on, "initial fill").await?;
         // Dirty keys as the binlog decoder renders them on MySQL; the text as stored on MariaDB.
         let key = |mysql: &str, mariadb: &str| {
@@ -2134,7 +2138,7 @@ fn reg_json_unit_delete_with_epoch_timestamps() {
                 &l,
                 Some(&chunk),
                 &r,
-                1000,
+                &w,
                 &metrics,
             )
             .await?;

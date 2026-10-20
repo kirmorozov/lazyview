@@ -72,7 +72,7 @@ jobs:
     # One job per server flavor of docker-compose.test.yml (docs/server-setup.md "Supported
     # servers"): the blocking matrix (oldest supported LTS + latest GA per product) must pass,
     # the advisory pre-releases only annotate the run when they fail (continue-on-error).
-    name: integration (${{ matrix.flavor }}${{ matrix.advisory && ', advisory' || '' }})
+    name: integration (${{ matrix.flavor }}${{ matrix.supervisor && format(', supervisor {0}', matrix.supervisor) || '' }}${{ matrix.advisory && ', advisory' || '' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     continue-on-error: ${{ matrix.advisory }}
@@ -87,6 +87,9 @@ jobs:
           - { flavor: percona97, port: 33197, advisory: false }
           - { flavor: mariadb1011, port: 33111, advisory: false }
           - { flavor: mariadb130, port: 33130, advisory: false }
+          # The sequential refresh path (LAZYVIEW_SUPERVISOR=off) on one blocking flavor; the
+          # other jobs run the default (concurrent) one.
+          - { flavor: mariadb1011, port: 33111, advisory: false, supervisor: "off" }
           # Newest pre-releases (compose profile `prerelease`): never required.
           - { flavor: mariadb132-pre, port: 33132, advisory: true }
           - { flavor: mysql2610-pre, port: 33261, advisory: true }
@@ -131,6 +134,8 @@ jobs:
           # One server here: the multi-server scenarios skip (visibly) instead of failing, which
           # the harness does by default when CI is set; integration-multi runs them.
           LAZYVIEW_TEST_REQUIRE_MULTI: "0"
+          # Empty: the default mode. The harness passes it to every engine a test starts.
+          LAZYVIEW_SUPERVISOR: ${{ matrix.supervisor || '' }}
         # --no-fail-fast: run every suite and report all failures, not just the first.
         run: cargo test --locked --no-fail-fast --test '*' -- --test-threads=1
       - name: advisory flavor failed
@@ -151,7 +156,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: integration-logs-${{ matrix.flavor }}
+          name: integration-logs-${{ matrix.flavor }}${{ matrix.supervisor && format('-supervisor-{0}', matrix.supervisor) || '' }}
           path: |
             server-logs/
             tmp/out/test-logs/

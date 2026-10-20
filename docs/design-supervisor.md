@@ -1,11 +1,23 @@
 # Design: refresh supervisor (concurrent, adaptive, overload-safe)
 
-> **Not implemented.** None of the variables, metrics, states or files below exist yet; see
-> [configuration](configuration.md) and [operations](operations.md) for current behaviour. Paths
-> under `tmp/` refer to local, git-ignored benchmark scripts and output that are not in the
-> repository.
+> **Partly implemented.** Implemented (see [configuration](configuration.md#concurrent-refreshes)
+> and [operations](operations.md#metrics)): the pools and the executor of §2 with fixed limits
+> (`adaptive` uses them too, with interim defaults of 4 source reads and 2 writes per target),
+> one executor run for all live views of a flush, the error classes, retries and the
+> no-rebuild rule of §4.2, the zombie fence of §4.3, the row budget and CPU offload of §4.5, and
+> the counters and per-pool gauges of §5 that fixed limits maintain. Not implemented yet:
+> pipelining (§3: the flush still runs inline, the binlog is not read meanwhile), the adaptive
+> limiter (§4, §4.4), `LAZYVIEW_STALE_AFTER_MS` (parsed, no effect), parallel lookups and the
+> fault proxy of §7. `tests/supervisor.rs` covers §7 tests 1, 3 and 5 without a proxy (row locks
+> slow writes down and time them out). A prototype of the limiter against a simulated server
+> showed two problems to solve first: rounds of 4 operations / 50 ms are too noisy (at 10 %
+> latency noise the limit changed direction ~55 times a minute; 16 operations / 250 ms: a few),
+> and under sustained saturation the minimum over 2 minutes of sub-window medians drifts up to
+> the contended latency, so the limit creeps back to the maximum (it needs a longer-horizon
+> baseline or periodic probing at a lower limit). Paths under `tmp/` refer to local, git-ignored
+> benchmark scripts and output that are not in the repository.
 
-Status: proposal. Scope: the flush path of `src/engine.rs`, meaning refreshes of live views and of changes
+Status: partly implemented (`src/supervisor.rs`). Scope: the flush path of `src/engine.rs`, meaning refreshes of live views and of changes
 buffered during builds. Goal: the lowest change-to-MV latency the databases can sustain without overloading
 them. When they are slow, lazyview falls back to today's sequential behaviour instead of piling up work.
 

@@ -121,7 +121,7 @@ SELECT name, target, state, mode, detail FROM _lazyview_overview;
 
 | `mode` | `detail` | how it is maintained |
 |---|---|---|
-| `incremental` | `spj` | select / join (also with subqueries, CTEs, derived tables and `ORDER BY` without `LIMIT`). Unit: the primary key of the first table in FROM, a key reduced from it by unique keys, or the whole row of a table without a primary key. Only changed units are re-read and rewritten |
+| `incremental` | `spj` | select / join (also with subqueries, CTEs, derived tables and `ORDER BY` without `LIMIT`). Unit: the primary key of the first table in FROM, a key reduced from it by unique keys, or the whole row of a table without a primary key. Only changed units are re-read; with a [row key](internals.md) only their rows that differ are written, otherwise the changed units are rewritten |
 | `incremental` | `grouped` | `GROUP BY`, `DISTINCT` (unit: the row, or a source key that determines it) and window functions with `PARTITION BY` (unit: the partition). Only changed groups are recomputed |
 | `incremental` | `global` | aggregates without `GROUP BY` (a single row), top-N (`ORDER BY … LIMIT n`) and windows without `PARTITION BY`. One unit, recomputed with one query per batch when a source changes |
 | `full` | the reason (see below) | rebuilt completely into a shadow table and swapped in, at most once per `LAZYVIEW_FULL_REFRESH_MS` |

@@ -52,6 +52,8 @@ counters!(
     source_queries,
     mv_queries,
     mv_rows_inserted,
+    // Of mv_rows_inserted: rows upserted by their row key (INSERT ... ON DUPLICATE KEY UPDATE).
+    mv_rows_upserted,
     mv_rows_deleted,
     full_rebuilds,
     definition_reloads,
@@ -106,6 +108,8 @@ pub struct PoolGauges {
     pub limit: AtomicU64,
     pub max: AtomicU64,
     pub inflight: AtomicU64,
+    /// Most operations in flight at once since start.
+    pub peak: AtomicU64,
     pub queued: AtomicU64,
     /// Open connections of the pool (in use + idle).
     pub connections: AtomicU64,
@@ -126,23 +130,34 @@ impl PoolGauges {
         }
     }
 
-    /// `(name, help, value)` of every gauge.
+    /// `(name, help, value)` of every gauge that is maintained: with fixed limits the
+    /// connection count and the limiter's round statistics (`connections`, `rtt_seconds`,
+    /// `rtt_baseline_seconds`, `gradient`) are not, so they are not shown either.
     pub fn values(&self) -> Vec<(&'static str, &'static str, f64)> {
         let f = |g: &AtomicU64| Metrics::get_f64(g);
         let u = |g: &AtomicU64| Metrics::get(g) as f64;
         vec![
-            ("limit", "Current concurrency limit of the pool (adaptive).", f(&self.limit)),
-            ("max", "Maximum concurrency (pool size).", u(&self.max)),
-            ("inflight", "Operations running on the pool.", u(&self.inflight)),
-            ("queued", "Operations waiting for a permit.", u(&self.queued)),
-            ("connections", "Open connections of the pool.", u(&self.connections)),
-            ("rtt_seconds", "Median operation time of the last limiter round.", f(&self.rtt_seconds)),
             (
-                "rtt_baseline_seconds",
-                "Uncontended operation time (baseline) of the busiest size class in the last round.",
-                f(&self.rtt_baseline_seconds),
+                "limit",
+                "Current concurrency limit of the pool.",
+                f(&self.limit),
             ),
-            ("gradient", "Last latency gradient: median(rtt / baseline).", f(&self.gradient)),
+            ("max", "Maximum concurrency (pool size).", u(&self.max)),
+            (
+                "inflight",
+                "Operations running on the pool.",
+                u(&self.inflight),
+            ),
+            (
+                "peak_inflight",
+                "Most operations running on the pool at once since start.",
+                u(&self.peak),
+            ),
+            (
+                "queued",
+                "Operations waiting for a permit.",
+                u(&self.queued),
+            ),
         ]
     }
 }

@@ -1901,3 +1901,34 @@ fn show_plans() {
         }
     }
 }
+
+/// Upserts by row identity (`ViewPlan::rows_identified`): tables of semi- and anti-join
+/// subqueries add no rows of their own, so a select/join view is identified by its unit and the
+/// lineage of its FROM tables; a FROM table without lineage or a first table without a row key
+/// leaves the rows unidentified.
+#[test]
+fn semi_join_views_are_identified_by_their_from_tables() {
+    for sql in [
+        "CREATE VIEW v AS SELECT o.id, o.status FROM orders o \
+         WHERE EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.customer_id)",
+        "CREATE VIEW v AS SELECT o.id, o.status FROM orders o \
+         WHERE NOT EXISTS (SELECT 1 FROM logs l WHERE l.msg = o.status)",
+        "CREATE VIEW v AS SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id \
+         WHERE o.id IN (SELECT i.order_id FROM order_items i WHERE i.qty > 1)",
+    ] {
+        let v = p(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert!(
+            v.aliases.iter().any(|a| a.semi.is_some()),
+            "{sql}: planned without a semi-join table"
+        );
+        assert!(v.rows_identified(), "{sql}");
+    }
+    for sql in [
+        "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.id \
+         WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id)",
+        "CREATE VIEW v AS SELECT msg FROM logs",
+    ] {
+        assert!(!p(sql).rows_identified(), "{sql}");
+    }
+}

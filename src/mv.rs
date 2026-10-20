@@ -26,6 +26,12 @@ const MAX_KEY_PARTS: usize = 16;
 const TEXT_PREFIX: u64 = 255;
 /// Ownership marker prefix of the comment of every table lazyview creates (see [`marker`]).
 pub const MARKER_PREFIX: &str = "lazyview:v1 ";
+/// Name of the unique index over the row identity (see [`Layout::row_key`]).
+const ROW_INDEX: &str = "_lv_row";
+/// Row alias of upserts (`INSERT ... AS <alias> ON DUPLICATE KEY UPDATE`).
+const ROW_ALIAS: &str = "_lv_new";
+/// Estimated bytes per write statement unless configured (`LAZYVIEW_WRITE_BATCH_BYTES`).
+pub const DEFAULT_WRITE_BATCH_BYTES: usize = 4 << 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MvCol {
@@ -56,6 +62,20 @@ pub struct Layout {
     /// `UNIX_TIMESTAMP(<expression>)` and written in a `+00:00` session (see
     /// [`Layout::source_sql`]). Empty when the view has none or one cannot be read that way.
     pub epoch: Vec<(usize, String)>,
+    /// Columns no two rows agree on (positions in `cols`): the unit columns of views with at most
+    /// one row per unit, followed by the lineage columns for select/join views whose rows they
+    /// identify (see [`ViewPlan::rows_identified`]). Empty when rows have no identity. Rows are
+    /// upserted by it when it can be a unique index (see [`Layout::row_key`]).
+    pub identity: Vec<usize>,
+}
+
+/// The unique index behind [`Layout::row_key`].
+#[derive(Debug, Clone, PartialEq)]
+enum RowIndex {
+    /// The PRIMARY KEY on the unit.
+    Primary,
+    /// `_lv_row`, a UNIQUE KEY over these (whole) columns.
+    Unique(String),
 }
 
 impl Layout {
@@ -81,6 +101,7 @@ impl Layout {
     /// `CREATE TABLE` with an optional ownership marker as the table comment (see [`marker`]).
     pub fn create_sql_marked(&self, schema: &str, table: &str, marker: Option<&str>) -> String {
         let index = self.unit_index();
+        let row = self.row_index();
         let primary = matches!(index, Some((true, _)));
         let mut defs: Vec<String> = self
             .cols
@@ -99,10 +120,15 @@ impl Layout {
                 d
             })
             .collect();
-        match index {
-            Some((true, parts)) => defs.push(format!("PRIMARY KEY ({parts})")),
-            Some((false, parts)) => defs.push(format!("KEY `_lv_unit` ({parts})")),
-            None => {}
+        match (index, &row) {
+            (Some((true, parts)), _) => defs.push(format!("PRIMARY KEY ({parts})")),
+            // `_lv_row` starts with the unit columns: it serves unit filters too.
+            (Some((false, _)), Some(RowIndex::Unique(_))) => {}
+            (Some((false, parts)), _) => defs.push(format!("KEY `_lv_unit` ({parts})")),
+            (None, _) => {}
+        }
+        if let Some(RowIndex::Unique(parts)) = &row {
+            defs.push(format!("UNIQUE KEY `{ROW_INDEX}` ({parts})"));
         }
         for (name, parts) in self.lineage_indexes() {
             defs.push(format!("KEY {} ({parts})", q(&name)));
@@ -143,6 +169,64 @@ impl Layout {
             .rev()
             .find_map(|n| fit_key(&lead[..n]))
             .map(|k| (false, k))
+    }
+
+    /// The unique index over [`Layout::identity`]: the PRIMARY KEY when the identity is the unit
+    /// and that is the primary key, else `_lv_row` over the whole identity columns (a prefix
+    /// would let distinct rows collide). None when the rows have no identity, a column cannot be
+    /// indexed whole, the key exceeds InnoDB's limits, or a TIMESTAMP column is read in the
+    /// session's time zone (the two instants of a DST fall-back hour read as one value).
+    fn row_index(&self) -> Option<RowIndex> {
+        if self.identity.is_empty()
+            || (!self.epoch_timestamps()
+                && self
+                    .identity
+                    .iter()
+                    .any(|&p| self.cols[p].data_type == "timestamp"))
+        {
+            return None;
+        }
+        if self.identity == self.unit_pos && matches!(self.unit_index(), Some((true, _))) {
+            return Some(RowIndex::Primary);
+        }
+        if self.identity.len() > MAX_KEY_PARTS {
+            return None;
+        }
+        let bytes: Option<u64> = self
+            .identity
+            .iter()
+            .map(|&p| self.cols[p].key_part().full_bytes())
+            .sum();
+        if !bytes.is_some_and(|b| b <= MAX_KEY_BYTES) {
+            return None;
+        }
+        Some(RowIndex::Unique(
+            self.identity
+                .iter()
+                .map(|&p| q(&self.cols[p].name))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ))
+    }
+
+    /// The row key changed rows are upserted by (positions in `cols`; see [`Layout::identity`]),
+    /// when the table has a unique index over it. None: changed units are deleted and their
+    /// rows inserted again.
+    pub fn row_key(&self) -> Option<&[usize]> {
+        self.row_index().map(|_| self.identity.as_slice())
+    }
+
+    /// How the values of `cols` are bound in a filter of a write (see [`write_diff`]): JSON as
+    /// JSON values, TIMESTAMPs read in the session's time zone by local time (in a `+00:00`
+    /// write session they are exact UTC datetimes).
+    fn write_kinds(&self, cols: &[usize]) -> Vec<UnitKind> {
+        cols.iter()
+            .map(|&p| match self.cols[p].data_type.as_str() {
+                "timestamp" if !self.epoch_timestamps() => UnitKind::Timestamp,
+                "json" => UnitKind::Json,
+                _ => UnitKind::Plain,
+            })
+            .collect()
     }
 
     /// Whether TIMESTAMP columns are read as epochs and written as UTC datetimes in a `+00:00`
@@ -791,6 +875,17 @@ pub async fn probe(src: &mut Conn, src_schema: &str, plan: &ViewPlan) -> Result<
                 && !c.data_type.contains("blob")
                 && c.data_type != "json"
         });
+    let identity: Vec<usize> = if plan.unit_unique {
+        unit_pos.clone()
+    } else if plan.rows_identified() {
+        unit_pos
+            .iter()
+            .chain(lineage.iter().flatten())
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(Layout {
         cols,
         n_visible,
@@ -799,7 +894,38 @@ pub async fn probe(src: &mut Conn, src_schema: &str, plan: &ViewPlan) -> Result<
         primary,
         lineage,
         epoch,
+        identity,
     })
+}
+
+/// Whether `table` has the unique index its rows are upserted by (see [`Layout::row_key`]);
+/// true when the layout has none. Tables created before upserts lack `_lv_row`.
+pub async fn has_row_index(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+) -> Result<bool> {
+    let (index, cols) = match layout.row_index() {
+        None => return Ok(true),
+        Some(RowIndex::Primary) => ("PRIMARY", &layout.unit_pos),
+        Some(RowIndex::Unique(_)) => (ROW_INDEX, &layout.identity),
+    };
+    let parts: Vec<(String, i64, Option<i64>)> = conn
+        .exec(
+            "SELECT CAST(COLUMN_NAME AS CHAR), CAST(NON_UNIQUE AS SIGNED), CAST(SUB_PART AS SIGNED) \
+             FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+             AND INDEX_NAME = ? ORDER BY SEQ_IN_INDEX",
+            (schema, table, index),
+        )
+        .await?;
+    Ok(parts.len() == cols.len()
+        && parts
+            .iter()
+            .zip(cols.iter())
+            .all(|((name, non_unique, sub), &p)| {
+                *non_unique == 0 && sub.is_none() && name.eq_ignore_ascii_case(&layout.cols[p].name)
+            }))
 }
 
 /// `BASE TABLE` / `VIEW` / None.
@@ -930,30 +1056,219 @@ fn rows_per_insert(layout: &Layout, batch_rows: usize) -> usize {
     (MAX_PARAMS / layout.cols.len().max(1)).clamp(1, batch_rows.max(1))
 }
 
-/// Multi-row parameterized INSERTs.
+/// How a target server takes upserts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upsert {
+    /// `INSERT ... VALUES (...) AS new ON DUPLICATE KEY UPDATE c = new.c` (MySQL and Percona
+    /// from 8.0.19, where `VALUES(c)` is deprecated).
+    RowAlias,
+    /// `... ON DUPLICATE KEY UPDATE c = VALUES(c)` (MariaDB, which has no row alias; older MySQL).
+    Values,
+}
+
+/// Statement limits and upsert syntax of the writes to one server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteOpts {
+    /// Rows per INSERT (`LAZYVIEW_WRITE_BATCH_ROWS`), also bounded by the placeholder limit.
+    pub batch_rows: usize,
+    /// Estimated bytes per statement (`LAZYVIEW_WRITE_BATCH_BYTES`, at most half the server's
+    /// `max_allowed_packet`). A larger row goes alone.
+    pub batch_bytes: usize,
+    pub upsert: Upsert,
+}
+
+impl WriteOpts {
+    /// For a server reporting `version` (`@@version`) and `max_packet` (`@@max_allowed_packet`).
+    pub fn for_server(
+        version: &str,
+        max_packet: u64,
+        batch_rows: usize,
+        batch_bytes: usize,
+    ) -> WriteOpts {
+        let num: Vec<u32> = version
+            .split(|c: char| !c.is_ascii_digit())
+            .take(3)
+            .map(|p| p.parse().unwrap_or(0))
+            .collect();
+        let mysql_alias = num.len() == 3 && (num[0], num[1], num[2]) >= (8, 0, 19);
+        let upsert = if version.to_ascii_lowercase().contains("mariadb") || !mysql_alias {
+            Upsert::Values
+        } else {
+            Upsert::RowAlias
+        };
+        let cap = usize::try_from(max_packet / 2).unwrap_or(usize::MAX);
+        WriteOpts {
+            batch_rows: batch_rows.max(1),
+            batch_bytes: batch_bytes.min(cap).max(1024),
+            upsert,
+        }
+    }
+}
+
+/// [`WriteOpts`] for the server `conn` is connected to.
+pub async fn write_opts(
+    conn: &mut Conn,
+    batch_rows: usize,
+    batch_bytes: usize,
+) -> Result<WriteOpts> {
+    let (version, packet): (String, u64) = conn
+        .query_first("SELECT CAST(@@version AS CHAR), @@max_allowed_packet")
+        .await?
+        .context("reading @@version and @@max_allowed_packet")?;
+    Ok(WriteOpts::for_server(
+        &version,
+        packet,
+        batch_rows,
+        batch_bytes,
+    ))
+}
+
+/// Estimated bytes a value takes in a statement.
+fn value_bytes(v: &Value) -> usize {
+    match v {
+        Value::Bytes(b) => b.len() + 9,
+        Value::NULL => 1,
+        _ => 13,
+    }
+}
+
+fn datum_bytes(d: &Datum) -> usize {
+    match d {
+        Datum::Bytes(b) => b.len() + 9,
+        _ => 13,
+    }
+}
+
+/// Consecutive runs of `items` with at most `max_items` items and `max_bytes` estimated bytes
+/// each (at least one item per run).
+fn batches<T>(
+    items: &[T],
+    max_items: usize,
+    max_bytes: usize,
+    bytes: impl Fn(&T) -> usize,
+) -> Vec<&[T]> {
+    let mut out = Vec::new();
+    let (mut start, mut size) = (0, 0);
+    for (i, it) in items.iter().enumerate() {
+        let b = bytes(it);
+        if i > start && (i - start >= max_items.max(1) || size + b > max_bytes) {
+            out.push(&items[start..i]);
+            (start, size) = (i, 0);
+        }
+        size += b;
+    }
+    if start < items.len() {
+        out.push(&items[start..]);
+    }
+    out
+}
+
+/// A multi-row INSERT of `n` rows; with `upsert`, rows whose key exists replace that row.
+fn insert_sql(
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    n: usize,
+    upsert: Option<Upsert>,
+) -> String {
+    let tuple = format!("({})", vec!["?"; layout.cols.len()].join(","));
+    let mut sql = format!(
+        "INSERT INTO {}.{} ({}) VALUES {}",
+        q(schema),
+        q(table),
+        layout.col_list(),
+        vec![tuple.as_str(); n].join(",")
+    );
+    // Every column is set, the key columns too: a collation-equal key takes the new bytes.
+    let set = |value: &dyn Fn(&str) -> String| {
+        layout
+            .cols
+            .iter()
+            .map(|c| format!("{} = {}", q(&c.name), value(&q(&c.name))))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match upsert {
+        None => {}
+        Some(Upsert::RowAlias) => {
+            // (The row alias must differ from the table name.)
+            let alias = if table.eq_ignore_ascii_case(ROW_ALIAS) {
+                q(&format!("{ROW_ALIAS}_"))
+            } else {
+                q(ROW_ALIAS)
+            };
+            let updates = set(&|c| format!("{alias}.{c}"));
+            sql.push_str(&format!(" AS {alias} ON DUPLICATE KEY UPDATE {updates}"));
+        }
+        Some(Upsert::Values) => {
+            let updates = set(&|c| format!("VALUES({c})"));
+            sql.push_str(&format!(" ON DUPLICATE KEY UPDATE {updates}"));
+        }
+    }
+    sql
+}
+
+/// Multi-row parameterized INSERTs (upserts with `upsert`, see [`Layout::row_key`]), at most
+/// `w.batch_rows` rows and about `w.batch_bytes` bytes each.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_rows<C: Queryable>(
     conn: &mut C,
     schema: &str,
     table: &str,
     layout: &Layout,
     rows: &[Vec<Value>],
-    batch_rows: usize,
+    w: &WriteOpts,
+    upsert: bool,
     metrics: &Metrics,
 ) -> Result<()> {
-    let per = rows_per_insert(layout, batch_rows);
-    let tuple = format!("({})", vec!["?"; layout.cols.len()].join(","));
-    for chunk in rows.chunks(per) {
-        let sql = format!(
-            "INSERT INTO {}.{} ({}) VALUES {}",
-            q(schema),
-            q(table),
-            layout.col_list(),
-            vec![tuple.as_str(); chunk.len()].join(",")
+    let per = rows_per_insert(layout, w.batch_rows);
+    let text = 3 + 2 * layout.cols.len();
+    let row_bytes = |r: &Vec<Value>| text + r.iter().map(value_bytes).sum::<usize>();
+    for chunk in batches(rows, per, w.batch_bytes, row_bytes) {
+        let sql = insert_sql(
+            schema,
+            table,
+            layout,
+            chunk.len(),
+            upsert.then_some(w.upsert),
         );
         let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
         conn.exec_drop(sql, params).await?;
         Metrics::add(&metrics.mv_queries, 1);
         Metrics::add(&metrics.mv_rows_inserted, chunk.len() as u64);
+        if upsert {
+            Metrics::add(&metrics.mv_rows_upserted, chunk.len() as u64);
+        }
+    }
+    Ok(())
+}
+
+/// Deletes the rows whose row key (see [`Layout::row_key`]) is one of `keys`, in statements of
+/// at most the placeholder limit and about `w.batch_bytes` bytes.
+async fn delete_keys<C: Queryable>(
+    conn: &mut C,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    keys: &[Key],
+    w: &WriteOpts,
+    metrics: &Metrics,
+) -> Result<()> {
+    let Some(key) = layout.row_key() else {
+        bail!("internal: rows of `{table}` have no row key");
+    };
+    let cols: Vec<String> = key.iter().map(|&p| q(&layout.cols[p].name)).collect();
+    let kinds = layout.write_kinds(key);
+    let per = MAX_PARAMS / cols.len().max(1);
+    let key_bytes = |k: &Key| 4 + k.iter().map(datum_bytes).sum::<usize>();
+    for piece in batches(keys, per, w.batch_bytes, key_bytes) {
+        let (f, p) = keys_chunk(piece.to_vec()).filter_typed(&cols, &kinds);
+        conn.exec_drop(
+            format!("DELETE FROM {}.{} WHERE {f}", q(schema), q(table)),
+            p,
+        )
+        .await?;
+        Metrics::add(&metrics.mv_queries, 1);
     }
     Ok(())
 }
@@ -961,6 +1276,7 @@ pub async fn insert_rows<C: Queryable>(
 pub struct BuildTarget<'a> {
     pub conn: &'a mut Conn,
     pub schema: String,
+    pub write: WriteOpts,
 }
 
 /// Fills each target's shadow table from one streaming, non-locking read of the source.
@@ -975,6 +1291,7 @@ pub async fn fill(
 ) -> Result<u64> {
     let shadow = shadow_name(name);
     let sql = layout.source_sql(plan, None);
+    // Read in pieces of a batch; each target splits them by its own limits.
     let per = rows_per_insert(layout, batch_rows);
     if layout.epoch_timestamps() {
         // The build's own connections: they only insert from here on.
@@ -996,7 +1313,7 @@ pub async fn fill(
         if buf.len() >= per || (done && !buf.is_empty()) {
             for t in targets.iter_mut() {
                 insert_rows(
-                    t.conn, &t.schema, &shadow, layout, &buf, batch_rows, metrics,
+                    t.conn, &t.schema, &shadow, layout, &buf, &t.write, false, metrics,
                 )
                 .await?;
             }
@@ -1119,7 +1436,10 @@ fn group(layout: &Layout, rows: Vec<(Vec<Datum>, Vec<Value>)>) -> Groups {
 pub struct Applied {
     pub units_changed: u64,
     pub deleted: u64,
+    /// Rows written by INSERTs (upserts included).
     pub inserted: u64,
+    /// Of those, rows upserted by their row key.
+    pub upserted: u64,
 }
 
 /// New (source) rows of a chunk, converted and grouped by unit once and shared by every target.
@@ -1147,14 +1467,23 @@ pub fn prepare(layout: &Layout, rows: Vec<Vec<Value>>) -> Prepared {
     }
 }
 
-/// What a target table needs so that the chunk's units match the new rows.
+/// What a target table needs so that the chunk's units match the new rows. Without a row key
+/// (see [`Layout::row_key`]) the changed units are deleted and their new rows inserted. With one,
+/// only the rows of changed units that differ are written: `delete_keys` first, then `inserts`
+/// as upserts, so a vanished key that the server deems equal to a new one (case, trailing
+/// spaces) is gone before the new row is written.
 #[derive(Debug, Default)]
 pub struct Diff {
-    /// Units whose rows differ (to delete and re-insert).
+    /// Units with a row that differs.
     pub changed: Vec<Key>,
-    /// Old rows of the changed units (deleted).
+    /// Written per unit (no row key).
+    pub by_unit: bool,
+    /// Row keys whose old rows are deleted: rows that vanished, and the old rows of a changed
+    /// key with a NULL (a NULL never conflicts in a unique index, so it cannot be upserted).
+    pub delete_keys: Vec<Key>,
+    /// Old rows deleted.
     pub deleted_rows: u64,
-    /// New rows of the changed units (inserted).
+    /// New rows written: inserted (per unit) or upserted (by row key).
     pub inserts: Vec<Vec<Value>>,
     /// Rows compared (old + new), for statistics.
     pub compared: usize,
@@ -1198,8 +1527,24 @@ pub async fn read_old(
         .collect())
 }
 
-/// Compares old MV rows with the prepared new rows per unit (pure CPU work).
-pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
+type Row2 = (Vec<Datum>, Vec<Value>);
+
+/// Whether two sets of rows are equal as multisets.
+fn same_rows(a: &[&Row2], b: &[&Row2]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<&Vec<Datum>> = a.iter().map(|r| &r.0).collect();
+    let mut b: Vec<&Vec<Datum>> = b.iter().map(|r| &r.0).collect();
+    a.sort();
+    b.sort();
+    a == b
+}
+
+/// Compares old MV rows with the prepared new rows per unit, and within a changed unit per row
+/// key when the layout has one (pure CPU work). Fails if new rows share a row key without a
+/// NULL: the identity the table's unique index is built on does not hold.
+pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Result<Diff> {
     let compared = old.len() + new.rows;
     let old = group(
         layout,
@@ -1207,52 +1552,86 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
             .map(|v| (to_datums(layout, &v), v))
             .collect(),
     );
-    let mut changed: Vec<Key> = Vec::new();
-    for (k, rows) in &new.groups {
-        let same = old.get(k).map(|o| {
-            let mut a: Vec<&Vec<Datum>> = o.iter().map(|r| &r.0).collect();
-            let mut b: Vec<&Vec<Datum>> = rows.iter().map(|r| &r.0).collect();
-            a.sort();
-            b.sort();
-            a == b
-        });
-        if same != Some(true) {
-            changed.push(k.clone());
-        }
-    }
-    for k in old.keys() {
-        if !new.groups.contains_key(k) {
-            changed.push(k.clone());
-        }
-    }
-    let deleted_rows: u64 = changed
-        .iter()
-        .map(|k| old.get(k).map(|v| v.len() as u64).unwrap_or(0))
-        .sum();
-    let inserts: Vec<Vec<Value>> = changed
-        .iter()
-        .filter_map(|k| new.groups.get(k))
-        .flatten()
-        .map(|r| r.1.clone())
-        .collect();
-    Diff {
-        changed,
-        deleted_rows,
-        inserts,
+    let row_key = layout.row_key();
+    let mut d = Diff {
+        by_unit: row_key.is_none(),
         compared,
+        ..Default::default()
+    };
+    let none: Vec<Row2> = Vec::new();
+    let units = new
+        .groups
+        .keys()
+        .chain(old.keys().filter(|k| !new.groups.contains_key(*k)));
+    for k in units {
+        let o: Vec<&Row2> = old.get(k).unwrap_or(&none).iter().collect();
+        let n: Vec<&Row2> = new.groups.get(k).unwrap_or(&none).iter().collect();
+        if same_rows(&o, &n) {
+            continue;
+        }
+        d.changed.push(k.clone());
+        match row_key {
+            None => {
+                d.deleted_rows += o.len() as u64;
+                d.inserts.extend(n.iter().map(|r| r.1.clone()));
+            }
+            Some(key) => diff_rows(key, o, n, &mut d)?,
+        }
     }
+    Ok(d)
 }
 
-/// Writes a diff in one transaction (DELETE of the changed units + multi-row INSERTs).
-/// `began` is set once the transaction has been started on the server (from then on a lost
-/// connection may still commit: see the supervisor's zombie fence).
+/// The rows of one changed unit, compared per row key (see [`diff`]).
+fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) -> Result<()> {
+    fn by_key<'a>(key: &[usize], rows: Vec<&'a Row2>) -> HashMap<Key, Vec<&'a Row2>> {
+        let mut m: HashMap<Key, Vec<&Row2>> = HashMap::new();
+        for r in rows {
+            m.entry(key.iter().map(|&p| r.0[p].clone()).collect())
+                .or_default()
+                .push(r);
+        }
+        m
+    }
+    let mut old = by_key(key, old);
+    for (k, n) in by_key(key, new) {
+        let o = old.remove(&k).unwrap_or_default();
+        if same_rows(&o, &n) {
+            continue;
+        }
+        let null = crate::datum::key_has_null(&k);
+        if n.len() > 1 && !null {
+            bail!(
+                "internal: {} rows of the view share the row key {k:?}; the table's unique index \
+                 `{ROW_INDEX}` cannot hold them",
+                n.len()
+            );
+        }
+        // An old row with the same key is replaced in place, unless the key has a NULL (or the
+        // table holds it more than once): those are deleted and inserted again.
+        if !o.is_empty() && (null || o.len() > 1) {
+            d.delete_keys.push(k);
+            d.deleted_rows += o.len() as u64;
+        }
+        d.inserts.extend(n.iter().map(|r| r.1.clone()));
+    }
+    for (k, o) in old {
+        d.delete_keys.push(k);
+        d.deleted_rows += o.len() as u64;
+    }
+    Ok(())
+}
+
+/// Writes a diff in one transaction (see [`Diff`]). `began` is set once the transaction has
+/// been started on the server (from then on a lost connection may still commit: see the
+/// supervisor's zombie fence).
+#[allow(clippy::too_many_arguments)]
 pub async fn write_diff(
     conn: &mut Conn,
     schema: &str,
     table: &str,
     layout: &Layout,
     d: &Diff,
-    batch_rows: usize,
+    w: &WriteOpts,
     metrics: &Metrics,
     began: &AtomicBool,
 ) -> Result<Applied> {
@@ -1262,12 +1641,12 @@ pub async fn write_diff(
     began.store(true, Ordering::SeqCst);
     let utc = layout.epoch_timestamps();
     if utc {
-        // TIMESTAMPs (also as unit keys of the DELETE) are UTC datetimes; the session's own
-        // time zone is restored for the unit filters of the next read.
+        // TIMESTAMPs (also as keys of the DELETEs) are UTC datetimes; the session's own time
+        // zone is restored for the unit filters of the next read.
         conn.query_drop(format!("SET @lv_tz = @@SESSION.time_zone, {UTC_SESSION}"))
             .await?;
     }
-    let r = write_tx(conn, schema, table, layout, d, batch_rows, metrics).await;
+    let r = write_tx(conn, schema, table, layout, d, w, metrics).await;
     if utc {
         let restored = conn.query_drop("SET SESSION time_zone = @lv_tz").await;
         if r.is_ok() {
@@ -1284,31 +1663,22 @@ async fn write_tx(
     table: &str,
     layout: &Layout,
     d: &Diff,
-    batch_rows: usize,
+    w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<Applied> {
-    let mut out = Applied {
+    let out = Applied {
         units_changed: d.changed.len() as u64,
-        ..Default::default()
+        deleted: d.deleted_rows,
+        inserted: d.inserts.len() as u64,
+        upserted: if d.by_unit { 0 } else { d.inserts.len() as u64 },
     };
     let mut tx = conn.start_transaction(Default::default()).await?;
-    if d.deleted_rows > 0 {
+    if d.by_unit && d.deleted_rows > 0 {
         let del_filter = if layout.unit_pos.is_empty() {
             ("TRUE".to_string(), Vec::new())
-        } else if layout.epoch_timestamps() {
-            // Keys from the rows: TIMESTAMPs as UTC datetimes, exact in the `+00:00` session
-            // (JSON keys still bind as JSON values).
-            let kinds: Vec<UnitKind> = layout
-                .unit_kinds()
-                .into_iter()
-                .map(|k| match k {
-                    UnitKind::Timestamp => UnitKind::Plain,
-                    k => k,
-                })
-                .collect();
-            keys_chunk(d.changed.clone()).filter_typed(&layout.unit_cols(), &kinds)
         } else {
-            keys_chunk(d.changed.clone()).filter_typed(&layout.unit_cols(), &layout.unit_kinds())
+            keys_chunk(d.changed.clone())
+                .filter_typed(&layout.unit_cols(), &layout.write_kinds(&layout.unit_pos))
         };
         tx.exec_drop(
             format!(
@@ -1321,21 +1691,23 @@ async fn write_tx(
         )
         .await?;
         Metrics::add(&metrics.mv_queries, 1);
-        Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
-        out.deleted = d.deleted_rows;
     }
+    if !d.by_unit {
+        delete_keys(&mut tx, schema, table, layout, &d.delete_keys, w, metrics).await?;
+    }
+    Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
     insert_rows(
-        &mut tx, schema, table, layout, &d.inserts, batch_rows, metrics,
+        &mut tx, schema, table, layout, &d.inserts, w, !d.by_unit, metrics,
     )
     .await?;
     tx.commit().await?;
-    out.inserted = d.inserts.len() as u64;
     Metrics::add(&metrics.units_changed, out.units_changed);
     Ok(out)
 }
 
 /// Brings `table` in line with `new_rows` for the units in `chunk` (all rows when `None`),
 /// writing only units whose rows differ.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply(
     conn: &mut Conn,
     schema: &str,
@@ -1343,19 +1715,20 @@ pub async fn apply(
     layout: &Layout,
     chunk: Option<&UnitChunk>,
     new_rows: &[Vec<Value>],
-    batch_rows: usize,
+    w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<Applied> {
     let old = read_old(conn, schema, table, layout, chunk, metrics).await?;
     let new = prepare(layout, new_rows.to_vec());
-    let d = diff(layout, old, &new);
+    let d = diff(layout, old, &new)
+        .with_context(|| format!("comparing the rows of `{schema}`.`{table}`"))?;
     write_diff(
         conn,
         schema,
         table,
         layout,
         &d,
-        batch_rows,
+        w,
         metrics,
         &AtomicBool::new(false),
     )
@@ -1411,6 +1784,7 @@ mod tests {
             primary,
             lineage: Vec::new(),
             epoch: Vec::new(),
+            identity: Vec::new(),
         }
     }
 
@@ -1677,12 +2051,12 @@ mod tests {
             row(1, "[10.0, 20.5]", r#"{"x": 1.5}"#),
             row(2, "[3.25]", "[1, 2]"),
         ];
-        let d = diff(&l, stored.clone(), &prepare(&l, source.clone()));
+        let d = diff(&l, stored.clone(), &prepare(&l, source.clone())).unwrap();
         assert!(d.is_empty(), "rewrote equal units: {:?}", d.changed);
         // A real change of one unit rewrites that unit only.
         let mut changed = source.clone();
         changed[1] = row(2, "[3.26]", "[1, 2]");
-        let d = diff(&l, stored.clone(), &prepare(&l, changed));
+        let d = diff(&l, stored.clone(), &prepare(&l, changed)).unwrap();
         assert_eq!(d.changed.len(), 1);
         assert_eq!(
             d.changed[0][1],
@@ -1699,8 +2073,319 @@ mod tests {
             &l,
             stored,
             &prepare(&l, vec![source[0].clone(), row(2, "[3.25]", "[1, 2.0]")]),
-        );
+        )
+        .unwrap();
         assert_eq!(d.changed.len(), 2, "old [1,2] and new [1,2.0] units");
+    }
+
+    /// Row keys: the unit's PRIMARY KEY, else `_lv_row` over the whole identity columns (it
+    /// replaces `_lv_unit`, whose columns it starts with); none when a column cannot be indexed
+    /// whole, the key is too long, or TIMESTAMPs are read in the session's time zone.
+    #[test]
+    fn row_keys_and_their_indexes() {
+        let mut l = layout(
+            vec![
+                col("g", "int", "int", None),
+                col("n", "bigint", "bigint", None),
+            ],
+            2,
+            vec![0],
+            true,
+        );
+        l.identity = vec![0];
+        assert_eq!(l.row_key(), Some(&[0][..]));
+        let sql = l.create_sql("s", "t");
+        assert!(
+            sql.contains("PRIMARY KEY (`g`)") && !sql.contains("UNIQUE"),
+            "{sql}"
+        );
+        // Select/join view: unit + lineage columns.
+        let mut l = layout(
+            vec![
+                col("id", "int", "int", None),
+                col("v", "varchar", "varchar(10)", Some("utf8mb4")),
+                col("_lv_a1_pk0", "int", "int", None),
+                col("_lv_a2_pk0", "varchar", "varchar(20)", Some("utf8mb4")),
+            ],
+            2,
+            vec![0],
+            false,
+        );
+        l.hidden = vec![];
+        l.lineage = vec![vec![2], vec![3]];
+        l.identity = vec![0, 2, 3];
+        assert_eq!(l.row_key(), Some(&[0, 2, 3][..]));
+        let sql = l.create_sql("s", "t");
+        assert!(
+            sql.contains("UNIQUE KEY `_lv_row` (`id`, `_lv_a1_pk0`, `_lv_a2_pk0`)"),
+            "{sql}"
+        );
+        assert!(
+            !sql.contains("`_lv_unit`"),
+            "_lv_row serves unit filters: {sql}"
+        );
+        assert!(sql.contains("KEY `_lv_a1` (`_lv_a1_pk0`)"), "{sql}");
+        assert!(l.has_unit_index());
+        // Nullable grouped keys (no PRIMARY KEY possible): `_lv_row` over the unit.
+        let mut l = layout(
+            vec![
+                col("g", "varchar", "varchar(10)", Some("utf8mb4")),
+                col("n", "int", "int", None),
+            ],
+            2,
+            vec![0],
+            false,
+        );
+        l.identity = vec![0];
+        assert!(l
+            .create_sql("s", "t")
+            .contains("UNIQUE KEY `_lv_row` (`g`)"));
+        // A column that can only be indexed by a prefix: no row key, `_lv_unit` stays.
+        let mut l = layout(
+            vec![
+                col("k", "varchar", "varchar(1000)", Some("utf8mb4")),
+                col("n", "int", "int", None),
+            ],
+            2,
+            vec![0],
+            false,
+        );
+        l.identity = vec![0];
+        assert_eq!(l.row_key(), None);
+        let sql = l.create_sql("s", "t");
+        assert!(
+            sql.contains("KEY `_lv_unit` (`k`(768))") && !sql.contains("UNIQUE"),
+            "{sql}"
+        );
+        let mut l = layout(
+            vec![
+                col("t", "text", "text", Some("utf8mb4")),
+                col("n", "int", "int", None),
+            ],
+            2,
+            vec![0],
+            false,
+        );
+        l.identity = vec![0];
+        assert_eq!(l.row_key(), None);
+        // TIMESTAMPs: only when read as epochs (exact UTC values).
+        let mut l = layout(
+            vec![
+                col("ts", "timestamp", "timestamp(6)", None),
+                col("n", "int", "int", None),
+            ],
+            2,
+            vec![0],
+            true,
+        );
+        l.identity = vec![0];
+        assert_eq!(l.row_key(), None, "local TIMESTAMPs");
+        assert!(l.create_sql("s", "t").contains("PRIMARY KEY (`ts`)"));
+        l.epoch = vec![(0, "ts".into())];
+        assert_eq!(l.row_key(), Some(&[0][..]));
+        // No identity: no row key.
+        let l = layout(vec![col("v", "int", "int", None)], 1, vec![], false);
+        assert_eq!(l.row_key(), None);
+    }
+
+    #[test]
+    fn upsert_syntax_and_packet_limits() {
+        let w = |v: &str, p: u64| WriteOpts::for_server(v, p, 500, DEFAULT_WRITE_BATCH_BYTES);
+        assert_eq!(w("8.4.11", 64 << 20).upsert, Upsert::RowAlias);
+        assert_eq!(w("26.7.0", 64 << 20).upsert, Upsert::RowAlias);
+        assert_eq!(w("8.0.19", 64 << 20).upsert, Upsert::RowAlias);
+        assert_eq!(w("8.0.18-log", 64 << 20).upsert, Upsert::Values);
+        assert_eq!(w("5.7.44", 64 << 20).upsert, Upsert::Values);
+        assert_eq!(
+            w("10.11.19-MariaDB-ubu2204-log", 16 << 20).upsert,
+            Upsert::Values
+        );
+        assert_eq!(w("5.5.5-10.6.1-MariaDB", 16 << 20).upsert, Upsert::Values);
+        assert_eq!(w("13.0.2-MariaDB", 16 << 20).upsert, Upsert::Values);
+        assert_eq!(w("8.4.11", 64 << 20).batch_bytes, 4 << 20);
+        assert_eq!(
+            w("8.4.11", 1 << 20).batch_bytes,
+            512 << 10,
+            "half of max_allowed_packet"
+        );
+        assert_eq!(w("8.4.11", 1024).batch_bytes, 1024, "floor");
+    }
+
+    #[test]
+    fn upsert_statements() {
+        let l = layout(
+            vec![
+                col("g", "int", "int", None),
+                col("n", "bigint", "bigint", None),
+            ],
+            2,
+            vec![0],
+            true,
+        );
+        assert_eq!(
+            insert_sql("s", "t", &l, 2, None),
+            "INSERT INTO `s`.`t` (`g`, `n`) VALUES (?,?),(?,?)"
+        );
+        assert_eq!(
+            insert_sql("s", "t", &l, 1, Some(Upsert::RowAlias)),
+            "INSERT INTO `s`.`t` (`g`, `n`) VALUES (?,?) AS `_lv_new` \
+             ON DUPLICATE KEY UPDATE `g` = `_lv_new`.`g`, `n` = `_lv_new`.`n`"
+        );
+        assert_eq!(
+            insert_sql("s", "t", &l, 1, Some(Upsert::Values)),
+            "INSERT INTO `s`.`t` (`g`, `n`) VALUES (?,?) \
+             ON DUPLICATE KEY UPDATE `g` = VALUES(`g`), `n` = VALUES(`n`)"
+        );
+        assert!(
+            insert_sql("s", "_LV_NEW", &l, 1, Some(Upsert::RowAlias)).contains("AS `_lv_new_`"),
+            "the row alias differs from the table name"
+        );
+    }
+
+    #[test]
+    fn statement_batches_by_rows_and_bytes() {
+        let sizes = [10usize, 10, 10, 50, 10, 200, 10];
+        let lens = |b: Vec<&[usize]>| b.iter().map(|x| x.len()).collect::<Vec<_>>();
+        assert_eq!(lens(batches(&sizes, 100, 1000, |&b| b)), vec![7]);
+        assert_eq!(lens(batches(&sizes, 3, 1000, |&b| b)), vec![3, 3, 1]);
+        assert_eq!(
+            lens(batches(&sizes, 100, 60, |&b| b)),
+            vec![3, 2, 1, 1],
+            "a big item alone"
+        );
+        assert_eq!(lens(batches(&sizes, 100, 1, |&b| b)), vec![1; 7]);
+        assert!(batches::<usize>(&[], 10, 10, |&b| b).is_empty());
+        let total: usize = batches(&sizes, 2, 25, |&b| b).iter().map(|b| b.len()).sum();
+        assert_eq!(total, sizes.len(), "every item exactly once");
+    }
+
+    /// The row-level diff of upserting layouts: unchanged rows and units are never written, a
+    /// changed row is one upsert, vanished rows are deleted by key, keys with a NULL are deleted
+    /// and inserted again, rows move between units and units grow and shrink.
+    #[test]
+    fn row_level_diffs() {
+        // An SPJ layout: unit `id`, value `v`, lineage `_lv_a1_pk0` (NULL: LEFT JOIN unmatched).
+        let mut l = layout(
+            vec![
+                col("id", "int", "int", None),
+                col("v", "varchar", "varchar(10)", Some("utf8mb4")),
+                col("_lv_a1_pk0", "int", "int", None),
+            ],
+            2,
+            vec![0],
+            false,
+        );
+        l.hidden = vec![];
+        l.lineage = vec![vec![2]];
+        l.identity = vec![0, 2];
+        assert!(l.row_key().is_some());
+        let r = |id: i64, v: &str, a: Option<i64>| {
+            vec![
+                Value::Int(id),
+                Value::Bytes(v.as_bytes().to_vec()),
+                a.map(Value::Int).unwrap_or(Value::NULL),
+            ]
+        };
+        let k = |id: i64, a: Option<i64>| -> Key {
+            Box::new([Datum::Int(id), a.map(Datum::Int).unwrap_or(Datum::Null)])
+        };
+        let old = vec![
+            r(1, "a", Some(10)),
+            r(1, "b", Some(11)),
+            r(1, "c", Some(12)),
+            r(2, "x", None),
+            r(3, "y", Some(30)),
+        ];
+        let sorted = |mut v: Vec<Key>| {
+            v.sort();
+            v
+        };
+        // Nothing changed: nothing written.
+        let d = diff(&l, old.clone(), &prepare(&l, old.clone())).unwrap();
+        assert!(d.is_empty() && d.inserts.is_empty() && d.delete_keys.is_empty());
+        // One row of a 3-row unit changes: one upsert, no delete, unit counted once.
+        let mut new = old.clone();
+        new[1] = r(1, "B", Some(11));
+        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        assert!(!d.by_unit);
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(d.inserts, vec![r(1, "B", Some(11))]);
+        assert!(d.delete_keys.is_empty());
+        assert_eq!(d.deleted_rows, 0);
+        // The unit shrinks (12 vanishes) and grows (13 appears); unit 3 vanishes entirely.
+        let new = vec![
+            r(1, "a", Some(10)),
+            r(1, "b", Some(11)),
+            r(1, "d", Some(13)),
+            r(2, "x", None),
+        ];
+        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        assert_eq!(d.changed.len(), 2);
+        assert_eq!(d.inserts, vec![r(1, "d", Some(13))]);
+        assert_eq!(sorted(d.delete_keys), vec![k(1, Some(12)), k(3, Some(30))]);
+        assert_eq!(d.deleted_rows, 2);
+        // A row with a NULL in its key changes: delete (null-safe) + insert.
+        let mut new = old.clone();
+        new[3] = r(2, "X", None);
+        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        assert_eq!(d.delete_keys, vec![k(2, None)]);
+        assert_eq!(d.inserts, vec![r(2, "X", None)]);
+        assert_eq!(d.deleted_rows, 1);
+        // The unmatched row gets a match: its NULL-key row goes, the new key is upserted.
+        let mut new = old.clone();
+        new[3] = r(2, "x", Some(20));
+        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        assert_eq!(d.delete_keys, vec![k(2, None)]);
+        assert_eq!(d.inserts, vec![r(2, "x", Some(20))]);
+        // A row moves from unit 3 to unit 1 (another unit's lineage now): both units change.
+        let mut new = old.clone();
+        new[4] = r(1, "y", Some(30));
+        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        assert_eq!(d.changed.len(), 2);
+        assert_eq!(d.delete_keys, vec![k(3, Some(30))]);
+        assert_eq!(d.inserts, vec![r(1, "y", Some(30))]);
+        // A collation-equal key with other bytes is a different key: the old one is deleted
+        // first, then the new one upserted (see `Diff`).
+        let mut l2 = layout(
+            vec![
+                col("g", "varchar", "varchar(10)", Some("utf8mb4")),
+                col("n", "int", "int", None),
+            ],
+            2,
+            vec![0],
+            true,
+        );
+        l2.identity = vec![0];
+        let g = |s: &str, n: i64| vec![Value::Bytes(s.as_bytes().to_vec()), Value::Int(n)];
+        let d = diff(&l2, vec![g("a", 1)], &prepare(&l2, vec![g("A", 1)])).unwrap();
+        assert_eq!(
+            d.delete_keys,
+            vec![Key::from([Datum::Bytes(b"a".to_vec())])]
+        );
+        assert_eq!(d.inserts, vec![g("A", 1)]);
+        // Rows sharing a key without a NULL contradict the unique index: an error, not data loss.
+        let e = diff(
+            &l,
+            vec![],
+            &prepare(&l, vec![r(1, "a", Some(10)), r(1, "b", Some(10))]),
+        );
+        assert!(e.unwrap_err().to_string().contains("share the row key"));
+        // ... with a NULL they are legal (NULLs never conflict) and inserted as they are.
+        let d = diff(
+            &l,
+            vec![],
+            &prepare(&l, vec![r(5, "a", None), r(5, "b", None)]),
+        )
+        .unwrap();
+        assert_eq!(d.inserts.len(), 2);
+        // Without a row key the changed units are rewritten whole, as before.
+        let mut l3 = l.clone();
+        l3.identity = vec![];
+        let mut new = old.clone();
+        new[1] = r(1, "B", Some(11));
+        let d = diff(&l3, old.clone(), &prepare(&l3, new)).unwrap();
+        assert!(d.by_unit && d.delete_keys.is_empty());
+        assert_eq!((d.inserts.len(), d.deleted_rows), (3, 3));
     }
 
     #[test]

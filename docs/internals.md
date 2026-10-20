@@ -30,7 +30,22 @@
   `order_items` and `payments` become one refresh of unit 42.
 * **Non-blocking reads, diff writes.** Sources are read only with plain, non-locking `SELECT`s
   (READ COMMITTED), never with `INSERT … SELECT`. Fresh rows are compared with the materialized
-  rows of each unit, and only the units that changed are written.
+  rows of each unit, and only the units that changed are written, one transaction per chunk of
+  units and target.
+* **Upserts by row key.** Most view tables have a unique row key: the unit (the PRIMARY KEY, or
+  the unique index `_lv_row` when the unit can be NULL or is hidden) for grouped and single-table
+  views, the unit plus the lineage columns (`_lv_row`) for select/join views whose other tables
+  all carry their primary key as lineage. In a changed unit only the rows that differ are
+  written: rows that vanished are deleted by key (batched `IN` lists and `BETWEEN` ranges), then
+  changed and new rows go in as multi-row `INSERT … ON DUPLICATE KEY UPDATE` (with a row alias on
+  MySQL and Percona, `VALUES()` on MariaDB). Deleting first keeps keys the server deems equal
+  but that differ in bytes (case, trailing spaces) correct. A key with a NULL never conflicts in
+  a unique index, so such rows are deleted and inserted again. Views without a row key (a table
+  joined straight on the unit, such as `orders JOIN order_items ON i.order_id = o.id`, one
+  without a primary key, unit columns that can only be indexed by a prefix) delete their
+  changed units and insert their rows again. Statements are bounded by
+  `LAZYVIEW_WRITE_BATCH_ROWS`, `LAZYVIEW_WRITE_BATCH_BYTES` and 60,000 placeholders. A table
+  built by a version without upserts lacks `_lv_row` and is rebuilt once on resume.
 * **Values as stored.** lazyview's sessions drop `STRICT_*`, `NO_ZERO_DATE` and `NO_ZERO_IN_DATE`
   from the server's `sql_mode`, and the parser flags `ANSI_QUOTES`, `PIPES_AS_CONCAT`,
   `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES` and `IGNORE_SPACE` (definitions are read and SQL

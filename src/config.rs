@@ -66,8 +66,8 @@ impl Default for SupervisorConfig {
     fn default() -> Self {
         SupervisorConfig {
             mode: SupervisorMode::Adaptive,
-            max_source: 8,
-            max_target: 4,
+            max_source: DEFAULT_MAX_SOURCE,
+            max_target: DEFAULT_MAX_TARGET,
             max_target_override: BTreeMap::new(),
             max_inflight_rows: 200_000,
             cpu_workers: default_cpu_workers(),
@@ -75,6 +75,11 @@ impl Default for SupervisorConfig {
         }
     }
 }
+
+/// Interim pool sizes while `adaptive` runs with fixed limits (the design's 8 / 4 come with the
+/// adaptive limiter).
+pub const DEFAULT_MAX_SOURCE: usize = 4;
+pub const DEFAULT_MAX_TARGET: usize = 2;
 
 /// `min(4, max(1, cores / 4))`.
 pub fn default_cpu_workers() -> usize {
@@ -96,6 +101,9 @@ pub struct Config {
     pub batch_max_keys: usize,
     pub query_chunk: usize,
     pub write_batch_rows: usize,
+    /// Estimated bytes per INSERT / DELETE statement of a write (at most half of each server's
+    /// `max_allowed_packet`).
+    pub write_batch_bytes: usize,
     pub server_id: u32,
     pub instance_id: String,
     pub drop_removed: bool,
@@ -239,8 +247,12 @@ impl Config {
         }
         let supervisor = SupervisorConfig {
             mode: supervisor_mode,
-            max_source: (num("LAZYVIEW_MAX_SOURCE_CONCURRENCY", 8)? as usize).max(1),
-            max_target: (num("LAZYVIEW_MAX_TARGET_CONCURRENCY", 4)? as usize).max(1),
+            max_source: (num("LAZYVIEW_MAX_SOURCE_CONCURRENCY", DEFAULT_MAX_SOURCE as u64)?
+                as usize)
+                .max(1),
+            max_target: (num("LAZYVIEW_MAX_TARGET_CONCURRENCY", DEFAULT_MAX_TARGET as u64)?
+                as usize)
+                .max(1),
             max_target_override,
             max_inflight_rows: (num("LAZYVIEW_MAX_INFLIGHT_ROWS", 200_000)? as usize).max(1),
             cpu_workers: (num("LAZYVIEW_CPU_WORKERS", default_cpu_workers() as u64)? as usize)
@@ -256,6 +268,11 @@ impl Config {
             batch_max_keys: num("LAZYVIEW_BATCH_MAX_KEYS", 50_000)? as usize,
             query_chunk,
             write_batch_rows: num("LAZYVIEW_WRITE_BATCH_ROWS", 500)?.max(1) as usize,
+            write_batch_bytes: num(
+                "LAZYVIEW_WRITE_BATCH_BYTES",
+                crate::mv::DEFAULT_WRITE_BATCH_BYTES as u64,
+            )?
+            .max(1024) as usize,
             server_id,
             instance_id,
             drop_removed: flag("LAZYVIEW_DROP_REMOVED", true)?,
@@ -458,6 +475,7 @@ mod tests {
         assert!(c.sync && c.drop_removed);
         assert!(c.server_id >= 1 << 30 && !c.server_id_fixed);
         assert_eq!(c.health_addr, Some(([0, 0, 0, 0], 8080).into()));
+        assert_eq!((c.write_batch_rows, c.write_batch_bytes), (500, 4 << 20));
         let c = cfg(&[
             ("LAZYVIEW_DSN", "x"),
             ("LAZYVIEW_START_MODE", "REBUILD"),
@@ -528,11 +546,11 @@ mod tests {
         let c = cfg(&[("LAZYVIEW_DSN", "mysql://a@b/c")]).unwrap();
         let s = &c.supervisor;
         assert_eq!(s.mode, SupervisorMode::Adaptive);
-        assert_eq!((s.max_source, s.max_target), (8, 4));
+        assert_eq!((s.max_source, s.max_target), (4, 2));
         assert_eq!(s.max_inflight_rows, 200_000);
         assert!((1..=4).contains(&s.cpu_workers));
         assert_eq!(s.stale_after, Duration::from_secs(300));
-        assert_eq!(s.max_for_target("source"), 4);
+        assert_eq!(s.max_for_target("source"), 2);
         let c = cfg(&[
             ("LAZYVIEW_DSN", "mysql://a@b/c"),
             ("LAZYVIEW_SUPERVISOR", "Fixed"),

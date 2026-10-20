@@ -28,6 +28,7 @@ use crate::lookback::Lookback;
 use crate::meta::{self, StateUpdate, SOURCE_TARGET};
 use crate::metrics::Metrics;
 use crate::mv::{self, BuildTarget, Layout};
+use crate::supervisor::{self, Supervisor};
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
 
@@ -220,6 +221,10 @@ struct Target {
     opts: Opts,
     schema: String,
     conn: Option<Conn>,
+    /// Statement limits and upsert syntax of this server (read with the connection).
+    write: Option<mv::WriteOpts>,
+    /// Session sql_mode of the connection (the supervisor's pooled connections set it too).
+    sql_mode: Option<String>,
     /// Unreachable: connection attempts fail fast until then (backoff), so a dead target never
     /// stalls the binlog loop for more than one connect timeout per period.
     retry_at: Option<Instant>,
@@ -325,6 +330,9 @@ struct Slot {
     last_plan: Option<Arc<ViewPlan>>,
     /// Consecutive failed refreshes of the live version.
     refresh_failures: u32,
+    /// Of those, failures from an overloaded or unreachable server (supervised refreshes: they
+    /// never lead to a rebuild).
+    overload_failures: u32,
     /// Re-plan once the build in flight is done (its source data was replaced meanwhile).
     replan_after: bool,
     /// `_lazyview.rebuild` was set when the binlog was here: cleared once a build started at or
@@ -519,6 +527,9 @@ struct Engine {
     last_touch: Instant,
     last_stats: (Instant, crate::metrics::Snapshot),
     last_meta_ping: Instant,
+    /// Concurrent refreshes on connection pools; `None` with `LAZYVIEW_SUPERVISOR=off` (one
+    /// sequential refresh on the connections above).
+    sup: Option<Supervisor>,
 }
 
 /// One connection attempt (TCP, TLS and handshake) is bounded well inside the liveness window:
@@ -546,6 +557,14 @@ async fn connect(opts: &Opts) -> Result<Conn> {
     };
     mv::init_session(&mut c).await?;
     Ok(c)
+}
+
+/// The session sql_mode of a connection set up by [`connect`] (for pooled connections).
+async fn session_sql_mode(conn: &mut Conn) -> Result<String> {
+    let mode: Option<String> = conn
+        .query_first("SELECT CAST(@@SESSION.sql_mode AS CHAR)")
+        .await?;
+    Ok(mode.unwrap_or_default())
 }
 
 /// Identity of the server that writes the binlog: a saved position only means something on
@@ -634,6 +653,8 @@ impl Engine {
                 opts: src_opts.clone(),
                 schema: schema.clone(),
                 conn: None,
+                write: None,
+                sql_mode: None,
                 retry_at: None,
                 failures: 0,
             },
@@ -647,6 +668,8 @@ impl Engine {
                     opts,
                     schema: ts,
                     conn: None,
+                    write: None,
+                    sql_mode: None,
                     retry_at: None,
                     failures: 0,
                 },
@@ -661,6 +684,26 @@ impl Engine {
             .collect();
         let (build_tx, build_rx) = mpsc::unbounded_channel();
         let cfg_build_concurrency = cfg.build_concurrency;
+        let sup = Supervisor::new(
+            &cfg.supervisor,
+            &src_opts,
+            &session_sql_mode(&mut src).await?,
+            metrics.clone(),
+        );
+        match cfg.supervisor.mode {
+            crate::config::SupervisorMode::Off => {
+                info!("refreshes run sequentially (LAZYVIEW_SUPERVISOR=off)")
+            }
+            mode => {
+                if mode == crate::config::SupervisorMode::Adaptive {
+                    info!("adaptive limiter not implemented yet; using fixed limits");
+                }
+                info!(
+                    "refreshes run concurrently: {} source reads, {} writes per target",
+                    cfg.supervisor.max_source, cfg.supervisor.max_target
+                );
+            }
+        }
         let zero = Position {
             file: String::new(),
             pos: 0,
@@ -709,6 +752,7 @@ impl Engine {
             last_touch: Instant::now(),
             last_stats: (Instant::now(), Default::default()),
             last_meta_ping: Instant::now(),
+            sup,
         };
 
         let defs = meta::load_definitions(&mut e.meta).await?;
@@ -1572,6 +1616,7 @@ impl Engine {
             down: BTreeMap::new(),
             last_plan: None,
             refresh_failures: 0,
+            overload_failures: 0,
             replan_after: false,
             rebuild_asked: None,
             plan_timed_out: None,
@@ -1609,7 +1654,14 @@ impl Engine {
                     (at - Instant::now()).as_secs_f64()
                 );
             }
-            let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, connect(&target.opts)).await
+            let (rows, bytes) = (self.cfg.write_batch_rows, self.cfg.write_batch_bytes);
+            let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, async {
+                let mut c = connect(&target.opts).await?;
+                let w = mv::write_opts(&mut c, rows, bytes).await?;
+                let mode = session_sql_mode(&mut c).await?;
+                Ok::<_, anyhow::Error>((c, w, mode))
+            })
+            .await
             {
                 Ok(r) => r.with_context(|| format!("connecting to target {t}")),
                 Err(_) => Err(anyhow!(
@@ -1618,8 +1670,10 @@ impl Engine {
             };
             metrics.beat();
             match r {
-                Ok(c) => {
+                Ok((c, w, mode)) => {
                     target.conn = Some(c);
+                    target.write = Some(w);
+                    target.sql_mode = Some(mode);
                     target.failures = 0;
                     target.retry_at = None;
                 }
@@ -1656,11 +1710,20 @@ impl Engine {
         let mut resumed = Vec::new();
         for t in candidates {
             let ts = self.targets[&t].schema.clone();
-            let cols = match self.target_conn(&t).await {
-                Ok(conn) => mv::table_columns(conn, &ts, &name).await.ok(),
-                Err(_) => None,
+            // Columns as the layout's, and the unique index rows are upserted by (tables
+            // built before upserts lack `_lv_row`: rebuilt once).
+            let fits = match self.target_conn(&t).await {
+                Ok(conn) => match mv::table_columns(conn, &ts, &name).await {
+                    Ok(c) if mv::layout_matches(&layout, &c) => {
+                        mv::has_row_index(conn, &ts, &name, &layout)
+                            .await
+                            .unwrap_or(false)
+                    }
+                    _ => false,
+                },
+                Err(_) => false,
             };
-            if cols.is_some_and(|c| mv::layout_matches(&layout, &c)) {
+            if fits {
                 resumed.push(t);
             }
         }
@@ -1788,7 +1851,7 @@ impl Engine {
             specs,
             plan.clone(),
             name.clone(),
-            self.cfg.write_batch_rows,
+            (self.cfg.write_batch_rows, self.cfg.write_batch_bytes),
             self.metrics.clone(),
             self.build_tx.clone(),
             self.build_slots.clone(),
@@ -2276,6 +2339,9 @@ impl Engine {
         }
         if !self.in_txn {
             let _ = self.flush().await;
+        }
+        if let Some(sup) = &self.sup {
+            sup.disconnect().await;
         }
         for s in &self.slots {
             if let Some(n) = &s.next {
@@ -2963,6 +3029,8 @@ impl Engine {
             }
             self.retry_down().await;
             let now = Instant::now();
+            // Supervised: the live views refresh together (below), each after its swap.
+            let together = self.sup.is_some();
             for i in 0..self.slots.len() {
                 let t0 = Instant::now();
                 if self.slots[i]
@@ -2974,9 +3042,17 @@ impl Engine {
                     self.finish_next(i).await;
                     slow.push((t0.elapsed(), "swap", i));
                 }
+                if !together {
+                    let t1 = Instant::now();
+                    self.refresh_live(i).await;
+                    slow.push((t1.elapsed(), "refresh", i));
+                }
+            }
+            if together && !self.slots.is_empty() {
                 let t1 = Instant::now();
-                self.refresh_live(i).await;
-                slow.push((t1.elapsed(), "refresh", i));
+                let all: Vec<usize> = (0..self.slots.len()).collect();
+                self.refresh_all_live(&all).await;
+                slow.push((t1.elapsed(), "refresh (all views, from)", 0));
             }
         }
         if let Err(e) = self.persist_position(false).await {
@@ -3567,9 +3643,29 @@ impl Engine {
     }
 
     async fn refresh_live(&mut self, i: usize) {
+        let Some(mut st) = self.live_begin(i).await else {
+            return;
+        };
+        let r = self
+            .refresh(
+                &st.plan,
+                &st.layout,
+                &mut st.dirty,
+                &st.targets,
+                &st.name,
+                &mut st.recent,
+                st.since.as_ref(),
+            )
+            .await;
+        self.live_end(i, st, r).await;
+    }
+
+    /// What [`Self::refresh_live`] does before the refresh: lagging targets, full-mode views
+    /// (rebuilt instead), and the changes to apply. None: nothing to refresh now.
+    async fn live_begin(&mut self, i: usize) -> Option<LiveRefresh> {
         // A routine rebuild is being swapped in: changes wait for it (see `finish_next`).
         if self.slots[i].next.as_ref().is_some_and(|n| n.swapping) {
-            return;
+            return None;
         }
         self.retry_lag(i).await;
         let def_id = self.slots[i].def_id;
@@ -3578,13 +3674,11 @@ impl Engine {
         let now = Instant::now();
         let full_due = self.full_due(&self.slots[i]).is_none_or(|t| t <= now);
         let s = &mut self.slots[i];
-        let Some(l) = s.live.as_mut() else {
-            return;
-        };
+        let l = s.live.as_mut()?;
         if l.frozen || l.dirty.is_empty() || backing_off {
-            return;
+            return None;
         }
-        let mut dirty = l.dirty.take();
+        let dirty = l.dirty.take();
         let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
         let lagging: Vec<String> = l.lag.keys().cloned().collect();
         let targets: Vec<String> = l
@@ -3610,21 +3704,40 @@ impl Engine {
                 // Not due yet: stay stale until the next refresh slot (see flush_deadline).
                 l.dirty.all = true;
             }
-            return;
+            return None;
         }
-        let mut recent = std::mem::take(&mut l.recent);
+        let recent = std::mem::take(&mut l.recent);
         let since = l.since.clone();
-        let r = self
-            .refresh(
-                &plan,
-                &layout,
-                &mut dirty,
-                &targets,
-                &name,
-                &mut recent,
-                since.as_ref(),
-            )
-            .await;
+        Some(LiveRefresh {
+            plan,
+            layout,
+            name,
+            dirty,
+            targets,
+            lagging,
+            recent,
+            since,
+            def_id,
+            replan_pending,
+            full_due,
+        })
+    }
+
+    /// What [`Self::refresh_live`] does with the result `r` of the refresh `st`.
+    async fn live_end(&mut self, i: usize, st: LiveRefresh, r: Result<Refreshed>) {
+        let LiveRefresh {
+            plan,
+            layout: _,
+            name,
+            dirty,
+            targets: _,
+            lagging,
+            recent,
+            since: _,
+            def_id,
+            replan_pending,
+            full_due,
+        } = st;
         if let Some(l) = self.slots[i].live.as_mut() {
             l.recent = recent;
         }
@@ -3641,10 +3754,16 @@ impl Engine {
                 }
                 s.refresh_failures += 1;
                 let n = s.refresh_failures;
+                // Supervised: an overloaded or unreachable server is waited out, never answered
+                // with a rebuild (design-supervisor.md, I5).
+                if self.sup.is_some() && supervisor::is_overload(&e) {
+                    s.overload_failures += 1;
+                }
+                let escalating = n - s.overload_failures;
                 let delay = Duration::from_millis(250 << n.min(7)).min(Duration::from_secs(30));
                 s.retry_at = Some(Instant::now() + delay);
                 warn!(view = %name, attempt = n, "refresh failed: {e:#}; retrying in {delay:?}");
-                if n == 3 && !replan_pending {
+                if escalating == 3 && !replan_pending && s.overload_failures < n {
                     self.schedule_replan(def_id, false, true);
                 }
             }
@@ -3652,6 +3771,7 @@ impl Engine {
                 let s = &mut self.slots[i];
                 s.retry_at = None;
                 s.refresh_failures = 0;
+                s.overload_failures = 0;
                 if s.next.is_none() && !replan_pending {
                     self.failures.remove(&def_id);
                 }
@@ -3777,7 +3897,7 @@ impl Engine {
     /// the sources failed.
     async fn refresh(
         &mut self,
-        plan: &ViewPlan,
+        plan: &Arc<ViewPlan>,
         layout: &Layout,
         dirty: &mut ViewDirty,
         targets: &[String],
@@ -3785,6 +3905,14 @@ impl Engine {
         recent: &mut Lookback,
         since: Option<&Position>,
     ) -> Result<Refreshed> {
+        if self.sup.is_some() {
+            let mut p = self
+                .prepare_refresh(plan, layout, dirty, targets, table, recent, since)
+                .await?;
+            let out = run_pending(self.sup.as_ref().expect("supervised"), &mut p).await;
+            self.metrics.beat();
+            return finish_refresh(dirty, p, out);
+        }
         let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
         if matches!(plan.mode, Mode::Global) {
             if !dirty.all {
@@ -3866,6 +3994,141 @@ impl Engine {
         })
     }
 
+    /// The part of a supervised [`Self::refresh`] that needs the engine: the lookups (on the
+    /// engine's own connections) and the job for the supervisor's pools (see
+    /// `src/supervisor.rs`), run by [`run_pending`] and completed by [`finish_refresh`]. A
+    /// target without a working control connection (write limits, sql_mode) fails right away.
+    async fn prepare_refresh(
+        &mut self,
+        plan: &Arc<ViewPlan>,
+        layout: &Layout,
+        dirty: &mut ViewDirty,
+        targets: &[String],
+        table: &str,
+        recent: &mut Lookback,
+        since: Option<&Position>,
+    ) -> Result<PendingRefresh> {
+        let mut p = PendingRefresh {
+            global: matches!(plan.mode, Mode::Global),
+            rebuild: dirty.rebuild,
+            ..Default::default()
+        };
+        if p.global {
+            if !dirty.all {
+                p.idle = true;
+                return Ok(p);
+            }
+            Metrics::add(&self.metrics.units_refreshed, 1);
+        } else {
+            // `dirty` is only cleared once everything succeeded, so a failure can be retried.
+            let mut units = dirty.units.clone();
+            if !self
+                .lookups(
+                    plan,
+                    layout,
+                    &dirty.images,
+                    (targets, table),
+                    (recent, since),
+                    &mut units,
+                )
+                .await?
+            {
+                debug!(view = %plan.name, "too many changed rows to look up; rebuilding instead");
+                p.rebuild = true;
+            }
+            Metrics::add(&self.metrics.units_refreshed, units.len() as u64);
+            p.units = Some(units);
+        }
+        let mut jobs = Vec::new();
+        for t in targets {
+            if let Err(e) = self.target_conn(t).await {
+                p.failed.push((t.clone(), e.context(format!("target {t}"))));
+                continue;
+            }
+            let target = &self.targets[t.as_str()];
+            let (Some(write), Some(mode)) = (target.write, target.sql_mode.clone()) else {
+                p.failed.push((
+                    t.clone(),
+                    anyhow!("internal: target {t} has no write settings"),
+                ));
+                continue;
+            };
+            let (opts, schema) = (target.opts.clone(), target.schema.clone());
+            let endpoint = self
+                .sup
+                .as_mut()
+                .expect("supervised refresh")
+                .write_endpoint(t, &opts, &mode);
+            jobs.push(supervisor::TargetJob {
+                name: t.clone(),
+                schema,
+                write,
+                endpoint,
+            });
+        }
+        if !jobs.is_empty() {
+            p.job = Some(supervisor::Job {
+                plan: plan.clone(),
+                layout: Arc::new(layout.clone()),
+                table: table.to_string(),
+                targets: jobs,
+                // Unit filters bind one placeholder per unit column.
+                max_chunk: self
+                    .cfg
+                    .query_chunk
+                    .min(MAX_FILTER_PARAMS / plan.unit_exprs.len().max(1))
+                    .max(1),
+                timeout: self.cfg.target_timeout,
+                fresh: self.flavor == Flavor::MariaDb,
+            });
+        }
+        self.metrics.beat();
+        Ok(p)
+    }
+
+    /// The live refreshes of `slots` at once (supervised): each view's lookups in turn, then
+    /// every view's chunk reads and writes together on the shared pools, then each result.
+    async fn refresh_all_live(&mut self, slots: &[usize]) {
+        let mut started = Vec::new();
+        for &i in slots {
+            let Some(mut st) = self.live_begin(i).await else {
+                continue;
+            };
+            let p = self
+                .prepare_refresh(
+                    &st.plan,
+                    &st.layout,
+                    &mut st.dirty,
+                    &st.targets,
+                    &st.name,
+                    &mut st.recent,
+                    st.since.as_ref(),
+                )
+                .await;
+            started.push((i, st, p));
+        }
+        if started.is_empty() {
+            return;
+        }
+        let sup = self.sup.as_ref().expect("supervised refresh");
+        let outs = futures_util::future::join_all(started.iter_mut().map(|(_, _, p)| async move {
+            match p {
+                Ok(p) => Some(run_pending(sup, p).await),
+                Err(_) => None,
+            }
+        }))
+        .await;
+        self.metrics.beat();
+        for ((i, mut st, p), out) in started.into_iter().zip(outs) {
+            let r = match (p, out) {
+                (Ok(p), Some(out)) => finish_refresh(&mut st.dirty, p, out),
+                (Err(e), _) => Err(e),
+                (Ok(_), None) => unreachable!("every prepared refresh ran"),
+            };
+            self.live_end(i, st, r).await;
+        }
+    }
+
     /// Writes the new rows of a chunk (all rows: `None`) to `table` on target `t`.
     async fn apply_target(
         &mut self,
@@ -3877,14 +4140,17 @@ impl Engine {
     ) -> Result<()> {
         let ts = self.targets[t].schema.clone();
         let metrics = self.metrics.clone();
-        let (batch, timeout) = (self.cfg.write_batch_rows, self.cfg.target_timeout);
-        let c = self
-            .target_conn(t)
+        let timeout = self.cfg.target_timeout;
+        self.target_conn(t)
             .await
             .with_context(|| format!("target {t}"))?;
+        let target = self.targets.get_mut(t).unwrap();
+        let (Some(c), Some(w)) = (target.conn.as_mut(), target.write) else {
+            bail!("internal: target {t} has no connection");
+        };
         let r = match tokio::time::timeout(
             timeout,
-            mv::apply(c, &ts, table, layout, chunk, rows, batch, &metrics),
+            mv::apply(c, &ts, table, layout, chunk, rows, &w, &metrics),
         )
         .await
         {
@@ -4283,6 +4549,78 @@ struct Refreshed {
     failed: Vec<(String, anyhow::Error)>,
 }
 
+/// A live refresh between [`Engine::live_begin`] and [`Engine::live_end`].
+struct LiveRefresh {
+    plan: Arc<ViewPlan>,
+    layout: Layout,
+    name: String,
+    /// The changes taken from the live version (merged back if the refresh fails).
+    dirty: ViewDirty,
+    targets: Vec<String>,
+    lagging: Vec<String>,
+    recent: Lookback,
+    since: Option<Position>,
+    def_id: u64,
+    replan_pending: bool,
+    full_due: bool,
+}
+
+/// A supervised refresh with its lookups done (see [`Engine::prepare_refresh`]).
+#[derive(Default)]
+struct PendingRefresh {
+    /// Chunk reads and writes for the supervisor; None when no target can be written.
+    job: Option<supervisor::Job>,
+    /// The units (None: the whole view, a global aggregate).
+    units: Option<UnitSet>,
+    global: bool,
+    /// A global view without changes: nothing to do.
+    idle: bool,
+    rebuild: bool,
+    /// Targets that failed before the run.
+    failed: Vec<(String, anyhow::Error)>,
+}
+
+/// Runs the chunk ops of a prepared refresh on the supervisor's pools.
+async fn run_pending(sup: &Supervisor, p: &mut PendingRefresh) -> Result<supervisor::Outcome> {
+    match p.job.take() {
+        Some(job) if !p.idle => sup.run(job, p.units.as_ref()).await,
+        _ => Ok(supervisor::Outcome::default()),
+    }
+}
+
+/// The result of a supervised refresh, clearing `dirty` (except a pending rebuild) once it
+/// succeeded (see [`Engine::refresh`]).
+fn finish_refresh(
+    dirty: &mut ViewDirty,
+    p: PendingRefresh,
+    out: Result<supervisor::Outcome>,
+) -> Result<Refreshed> {
+    if p.idle {
+        return Ok(Refreshed::default());
+    }
+    let mut failed = p.failed;
+    failed.extend(out?.failed);
+    if p.global {
+        dirty.all = false;
+        return Ok(Refreshed {
+            units: UnitSet::default(),
+            all: true,
+            failed,
+        });
+    }
+    let n = dirty.images.len();
+    *dirty = ViewDirty {
+        images: vec![HashSet::new(); n],
+        rebuild: p.rebuild,
+        ..Default::default()
+    };
+    Ok(Refreshed {
+        units: p.units.unwrap_or_default(),
+        all: false,
+        failed,
+    })
+}
+
 /// Placeholders per statement (the server limit is 65535).
 const MAX_FILTER_PARAMS: usize = 60_000;
 
@@ -4407,12 +4745,20 @@ async fn foreign_table(c: &mut Conn, schema: &str, name: &str, marker: &str) -> 
 }
 
 /// Connects to a build target, runs its ownership checks and creates the shadow table.
-async fn prepare_target(spec: &BuildSpec, name: &str, layout: &Layout) -> Result<Conn> {
+async fn prepare_target(
+    spec: &BuildSpec,
+    name: &str,
+    layout: &Layout,
+    (batch_rows, batch_bytes): (usize, usize),
+) -> Result<(Conn, mv::WriteOpts)> {
     let (t, ts) = (&spec.target, &spec.schema);
     let mut c = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT * 3, connect(&spec.opts)).await {
         Ok(r) => r.with_context(|| format!("connecting to target {t}"))?,
         Err(_) => bail!("connecting to target {t}: timed out"),
     };
+    let w = mv::write_opts(&mut c, batch_rows, batch_bytes)
+        .await
+        .with_context(|| format!("target {t}"))?;
     let ours = |m: Option<String>| m.as_deref() == Some(spec.marker.as_str());
     if spec.check_side {
         for side in [mv::shadow_name(name), mv::old_name(name)] {
@@ -4436,7 +4782,7 @@ async fn prepare_target(spec: &BuildSpec, name: &str, layout: &Layout) -> Result
     mv::create_shadow_marked(&mut c, ts, name, layout, &spec.marker)
         .await
         .with_context(|| format!("creating the shadow table on target {t}"))?;
-    Ok(c)
+    Ok((c, w))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4446,7 +4792,7 @@ async fn build_task(
     targets: Vec<BuildSpec>,
     plan: Arc<ViewPlan>,
     name: String,
-    batch_rows: usize,
+    batch: (usize, usize),
     metrics: Arc<Metrics>,
     tx: mpsc::UnboundedSender<BuildDone>,
     slots: Arc<tokio::sync::Semaphore>,
@@ -4461,29 +4807,27 @@ async fn build_task(
         let mut conns = Vec::new();
         let mut failed = Vec::new();
         for spec in &targets {
-            match prepare_target(spec, &name, &layout).await {
-                Ok(c) => conns.push((c, spec.schema.clone())),
+            match prepare_target(spec, &name, &layout, batch).await {
+                Ok((c, w)) => conns.push((c, spec.schema.clone(), w)),
                 Err(e) => failed.push((spec.target.clone(), e)),
             }
         }
         if !conns.is_empty() {
             let mut bt: Vec<BuildTarget> = conns
                 .iter_mut()
-                .map(|(c, s)| BuildTarget {
+                .map(|(c, s, w)| BuildTarget {
                     conn: c,
                     schema: s.clone(),
+                    write: *w,
                 })
                 .collect();
-            let n = mv::fill(
-                &mut src, &plan, &layout, &mut bt, &name, batch_rows, &metrics,
-            )
-            .await?;
+            let n = mv::fill(&mut src, &plan, &layout, &mut bt, &name, batch.0, &metrics).await?;
             debug!(view = %name, rows = n, "build finished");
         }
         // `swap`: swap the shadow tables in right away. A target where that fails is left to
         // the engine, which swaps (and retries) the rest as for any build.
         let mut swapped = Vec::new();
-        for ((c, ts), spec) in conns.iter_mut().zip(
+        for ((c, ts, _), spec) in conns.iter_mut().zip(
             targets
                 .iter()
                 .filter(|s| !failed.iter().any(|(t, _)| *t == s.target)),
@@ -4502,7 +4846,7 @@ async fn build_task(
                 }
             }
         }
-        for (c, _) in conns {
+        for (c, _, _) in conns {
             let _ = c.disconnect().await;
         }
         let _ = src.disconnect().await;

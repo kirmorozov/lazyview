@@ -917,6 +917,32 @@ impl ViewPlan {
         self.lineage.iter().find(|k| k.alias == alias)
     }
 
+    /// Whether the unit and the lineage keys together identify each materialized row of a
+    /// select/join view: the first table has a row key (its primary key or a UNIQUE NOT NULL
+    /// key, which is then the unit) and every other table of the FROM clause carries its row
+    /// key as a lineage key. A row of such a view is one combination of rows of these tables
+    /// (with NULLs for the unmatched side of a LEFT JOIN), so no two rows agree on all of them.
+    /// Tables of semi- and anti-join subqueries and of ORDER BY subqueries contribute no rows
+    /// of their own. A first table without a row key (equal rows share their unit), a table
+    /// mapped to units straight from its images (no lineage columns), one without a row key
+    /// (lineage by the whole row: duplicates) and any other table without lineage leave the
+    /// rows unidentified. Grouped views and single-table views are identified by the unit
+    /// alone (`unit_unique`).
+    pub fn rows_identified(&self) -> bool {
+        let keyed = |a: usize| self.aliases[a].table.row_key().map(<[usize]>::len);
+        self.mode == Mode::Spj
+            && !self.unit_exprs.is_empty()
+            && !self.aliases.is_empty()
+            && keyed(0).is_some()
+            && (1..self.aliases.len()).all(|a| {
+                let ap = &self.aliases[a];
+                ap.semi.is_some()
+                    || ap.pos.0 == usize::MAX
+                    || keyed(a)
+                        .is_some_and(|n| self.lineage_of(a).is_some_and(|k| k.cols.len() == n))
+            })
+    }
+
     /// `SELECT DISTINCT <units> FROM ... WHERE ... AND <filter>`: the units of the current rows
     /// that `filter` (over a lineage alias's primary key) selects.
     pub fn key_lookup_sql(&self, filter: &str) -> String {
@@ -3903,6 +3929,32 @@ mod tests {
             "CREATE VIEW v AS SELECT id, status FROM orders",
         ] {
             assert!(p(sql).lineage.is_empty(), "{sql}");
+        }
+    }
+
+    /// Rows of a select/join view are identified by the unit plus the lineage keys only when
+    /// every other table carries its primary key as lineage (upserts by that identity).
+    #[test]
+    fn spj_rows_identified_by_unit_and_lineage() {
+        for sql in [
+            "CREATE VIEW v AS SELECT o.id, c.name, r.name AS region FROM orders o \
+             JOIN customers c ON c.id = o.customer_id LEFT JOIN regions r ON r.id = c.region_id",
+            "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.customer_id",
+            "CREATE VIEW v AS SELECT id, status FROM orders",
+        ] {
+            assert!(p(sql).rows_identified(), "{sql}");
+        }
+        for sql in [
+            // order_items maps to units directly: no lineage, several rows per unit.
+            "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.id",
+            // logs has no primary key: whole-row lineage, equal rows are duplicates.
+            "CREATE VIEW v AS SELECT o.id, l.msg FROM orders o JOIN logs l ON l.msg = o.status",
+            "CREATE VIEW v AS SELECT c.name, COUNT(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.name",
+            "CREATE VIEW v AS SELECT COUNT(*) AS n FROM orders",
+            // A first table without a row key: equal rows share their unit.
+            "CREATE VIEW v AS SELECT msg FROM logs",
+        ] {
+            assert!(!p(sql).rows_identified(), "{sql}");
         }
     }
 
