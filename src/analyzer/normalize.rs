@@ -16,7 +16,7 @@ use sqlparser::ast::{
     visit_expressions, visit_expressions_mut, BinaryOperator, Distinct, Expr, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
     ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
-    Value,
+    UnaryOperator, Value,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -31,6 +31,7 @@ use super::ir::{Block, Item, Origin, Rel, Semi, SemiTable, Source};
 use super::names::ident_name;
 use super::scope::Scope;
 use crate::analyze::null_propagating;
+use crate::catalog::{Column, TypeFamily};
 
 pub(crate) const AGGREGATES: &[&str] = &[
     "COUNT",
@@ -1285,7 +1286,7 @@ fn scalar(
             for (a, z) in [(left, right), (right, left)] {
                 if let Res::Col(_, col) = inner.resolve(a) {
                     let (zi, zo, _) = scan(z);
-                    if zi.is_empty() && zo > 0 {
+                    if zi.is_empty() && zo > 0 && key_exact(&info.columns[col], outer, z) {
                         bound.insert(col);
                     }
                 }
@@ -1293,7 +1294,7 @@ fn scalar(
         }
     }
     // Each outer row matches at most one row: a whole key (the PK or a UNIQUE NOT NULL key) is
-    // bound to outer expressions.
+    // bound to outer columns that compare like it (G1).
     let Some(key) = info
         .keys()
         .find(|k| k.iter().all(|c| bound.contains(c)))
@@ -1954,22 +1955,79 @@ pub(crate) fn semi_renamed(s: &Semi, taken: &HashSet<String>) -> Semi {
     out
 }
 
+/// Whether `key_col = e` compares like the key, so that distinct key values never equal the
+/// same value of `e` (G1): `e` is a column of the same type family (for strings the same charset
+/// and collation: no number against a string key, no `COLLATE`), or an integer expression
+/// against an integer key.
+fn key_exact(key_col: &Column, r: &Resolver, e: &Expr) -> bool {
+    match r.column(e) {
+        Some(c) => c.family() == key_col.family(),
+        None => key_col.family() == TypeFamily::Integer && integer_valued(r, e),
+    }
+}
+
+/// Whether `e` is an integer: integer columns and literals under `+ - * DIV %`.
+fn integer_valued(r: &Resolver, e: &Expr) -> bool {
+    match e {
+        Expr::Nested(x) => integer_valued(r, x),
+        Expr::Value(v) => matches!(&v.value, Value::Number(n, _) if n.parse::<i64>().is_ok()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => integer_valued(r, expr),
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::MyIntegerDivide
+                | BinaryOperator::Modulo,
+            right,
+        } => integer_valued(r, left) && integer_valued(r, right),
+        _ => r
+            .column(e)
+            .is_some_and(|c| c.family() == TypeFamily::Integer),
+    }
+}
+
 /// Whether the semi-join is over one table and its correlation covers a whole key of it (the
-/// primary key or a UNIQUE NOT NULL key: each outer row matches at most one row of the table,
-/// the semi-join is an inner join).
-fn unique(s: &Semi) -> bool {
+/// primary key or a UNIQUE NOT NULL key) with key-exact equalities: each outer row matches at
+/// most one row of the table, the semi-join is an inner join.
+fn unique(b: &Block, s: &Semi) -> bool {
     let [t] = s.tables.as_slice() else {
         return false;
     };
+    let Some(args) = b
+        .select
+        .selection
+        .as_ref()
+        .and_then(|w| marker_args(w, s.id))
+    else {
+        return false;
+    };
+    let r = Resolver::new(b);
     !s.negated
         && t.info.keys().any(|key| {
-            key.iter()
-                .all(|c| s.correlation.iter().any(|(_, sc, _)| sc == c))
+            key.iter().all(|&c| {
+                s.correlation.iter().any(|&(_, sc, k)| {
+                    sc == c
+                        && args
+                            .get(k)
+                            .is_some_and(|a| key_exact(&t.info.columns[c], &r, a))
+                })
+            })
         })
 }
 
 fn semis_to_joins(b: &mut Block) -> Result<()> {
-    if !b.semis.iter().any(unique) {
+    let joinable: HashSet<usize> = b
+        .semis
+        .iter()
+        .filter(|s| unique(b, s))
+        .map(|s| s.id)
+        .collect();
+    if joinable.is_empty() {
         return Ok(());
     }
     qualify(b)?;
@@ -1977,7 +2035,7 @@ fn semis_to_joins(b: &mut Block) -> Result<()> {
     let semis = std::mem::take(&mut b.semis);
     let mut conds_all = Vec::new();
     for s in semis {
-        if !unique(&s) {
+        if !joinable.contains(&s.id) {
             b.semis.push(s);
             continue;
         }

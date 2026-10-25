@@ -689,7 +689,8 @@ fn not_null_columns_and_unique_keys_in_semi_joins() {
         "{:?}",
         v.where_sql
     );
-    // A UNIQUE NOT NULL key (no PK): IN over it is an inner join.
+    // A UNIQUE NOT NULL key (no PK): IN over it is an inner join when the outer column compares
+    // like the key (G1: same charset and collation).
     set(&mut cat, "codes", &|t| {
         t.pk.clear();
         t.columns[0].nullable = false;
@@ -697,7 +698,7 @@ fn not_null_columns_and_unique_keys_in_semi_joins() {
     });
     let v = plan(
         &cat,
-        "SELECT r.id FROM refs r WHERE r.code IN (SELECT c.code FROM codes c WHERE c.v > 1)",
+        "SELECT cu.id FROM customers cu WHERE cu.name IN (SELECT c.code FROM codes c WHERE c.v > 1)",
     );
     assert!(
         v.aliases.iter().all(|a| a.pos.0 != usize::MAX),
@@ -705,6 +706,139 @@ fn not_null_columns_and_unique_keys_in_semi_joins() {
         v.tracing()
     );
     assert!(v.from_sql.contains("codes"), "{}", v.from_sql);
+    // A latin1 column against the utf8mb4 key: a semi-join (lookups).
+    let v = plan(
+        &cat,
+        "SELECT r.id FROM refs r WHERE r.code IN (SELECT c.code FROM codes c WHERE c.v > 1)",
+    );
+    assert_eq!(v.tracing(), "r:unit,c:lookup");
+    assert!(!v.from_sql.contains("codes"), "{}", v.from_sql);
+}
+
+/// G1: a semi-join becomes an inner join, and a scalar subquery a LEFT JOIN, only when the
+/// equalities on the key compare like the key. A string key against a number (`'1'`, `'01'`,
+/// `'1.0'` all equal 1) or under an explicit COLLATE matches several key rows: those stay
+/// semi-joins (lookups, exact) or subqueries. An integer expression against an integer key, or
+/// a column of the key's own collation, joins.
+#[test]
+fn semi_joins_need_key_exact_equalities() {
+    let mut cat = catalog();
+    let int = |n: &str| {
+        let mut c = Column::simple(n, "int");
+        c.nullable = false;
+        c
+    };
+    let text = |n: &str, co: &str| {
+        let mut c = Column::new(
+            n,
+            "varchar",
+            "varchar(10)",
+            Some("utf8mb4"),
+            Some(co),
+            Some(40),
+            false,
+        );
+        c.nullable = false;
+        c
+    };
+    let general = "utf8mb4_general_ci";
+    for (name, cols, pk, unique) in [
+        (
+            "c",
+            vec![
+                int("id"),
+                int("num"),
+                text("name", general),
+                Column::simple("ref", "int"),
+            ],
+            vec![0],
+            vec![],
+        ),
+        (
+            "s_str",
+            vec![int("id"), text("code", general), Column::simple("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_spk",
+            vec![text("code", general), Column::simple("v", "int")],
+            vec![0],
+            vec![],
+        ),
+        (
+            "s_bin",
+            vec![
+                int("id"),
+                text("code", "utf8mb4_bin"),
+                Column::simple("v", "int"),
+            ],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_int",
+            vec![int("id"), int("code"), Column::simple("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        let mut t = (*t).clone();
+        t.unique_keys = unique;
+        cat.insert(k, Arc::new(t));
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    // (definition, subquery table, joined)
+    for (sql, table, joined) in [
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_str s)", "s_str", false),
+        (
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_str s WHERE s.code = c.num)",
+            "s_str",
+            false,
+        ),
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_spk s)", "s_spk", false),
+        (
+            "SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)",
+            "s_bin",
+            false,
+        ),
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_int s)", "s_int", true),
+        ("SELECT c.id FROM c WHERE c.num * 2 + 1 IN (SELECT s.code FROM s_int s)", "s_int", true),
+        ("SELECT c.id FROM c WHERE c.name IN (SELECT s.code FROM s_str s)", "s_str", true),
+        ("SELECT c.id FROM c WHERE c.name IN (SELECT s.code FROM s_spk s)", "s_spk", true),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.from_sql.contains(table), joined, "{sql}: {}", v.from_sql);
+        assert_eq!(
+            v.aliases.iter().any(|a| a.semi.is_some()),
+            !joined,
+            "{sql}: {}",
+            v.tracing()
+        );
+    }
+    // Scalar subqueries: a LEFT JOIN only over a key-exact equality, else a subquery (Full).
+    for (sql, joined) in [
+        ("SELECT c.id, (SELECT s.v FROM s_str s WHERE s.code = c.num) AS v FROM c", false),
+        ("SELECT c.id, (SELECT s.v FROM s_spk s WHERE s.code = c.num) AS v FROM c", false),
+        (
+            "SELECT c.id, (SELECT b.v FROM s_bin b WHERE b.code = c.name COLLATE utf8mb4_general_ci) AS v FROM c",
+            false,
+        ),
+        ("SELECT c.id, (SELECT s.v FROM s_int s WHERE s.code = c.num) AS v FROM c", true),
+        ("SELECT c.id, (SELECT s.v FROM s_spk s WHERE s.code = c.name) AS v FROM c", true),
+    ] {
+        let want = if joined {
+            Mode::Spj
+        } else {
+            Mode::Full("subquery".into())
+        };
+        assert_eq!(plan(sql).mode, want, "{sql}");
+    }
 }
 
 /// The VIEW_DEFINITION validator: the server's canonical text (MySQL and MariaDB printing)

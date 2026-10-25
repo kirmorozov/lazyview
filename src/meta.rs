@@ -185,16 +185,16 @@ pub fn parse_targets(s: Option<&str>) -> Vec<String> {
 
 impl DefRow {
     /// The statement to plan: `definition` as written, or `CREATE VIEW <name> AS <definition>`
-    /// when a name is given and the definition is a bare SELECT.
+    /// when a name is given and the definition is a bare SELECT. Comments before CREATE belong
+    /// to the statement; a leading UTF-8 byte-order mark does not.
     pub fn effective_definition(&self) -> String {
-        let d = self.definition.trim();
-        let starts_create = d
-            .split_whitespace()
-            .next()
-            .map(|w| w.eq_ignore_ascii_case("CREATE"))
-            .unwrap_or(false);
+        let d = self
+            .definition
+            .trim()
+            .trim_start_matches('\u{feff}')
+            .trim_start();
         match &self.name {
-            Some(n) if !starts_create => {
+            Some(n) if !crate::analyze::is_create_statement(d) => {
                 format!("CREATE VIEW `{}` AS {d}", n.replace('`', "``"))
             }
             _ => d.to_string(),
@@ -449,6 +449,29 @@ mod tests {
         assert_eq!(
             row(Some("x"), "create view x as select 1").effective_definition(),
             "create view x as select 1"
+        );
+        // G2: comments before CREATE (and mysqldump's versioned comments) belong to a CREATE
+        // statement, which stays as written once the engine has recorded its name.
+        for def in [
+            "-- annotated view\nCREATE VIEW g2_cmt AS SELECT id, num FROM c",
+            "/* block note */ CREATE VIEW g2_blk AS SELECT id FROM c",
+            "#hash note\nCREATE VIEW g2_hash AS SELECT num FROM c",
+            "/*!50001 CREATE ALGORITHM=UNDEFINED */ /*!50001 VIEW `v` AS SELECT id FROM c */",
+        ] {
+            assert_eq!(row(Some("v"), def).effective_definition(), def, "{def}");
+        }
+        assert_eq!(
+            row(Some("v"), "-- note\nSELECT 1").effective_definition(),
+            "CREATE VIEW `v` AS -- note\nSELECT 1"
+        );
+        // A leading byte-order mark is dropped.
+        assert_eq!(
+            row(Some("v"), "\u{feff}CREATE VIEW v AS SELECT 1").effective_definition(),
+            "CREATE VIEW v AS SELECT 1"
+        );
+        assert_eq!(
+            row(Some("v"), "\u{feff} SELECT 1").effective_definition(),
+            "CREATE VIEW `v` AS SELECT 1"
         );
     }
 

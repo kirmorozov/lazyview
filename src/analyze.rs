@@ -336,6 +336,15 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
         bail!("the definition is empty: {SINGLE_SELECT}");
     }
     if word(0).map(|t| kw(t, "CREATE")) != Some(true) {
+        // A query reaches here only from a `_lazyview` row without a name (G3).
+        if word(0).is_some_and(|t| {
+            ["SELECT", "WITH", "VALUES", "TABLE"]
+                .iter()
+                .any(|k| kw(t, k))
+                || matches!(t, Token::LParen)
+        }) {
+            bail!("the definition needs a name: set `_lazyview.name`, or write CREATE VIEW name AS SELECT …");
+        }
         bail!("{SINGLE_SELECT}; found `{}` …", tokens[words[0]].token);
     }
     let view_at = (0..words.len())
@@ -493,6 +502,25 @@ const SINGLE_SELECT: &str =
 /// Definitions are tokenized without unescaping: string literals keep their escapes (`'a\'b'`,
 /// `'x\_y'`), so rendered SQL means what was written, and quoted identifiers keep doubled quote
 /// characters (see [`unquote`]).
+/// Whether `def` is a `CREATE …` statement: its first token that is not whitespace or a comment
+/// is CREATE, as [`parse_definition`] reads it (G2: `-- note` / `/* */` / `#` before it).
+pub fn is_create_statement(def: &str) -> bool {
+    match tokenize(def) {
+        Ok(tokens) => tokens
+            .iter()
+            .find(|t| !matches!(t.token, Token::Whitespace(_)))
+            .is_some_and(|t| {
+                matches!(&t.token, Token::Word(w)
+                    if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("CREATE"))
+            }),
+        // Unreadable text: the first word decides (parse_definition reports the error).
+        Err(_) => def
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("CREATE")),
+    }
+}
+
 fn tokenize(sql: &str) -> Result<Vec<TokenWithSpan>> {
     Tokenizer::new(&MySqlDialect {}, sql)
         .with_unescape(false)
@@ -5265,6 +5293,18 @@ mod tests {
             err("INSERT INTO orders VALUES (1)"),
             format!("{one}; found `INSERT` …")
         );
+        // G3: a query without CREATE VIEW comes from a row without a name.
+        for sql in [
+            "SELECT num, COUNT(*) AS n FROM c GROUP BY num",
+            "WITH t AS (SELECT 1 AS a) SELECT a FROM t",
+            "(SELECT 1)",
+        ] {
+            assert_eq!(
+                err(sql),
+                "the definition needs a name: set `_lazyview.name`, or write CREATE VIEW name AS SELECT …",
+                "{sql}"
+            );
+        }
         assert_eq!(
             err("CREATE TABLE t (a int)"),
             format!("{one}; found CREATE without VIEW")

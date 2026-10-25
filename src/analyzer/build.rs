@@ -18,7 +18,7 @@ use super::names::{ident_name, item_name, Name, NameKind};
 use super::normalize;
 use super::scope::Scope;
 use super::source::Text;
-use crate::catalog::{TableInfo, TableRef};
+use crate::catalog::{Column, TableInfo, TableRef};
 
 pub(crate) struct Builder<'a> {
     pub schema: &'a str,
@@ -348,6 +348,8 @@ pub(crate) struct Resolver {
     /// Items joined with `USING (…)`: their coalesced column names.
     using: Vec<Vec<String>>,
     derived: Vec<bool>,
+    /// The tables of the base-table items (column types).
+    tables: Vec<Option<Arc<TableInfo>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -393,6 +395,15 @@ impl Resolver {
                 .iter()
                 .map(|i| matches!(i.source, Source::Derived(_)))
                 .collect(),
+            tables: b.items.iter().map(|i| i.table().cloned()).collect(),
+        }
+    }
+
+    /// The base-table column `e` names, if it names one.
+    pub(crate) fn column(&self, e: &Expr) -> Option<&Column> {
+        match self.resolve(e) {
+            Res::Col(i, c) => self.tables[i].as_ref()?.columns.get(c),
+            _ => None,
         }
     }
 

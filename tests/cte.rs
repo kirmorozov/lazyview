@@ -2493,3 +2493,235 @@ fn cte_bad_definitions_fail_once() {
         run_bad_definitions(&ctx).await
     });
 }
+
+// --- G1: a semi-join or scalar subquery joins its table only over key-exact equalities.
+
+const KEY_EXACT_DDL: &[&str] = &[
+    "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, num INT NOT NULL, name VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, ref INT NULL)",
+    "CREATE TABLE s_str (id INT NOT NULL PRIMARY KEY, code VARCHAR(10) NOT NULL, v INT NULL, UNIQUE KEY u_code (code))",
+    "CREATE TABLE s_spk (code VARCHAR(10) NOT NULL PRIMARY KEY, v INT NULL)",
+    "CREATE TABLE s_bin (id INT NOT NULL PRIMARY KEY, code VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, v INT NULL, UNIQUE KEY u_code (code))",
+    "CREATE TABLE s_int (id INT NOT NULL PRIMARY KEY, code INT NOT NULL, v INT NULL, UNIQUE KEY u_code (code))",
+    "INSERT INTO c VALUES (1,1,'abc',NULL),(2,2,'xyz',5),(3,7,'ABD',7)",
+    "INSERT INTO s_str VALUES (1,'1',10),(2,'01',20),(3,'abc',30),(4,'7',40)",
+    "INSERT INTO s_spk VALUES ('1',10),('01',20),('7',40)",
+    "INSERT INTO s_bin VALUES (1,'abc',1),(2,'ABC',2),(3,'xyz',3)",
+    "INSERT INTO s_int VALUES (1,1,10),(2,7,70)",
+];
+
+/// The final verifier's repro: a string key against a number (`'1'`, `'01'` and `'1.0'` all
+/// equal 1) or under an explicit weaker collation matches several key rows, so an inner join
+/// would repeat the outer row; an INT key is the control.
+fn key_exact_cases() -> Vec<Case> {
+    vec![
+        case(
+            "dup_uq_in_numstr",
+            "incremental",
+            "spj",
+            "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_str s)",
+        ),
+        case(
+            "dup_uq_exists_numstr",
+            "incremental",
+            "spj",
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_str s WHERE s.code = c.num)",
+        ),
+        case(
+            "dup_pk_in_numstr",
+            "incremental",
+            "spj",
+            "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_spk s)",
+        ),
+        case(
+            "dup_uq_in_collate",
+            "incremental",
+            "spj",
+            "SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)",
+        ),
+        case(
+            "ctl_uq_in_int",
+            "incremental",
+            "spj",
+            "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_int s)",
+        ),
+    ]
+}
+
+const KEY_EXACT_STEPS: &[(&str, &[&str])] = &[
+    (
+        "a third numeric spelling",
+        &[
+            "INSERT INTO s_str VALUES (5,'1.0',50)",
+            "INSERT INTO s_spk VALUES ('1.0',50)",
+        ],
+    ),
+    (
+        "key changed by UPDATE",
+        &[
+            "UPDATE s_str SET code = '8' WHERE id = 2",
+            "UPDATE s_bin SET code = 'abd' WHERE id = 2",
+        ],
+    ),
+];
+
+async fn run_key_exact(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
+    let db = ctx.new_db(&format!("cte_keyx_{label}")).await?;
+    let mut c = db.conn().await?;
+    for s in KEY_EXACT_DDL {
+        exec(&mut c, s).await?;
+    }
+    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), key_exact_cases()).await?;
+    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        &format!("{label}: initial build"),
+    )
+    .await?;
+    for (what, stmts) in KEY_EXACT_STEPS {
+        for s in *stmts {
+            exec(&mut c, s).await.with_context(|| what.to_string())?;
+        }
+        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
+    }
+    assert_ready(&mut c, &names(&specs)).await?;
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// G1: semi-joins over string keys compared with numbers or under a weaker COLLATE stay
+/// semi-joins (no repeated outer rows); the INT key still joins.
+#[test]
+fn cte_key_exact_semi_joins_match_their_oracles() {
+    scenario("cte_keyx", |ctx| async move {
+        run_key_exact(&ctx, "w0", "0").await?;
+        run_key_exact(&ctx, "w50", "50").await?;
+        Ok(())
+    });
+}
+
+// --- G2 / G3: comments before CREATE VIEW, a byte-order mark, a bare SELECT without a name.
+
+/// (the name the engine records, a definition inserted without a name).
+const COMMENTED_DEFINITIONS: &[(&str, &str)] = &[
+    (
+        "g2_cmt",
+        "-- annotated view\nCREATE VIEW g2_cmt AS SELECT id, num FROM g2_c",
+    ),
+    (
+        "g2_blk",
+        "/* block note */ CREATE VIEW g2_blk AS SELECT id FROM g2_c",
+    ),
+    (
+        "g2_hash",
+        "#hash note\nCREATE VIEW g2_hash AS SELECT num FROM g2_c",
+    ),
+    ("g2_ctl", "CREATE VIEW g2_ctl AS SELECT id FROM g2_c"),
+    (
+        "g2_bom",
+        "\u{feff}CREATE VIEW g2_bom AS SELECT id, num FROM g2_c WHERE num > 1",
+    ),
+];
+
+/// Every state row of definition `id` is `ready` under `name`.
+async fn def_ready_as(c: &mut mysql_async::Conn, id: u64, name: &str) -> Result<bool> {
+    let rows: Vec<StateRow> = view_states(c)
+        .await?
+        .into_iter()
+        .filter(|s| s.definition_id == Some(id))
+        .collect();
+    Ok(!rows.is_empty() && rows.iter().all(|s| s.state == "ready" && s.name == name))
+}
+
+async fn run_commented_definitions(ctx: &Ctx) -> Result<()> {
+    let db = ctx.new_db("cte_g2").await?;
+    let mut c = db.conn().await?;
+    exec(
+        &mut c,
+        "CREATE TABLE g2_c (id INT NOT NULL PRIMARY KEY, num INT NOT NULL)",
+    )
+    .await?;
+    exec(&mut c, "INSERT INTO g2_c VALUES (1, 1), (2, 2), (3, 7)").await?;
+    let ok = vec![case("g2_ok", "incremental", "spj", "SELECT id FROM g2_c")];
+    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), ok).await?;
+    let mut eng = start_checked(ctx, &db, &specs, &expect, "0").await?;
+    let mut ids = Vec::new();
+    for (_, def) in COMMENTED_DEFINITIONS {
+        exec(
+            &mut c,
+            &format!("INSERT INTO _lazyview (definition) VALUES ({})", q(def)),
+        )
+        .await?;
+        ids.push(scalar_i64(&mut c, "SELECT LAST_INSERT_ID()").await? as u64);
+    }
+    // G3: a bare SELECT without a name.
+    exec(
+        &mut c,
+        "INSERT INTO _lazyview (definition) VALUES ('SELECT num, COUNT(*) AS n FROM g2_c GROUP BY num')",
+    )
+    .await?;
+    let bare = scalar_i64(&mut c, "SELECT LAST_INSERT_ID()").await? as u64;
+    for ((name, _), id) in COMMENTED_DEFINITIONS.iter().zip(&ids) {
+        wait_def_state(&mut c, &mut eng, *id, "ready", t_ready()).await?;
+        let recorded = scalar(
+            &mut c,
+            &format!("SELECT name FROM _lazyview WHERE id = {id}"),
+        )
+        .await?;
+        anyhow::ensure!(
+            recorded.as_deref() == Some(*name),
+            "{name}: _lazyview.name is {recorded:?}"
+        );
+    }
+    let st = wait_def_state(&mut c, &mut eng, bare, "error", t_ready()).await?;
+    let msg = st.last_error.unwrap_or_default();
+    anyhow::ensure!(
+        msg.contains("the definition needs a name: set `_lazyview.name`, or write CREATE VIEW name AS SELECT"),
+        "bare SELECT without a name: {msg}"
+    );
+    // A restart plans the definitions again, now with their recorded names.
+    eng.stop().await?;
+    let mut eng = ctx.start_engine(
+        &db,
+        &[
+            ("LAZYVIEW_BATCH_WINDOW_MS", "0"),
+            ("LAZYVIEW_FULL_REFRESH_MS", "0"),
+        ],
+    )?;
+    exec(
+        &mut c,
+        "INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW g2_after AS SELECT num FROM g2_c')",
+    )
+    .await?;
+    let after = scalar_i64(&mut c, "SELECT LAST_INSERT_ID()").await? as u64;
+    wait_def_state(&mut c, &mut eng, after, "ready", t_ready()).await?;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < until {
+        for ((name, _), id) in COMMENTED_DEFINITIONS.iter().zip(&ids) {
+            if !def_ready_as(&mut c, *id, name).await? {
+                let rows: Vec<StateRow> = view_states(&mut c)
+                    .await?
+                    .into_iter()
+                    .filter(|s| s.definition_id == Some(*id))
+                    .collect();
+                bail!("{name} after the restart: {rows:?}");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// G2 / G3: definitions with a comment (or a byte-order mark) before CREATE VIEW stay ready
+/// under their names across a restart; a bare SELECT without a name says it needs one.
+#[test]
+fn cte_commented_definitions_survive_restart() {
+    scenario("cte_g2", |ctx| async move {
+        run_commented_definitions(&ctx).await
+    });
+}
