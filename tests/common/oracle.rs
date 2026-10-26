@@ -115,14 +115,15 @@ pub struct Table {
 }
 
 pub async fn fetch(conn: &mut Conn, sql: &str) -> Result<Table> {
+    let rs = super::renamed_sql(conn, sql)?;
     let mut res = conn
-        .query_iter(sql)
+        .query_iter(rs.sql.as_str())
         .await
-        .with_context(|| format!("SQL failed: {sql}"))?;
+        .with_context(|| format!("SQL failed: {}", rs.shown(sql)))?;
     let columns: Vec<String> = res
         .columns_ref()
         .iter()
-        .map(|c| c.name_str().to_string())
+        .map(|c| rs.column(c.name_str().to_string()))
         .collect();
     let raw: Vec<Row> = res.collect().await?;
     drop(res);
@@ -133,7 +134,7 @@ pub async fn fetch(conn: &mut Conn, sql: &str) -> Result<Table> {
                 .into_iter()
                 .map(|v| match v {
                     Value::NULL => None,
-                    Value::Bytes(b) => Some(b),
+                    Value::Bytes(b) => Some(rs.cell_bytes(b)),
                     other => Some(other.as_sql(true).into_bytes()),
                 })
                 .collect()

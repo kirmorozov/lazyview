@@ -9,7 +9,6 @@ use anyhow::{bail, ensure, Context, Result};
 use common::*;
 use lazyview::accumulate::UnitChunk;
 use lazyview::mv::{Layout, MvCol};
-use mysql_async::prelude::Queryable;
 use mysql_async::Value;
 
 /// Tiny schema used by most reproductions.
@@ -861,7 +860,7 @@ fn reg_failed_full_rebuild_backs_off() {
         // Every build of this definition fails from now on: its probe view name is taken.
         let probe = format!(
             "_lv_probe_{}",
-            lazyview::analyze::definition_hash(&spec.definition)
+            lazyview::analyze::definition_hash(&rename_for(&db, &spec.definition)?)
         );
         exec(&mut c, &format!("CREATE TABLE `{probe}` (x INT)")).await?;
         let mut sc = db.conn().await?;
@@ -1843,13 +1842,14 @@ async fn probe(
     table: &str,
     units: usize,
 ) -> Result<Layout> {
-    let rows: Vec<(String, String, String, String)> = c
-        .exec(
-            "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(IS_NULLABLE AS CHAR) \
+    // (As the server names them: `mv::apply` writes with these names.)
+    let rows: Vec<(String, String, String, String)> = typed_exec_as_sent(
+        c,
+        "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(IS_NULLABLE AS CHAR) \
              FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-            (schema, table),
-        )
-        .await?;
+        (schema, table),
+    )
+    .await?;
     let cols: Vec<MvCol> = rows
         .into_iter()
         .map(|(name, column_type, data_type, nullable)| MvCol {
@@ -1890,7 +1890,7 @@ async fn rows(
         None => ("TRUE".into(), Vec::new()),
     };
     let sql = select.replace("{F}", &f);
-    let rows: Vec<mysql_async::Row> = c.exec(sql, p).await?;
+    let rows: Vec<mysql_async::Row> = typed_exec(c, sql, p).await?;
     Ok(rows
         .into_iter()
         .map(|r| layout.normalize_source(r.unwrap()))
@@ -1905,13 +1905,15 @@ async fn check(
     on: &str,
     what: &str,
 ) -> Result<()> {
-    let (a, b, both): (i64, i64, i64) = c
-        .query_first(format!(
+    let (a, b, both): (i64, i64, i64) = typed_first(
+        c,
+        format!(
             "SELECT (SELECT COUNT(*) FROM {mv}), (SELECT COUNT(*) FROM ({oracle}) o), \
              (SELECT COUNT(*) FROM {mv} m JOIN ({oracle}) o ON {on} AND o.n = m.n)"
-        ))
-        .await?
-        .context("counts")?;
+        ),
+    )
+    .await?
+    .context("counts")?;
     ensure!(
         a == b && b == both,
         "{what}: {mv} has {a} rows, the oracle {b}, {both} agree"
@@ -1970,7 +1972,17 @@ fn reg_json_unit_filters_match_json_equal_groups() {
         let key = |mysql: &str, mariadb: &str| j(if maria { mariadb } else { mysql });
         // Initial fill of the single-column view (the whole view).
         let r = rows(&mut c, &l_j, sel_j, &["doc"], None).await?;
-        mv::apply(&mut c, &db.name, "mv_j", &l_j, None, &r, &w, &metrics).await?;
+        mv::apply(
+            &mut c,
+            &db.name,
+            &name_for(&db, "mv_j"),
+            &l_j,
+            None,
+            &r,
+            &w,
+            &metrics,
+        )
+        .await?;
         check(&mut c, "mv_j", orc_j, on_j, "initial fill").await?;
         // Row 3 moves to the {"a": 1} group (a new text group on MariaDB).
         exec(&mut c, r#"UPDATE jt SET doc = '{"a": 1.00}' WHERE id = 3"#).await?;
@@ -1987,7 +1999,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
         mv::apply(
             &mut c,
             &db.name,
-            "mv_j",
+            &name_for(&db, "mv_j"),
             &l_j,
             Some(&chunk),
             &r,
@@ -2023,7 +2035,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
         mv::apply(
             &mut c,
             &db.name,
-            "mv_j",
+            &name_for(&db, "mv_j"),
             &l_j,
             Some(&chunk),
             &r,
@@ -2034,7 +2046,17 @@ fn reg_json_unit_filters_match_json_equal_groups() {
         check(&mut c, "mv_j", orc_j, on_j, "delete of a JSON group").await?;
         // Composite units with NULLs: plain tuples and the null-safe branch bind per position.
         let r = rows(&mut c, &l_gj, sel_gj, &["g", "doc"], None).await?;
-        mv::apply(&mut c, &db.name, "mv_gj", &l_gj, None, &r, &w, &metrics).await?;
+        mv::apply(
+            &mut c,
+            &db.name,
+            &name_for(&db, "mv_gj"),
+            &l_gj,
+            None,
+            &r,
+            &w,
+            &metrics,
+        )
+        .await?;
         check(&mut c, "mv_gj", orc_gj, on_gj, "initial fill (composite)").await?;
         run(
             &mut c,
@@ -2060,7 +2082,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
         mv::apply(
             &mut c,
             &db.name,
-            "mv_gj",
+            &name_for(&db, "mv_gj"),
             &l_gj,
             Some(&chunk),
             &r,
@@ -2080,7 +2102,6 @@ fn reg_json_unit_filters_match_json_equal_groups() {
 #[test]
 fn reg_json_group_key_view() {
     scenario("reg_json_view", |ctx| async move {
-        use mysql_async::prelude::Queryable;
         let specs = vec![ViewSpec::new(
             "r_docs",
             Kind::Full,
@@ -2098,9 +2119,11 @@ fn reg_json_group_key_view() {
         )
         .await?;
         let mut c = db.conn().await?;
-        let mode: Option<String> = c
-            .query_first("SELECT `mode` FROM _lazyview_state WHERE name = 'r_docs'")
-            .await?;
+        let mode: Option<String> = typed_first(
+            &mut c,
+            "SELECT `mode` FROM _lazyview_state WHERE name = 'r_docs'",
+        )
+        .await?;
         let incremental = mode.as_deref() == Some("incremental");
         for (what, stmt) in [
             (
@@ -2159,7 +2182,17 @@ fn reg_json_unit_delete_with_epoch_timestamps() {
         let metrics = Metrics::default();
         let w = mv::write_opts(&mut c, 1000, mv::DEFAULT_WRITE_BATCH_BYTES).await?;
         let r = rows(&mut c, &l, sel, &["doc"], None).await?;
-        mv::apply(&mut c, &db.name, "mv_jt", &l, None, &r, &w, &metrics).await?;
+        mv::apply(
+            &mut c,
+            &db.name,
+            &name_for(&db, "mv_jt"),
+            &l,
+            None,
+            &r,
+            &w,
+            &metrics,
+        )
+        .await?;
         check(&mut c, "mv_jt", orc, on, "initial fill").await?;
         // Dirty keys as the binlog decoder renders them on MySQL; the text as stored on MariaDB.
         let key = |mysql: &str, mariadb: &str| {
@@ -2193,7 +2226,7 @@ fn reg_json_unit_delete_with_epoch_timestamps() {
             mv::apply(
                 &mut c,
                 &db.name,
-                "mv_jt",
+                &name_for(&db, "mv_jt"),
                 &l,
                 Some(&chunk),
                 &r,
@@ -2246,9 +2279,11 @@ fn reg_json_decimal_values_converge() {
         add_views(&mut c, &specs).await?;
         let mut eng = ctx.start_engine(&db, &[])?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-        let mode: Option<String> = c
-            .query_first("SELECT `mode` FROM _lazyview_state WHERE name = 'r_json_dec'")
-            .await?;
+        let mode: Option<String> = typed_first(
+            &mut c,
+            "SELECT `mode` FROM _lazyview_state WHERE name = 'r_json_dec'",
+        )
+        .await?;
         ensure!(
             mode.as_deref() == Some("incremental"),
             "r_json_dec is not incremental: {mode:?}"
@@ -2292,13 +2327,13 @@ fn reg_json_decimal_values_converge() {
                 exec(&mut c, stmt).await?;
             }
             eng.wait_caught_up(&mut sc, t_catchup()).await?;
-            let expected: Rows = c.query(expected_sql.as_str()).await?;
-            let actual: Rows = c.query(mv_sql).await?;
+            let expected: Rows = typed_rows(&mut c, expected_sql.as_str()).await?;
+            let actual: Rows = typed_rows(&mut c, mv_sql).await?;
             ensure!(
                 actual == expected,
                 "{what}: r_json_dec\n  {actual:?}\nis not the view's rows as stored\n  {expected:?}"
             );
-            let computed: Rows = c.query(computed_sql.as_str()).await?;
+            let computed: Rows = typed_rows(&mut c, computed_sql.as_str()).await?;
             ensure!(
                 maria || computed != expected,
                 "{what}: the view's JSON text is stored unchanged ({computed:?}): the server keeps \
@@ -2322,7 +2357,7 @@ fn reg_json_decimal_values_converge() {
                     expected.len(),
                     fmt_snapshot(&d)
                 );
-                let actual: Rows = c.query(mv_sql).await?;
+                let actual: Rows = typed_rows(&mut c, mv_sql).await?;
                 ensure!(
                     actual == expected,
                     "{what}, refresh {touches}: r_json_dec changed\n  {actual:?}\n  {expected:?}"
@@ -2359,7 +2394,7 @@ fn reg_first_build_swap_does_not_stall_other_views() {
         // A reader transaction on r_locked: the swap's RENAME waits for its metadata lock.
         let mut reader = db.conn().await?;
         exec(&mut reader, "START TRANSACTION").await?;
-        let _: Option<i64> = reader.query_first("SELECT COUNT(*) FROM r_locked").await?;
+        let _: Option<i64> = typed_first(&mut reader, "SELECT COUNT(*) FROM r_locked").await?;
         let mut c = db.conn().await?;
         let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_START_MODE", "rebuild")])?;
         let r = async {
@@ -2383,9 +2418,11 @@ fn reg_first_build_swap_does_not_stall_other_views() {
                 )
                 .await?;
                 loop {
-                    let n: Option<i64> = c
-                        .query_first(format!("SELECT COUNT(*) FROM r_names WHERE id = {id}"))
-                        .await?;
+                    let n: Option<i64> = typed_first(
+                        &mut c,
+                        format!("SELECT COUNT(*) FROM r_names WHERE id = {id}"),
+                    )
+                    .await?;
                     if n == Some(1) {
                         break;
                     }
@@ -2399,9 +2436,11 @@ fn reg_first_build_swap_does_not_stall_other_views() {
                 }
                 tokio::time::sleep(Duration::from_millis(700)).await;
             }
-            let state: Option<String> = c
-                .query_first("SELECT state FROM _lazyview_state WHERE name = 'r_locked'")
-                .await?;
+            let state: Option<String> = typed_first(
+                &mut c,
+                "SELECT state FROM _lazyview_state WHERE name = 'r_locked'",
+            )
+            .await?;
             ensure!(
                 state.as_deref() == Some("building"),
                 "r_locked went live although its table is locked: {state:?}"
@@ -2422,13 +2461,13 @@ async fn state_detail(
     c: &mut mysql_async::Conn,
     name: &str,
 ) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
-    Ok(c
-        .exec_first(
-            "SELECT CAST(state AS CHAR), CAST(mode AS CHAR), CAST(detail AS CHAR), CAST(last_error AS CHAR) \
+    typed_exec_first(
+        c,
+        "SELECT CAST(state AS CHAR), CAST(mode AS CHAR), CAST(detail AS CHAR), CAST(last_error AS CHAR) \
              FROM _lazyview_state WHERE name = ? AND target = 'source'",
-            (name,),
-        )
-        .await?)
+        (name,),
+    )
+    .await
 }
 
 /// A view reading a view in `error` said `waiting for upstream view ... to be built` forever,
@@ -2465,10 +2504,12 @@ fn reg_dependent_of_view_in_error_shows_its_error() {
                 == Some(format!("upstream view `lz_dep` is in error: {dep_err}").as_str()),
             "lz_dep2: {dep2:?}"
         );
-        let listed: i64 = c
-            .query_first("SELECT COUNT(*) FROM _lazyview_overview WHERE state = 'error'")
-            .await?
-            .unwrap_or(0);
+        let listed: i64 = typed_first(
+            &mut c,
+            "SELECT COUNT(*) FROM _lazyview_overview WHERE state = 'error'",
+        )
+        .await?
+        .unwrap_or(0);
         ensure!(
             listed == 3,
             "the troubleshooting query lists {listed} of the 3 views in error"
@@ -2541,9 +2582,11 @@ fn reg_deleted_state_row_is_written_back() {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let managed: Option<i64> = c
-            .query_first("SELECT managed FROM _lazyview_state WHERE name = 'r_state'")
-            .await?;
+        let managed: Option<i64> = typed_first(
+            &mut c,
+            "SELECT managed FROM _lazyview_state WHERE name = 'r_state'",
+        )
+        .await?;
         ensure!(
             managed == Some(1),
             "r_state's table is no longer recorded as lazyview's"
@@ -2612,7 +2655,7 @@ fn reg_failed_build_keeps_planned_mode() {
 
 /// `_lazyview.rebuild` of view `name` (0 once lazyview has done the requested rebuild).
 async fn rebuild_flag(c: &mut mysql_async::Conn, name: &str) -> Result<i64> {
-    c.exec_first("SELECT rebuild FROM _lazyview WHERE name = ?", (name,))
+    typed_exec_first(c, "SELECT rebuild FROM _lazyview WHERE name = ?", (name,))
         .await?
         .context("no _lazyview row")
 }
@@ -2668,12 +2711,12 @@ fn reg_rebuild_flag_rebuilds_one_view() {
                 let running = eng;
                 running.stop().await?;
                 exec(&mut c, ask).await?;
-                let u = c.query_first(updated_sql).await?;
+                let u = typed_first(&mut c, updated_sql).await?;
                 eng = ctx.start_engine(&db, &[])?;
                 u
             } else {
                 exec(&mut c, ask).await?;
-                c.query_first(updated_sql).await?
+                typed_first(&mut c, updated_sql).await?
             };
             let before = eng.snapshot();
             wait_rebuilt(&mut c, &mut eng, "r_counts").await?;
@@ -2693,11 +2736,11 @@ fn reg_rebuild_flag_rebuilds_one_view() {
                 "{what}: expected one rebuild (r_counts only): {}",
                 fmt_snapshot(&d)
             );
-            let after: Option<String> = c
-                .query_first(
-                    "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE name = 'r_counts'",
-                )
-                .await?;
+            let after: Option<String> = typed_first(
+                &mut c,
+                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE name = 'r_counts'",
+            )
+            .await?;
             ensure!(
                 after == updated,
                 "{what}: clearing the flag moved updated_at ({updated:?} -> {after:?})"
@@ -2776,8 +2819,7 @@ fn reg_case_only_name_clash() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_case_clash", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
-        let first: u64 = c
-            .query_first("SELECT id FROM _lazyview WHERE name = 'Lz_Case'")
+        let first: u64 = typed_first(&mut c, "SELECT id FROM _lazyview WHERE name = 'Lz_Case'")
             .await?
             .context("no Lz_Case row")?;
         exec(
@@ -2785,8 +2827,7 @@ fn reg_case_only_name_clash() {
             "INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW lz_case AS SELECT id, customer_id FROM orders')",
         )
         .await?;
-        let second: u64 = c
-            .query_first("SELECT LAST_INSERT_ID()")
+        let second: u64 = typed_first(&mut c, "SELECT LAST_INSERT_ID()")
             .await?
             .context("no id")?;
         let row = wait_state(&mut c, &mut eng, "lz_case", "error", t_ready()).await?;
@@ -2799,8 +2840,7 @@ fn reg_case_only_name_clash() {
             row.last_error.as_deref() == Some(expected.as_str()),
             "lz_case: {row:?}"
         );
-        let shown: Vec<(u64, String, Option<String>)> = c
-            .query("SELECT id, CAST(name AS CHAR), CAST(state AS CHAR) FROM _lazyview_overview ORDER BY id")
+        let shown: Vec<(u64, String, Option<String>)> = typed_rows(&mut c, "SELECT id, CAST(name AS CHAR), CAST(state AS CHAR) FROM _lazyview_overview ORDER BY id")
             .await?;
         ensure!(
             shown
@@ -2827,9 +2867,11 @@ fn reg_case_only_name_clash() {
         .await?;
         let t = std::time::Instant::now();
         loop {
-            let n: Option<i64> = c
-                .query_first("SELECT COUNT(*) FROM _lazyview_state WHERE name = 'lz_case'")
-                .await?;
+            let n: Option<i64> = typed_first(
+                &mut c,
+                "SELECT COUNT(*) FROM _lazyview_state WHERE name = 'lz_case'",
+            )
+            .await?;
             if n == Some(0) {
                 break;
             }
@@ -2890,7 +2932,7 @@ fn reg_view_named_like_its_source_table() {
             "a view over orders next to them",
         )
         .await?;
-        let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM orders").await?;
+        let n: Option<i64> = typed_first(&mut c, "SELECT COUNT(*) FROM orders").await?;
         ensure!(
             n == Some(4),
             "the source table orders was touched: {n:?} rows"
@@ -2935,9 +2977,8 @@ fn reg_slow_planning_is_bounded() {
         let t1 = Instant::now();
         exec(&mut c, "UPDATE orders SET status = 'held' WHERE id = 11").await?;
         loop {
-            let s: Option<String> = c
-                .query_first("SELECT status FROM r_fast WHERE id = 11")
-                .await?;
+            let s: Option<String> =
+                typed_first(&mut c, "SELECT status FROM r_fast WHERE id = 11").await?;
             if s.as_deref() == Some("held") {
                 break;
             }
@@ -3017,12 +3058,14 @@ fn reg_not_in_prepared_statement_canary() {
                 &format!("UPDATE p SET amount = {amount} WHERE id = 200"),
             )
             .await?;
-            let got: Vec<i64> = exec_source(&mut fresh, sql.into(), Vec::new(), true).await?;
+            let got: Vec<i64> =
+                exec_source(&mut fresh, rename_for(&db, sql)?, Vec::new(), true).await?;
             ensure!(
                 got == expected,
                 "amount {amount}: a freshly prepared read gave {got:?}, expected {expected:?}"
             );
-            let got: Vec<i64> = exec_source(&mut cached, sql.into(), Vec::new(), false).await?;
+            let got: Vec<i64> =
+                exec_source(&mut cached, rename_for(&db, sql)?, Vec::new(), false).await?;
             if got != expected {
                 stale.push(format!("amount {amount}: {got:?} instead of {expected:?}"));
             }
@@ -3070,7 +3113,6 @@ fn reg_not_in_prepared_statement_canary() {
 #[test]
 fn reg_null_unit_on_nullable_unique_index() {
     scenario("reg_null_uq", |ctx| async move {
-        use mysql_async::prelude::Queryable;
         let specs = vec![
             ViewSpec::new(
                 "r_nopk",
@@ -3099,12 +3141,18 @@ fn reg_null_unit_on_nullable_unique_index() {
         let mut c = db.conn().await?;
         // Server canary.
         let null = (mysql_async::Value::NULL,);
-        let prepared: Option<i64> = c
-            .exec_first("SELECT COUNT(*) FROM s_nopk WHERE (code) <=> ?", null)
-            .await?;
-        let literal: Option<i64> = c
-            .exec_first("SELECT COUNT(*) FROM s_nopk WHERE (code) IS NULL", ())
-            .await?;
+        let prepared: Option<i64> = typed_exec_first(
+            &mut c,
+            "SELECT COUNT(*) FROM s_nopk WHERE (code) <=> ?",
+            null,
+        )
+        .await?;
+        let literal: Option<i64> = typed_exec_first(
+            &mut c,
+            "SELECT COUNT(*) FROM s_nopk WHERE (code) IS NULL",
+            (),
+        )
+        .await?;
         ensure!(
             literal == Some(2),
             "prepared `IS NULL` found {literal:?} of the 2 NULL rows"
@@ -3121,9 +3169,11 @@ fn reg_null_unit_on_nullable_unique_index() {
                  (MySQL-family bug present)"
             )
         });
-        let mode: Option<String> = c
-            .query_first("SELECT `mode` FROM _lazyview_state WHERE name = 'r_nopk'")
-            .await?;
+        let mode: Option<String> = typed_first(
+            &mut c,
+            "SELECT `mode` FROM _lazyview_state WHERE name = 'r_nopk'",
+        )
+        .await?;
         ensure!(
             mode.as_deref() == Some("incremental"),
             "r_nopk is not maintained incrementally: {mode:?}"
@@ -3308,11 +3358,12 @@ fn reg_index_ddl_on_view_table_does_not_rebuild() {
 
 /// `updated_at` of a view's state row (as text, comparable).
 async fn state_updated_at(c: &mut mysql_async::Conn, name: &str) -> Result<Option<String>> {
-    Ok(c.exec_first(
+    typed_exec_first(
+        c,
         "SELECT CAST(updated_at AS CHAR) FROM _lazyview_state WHERE name = ?",
         (name,),
     )
-    .await?)
+    .await
 }
 
 /// `error` rows across a restart: a definition deleted while lazyview was stopped left its row
@@ -3376,9 +3427,11 @@ fn reg_error_rows_are_rechecked_at_startup() {
             still_after > still_before,
             "r_still was not checked again at startup: updated_at {still_before:?} -> {still_after:?}"
         );
-        let gone: Option<i64> = c
-            .query_first("SELECT COUNT(*) FROM _lazyview_state WHERE name = 'r_gone'")
-            .await?;
+        let gone: Option<i64> = typed_first(
+            &mut c,
+            "SELECT COUNT(*) FROM _lazyview_state WHERE name = 'r_gone'",
+        )
+        .await?;
         ensure!(
             gone == Some(0),
             "the state row of a definition deleted while stopped stayed"
@@ -3401,7 +3454,8 @@ fn reg_unparseable_definition_keeps_its_table() {
         )];
         let (db, eng) = setup(&ctx, "reg_bad_parse", ENTITIES, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        let good: Vec<(i64, i64)> = c.query("SELECT grp, n FROM r_keep ORDER BY grp").await?;
+        let good: Vec<(i64, i64)> =
+            typed_rows(&mut c, "SELECT grp, n FROM r_keep ORDER BY grp").await?;
         exec(
             &mut c,
             "UPDATE _lazyview SET definition = 'CREATE VIEW r_keep AS SELEC grp FROM entities' WHERE name = 'r_keep'",
@@ -3426,7 +3480,8 @@ fn reg_unparseable_definition_keeps_its_table() {
                 table_exists(&mut c, "r_keep").await?,
                 "{when}: the last good table of r_keep was dropped"
             );
-            let now: Vec<(i64, i64)> = c.query("SELECT grp, n FROM r_keep ORDER BY grp").await?;
+            let now: Vec<(i64, i64)> =
+                typed_rows(&mut c, "SELECT grp, n FROM r_keep ORDER BY grp").await?;
             ensure!(now == good, "{when}: r_keep changed: {now:?} vs {good:?}");
         }
         exec(
@@ -3481,7 +3536,6 @@ fn reg_global_sql_mode_parser_flags() {
 }
 
 async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
-    use mysql_async::prelude::Queryable;
     // This connection inherits the global mode: the test's own SQL uses single quotes.
     let mut c = db.conn().await?;
     let mode = scalar(&mut c, "SELECT CAST(@@SESSION.sql_mode AS CHAR)")
@@ -3509,20 +3563,23 @@ async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
     add_views(&mut c, &specs).await?;
     let mut eng = ctx.start_engine(db, &[])?;
     wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-    let mode: Option<String> = c
-        .query_first("SELECT `mode` FROM _lazyview_state WHERE name = 'r_paid'")
-        .await?;
+    let mode: Option<String> = typed_first(
+        &mut c,
+        "SELECT `mode` FROM _lazyview_state WHERE name = 'r_paid'",
+    )
+    .await?;
     ensure!(
         mode.as_deref() == Some("incremental"),
         "r_paid is not incremental: {mode:?}"
     );
     async fn same(c: &mut mysql_async::Conn, what: &str) -> Result<()> {
-        let mv: Vec<(i64, i64)> = c
-            .query("SELECT customer_id, n FROM r_paid ORDER BY 1")
-            .await?;
-        let src: Vec<(i64, i64)> = c
-            .query("SELECT customer_id, COUNT(*) FROM orders WHERE status = 'paid' GROUP BY customer_id ORDER BY 1")
-            .await?;
+        let mv: Vec<(i64, i64)> =
+            typed_rows(c, "SELECT customer_id, n FROM r_paid ORDER BY 1").await?;
+        let src: Vec<(i64, i64)> = typed_rows(
+            c,
+            "SELECT customer_id, COUNT(*) FROM orders WHERE status = 'paid' GROUP BY customer_id ORDER BY 1",
+        )
+        .await?;
         ensure!(mv == src, "{what}: r_paid {mv:?} != source {src:?}");
         Ok(())
     }
@@ -3974,12 +4031,12 @@ fn reg_partial_units() {
         let (db, mut eng) = setup(&ctx, "reg_partial", &ddl, &specs, &[]).await?;
         let mut sc = db.conn().await?;
         for s in &specs {
-            let mode: Option<String> = sc
-                .exec_first(
-                    "SELECT `mode` FROM _lazyview_state WHERE name = ?",
-                    (s.name.as_str(),),
-                )
-                .await?;
+            let mode: Option<String> = typed_exec_first(
+                &mut sc,
+                "SELECT `mode` FROM _lazyview_state WHERE name = ?",
+                (s.name.as_str(),),
+            )
+            .await?;
             ensure!(
                 mode.as_deref() == Some("incremental"),
                 "{} is not maintained incrementally: {mode:?}",

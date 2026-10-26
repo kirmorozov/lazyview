@@ -3251,3 +3251,5 @@ fn not_in_twins_across_join_placements() {
     let w = plan(sql).where_sql.unwrap_or_default();
     assert!(w.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {w}");
 }
+#[path = "tests_rename.rs"]
+mod rename;
