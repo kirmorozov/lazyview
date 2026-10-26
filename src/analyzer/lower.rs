@@ -195,7 +195,7 @@ fn attach_semis(
             };
             // A child of a cascading foreign key changes without binlog rows (C3): its parents'
             // deletes / key updates route to the units their image gives (the subquery is
-            // correlated on the unit through the FK columns) or rebuild the view.
+            // correlated on the unit through the FK columns); otherwise the view is Full.
             if !t.info.cascades.is_empty() {
                 let child = (t.info.schema.clone(), t.info.name.clone());
                 for mut r in analyze::cascade_routes(&[(t.info.clone(), direct.clone())], tables) {
@@ -209,12 +209,12 @@ fn attach_semis(
                         r.unit_from_parent = None;
                     }
                     if r.unit_from_parent.is_none() {
-                        r.untraced = Some(format!(
+                        return Err(Refused::Reason(format!(
                             "{} over `{}`: the units a cascade from `{}` changes are not known",
                             semi_kind(s),
                             t.info.name,
                             r.parent.name
-                        ));
+                        )));
                     }
                     plan.cascades.push(r);
                 }

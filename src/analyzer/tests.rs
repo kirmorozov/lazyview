@@ -841,6 +841,221 @@ fn semi_joins_need_key_exact_equalities() {
     }
 }
 
+/// G1 / G4 (guard R4): the key-exact rule in other formulations: swapped sides and a one-element
+/// row, composite keys with one non-exact part, integer widths and signedness, the subquery
+/// reached through a CTE or derived table with renamed columns, scalar subqueries in the SELECT
+/// list and in WHERE, and outer columns one and two joins away.
+#[test]
+fn key_exact_formulations() {
+    let mut cat = catalog();
+    let int = |n: &str, ty: &str| {
+        let mut c = Column::new(n, ty, ty, None, None, None, false);
+        c.nullable = false;
+        c
+    };
+    let text = |n: &str| {
+        let mut c = Column::new(
+            n,
+            "varchar",
+            "varchar(10)",
+            Some("utf8mb4"),
+            Some("utf8mb4_general_ci"),
+            Some(40),
+            false,
+        );
+        c.nullable = false;
+        c
+    };
+    for (name, cols, pk, unique) in [
+        (
+            "c",
+            vec![int("id", "int"), int("num", "int"), text("name")],
+            vec![0],
+            vec![],
+        ),
+        (
+            "d",
+            vec![
+                int("id", "int"),
+                int("c_id", "int"),
+                int("num", "int"),
+                text("code"),
+            ],
+            vec![0],
+            vec![],
+        ),
+        (
+            "e",
+            vec![int("id", "int"), int("d_id", "int"), int("num", "int")],
+            vec![0],
+            vec![],
+        ),
+        (
+            "s_str",
+            vec![int("id", "int"), text("code"), int("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_int",
+            vec![int("id", "int"), int("code", "int"), int("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_big",
+            vec![int("id", "int"), int("code", "bigint"), int("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_uns",
+            vec![
+                int("id", "int"),
+                Column::new("code", "int", "int unsigned", None, None, None, false),
+                int("v", "int"),
+            ],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_comp",
+            vec![
+                int("id", "int"),
+                int("a", "int"),
+                text("b"),
+                int("v", "int"),
+            ],
+            vec![0],
+            vec![vec![1, 2]],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        let mut t = (*t).clone();
+        for c in &mut t.columns {
+            c.nullable = false;
+        }
+        t.unique_keys = unique;
+        cat.insert(k, Arc::new(t));
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    // (definition, subquery table, joined)
+    for (sql, table, joined) in [
+        // (a) swapped sides, a one-element row.
+        ("SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_str s WHERE c.num = s.code)", "s_str", false),
+        ("SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_int s WHERE c.num = s.code)", "s_int", true),
+        ("SELECT c.id FROM c WHERE (c.num) IN (SELECT s.code FROM s_str s)", "s_str", false),
+        ("SELECT c.id FROM c WHERE (c.num) IN (SELECT (s.code) FROM s_int s)", "s_int", true),
+        // (b) a composite key: every part must be exact.
+        ("SELECT c.id FROM c WHERE (c.num, c.num) IN (SELECT s.a, s.b FROM s_comp s)", "s_comp", false),
+        (
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_comp s WHERE s.a = c.num AND s.b = c.num)",
+            "s_comp",
+            false,
+        ),
+        ("SELECT c.id FROM c WHERE (c.num, c.name) IN (SELECT s.a, s.b FROM s_comp s)", "s_comp", true),
+        (
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_comp s WHERE s.b = c.name AND s.a = c.num)",
+            "s_comp",
+            true,
+        ),
+        // (c) integer widths and signedness compare as integers.
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_big s)", "s_big", true),
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_uns s)", "s_uns", true),
+        // (d) through a CTE / derived table with renamed columns, and inside a CTE.
+        (
+            "WITH t AS (SELECT c.id AS cid, c.num AS n FROM c) SELECT t.cid FROM t WHERE t.n IN (SELECT s.code FROM s_str s)",
+            "s_str",
+            false,
+        ),
+        (
+            "WITH t AS (SELECT c.id AS cid, c.num AS n FROM c) SELECT t.cid FROM t WHERE t.n IN (SELECT s.code FROM s_int s)",
+            "s_int",
+            true,
+        ),
+        (
+            "SELECT x.cid FROM (SELECT c.id AS cid, c.num AS n FROM c) x WHERE EXISTS (SELECT 1 FROM s_str s WHERE s.code = x.n)",
+            "s_str",
+            false,
+        ),
+        (
+            "SELECT x.cid FROM (SELECT c.id AS cid, c.num AS n FROM c) x WHERE EXISTS (SELECT 1 FROM s_int s WHERE s.code = x.n)",
+            "s_int",
+            true,
+        ),
+        (
+            "WITH t AS (SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_str s)) SELECT id FROM t",
+            "s_str",
+            false,
+        ),
+        (
+            "WITH t AS (SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_int s)) SELECT id FROM t",
+            "s_int",
+            true,
+        ),
+        // (e) outer columns one and two joins away.
+        (
+            "SELECT c.id FROM c JOIN d ON d.c_id = c.id WHERE d.num IN (SELECT s.code FROM s_str s)",
+            "s_str",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c JOIN d ON d.c_id = c.id WHERE d.code IN (SELECT s.code FROM s_str s)",
+            "s_str",
+            true,
+        ),
+        (
+            "SELECT c.id FROM c JOIN d ON d.c_id = c.id JOIN e ON e.d_id = d.id WHERE e.num IN (SELECT s.code FROM s_str s)",
+            "s_str",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c JOIN d ON d.c_id = c.id JOIN e ON e.d_id = d.id WHERE e.num IN (SELECT s.code FROM s_int s)",
+            "s_int",
+            true,
+        ),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.from_sql.contains(table), joined, "{sql}: {}", v.from_sql);
+        assert_eq!(
+            v.aliases.iter().any(|a| a.semi.is_some()),
+            !joined,
+            "{sql}: {}",
+            v.tracing()
+        );
+    }
+    // Scalar subqueries in the SELECT list and in WHERE: a LEFT JOIN only over exact keys.
+    for (sql, joined) in [
+        ("SELECT c.id, (SELECT s.v FROM s_str s WHERE c.num = s.code) AS v FROM c", false),
+        ("SELECT c.id, (SELECT s.v FROM s_int s WHERE c.num = s.code) AS v FROM c", true),
+        ("SELECT c.id FROM c WHERE (SELECT s.v FROM s_str s WHERE s.code = c.num) > 1", false),
+        ("SELECT c.id FROM c WHERE (SELECT s.v FROM s_int s WHERE s.code = c.num) > 1", true),
+        (
+            "SELECT c.id, (SELECT s.v FROM s_comp s WHERE s.a = c.num AND s.b = c.num) AS v FROM c",
+            false,
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM s_comp s WHERE s.a = c.num AND s.b = c.name) AS v FROM c",
+            true,
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM s_big s WHERE s.code = d.num) AS v FROM c JOIN d ON d.c_id = c.id",
+            true,
+        ),
+    ] {
+        let m = plan(sql).mode;
+        if joined {
+            assert_eq!(m, Mode::Spj, "{sql}");
+        } else {
+            assert!(matches!(&m, Mode::Full(_)), "{sql}: {m:?}");
+        }
+    }
+}
+
 /// G4: TIMESTAMP equality is not injective under a time zone with DST (two instants of the
 /// fall-back hour show one local time), so a TIMESTAMP on either side of a key equality never
 /// turns a semi-join, a scalar subquery or an aggregated CTE into a join; DATE and DATETIME keys
@@ -975,6 +1190,209 @@ fn timestamp_keys_are_not_key_exact() {
         ),
     ] {
         assert_eq!(plan(sql).mode, want, "{sql}");
+    }
+}
+
+/// G5: a JSON value in a composite unit is Full (MySQL compares JSON by representation in a row
+/// IN list of two or more tuples, the engine's filter for several units). Decided on the value's
+/// type, not on how it is written; a single JSON key, text and scalars over JSON, a unit the keys
+/// reduce to columns without JSON, and MariaDB's JSON (LONGTEXT) are not affected. Also through
+/// CTEs and derived tables with renamed columns, joins in every placement, and 1-3 hops.
+#[test]
+fn json_columns_in_composite_units() {
+    let mut cat = catalog();
+    let col = |n: &str, ty: &str| Column::new(n, ty, ty, None, None, None, false);
+    let mut long = Column::new(
+        "doc",
+        "longtext",
+        "longtext",
+        Some("utf8mb4"),
+        Some("utf8mb4_bin"),
+        None,
+        true,
+    );
+    long.nullable = true;
+    for (name, cols, pk) in [
+        (
+            "docs",
+            vec![col("id", "int"), col("doc", "json"), col("grp", "int")],
+            vec![0],
+        ),
+        (
+            "docs_m",
+            vec![col("id", "int"), long, col("grp", "int")],
+            vec![0],
+        ),
+        (
+            "docs_ab",
+            vec![
+                col("a", "int"),
+                col("b", "int"),
+                col("doc", "json"),
+                col("grp", "int"),
+            ],
+            vec![0, 1],
+        ),
+        (
+            "items",
+            vec![
+                col("id", "int"),
+                col("grp", "int"),
+                col("doc_id", "int"),
+                col("link_id", "int"),
+            ],
+            vec![0],
+        ),
+        (
+            "links",
+            vec![col("id", "int"), col("doc_id", "int"), col("mid_id", "int")],
+            vec![0],
+        ),
+        (
+            "mids",
+            vec![col("id", "int"), col("doc_id", "int")],
+            vec![0],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        cat.insert(k, t);
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let full = |sql: &str| {
+        let m = plan(sql).mode;
+        assert!(
+            matches!(&m, Mode::Full(r) if r.starts_with("JSON value `")
+                && r.ends_with("` in a composite group key: MySQL compares JSON by representation in multi-row IN lists")),
+            "{sql}: {m:?}"
+        );
+    };
+    let grouped = |sql: &str| assert_eq!(plan(sql).mode, Mode::Grouped, "{sql}");
+    assert_eq!(
+        plan("SELECT grp, doc, COUNT(*) AS n FROM docs GROUP BY grp, doc").mode,
+        Mode::Full(
+            "JSON value `doc` in a composite group key: MySQL compares JSON by representation in multi-row IN lists"
+                .into()
+        )
+    );
+    // JSON values next to another key: columns, choices among JSON values, JSON computed below
+    // the top (DISTINCT and PARTITION BY units alike).
+    for sql in [
+        "SELECT DISTINCT grp, doc FROM docs",
+        "SELECT id, SUM(grp) OVER (PARTITION BY grp, doc) AS s FROM docs",
+        "SELECT grp, IFNULL(doc, '{}') AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+        "SELECT grp, CASE WHEN grp > 1 THEN doc END AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+        "SELECT grp, IFNULL(JSON_OBJECT('k', id), JSON_OBJECT()) AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+    ] {
+        full(sql);
+    }
+    // JSON computed by CAST or CONVERT (both spellings), alone or next to another key: Full by
+    // the computed-JSON rule.
+    for sql in [
+        "SELECT grp, CAST(JSON_UNQUOTE(doc) AS JSON) AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+        "SELECT grp, CONVERT(JSON_UNQUOTE(doc), JSON) AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+        "SELECT CONVERT(JSON_UNQUOTE(doc), JSON) AS k, COUNT(*) AS n FROM docs GROUP BY k",
+    ] {
+        let m = plan(sql).mode;
+        assert!(
+            matches!(&m, Mode::Full(r) if r.contains("is a JSON value computed by a function")),
+            "{sql}: {m:?}"
+        );
+    }
+    // Text and scalars over JSON next to another key, single JSON keys, MariaDB.
+    for sql in [
+        "SELECT doc, COUNT(*) AS n FROM docs GROUP BY doc",
+        "SELECT DISTINCT doc FROM docs",
+        "SELECT grp, JSON_UNQUOTE(JSON_EXTRACT(doc, '$.a')) AS a, COUNT(*) AS n FROM docs GROUP BY grp, a",
+        "SELECT grp, doc ->> '$.a' AS a, COUNT(*) AS n FROM docs GROUP BY grp, a",
+        "SELECT grp, LOWER(doc ->> '$.a') AS a, COUNT(*) AS n FROM docs GROUP BY grp, a",
+        "SELECT grp, JSON_VALUE(doc, '$.a') AS a, COUNT(*) AS n FROM docs GROUP BY grp, a",
+        "SELECT grp, JSON_LENGTH(doc) AS l, COUNT(*) AS n FROM docs GROUP BY grp, l",
+        "SELECT grp, CAST(doc AS CHAR) AS t, COUNT(*) AS n FROM docs GROUP BY grp, t",
+        "SELECT grp, doc, COUNT(*) AS n FROM docs_m GROUP BY grp, doc",
+    ] {
+        grouped(sql);
+    }
+    // The primary key determines doc: the unit is the key alone (renamed, by position, or not
+    // selected); a composite key stays composite but holds no JSON.
+    for sql in [
+        "SELECT id, doc, COUNT(*) AS n FROM docs GROUP BY id, doc",
+        "SELECT id AS k, doc, COUNT(*) AS n FROM docs GROUP BY k, doc",
+        "SELECT id, doc, COUNT(*) AS n FROM docs GROUP BY 1, 2",
+        "SELECT doc, COUNT(*) AS n FROM docs GROUP BY id, doc",
+        "SELECT a, b, doc, COUNT(*) AS n FROM docs_ab GROUP BY a, b, doc",
+        "SELECT DISTINCT id, doc FROM docs",
+    ] {
+        grouped(sql);
+    }
+    full("SELECT a, doc, COUNT(*) AS n FROM docs_ab GROUP BY a, doc");
+    // Window units are the PARTITION BY list as written (the unit planner does not reduce them by
+    // keys): a JSON column there is Full even next to the key (conservative, sound).
+    for sql in [
+        "SELECT id, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
+        "SELECT a, SUM(grp) OVER (PARTITION BY a, b, doc) AS s FROM docs_ab",
+        "SELECT a, SUM(grp) OVER (PARTITION BY a, doc) AS s FROM docs_ab",
+    ] {
+        full(sql);
+    }
+    // Through a CTE and a derived table with renamed columns.
+    for (sql, json) in [
+        ("WITH x AS (SELECT grp AS g, doc AS j FROM docs) SELECT g, j, COUNT(*) AS n FROM x GROUP BY g, j", true),
+        ("SELECT g, j, COUNT(*) AS n FROM (SELECT grp AS g, doc AS j FROM docs) x GROUP BY g, j", true),
+        ("WITH x AS (SELECT grp AS g, doc AS j FROM docs_m) SELECT g, j, COUNT(*) AS n FROM x GROUP BY g, j", false),
+        ("SELECT g, j, COUNT(*) AS n FROM (SELECT grp AS g, doc AS j FROM docs_m) x GROUP BY g, j", false),
+        ("WITH x AS (SELECT id AS k, doc AS j FROM docs) SELECT k, j, COUNT(*) AS n FROM x GROUP BY k, j", false),
+    ] {
+        if json {
+            full(sql)
+        } else {
+            grouped(sql)
+        }
+    }
+    // A joined table's JSON column: joined on its key (JOIN … ON, comma + WHERE, either order,
+    // LEFT JOIN), one to three hops away; the outer key determines it (Grouped), another column
+    // does not (Full).
+    let hops = [
+        "items i JOIN docs d ON d.id = i.doc_id",
+        "items i JOIN docs d ON i.doc_id = d.id",
+        "items i, docs d WHERE d.id = i.doc_id",
+        "items i, docs d WHERE i.doc_id = d.id",
+        "docs d JOIN items i ON d.id = i.doc_id",
+        "items i LEFT JOIN docs d ON d.id = i.doc_id",
+        "items i JOIN links l ON l.id = i.link_id JOIN docs d ON d.id = l.doc_id",
+        "items i JOIN links l ON l.id = i.link_id JOIN mids m ON m.id = l.mid_id JOIN docs d ON d.id = m.doc_id",
+    ];
+    for from in hops {
+        let (from, cond) = match from.split_once(" WHERE ") {
+            Some((f, w)) => (f.to_string(), format!(" WHERE {w}")),
+            None => (from.to_string(), String::new()),
+        };
+        grouped(&format!(
+            "SELECT i.id, d.doc, COUNT(*) AS n FROM {from}{cond} GROUP BY i.id, d.doc"
+        ));
+        let other =
+            format!("SELECT i.grp, d.doc, COUNT(*) AS n FROM {from}{cond} GROUP BY i.grp, d.doc");
+        if from.contains("LEFT JOIN") {
+            // (The NULL-side group key is refused first.)
+            assert_eq!(
+                plan(&other).mode,
+                Mode::Full("group key on the NULL side of a LEFT JOIN".into())
+            );
+        } else {
+            full(&other);
+        }
+    }
+    // A one-element `IN (y)` is not a key equality for the unit planner: the key does not reduce
+    // the unit, so the JSON column stays in it and the view is Full (conservative, sound).
+    for from in [
+        "items i JOIN docs d ON d.id IN (i.doc_id)",
+        "items i, docs d WHERE d.id IN (i.doc_id)",
+    ] {
+        full(&format!(
+            "SELECT i.id, d.doc, COUNT(*) AS n FROM {from} GROUP BY i.id, d.doc"
+        ));
     }
 }
 
@@ -1796,11 +2214,9 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
     );
 }
 
-/// A semi-join whose table maps to the units neither directly nor through a unique key: an
-/// inner join with the internal view of its distinct keys.
-/// C3: a semi-join over a child of a cascading foreign key stays incremental: the parent's
-/// deletes / key updates give the units where the subquery is correlated on the unit through
-/// the FK columns, else they rebuild the view (cascaded child rows have no binlog rows).
+/// C3: a semi-join over a child of a cascading foreign key stays incremental where the subquery
+/// is correlated on the unit through the FK columns (the parent's deletes / key updates give the
+/// units); otherwise the view is Full (cascaded child rows have no binlog rows).
 #[test]
 fn semi_joins_over_cascading_children() {
     let mut cat = catalog();
@@ -1822,13 +2238,14 @@ fn semi_joins_over_cascading_children() {
     let v = plan("SELECT o.id, o.status FROM orders o WHERE EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.qty > 5)");
     assert_eq!(v.mode, Mode::Spj);
     assert_eq!(v.tracing(), "o:unit,i:unit,^orders:unit");
-    // Not on the unit: the parent's deletes rebuild the view; everything else is incremental.
+    // Not on the unit: the units a parent's delete changes are not known.
     let v = plan("SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT qty FROM order_items WHERE price > 1)");
-    assert_eq!(v.mode, Mode::Spj);
-    assert_eq!(v.tracing(), "o:unit,order_items:lookup,^orders:rebuild");
     assert_eq!(
-        v.cascades[0].untraced.as_deref(),
-        Some("IN subquery over `order_items`: the units a cascade from `orders` changes are not known")
+        v.mode,
+        Mode::Full(
+            "IN subquery over `order_items`: the units a cascade from `orders` changes are not known"
+                .into()
+        )
     );
 }
 
@@ -1998,8 +2415,13 @@ fn semi_joins_over_joined_subqueries() {
     )
     .unwrap();
     let v = analyzer_plan(&d, "db", &cat).unwrap();
-    assert_eq!(v.mode, Mode::Spj);
-    assert_eq!(v.tracing(), "c:unit,o:unit,i:lookup,^orders:rebuild");
+    assert_eq!(
+        v.mode,
+        Mode::Full(
+            "IN subquery over `order_items`: the units a cascade from `orders` changes are not known"
+                .into()
+        )
+    );
 }
 
 /// Window and top-N CTEs are isolated too: the parent filters or joins their table.

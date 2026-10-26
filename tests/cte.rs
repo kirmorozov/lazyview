@@ -1278,17 +1278,19 @@ fn cascade_traced_cases() -> Vec<(Case, &'static str)> {
 /// every descendant): routed to a rebuild, which must keep them equal to the oracle.
 fn cascade_rebuild_cases() -> Vec<(Case, &'static str)> {
     vec![
-        // C3: a semi-join over the cascading child not correlated on the unit: the parent's
-        // deletes / key updates rebuild the view, the rest stays incremental.
+        // C3: a semi-join over the cascading child not correlated on the unit: the units a
+        // parent's delete / key update changes are not known, so the view is Full.
         (
-            case("casc_semi_lookup", "incremental", "spj",
+            case("casc_semi_lookup", "full",
+                 "EXISTS subquery over `c_kids`: the units a cascade from `c_pars` changes are not known",
                  "SELECT o.id FROM c_orders o WHERE EXISTS (SELECT 1 FROM c_kids k WHERE k.qty = o.kid_id - 4)"),
-            "o:unit,k:lookup,^c_pars:rebuild",
+            "rebuild",
         ),
         (
-            case("casc_semi_grouped", "incremental", "grouped",
+            case("casc_semi_grouped", "full",
+                 "EXISTS subquery over `c_kids`: the units a cascade from `c_pars` changes are not known",
                  "SELECT p.active, COUNT(*) AS n FROM c_pars p WHERE EXISTS (SELECT 1 FROM c_kids k WHERE k.par_id = p.id) GROUP BY p.active"),
-            "p:unit,k:lookup,^c_pars:rebuild",
+            "rebuild",
         ),
         (
             case("a1_left", "incremental", "spj",
@@ -2514,6 +2516,13 @@ const KEY_EXACT_DDL: &[&str] = &[
     "INSERT INTO c_t VALUES (1,'2026-01-01 00:00:00','2026-01-01 00:00:00'),(2,'2026-01-02 10:00:00',NULL),(3,'2026-11-01 01:30:00','2026-11-01 01:30:00')",
     "INSERT INTO k_ts VALUES (1,'2026-01-01 00:00:00',1),(2,'2026-11-01 01:30:00',2)",
     "INSERT INTO k_dt VALUES (1,'2026-01-01 00:00:00',1),(2,'2026-01-02 10:00:00',2)",
+    // Other formulations (guard R4): composite keys, integer widths, an outer column one join away.
+    "CREATE TABLE s_comp (id INT NOT NULL PRIMARY KEY, a INT NOT NULL, b VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, v INT NULL, UNIQUE KEY u_ab (a, b))",
+    "CREATE TABLE s_big (id INT NOT NULL PRIMARY KEY, code BIGINT NOT NULL, v INT NULL, UNIQUE KEY u_code (code))",
+    "CREATE TABLE c_link (id INT NOT NULL PRIMARY KEY, c_id INT NOT NULL, num INT NOT NULL)",
+    "INSERT INTO s_comp VALUES (1,1,'1',1),(2,1,'01',2),(3,7,'7',3),(4,2,'xyz',4),(5,3,'abc',5)",
+    "INSERT INTO s_big VALUES (1,1,1),(2,7,2),(3,9007199254740993,3)",
+    "INSERT INTO c_link VALUES (1,1,1),(2,2,7),(3,3,2)",
 ];
 
 /// The final verifier's repros, with the routes the analyzer must choose: a string key against
@@ -2612,6 +2621,53 @@ fn key_exact_cases() -> Vec<(Case, &'static str)> {
             ),
             "c:unit,s:lineage",
         ),
+        // Swapped sides; a composite key with one non-exact part, and an exact one; INT vs
+        // BIGINT; an outer column one join away.
+        (
+            case(
+                "swap_exists_numstr",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_str s WHERE c.num = s.code)",
+            ),
+            "c:unit,s:lookup",
+        ),
+        (
+            case(
+                "comp_mixed",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE (c.num, c.num) IN (SELECT s.a, s.b FROM s_comp s)",
+            ),
+            "c:unit,s:lookup",
+        ),
+        (
+            case(
+                "comp_exact",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE (c.num, c.name) IN (SELECT s.a, s.b FROM s_comp s)",
+            ),
+            "c:unit,s:lineage",
+        ),
+        (
+            case(
+                "big_in_int",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_big s)",
+            ),
+            "c:unit,s:lineage",
+        ),
+        (
+            case(
+                "hop_numstr",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c JOIN c_link l ON l.c_id = c.id WHERE l.num IN (SELECT s.code FROM s_str s)",
+            ),
+            "c:unit,l:unit,s:lookup",
+        ),
     ]
 }
 
@@ -2630,6 +2686,8 @@ const KEY_EXACT_STEPS: &[(&str, &[&str])] = &[
             "UPDATE s_bin SET code = 'abd' WHERE id = 2",
             "UPDATE k_ts SET k = '2026-01-02 10:00:00' WHERE id = 2",
             "UPDATE k_dt SET k = '2026-11-01 01:30:00' WHERE id = 1",
+            "UPDATE s_comp SET b = '2' WHERE id = 4",
+            "UPDATE c_link SET num = 1 WHERE id = 3",
         ],
     ),
 ];
@@ -2812,5 +2870,211 @@ async fn run_commented_definitions(ctx: &Ctx) -> Result<()> {
 fn cte_commented_definitions_survive_restart() {
     scenario("cte_g2", |ctx| async move {
         run_commented_definitions(&ctx).await
+    });
+}
+
+// --- G5: a JSON column in a composite unit (MySQL compares JSON by representation in a row IN
+// list of two or more tuples, the engine's filter for several units).
+
+const JSON_KEY_DDL: &[&str] = &[
+    "CREATE TABLE docs (id INT NOT NULL PRIMARY KEY, doc JSON NULL, grp INT NULL)",
+    r#"INSERT INTO docs VALUES (1,'{"a":1}',1),(2,'{"a": 1}',1),(3,'{"a":1.0}',2),(4,'{"b":2,"a":1}',1),(5,'{"a":1,"b":2}',2),(6,'null',1),(7,NULL,1),(8,'[1,2]',2),(9,'[1, 2]',1),(10,'{"n":{"x":[1,{"y":2}]}}',1),(11,'"str"',2),(12,'1',1),(13,'1.0',2),(14,'true',1),(15,'{"d":0.30000000000000004}',1),(16,'{"big":18446744073709551615}',1),(17,'{"neg":-0.0}',2),(18,'{"s":"\\u00e9"}',1),(19,'{"s":"é"}',2)"#,
+];
+
+/// The final verifier's JSON group-key cases; `j_grp2` (JSON in a composite key) is Full on the
+/// MySQL family and a plain text unit on MariaDB (JSON is LONGTEXT there).
+fn json_key_cases(mariadb: bool) -> Vec<Case> {
+    vec![
+        case(
+            "j_grp",
+            "incremental",
+            "grouped",
+            "SELECT doc, COUNT(*) AS n FROM docs GROUP BY doc",
+        ),
+        case(
+            "j_distinct",
+            "incremental",
+            "grouped",
+            "SELECT DISTINCT doc FROM docs",
+        ),
+        if mariadb {
+            case(
+                "j_grp2",
+                "incremental",
+                "grouped",
+                "SELECT grp, doc, COUNT(*) AS n FROM docs GROUP BY grp, doc",
+            )
+        } else {
+            case(
+                "j_grp2",
+                "full",
+                "JSON value `doc` in a composite group key: MySQL compares JSON by representation in multi-row IN lists",
+                "SELECT grp, doc, COUNT(*) AS n FROM docs GROUP BY grp, doc",
+            )
+        },
+        // The same through a CTE with renamed columns.
+        if mariadb {
+            case(
+                "j_cte2",
+                "incremental",
+                "grouped",
+                "WITH x AS (SELECT grp AS g, doc AS j FROM docs) SELECT g, j, COUNT(*) AS n FROM x GROUP BY g, j",
+            )
+        } else {
+            case(
+                "j_cte2",
+                "full",
+                "JSON value `docs.doc` in a composite group key: MySQL compares JSON by representation in multi-row IN lists",
+                "WITH x AS (SELECT grp AS g, doc AS j FROM docs) SELECT g, j, COUNT(*) AS n FROM x GROUP BY g, j",
+            )
+        },
+        case(
+            "j_sum",
+            "incremental",
+            "grouped",
+            "SELECT doc, SUM(grp) AS s, MIN(id) AS m FROM docs GROUP BY doc",
+        ),
+        case(
+            "j_ifnull",
+            "incremental",
+            "grouped",
+            "SELECT IFNULL(doc, '{}') AS k, COUNT(*) AS n FROM docs GROUP BY k",
+        ),
+        case(
+            "j_unquote",
+            "incremental",
+            "grouped",
+            "SELECT JSON_UNQUOTE(JSON_EXTRACT(doc, '$.a')) AS a, COUNT(*) AS n FROM docs GROUP BY a",
+        ),
+        case(
+            "j_spj",
+            "incremental",
+            "spj",
+            "SELECT id, doc FROM docs WHERE grp = 1",
+        ),
+        // A window unit is its PARTITION BY list as written: Full on the MySQL family even with
+        // the key next to doc (conservative).
+        if mariadb {
+            case(
+                "j_win",
+                "incremental",
+                "grouped",
+                "SELECT id, grp, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
+            )
+        } else {
+            case(
+                "j_win",
+                "full",
+                "JSON value `doc` in a composite group key: MySQL compares JSON by representation in multi-row IN lists",
+                "SELECT id, grp, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
+            )
+        },
+    ]
+}
+
+const JSON_KEY_STEPS: &[(&str, &[&str])] = &[
+    (
+        "move within a JSON-equal group, other spelling",
+        &[r#"UPDATE docs SET doc = '{"a":1.0}' WHERE id = 1"#],
+    ),
+    (
+        "delete a group's first row",
+        &["DELETE FROM docs WHERE id = 2"],
+    ),
+    (
+        "JSON null and SQL NULL swap",
+        &[
+            "UPDATE docs SET doc = 'null' WHERE id = 3",
+            "UPDATE docs SET doc = NULL WHERE id = 6",
+        ],
+    ),
+    (
+        "group key unchanged, other column changes",
+        &["UPDATE docs SET grp = 2 WHERE id = 4"],
+    ),
+    (
+        "another spelling, keys swapped",
+        &[
+            r#"INSERT INTO docs VALUES (20, '{"a" : 1 , "b" : 2}', 1), (21, '{"b":2, "a":1.00}', 2)"#,
+        ],
+    ),
+];
+
+/// Why G5 exists, for the log: one-tuple vs two-tuple row IN over JSON-equal spellings (the
+/// MySQL family finds 3 rows, then 1). lazyview must be right either way.
+async fn json_row_in_canary(ctx: &Ctx) -> Result<()> {
+    if ctx.server().is_mariadb() {
+        // (No JSON type: JSON is LONGTEXT, CAST(… AS JSON) does not parse.)
+        ctx.log("JSON row-IN canary: not applicable on MariaDB");
+        return Ok(());
+    }
+    let db = ctx.new_db("cte_json_canary").await?;
+    let mut c = db.conn().await?;
+    for s in [
+        "CREATE TABLE jd (id INT PRIMARY KEY, g INT, doc JSON)",
+        r#"INSERT INTO jd VALUES (1, 2, '{"a": 1, "b": 2}'), (2, 2, '{"b":2, "a":1.00}'), (3, 2, '{"a":1,"b":2}')"#,
+    ] {
+        exec(&mut c, s).await?;
+    }
+    let one = scalar_i64(
+        &mut c,
+        r#"SELECT COUNT(*) FROM jd WHERE (g, doc) IN ((2, CAST('{"a": 1.0, "b": 2}' AS JSON)))"#,
+    )
+    .await?;
+    let two = scalar_i64(
+        &mut c,
+        r#"SELECT COUNT(*) FROM jd WHERE (g, doc) IN ((2, CAST('{"a": 1.0, "b": 2}' AS JSON)), (3, CAST('{}' AS JSON)))"#,
+    )
+    .await?;
+    ctx.log(format!(
+        "JSON row-IN canary: one tuple {one} rows, two tuples {two} rows{}",
+        if one != two {
+            " (multi-row IN compares JSON by representation)"
+        } else {
+            ""
+        }
+    ));
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+async fn run_json_keys(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
+    let db = ctx.new_db(&format!("cte_jkey_{label}")).await?;
+    let mut c = db.conn().await?;
+    for s in JSON_KEY_DDL {
+        exec(&mut c, s).await?;
+    }
+    let mariadb = ctx.server().is_mariadb();
+    let (specs, expect) = prepare(&db, mariadb, json_key_cases(mariadb)).await?;
+    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        &format!("{label}: initial build"),
+    )
+    .await?;
+    for (what, stmts) in JSON_KEY_STEPS {
+        for s in *stmts {
+            exec(&mut c, s).await.with_context(|| what.to_string())?;
+        }
+        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
+    }
+    assert_ready(&mut c, &names(&specs)).await?;
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// G5: JSON group keys stay equal to their oracles; a JSON column in a composite key is Full on
+/// the MySQL family (its refresh filter would compare JSON by representation).
+#[test]
+fn cte_json_group_keys_match_their_oracles() {
+    scenario("cte_jkey", |ctx| async move {
+        json_row_in_canary(&ctx).await?;
+        run_json_keys(&ctx, "w0", "0").await?;
+        run_json_keys(&ctx, "w50", "50").await?;
+        Ok(())
     });
 }

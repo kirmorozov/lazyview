@@ -294,7 +294,8 @@ reads.
   parent's row does not lead to it: such a view is rebuilt as described below.
 * A child read only in an `IN` / `EXISTS` subquery is handled the same way: correlated on the
   view's unit through the foreign-key column (`WHERE EXISTS (SELECT 1 FROM kids k WHERE k.par_id =
-  p.id)`), the parent's row gives the units; otherwise the rule below applies.
+  p.id)`), the parent's row gives the units; otherwise the view is full (``EXISTS subquery over
+  `kids`: the units a cascade from `pars` changes are not known``).
 * Otherwise a delete or key update on the parent triggers an online rebuild of the view (at most
   once per `LAZYVIEW_FULL_REFRESH_MS`, never more than one at a time). lazyview logs a warning
   when such a view is created (with the `reasons` that apply): `reads a child of a cascading foreign key whose units cannot be

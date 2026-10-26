@@ -2066,12 +2066,45 @@ fn json_computed(e: &Expr) -> bool {
     match e {
         Expr::Nested(x) => json_computed(x),
         Expr::Function(f) => JSON_PRODUCING.contains(&function_name(f).as_str()),
-        Expr::Cast { data_type, .. } => data_type.to_string().eq_ignore_ascii_case("JSON"),
+        Expr::Cast { data_type, .. }
+        | Expr::Convert {
+            data_type: Some(data_type),
+            ..
+        } => data_type.to_string().eq_ignore_ascii_case("JSON"),
         Expr::BinaryOp {
             op: BinaryOperator::Arrow,
             ..
         } => true,
         _ => false,
+    }
+}
+
+/// Whether a unit expression's value has the JSON type: a JSON column (`json_col`), a value
+/// computed as JSON ([`json_computed`]), or a choice one of whose values has it (`IFNULL`,
+/// `COALESCE`, `NULLIF`, `IF`, `CASE`). Text and scalars over JSON (`->>`, JSON_UNQUOTE,
+/// JSON_VALUE, JSON_LENGTH, `CAST(… AS CHAR)`) are not.
+fn json_valued(e: &Expr, json_col: &dyn Fn(&Expr) -> bool) -> bool {
+    let any = |xs: &[&Expr]| xs.iter().any(|x| json_valued(x, json_col));
+    match e {
+        Expr::Nested(x) => json_valued(x, json_col),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => json_col(e),
+        Expr::Function(f) => match (function_name(f).as_str(), function_args(f)) {
+            ("IFNULL" | "COALESCE", Some(a)) => any(&a),
+            ("NULLIF", Some(a)) => any(&a[..a.len().min(1)]),
+            ("IF", Some(a)) => any(&a[a.len().min(1)..]),
+            _ => json_computed(e),
+        },
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            conditions.iter().any(|w| json_valued(&w.result, json_col))
+                || else_result
+                    .as_deref()
+                    .is_some_and(|x| json_valued(x, json_col))
+        }
+        _ => json_computed(e),
     }
 }
 
@@ -2860,6 +2893,23 @@ pub fn plan_block(
         return Ok(full(&format!(
             "group key `{u}` is a JSON value computed by a function (MariaDB compares it as JSON, its unit filter as text): group by the column, or by its text with ->> / JSON_UNQUOTE"
         )));
+    }
+    // A JSON value in a composite unit (G5): MySQL compares JSON by value in `doc = ?` and in a
+    // one-row `(g, doc) IN ((?, ?))`, but by representation in a row IN list of two or more
+    // tuples, the engine's filter for several units, so a refresh would miss JSON-equal rows.
+    // (MariaDB JSON is LONGTEXT: its columns are not of type json.)
+    if unit_refs.len() > 1 {
+        let json_col = |x: &Expr| {
+            scope
+                .resolve(x)
+                .is_some_and(|(a, c)| aliases[a].1.columns[c].data_type == "json")
+        };
+        if let Some(u) = unit_refs.iter().find(|u| json_valued(u, &json_col)) {
+            return Ok(full(&format!(
+                "JSON value `{}` in a composite group key: MySQL compares JSON by representation in multi-row IN lists",
+                u.to_string().replace('`', "")
+            )));
+        }
     }
     // (BIT unit keys: binlog values become unsigned integers and are bound as such; both sides
     // of every comparison see the same number.)
