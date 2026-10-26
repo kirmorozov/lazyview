@@ -75,6 +75,32 @@ async fn run_engine(
     r.map_err(|e| with_access_hint(e, &user, &schema))
 }
 
+/// Whether the server is Amazon RDS (`@@basedir` under `rdsdbbin`) or Aurora (`@@aurora_version`).
+fn is_managed_service(basedir: Option<&str>, aurora: bool) -> bool {
+    basedir.is_some_and(|b| b.contains("rdsdbbin")) || aurora
+}
+
+/// The startup warning for an RDS / Aurora binlog retention (`value` of `mysql.rds_configuration`'s
+/// `binlog retention hours`), `None` when it is at least 12 hours.
+fn retention_warning(hours: Option<&str>) -> Option<String> {
+    match hours.and_then(|h| h.trim().parse::<u64>().ok()) {
+        Some(h) if h >= 12 => None,
+        other => Some(format!(
+            "Amazon RDS/Aurora binlog retention is {}; after an outage longer than that lazyview cannot resume and \
+             rebuilds all views. Run once: CALL mysql.rds_set_configuration('binlog retention hours', 24);",
+            other
+                .map(|h| format!("{h} hours"))
+                .unwrap_or_else(|| "not set (binlogs are purged within minutes)".into())
+        )),
+    }
+}
+
+/// Whether to suggest GTIDs: RDS MySQL (not Aurora, where the parameter does not exist as such)
+/// with `gtid_mode` known and not `ON`.
+fn wants_gtid_tip(aurora: bool, gtid_mode: Option<&str>) -> bool {
+    !aurora && gtid_mode.is_some_and(|g| !g.eq_ignore_ascii_case("ON"))
+}
+
 /// Amazon RDS / Aurora purge binlogs aggressively by default; a short retention means a restart
 /// after an outage cannot resume and must rebuild every view. Warn once at startup.
 async fn managed_service_checks(conn: &mut Conn) {
@@ -83,12 +109,7 @@ async fn managed_service_checks(conn: &mut Conn) {
         .query_first("SELECT @@aurora_version")
         .await
         .unwrap_or(None);
-    let rds = basedir
-        .as_deref()
-        .map(|b| b.contains("rdsdbbin"))
-        .unwrap_or(false)
-        || aurora.is_some();
-    if !rds {
+    if !is_managed_service(basedir.as_deref(), aurora.is_some()) {
         return;
     }
     let hours: Option<Option<String>> = conn
@@ -97,24 +118,14 @@ async fn managed_service_checks(conn: &mut Conn) {
         )
         .await
         .unwrap_or(None);
-    match hours.flatten().and_then(|h| h.trim().parse::<u64>().ok()) {
-        Some(h) if h >= 12 => {}
-        other => warn!(
-            "Amazon RDS/Aurora binlog retention is {}; after an outage longer than that lazyview cannot resume and \
-             rebuilds all views. Run once: CALL mysql.rds_set_configuration('binlog retention hours', 24);",
-            other.map(|h| format!("{h} hours")).unwrap_or_else(|| "not set (binlogs are purged within minutes)".into())
-        ),
+    if let Some(w) = retention_warning(hours.flatten().as_deref()) {
+        warn!("{w}");
     }
     let gtid: Option<String> = conn
         .query_first("SELECT @@GLOBAL.gtid_mode")
         .await
         .unwrap_or(None);
-    if aurora.is_none()
-        && gtid
-            .as_deref()
-            .map(|g| !g.eq_ignore_ascii_case("ON"))
-            .unwrap_or(false)
-    {
+    if wants_gtid_tip(aurora.is_some(), gtid.as_deref()) {
         info!("tip: gtid_mode=ON and enforce_gtid_consistency=ON in the RDS parameter group give lazyview an exact commit-visibility fence");
     }
 }
@@ -5032,5 +5043,44 @@ mod tests {
         assert!(d.full() && !d.open());
         while d.pop().is_some() {}
         assert!(d.queue.capacity() <= DRAIN_KEEP_SLOTS && d.bytes == 0);
+    }
+}
+
+#[cfg(test)]
+mod managed_service_tests {
+    use super::*;
+
+    #[test]
+    fn rds_and_aurora_are_recognised() {
+        assert!(is_managed_service(Some("/rdsdbbin/mysql-8.4.8.R1/"), false));
+        assert!(is_managed_service(Some("/usr/"), true));
+        assert!(is_managed_service(None, true));
+        assert!(!is_managed_service(Some("/usr/"), false));
+        assert!(!is_managed_service(None, false));
+    }
+
+    #[test]
+    fn retention_below_twelve_hours_warns() {
+        assert!(retention_warning(Some("12")).is_none());
+        assert!(retention_warning(Some(" 24 ")).is_none());
+        assert!(retention_warning(Some("11")).unwrap().contains("11 hours"));
+        assert!(retention_warning(Some("0")).unwrap().contains("0 hours"));
+        for unset in [None, Some(""), Some("NULL"), Some("x")] {
+            assert!(
+                retention_warning(unset).unwrap().contains("not set"),
+                "{unset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gtid_tip_only_for_known_off_modes_off_aurora() {
+        assert!(wants_gtid_tip(false, Some("OFF")));
+        assert!(wants_gtid_tip(false, Some("OFF_PERMISSIVE")));
+        assert!(wants_gtid_tip(false, Some("ON_PERMISSIVE")));
+        assert!(!wants_gtid_tip(false, Some("ON")));
+        assert!(!wants_gtid_tip(false, Some("on")));
+        assert!(!wants_gtid_tip(false, None));
+        assert!(!wants_gtid_tip(true, Some("OFF")));
     }
 }
