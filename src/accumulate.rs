@@ -6,7 +6,7 @@ use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
 use roaring::RoaringTreemap;
 
-use crate::analyze::{AliasPlan, ConstFilter, Mode, ViewPlan};
+use crate::analyze::{AliasPlan, CascadeRoute, ConstFilter, Mode, ViewPlan};
 use crate::catalog::FkAction;
 use crate::datum::{Datum, Key};
 
@@ -321,6 +321,11 @@ pub struct ViewDirty {
     pub images: Vec<HashSet<Key>>,
     /// Per set of `ViewPlan::partial`: partial unit keys (every unit matching one is refreshed).
     pub partial: Vec<UnitSet>,
+    /// Pinned cascade children (see `CascadeRoute::pinned`) whose parent key changed, as
+    /// (presence column, FK value): `marks` asks the materialized table for the units holding
+    /// such rows (the parent's old key), `holds` the sources (a key update into a pinned value).
+    pub marks: Vec<(usize, Datum)>,
+    pub holds: Vec<(usize, Datum)>,
     /// Full views: rebuild needed. Global views: recompute the single row.
     pub all: bool,
     /// Incremental views: affected units unknown (cascading FK); rebuild in the background.
@@ -342,12 +347,16 @@ impl ViewDirty {
             && self.units.is_empty()
             && self.images.iter().all(HashSet::is_empty)
             && self.partial.iter().all(UnitSet::is_empty)
+            && self.marks.is_empty()
+            && self.holds.is_empty()
     }
 
     pub fn key_count(&self) -> usize {
         self.units.len()
             + self.images.iter().map(HashSet::len).sum::<usize>()
             + self.partial.iter().map(UnitSet::len).sum::<usize>()
+            + self.marks.len()
+            + self.holds.len()
     }
 
     /// Adds everything buffered in `other` (e.g. to retry after a failed refresh).
@@ -360,6 +369,12 @@ impl ViewDirty {
             mine.extend(theirs);
         }
         extend_partial(&mut self.partial, other.partial);
+        for m in other.marks {
+            push_once(&mut self.marks, m);
+        }
+        for h in other.holds {
+            push_once(&mut self.holds, h);
+        }
         self.all |= other.all;
         self.rebuild |= other.rebuild;
     }
@@ -372,6 +387,12 @@ impl ViewDirty {
             out.images.resize(n, HashSet::new());
         }
         out
+    }
+}
+
+fn push_once<T: PartialEq>(v: &mut Vec<T>, x: T) {
+    if !v.contains(&x) {
+        v.push(x);
     }
 }
 
@@ -426,8 +447,8 @@ pub fn feed(
     // A side failing the alias's constant filters is never its row (an alias pinned by constant
     // filters ignores the rows of the others): the change is an insert, a delete, or nothing to it.
     let filters = plan.filters_of(alias);
-    let before = before.filter(|r| passes(r, a, filters));
-    let after = after.filter(|r| passes(r, a, filters));
+    let before = before.filter(|r| ConstFilter::passes(filters, r, &a.table));
+    let after = after.filter(|r| ConstFilter::passes(filters, r, &a.table));
     if before.is_none() && after.is_none() {
         return Fed::Skipped;
     }
@@ -499,9 +520,28 @@ pub fn feed_cascade(
     if action == FkAction::Restrict {
         return Fed::Skipped;
     }
+    // A key no alias of the child pins: none of its child rows is read, before or after (the
+    // new key of a CASCADE update, or NULL). A short image or an absent value may reach it.
+    if let Some((pc, values)) = &c.reach {
+        let reaches = |r: &BinlogRow| {
+            r.len() != c.parent.columns.len()
+                || value_at(r, *pc).is_none()
+                || values.contains(&Datum::from_binlog(
+                    value_at(r, *pc),
+                    &c.parent.columns[*pc],
+                ))
+        };
+        let moved = after.filter(|_| action == FkAction::Cascade);
+        if !reaches(b) && !moved.is_some_and(reaches) {
+            return Fed::Skipped;
+        }
+    }
     if !matches!(plan.mode, Mode::Spj | Mode::Grouped) {
         dirty.all = true;
         return Fed::Recorded;
+    }
+    if c.derived {
+        return feed_derived_cascade(c, action, dirty, b, after);
     }
     let Some(pcols) = &c.unit_from_parent else {
         dirty.rebuild = true;
@@ -529,17 +569,87 @@ pub fn feed_cascade(
     Fed::Recorded
 }
 
-/// Whether `row` can be a row of alias `a` by its constant `filters`: a few comparisons of
-/// decoded integers, no allocation. A row that is not a full image, or lacks a value, passes.
-fn passes(row: &BinlogRow, a: &AliasPlan, filters: &[ConstFilter]) -> bool {
-    filters.is_empty()
-        || row.len() != a.table.columns.len()
-        || filters.iter().all(|f| match value_at(row, f.col) {
-            None => true,
-            v => f
-                .values
-                .contains(&Datum::from_binlog(v, &a.table.columns[f.col])),
-        })
+/// A derived cascade (see `CascadeRoute::derived`): partial unit keys from the parent's old key
+/// (and its new key, or NULLs, as the action sets the children's FK), and for each pinned alias
+/// whose values hold the old or new key, the presence lookups that give the units of those
+/// child rows. A parent row that is not a full image cannot be read: the documented safety net
+/// is a rebuild, with a warning.
+fn feed_derived_cascade(
+    c: &CascadeRoute,
+    action: FkAction,
+    dirty: &mut ViewDirty,
+    b: &BinlogRow,
+    after: Option<&BinlogRow>,
+) -> Fed {
+    let full = |r: &BinlogRow| r.len() == c.parent.columns.len();
+    // The children's FK after the change: the new key (CASCADE update) or NULL (SET NULL).
+    let new_key = after.filter(|_| action == FkAction::Cascade);
+    if !full(b) || new_key.is_some_and(|a| !full(a)) {
+        partial_parent_image(&c.parent.name);
+        dirty.rebuild = true;
+        return Fed::Recorded;
+    }
+    let datum = |r: &BinlogRow, p: usize| Datum::from_binlog(value_at(r, p), &c.parent.columns[p]);
+    let mut fed = Fed::Skipped;
+    for pin in &c.pinned {
+        let key = |r: &BinlogRow| {
+            let v = datum(r, pin.parent_col);
+            pin.values
+                .iter()
+                .find(|(x, _)| *x == v)
+                .map(|(x, k)| (*k, x.clone()))
+        };
+        if let Some(m) = key(b) {
+            push_once(&mut dirty.marks, m);
+            fed = Fed::Recorded;
+        }
+        if let Some(h) = new_key.and_then(key) {
+            push_once(&mut dirty.holds, h);
+            fed = Fed::Recorded;
+        }
+    }
+    if c.partial_from_parent.is_empty() {
+        return fed;
+    }
+    let max = c
+        .partial_from_parent
+        .iter()
+        .map(|(s, _)| s + 1)
+        .max()
+        .unwrap_or(0);
+    if dirty.partial.len() < max {
+        dirty.partial.resize_with(max, UnitSet::default);
+    }
+    for (set, pcols) in &c.partial_from_parent {
+        let key = |r: &BinlogRow| -> Key { pcols.iter().map(|&p| datum(r, p)).collect() };
+        dirty.partial[*set].insert(key(b));
+        match new_key {
+            Some(a) => dirty.partial[*set].insert(key(a)),
+            None if action == FkAction::SetNull => {
+                dirty.partial[*set].insert(pcols.iter().map(|_| Datum::Null).collect())
+            }
+            None => {}
+        }
+    }
+    Fed::Recorded
+}
+
+/// Warns (at most once a minute) that a cascade parent's row image lacked columns, so the units
+/// its cascade changes were unknown and the view is rebuilt (`binlog_row_image` other than FULL,
+/// or a server leaving generated columns out of the image).
+fn partial_parent_image(parent: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) >= 60 {
+        LAST.store(now, Ordering::Relaxed);
+        tracing::warn!(
+            parent,
+            "a cascade parent's row image lacks columns (binlog_row_image must be FULL): the units its cascade changes are unknown, rebuilding the view"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -945,6 +1055,195 @@ mod tests {
             .map(|v| (v ^ SIGN) as i64)
             .collect();
         assert_eq!(got, vec![7, 8, 10], "entity 9 only had another key");
+    }
+
+    /// A derived cascade: a parent row failing every pinned child alias's filters is skipped,
+    /// one passing them marks the units its presence column names, and a parent whose key is a
+    /// child alias's partial unit gives partial keys (old and new key on a cascaded key update).
+    /// An untraced route whose child aliases are all pinned skips every other key.
+    #[test]
+    fn derived_cascades_use_the_parent_key() {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        use mysql_async::Value;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, FkAction, ForeignKey, TableInfo};
+
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let fk = |parent: &str, child_col: usize, parent_col: &str| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols: vec![child_col],
+            parent_cols: vec![parent_col.into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades| {
+            let t = TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns,
+                pk,
+                unique_keys: vec![],
+                cascades,
+                is_view: false,
+                view_bases: vec![],
+            };
+            (("db".to_string(), name.to_string()), Arc::new(t))
+        };
+        let tables: std::collections::HashMap<_, _> = [
+            table(
+                "kind",
+                vec![int("kid", "smallint unsigned")],
+                vec![0],
+                vec![],
+            ),
+            table("obj", vec![int("oid", "int unsigned")], vec![0], vec![]),
+            table(
+                "link",
+                vec![int("gid", "int"), int("oid", "int unsigned")],
+                vec![0, 1],
+                vec![],
+            ),
+            table(
+                "attrs",
+                vec![
+                    int("id", "int"),
+                    int("oid", "int unsigned"),
+                    int("aid", "smallint unsigned"),
+                    int("val", "int"),
+                ],
+                vec![0],
+                vec![fk("obj", 1, "oid"), fk("kind", 2, "kid")],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let p = plan(
+            &parse_definition(
+                "CREATE VIEW v AS SELECT c.gid, c.oid, MAX(a.val) AS x FROM link c \
+                 JOIN attrs a ON a.oid = c.oid AND a.aid = 7 GROUP BY c.gid, c.oid",
+            )
+            .unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        let ci = |parent: &str| {
+            p.cascades
+                .iter()
+                .position(|c| c.parent.name == parent)
+                .unwrap()
+        };
+        let (kind, obj) = (ci("kind"), ci("obj"));
+        assert!(p.cascades[kind].derived && p.cascades[obj].derived);
+        let row = |v: i64| {
+            BinlogRow::new(
+                vec![Some(BinlogValue::Value(Value::Int(v)))],
+                Arc::from(vec![mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG)]),
+            )
+        };
+        // A key no alias reads: nothing to do.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed_cascade(&p, kind, &mut d, Some(&row(50)), None),
+            Fed::Skipped
+        );
+        assert_eq!(
+            feed_cascade(&p, kind, &mut d, Some(&row(50)), Some(&row(51))),
+            Fed::Skipped
+        );
+        assert!(d.is_empty());
+        // The pinned key: the units the presence column marks; a key update into it: the
+        // units holding such rows now; out of it: the marked ones. Never a rebuild.
+        assert_eq!(
+            feed_cascade(&p, kind, &mut d, Some(&row(7)), None),
+            Fed::Recorded
+        );
+        assert_eq!(
+            (d.marks.clone(), d.holds.clone()),
+            (vec![(0, Datum::Int(7))], vec![])
+        );
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        feed_cascade(&p, kind, &mut d, Some(&row(50)), Some(&row(7)));
+        assert_eq!(
+            (d.marks.clone(), d.holds.clone()),
+            (vec![], vec![(0, Datum::Int(7))])
+        );
+        feed_cascade(&p, kind, &mut d, Some(&row(7)), Some(&row(51)));
+        feed_cascade(&p, kind, &mut d, Some(&row(7)), None);
+        assert_eq!(
+            d.marks,
+            vec![(0, Datum::Int(7))],
+            "one lookup per key and flush"
+        );
+        assert!(!d.rebuild);
+        // The partial unit from the parent's key: deleted key, old and new key on an update.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed_cascade(&p, obj, &mut d, Some(&row(5)), None),
+            Fed::Recorded
+        );
+        feed_cascade(&p, obj, &mut d, Some(&row(6)), Some(&row(9)));
+        assert!(!d.rebuild && d.units.is_empty());
+        let got: Vec<i64> = d.partial[0]
+            .ints
+            .iter()
+            .map(|v| (v ^ SIGN) as i64)
+            .collect();
+        assert_eq!(got, vec![5, 6, 9]);
+        // Not derived (a HAVING over the NULL-side pinned alias), but bounded by the pins: a
+        // key outside them is skipped; the pinned key, a key update into or out of it, or a
+        // short image keep main's rebuild.
+        let p = plan(
+            &parse_definition(
+                "CREATE VIEW v AS SELECT c.gid, c.oid, MAX(b.val) AS y FROM link c \
+                 LEFT JOIN attrs b ON b.oid = c.oid AND b.aid = 8 GROUP BY c.gid, c.oid \
+                 HAVING MAX(b.val) IS NULL",
+            )
+            .unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        let kind = p
+            .cascades
+            .iter()
+            .position(|c| c.parent.name == "kind")
+            .unwrap();
+        assert!(!p.cascades[kind].derived && p.cascades[kind].reach.is_some());
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed_cascade(&p, kind, &mut d, Some(&row(50)), None),
+            Fed::Skipped
+        );
+        assert_eq!(
+            feed_cascade(&p, kind, &mut d, Some(&row(50)), Some(&row(51))),
+            Fed::Skipped
+        );
+        assert!(d.is_empty() && !d.rebuild);
+        let short = BinlogRow::new(vec![], Arc::from(Vec::new()));
+        for (b, a) in [
+            (row(8), None),
+            (row(50), Some(row(8))),
+            (row(8), Some(row(50))),
+            (short, None),
+        ] {
+            let mut d = ViewDirty::for_aliases(p.aliases.len());
+            feed_cascade(&p, kind, &mut d, Some(&b), a.as_ref());
+            assert!(d.rebuild, "{b:?} -> {a:?}");
+        }
     }
 
     #[test]

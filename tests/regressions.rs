@@ -4080,3 +4080,179 @@ fn reg_partial_units() {
         eng.stop().await
     });
 }
+
+/// Cascading-FK parents whose row gives the changed units: a parent read through a partial
+/// alias traces its cascades (its own change refreshes every group holding it); a child alias
+/// whose partial unit is the FK gets partial keys from the parent's key (ON DELETE CASCADE and
+/// SET NULL); a child alias pinned by constant filters on the FK ignores other parent rows, and
+/// a pinned parent row finds its units through a presence column of the materialized table; a
+/// route the plan cannot derive (a HAVING over a NULL-side pinned alias) still ignores parent
+/// keys outside the pins. Parent deletes and key updates (the children's rows change without
+/// binlog events) leave the views exact without a rebuild.
+#[test]
+fn reg_cascades_derived_from_the_parent() {
+    scenario("reg_casc_derived", |ctx| async move {
+        let mut ddl: Vec<String> = vec![
+            "CREATE TABLE kind (kid SMALLINT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE obj (oid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE obj_link (gid MEDIUMINT UNSIGNED NOT NULL, oid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (gid, oid))"
+                .into(),
+            "CREATE TABLE obj_attr (vid BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+             oid INT UNSIGNED NOT NULL, aid SMALLINT UNSIGNED NOT NULL, scope TINYINT NOT NULL, \
+             val INT NULL, UNIQUE KEY obj_aid_scope (oid, aid, scope), \
+             FOREIGN KEY (oid) REFERENCES obj (oid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (aid) REFERENCES kind (kid) ON DELETE CASCADE ON UPDATE CASCADE)"
+                .into(),
+            "CREATE TABLE obj_tag (tid INT PRIMARY KEY, oid INT UNSIGNED NULL, tag VARCHAR(10) NOT NULL, \
+             FOREIGN KEY (oid) REFERENCES obj (oid) ON DELETE SET NULL ON UPDATE CASCADE)"
+                .into(),
+            "INSERT INTO kind VALUES (11, 'a'), (12, 'b'), (40, 'c'), (50, 'd')".into(),
+        ];
+        let (mut objs, mut links, mut attrs) = (Vec::new(), Vec::new(), Vec::new());
+        for o in 1..=12u32 {
+            objs.push(format!("({o}, 'o{o}')"));
+            links.push(format!("({}, {o}, {})", 1 + o % 3, o * 10));
+            for a in [11, 12, 40, 50] {
+                attrs.push(format!("({o}, {a}, 3, {})", o + a));
+            }
+        }
+        ddl.push(format!("INSERT INTO obj VALUES {}", objs.join(", ")));
+        ddl.push(format!("INSERT INTO obj_link VALUES {}", links.join(", ")));
+        ddl.push(format!(
+            "INSERT INTO obj_attr (oid, aid, scope, val) VALUES {}",
+            attrs.join(", ")
+        ));
+        ddl.push(
+            "INSERT INTO obj_tag VALUES (1, 3, 'x'), (2, 3, 'y'), (3, 4, 'z'), (4, 5, 'w'), (5, NULL, 'v')"
+                .into(),
+        );
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![
+            // Grouped by (group, object), the object read through a partial alias.
+            ViewSpec::new(
+                "r_casc_grouped",
+                Kind::Incremental,
+                "SELECT c.gid, o.oid, MAX(c.pos) AS pos, MAX(s.val) AS a1, MAX(t.val) AS a2 \
+                 FROM obj_link c JOIN obj o ON o.oid = c.oid \
+                 JOIN obj_attr s ON s.oid = o.oid AND s.aid = 11 AND s.scope = 3 \
+                 LEFT JOIN obj_attr t ON t.oid = o.oid AND t.aid = 12 AND t.scope = 3 \
+                 GROUP BY c.gid, o.oid",
+            ),
+            // The object not read: the value alias's partial unit is the FK.
+            ViewSpec::new(
+                "r_casc_noparent",
+                Kind::Incremental,
+                "SELECT c.gid, c.oid, MAX(c.pos) AS pos, MAX(s.val) AS a1 FROM obj_link c \
+                 LEFT JOIN obj_attr s ON s.oid = c.oid AND s.aid = 11 GROUP BY c.gid, c.oid",
+            ),
+            // Tags whose object is SET NULL by a delete: partial keys from the parent's key.
+            ViewSpec::new(
+                "r_casc_tags",
+                Kind::Incremental,
+                "SELECT c.gid, c.oid, COUNT(g.tid) AS tags FROM obj_link c \
+                 LEFT JOIN obj_tag g ON g.oid = c.oid GROUP BY c.gid, c.oid",
+            ),
+            // Select/join anchored on the value table: the object by lineage, the key table by
+            // the anchor's pins.
+            ViewSpec::new(
+                "r_casc_rows",
+                Kind::Incremental,
+                "SELECT a.vid, a.val, o.label FROM obj_attr a JOIN obj o ON o.oid = a.oid \
+                 WHERE a.aid IN (11, 12)",
+            ),
+            // A HAVING over the NULL-side pinned alias: no presence column, but only its own
+            // key can reach the view.
+            ViewSpec::new(
+                "r_casc_having",
+                Kind::Incremental,
+                "SELECT c.gid, c.oid, MAX(t.val) AS a3 FROM obj_link c \
+                 LEFT JOIN obj_attr t ON t.oid = c.oid AND t.aid = 50 AND t.scope = 3 \
+                 GROUP BY c.gid, c.oid HAVING MAX(t.val) IS NULL OR MAX(t.val) > 55",
+            ),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_casc_derived", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let before = eng.snapshot();
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "a key row no alias reads changes its key, then is deleted (its values follow, \
+                 then cascade away)",
+                &[
+                    "UPDATE kind SET kid = 41 WHERE kid = 40",
+                    "DELETE FROM kind WHERE kid = 41",
+                ],
+            ),
+            (
+                "objects deleted (values cascade away, tags lose them)",
+                &["DELETE FROM obj WHERE oid IN (5, 9)"],
+            ),
+            (
+                "an object's key changes (its values and tags follow by cascade)",
+                &["UPDATE obj SET oid = 103 WHERE oid = 3"],
+            ),
+            (
+                "the object comes back under its old key with new values",
+                &[
+                    "UPDATE obj SET oid = 3 WHERE oid = 103",
+                    "UPDATE obj_attr SET val = 77 WHERE oid = 3 AND aid = 11",
+                ],
+            ),
+            (
+                "a key row an alias is pinned to changes its key, then is deleted",
+                &[
+                    "UPDATE kind SET kid = 13 WHERE kid = 12",
+                    "DELETE FROM kind WHERE kid = 13",
+                ],
+            ),
+            (
+                "an object deleted and its key re-inserted in one transaction",
+                &[
+                    "START TRANSACTION",
+                    "DELETE FROM obj WHERE oid = 7",
+                    "INSERT INTO obj VALUES (7, 'again')",
+                    "INSERT INTO obj_attr (oid, aid, scope, val) VALUES (7, 11, 3, 5)",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "a key row an alias is pinned to is deleted",
+                &["DELETE FROM kind WHERE kid = 11"],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        let d = eng.snapshot().since(&before);
+        ctx.log(format!(
+            "parent deletes and key updates: {}",
+            fmt_snapshot(&d)
+        ));
+        ensure!(
+            d.full_rebuilds == 0,
+            "cascades whose units the parent's row gives rebuilt the views: {}",
+            fmt_snapshot(&d)
+        );
+        // The key the HAVING view pins still reaches it (no derivation there: main's rebuild).
+        let before = eng.snapshot();
+        run(&mut c, &["DELETE FROM kind WHERE kid = 50"]).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the key row the HAVING view pins is deleted",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds >= 1,
+            "a pinned key of a route the plan cannot derive was skipped: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}

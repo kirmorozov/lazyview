@@ -262,10 +262,25 @@ and never reach the binlog. lazyview therefore also watches the parent tables of
 reads.
 
 * If the view's unit is the foreign-key column (grouped by `order_id`, or joined
-  `i.order_id = o.id`), the affected units come from the parent's binlog row.
+  `i.order_id = o.id`), the affected units come from the parent's binlog row. The same holds for
+  part of the unit: in a view grouped by `g.id, i.item_id`, a child joined on `item_id` is
+  refreshed for the groups with the parent's key.
 * If the view joins the parent on the foreign key (`JOIN customers c ON c.id = a.customer_id`),
   the rows a cascade changes are found through the parent's row as well, also over several
-  levels (groups → parents → children) when every level is joined.
+  levels (groups → parents → children) when every level is joined. The parent may also be read
+  through part of the group key.
+* A child that the view pins to some foreign-key values (`JOIN item_attr w ON w.item_id = i.id
+  AND w.attr = 5`, with `attr` referencing a definitions table) is only affected by those parent
+  rows: deleting or renumbering any other parent row changes nothing in the view. Deleting or
+  renumbering a pinned parent row refreshes exactly the rows that hold such children: the
+  materialized table keeps a hidden column per pinned value (`_lv_c<k>`, a count per group or the
+  child's key value per row) that names them. In a grouped view with `HAVING` this needs the child
+  inner-joined and pinned to one value; otherwise the pinned parent rows' deletes rebuild the view
+  (below), while every other parent row still changes nothing. This holds wherever every alias of
+  the child is pinned on the foreign-key column, also when the view cannot follow the pinned rows:
+  the warning below then names the parent keys that still rebuild (``only `p`.`id` IN (5) reaches it``).
+* These routes read the parent's row image: with `binlog_row_image` other than FULL a cascade
+  from such a parent rebuilds the view, and lazyview warns about the incomplete image.
 * Through a `LEFT JOIN` with the parent on the NULL side, the parent is traced only when the join
   condition is the foreign-key equality and nothing else (`LEFT JOIN customers c ON c.id =
   a.customer_id`, or `USING`). With any other condition (`… ON c.id = a.customer_id AND

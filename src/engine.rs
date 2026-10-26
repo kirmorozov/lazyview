@@ -1154,7 +1154,7 @@ impl Engine {
         let mut reasons: Vec<String> = plan
             .cascades
             .iter()
-            .filter(|c| c.unit_from_parent.is_none() && !c.traced)
+            .filter(|c| c.unit_from_parent.is_none() && !c.traced && !c.derived)
             .map(|c| {
                 c.untraced.clone().unwrap_or_else(|| {
                     format!(
@@ -4189,6 +4189,14 @@ impl Engine {
             debug!(view = %plan.name, "too many changed rows to look up; rebuilding instead");
             rebuild = true;
         }
+        self.presence_lookups(
+            plan,
+            layout,
+            (&dirty.marks, &dirty.holds),
+            (targets, table),
+            &mut units,
+        )
+        .await?;
         let partial = dirty.partial.clone();
         Metrics::add(
             &self.metrics.units_refreshed,
@@ -4289,6 +4297,14 @@ impl Engine {
                 debug!(view = %plan.name, "too many changed rows to look up; rebuilding instead");
                 p.rebuild = true;
             }
+            self.presence_lookups(
+                plan,
+                layout,
+                (&dirty.marks, &dirty.holds),
+                (targets, table),
+                &mut units,
+            )
+            .await?;
             p.partial = dirty.partial.clone();
             Metrics::add(
                 &self.metrics.units_refreshed,
@@ -4501,6 +4517,44 @@ impl Engine {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Units of pinned cascade children whose parent key changed (see `ViewDirty::marks`):
+    /// the materialized units a presence column marks for the parent's old key, and the current
+    /// units holding rows with a new key (a key update into a pinned value).
+    async fn presence_lookups(
+        &mut self,
+        plan: &ViewPlan,
+        layout: &Layout,
+        (marks, holds): (&[(usize, Datum)], &[(usize, Datum)]),
+        (targets, table): (&[String], &str),
+        units: &mut UnitSet,
+    ) -> Result<()> {
+        let unit_cols = layout.unit_cols().join(", ");
+        for (k, v) in marks {
+            let filter = plan.presence[*k].marks(v);
+            let sql = |ts: &str| {
+                format!(
+                    "SELECT DISTINCT {unit_cols} FROM {}.{} WHERE {filter}",
+                    analyze::quote_ident(ts),
+                    analyze::quote_ident(table)
+                )
+            };
+            for r in self.read_materialized(targets, sql, Vec::new()).await? {
+                units.insert(r.unwrap().into_iter().map(Datum::from_value).collect());
+            }
+        }
+        for (k, v) in holds {
+            let fresh = self.flavor == Flavor::MariaDb;
+            let sql = plan.key_lookup_sql(&plan.presence[*k].holds(v));
+            let rows: Vec<mysql_async::Row> =
+                mv::exec_source(&mut self.src, sql, Vec::new(), fresh).await?;
+            Metrics::add(&self.metrics.lookup_queries, 1);
+            for r in rows {
+                units.insert(r.unwrap().into_iter().map(Datum::from_value).collect());
+            }
+        }
+        Ok(())
     }
 
     /// Lineage lookup of alias `alias` (see [`Self::lookups`]): `keys` are primary keys of its

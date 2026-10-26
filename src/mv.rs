@@ -876,12 +876,25 @@ pub async fn probe(src: &mut Conn, src_schema: &str, plan: &ViewPlan) -> Result<
             n_visible + hidden.len()
         );
     }
-    let lineage = lineage_keys(&cols, n_visible + hidden.len()).with_context(|| {
-        format!(
-            "probe of view `{}`: unexpected columns after the hidden unit columns",
+    // (The presence columns of pinned cascade children close the list.)
+    let lineage_end = cols.len().saturating_sub(plan.presence.len());
+    if cols[lineage_end..]
+        .iter()
+        .zip(&plan.presence)
+        .any(|(c, p)| c.src_name != p.name)
+    {
+        bail!(
+            "probe of view `{}`: unexpected columns where the presence columns belong",
             plan.name
-        )
-    })?;
+        );
+    }
+    let lineage =
+        lineage_keys(&cols[..lineage_end], n_visible + hidden.len()).with_context(|| {
+            format!(
+                "probe of view `{}`: unexpected columns after the hidden unit columns",
+                plan.name
+            )
+        })?;
     let epoch = epoch_exprs(plan, &cols, n_visible, &hidden);
     let mut cols = cols;
     if let Some(names) = &plan.output_names {

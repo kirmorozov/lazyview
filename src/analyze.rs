@@ -751,6 +751,76 @@ pub struct ConstFilter {
     pub values: Vec<Datum>,
 }
 
+impl ConstFilter {
+    /// Whether `row`, a binlog image of `table`, can be a row of the alias pinned by `filters`:
+    /// a few comparisons of decoded integers, no allocation. A row that is not a full image,
+    /// or lacks the value, passes.
+    pub fn passes(
+        filters: &[ConstFilter],
+        row: &mysql_async::binlog::row::BinlogRow,
+        table: &TableInfo,
+    ) -> bool {
+        filters.is_empty()
+            || row.len() != table.columns.len()
+            || filters.iter().all(|f| match row.as_ref(f.col) {
+                None => true,
+                v => f
+                    .values
+                    .contains(&Datum::from_binlog(v, &table.columns[f.col])),
+            })
+    }
+}
+
+/// A child alias of a cascade pinned by its constant filters to some values of the FK (see
+/// [`CascadeRoute::pinned`]): the parent column and, per value, its presence column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pinned {
+    pub parent_col: usize,
+    pub values: Vec<(Datum, usize)>,
+}
+
+/// A hidden materialized column telling which units hold rows of a pinned cascade child alias
+/// (see `cascade_derivations`): a grouped view counts the alias's rows with one FK value per
+/// group (`counts`), a select/join view carries the alias's FK value. The units a cascade from
+/// a parent key changes are the materialized units it marks for that key ([`Self::marks`]),
+/// plus, for a key update into a pinned value, the units holding such rows now
+/// ([`Self::holds`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Presence {
+    /// Materialized column name, `_lv_c<k>`.
+    pub name: String,
+    /// The SELECT expression computing it.
+    pub expr: String,
+    /// The alias's FK column, as an expression of the view's FROM clause.
+    pub fk: String,
+    /// Grouped views: the FK value it counts.
+    pub counts: Option<Datum>,
+}
+
+impl Presence {
+    /// Predicate on the materialized table: the units holding the alias's rows with FK `value`.
+    pub fn marks(&self, value: &Datum) -> String {
+        match self.counts {
+            Some(_) => format!("{} > 0", quote_ident(&self.name)),
+            None => format!("{} = {}", quote_ident(&self.name), int_sql(value)),
+        }
+    }
+
+    /// Predicate on the sources: the rows of the alias with FK `value`.
+    pub fn holds(&self, value: &Datum) -> String {
+        format!("{} = {}", self.fk, int_sql(value))
+    }
+}
+
+/// An integer datum (constant filters hold only integers) as an SQL literal.
+fn int_sql(d: &Datum) -> String {
+    match d {
+        Datum::Int(i) => i.to_string(),
+        Datum::UInt(u) => u.to_string(),
+        other => unreachable!("non-integer filter value {other:?}"),
+    }
+}
+
 /// Partial direct units (see `partial_units`): aliases whose rows give part of the unit.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PartialUnits {
@@ -797,9 +867,23 @@ pub struct CascadeRoute {
     /// alias) find every materialized row the cascade changes, so the parent needs no route of
     /// its own.
     pub traced: bool,
-    /// Why the route is neither unit-derived nor traced (the view rebuilds on the parent's
-    /// deletes / key updates).
+    /// Why the route is neither unit-derived, traced nor `derived` (the view rebuilds on the
+    /// parent's deletes / key updates).
     pub untraced: Option<String>,
+    /// The parent's row gives the units the cascade can change, alias by alias of the child
+    /// (`cascade_derivations`), never a rebuild: `partial_from_parent` gives partial unit keys
+    /// (set of `ViewPlan::partial`, the parent column for each position); each entry of
+    /// `pinned` is an alias the constant filters pin to some values of the (single-column) FK:
+    /// a parent key among them names the materialized units holding that alias's rows through
+    /// a presence column (`ViewPlan::presence`), any other key reaches nothing.
+    pub derived: bool,
+    pub partial_from_parent: Vec<(usize, Vec<usize>)>,
+    pub pinned: Vec<Pinned>,
+    /// Every alias of the child pins its (single-column) FK with constant filters: the parent
+    /// column and the values they allow. A parent key outside them is the FK of no alias's
+    /// row, before or after the change, so the cascade changes nothing the view reads,
+    /// whatever the route (`cascade_reach`).
+    pub reach: Option<(usize, Vec<Datum>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -850,6 +934,8 @@ pub struct ViewPlan {
     pub alias_filters: Vec<Vec<ConstFilter>>,
     /// Aliases traced by partial units instead of lookups.
     pub partial: PartialUnits,
+    /// Hidden presence columns of pinned cascade children (after the lineage columns).
+    pub presence: Vec<Presence>,
 }
 
 impl ViewPlan {
@@ -871,6 +957,9 @@ impl ViewPlan {
             for (e, c) in k.exprs.iter().zip(&k.cols) {
                 cols.push(format!("{e} AS {}", quote_ident(c)));
             }
+        }
+        for p in &self.presence {
+            cols.push(format!("{} AS {}", p.expr, quote_ident(&p.name)));
         }
         let mut sql = format!("SELECT {} FROM {}", cols.join(", "), self.from_sql);
         push_where(&mut sql, self.where_sql.as_deref(), filter);
@@ -926,6 +1015,8 @@ impl ViewPlan {
                 "unit"
             } else if c.traced {
                 "traced"
+            } else if c.derived {
+                "derived"
             } else {
                 "rebuild"
             };
@@ -1702,6 +1793,181 @@ fn partial_units(
     out
 }
 
+/// What [`cascade_derivations`] reads of the plan.
+struct PinContext<'a> {
+    aliases: &'a [AliasPlan],
+    partial: &'a PartialUnits,
+    filters: &'a [Vec<ConstFilter>],
+    /// A GROUP BY view (presence counts per group); otherwise a select/join view.
+    grouped: bool,
+    having: bool,
+    null_side: &'a [usize],
+}
+
+/// For a cascade the parent's row neither gives units for nor traces through its own alias:
+/// whether it still gives the units the cascade can change, alias by alias of the child (an
+/// alias with a unit route of its own needs nothing here), so that the route never rebuilds:
+///
+/// * an alias whose partial unit columns are all FK columns gets partial keys from the
+///   parent's key (`partial_from_parent`);
+/// * an alias pinned by its constant filters to some values of a single-column FK can only
+///   hold child rows with those values: a parent key among them changes exactly the units
+///   holding such rows, which a hidden presence column marks in the materialized table
+///   ([`Presence`]); any other key reaches nothing. Exact only where those rows cannot keep a
+///   unit out of the table: a grouped view without HAVING (or with the alias inner-joined and
+///   pinned to one value: removing its rows removes the whole group), a select/join view
+///   whose WHERE keeps no NULL-extended rows of the alias.
+///
+/// When every alias is covered the route is `derived`; otherwise it stays untraced.
+/// (Only where the cascade continues into no untraced level: the caller checks.)
+fn cascade_derivations(c: &mut CascadeRoute, ctx: &PinContext, presence: &mut Vec<Presence>) {
+    let to_parent = |col: usize| -> Option<usize> {
+        let j = c.child_cols.iter().position(|&x| x == col)?;
+        let pc = c.parent_cols[j];
+        filter_or_key_column(&c.parent.columns[pc]).then_some(pc)
+    };
+    let (mut parts, mut pins, mut added) = (Vec::new(), Vec::new(), Vec::new());
+    for (ai, a) in ctx.aliases.iter().enumerate() {
+        if (a.table.schema.as_str(), a.table.name.as_str())
+            != (c.child.0.as_str(), c.child.1.as_str())
+        {
+            continue;
+        }
+        // A unit alias whose unit columns are all FK columns has a unit route of its own.
+        if a.direct_unit.as_ref().is_some_and(|cols| {
+            cols.iter()
+                .all(|&col| a.table.columns[col].exact_key() && to_parent(col).is_some())
+        }) {
+            continue;
+        }
+        let part = ctx
+            .partial
+            .aliases
+            .get(ai)
+            .and_then(Option::as_ref)
+            .and_then(|(set, cols)| {
+                let pcols: Option<Vec<usize>> = cols.iter().map(|&col| to_parent(col)).collect();
+                Some((*set, pcols?))
+            });
+        if let Some(p) = part {
+            parts.push(p);
+            continue;
+        }
+        let ([fk], [pc]) = (c.child_cols.as_slice(), c.parent_cols.as_slice()) else {
+            return;
+        };
+        let Some(f) = ctx
+            .filters
+            .get(ai)
+            .into_iter()
+            .flatten()
+            .find(|f| f.col == *fk)
+        else {
+            return;
+        };
+        let exact = if ctx.grouped {
+            !ctx.having || (!ctx.null_side.contains(&ai) && f.values.len() == 1)
+        } else {
+            !a.lookup_where
+        };
+        if !exact || !filter_column(&c.parent.columns[*pc]) {
+            return;
+        }
+        let fk_sql = format!(
+            "{}.{}",
+            quote_ident(&a.name),
+            quote_ident(&a.table.columns[*fk].name)
+        );
+        let mut values: Vec<(Datum, usize)> = Vec::new();
+        for (j, v) in f.values.iter().enumerate() {
+            // Grouped: one count per value; select/join: the FK value itself, once.
+            if !ctx.grouped && j > 0 {
+                values.push((v.clone(), values[0].1));
+                continue;
+            }
+            let k = presence.len() + added.len();
+            added.push(Presence {
+                name: format!("_lv_c{k}"),
+                expr: if ctx.grouped {
+                    format!("COUNT(CASE WHEN {fk_sql} = {} THEN 1 END)", int_sql(v))
+                } else {
+                    fk_sql.clone()
+                },
+                fk: fk_sql.clone(),
+                counts: ctx.grouped.then(|| v.clone()),
+            });
+            values.push((v.clone(), k));
+        }
+        pins.push(Pinned {
+            parent_col: *pc,
+            values,
+        });
+    }
+    if parts.is_empty() && pins.is_empty() {
+        return;
+    }
+    presence.extend(added);
+    c.derived = true;
+    c.untraced = None;
+    c.partial_from_parent = parts;
+    c.pinned = pins;
+}
+
+/// Where every alias of a cascade's child pins its single-column FK with constant filters, the
+/// parent column and the values they allow ([`CascadeRoute::reach`]): child rows with another
+/// FK value are no alias's rows, before the cascade (old key) and after it (new key, or NULL),
+/// and a cascade continuing out of them (`continues`: joined to an alias of this child) reaches
+/// no materialized row either. The route's reason names the keys that still reach the view.
+fn cascade_reach(
+    c: &mut CascadeRoute,
+    aliases: &[AliasPlan],
+    filters: &[Vec<ConstFilter>],
+    continues: bool,
+) {
+    let ([fk], [pc]) = (c.child_cols.as_slice(), c.parent_cols.as_slice()) else {
+        return;
+    };
+    let (parent, mut child) = (&c.parent.columns[*pc], None);
+    let mut values: Vec<Datum> = Vec::new();
+    for (ai, a) in aliases.iter().enumerate() {
+        if (a.table.schema.as_str(), a.table.name.as_str())
+            != (c.child.0.as_str(), c.child.1.as_str())
+        {
+            continue;
+        }
+        let Some(f) = filters.get(ai).into_iter().flatten().find(|f| f.col == *fk) else {
+            return;
+        };
+        child = Some(&a.table.columns[*fk]);
+        for v in &f.values {
+            if !values.contains(v) {
+                values.push(v.clone());
+            }
+        }
+    }
+    // Both sides decode to the same integer kind (FK columns share their sign).
+    let unsigned = |col: &crate::catalog::Column| matches!(col.kind, ColKind::Unsigned(_));
+    let Some(child) = child else { return };
+    if !continues || !filter_column(parent) || unsigned(parent) != unsigned(child) {
+        return;
+    }
+    if let Some(r) = &mut c.untraced {
+        let list: Vec<String> = values.iter().map(int_sql).collect();
+        r.push_str(&format!(
+            " (only `{}`.`{}` IN ({}) reaches it)",
+            c.parent.name,
+            parent.name,
+            list.join(", ")
+        ));
+    }
+    c.reach = Some((*pc, values));
+}
+
+/// A parent key column whose binlog value is its SQL value (as for unit keys), not generated.
+fn filter_or_key_column(column: &crate::catalog::Column) -> bool {
+    column.exact_key() && column.generated.is_none()
+}
+
 /// Column references in an expression (unresolvable identifiers are ignored).
 fn col_refs(e: &Expr, scope: &Scope) -> Vec<ColRef> {
     let mut out = Vec::new();
@@ -1932,6 +2198,7 @@ pub fn plan_block(
         lookup_where_sql: None,
         alias_filters: Vec::new(),
         partial: PartialUnits::default(),
+        presence: Vec::new(),
         unit_unique: false,
         lineage: Vec::new(),
         output_names: output_names.clone(),
@@ -2611,6 +2878,15 @@ pub fn plan_block(
             a.image_cols = key;
         }
     }
+    let alias_filters = const_filters(select, &joins, &scope, &base_edges, &own_edges);
+    let partial = partial_units(
+        &alias_plans,
+        &lineage,
+        &unit_cols,
+        &scope,
+        &base_edges,
+        &own_edges,
+    );
     let unit_unique = match mode {
         Mode::Spj => n_alias == 1 && aliases[0].1.row_key().is_some(),
         Mode::Grouped => !windowed,
@@ -2622,6 +2898,7 @@ pub fn plan_block(
         (Some(o), Some(_)) => order_subquery_tables(o, default_schema, tables),
         _ => Vec::new(),
     };
+    let mut presence: Vec<Presence> = Vec::new();
     let mut cascades = cascade_routes(
         &alias_plans
             .iter()
@@ -2659,7 +2936,8 @@ pub fn plan_block(
                 .filter(|&x| {
                     table_ref(&alias_plans[x].table) == parent
                         && (alias_plans[x].direct_unit.is_some()
-                            || lineage.iter().any(|k| k.alias == x))
+                            || lineage.iter().any(|k| k.alias == x)
+                            || partial.aliases.get(x).is_some_and(Option::is_some))
                 })
                 .collect();
             let children: Vec<usize> = (0..n_alias)
@@ -2670,7 +2948,7 @@ pub fn plan_block(
             }
             if parents.is_empty() {
                 return Err(format!(
-                    "the view does not read `{}` through a unit or lineage alias",
+                    "the view does not read `{}` through a unit, partial or lineage alias",
                     c.parent.name
                 ));
             }
@@ -2735,6 +3013,7 @@ pub fn plan_block(
         path.pop();
         r
     }
+    let mut continuing = Vec::with_capacity(cascades.len());
     for i in 0..cascades.len() {
         let continues = continues_ok(i, &cascades, &joined, &mut Vec::new()).map_err(|(j, r)| {
             format!(
@@ -2745,16 +3024,31 @@ pub fn plan_block(
         let c = &mut cascades[i];
         if c.unit_from_parent.is_some() {
             // The parent's image gives this level's units; the next level may lie elsewhere.
-            if let Err(r) = continues {
+            if let Err(r) = &continues {
                 c.unit_from_parent = None;
-                c.untraced = Some(r);
+                c.untraced = Some(r.clone());
             }
         } else {
-            match joined[i].clone().and(continues) {
+            match joined[i].clone().and(continues.clone()) {
                 Ok(()) => c.traced = true,
                 Err(r) => c.untraced = Some(r),
             }
         }
+        if c.untraced.is_some() && continues.is_ok() && matches!(mode, Mode::Spj | Mode::Grouped) {
+            cascade_derivations(
+                c,
+                &PinContext {
+                    aliases: &alias_plans,
+                    partial: &partial,
+                    filters: &alias_filters,
+                    grouped: mode == Mode::Grouped && !resolved_groups.is_empty() && !windowed,
+                    having: select.having.is_some(),
+                    null_side: &null_side,
+                },
+                &mut presence,
+            );
+        }
+        continuing.push(continues.is_ok());
     }
     for (t, cols) in order_tables {
         alias_plans.push(AliasPlan {
@@ -2771,6 +3065,10 @@ pub fn plan_block(
             lookup_where: false,
         });
     }
+    // (After every alias is known: the ORDER BY tables above have no filters.)
+    for (c, &continues) in cascades.iter_mut().zip(&continuing) {
+        cascade_reach(c, &alias_plans, &alias_filters, continues);
+    }
     let window_sql = if select.named_window.is_empty() {
         None
     } else {
@@ -2784,15 +3082,6 @@ pub fn plan_block(
                 .join(", ")
         ))
     };
-    let alias_filters = const_filters(select, &joins, &scope, &base_edges, &own_edges);
-    let partial = partial_units(
-        &alias_plans[..n_alias],
-        &lineage,
-        &unit_cols,
-        &scope,
-        &base_edges,
-        &own_edges,
-    );
     Ok(ViewPlan {
         schema,
         name: def.name.clone(),
@@ -2840,6 +3129,7 @@ pub fn plan_block(
             .filter(|w| !w.is_empty()),
         alias_filters,
         partial,
+        presence,
         unit_unique,
         lineage,
         cascades,
@@ -3815,6 +4105,10 @@ fn cascade_routes(
                 child_cols: fk.child_cols.clone(),
                 traced: false,
                 untraced: None,
+                derived: false,
+                partial_from_parent: Vec::new(),
+                pinned: Vec::new(),
+                reach: None,
             });
             if depth < 8 && !read.contains(&fk.parent) {
                 // A cascade into the parent cascades further into the child: unknown units.
@@ -4509,6 +4803,352 @@ mod tests {
         );
     }
 
+    /// Cascades the parent's row still bounds: a parent read through a partial alias traces
+    /// them; a child alias whose partial unit columns are FK columns gets partial keys from the
+    /// parent's key; a child alias pinned by constant filters on FK columns only needs the
+    /// parent rows that pass them; anything else, and chains through tables the view does not
+    /// read, still rebuild.
+    #[test]
+    fn cascades_derived_from_partial_ids_and_filters() {
+        use crate::catalog::{FkAction, ForeignKey};
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let fk = |parent: &str, child_col: usize, parent_col: &str| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols: vec![child_col],
+            parent_cols: vec![parent_col.into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let with_fk = |t: (TableRef, Arc<TableInfo>), f: Vec<ForeignKey>| {
+            let mut i = (*t.1).clone();
+            i.cascades = f;
+            (t.0, Arc::new(i))
+        };
+        let cat: HashMap<_, _> = [
+            typed("realm", vec![int("rid", "int unsigned")], &[0]),
+            with_fk(
+                typed(
+                    "kind",
+                    vec![int("kid", "smallint unsigned"), int("rid", "int unsigned")],
+                    &[0],
+                ),
+                vec![fk("realm", 1, "rid")],
+            ),
+            typed(
+                "obj",
+                vec![int("oid", "int unsigned"), int("w", "int")],
+                &[0],
+            ),
+            typed(
+                "link",
+                vec![
+                    int("gid", "int"),
+                    int("oid", "int unsigned"),
+                    int("pos", "int"),
+                ],
+                &[0, 1],
+            ),
+            with_fk(
+                typed(
+                    "obj_attr",
+                    vec![
+                        int("id", "int"),
+                        int("oid", "int unsigned"),
+                        int("aid", "smallint unsigned"),
+                        int("val", "int"),
+                    ],
+                    &[0],
+                ),
+                vec![fk("obj", 1, "oid"), fk("kind", 2, "kid")],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let plan = |sql: &str| {
+            let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+            crate::analyzer::plan(&d, "db", &cat).unwrap()
+        };
+        let route = |v: &ViewPlan, parent: &str| -> CascadeRoute {
+            v.cascades
+                .iter()
+                .find(|c| c.parent.name == parent)
+                .unwrap_or_else(|| panic!("{parent}: {:?}", v.cascades))
+                .clone()
+        };
+        // The parent read through a partial alias: traced. The value-key parent is bounded
+        // by the aliases' filters; its own parent (a chain) still rebuilds.
+        let v = plan(
+            "SELECT c.gid, o.oid, MAX(a.val) AS x, MAX(b.val) AS y FROM link c \
+             JOIN obj o ON o.oid = c.oid JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 \
+             LEFT JOIN obj_attr b ON b.oid = o.oid AND b.aid IN (8, 9) GROUP BY c.gid, o.oid",
+        );
+        assert!(route(&v, "obj").traced, "{:?}", v.cascades);
+        let k = route(&v, "kind");
+        assert!(k.derived && k.untraced.is_none(), "{k:?}");
+        assert!(k.partial_from_parent.is_empty());
+        let kid = k.parent.col_index("kid").unwrap();
+        // One count per pinned value (grouped view), named by the plan.
+        assert_eq!(
+            k.pinned,
+            vec![
+                Pinned {
+                    parent_col: kid,
+                    values: vec![(Datum::Int(7), 0)]
+                },
+                Pinned {
+                    parent_col: kid,
+                    values: vec![(Datum::Int(8), 1), (Datum::Int(9), 2)]
+                },
+            ]
+        );
+        assert_eq!(
+            v.presence
+                .iter()
+                .map(|p| p.expr.clone())
+                .collect::<Vec<_>>(),
+            [
+                "COUNT(CASE WHEN `a`.`aid` = 7 THEN 1 END)",
+                "COUNT(CASE WHEN `b`.`aid` = 8 THEN 1 END)",
+                "COUNT(CASE WHEN `b`.`aid` = 9 THEN 1 END)"
+            ]
+        );
+        assert_eq!(v.presence[1].marks(&Datum::Int(8)), "`_lv_c1` > 0");
+        assert_eq!(v.presence[2].holds(&Datum::Int(9)), "`b`.`aid` = 9");
+        assert!(v
+            .select_sql(&[], None)
+            .contains("COUNT(CASE WHEN `a`.`aid` = 7 THEN 1 END) AS `_lv_c0`"));
+        assert!(!route(&v, "realm").derived && route(&v, "realm").untraced.is_some());
+        assert!(v.tracing().contains("^obj:traced") && v.tracing().contains("^kind:derived"));
+        // Every alias of the child pins the FK: the keys that can reach the view at all. The
+        // chain through `kind` (a table the view does not read) has no bound.
+        assert_eq!(
+            k.reach,
+            Some((kid, vec![Datum::Int(7), Datum::Int(8), Datum::Int(9)]))
+        );
+        assert_eq!(route(&v, "realm").reach, None);
+        // The parent not read: the child alias's partial unit is its FK column, so the
+        // parent's key gives partial keys.
+        let v = plan(
+            "SELECT c.gid, c.oid, MAX(a.val) AS x FROM link c JOIN obj_attr a ON a.oid = c.oid \
+             AND a.aid = 7 GROUP BY c.gid, c.oid",
+        );
+        let o = route(&v, "obj");
+        assert!(o.derived, "{o:?}");
+        assert_eq!(
+            o.partial_from_parent,
+            vec![(0, vec![o.parent.col_index("oid").unwrap()])]
+        );
+        assert_eq!(v.partial.sets, vec![vec![1]]);
+        // An unpinned child alias without a partial unit on the FK: still a rebuild route.
+        let v = plan(
+            "SELECT c.gid, c.oid, MAX(a.val) AS x FROM link c JOIN obj_attr a ON a.val = c.pos \
+             GROUP BY c.gid, c.oid",
+        );
+        assert!(route(&v, "kind").untraced.is_some() && !route(&v, "kind").derived);
+        assert!(route(&v, "obj").untraced.is_some() && !route(&v, "obj").derived);
+        assert_eq!(route(&v, "kind").reach, None);
+        // A HAVING over a NULL-side pinned alias: removing its rows could let a group the table
+        // does not hold appear, so presence cannot find it: the route stays untraced, but only
+        // the pinned key reaches the view, and the reason says so.
+        let v = plan(
+            "SELECT c.gid, o.oid, MAX(b.val) AS y FROM link c JOIN obj o ON o.oid = c.oid \
+             LEFT JOIN obj_attr b ON b.oid = o.oid AND b.aid = 8 GROUP BY c.gid, o.oid \
+             HAVING MAX(b.val) IS NULL",
+        );
+        let k = route(&v, "kind");
+        assert!(k.untraced.is_some() && !k.derived);
+        assert!(v.presence.is_empty());
+        assert_eq!(k.reach, Some((kid, vec![Datum::Int(8)])));
+        assert!(
+            k.untraced
+                .as_deref()
+                .is_some_and(|r| r.ends_with(" (only `kind`.`kid` IN (8) reaches it)")),
+            "{k:?}"
+        );
+        // One alias of the child pinned, another not: no bound.
+        let v = plan(
+            "SELECT c.gid, c.oid, MAX(a.val) AS x, MAX(b.val) AS y FROM link c \
+             JOIN obj_attr a ON a.oid = c.oid AND a.aid = 7 LEFT JOIN obj_attr b ON b.oid = c.oid \
+             GROUP BY c.gid, c.oid",
+        );
+        assert_eq!(route(&v, "kind").reach, None);
+        // A pinned child whose own cascade continues into an alias not joined to it on that
+        // FK: the rows a key outside the pins removes there may be read, so no bound; joined
+        // on the FK, the bound holds.
+        let v = plan(
+            "SELECT a.id, a.val, k.kid FROM obj_attr a JOIN kind k ON k.kid = a.val AND k.rid = 3",
+        );
+        assert_eq!(route(&v, "realm").reach, None);
+        let v = plan(
+            "SELECT a.id, a.val, k.kid FROM obj_attr a JOIN kind k ON k.kid = a.aid AND k.rid = 3",
+        );
+        let r = route(&v, "realm");
+        assert_eq!(r.reach, Some((0, vec![Datum::Int(3)])), "{r:?}");
+        // A unit alias whose unit is not the FK: covered only by its filters on the FK.
+        let v = plan("SELECT a.id, a.val FROM obj_attr a WHERE a.aid = 7");
+        assert!(v.aliases[0].direct_unit.is_some());
+        let k = route(&v, "kind");
+        assert!(k.derived && k.pinned.len() == 1, "{k:?}");
+        // Select/join: the FK value itself, selected by value.
+        assert_eq!(v.presence.len(), 1);
+        assert_eq!(v.presence[0].expr, "`a`.`aid`");
+        assert_eq!(v.presence[0].marks(&Datum::Int(7)), "`_lv_c0` = 7");
+        assert!(route(&v, "obj").untraced.is_some() && !route(&v, "obj").derived);
+    }
+
+    /// Derived cascade routes do not depend on how the query is written: the same routes, pins
+    /// and partial keys for permuted joins, the FK equality in the WHERE or the ON (comma joins
+    /// too), the pin as `=`, a one-element IN or with swapped sides, the view wrapped in a CTE or
+    /// a derived table with renamed outputs, and the target id not selected. A pin on a
+    /// composite FK is not followed (presence needs one FK column): untraced. The keys that can
+    /// reach the view (`reach`) are the same per formulation too, also on an untraced route.
+    #[test]
+    fn derived_cascades_per_formulation() {
+        use crate::catalog::{FkAction, ForeignKey};
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let fk = |parent: &str, child_cols: Vec<usize>, parent_cols: &[&str]| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols,
+            parent_cols: parent_cols.iter().map(|c| c.to_string()).collect(),
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let with_fk = |t: (TableRef, Arc<TableInfo>), f: Vec<ForeignKey>| {
+            let mut i = (*t.1).clone();
+            i.cascades = f;
+            (t.0, Arc::new(i))
+        };
+        let cat: HashMap<_, _> = [
+            typed("kind", vec![int("kid", "smallint unsigned")], &[0]),
+            typed("pair", vec![int("p1", "int"), int("p2", "int")], &[0, 1]),
+            typed("obj", vec![int("oid", "int unsigned")], &[0]),
+            typed(
+                "link",
+                vec![int("gid", "int"), int("oid", "int unsigned")],
+                &[0, 1],
+            ),
+            with_fk(
+                typed(
+                    "obj_attr",
+                    vec![
+                        int("id", "int"),
+                        int("oid", "int unsigned"),
+                        int("aid", "smallint unsigned"),
+                        int("p1", "int"),
+                        int("p2", "int"),
+                        int("val", "int"),
+                    ],
+                    &[0],
+                ),
+                vec![
+                    fk("obj", vec![1], &["oid"]),
+                    fk("kind", vec![2], &["kid"]),
+                    fk("pair", vec![3, 4], &["p1", "p2"]),
+                ],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        // Per parent: how its cascade is followed (pins as their values, presence order apart).
+        let routes = |sql: &str| -> BTreeMap<String, String> {
+            let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+            let v = crate::analyzer::plan(&d, "db", &cat).unwrap();
+            assert_eq!(v.mode, Mode::Grouped, "{sql}");
+            v.cascades
+                .iter()
+                .map(|c| {
+                    let how = if c.unit_from_parent.is_some() {
+                        "unit".to_string()
+                    } else if c.traced {
+                        "traced".to_string()
+                    } else if c.derived {
+                        let pins: Vec<Vec<Datum>> = c
+                            .pinned
+                            .iter()
+                            .map(|p| p.values.iter().map(|(d, _)| d.clone()).collect())
+                            .collect();
+                        format!(
+                            "derived partial={:?} pins={pins:?}",
+                            c.partial_from_parent
+                                .iter()
+                                .map(|(s, _)| v.partial.sets[*s].clone())
+                                .collect::<Vec<_>>()
+                        )
+                    } else {
+                        "rebuild".to_string()
+                    };
+                    let reach = c.reach.as_ref().map(|(_, v)| v);
+                    (c.parent.name.clone(), format!("{how} reach={reach:?}"))
+                })
+                .collect()
+        };
+        use std::collections::BTreeMap;
+        let base = "SELECT c.gid, c.oid, MAX(a.val) AS x FROM link c \
+                    JOIN obj_attr a ON a.oid = c.oid AND a.aid = 7 GROUP BY c.gid, c.oid";
+        let want = routes(base);
+        assert_eq!(want["obj"], "derived partial=[[1]] pins=[] reach=None");
+        assert_eq!(
+            want["kind"],
+            "derived partial=[] pins=[[Int(7)]] reach=Some([Int(7)])"
+        );
+        assert_eq!(want["pair"], "rebuild reach=None");
+        // Untraced (a HAVING over the NULL-side pinned alias) but bounded by the pin.
+        let bounded = "SELECT c.gid, c.oid, MAX(b.val) AS y FROM link c LEFT JOIN obj_attr b \
+                       ON b.oid = c.oid AND b.aid = 8 GROUP BY c.gid, c.oid HAVING MAX(b.val) IS NULL";
+        let want_bounded = routes(bounded);
+        assert_eq!(want_bounded["kind"], "rebuild reach=Some([Int(8)])");
+        for sql in [
+            "SELECT c.gid, c.oid, MAX(b.val) AS y FROM link c LEFT JOIN obj_attr b \
+             ON 8 = b.aid AND c.oid = b.oid GROUP BY c.gid, c.oid HAVING MAX(b.val) IS NULL",
+            "SELECT c.gid, c.oid, MAX(b.val) AS y FROM link c LEFT JOIN obj_attr b \
+             ON b.oid = c.oid AND b.aid IN (8) GROUP BY c.gid, c.oid HAVING MAX(b.val) IS NULL",
+            "SELECT MAX(b.val) AS y FROM link c LEFT JOIN obj_attr b ON b.oid = c.oid \
+             AND b.aid = 8 GROUP BY c.gid, c.oid HAVING MAX(b.val) IS NULL",
+            "SELECT d.g, d.ob, MAX(d.v) AS y FROM (SELECT c.gid AS g, c.oid AS ob, b.val AS v \
+             FROM link c LEFT JOIN obj_attr b ON b.oid = c.oid AND b.aid = 8) d \
+             GROUP BY d.g, d.ob HAVING MAX(d.v) IS NULL",
+        ] {
+            assert_eq!(routes(sql), want_bounded, "{sql}");
+        }
+        for sql in [
+            "SELECT c.gid, c.oid, MAX(a.val) AS x FROM obj_attr a JOIN link c ON c.oid = a.oid \
+             WHERE a.aid = 7 GROUP BY c.gid, c.oid",
+            "SELECT c.gid, c.oid, MAX(a.val) AS x FROM link c, obj_attr a \
+             WHERE a.oid = c.oid AND a.aid IN (7) GROUP BY c.gid, c.oid",
+            "SELECT c.gid, c.oid, MAX(a.val) AS x FROM link c JOIN obj_attr a \
+             ON 7 = a.aid AND c.oid = a.oid GROUP BY c.gid, c.oid",
+            "WITH w AS (SELECT c.gid AS g, c.oid AS ob, a.val AS v FROM link c \
+             JOIN obj_attr a ON a.oid = c.oid AND a.aid = 7) \
+             SELECT g AS grp, ob AS object, MAX(v) AS x FROM w GROUP BY g, ob",
+            "SELECT d.g, d.ob, MAX(d.v) AS x FROM (SELECT c.gid AS g, c.oid AS ob, a.val AS v \
+             FROM link c JOIN obj_attr a ON a.oid = c.oid WHERE a.aid = 7) d GROUP BY d.g, d.ob",
+            "SELECT MAX(a.val) AS x FROM link c JOIN obj_attr a ON a.oid = c.oid AND a.aid = 7 \
+             GROUP BY c.gid, c.oid",
+        ] {
+            assert_eq!(routes(sql), want, "{sql}");
+        }
+    }
+
     #[test]
     fn parse_noise() {
         let d = parse_definition(
@@ -4965,7 +5605,7 @@ mod tests {
             "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id \
              WHERE p.id IS NULL OR p.active = 1",
             "pars",
-            "does not read `pars` through a unit or lineage alias",
+            "does not read `pars` through a unit, partial or lineage alias",
         );
     }
 
