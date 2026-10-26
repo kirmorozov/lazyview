@@ -198,12 +198,12 @@ impl Column {
     }
 
     /// Drops the `COLLATE` of a string param when the column has `default`, the collation that
-    /// `CONVERT(... USING charset)` yields on the server. The param then has the column's own
-    /// IMPLICIT coercibility; an EXPLICIT one clashes with any `COLLATE` in the view definition
-    /// ("Illegal mix of collations").
+    /// `CAST(... AS CHAR CHARACTER SET charset)` yields on the server. The param then has the
+    /// column's own IMPLICIT coercibility; an EXPLICIT one clashes with any `COLLATE` in the view
+    /// definition ("Illegal mix of collations").
     pub fn with_default_collation(mut self, default: Option<&str>) -> Column {
         if let (Some(cs), Some(co), Some(d)) = (&self.charset, &self.collation, default) {
-            if co.eq_ignore_ascii_case(d) && self.param.starts_with("CONVERT(") {
+            if co.eq_ignore_ascii_case(d) && self.param.starts_with(TEXT_PARAM_PREFIX) {
                 self.param = text_param(cs, None);
             }
         }
@@ -211,11 +211,15 @@ impl Column {
     }
 }
 
-/// Typed placeholder for a string value: its bytes in the column's charset (and collation).
+const TEXT_PARAM_PREFIX: &str = "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET ";
+
+/// Typed placeholder for a string value: its bytes in the column's charset (and collation). Not
+/// `CONVERT(CAST(? AS BINARY) USING charset)`: MariaDB replaces every byte that is not valid in
+/// the connection's character set (utf8mb4) with `?` there, so latin1 `ï` (0xEF) is lost.
 fn text_param(charset: &str, collation: Option<&str>) -> String {
     match collation {
-        Some(co) => format!("CONVERT(CAST(? AS BINARY) USING {charset}) COLLATE {co}"),
-        None => format!("CONVERT(CAST(? AS BINARY) USING {charset})"),
+        Some(co) => format!("{TEXT_PARAM_PREFIX}{charset}) COLLATE {co}"),
+        None => format!("{TEXT_PARAM_PREFIX}{charset})"),
     }
 }
 
@@ -298,7 +302,7 @@ pub type TableRef = (String, String);
 #[derive(Default)]
 pub struct Catalog {
     tables: HashMap<TableRef, Arc<TableInfo>>,
-    /// Charset -> collation of `CONVERT(... USING charset)` (None: unknown).
+    /// Charset -> collation of `CAST(... AS CHAR CHARACTER SET charset)` (None: unknown).
     default_collations: HashMap<String, Option<String>>,
 }
 
@@ -591,8 +595,8 @@ fn generated_deps(expr: &str, names: &[String]) -> Option<Vec<usize>> {
     Some(deps)
 }
 
-/// The collation `CONVERT(... USING charset)` yields on this server (its default for the
-/// charset, which MariaDB's `character_set_collations` can override). None if unknown.
+/// The collation `CAST(... AS CHAR CHARACTER SET charset)` yields on this server (its default for
+/// the charset, which MariaDB's `character_set_collations` can override). None if unknown.
 async fn default_collation(conn: &mut Conn, charset: &str) -> Option<String> {
     if charset.is_empty()
         || !charset
@@ -602,7 +606,7 @@ async fn default_collation(conn: &mut Conn, charset: &str) -> Option<String> {
         return None;
     }
     conn.query_first::<Option<String>, _>(format!(
-        "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
+        "SELECT CAST(COLLATION(CAST(CAST('' AS BINARY) AS CHAR CHARACTER SET {charset})) AS CHAR)"
     ))
     .await
     .ok()
@@ -821,13 +825,13 @@ mod tests {
         );
         assert_eq!(
             s.param,
-            "CONVERT(CAST(? AS BINARY) USING utf8mb4) COLLATE utf8mb4_0900_ai_ci"
+            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_0900_ai_ci"
         );
         assert_eq!(
             s.clone()
                 .with_default_collation(Some("utf8mb4_0900_ai_ci"))
                 .param,
-            "CONVERT(CAST(? AS BINARY) USING utf8mb4)"
+            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET utf8mb4)"
         );
         assert_eq!(
             s.clone()
@@ -837,6 +841,22 @@ mod tests {
             "a non-default collation stays explicit"
         );
         assert_eq!(s.clone().with_default_collation(None).param, s.param);
+        // A non-UTF8 charset: the bytes are reinterpreted, never converted (MariaDB turns
+        // invalid utf8mb4 into '?' inside CONVERT(... USING ...)).
+        let l = Column::new(
+            "l",
+            "varchar",
+            "varchar(5)",
+            Some("latin1"),
+            Some("latin1_swedish_ci"),
+            Some(5),
+            true,
+        );
+        assert_eq!(
+            l.param,
+            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1) COLLATE latin1_swedish_ci"
+        );
+        assert!(!l.exact_key(), "latin1 binlog bytes are not unit keys");
         let i = Column::simple("i", "int");
         assert_eq!(i.clone().with_default_collation(Some("x")).param, i.param);
         let e = Column::new(
