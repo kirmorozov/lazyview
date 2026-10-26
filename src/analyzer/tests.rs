@@ -2811,6 +2811,18 @@ fn formulation_catalog() -> HashMap<TableRef, Arc<TableInfo>> {
             vec![],
         ),
         (
+            "link2",
+            vec![col("id", false), col("link_id", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "link3",
+            vec![col("id", false), col("link2_id", false)],
+            vec![0],
+            vec![],
+        ),
+        (
             "item",
             vec![col("id", false), col("ent_id", false), col("v", false)],
             vec![0],
@@ -3152,7 +3164,8 @@ fn known_limit_unit_follows_from_order() {
 /// as its written NOT EXISTS twin: the column's table followed by an inner, comma or LEFT join;
 /// the cascade forms with another table after the parent; a derived table / CTE inner- or
 /// comma-joined after another table; a multi-table inner block (the column on the head or on an
-/// inner-joined table); the NOT IN column not selected and not the first output.
+/// inner-joined table); the column's table or a derived table in the middle of a chain, two or
+/// three joins from the unit; the NOT IN column not selected and not the first output.
 #[test]
 fn not_in_twins_across_join_placements() {
     let cat = formulation_catalog();
@@ -3174,6 +3187,44 @@ fn not_in_twins_across_join_placements() {
         ("WITH t AS (SELECT e.id AS eid FROM entity e) SELECT l.id FROM link l JOIN t ON t.eid = l.ent_id WHERE {P}", "t.eid", attr, "l:unit,e:lineage,a:lookup"),
         ("SELECT x.lid FROM (SELECT l.id AS lid, e.id AS eid FROM link l JOIN entity e ON e.id = l.ent_id) x WHERE {P}", "x.eid", attr, "l:unit,e:lineage,a:lookup"),
         ("SELECT x.eid FROM (SELECT e.id AS eid, l.id AS lid FROM entity e JOIN link l ON l.ent_id = e.id) x WHERE {P}", "x.eid", attr, "e:unit,l:unit,a:unit"),
+        // The column's table (or a derived table) in the middle of a chain: inner-joined and
+        // followed by an inner, comma or LEFT join; and two or three joins away from the unit.
+        (
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id JOIN attr b ON b.ent_id = e.id WHERE {P}",
+            "e.id",
+            attr,
+            "l:unit,e:lineage,b:lineage,a:lookup",
+        ),
+        (
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id, attr b WHERE b.ent_id = e.id AND {P}",
+            "e.id",
+            attr,
+            "l:unit,e:lineage,b:lineage,a:lookup",
+        ),
+        (
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id LEFT JOIN attr b ON b.ent_id = e.id WHERE {P}",
+            "e.id",
+            attr,
+            "l:unit,e:lineage,b:lineage,a:lookup",
+        ),
+        (
+            "SELECT l.id FROM link l JOIN (SELECT e.id AS eid FROM entity e) x ON x.eid = l.ent_id JOIN attr b ON b.ent_id = x.eid WHERE {P}",
+            "x.eid",
+            attr,
+            "l:unit,e:lineage,b:lineage,a:lookup",
+        ),
+        (
+            "SELECT m.id FROM link2 m JOIN link l ON l.id = m.link_id JOIN entity e ON e.id = l.ent_id WHERE {P}",
+            "e.id",
+            attr,
+            "m:unit,l:lineage,e:lineage,a:lookup",
+        ),
+        (
+            "SELECT n.id FROM link3 n JOIN link2 m ON m.id = n.link2_id JOIN link l ON l.id = m.link_id JOIN entity e ON e.id = l.ent_id WHERE {P}",
+            "e.id",
+            attr,
+            "n:unit,m:lineage,l:lineage,e:lineage,a:lookup",
+        ),
         // The NOT IN column not selected and not the derived block's first output.
         ("SELECT e.v FROM entity e WHERE {P}", "e.id", attr, "e:unit,a:unit"),
         ("SELECT x.v FROM (SELECT e.v AS v, e.id AS eid FROM entity e) x WHERE {P}", "x.eid", attr, "e:unit,a:unit"),
