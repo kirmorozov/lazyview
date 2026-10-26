@@ -862,6 +862,8 @@ pub struct Txn {
     pub label: String,
     pub stmts: Vec<String>,
     pub rollback: bool,
+    /// Deletes a row and re-creates it by the same primary key (see [`run_txn`]).
+    pub retry_duplicate: bool,
 }
 
 /// Random transaction generator over the e-commerce schema.
@@ -949,6 +951,7 @@ impl Workload {
             *self.stats.entry("(rollback)").or_default() += 1;
         }
         vec![Txn {
+            retry_duplicate: labels.contains(&"fk_recreate"),
             label: labels.join("+"),
             stmts,
             rollback,
@@ -994,6 +997,7 @@ impl Workload {
                 label: format!("hammer({id})"),
                 stmts: c.to_vec(),
                 rollback: false,
+                retry_duplicate: false,
             })
             .collect()
     }
@@ -1002,7 +1006,9 @@ impl Workload {
     pub fn op(&mut self) -> (&'static str, Vec<String>) {
         let w = self.g.range(0, 111);
         if w >= 100 {
-            return ("fk", self.fk_op(w - 100));
+            // (fk_op's last arm, 10 and 11, deletes a seeded group and re-creates it by id.)
+            let label = if w >= 110 { "fk_recreate" } else { "fk" };
+            return (label, self.fk_op(w - 100));
         }
         match w {
             0..=9 => ("new_order", self.new_order()),
@@ -1539,7 +1545,14 @@ impl Workload {
 // Execution
 // ---------------------------------------------------------------------------------------------
 
-/// Runs one transaction, retrying the whole transaction on deadlock / lock wait timeout.
+/// Runs one transaction, retrying the whole transaction on deadlock / lock wait timeout, and on
+/// a duplicate key for transactions that delete a row and re-create it by the same primary key
+/// (`retry_duplicate`): MySQL 26.x checks and cascades foreign keys in the SQL layer
+/// (`innodb_native_foreign_keys=OFF`), and while DDL runs in the same schema (the engine's
+/// probe views and shadow tables during its builds) the re-INSERT can fail with ERROR 1062
+/// although the same transaction just deleted the row. Reproduced with two writers replaying
+/// the fk ops and a third session creating and dropping views and tables: 19 and 2 errors in
+/// 3,000 transactions on 26.7 (durable / local settings), none without the DDL, none on 8.4.
 pub async fn run_txn(conn: &mut Conn, t: &Txn) -> Result<()> {
     let mut attempt = 0;
     loop {
@@ -1560,7 +1573,8 @@ pub async fn run_txn(conn: &mut Conn, t: &Txn) -> Result<()> {
             Err(e) => {
                 let _ = conn.query_drop("ROLLBACK").await;
                 let code = server_code(&e);
-                if matches!(code, Some(1213) | Some(1205)) && attempt < 30 {
+                let duplicate = t.retry_duplicate && code == Some(1062);
+                if (matches!(code, Some(1213) | Some(1205)) || duplicate) && attempt < 30 {
                     tokio::time::sleep(Duration::from_millis(5 * attempt)).await;
                     continue;
                 }

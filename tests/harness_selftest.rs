@@ -12,7 +12,8 @@ use std::sync::Arc;
 use anyhow::{bail, ensure};
 use common::oracle::{diff_tables, hand_materialize, Table};
 use common::workload::{
-    ecommerce_views, run_batches, run_concurrent, seed_statements, setup_ecommerce, Sizes, Workload,
+    ecommerce_views, run_batches, run_concurrent, run_txn, seed_statements, setup_ecommerce, Sizes,
+    Txn, Workload,
 };
 use common::*;
 
@@ -386,4 +387,55 @@ fn dump_workload() {
     let path = repo_dir().join(format!("tmp/out/workload-{seed}.sql"));
     std::fs::write(&path, out).unwrap();
     println!("wrote {}", path.display());
+}
+
+/// run_txn retries a duplicate key (ERROR 1062) for transactions that delete a row and
+/// re-create it by its key (`retry_duplicate`, MySQL 26.x with DDL in the schema) and fails on it
+/// otherwise: here the re-created key is held by another row until a second session removes it.
+#[test]
+fn selftest_duplicate_key_retry() {
+    scenario("selftest_dup", |ctx| async move {
+        let db = ctx.new_db("selftest_dup").await?;
+        let mut c = db.conn().await?;
+        exec(
+            &mut c,
+            "CREATE TABLE entity (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+        )
+        .await?;
+        exec(&mut c, "INSERT INTO entity VALUES (1, 'held'), (2, 'item')").await?;
+        let txn = |retry_duplicate| Txn {
+            label: "recreate".into(),
+            stmts: vec![
+                "DELETE FROM entity WHERE id = 2".into(),
+                "INSERT INTO entity (id, name) VALUES (1, 'reborn')".into(),
+            ],
+            rollback: false,
+            retry_duplicate,
+        };
+        let e = run_txn(&mut c, &txn(false)).await.unwrap_err();
+        ensure!(
+            server_code(&e) == Some(1062),
+            "expected ERROR 1062, got {e:#}"
+        );
+        ensure!(
+            scalar_i64(&mut c, "SELECT COUNT(*) FROM entity").await? == 2,
+            "the failed transaction was rolled back"
+        );
+        let dbc = db.clone();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let mut c = dbc.conn().await?;
+            exec(&mut c, "DELETE FROM entity WHERE id = 1").await
+        });
+        run_txn(&mut c, &txn(true)).await?;
+        release.await??;
+        ensure!(
+            scalar(&mut c, "SELECT GROUP_CONCAT(name ORDER BY id) FROM entity")
+                .await?
+                .as_deref()
+                == Some("reborn"),
+            "the retried transaction applied once"
+        );
+        Ok(())
+    });
 }
