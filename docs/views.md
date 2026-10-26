@@ -214,6 +214,12 @@ How full mode behaves:
   straight from the binlog row, without a query. This needs columns of the same type family
   (integers with integers, decimals with decimals, strings with the same character set and
   collation). `TIMESTAMP`, `JSON`, `FLOAT`, `DOUBLE` and `YEAR` keys always use a lookup query.
+* A changed row only counts for a table alias whose constant conditions it meets: `col = 97`,
+  `col IN (2, 3, 4)` or `col <=> 1` on an integer column, in that alias's own `ON` or in the
+  `WHERE`. An EAV table joined once per attribute (`JOIN catalog_product_entity_int s ON
+  s.entity_id = e.entity_id AND s.attribute_id = 97 AND s.store_id = 0`) therefore sends each
+  changed value row only to the aliases of its own attribute and store, so a save that touches
+  several attributes of one entity stays a small incremental refresh.
 * A join without any condition between a table and the rest (`FROM orders o JOIN regions r`,
   `CROSS JOIN`) makes the view full: every row of that table belongs to every output row.
 

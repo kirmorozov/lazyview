@@ -3252,3 +3252,309 @@ async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
     }
     eng.stop().await
 }
+
+/// EAV-shaped sources: one value table joined once per (attribute, store), each alias pinned by
+/// constant equalities. Seeded so that every attribute row an alias reads exists where needed:
+/// (97, 0), (97, 1), (99, 0), (103, 0), (200, 0) for every entity, the others for some.
+const EAV_DDL: &[&str] = &[
+    "CREATE TABLE ent (entity_id INT UNSIGNED PRIMARY KEY, sku VARCHAR(20) NOT NULL)",
+    "CREATE TABLE ent_cat (category_id INT UNSIGNED NOT NULL, entity_id INT UNSIGNED NOT NULL, \
+     position INT NOT NULL, PRIMARY KEY (category_id, entity_id))",
+    "CREATE TABLE ent_int (value_id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+     entity_id INT UNSIGNED NOT NULL, attribute_id SMALLINT UNSIGNED NOT NULL, \
+     store_id SMALLINT UNSIGNED NOT NULL, value INT NULL, \
+     UNIQUE KEY eav (entity_id, attribute_id, store_id))",
+];
+
+fn eav_seed() -> Vec<String> {
+    let mut ent = Vec::new();
+    let mut cat = Vec::new();
+    let mut int = Vec::new();
+    for e in 1..=24u32 {
+        ent.push(format!("({e}, 'sku{e}')"));
+        cat.push(format!("({}, {e}, {})", 1 + e % 3, e * 10));
+        if e % 2 == 0 {
+            cat.push(format!("(4, {e}, {e})"));
+        }
+        let mut attr = |a: u32, s: u32, v: &str| int.push(format!("({e}, {a}, {s}, {v})"));
+        attr(97, 0, &(1 + e % 2).to_string());
+        attr(97, 1, if e % 3 == 0 { "NULL" } else { "1" });
+        attr(99, 0, &(1 + e % 4).to_string());
+        if e % 4 == 0 {
+            attr(99, 1, "4");
+        }
+        if e % 2 == 1 {
+            attr(101, 0, &(e * 3).to_string());
+        }
+        if e % 5 == 0 {
+            attr(102, 0, &(e * 7).to_string());
+        }
+        attr(103, 0, &(e % 7).to_string());
+        if e % 2 == 0 {
+            attr(104, 0, "1");
+        }
+        attr(200, 0, "0");
+    }
+    vec![
+        format!("INSERT INTO ent VALUES {}", ent.join(", ")),
+        format!("INSERT INTO ent_cat VALUES {}", cat.join(", ")),
+        format!(
+            "INSERT INTO ent_int (entity_id, attribute_id, store_id, value) VALUES {}",
+            int.join(", ")
+        ),
+    ]
+}
+
+/// The joins of the EAV views: seven aliases of `ent_int`, pinned in their own ON (also as
+/// `literal = col`, `<=>` and an IN list) or, for `s0`, in the WHERE.
+const EAV_JOINS: &str = "JOIN ent_int s0 ON s0.entity_id = e.entity_id \
+     LEFT JOIN ent_int s1 ON s1.entity_id = e.entity_id AND s1.attribute_id = 97 AND s1.store_id = 1 \
+     JOIN ent_int v0 ON v0.entity_id = e.entity_id AND v0.attribute_id = 99 AND v0.store_id = 0 \
+     LEFT JOIN ent_int v1 ON v1.entity_id = e.entity_id AND 99 = v1.attribute_id AND v1.store_id <=> 1 \
+     LEFT JOIN ent_int p0 ON p0.entity_id = e.entity_id AND p0.attribute_id IN (101, 102) AND p0.store_id = 0 \
+     LEFT JOIN ent_int w0 ON w0.entity_id = e.entity_id AND w0.attribute_id = 103 AND w0.store_id = 0 \
+     LEFT JOIN ent_int n0 ON n0.entity_id = e.entity_id AND n0.attribute_id = 104 AND n0.store_id = 0 \
+     WHERE s0.attribute_id = 97 AND s0.store_id = 0";
+
+fn eav_views() -> Vec<ViewSpec> {
+    vec![
+        // Grouped by (category, entity): every alias of `ent_int` is resolved by lookups.
+        ViewSpec::new(
+            "r_eav_cat",
+            Kind::Incremental,
+            &format!(
+                "SELECT c.category_id, e.entity_id, MAX(c.position) AS pos, COUNT(*) AS n, \
+                 COALESCE(MAX(s1.value), MAX(s0.value)) AS status, \
+                 COALESCE(MAX(v1.value), MAX(v0.value)) AS vis, MAX(p0.value) AS tier, \
+                 MAX(w0.value) AS weight, MAX(n0.value) AS news \
+                 FROM ent_cat c JOIN ent e ON e.entity_id = c.entity_id {EAV_JOINS} \
+                 GROUP BY c.category_id, e.entity_id"
+            ),
+        ),
+        // Select/join over the category links: the aliases are traced by lineage.
+        ViewSpec::new(
+            "r_eav_rows",
+            Kind::Incremental,
+            &format!(
+                "SELECT c.category_id, c.entity_id, c.position, e.sku, s0.value AS status, \
+                 s1.value AS status_s1, v0.value AS vis, v1.value AS vis_s1, \
+                 p0.attribute_id AS tier_attr, p0.value AS tier, w0.value AS weight, n0.value AS news \
+                 FROM ent_cat c JOIN ent e ON e.entity_id = c.entity_id {EAV_JOINS}"
+            ),
+        ),
+        // Grouped by entity: the aliases give units straight from the row images.
+        ViewSpec::new(
+            "r_eav_entity",
+            Kind::Incremental,
+            &format!(
+                "SELECT e.entity_id, MAX(s0.value) AS status, MAX(s1.value) AS status_s1, \
+                 MAX(v0.value) AS vis, MAX(v1.value) AS vis_s1, SUM(p0.value) AS tier, \
+                 MAX(w0.value) AS weight, MAX(n0.value) AS news \
+                 FROM ent e {EAV_JOINS} GROUP BY e.entity_id"
+            ),
+        ),
+    ]
+}
+
+/// Rebuild storm on EAV views (m2-cdc, 2026-10-25): an entity save updates several rows of the
+/// same value table in one transaction, and every row change was recorded for every alias of the
+/// table, whatever its attribute / store constants. Each save then gave images to all seven
+/// lookup aliases, more than the lookups combine (`lookback::MAX_TABLES`), and the grouped view
+/// was rebuilt instead of refreshed, over and over under ordinary writes. A row an alias's
+/// constant filters reject is never that alias's row, so concurrent single-entity saves stay
+/// incremental; rows also move into and out of the filters (attribute and store changes).
+#[test]
+fn reg_eav_aliases_see_only_their_rows() {
+    scenario("reg_eav_prune", |ctx| async move {
+        let specs = eav_views();
+        let mut ddl: Vec<String> = EAV_DDL.iter().map(|s| s.to_string()).collect();
+        ddl.extend(eav_seed());
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let (db, mut eng) = setup(&ctx, "reg_eav_prune", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let before = eng.snapshot();
+        // Concurrent entity saves: status and visibility (store 0), status (store 1) and an
+        // attribute no view reads, one entity per transaction, each writer its own entities.
+        let mut writers = Vec::new();
+        for w in 0..4u32 {
+            let dsn = db.dsn.clone();
+            writers.push(tokio::spawn(async move {
+                let mut c = connect(&dsn).await?;
+                for i in 0..40u32 {
+                    let e = 1 + w + 4 * (i % 6);
+                    let set = |a: u32, s: u32, v: u32| {
+                        format!(
+                            "UPDATE ent_int SET value = {v} WHERE entity_id = {e} \
+                             AND attribute_id = {a} AND store_id = {s}"
+                        )
+                    };
+                    let stmts = [
+                        "START TRANSACTION".to_string(),
+                        set(97, 0, 1 + (i + w) % 2),
+                        set(99, 0, 1 + (i * 3 + w) % 4),
+                        set(97, 1, 1 + i % 2),
+                        set(200, 0, i),
+                        "COMMIT".to_string(),
+                    ];
+                    for s in &stmts {
+                        exec(&mut c, s).await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        for w in writers {
+            w.await.context("writer panicked")??;
+        }
+        verify(&ctx, &mut eng, &db, &specs, "concurrent entity saves").await?;
+        let saves = eng.snapshot().since(&before);
+        ctx.log(format!("after 160 entity saves: {}", fmt_snapshot(&saves)));
+        // Rows moving into and out of the aliases' filters.
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "attribute moves from one alias to another (103 -> 104)",
+                &["UPDATE ent_int SET attribute_id = 104 WHERE entity_id = 1 AND attribute_id = 103 AND store_id = 0"],
+            ),
+            (
+                "attribute moves out of every alias (104 -> 201)",
+                &["UPDATE ent_int SET attribute_id = 201 WHERE entity_id = 1 AND attribute_id = 104 AND store_id = 0"],
+            ),
+            (
+                "attribute moves back into an alias (201 -> 103), value changed with it",
+                &["UPDATE ent_int SET attribute_id = 103, value = 42 WHERE entity_id = 1 AND attribute_id = 201"],
+            ),
+            (
+                "store moves out of an alias (99: 1 -> 2), another row's value changes in it",
+                &[
+                    "UPDATE ent_int SET store_id = 2 WHERE entity_id = 4 AND attribute_id = 99 AND store_id = 1",
+                    "UPDATE ent_int SET store_id = 1, value = 3 WHERE entity_id = 8 AND attribute_id = 99 AND store_id = 1",
+                ],
+            ),
+            (
+                "store moves back in",
+                &["UPDATE ent_int SET store_id = 1 WHERE entity_id = 4 AND attribute_id = 99 AND store_id = 2"],
+            ),
+            (
+                "attribute moves within an IN list (101 -> 102)",
+                &["UPDATE ent_int SET attribute_id = 102 WHERE entity_id = 3 AND attribute_id = 101"],
+            ),
+            (
+                "the inner-joined alias's row moves out (entity leaves) and back",
+                &[
+                    "START TRANSACTION",
+                    "UPDATE ent_int SET attribute_id = 98 WHERE entity_id = 6 AND attribute_id = 97 AND store_id = 0",
+                    "UPDATE ent_int SET store_id = 3 WHERE entity_id = 7 AND attribute_id = 97 AND store_id = 0",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "they come back in one transaction with other changes",
+                &[
+                    "START TRANSACTION",
+                    "UPDATE ent_int SET attribute_id = 97 WHERE entity_id = 6 AND attribute_id = 98",
+                    "UPDATE ent_int SET store_id = 0 WHERE entity_id = 7 AND attribute_id = 97 AND store_id = 3",
+                    "UPDATE ent_int SET value = 5 WHERE entity_id = 7 AND attribute_id = 99 AND store_id = 0",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "unread attributes inserted, changed, deleted",
+                &[
+                    "INSERT INTO ent_int (entity_id, attribute_id, store_id, value) VALUES (5, 300, 0, 1), (5, 97, 2, 1)",
+                    "UPDATE ent_int SET value = 2 WHERE entity_id = 5 AND attribute_id IN (300, 200)",
+                    "DELETE FROM ent_int WHERE entity_id = 5 AND (attribute_id = 300 OR store_id = 2)",
+                ],
+            ),
+            (
+                "read rows deleted, re-inserted and re-keyed",
+                &[
+                    "DELETE FROM ent_int WHERE entity_id = 9 AND attribute_id IN (97, 103)",
+                    "INSERT INTO ent_int (entity_id, attribute_id, store_id, value) VALUES (9, 97, 0, 2), (9, 104, 0, 7)",
+                    "UPDATE ent_int SET value_id = value_id + 100000 WHERE entity_id = 10 AND attribute_id = 99 AND store_id = 0",
+                ],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        let d = eng.snapshot().since(&before);
+        ctx.log(format!("whole run: {}", fmt_snapshot(&d)));
+        ensure!(
+            d.full_rebuilds == 0 && d.lookback_overflows == 0,
+            "single-entity saves rebuilt the views ({} rebuilds, {} lookback overflows): {}",
+            d.full_rebuilds,
+            d.lookback_overflows,
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
+/// Constant filters compare the decoded binlog value with the literal: at the ends of every
+/// integer range (signed and unsigned, 8 to 64 bits) a row moving into or out of an alias's
+/// filter must be seen by exactly that alias, also through a NULL and a STORED generated column.
+#[test]
+fn reg_const_filters_at_integer_extremes() {
+    scenario("reg_const_int", |ctx| async move {
+        let ddl = [
+            "CREATE TABLE ks (id INT PRIMARY KEY)",
+            "CREATE TABLE kv (id INT PRIMARY KEY, ts TINYINT NULL, tu TINYINT UNSIGNED NULL, \
+             ms MEDIUMINT NULL, mu MEDIUMINT UNSIGNED NULL, bs BIGINT NULL, bu BIGINT UNSIGNED NULL, \
+             g INT AS (ts + 1) STORED, v INT NOT NULL)",
+            "INSERT INTO ks VALUES (1), (2), (3)",
+            "INSERT INTO kv (id, ts, tu, ms, mu, bs, bu, v) VALUES (1, 0, 0, 0, 0, 0, 0, 10), \
+             (2, -128, 255, -8388608, 16777215, -9223372036854775808, 18446744073709551615, 20), \
+             (3, NULL, NULL, NULL, NULL, NULL, NULL, 30)",
+        ];
+        let specs = vec![ViewSpec::new(
+            "r_int_ends",
+            Kind::Incremental,
+            "SELECT k.id, a.v AS a, b.v AS b, c.v AS c, d.v AS d, f.v AS f, h.v AS h, j.v AS j \
+             FROM ks k \
+             LEFT JOIN kv a ON a.id = k.id AND a.ts = -128 \
+             LEFT JOIN kv b ON b.id = k.id AND b.tu = 255 \
+             LEFT JOIN kv c ON c.id = k.id AND c.ms IN (-8388608, 8388607) \
+             LEFT JOIN kv d ON d.id = k.id AND d.mu = 16777215 \
+             LEFT JOIN kv f ON f.id = k.id AND f.bs <=> -9223372036854775808 \
+             LEFT JOIN kv h ON h.id = k.id AND h.bu = 18446744073709551615 \
+             LEFT JOIN kv j ON j.id = k.id AND j.g = -127",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_const_int", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &str)] = &[
+            (
+                "row 1 moves into every filter",
+                "UPDATE kv SET ts = -128, tu = 255, ms = 8388607, mu = 16777215, \
+                 bs = -9223372036854775808, bu = 18446744073709551615, v = 11 WHERE id = 1",
+            ),
+            (
+                "row 2 moves out by one",
+                "UPDATE kv SET ts = -127, tu = 254, ms = -8388607, mu = 16777214, \
+                 bs = -9223372036854775807, bu = 18446744073709551614, v = 21 WHERE id = 2",
+            ),
+            (
+                "row 3 moves in from NULL",
+                "UPDATE kv SET ts = -128, tu = 255, ms = -8388608, mu = 16777215, \
+                 bs = -9223372036854775808, bu = 18446744073709551615, v = 31 WHERE id = 3",
+            ),
+            (
+                "row 1 moves out to NULL",
+                "UPDATE kv SET ts = NULL, tu = NULL, ms = NULL, mu = NULL, bs = NULL, bu = NULL, \
+                 v = 12 WHERE id = 1",
+            ),
+            (
+                "row 2 moves to the other end",
+                "UPDATE kv SET ts = 127, tu = 0, ms = 8388607, mu = 0, bs = 9223372036854775807, \
+                 bu = 0, v = 22 WHERE id = 2",
+            ),
+        ];
+        for (what, stmt) in steps {
+            run(&mut c, &[stmt]).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}

@@ -6,7 +6,7 @@ use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
 use roaring::RoaringTreemap;
 
-use crate::analyze::{AliasPlan, Mode, ViewPlan};
+use crate::analyze::{AliasPlan, ConstFilter, Mode, ViewPlan};
 use crate::catalog::FkAction;
 use crate::datum::{Datum, Key};
 
@@ -392,6 +392,14 @@ pub fn feed(
             return Fed::Skipped;
         }
     }
+    // A side failing the alias's constant filters is never its row (an EAV alias pinned to one
+    // attribute ignores the others): the change is an insert, a delete, or nothing to it.
+    let filters = plan.filters_of(alias);
+    let before = before.filter(|r| passes(r, a, filters));
+    let after = after.filter(|r| passes(r, a, filters));
+    if before.is_none() && after.is_none() {
+        return Fed::Skipped;
+    }
     if !matches!(plan.mode, Mode::Spj | Mode::Grouped) {
         dirty.all = true;
         return Fed::Recorded;
@@ -481,6 +489,19 @@ pub fn feed_cascade(
     Fed::Recorded
 }
 
+/// Whether `row` can be a row of alias `a` by its constant `filters`: a few comparisons of
+/// decoded integers, no allocation. A row that is not a full image, or lacks a value, passes.
+fn passes(row: &BinlogRow, a: &AliasPlan, filters: &[ConstFilter]) -> bool {
+    filters.is_empty()
+        || row.len() != a.table.columns.len()
+        || filters.iter().all(|f| match value_at(row, f.col) {
+            None => true,
+            v => f
+                .values
+                .contains(&Datum::from_binlog(v, &a.table.columns[f.col])),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +588,201 @@ mod tests {
         feed(&p, 1, &mut dirty, Some(&before), Some(&moved));
         let [old, new] = images(&before, &moved);
         assert!(dirty.images[1].contains(&old) && dirty.images[1].contains(&new));
+    }
+
+    /// Rows failing an alias's constant filters are not its rows: a change with both sides
+    /// failing is skipped, one with a side failing is recorded as the insert or delete of the
+    /// other side, for unit, lineage and lookup aliases alike.
+    #[test]
+    fn constant_filters_prune_rows() {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        use mysql_async::Value;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, TableInfo};
+
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>| {
+            let t = TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns,
+                pk,
+                unique_keys: vec![],
+                cascades: vec![],
+                is_view: false,
+                view_bases: vec![],
+            };
+            (("db".to_string(), name.to_string()), Arc::new(t))
+        };
+        let tables: std::collections::HashMap<_, _> = [
+            table("ent", vec![int("id", "int unsigned")], vec![0]),
+            table(
+                "cat",
+                vec![int("cid", "int"), int("eid", "int unsigned")],
+                vec![0, 1],
+            ),
+            table(
+                "val",
+                vec![
+                    int("id", "int"),
+                    int("e", "int unsigned"),
+                    int("attr", "smallint unsigned"),
+                    int("store", "smallint"),
+                    int("v", "int"),
+                ],
+                vec![0],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let view = |sql: &str| {
+            plan(
+                &parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap(),
+                "db",
+                &tables,
+            )
+            .unwrap()
+        };
+        let row = |id: i64, e: i64, attr: Option<i64>, store: i64| {
+            let cols: Arc<[mysql_async::Column]> = (0..5)
+                .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
+                .collect();
+            let v = |x: i64| Some(BinlogValue::Value(Value::Int(x)));
+            BinlogRow::new(
+                vec![
+                    v(id),
+                    v(e),
+                    Some(BinlogValue::Value(attr.map_or(Value::NULL, Value::Int))),
+                    v(store),
+                    v(id * 10),
+                ],
+                cols,
+            )
+        };
+        let (pass, pass2) = (row(1, 1, Some(97), 0), row(2, 2, Some(97), -1));
+        let (other, null) = (row(3, 3, Some(99), 0), row(4, 4, None, 0));
+        let other_store = row(5, 5, Some(97), 1);
+        // Lookup alias (grouped by category and entity): the images of the passing side only.
+        let p = view(
+            "SELECT c.cid, e.id, MAX(a.v) AS v FROM cat c JOIN ent e ON e.id = c.eid \
+             JOIN val a ON a.e = e.id AND a.attr = 97 AND a.store IN (0, -1) GROUP BY c.cid, e.id",
+        );
+        assert!(p.aliases[2].direct_unit.is_none() && p.lineage_of(2).is_none());
+        let a = &p.aliases[2];
+        let img = |r: &BinlogRow| project(r, a, &a.image_cols);
+        // (before, after, expected images; None: skipped)
+        let cases: [(Option<&BinlogRow>, Option<&BinlogRow>, Option<Vec<Key>>); 9] = [
+            (
+                Some(&pass),
+                Some(&pass2),
+                Some(vec![img(&pass), img(&pass2)]),
+            ),
+            (Some(&other), Some(&null), None),
+            (Some(&other_store), Some(&other), None),
+            (Some(&other), Some(&pass), Some(vec![img(&pass)])),
+            (Some(&pass), Some(&other_store), Some(vec![img(&pass)])),
+            (None, Some(&other), None),
+            (None, Some(&pass), Some(vec![img(&pass)])),
+            (Some(&null), None, None),
+            (Some(&pass2), None, Some(vec![img(&pass2)])),
+        ];
+        for (i, (b, af, want)) in cases.iter().enumerate() {
+            let mut d = ViewDirty::for_aliases(p.aliases.len());
+            let fed = feed(&p, 2, &mut d, *b, *af);
+            match want {
+                None => {
+                    assert_eq!(fed, Fed::Skipped, "case {i}");
+                    assert!(d.is_empty(), "case {i}: {d:?}");
+                }
+                Some(want) => {
+                    assert_eq!(fed, Fed::Recorded, "case {i}");
+                    let want: HashSet<Key> = want.iter().cloned().collect();
+                    assert_eq!(d.images[2], want, "case {i}");
+                    assert!(d.units.is_empty(), "case {i}");
+                }
+            }
+        }
+        // Lineage alias (select/join): the key of the passing side; a filter in the WHERE.
+        let p = view(
+            "SELECT c.cid, c.eid, a.v FROM cat c JOIN val a ON a.e = c.eid AND a.attr = 97 \
+             WHERE a.store = 0",
+        );
+        assert!(p.lineage_of(1).is_some());
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(feed(&p, 1, &mut d, Some(&other), Some(&null)), Fed::Skipped);
+        assert_eq!(
+            feed(&p, 1, &mut d, Some(&pass2), Some(&other)),
+            Fed::Skipped
+        );
+        assert!(d.is_empty());
+        assert_eq!(
+            feed(&p, 1, &mut d, Some(&pass), Some(&other)),
+            Fed::Recorded
+        );
+        assert_eq!(
+            d.images[1],
+            HashSet::from([Key::from([Datum::Int(1)])]),
+            "the key of the row that left"
+        );
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed(&p, 1, &mut d, Some(&other_store), Some(&pass)),
+            Fed::Recorded
+        );
+        assert_eq!(d.images[1], HashSet::from([Key::from([Datum::Int(1)])]));
+        // Unit alias (grouped by entity): units of the passing side only.
+        let p = view(
+            "SELECT e.id, MAX(a.v) AS v FROM ent e LEFT JOIN val a ON a.e = e.id AND a.attr = 97 \
+             AND a.store = 0 GROUP BY e.id",
+        );
+        assert!(p.aliases[1].direct_unit.is_some());
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed(&p, 1, &mut d, Some(&other), Some(&other_store)),
+            Fed::Skipped
+        );
+        assert_eq!(feed(&p, 1, &mut d, None, Some(&null)), Fed::Skipped);
+        assert!(d.is_empty());
+        assert_eq!(
+            feed(&p, 1, &mut d, Some(&other), Some(&pass)),
+            Fed::Recorded
+        );
+        assert_eq!(feed(&p, 1, &mut d, Some(&pass2), None), Fed::Skipped);
+        assert_eq!(
+            (d.units.len(), d.units.contains(&[Datum::Int(1)])),
+            (1, true),
+            "entity 1 (moved in), not 3 (its old row) nor 2 (another store)"
+        );
+        // Rows that are not full images pass (their values are not known).
+        let short = BinlogRow::new(
+            vec![Some(BinlogValue::Value(Value::Int(6)))],
+            (0..1)
+                .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
+                .collect(),
+        );
+        assert_eq!(feed(&p, 1, &mut d, None, Some(&short)), Fed::Recorded);
+        // Without filters nothing changes: every alias of the table sees every row.
+        let p =
+            view("SELECT e.id, MAX(a.v) AS v FROM ent e JOIN val a ON a.e = e.id GROUP BY e.id");
+        assert!(p.filters_of(1).is_empty());
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed(&p, 1, &mut d, Some(&other), Some(&null)),
+            Fed::Recorded
+        );
     }
 
     #[test]

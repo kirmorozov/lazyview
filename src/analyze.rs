@@ -18,7 +18,8 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Word};
 
-use crate::catalog::{ColKind, FkAction, TableInfo, TableRef};
+use crate::catalog::{ColKind, FkAction, TableInfo, TableRef, TypeFamily};
+use crate::datum::Datum;
 
 /// Placeholder table name used to render "FROM with one table replaced by literal rows".
 pub(crate) const SUBST_MARKER: &str = "__lv_subst_marker__";
@@ -741,6 +742,15 @@ pub struct AliasPlan {
     pub lookup_where: bool,
 }
 
+/// A constant filter of an alias (see `const_filters`): a row of its table is that alias's row
+/// in some row of the query only if column `col` holds one of `values`, as decoded from the
+/// binlog (`Datum::from_binlog`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstFilter {
+    pub col: usize,
+    pub values: Vec<Datum>,
+}
+
 /// Lineage of a lookup-resolved alias (select/join views): hidden, indexed materialized columns
 /// carrying the primary key of that alias's row in each materialized row. A changed row of the
 /// table maps to the materialized rows it is part of by an index lookup on the materialized
@@ -826,6 +836,8 @@ pub struct ViewPlan {
     /// subquery predicates (evaluated on the substituted rows instead) and without conjuncts that
     /// keep NULL-extended rows.
     pub lookup_where_sql: Option<String>,
+    /// Per alias of the FROM clause: its constant filters (aliases past the end have none).
+    pub alias_filters: Vec<Vec<ConstFilter>>,
 }
 
 impl ViewPlan {
@@ -941,6 +953,11 @@ impl ViewPlan {
                     || keyed(a)
                         .is_some_and(|n| self.lineage_of(a).is_some_and(|k| k.cols.len() == n))
             })
+    }
+
+    /// The constant filters of `alias`: a row failing one is never that alias's row.
+    pub fn filters_of(&self, alias: usize) -> &[ConstFilter] {
+        self.alias_filters.get(alias).map_or(&[], Vec::as_slice)
     }
 
     /// `SELECT DISTINCT <units> FROM ... WHERE ... AND <filter>`: the units of the current rows
@@ -1470,6 +1487,105 @@ fn null_rejecting(e: &Expr) -> bool {
     }
 }
 
+/// Constant filters of each FROM alias: the conjuncts of its own join condition (inner or LEFT
+/// JOIN ON) and of the WHERE clause that compare one of its columns with constants
+/// ([`const_filter`]). Each is NULL-rejecting and reads that alias alone, so a row failing it is
+/// never the alias's row in a row of the query: under its own ON it matches nothing (a LEFT JOIN
+/// NULL-extends, as it would without the row), and under the WHERE every joined row holding it
+/// is dropped, as is the NULL-extended row it could displace. Conjuncts of another table's ON are
+/// not this alias's (a LEFT JOIN keeps its preserved rows whatever they say).
+fn const_filters(
+    select: &Select,
+    joins: &[(usize, bool, JoinConstraint)],
+    scope: &Scope,
+) -> Vec<Vec<ConstFilter>> {
+    let mut out = vec![Vec::new(); scope.aliases.len()];
+    let own = joins.iter().filter_map(|(a, _, c)| match c {
+        JoinConstraint::On(e) => Some((Some(*a), e)),
+        _ => None,
+    });
+    for (only, e) in own.chain(select.selection.iter().map(|w| (None, w))) {
+        let mut cs = Vec::new();
+        conjuncts(e, &mut cs);
+        for ((a, col), values) in cs.into_iter().filter_map(|c| const_filter(c, scope)) {
+            if only.is_none_or(|o| o == a) {
+                out[a].push(ConstFilter { col, values });
+            }
+        }
+    }
+    out
+}
+
+/// `col = literal`, `literal = col`, `col <=> literal` or `col IN (literal, …)` over an integer
+/// column (signed or unsigned, not VIRTUAL) with integer literals: the column and the values it
+/// must hold. Row images carry such a column's value as the integer it is (as for unit keys)
+/// and SQL compares integers exactly, so a binlog value passes exactly when the condition holds
+/// for the row; NULL fails both (`<=>` with a non-NULL literal is FALSE). Other kinds convert
+/// (strings by collation and pad rules, temporal, decimal and inexact values): never filters.
+fn const_filter(e: &Expr, scope: &Scope) -> Option<(ColRef, Vec<Datum>)> {
+    let (col, lits) = match e {
+        Expr::Nested(x) => return const_filter(x, scope),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq | BinaryOperator::Spaceship,
+            right,
+        } => match scope.resolve(left) {
+            Some(_) => (left.as_ref(), vec![right.as_ref()]),
+            None => (right.as_ref(), vec![left.as_ref()]),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => (expr.as_ref(), list.iter().collect()),
+        _ => return None,
+    };
+    let c = scope.resolve(col)?;
+    let column = &scope.aliases[c.0].1.columns[c.1];
+    if column.family() != TypeFamily::Integer
+        || !matches!(column.kind, ColKind::Plain | ColKind::Unsigned(_))
+        || !column.exact_key()
+    {
+        return None;
+    }
+    let values = lits
+        .into_iter()
+        .map(int_literal)
+        .collect::<Option<Vec<_>>>()?;
+    Some((c, values))
+}
+
+/// An integer literal (`97`, `-1`, `TRUE`) as the datum of an integer column holding it.
+fn int_literal(e: &Expr) -> Option<Datum> {
+    fn value(e: &Expr) -> Option<i128> {
+        match e {
+            Expr::Nested(x) => value(x),
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => value(expr).map(|v| -v),
+            Expr::UnaryOp {
+                op: UnaryOperator::Plus,
+                expr,
+            } => value(expr),
+            Expr::Value(v) => match &v.value {
+                Value::Number(n, _) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                    n.parse().ok()
+                }
+                Value::Boolean(b) => Some(i128::from(*b)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let v = value(e)?;
+    match (i64::try_from(v), u64::try_from(v)) {
+        (Ok(i), _) => Some(Datum::Int(i)),
+        (_, Ok(u)) => Some(Datum::UInt(u)),
+        _ => None,
+    }
+}
+
 /// Column references in an expression (unresolvable identifiers are ignored).
 fn col_refs(e: &Expr, scope: &Scope) -> Vec<ColRef> {
     let mut out = Vec::new();
@@ -1698,6 +1814,7 @@ pub fn plan_block(
         order_limit_sql: None,
         window_sql: None,
         lookup_where_sql: None,
+        alias_filters: Vec::new(),
         unit_unique: false,
         lineage: Vec::new(),
         output_names: output_names.clone(),
@@ -2550,6 +2667,7 @@ pub fn plan_block(
                 .join(", ")
         ))
     };
+    let alias_filters = const_filters(select, &joins, &scope);
     Ok(ViewPlan {
         schema,
         name: def.name.clone(),
@@ -2595,6 +2713,7 @@ pub fn plan_block(
         lookup_where_sql: lookup_where
             .map(|w| w.join(" AND "))
             .filter(|w| !w.is_empty()),
+        alias_filters,
         unit_unique,
         lineage,
         cascades,
@@ -3813,6 +3932,180 @@ mod tests {
     fn p(sql: &str) -> ViewPlan {
         let d = parse_definition(sql).unwrap();
         plan_block(&d, "db", &catalog()).unwrap()
+    }
+
+    /// Constant filters per FROM alias: `col = lit`, `lit = col`, `col <=> lit` and IN lists of
+    /// integer literals over integer columns, from the alias's own ON or from a WHERE conjunct
+    /// over it alone; nothing that converts, negates, combines or reads other tables.
+    #[test]
+    fn const_filters_per_alias() {
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let mut virt = int("g", "int");
+        virt.generated = Some(crate::catalog::Generated {
+            expr: "(`e` + 1)".into(),
+            stored: false,
+            deps: Some(vec![1]),
+        });
+        let mut stored = int("gs", "int");
+        stored.generated = Some(crate::catalog::Generated {
+            expr: "(`e` * 2)".into(),
+            stored: true,
+            deps: Some(vec![1]),
+        });
+        let cat: HashMap<_, _> = [
+            typed("ent", vec![int("id", "int")], &[0]),
+            typed(
+                "val",
+                vec![
+                    int("id", "int"),
+                    int("e", "int unsigned"),
+                    int("attr", "smallint unsigned"),
+                    int("store", "smallint"),
+                    int("big", "bigint unsigned"),
+                    Column::simple("code", "varchar"),
+                    Column::new(
+                        "bin",
+                        "varbinary",
+                        "varbinary(8)",
+                        None,
+                        None,
+                        Some(8),
+                        false,
+                    ),
+                    Column::simple("price", "decimal"),
+                    Column::simple("ts", "datetime"),
+                    Column::simple("yr", "year"),
+                    Column::simple("flag", "bit"),
+                    Column::new(
+                        "kind",
+                        "enum",
+                        "enum('a','b')",
+                        Some("utf8mb4"),
+                        Some("utf8mb4_general_ci"),
+                        None,
+                        false,
+                    ),
+                    virt,
+                    stored,
+                ],
+                &[0],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let filters = |sql: &str| -> Vec<Vec<String>> {
+            let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+            let v = crate::analyzer::plan(&d, "db", &cat).unwrap();
+            assert!(
+                v.is_incremental() || v.mode == Mode::Global,
+                "{sql}: {:?}",
+                v.mode
+            );
+            (0..v.aliases.len())
+                .map(|a| {
+                    let t = &v.aliases[a].table;
+                    v.filters_of(a)
+                        .iter()
+                        .map(|f| format!("{}={:?}", t.columns[f.col].name, f.values))
+                        .collect()
+                })
+                .collect()
+        };
+        let none = |sql: &str| {
+            let f = filters(sql);
+            assert!(f.iter().all(Vec::is_empty), "{sql}: {f:?}");
+        };
+        let from = "FROM ent e JOIN val a ON a.e = e.id";
+        // Own ON (inner and LEFT JOIN), both operand orders, `<=>`, IN lists, the WHERE.
+        assert_eq!(
+            filters(&format!(
+                "SELECT e.id, a.store, b.store AS s {from} AND a.attr = 97 AND 0 = a.store \
+                 LEFT JOIN val b ON b.e = e.id AND b.attr IN (97, 99) AND b.store <=> 1 \
+                 WHERE a.big = 18446744073709551615 AND e.id = -1 AND (b.store = +1) AND a.gs = 4"
+            )),
+            vec![
+                vec!["id=[Int(-1)]".to_string()],
+                vec![
+                    "attr=[Int(97)]".into(),
+                    "store=[Int(0)]".into(),
+                    "big=[UInt(18446744073709551615)]".into(),
+                    "gs=[Int(4)]".into(),
+                ],
+                vec![
+                    "attr=[Int(97), Int(99)]".into(),
+                    "store=[Int(1)]".into(),
+                    "store=[Int(1)]".into(),
+                ],
+            ]
+        );
+        // Grouped and global views alike; parentheses, signs and booleans are literals.
+        assert_eq!(
+            filters(&format!(
+                "SELECT e.id, COUNT(*) AS n {from} AND ((a.attr) = (97)) AND a.store = -(3) \
+                 WHERE a.big IN (TRUE, 2) GROUP BY e.id"
+            ))[1],
+            ["attr=[Int(97)]", "store=[Int(-3)]", "big=[Int(1), Int(2)]"]
+        );
+        assert_eq!(
+            filters(&format!("SELECT COUNT(*) AS n {from} WHERE a.attr = 7"))[1],
+            ["attr=[Int(7)]"]
+        );
+        // Not filters: OR, NOT, IS NULL, functions, expressions, other columns or tables,
+        // conditions in another table's ON, NULLs, non-integer literals, converting kinds.
+        for cond in [
+            "(a.attr = 97 OR a.attr = 99)",
+            "NOT a.attr = 97",
+            "a.attr NOT IN (97)",
+            "a.attr <> 97",
+            "a.attr IS NULL",
+            "a.attr IS NOT NULL",
+            "ABS(a.store) = 1",
+            "a.attr + 0 = 97",
+            "a.attr = a.store",
+            "a.attr = e.id",
+            "a.attr IN (97, NULL)",
+            "a.attr <=> NULL",
+            "a.attr = NULL",
+            "a.attr = '97'",
+            "a.attr = 97.0",
+            "a.attr = 1e2",
+            "a.attr = 0x61",
+            "a.attr BETWEEN 1 AND 2",
+            "a.attr > 96",
+            "a.big = 99999999999999999999999",
+            "a.code = 'x'",
+            "a.bin = 'x'",
+            "a.price = 5",
+            "a.ts = 20200101",
+            "a.yr = 2020",
+            "a.flag = 1",
+            "a.kind = 1",
+            "a.g = 2",
+        ] {
+            none(&format!("SELECT e.id, a.store {from} WHERE {cond}"));
+            none(&format!("SELECT e.id, a.store {from} AND {cond}"));
+        }
+        // A semi-join over a unique key becomes a join: its table's own conditions are its filters.
+        assert_eq!(
+            filters(&format!(
+                "SELECT e.id, a.store {from} WHERE a.attr IN (SELECT x.id FROM ent x WHERE x.id = 3)"
+            )),
+            [vec![], vec![], vec!["id=[Int(3)]".to_string()]]
+        );
+        // A LEFT JOIN keeps its preserved rows whatever its ON says about them, and an inner
+        // join's ON constrains only the table it joins.
+        none("SELECT e.id, a.store FROM ent e LEFT JOIN val a ON a.e = e.id AND e.id = 5");
+        none("SELECT e.id, a.store FROM ent e JOIN val a ON a.e = e.id AND e.id = 5");
     }
 
     #[test]
