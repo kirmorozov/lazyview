@@ -392,8 +392,8 @@ pub fn feed(
             return Fed::Skipped;
         }
     }
-    // A side failing the alias's constant filters is never its row (an EAV alias pinned to one
-    // attribute ignores the others): the change is an insert, a delete, or nothing to it.
+    // A side failing the alias's constant filters is never its row (an alias pinned by constant
+    // filters ignores the rows of the others): the change is an insert, a delete, or nothing to it.
     let filters = plan.filters_of(alias);
     let before = before.filter(|r| passes(r, a, filters));
     let after = after.filter(|r| passes(r, a, filters));
@@ -630,17 +630,17 @@ mod tests {
         let tables: std::collections::HashMap<_, _> = [
             table("ent", vec![int("id", "int unsigned")], vec![0]),
             table(
-                "cat",
-                vec![int("cid", "int"), int("eid", "int unsigned")],
+                "link",
+                vec![int("gid", "int"), int("eid", "int unsigned")],
                 vec![0, 1],
             ),
             table(
-                "val",
+                "attrs",
                 vec![
                     int("id", "int"),
                     int("e", "int unsigned"),
-                    int("attr", "smallint unsigned"),
-                    int("store", "smallint"),
+                    int("aid", "smallint unsigned"),
+                    int("scope", "smallint"),
                     int("v", "int"),
                 ],
                 vec![0],
@@ -656,7 +656,7 @@ mod tests {
             )
             .unwrap()
         };
-        let row = |id: i64, e: i64, attr: Option<i64>, store: i64| {
+        let row = |id: i64, e: i64, aid: Option<i64>, scope: i64| {
             let cols: Arc<[mysql_async::Column]> = (0..5)
                 .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
                 .collect();
@@ -665,20 +665,20 @@ mod tests {
                 vec![
                     v(id),
                     v(e),
-                    Some(BinlogValue::Value(attr.map_or(Value::NULL, Value::Int))),
-                    v(store),
+                    Some(BinlogValue::Value(aid.map_or(Value::NULL, Value::Int))),
+                    v(scope),
                     v(id * 10),
                 ],
                 cols,
             )
         };
-        let (pass, pass2) = (row(1, 1, Some(97), 0), row(2, 2, Some(97), -1));
-        let (other, null) = (row(3, 3, Some(99), 0), row(4, 4, None, 0));
-        let other_store = row(5, 5, Some(97), 1);
-        // Lookup alias (grouped by category and entity): the images of the passing side only.
+        let (pass, pass2) = (row(1, 1, Some(7), 0), row(2, 2, Some(7), -1));
+        let (other, null) = (row(3, 3, Some(9), 0), row(4, 4, None, 0));
+        let other_scope = row(5, 5, Some(7), 1);
+        // Lookup alias (grouped by link group and entity): the images of the passing side only.
         let p = view(
-            "SELECT c.cid, e.id, MAX(a.v) AS v FROM cat c JOIN ent e ON e.id = c.eid \
-             JOIN val a ON a.e = e.id AND a.attr = 97 AND a.store IN (0, -1) GROUP BY c.cid, e.id",
+            "SELECT c.gid, e.id, MAX(a.v) AS v FROM link c JOIN ent e ON e.id = c.eid \
+             JOIN attrs a ON a.e = e.id AND a.aid = 7 AND a.scope IN (0, -1) GROUP BY c.gid, e.id",
         );
         assert!(p.aliases[2].direct_unit.is_none() && p.lineage_of(2).is_none());
         let a = &p.aliases[2];
@@ -691,9 +691,9 @@ mod tests {
                 Some(vec![img(&pass), img(&pass2)]),
             ),
             (Some(&other), Some(&null), None),
-            (Some(&other_store), Some(&other), None),
+            (Some(&other_scope), Some(&other), None),
             (Some(&other), Some(&pass), Some(vec![img(&pass)])),
-            (Some(&pass), Some(&other_store), Some(vec![img(&pass)])),
+            (Some(&pass), Some(&other_scope), Some(vec![img(&pass)])),
             (None, Some(&other), None),
             (None, Some(&pass), Some(vec![img(&pass)])),
             (Some(&null), None, None),
@@ -717,8 +717,8 @@ mod tests {
         }
         // Lineage alias (select/join): the key of the passing side; a filter in the WHERE.
         let p = view(
-            "SELECT c.cid, c.eid, a.v FROM cat c JOIN val a ON a.e = c.eid AND a.attr = 97 \
-             WHERE a.store = 0",
+            "SELECT c.gid, c.eid, a.v FROM link c JOIN attrs a ON a.e = c.eid AND a.aid = 7 \
+             WHERE a.scope = 0",
         );
         assert!(p.lineage_of(1).is_some());
         let mut d = ViewDirty::for_aliases(p.aliases.len());
@@ -739,19 +739,19 @@ mod tests {
         );
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed(&p, 1, &mut d, Some(&other_store), Some(&pass)),
+            feed(&p, 1, &mut d, Some(&other_scope), Some(&pass)),
             Fed::Recorded
         );
         assert_eq!(d.images[1], HashSet::from([Key::from([Datum::Int(1)])]));
         // Unit alias (grouped by entity): units of the passing side only.
         let p = view(
-            "SELECT e.id, MAX(a.v) AS v FROM ent e LEFT JOIN val a ON a.e = e.id AND a.attr = 97 \
-             AND a.store = 0 GROUP BY e.id",
+            "SELECT e.id, MAX(a.v) AS v FROM ent e LEFT JOIN attrs a ON a.e = e.id AND a.aid = 7 \
+             AND a.scope = 0 GROUP BY e.id",
         );
         assert!(p.aliases[1].direct_unit.is_some());
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed(&p, 1, &mut d, Some(&other), Some(&other_store)),
+            feed(&p, 1, &mut d, Some(&other), Some(&other_scope)),
             Fed::Skipped
         );
         assert_eq!(feed(&p, 1, &mut d, None, Some(&null)), Fed::Skipped);
@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(
             (d.units.len(), d.units.contains(&[Datum::Int(1)])),
             (1, true),
-            "entity 1 (moved in), not 3 (its old row) nor 2 (another store)"
+            "entity 1 (moved in), not 3 (its old row) nor 2 (another scope)"
         );
         // Rows that are not full images pass (their values are not known).
         let short = BinlogRow::new(
@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(feed(&p, 1, &mut d, None, Some(&short)), Fed::Recorded);
         // Without filters nothing changes: every alias of the table sees every row.
         let p =
-            view("SELECT e.id, MAX(a.v) AS v FROM ent e JOIN val a ON a.e = e.id GROUP BY e.id");
+            view("SELECT e.id, MAX(a.v) AS v FROM ent e JOIN attrs a ON a.e = e.id GROUP BY e.id");
         assert!(p.filters_of(1).is_empty());
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(

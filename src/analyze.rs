@@ -1487,33 +1487,70 @@ fn null_rejecting(e: &Expr) -> bool {
     }
 }
 
-/// Constant filters of each FROM alias: the conjuncts of its own join condition (inner or LEFT
-/// JOIN ON) and of the WHERE clause that compare one of its columns with constants
-/// ([`const_filter`]). Each is NULL-rejecting and reads that alias alone, so a row failing it is
-/// never the alias's row in a row of the query: under its own ON it matches nothing (a LEFT JOIN
-/// NULL-extends, as it would without the row), and under the WHERE every joined row holding it
-/// is dropped, as is the NULL-extended row it could displace. Conjuncts of another table's ON are
-/// not this alias's (a LEFT JOIN keeps its preserved rows whatever they say).
+/// Constant filters of each FROM alias: the conjuncts of the WHERE clause and of inner joins'
+/// ON that compare one column of it with constants ([`const_filter`]), those of its own LEFT
+/// JOIN condition, and the same values for every column equal to a filtered one on the rows the
+/// alias is part of (`base_edges` and its own `own_edges`, as for direct units). Each conjunct is
+/// NULL-rejecting and reads that alias alone, so a row failing it is never the alias's row in a
+/// row of the query: under an inner join's ON or the WHERE every joined row holding it is
+/// dropped, as is the NULL-extended row it could displace (in the flat FROM an inner join's ON
+/// filters like the WHERE, wherever it is written); under its own LEFT JOIN condition it matches
+/// nothing, and the outer row is NULL-extended as it would be without it. Another LEFT JOIN's
+/// condition is not this alias's (a LEFT JOIN keeps its preserved rows whatever it says). A
+/// column equal to a filtered one holds a value only where the filtered column is not NULL, so
+/// where that alias's row is real and passes its filters.
 fn const_filters(
     select: &Select,
     joins: &[(usize, bool, JoinConstraint)],
     scope: &Scope,
+    base_edges: &[(ColRef, ColRef)],
+    own_edges: &[Vec<(ColRef, ColRef)>],
 ) -> Vec<Vec<ConstFilter>> {
     let mut out = vec![Vec::new(); scope.aliases.len()];
-    let own = joins.iter().filter_map(|(a, _, c)| match c {
-        JoinConstraint::On(e) => Some((Some(*a), e)),
+    let ons = joins.iter().filter_map(|(a, left, c)| match c {
+        JoinConstraint::On(e) => Some((left.then_some(*a), e)),
         _ => None,
     });
-    for (only, e) in own.chain(select.selection.iter().map(|w| (None, w))) {
+    for (only, e) in ons.chain(select.selection.iter().map(|w| (None, w))) {
         let mut cs = Vec::new();
         conjuncts(e, &mut cs);
         for ((a, col), values) in cs.into_iter().filter_map(|c| const_filter(c, scope)) {
-            if only.is_none_or(|o| o == a) {
-                out[a].push(ConstFilter { col, values });
+            let f = ConstFilter { col, values };
+            if only.is_none_or(|o| o == a) && !out[a].contains(&f) {
+                out[a].push(f);
+            }
+        }
+    }
+    let found = out.clone();
+    for (ai, (_, t)) in scope.aliases.iter().enumerate() {
+        let mut cls = Classes::new();
+        for (x, y) in base_edges.iter().chain(&own_edges[ai]) {
+            cls.union(*x, *y);
+        }
+        for c in (0..t.columns.len()).filter(|&c| filter_column(&t.columns[c])) {
+            let rc = cls.find((ai, c));
+            for (x, fs) in found.iter().enumerate() {
+                for f in fs {
+                    let g = ConstFilter {
+                        col: c,
+                        values: f.values.clone(),
+                    };
+                    if (x, f.col) != (ai, c) && cls.find((x, f.col)) == rc && !out[ai].contains(&g)
+                    {
+                        out[ai].push(g);
+                    }
+                }
             }
         }
     }
     out
+}
+
+/// Whether a column's binlog values compare exactly with integer literals (see [`const_filter`]).
+fn filter_column(column: &crate::catalog::Column) -> bool {
+    column.family() == TypeFamily::Integer
+        && matches!(column.kind, ColKind::Plain | ColKind::Unsigned(_))
+        && column.exact_key()
 }
 
 /// `col = literal`, `literal = col`, `col <=> literal` or `col IN (literal, …)` over an integer
@@ -1541,11 +1578,7 @@ fn const_filter(e: &Expr, scope: &Scope) -> Option<(ColRef, Vec<Datum>)> {
         _ => return None,
     };
     let c = scope.resolve(col)?;
-    let column = &scope.aliases[c.0].1.columns[c.1];
-    if column.family() != TypeFamily::Integer
-        || !matches!(column.kind, ColKind::Plain | ColKind::Unsigned(_))
-        || !column.exact_key()
-    {
+    if !filter_column(&scope.aliases[c.0].1.columns[c.1]) {
         return None;
     }
     let values = lits
@@ -1555,7 +1588,7 @@ fn const_filter(e: &Expr, scope: &Scope) -> Option<(ColRef, Vec<Datum>)> {
     Some((c, values))
 }
 
-/// An integer literal (`97`, `-1`, `TRUE`) as the datum of an integer column holding it.
+/// An integer literal (`5`, `-1`, `TRUE`) as the datum of an integer column holding it.
 fn int_literal(e: &Expr) -> Option<Datum> {
     fn value(e: &Expr) -> Option<i128> {
         match e {
@@ -2667,7 +2700,7 @@ pub fn plan_block(
                 .join(", ")
         ))
     };
-    let alias_filters = const_filters(select, &joins, &scope);
+    let alias_filters = const_filters(select, &joins, &scope, &base_edges, &own_edges);
     Ok(ViewPlan {
         schema,
         name: def.name.clone(),
@@ -3935,10 +3968,13 @@ mod tests {
     }
 
     /// Constant filters per FROM alias: `col = lit`, `lit = col`, `col <=> lit` and IN lists of
-    /// integer literals over integer columns, from the alias's own ON or from a WHERE conjunct
-    /// over it alone; nothing that converts, negates, combines or reads other tables.
+    /// integer literals over integer columns, from the WHERE, an inner join's ON or the alias's
+    /// own LEFT JOIN condition, carried through equalities; nothing that converts, negates,
+    /// combines or reads other tables.
     #[test]
     fn const_filters_per_alias() {
+        use std::collections::BTreeMap;
+
         let int = |n: &str, ct: &str| {
             Column::new(
                 n,
@@ -3952,25 +3988,25 @@ mod tests {
         };
         let mut virt = int("g", "int");
         virt.generated = Some(crate::catalog::Generated {
-            expr: "(`e` + 1)".into(),
+            expr: "(`oid` + 1)".into(),
             stored: false,
             deps: Some(vec![1]),
         });
         let mut stored = int("gs", "int");
         stored.generated = Some(crate::catalog::Generated {
-            expr: "(`e` * 2)".into(),
+            expr: "(`oid` * 2)".into(),
             stored: true,
             deps: Some(vec![1]),
         });
         let cat: HashMap<_, _> = [
-            typed("ent", vec![int("id", "int")], &[0]),
+            typed("obj", vec![int("id", "int")], &[0]),
             typed(
-                "val",
+                "obj_attr",
                 vec![
                     int("id", "int"),
-                    int("e", "int unsigned"),
-                    int("attr", "smallint unsigned"),
-                    int("store", "smallint"),
+                    int("oid", "int unsigned"),
+                    int("aid", "smallint unsigned"),
+                    int("scope", "smallint"),
                     int("big", "bigint unsigned"),
                     Column::simple("code", "varchar"),
                     Column::new(
@@ -4003,7 +4039,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let filters = |sql: &str| -> Vec<Vec<String>> {
+        // Per alias name: its filters as `column=values`, sorted.
+        let filters = |sql: &str| -> BTreeMap<String, Vec<String>> {
             let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
             let v = crate::analyzer::plan(&d, "db", &cat).unwrap();
             assert!(
@@ -4014,74 +4051,153 @@ mod tests {
             (0..v.aliases.len())
                 .map(|a| {
                     let t = &v.aliases[a].table;
-                    v.filters_of(a)
+                    let mut f: Vec<String> = v
+                        .filters_of(a)
                         .iter()
                         .map(|f| format!("{}={:?}", t.columns[f.col].name, f.values))
-                        .collect()
+                        .collect();
+                    f.sort();
+                    (v.aliases[a].name.clone(), f)
                 })
                 .collect()
         };
         let none = |sql: &str| {
             let f = filters(sql);
-            assert!(f.iter().all(Vec::is_empty), "{sql}: {f:?}");
+            assert!(f.values().all(Vec::is_empty), "{sql}: {f:?}");
         };
-        let from = "FROM ent e JOIN val a ON a.e = e.id";
-        // Own ON (inner and LEFT JOIN), both operand orders, `<=>`, IN lists, the WHERE.
+        let map = |entries: &[(&str, &[&str])]| -> BTreeMap<String, Vec<String>> {
+            entries
+                .iter()
+                .map(|(a, f)| (a.to_string(), f.iter().map(|s| s.to_string()).collect()))
+                .collect()
+        };
+        let from = "FROM obj o JOIN obj_attr a ON a.oid = o.id";
+        // Inner ON, LEFT JOIN ON, both operand orders, `<=>`, IN lists, the WHERE; a constant
+        // reaches the columns equal to the filtered one (o.id -> a.oid, b.oid).
         assert_eq!(
             filters(&format!(
-                "SELECT e.id, a.store, b.store AS s {from} AND a.attr = 97 AND 0 = a.store \
-                 LEFT JOIN val b ON b.e = e.id AND b.attr IN (97, 99) AND b.store <=> 1 \
-                 WHERE a.big = 18446744073709551615 AND e.id = -1 AND (b.store = +1) AND a.gs = 4"
+                "SELECT o.id, a.scope, b.scope AS s {from} AND a.aid = 7 AND 3 = a.scope \
+                 LEFT JOIN obj_attr b ON b.oid = o.id AND b.aid IN (7, 9) AND b.scope <=> 4 \
+                 WHERE a.big = 18446744073709551615 AND o.id = -1 AND (b.scope = +4) AND a.gs = 4"
             )),
-            vec![
-                vec!["id=[Int(-1)]".to_string()],
-                vec![
-                    "attr=[Int(97)]".into(),
-                    "store=[Int(0)]".into(),
-                    "big=[UInt(18446744073709551615)]".into(),
-                    "gs=[Int(4)]".into(),
-                ],
-                vec![
-                    "attr=[Int(97), Int(99)]".into(),
-                    "store=[Int(1)]".into(),
-                    "store=[Int(1)]".into(),
-                ],
-            ]
+            map(&[
+                ("o", &["id=[Int(-1)]"]),
+                (
+                    "a",
+                    &[
+                        "aid=[Int(7)]",
+                        "big=[UInt(18446744073709551615)]",
+                        "gs=[Int(4)]",
+                        "oid=[Int(-1)]",
+                        "scope=[Int(3)]",
+                    ]
+                ),
+                (
+                    "b",
+                    &["aid=[Int(7), Int(9)]", "oid=[Int(-1)]", "scope=[Int(4)]"]
+                ),
+            ])
         );
         // Grouped and global views alike; parentheses, signs and booleans are literals.
         assert_eq!(
             filters(&format!(
-                "SELECT e.id, COUNT(*) AS n {from} AND ((a.attr) = (97)) AND a.store = -(3) \
-                 WHERE a.big IN (TRUE, 2) GROUP BY e.id"
-            ))[1],
-            ["attr=[Int(97)]", "store=[Int(-3)]", "big=[Int(1), Int(2)]"]
+                "SELECT o.id, COUNT(*) AS n {from} AND ((a.aid) = (7)) AND a.scope = -(3) \
+                 WHERE a.big IN (TRUE, 2) GROUP BY o.id"
+            ))["a"],
+            ["aid=[Int(7)]", "big=[Int(1), Int(2)]", "scope=[Int(-3)]"]
         );
         assert_eq!(
-            filters(&format!("SELECT COUNT(*) AS n {from} WHERE a.attr = 7"))[1],
-            ["attr=[Int(7)]"]
+            filters(&format!("SELECT COUNT(*) AS n {from} WHERE a.aid = 7"))["a"],
+            ["aid=[Int(7)]"]
+        );
+        // Equivalent formulations give the same filters per alias: join order, which ON or the
+        // WHERE holds a condition, comma joins, `=` vs a one-element IN vs swapped sides, the
+        // view wrapped in a CTE or a derived table with other output names.
+        let base = "SELECT o.id, a.big AS x, b.big AS y FROM obj o \
+                    JOIN obj_attr a ON a.oid = o.id AND a.aid = 7 \
+                    LEFT JOIN obj_attr b ON b.oid = o.id AND b.aid IN (8) AND b.scope = 2 \
+                    WHERE a.scope = 2";
+        let want = filters(base);
+        assert_eq!(
+            want,
+            map(&[
+                ("o", &[]),
+                ("a", &["aid=[Int(7)]", "scope=[Int(2)]"]),
+                ("b", &["aid=[Int(8)]", "scope=[Int(2)]"]),
+            ])
+        );
+        for sql in [
+            "SELECT o.id, a.big AS x, b.big AS y FROM obj_attr a \
+             JOIN obj o ON o.id = a.oid AND 7 = a.aid AND a.scope IN (2) \
+             LEFT JOIN obj_attr b ON b.oid = o.id AND b.aid = 8 AND 2 = b.scope",
+            "SELECT o.id, a.big AS x, b.big AS y FROM obj o, obj_attr a \
+             LEFT JOIN obj_attr b ON b.oid = a.oid AND b.scope = 2 AND b.aid = 8 \
+             WHERE a.oid = o.id AND a.scope = 2 AND a.aid = 7",
+            "SELECT o.id, a.big AS x, b.big AS y FROM obj o \
+             JOIN obj_attr a ON a.oid = o.id \
+             LEFT JOIN obj_attr b ON b.oid = o.id AND b.aid IN (8) AND b.scope = 2 \
+             WHERE a.scope = 2 AND a.aid IN (7)",
+            &format!("WITH w AS ({base}) SELECT id AS ident, x AS xx, y FROM w"),
+            &format!("SELECT d.id AS ident, d.x FROM ({base}) d"),
+            "SELECT o.id, a.big AS x, b.big AS y FROM obj o \
+             JOIN (SELECT * FROM obj_attr WHERE aid = 7 AND scope = 2) a ON a.oid = o.id \
+             LEFT JOIN (SELECT * FROM obj_attr WHERE scope = 2 AND aid = 8) b ON b.oid = o.id",
+        ] {
+            // Per alias; only where the normalizer renamed a merged derived table's aliases,
+            // the filter sets regardless of names.
+            let got = filters(sql);
+            if got.keys().eq(want.keys()) {
+                assert_eq!(got, want, "{sql}");
+            } else {
+                let sets = |m: &BTreeMap<String, Vec<String>>| {
+                    let mut v: Vec<Vec<String>> = m.values().cloned().collect();
+                    v.sort();
+                    v
+                };
+                assert_eq!(sets(&got), sets(&want), "{sql}");
+            }
+        }
+        // Constants carried through equalities of the alias's rows (inner ON / WHERE, its own
+        // LEFT JOIN condition), not through another LEFT JOIN's.
+        assert_eq!(
+            filters(
+                "SELECT o.id FROM obj o JOIN obj_attr a ON a.oid = o.id \
+                 JOIN obj_attr b ON b.oid = o.id AND b.aid = a.aid \
+                 LEFT JOIN obj_attr c ON c.oid = o.id AND c.scope = a.scope WHERE a.aid = 7 AND a.scope = 2"
+            ),
+            map(&[
+                ("o", &[]),
+                ("a", &["aid=[Int(7)]", "scope=[Int(2)]"]),
+                ("b", &["aid=[Int(7)]"]),
+                ("c", &["scope=[Int(2)]"]),
+            ])
+        );
+        assert_eq!(
+            filters("SELECT o.id FROM obj o JOIN obj_attr a ON a.oid = o.id AND o.id = 5"),
+            map(&[("o", &["id=[Int(5)]"]), ("a", &["oid=[Int(5)]"])])
         );
         // Not filters: OR, NOT, IS NULL, functions, expressions, other columns or tables,
-        // conditions in another table's ON, NULLs, non-integer literals, converting kinds.
+        // NULLs, non-integer literals, converting kinds.
         for cond in [
-            "(a.attr = 97 OR a.attr = 99)",
-            "NOT a.attr = 97",
-            "a.attr NOT IN (97)",
-            "a.attr <> 97",
-            "a.attr IS NULL",
-            "a.attr IS NOT NULL",
-            "ABS(a.store) = 1",
-            "a.attr + 0 = 97",
-            "a.attr = a.store",
-            "a.attr = e.id",
-            "a.attr IN (97, NULL)",
-            "a.attr <=> NULL",
-            "a.attr = NULL",
-            "a.attr = '97'",
-            "a.attr = 97.0",
-            "a.attr = 1e2",
-            "a.attr = 0x61",
-            "a.attr BETWEEN 1 AND 2",
-            "a.attr > 96",
+            "(a.aid = 7 OR a.aid = 9)",
+            "NOT a.aid = 7",
+            "a.aid NOT IN (7)",
+            "a.aid <> 7",
+            "a.aid IS NULL",
+            "a.aid IS NOT NULL",
+            "ABS(a.scope) = 1",
+            "a.aid + 0 = 7",
+            "a.aid = a.scope",
+            "a.aid = o.id",
+            "a.aid IN (7, NULL)",
+            "a.aid <=> NULL",
+            "a.aid = NULL",
+            "a.aid = '7'",
+            "a.aid = 7.0",
+            "a.aid = 1e2",
+            "a.aid = 0x61",
+            "a.aid BETWEEN 1 AND 2",
+            "a.aid > 6",
             "a.big = 99999999999999999999999",
             "a.code = 'x'",
             "a.bin = 'x'",
@@ -4092,20 +4208,18 @@ mod tests {
             "a.kind = 1",
             "a.g = 2",
         ] {
-            none(&format!("SELECT e.id, a.store {from} WHERE {cond}"));
-            none(&format!("SELECT e.id, a.store {from} AND {cond}"));
+            none(&format!("SELECT o.id, a.scope {from} WHERE {cond}"));
+            none(&format!("SELECT o.id, a.scope {from} AND {cond}"));
         }
+        // A LEFT JOIN keeps its preserved rows whatever its condition says about them.
+        none("SELECT o.id, a.scope FROM obj o LEFT JOIN obj_attr a ON a.oid = o.id AND o.id = 5");
         // A semi-join over a unique key becomes a join: its table's own conditions are its filters.
         assert_eq!(
             filters(&format!(
-                "SELECT e.id, a.store {from} WHERE a.attr IN (SELECT x.id FROM ent x WHERE x.id = 3)"
-            )),
-            [vec![], vec![], vec!["id=[Int(3)]".to_string()]]
+                "SELECT o.id, a.scope {from} WHERE a.aid IN (SELECT x.id FROM obj x WHERE x.id = 3)"
+            ))["x"],
+            ["id=[Int(3)]"]
         );
-        // A LEFT JOIN keeps its preserved rows whatever its ON says about them, and an inner
-        // join's ON constrains only the table it joins.
-        none("SELECT e.id, a.store FROM ent e LEFT JOIN val a ON a.e = e.id AND e.id = 5");
-        none("SELECT e.id, a.store FROM ent e JOIN val a ON a.e = e.id AND e.id = 5");
     }
 
     #[test]

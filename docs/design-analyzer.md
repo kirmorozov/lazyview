@@ -38,12 +38,15 @@ The overview reports, per view and alias, `direct` / `lineage` / `forward` / `al
 Before any trace, a side of the change is dropped when it fails one of the alias's **constant
 filters** (`ViewPlan.alias_filters`, `analyze::const_filters`): conjuncts `col = lit`, `lit = col`,
 `col <=> lit`, `col IN (lit, …)` over one integer column of that alias (signed / unsigned,
-not VIRTUAL; integer literals only), taken from its own ON or from a WHERE conjunct over it alone.
-Each is NULL-rejecting, so a failing row is never the alias's row in any output row (its own ON
-does not match it; the WHERE drops every row holding it and the NULL-extended row it could
-displace); the binlog value is the integer itself, so the test is exact. A change failing on
-both sides is skipped for that alias, on one side it is the insert / delete of the other side.
-Self-joined EAV tables then give images only to the aliases of the changed attribute.
+not VIRTUAL; integer literals only), taken from a WHERE or inner-join ON conjunct over it alone
+(wherever it is written: the flat FROM filters an inner join's ON like the WHERE) or from its own
+LEFT JOIN condition, and carried to every column equal to a filtered one on the alias's rows
+(the equality classes of direct units). Each is NULL-rejecting, so a failing row is never the
+alias's row in any output row (its own LEFT JOIN condition does not match it; the WHERE / inner
+ON drops every row holding it and the NULL-extended row it could displace); the binlog value is
+the integer itself, so the test is exact. A change failing on both sides is skipped for that
+alias, on one side it is the insert / delete of the other side. A table joined once per key
+value then gives images only to the aliases of the changed row's key.
 
 ## 2. Architecture
 

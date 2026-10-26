@@ -214,12 +214,13 @@ How full mode behaves:
   straight from the binlog row, without a query. This needs columns of the same type family
   (integers with integers, decimals with decimals, strings with the same character set and
   collation). `TIMESTAMP`, `JSON`, `FLOAT`, `DOUBLE` and `YEAR` keys always use a lookup query.
-* A changed row only counts for a table alias whose constant conditions it meets: `col = 97`,
-  `col IN (2, 3, 4)` or `col <=> 1` on an integer column, in that alias's own `ON` or in the
-  `WHERE`. An EAV table joined once per attribute (`JOIN catalog_product_entity_int s ON
-  s.entity_id = e.entity_id AND s.attribute_id = 97 AND s.store_id = 0`) therefore sends each
-  changed value row only to the aliases of its own attribute and store, so a save that touches
-  several attributes of one entity stays a small incremental refresh.
+* A changed row only counts for a table alias whose constant conditions it meets: `col = 5`,
+  `col IN (2, 3, 4)` or `col <=> 1` on an integer column, in the `WHERE`, in an inner join's `ON`
+  or in that alias's own `LEFT JOIN` condition, also through equalities (`a.kind = b.kind AND
+  b.kind = 5` pins both). A key / value table joined once per key (`JOIN item_attr w ON
+  w.item_id = i.id AND w.attr = 5`, `JOIN item_attr h ON h.item_id = i.id AND h.attr = 6`)
+  therefore sends each changed value row only to the aliases of its own key, so a transaction
+  that changes several values of one item stays a small incremental refresh.
 * A join without any condition between a table and the rest (`FROM orders o JOIN regions r`,
   `CROSS JOIN`) makes the view full: every row of that table belongs to every output row.
 

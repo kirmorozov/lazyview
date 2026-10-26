@@ -3253,148 +3253,174 @@ async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
     eng.stop().await
 }
 
-/// EAV-shaped sources: one value table joined once per (attribute, store), each alias pinned by
-/// constant equalities. Seeded so that every attribute row an alias reads exists where needed:
-/// (97, 0), (97, 1), (99, 0), (103, 0), (200, 0) for every entity, the others for some.
-const EAV_DDL: &[&str] = &[
-    "CREATE TABLE ent (entity_id INT UNSIGNED PRIMARY KEY, sku VARCHAR(20) NOT NULL)",
-    "CREATE TABLE ent_cat (category_id INT UNSIGNED NOT NULL, entity_id INT UNSIGNED NOT NULL, \
-     position INT NOT NULL, PRIMARY KEY (category_id, entity_id))",
-    "CREATE TABLE ent_int (value_id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
-     entity_id INT UNSIGNED NOT NULL, attribute_id SMALLINT UNSIGNED NOT NULL, \
-     store_id SMALLINT UNSIGNED NOT NULL, value INT NULL, \
-     UNIQUE KEY eav (entity_id, attribute_id, store_id))",
+/// Key / value sources: one value table joined once per (key, scope), each alias pinned by
+/// constant equalities. Columns of one table use different integer types. Seeded so that every
+/// value row an alias reads exists where needed: (11, 3), (11, 5), (12, 3), (15, 3), (40, 3) for
+/// every object, the others for some.
+const PIN_DDL: &[&str] = &[
+    "CREATE TABLE obj (oid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)",
+    "CREATE TABLE obj_link (gid MEDIUMINT UNSIGNED NOT NULL, oid INT UNSIGNED NOT NULL, \
+     pos INT NOT NULL, PRIMARY KEY (gid, oid))",
+    "CREATE TABLE obj_attr (vid BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+     oid INT UNSIGNED NOT NULL, aid MEDIUMINT UNSIGNED NOT NULL, scope TINYINT NOT NULL, \
+     val INT NULL, UNIQUE KEY obj_aid_scope (oid, aid, scope))",
 ];
 
-fn eav_seed() -> Vec<String> {
-    let mut ent = Vec::new();
-    let mut cat = Vec::new();
-    let mut int = Vec::new();
-    for e in 1..=24u32 {
-        ent.push(format!("({e}, 'sku{e}')"));
-        cat.push(format!("({}, {e}, {})", 1 + e % 3, e * 10));
-        if e % 2 == 0 {
-            cat.push(format!("(4, {e}, {e})"));
+fn pin_seed() -> Vec<String> {
+    let mut obj = Vec::new();
+    let mut link = Vec::new();
+    let mut attr = Vec::new();
+    for o in 1..=24u32 {
+        obj.push(format!("({o}, 'o{o}')"));
+        link.push(format!("({}, {o}, {})", 1 + o % 3, o * 10));
+        if o % 2 == 0 {
+            link.push(format!("(4, {o}, {o})"));
         }
-        let mut attr = |a: u32, s: u32, v: &str| int.push(format!("({e}, {a}, {s}, {v})"));
-        attr(97, 0, &(1 + e % 2).to_string());
-        attr(97, 1, if e % 3 == 0 { "NULL" } else { "1" });
-        attr(99, 0, &(1 + e % 4).to_string());
-        if e % 4 == 0 {
-            attr(99, 1, "4");
+        let mut val = |a: u32, s: u32, v: &str| attr.push(format!("({o}, {a}, {s}, {v})"));
+        val(11, 3, &(1 + o % 2).to_string());
+        val(11, 5, if o % 3 == 0 { "NULL" } else { "1" });
+        val(12, 3, &(1 + o % 4).to_string());
+        if o % 4 == 0 {
+            val(12, 5, "4");
         }
-        if e % 2 == 1 {
-            attr(101, 0, &(e * 3).to_string());
+        if o % 2 == 1 {
+            val(13, 3, &(o * 3).to_string());
         }
-        if e % 5 == 0 {
-            attr(102, 0, &(e * 7).to_string());
+        if o % 5 == 0 {
+            val(14, 3, &(o * 7).to_string());
         }
-        attr(103, 0, &(e % 7).to_string());
-        if e % 2 == 0 {
-            attr(104, 0, "1");
+        val(15, 3, &(o % 7).to_string());
+        if o % 2 == 0 {
+            val(16, 3, "1");
         }
-        attr(200, 0, "0");
+        val(40, 3, "0");
     }
     vec![
-        format!("INSERT INTO ent VALUES {}", ent.join(", ")),
-        format!("INSERT INTO ent_cat VALUES {}", cat.join(", ")),
+        format!("INSERT INTO obj VALUES {}", obj.join(", ")),
+        format!("INSERT INTO obj_link VALUES {}", link.join(", ")),
         format!(
-            "INSERT INTO ent_int (entity_id, attribute_id, store_id, value) VALUES {}",
-            int.join(", ")
+            "INSERT INTO obj_attr (oid, aid, scope, val) VALUES {}",
+            attr.join(", ")
         ),
     ]
 }
 
-/// The joins of the EAV views: seven aliases of `ent_int`, pinned in their own ON (also as
+/// The joins of the pinned views: seven aliases of `obj_attr`, pinned in their own ON (also as
 /// `literal = col`, `<=>` and an IN list) or, for `s0`, in the WHERE.
-const EAV_JOINS: &str = "JOIN ent_int s0 ON s0.entity_id = e.entity_id \
-     LEFT JOIN ent_int s1 ON s1.entity_id = e.entity_id AND s1.attribute_id = 97 AND s1.store_id = 1 \
-     JOIN ent_int v0 ON v0.entity_id = e.entity_id AND v0.attribute_id = 99 AND v0.store_id = 0 \
-     LEFT JOIN ent_int v1 ON v1.entity_id = e.entity_id AND 99 = v1.attribute_id AND v1.store_id <=> 1 \
-     LEFT JOIN ent_int p0 ON p0.entity_id = e.entity_id AND p0.attribute_id IN (101, 102) AND p0.store_id = 0 \
-     LEFT JOIN ent_int w0 ON w0.entity_id = e.entity_id AND w0.attribute_id = 103 AND w0.store_id = 0 \
-     LEFT JOIN ent_int n0 ON n0.entity_id = e.entity_id AND n0.attribute_id = 104 AND n0.store_id = 0 \
-     WHERE s0.attribute_id = 97 AND s0.store_id = 0";
+const PIN_JOINS: &str = "JOIN obj_attr s0 ON s0.oid = o.oid \
+     LEFT JOIN obj_attr s1 ON s1.oid = o.oid AND s1.aid = 11 AND s1.scope = 5 \
+     JOIN obj_attr v0 ON v0.oid = o.oid AND v0.aid = 12 AND v0.scope = 3 \
+     LEFT JOIN obj_attr v1 ON v1.oid = o.oid AND 12 = v1.aid AND v1.scope <=> 5 \
+     LEFT JOIN obj_attr p0 ON p0.oid = o.oid AND p0.aid IN (13, 14) AND p0.scope = 3 \
+     LEFT JOIN obj_attr w0 ON w0.oid = o.oid AND w0.aid = 15 AND w0.scope = 3 \
+     LEFT JOIN obj_attr n0 ON n0.oid = o.oid AND n0.aid = 16 AND n0.scope = 3 \
+     WHERE s0.aid = 11 AND s0.scope = 3";
 
-fn eav_views() -> Vec<ViewSpec> {
+/// The grouped select list over `PIN_JOINS` (grouped by link group and object).
+const PIN_GROUPED: &str = "SELECT c.gid, o.oid, MAX(c.pos) AS pos, COUNT(*) AS n, \
+     COALESCE(MAX(s1.val), MAX(s0.val)) AS a1, COALESCE(MAX(v1.val), MAX(v0.val)) AS a2, \
+     MAX(p0.val) AS a3, MAX(w0.val) AS a4, MAX(n0.val) AS a5";
+
+fn pin_views() -> Vec<ViewSpec> {
     vec![
-        // Grouped by (category, entity): every alias of `ent_int` is resolved by lookups.
+        // Grouped by (link group, object): every alias of `obj_attr` is resolved by lookups.
         ViewSpec::new(
-            "r_eav_cat",
+            "r_pin_grouped",
             Kind::Incremental,
             &format!(
-                "SELECT c.category_id, e.entity_id, MAX(c.position) AS pos, COUNT(*) AS n, \
-                 COALESCE(MAX(s1.value), MAX(s0.value)) AS status, \
-                 COALESCE(MAX(v1.value), MAX(v0.value)) AS vis, MAX(p0.value) AS tier, \
-                 MAX(w0.value) AS weight, MAX(n0.value) AS news \
-                 FROM ent_cat c JOIN ent e ON e.entity_id = c.entity_id {EAV_JOINS} \
-                 GROUP BY c.category_id, e.entity_id"
+                "{PIN_GROUPED} FROM obj_link c JOIN obj o ON o.oid = c.oid {PIN_JOINS} \
+                 GROUP BY c.gid, o.oid"
             ),
         ),
-        // Select/join over the category links: the aliases are traced by lineage.
+        // The same view with the joins permuted and the pinning conditions moved between the
+        // ON clauses and the WHERE: the same filters per alias.
         ViewSpec::new(
-            "r_eav_rows",
+            "r_pin_grouped_perm",
             Kind::Incremental,
             &format!(
-                "SELECT c.category_id, c.entity_id, c.position, e.sku, s0.value AS status, \
-                 s1.value AS status_s1, v0.value AS vis, v1.value AS vis_s1, \
-                 p0.attribute_id AS tier_attr, p0.value AS tier, w0.value AS weight, n0.value AS news \
-                 FROM ent_cat c JOIN ent e ON e.entity_id = c.entity_id {EAV_JOINS}"
+                "{PIN_GROUPED} FROM obj_attr v0 JOIN obj_attr s0 ON s0.oid = v0.oid AND s0.aid IN (11) \
+                 JOIN obj o ON o.oid = s0.oid JOIN obj_link c ON c.oid = o.oid \
+                 LEFT JOIN obj_attr n0 ON n0.oid = o.oid AND n0.scope = 3 AND n0.aid = 16 \
+                 LEFT JOIN obj_attr w0 ON w0.oid = o.oid AND 15 = w0.aid AND w0.scope = 3 \
+                 LEFT JOIN obj_attr p0 ON p0.oid = o.oid AND p0.scope = 3 AND p0.aid IN (14, 13) \
+                 LEFT JOIN obj_attr v1 ON v1.oid = o.oid AND v1.aid = 12 AND v1.scope = 5 \
+                 LEFT JOIN obj_attr s1 ON s1.oid = o.oid AND s1.scope = 5 AND s1.aid = 11 \
+                 WHERE 3 = s0.scope AND v0.scope = 3 AND v0.aid = 12 \
+                 GROUP BY c.gid, o.oid"
             ),
         ),
-        // Grouped by entity: the aliases give units straight from the row images.
+        // Select/join over the links: the aliases are traced by lineage.
         ViewSpec::new(
-            "r_eav_entity",
+            "r_pin_rows",
             Kind::Incremental,
             &format!(
-                "SELECT e.entity_id, MAX(s0.value) AS status, MAX(s1.value) AS status_s1, \
-                 MAX(v0.value) AS vis, MAX(v1.value) AS vis_s1, SUM(p0.value) AS tier, \
-                 MAX(w0.value) AS weight, MAX(n0.value) AS news \
-                 FROM ent e {EAV_JOINS} GROUP BY e.entity_id"
+                "SELECT c.gid, c.oid, c.pos, o.label, s0.val AS a1, s1.val AS b1, v0.val AS a2, \
+                 v1.val AS b2, p0.aid AS k3, p0.val AS a3, w0.val AS a4, n0.val AS a5 \
+                 FROM obj_link c JOIN obj o ON o.oid = c.oid {PIN_JOINS}"
+            ),
+        ),
+        // The same select/join view wrapped in a CTE, with other output names.
+        ViewSpec::new(
+            "r_pin_rows_cte",
+            Kind::Incremental,
+            &format!(
+                "WITH r AS (SELECT c.gid, c.oid, c.pos, o.label, s0.val AS a1, v0.val AS a2, \
+                 p0.val AS a3, n0.val AS a5 FROM obj_link c JOIN obj o ON o.oid = c.oid {PIN_JOINS}) \
+                 SELECT gid AS grp, oid AS obj_id, pos, label, a1 AS x1, a2 AS x2, a3, a5 FROM r"
+            ),
+        ),
+        // Grouped by object: the aliases give units straight from the row images.
+        ViewSpec::new(
+            "r_pin_obj",
+            Kind::Incremental,
+            &format!(
+                "SELECT o.oid, MAX(s0.val) AS a1, MAX(s1.val) AS b1, MAX(v0.val) AS a2, \
+                 MAX(v1.val) AS b2, SUM(p0.val) AS a3, MAX(w0.val) AS a4, MAX(n0.val) AS a5 \
+                 FROM obj o {PIN_JOINS} GROUP BY o.oid"
             ),
         ),
     ]
 }
 
-/// Rebuild storm on EAV views (m2-cdc, 2026-10-25): an entity save updates several rows of the
-/// same value table in one transaction, and every row change was recorded for every alias of the
-/// table, whatever its attribute / store constants. Each save then gave images to all seven
-/// lookup aliases, more than the lookups combine (`lookback::MAX_TABLES`), and the grouped view
-/// was rebuilt instead of refreshed, over and over under ordinary writes. A row an alias's
-/// constant filters reject is never that alias's row, so concurrent single-entity saves stay
-/// incremental; rows also move into and out of the filters (attribute and store changes).
+/// A transaction that changes several values of one object updates several rows of the same
+/// value table, and every row change was recorded for every alias of the table, whatever its
+/// key / scope constants. Each such transaction then gave images to all seven lookup aliases,
+/// more than the lookups combine (`lookback::MAX_TABLES`), and the grouped views were rebuilt
+/// instead of refreshed, over and over under ordinary writes. A row an alias's constant filters
+/// reject is never that alias's row, so concurrent single-object transactions stay incremental;
+/// rows also move into and out of the filters (key and scope changes).
 #[test]
-fn reg_eav_aliases_see_only_their_rows() {
-    scenario("reg_eav_prune", |ctx| async move {
-        let specs = eav_views();
-        let mut ddl: Vec<String> = EAV_DDL.iter().map(|s| s.to_string()).collect();
-        ddl.extend(eav_seed());
+fn reg_pinned_aliases_see_only_their_rows() {
+    scenario("reg_pinned", |ctx| async move {
+        let specs = pin_views();
+        let mut ddl: Vec<String> = PIN_DDL.iter().map(|s| s.to_string()).collect();
+        ddl.extend(pin_seed());
         let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
-        let (db, mut eng) = setup(&ctx, "reg_eav_prune", &ddl, &specs, &[]).await?;
+        let (db, mut eng) = setup(&ctx, "reg_pinned", &ddl, &specs, &[]).await?;
         let mut sc = db.conn().await?;
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
         let before = eng.snapshot();
-        // Concurrent entity saves: status and visibility (store 0), status (store 1) and an
-        // attribute no view reads, one entity per transaction, each writer its own entities.
+        // Concurrent single-object transactions: keys 11 and 12 (scope 3), 11 (scope 5) and a
+        // key no view reads, one object per transaction, each writer its own objects.
         let mut writers = Vec::new();
         for w in 0..4u32 {
             let dsn = db.dsn.clone();
             writers.push(tokio::spawn(async move {
                 let mut c = connect(&dsn).await?;
                 for i in 0..40u32 {
-                    let e = 1 + w + 4 * (i % 6);
+                    let o = 1 + w + 4 * (i % 6);
                     let set = |a: u32, s: u32, v: u32| {
                         format!(
-                            "UPDATE ent_int SET value = {v} WHERE entity_id = {e} \
-                             AND attribute_id = {a} AND store_id = {s}"
+                            "UPDATE obj_attr SET val = {v} WHERE oid = {o} \
+                             AND aid = {a} AND scope = {s}"
                         )
                     };
                     let stmts = [
                         "START TRANSACTION".to_string(),
-                        set(97, 0, 1 + (i + w) % 2),
-                        set(99, 0, 1 + (i * 3 + w) % 4),
-                        set(97, 1, 1 + i % 2),
-                        set(200, 0, i),
+                        set(11, 3, 1 + (i + w) % 2),
+                        set(12, 3, 1 + (i * 3 + w) % 4),
+                        set(11, 5, 1 + i % 2),
+                        set(40, 3, i),
                         "COMMIT".to_string(),
                     ];
                     for s in &stmts {
@@ -3407,45 +3433,52 @@ fn reg_eav_aliases_see_only_their_rows() {
         for w in writers {
             w.await.context("writer panicked")??;
         }
-        verify(&ctx, &mut eng, &db, &specs, "concurrent entity saves").await?;
-        let saves = eng.snapshot().since(&before);
-        ctx.log(format!("after 160 entity saves: {}", fmt_snapshot(&saves)));
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "concurrent single-object transactions",
+        )
+        .await?;
+        let txs = eng.snapshot().since(&before);
+        ctx.log(format!("after 160 transactions: {}", fmt_snapshot(&txs)));
         // Rows moving into and out of the aliases' filters.
         let mut c = db.conn().await?;
         let steps: &[(&str, &[&str])] = &[
             (
-                "attribute moves from one alias to another (103 -> 104)",
-                &["UPDATE ent_int SET attribute_id = 104 WHERE entity_id = 1 AND attribute_id = 103 AND store_id = 0"],
+                "key moves from one alias to another (15 -> 16)",
+                &["UPDATE obj_attr SET aid = 16 WHERE oid = 1 AND aid = 15 AND scope = 3"],
             ),
             (
-                "attribute moves out of every alias (104 -> 201)",
-                &["UPDATE ent_int SET attribute_id = 201 WHERE entity_id = 1 AND attribute_id = 104 AND store_id = 0"],
+                "key moves out of every alias (16 -> 41)",
+                &["UPDATE obj_attr SET aid = 41 WHERE oid = 1 AND aid = 16 AND scope = 3"],
             ),
             (
-                "attribute moves back into an alias (201 -> 103), value changed with it",
-                &["UPDATE ent_int SET attribute_id = 103, value = 42 WHERE entity_id = 1 AND attribute_id = 201"],
+                "key moves back into an alias (41 -> 15), value changed with it",
+                &["UPDATE obj_attr SET aid = 15, val = 42 WHERE oid = 1 AND aid = 41"],
             ),
             (
-                "store moves out of an alias (99: 1 -> 2), another row's value changes in it",
+                "scope moves out of an alias (12: 5 -> 6), another row's value changes in it",
                 &[
-                    "UPDATE ent_int SET store_id = 2 WHERE entity_id = 4 AND attribute_id = 99 AND store_id = 1",
-                    "UPDATE ent_int SET store_id = 1, value = 3 WHERE entity_id = 8 AND attribute_id = 99 AND store_id = 1",
+                    "UPDATE obj_attr SET scope = 6 WHERE oid = 4 AND aid = 12 AND scope = 5",
+                    "UPDATE obj_attr SET scope = 5, val = 3 WHERE oid = 8 AND aid = 12 AND scope = 5",
                 ],
             ),
             (
-                "store moves back in",
-                &["UPDATE ent_int SET store_id = 1 WHERE entity_id = 4 AND attribute_id = 99 AND store_id = 2"],
+                "scope moves back in",
+                &["UPDATE obj_attr SET scope = 5 WHERE oid = 4 AND aid = 12 AND scope = 6"],
             ),
             (
-                "attribute moves within an IN list (101 -> 102)",
-                &["UPDATE ent_int SET attribute_id = 102 WHERE entity_id = 3 AND attribute_id = 101"],
+                "key moves within an IN list (13 -> 14)",
+                &["UPDATE obj_attr SET aid = 14 WHERE oid = 3 AND aid = 13"],
             ),
             (
-                "the inner-joined alias's row moves out (entity leaves) and back",
+                "the inner-joined alias's row moves out (object leaves) and back",
                 &[
                     "START TRANSACTION",
-                    "UPDATE ent_int SET attribute_id = 98 WHERE entity_id = 6 AND attribute_id = 97 AND store_id = 0",
-                    "UPDATE ent_int SET store_id = 3 WHERE entity_id = 7 AND attribute_id = 97 AND store_id = 0",
+                    "UPDATE obj_attr SET aid = 10 WHERE oid = 6 AND aid = 11 AND scope = 3",
+                    "UPDATE obj_attr SET scope = 7 WHERE oid = 7 AND aid = 11 AND scope = 3",
                     "COMMIT",
                 ],
             ),
@@ -3453,26 +3486,26 @@ fn reg_eav_aliases_see_only_their_rows() {
                 "they come back in one transaction with other changes",
                 &[
                     "START TRANSACTION",
-                    "UPDATE ent_int SET attribute_id = 97 WHERE entity_id = 6 AND attribute_id = 98",
-                    "UPDATE ent_int SET store_id = 0 WHERE entity_id = 7 AND attribute_id = 97 AND store_id = 3",
-                    "UPDATE ent_int SET value = 5 WHERE entity_id = 7 AND attribute_id = 99 AND store_id = 0",
+                    "UPDATE obj_attr SET aid = 11 WHERE oid = 6 AND aid = 10",
+                    "UPDATE obj_attr SET scope = 3 WHERE oid = 7 AND aid = 11 AND scope = 7",
+                    "UPDATE obj_attr SET val = 5 WHERE oid = 7 AND aid = 12 AND scope = 3",
                     "COMMIT",
                 ],
             ),
             (
-                "unread attributes inserted, changed, deleted",
+                "unread keys inserted, changed, deleted",
                 &[
-                    "INSERT INTO ent_int (entity_id, attribute_id, store_id, value) VALUES (5, 300, 0, 1), (5, 97, 2, 1)",
-                    "UPDATE ent_int SET value = 2 WHERE entity_id = 5 AND attribute_id IN (300, 200)",
-                    "DELETE FROM ent_int WHERE entity_id = 5 AND (attribute_id = 300 OR store_id = 2)",
+                    "INSERT INTO obj_attr (oid, aid, scope, val) VALUES (5, 50, 3, 1), (5, 11, 6, 1)",
+                    "UPDATE obj_attr SET val = 2 WHERE oid = 5 AND aid IN (50, 40)",
+                    "DELETE FROM obj_attr WHERE oid = 5 AND (aid = 50 OR scope = 6)",
                 ],
             ),
             (
                 "read rows deleted, re-inserted and re-keyed",
                 &[
-                    "DELETE FROM ent_int WHERE entity_id = 9 AND attribute_id IN (97, 103)",
-                    "INSERT INTO ent_int (entity_id, attribute_id, store_id, value) VALUES (9, 97, 0, 2), (9, 104, 0, 7)",
-                    "UPDATE ent_int SET value_id = value_id + 100000 WHERE entity_id = 10 AND attribute_id = 99 AND store_id = 0",
+                    "DELETE FROM obj_attr WHERE oid = 9 AND aid IN (11, 15)",
+                    "INSERT INTO obj_attr (oid, aid, scope, val) VALUES (9, 11, 3, 2), (9, 16, 3, 7)",
+                    "UPDATE obj_attr SET vid = vid + 100000 WHERE oid = 10 AND aid = 12 AND scope = 3",
                 ],
             ),
         ];
@@ -3484,7 +3517,7 @@ fn reg_eav_aliases_see_only_their_rows() {
         ctx.log(format!("whole run: {}", fmt_snapshot(&d)));
         ensure!(
             d.full_rebuilds == 0 && d.lookback_overflows == 0,
-            "single-entity saves rebuilt the views ({} rebuilds, {} lookback overflows): {}",
+            "single-object transactions rebuilt the views ({} rebuilds, {} lookback overflows): {}",
             d.full_rebuilds,
             d.lookback_overflows,
             fmt_snapshot(&d)
