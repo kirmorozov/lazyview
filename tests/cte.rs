@@ -2507,42 +2507,110 @@ const KEY_EXACT_DDL: &[&str] = &[
     "INSERT INTO s_spk VALUES ('1',10),('01',20),('7',40)",
     "INSERT INTO s_bin VALUES (1,'abc',1),(2,'ABC',2),(3,'xyz',3)",
     "INSERT INTO s_int VALUES (1,1,10),(2,7,70)",
+    // G4: TIMESTAMP keys (the fall-back hour of a DST time zone; the test servers run in UTC).
+    "CREATE TABLE c_t (id INT NOT NULL PRIMARY KEY, dt DATETIME NOT NULL, ts TIMESTAMP NULL)",
+    "CREATE TABLE k_ts (id INT NOT NULL PRIMARY KEY, k TIMESTAMP NOT NULL, v INT NULL, UNIQUE KEY u_k (k))",
+    "CREATE TABLE k_dt (id INT NOT NULL PRIMARY KEY, k DATETIME NOT NULL, v INT NULL, UNIQUE KEY u_k (k))",
+    "INSERT INTO c_t VALUES (1,'2026-01-01 00:00:00','2026-01-01 00:00:00'),(2,'2026-01-02 10:00:00',NULL),(3,'2026-11-01 01:30:00','2026-11-01 01:30:00')",
+    "INSERT INTO k_ts VALUES (1,'2026-01-01 00:00:00',1),(2,'2026-11-01 01:30:00',2)",
+    "INSERT INTO k_dt VALUES (1,'2026-01-01 00:00:00',1),(2,'2026-01-02 10:00:00',2)",
 ];
 
-/// The final verifier's repro: a string key against a number (`'1'`, `'01'` and `'1.0'` all
-/// equal 1) or under an explicit weaker collation matches several key rows, so an inner join
-/// would repeat the outer row; an INT key is the control.
-fn key_exact_cases() -> Vec<Case> {
+/// The final verifier's repros, with the routes the analyzer must choose: a string key against
+/// a number (`'1'`, `'01'` and `'1.0'` all equal 1), under an explicit weaker collation (G1) or
+/// a TIMESTAMP on either side (G4) matches several key rows, so an inner join would repeat the
+/// outer row: semi-join aliases (lookups). INT and DATETIME keys are the controls (joined).
+fn key_exact_cases() -> Vec<(Case, &'static str)> {
     vec![
-        case(
-            "dup_uq_in_numstr",
-            "incremental",
-            "spj",
-            "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_str s)",
+        (
+            case(
+                "dup_uq_in_numstr",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_str s)",
+            ),
+            "c:unit,s:lookup",
         ),
-        case(
-            "dup_uq_exists_numstr",
-            "incremental",
-            "spj",
-            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_str s WHERE s.code = c.num)",
+        (
+            case(
+                "dup_uq_exists_numstr",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_str s WHERE s.code = c.num)",
+            ),
+            "c:unit,s:lookup",
         ),
-        case(
-            "dup_pk_in_numstr",
-            "incremental",
-            "spj",
-            "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_spk s)",
+        (
+            case(
+                "dup_pk_in_numstr",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_spk s)",
+            ),
+            "c:unit,s:lookup",
         ),
-        case(
-            "dup_uq_in_collate",
-            "incremental",
-            "spj",
-            "SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)",
+        (
+            case(
+                "dup_uq_in_collate",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)",
+            ),
+            "c:unit,b:lookup",
         ),
-        case(
-            "ctl_uq_in_int",
-            "incremental",
-            "spj",
-            "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_int s)",
+        (
+            case(
+                "ctl_uq_in_int",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_int s)",
+            ),
+            "c:unit,s:lineage",
+        ),
+        (
+            case(
+                "ts_in_dt",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c_t c WHERE c.dt IN (SELECT s.k FROM k_ts s)",
+            ),
+            "c:unit,s:lookup",
+        ),
+        (
+            case(
+                "ts_exists_dt",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c_t c WHERE EXISTS (SELECT 1 FROM k_ts s WHERE s.k = c.dt)",
+            ),
+            "c:unit,s:lookup",
+        ),
+        (
+            case(
+                "ts_in_ts",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c_t c WHERE c.ts IN (SELECT s.k FROM k_ts s)",
+            ),
+            "c:unit,s:lookup",
+        ),
+        (
+            case(
+                "dt_in_ts",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c_t c WHERE c.ts IN (SELECT s.k FROM k_dt s)",
+            ),
+            "c:unit,s:lookup",
+        ),
+        (
+            case(
+                "ctl_dt_in_dt",
+                "incremental",
+                "spj",
+                "SELECT c.id FROM c_t c WHERE c.dt IN (SELECT s.k FROM k_dt s)",
+            ),
+            "c:unit,s:lineage",
         ),
     ]
 }
@@ -2560,6 +2628,8 @@ const KEY_EXACT_STEPS: &[(&str, &[&str])] = &[
         &[
             "UPDATE s_str SET code = '8' WHERE id = 2",
             "UPDATE s_bin SET code = 'abd' WHERE id = 2",
+            "UPDATE k_ts SET k = '2026-01-02 10:00:00' WHERE id = 2",
+            "UPDATE k_dt SET k = '2026-11-01 01:30:00' WHERE id = 1",
         ],
     ),
 ];
@@ -2570,7 +2640,25 @@ async fn run_key_exact(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
     for s in KEY_EXACT_DDL {
         exec(&mut c, s).await?;
     }
-    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), key_exact_cases()).await?;
+    let mariadb = ctx.server().is_mariadb();
+    let mut bad = String::new();
+    let mut plain = Vec::new();
+    for (case, tracing) in key_exact_cases() {
+        let def = format!("CREATE VIEW {} AS {}", case.name, case.select);
+        let plan = analyzer_plan(&db, mariadb, &def).await?;
+        if plan.tracing() != tracing {
+            bad.push_str(&format!(
+                "\n  {}: routes {}, expected {tracing}",
+                case.name,
+                plan.tracing()
+            ));
+        }
+        plain.push(case);
+    }
+    if !bad.is_empty() {
+        bail!("key-exact plans differ:{bad}");
+    }
+    let (specs, expect) = prepare(&db, mariadb, plain).await?;
     let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
     verify(
         ctx,
@@ -2592,8 +2680,9 @@ async fn run_key_exact(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
     Ok(())
 }
 
-/// G1: semi-joins over string keys compared with numbers or under a weaker COLLATE stay
-/// semi-joins (no repeated outer rows); the INT key still joins.
+/// G1 / G4: semi-joins over string keys compared with numbers or under a weaker COLLATE, and
+/// over TIMESTAMP keys or against TIMESTAMP columns, stay semi-joins (no repeated outer rows);
+/// the INT and DATETIME keys still join.
 #[test]
 fn cte_key_exact_semi_joins_match_their_oracles() {
     scenario("cte_keyx", |ctx| async move {

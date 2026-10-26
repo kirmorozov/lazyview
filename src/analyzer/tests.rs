@@ -841,6 +841,143 @@ fn semi_joins_need_key_exact_equalities() {
     }
 }
 
+/// G4: TIMESTAMP equality is not injective under a time zone with DST (two instants of the
+/// fall-back hour show one local time), so a TIMESTAMP on either side of a key equality never
+/// turns a semi-join, a scalar subquery or an aggregated CTE into a join; DATE and DATETIME keys
+/// against their own type still do.
+#[test]
+fn timestamp_keys_are_not_key_exact() {
+    let mut cat = catalog();
+    let col = |n: &str, ty: &str| {
+        let mut c = Column::new(n, ty, ty, None, None, None, false);
+        c.nullable = false;
+        c
+    };
+    for (name, cols, pk, unique) in [
+        (
+            "c",
+            vec![
+                col("id", "int"),
+                col("d", "date"),
+                col("dt", "datetime"),
+                col("ts", "timestamp"),
+            ],
+            vec![0],
+            vec![],
+        ),
+        (
+            "k_ts",
+            vec![col("id", "int"), col("k", "timestamp"), col("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "k_tspk",
+            vec![col("k", "timestamp"), col("v", "int")],
+            vec![0],
+            vec![],
+        ),
+        (
+            "k_dt",
+            vec![col("id", "int"), col("k", "datetime"), col("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "k_date",
+            vec![col("id", "int"), col("k", "date"), col("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        let mut t = (*t).clone();
+        t.unique_keys = unique;
+        cat.insert(k, Arc::new(t));
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    // (definition, subquery table, joined)
+    for (sql, table, joined) in [
+        (
+            "SELECT c.id FROM c WHERE c.dt IN (SELECT s.k FROM k_ts s)",
+            "k_ts",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM k_ts s WHERE s.k = c.dt)",
+            "k_ts",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.ts IN (SELECT s.k FROM k_ts s)",
+            "k_ts",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.ts IN (SELECT s.k FROM k_tspk s)",
+            "k_tspk",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.ts IN (SELECT s.k FROM k_dt s)",
+            "k_dt",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.dt IN (SELECT s.k FROM k_dt s)",
+            "k_dt",
+            true,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.d IN (SELECT s.k FROM k_date s)",
+            "k_date",
+            true,
+        ),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.from_sql.contains(table), joined, "{sql}: {}", v.from_sql);
+        assert_eq!(
+            v.aliases.iter().any(|a| a.semi.is_some()),
+            !joined,
+            "{sql}: {}",
+            v.tracing()
+        );
+    }
+    for (sql, want) in [
+        (
+            "SELECT c.id, (SELECT s.v FROM k_ts s WHERE s.k = c.dt) AS v FROM c",
+            Mode::Full("subquery".into()),
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM k_tspk s WHERE s.k = c.ts) AS v FROM c",
+            Mode::Full("subquery".into()),
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM k_dt s WHERE s.k = c.ts) AS v FROM c",
+            Mode::Full("subquery".into()),
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM k_dt s WHERE s.k = c.dt) AS v FROM c",
+            Mode::Spj,
+        ),
+        // An aggregated CTE joined on a TIMESTAMP key is not pulled up; on a DATETIME key it is.
+        (
+            "WITH t AS (SELECT ts, COUNT(*) AS n FROM c GROUP BY ts) SELECT s.id, t.n FROM k_ts s JOIN t ON t.ts = s.k",
+            Mode::Full("GROUP BY in CTE `t` joined to other tables (needs internal views)".into()),
+        ),
+        (
+            "WITH t AS (SELECT dt, COUNT(*) AS n FROM c GROUP BY dt) SELECT s.id, t.n FROM k_dt s JOIN t ON t.dt = s.k",
+            Mode::Grouped,
+        ),
+    ] {
+        assert_eq!(plan(sql).mode, want, "{sql}");
+    }
+}
+
 /// The VIEW_DEFINITION validator: the server's canonical text (MySQL and MariaDB printing)
 /// reads the same tables and column count; a different reading is an error naming it.
 #[test]

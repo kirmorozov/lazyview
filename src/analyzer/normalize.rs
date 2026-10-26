@@ -935,7 +935,7 @@ fn pull_up(b: &mut Block) -> Result<()> {
         agg
     };
     // Key preservation, to a fixpoint: a table is bound when each of its primary-key columns
-    // equals a group key of the derived item or a column of a bound table (same type family).
+    // equals a group key of the derived item or a column of a bound table ([`same_key_type`]).
     let mut bound: HashSet<usize> = [d].into_iter().collect();
     loop {
         let mut grew = false;
@@ -966,7 +966,7 @@ fn pull_up(b: &mut Block) -> Result<()> {
                                 }
                                 _ => None,
                             };
-                            other.is_some_and(|o| o.family() == t.columns[pc].family())
+                            other.is_some_and(|o| same_key_type(&o, &t.columns[pc]))
                         })
                     })
                 })
@@ -1956,14 +1956,21 @@ pub(crate) fn semi_renamed(s: &Semi, taken: &HashSet<String>) -> Semi {
 }
 
 /// Whether `key_col = e` compares like the key, so that distinct key values never equal the
-/// same value of `e` (G1): `e` is a column of the same type family (for strings the same charset
-/// and collation: no number against a string key, no `COLLATE`), or an integer expression
-/// against an integer key.
+/// same value of `e` (G1): `e` is a column of the same key type (see [`same_key_type`]), or an
+/// integer expression against an integer key.
 fn key_exact(key_col: &Column, r: &Resolver, e: &Expr) -> bool {
     match r.column(e) {
-        Some(c) => c.family() == key_col.family(),
+        Some(c) => same_key_type(key_col, c),
         None => key_col.family() == TypeFamily::Integer && integer_valued(r, e),
     }
+}
+
+/// Whether an equality of columns `a` and `b` is injective on either one as a key: the same type
+/// family (for strings the same charset and collation: no number against a string, no
+/// `COLLATE`) and no TIMESTAMP (G4: under a time zone with DST, two instants of the fall-back
+/// hour equal one local time).
+fn same_key_type(a: &Column, b: &Column) -> bool {
+    a.family() == b.family() && a.data_type != "timestamp" && b.data_type != "timestamp"
 }
 
 /// Whether `e` is an integer: integer columns and literals under `+ - * DIV %`.
