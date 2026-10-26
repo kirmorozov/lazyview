@@ -105,6 +105,9 @@ S7. REVIEW R4, structure independence. For each new planner / access-path behavi
     query SHAPE rather than a plan fact (for example "the first FROM table", "a two-column link table",
     "single INT id").
     A real user's view definitions may be used only for measurement or benchmarks, never as test fixtures.
+    The existing generic orders / customers / products shop workload in tests/common and examples counts as
+    generic; NEW fixtures and test tables use neutral names (entity / item / link), and lines that only use or
+    extend the existing shop workload are notes, not findings.
 
 S8. REVIEW R5, executor hooks. In the dedup core and the executor interface, any branch on the kind of
     target (lazyview materialized table vs another tool's action) instead of a hook on the executor is a
