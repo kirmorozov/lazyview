@@ -14,6 +14,8 @@ macro_rules! counters {
             pub gauges: Gauges,
             /// Per-pool supervisor gauges (one entry per connection pool).
             pub pools: Mutex<Vec<Arc<PoolGauges>>>,
+            /// Per-view update statistics (`/stats`, see src/stats.rs).
+            pub view_stats: crate::stats::Registry,
         }
 
         #[derive(Default, Debug, Clone, PartialEq, Eq)]

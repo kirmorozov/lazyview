@@ -6,6 +6,7 @@
 //! | `/startupz` | startup | the process serves and the engine loop makes progress (as `/livez`) | the same |
 //! | `/readyz` | readiness | active, streaming, every view has a live version | see below |
 //! | `/metrics` | — | always (Prometheus text format) | — |
+//! | `/stats` | — | always (JSON: per-view update statistics, see src/stats.rs) | — |
 //!
 //! `?verbose` lists every check (Kubernetes apiserver style), `?format=json` or
 //! `Accept: application/json` returns JSON. `HEAD` is answered like `GET` without a body.
@@ -712,6 +713,10 @@ fn prometheus(m: &Metrics, o: &Observed, s: &Settings) -> String {
             p.pos
         );
     }
+    // Per view (label `view`, see src/stats.rs).
+    m.view_stats
+        .snapshot()
+        .write_prometheus(&mut out, escape_label);
     let _ = writeln!(
         out,
         "# HELP lazyview_build_info lazyview version.\n# TYPE lazyview_build_info gauge\nlazyview_build_info{{version=\"{}\"}} 1",
@@ -876,6 +881,7 @@ const INDEX: &str = "lazyview health endpoint\n\
             (?standby=ok counts a hot standby as ready, ?building=ok ignores first builds,\n\
              ?require_all=1 fails on views in error)\n\
 /metrics    Prometheus metrics\n\
+/stats      per-view update statistics (JSON)\n\
 ?verbose lists every check; ?format=json (or Accept: application/json) returns JSON\n";
 
 // Connection states (what eviction may drop).
@@ -1003,13 +1009,21 @@ impl Ctx {
             "/livez" | "/healthz" => Some(Probe::Live),
             "/readyz" => Some(Probe::Ready),
             "/startupz" => Some(Probe::Startup),
-            "/metrics" | "/" => None,
+            "/metrics" | "/" | "/stats" => None,
             _ => return Response::text(404, "not found\n"),
         };
         if req.method != "GET" && req.method != "HEAD" {
             return Response {
                 allow: true,
                 ..Response::text(405, "only GET and HEAD are supported\n")
+            };
+        }
+        if req.path == "/stats" {
+            return Response {
+                status: 200,
+                content_type: JSON,
+                body: format!("{}\n", self.metrics.view_stats.snapshot().to_json()),
+                allow: false,
             };
         }
         let o = self.tracker.observe(&self.metrics);

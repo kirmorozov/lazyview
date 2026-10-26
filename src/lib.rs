@@ -13,6 +13,7 @@ pub mod engine;
 pub mod health;
 pub mod lookback;
 pub mod metrics;
+pub mod stats;
 
 pub use config::Config;
 pub use metrics::{Metrics, Snapshot};
