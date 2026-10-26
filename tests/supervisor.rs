@@ -476,3 +476,68 @@ fn sup_crash_during_concurrent_refreshes() {
         Ok(())
     });
 }
+
+/// The binlog keeps being read while a flush waits (here on a row lock of a view row): the
+/// transactions committed meanwhile are queued during that flush and applied right after it,
+/// in order, instead of being left in the server's socket, which made catch-up stall in CI
+/// (run 39346546709). Runs in the leg's supervisor mode (the read loop is the same in both).
+#[test]
+fn sup_binlog_read_while_a_flush_waits() {
+    scenario("sup_drain", |ctx| async move {
+        let db = ctx.new_db("sup_drain").await?;
+        let mut c = db.conn().await?;
+        exec_all(
+            &mut c,
+            &[
+                "CREATE TABLE entity (id INT PRIMARY KEY, v BIGINT NOT NULL)".to_string(),
+                "CREATE TABLE item (id INT PRIMARY KEY, entity_id INT NOT NULL, n INT NOT NULL, KEY (entity_id))".to_string(),
+                format!(
+                    "INSERT INTO entity VALUES {}",
+                    (1..=10).map(|i| format!("({i}, 0)")).collect::<Vec<_>>().join(", ")
+                ),
+            ],
+        )
+        .await?;
+        let specs = vec![
+            ViewSpec::new("e_view", Kind::Incremental, "SELECT id, v FROM entity"),
+            ViewSpec::new(
+                "i_view",
+                Kind::Incremental,
+                "SELECT entity_id, COUNT(*) AS n, SUM(n) AS total FROM item GROUP BY entity_id",
+            ),
+        ];
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &[]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+        let before = eng.snapshot();
+        // A reader holds a view row: the flush that writes it waits.
+        let mut lock = db.conn().await?;
+        exec(&mut lock, "START TRANSACTION").await?;
+        let _: Vec<mysql_async::Row> = lock
+            .query("SELECT id FROM e_view WHERE id = 1 FOR UPDATE")
+            .await?;
+        exec(&mut c, "UPDATE entity SET v = v + 1 WHERE id = 1").await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Committed while that flush waits.
+        for k in 0..300 {
+            exec(
+                &mut c,
+                &format!("INSERT INTO item VALUES ({k}, {}, {k})", k % 10 + 1),
+            )
+            .await?;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        exec(&mut lock, "COMMIT").await?;
+        lock.disconnect().await.ok();
+        verify(&ctx, &mut eng, &db, &specs, "after the waiting flush").await?;
+        let d = eng.snapshot().since(&before);
+        ctx.log(format!("drain: {}", fmt_snapshot(&d)));
+        ensure!(
+            d.flushes_overlapped > 0,
+            "the binlog was not read while the flush waited: {}",
+            fmt_snapshot(&d)
+        );
+        c.disconnect().await.ok();
+        eng.stop().await?;
+        Ok(())
+    });
+}

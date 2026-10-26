@@ -6,7 +6,8 @@
 > one executor run for all live views of a flush, the error classes, retries and the
 > no-rebuild rule of §4.2, the zombie fence of §4.3, the row budget and CPU offload of §4.5, and
 > the counters and per-pool gauges of §5 that fixed limits maintain. Not implemented yet:
-> pipelining (§3: the flush still runs inline, the binlog is not read meanwhile), the adaptive
+> pipelining (§3: the flush still runs inline; the binlog is read ahead into a bounded queue
+> meanwhile, but its events are processed only after the flush), the adaptive
 > limiter (§4, §4.4), `LAZYVIEW_STALE_AFTER_MS` (parsed, no effect), parallel lookups and the
 > fault proxy of §7. `tests/supervisor.rs` covers §7 tests 1, 3 and 5 without a proxy (row locks
 > slow writes down and time them out). A prototype of the limiter against a simulated server

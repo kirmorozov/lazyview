@@ -116,7 +116,10 @@ included), `mv_rows_upserted` (of those, rows upserted by their row key), `mv_ro
 `LAZYVIEW_PLAN_TIMEOUT_MS`), and for [concurrent refreshes](configuration.md#concurrent-refreshes)
 `supervisor_overload_errors` (ops that failed with an overload error), `supervisor_retries`,
 `supervisor_zombie_kills` (writes killed after a timeout inside their transaction) and
-`supervisor_cpu_offloads` (diffs run off the async threads).
+`supervisor_cpu_offloads` (diffs run off the async threads). The binlog keeps being read while a
+flush runs, up to 100,000 events or 32 MiB queued: `flushes_overlapped` counts the flushes during
+which it was read, `binlog_backpressure` those during which the queue was full (the stream then
+waits).
 
 Per connection pool of concurrent refreshes, labelled
 `{pool="read|write", endpoint="source|<target>"}`: `lazyview_supervisor_limit`, `_max` (pool

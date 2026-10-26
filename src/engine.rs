@@ -6,7 +6,7 @@
 //!   the background into shadow tables. Changes arriving meanwhile are buffered for it, applied
 //!   once the build finishes, and then the shadow is swapped in atomically (`RENAME TABLE`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -544,6 +544,64 @@ const SLOW_FLUSH: Duration = Duration::from_secs(1);
 
 /// While the binlog stream keeps delivering (a backlog), a due flush waits at most this long.
 const CATCH_UP_BATCH: Duration = Duration::from_millis(100);
+
+/// Binlog read ahead while a flush runs (see `Engine::flush_draining`): at most this many
+/// events and about this many bytes are queued; beyond that the stream waits (backpressure).
+const DRAIN_MAX_EVENTS: usize = 100_000;
+const DRAIN_MAX_BYTES: usize = 32 << 20;
+/// Queue slots kept once a drained queue is empty again (a larger queue is shrunk to this).
+const DRAIN_KEEP_SLOTS: usize = 1024;
+
+/// A binlog read result as the loop handles it (`Ok(None)`: the server closed the stream).
+type Read = Result<Option<Item>>;
+
+/// Binlog reads queued while a flush ran (see `Engine::flush_draining`), each with its
+/// approximate memory, and their running total.
+#[derive(Default)]
+struct Drained {
+    queue: VecDeque<(Read, usize)>,
+    bytes: usize,
+    /// Binlog file the oldest queued events were read from (None while the queue is empty).
+    file: Option<String>,
+}
+
+impl Drained {
+    /// Queues `r`, read from binlog file `file`.
+    fn push(&mut self, r: Read, file: &str) {
+        if self.queue.is_empty() {
+            self.file = Some(file.to_string());
+        }
+        let b = match &r {
+            Ok(Some(Item::Rows { event, .. })) => 64 + event.data().len(),
+            _ => 64,
+        };
+        self.bytes += b;
+        self.queue.push_back((r, b));
+    }
+
+    fn pop(&mut self) -> Option<Read> {
+        let (r, b) = self.queue.pop_front()?;
+        self.bytes -= b;
+        if self.queue.is_empty() {
+            self.file = None;
+            if self.queue.capacity() > DRAIN_KEEP_SLOTS {
+                self.queue.shrink_to(DRAIN_KEEP_SLOTS);
+            }
+        }
+        Some(r)
+    }
+
+    /// Below both bounds, and not ended by an error or the end of the stream.
+    fn open(&self) -> bool {
+        self.queue.len() < DRAIN_MAX_EVENTS
+            && self.bytes < DRAIN_MAX_BYTES
+            && !matches!(self.queue.back(), Some((Ok(None) | Err(_), _)))
+    }
+
+    fn full(&self) -> bool {
+        self.queue.len() >= DRAIN_MAX_EVENTS || self.bytes >= DRAIN_MAX_BYTES
+    }
+}
 
 /// Opens a connection with the service's session settings.
 async fn connect(opts: &Opts) -> Result<Conn> {
@@ -2244,6 +2302,8 @@ impl Engine {
             Metrics::set(&self.metrics.gauges.starting, 0);
             let mut last_event = Instant::now();
             let mut delivered = false;
+            // Read while the last flush ran: processed first, in order (see `flush_draining`).
+            let mut drained = Drained::default();
             loop {
                 Metrics::set(
                     &self.metrics.gauges.heartbeat_unix,
@@ -2253,48 +2313,56 @@ impl Engine {
                 let sleep_until =
                     deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
                 let mut idle = false;
-                tokio::select! {
-                    biased;
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            break 'reconnect;
-                        }
-                    }
-                    Some(done) = build_rx.recv() => self.on_build_done(done),
-                    item = reader.next() => {
-                        last_event = Instant::now();
-                        match item {
-                            Ok(Some(item)) => {
-                                if !delivered {
-                                    delivered = true;
-                                    backoff = Duration::from_millis(500);
-                                }
-                                Metrics::add(&self.metrics.events, 1);
-                                if let Err(e) = self.on_item(&reader, item).await {
-                                    error!("processing binlog event: {e:#}");
-                                    return Err(e);
-                                }
-                            }
-                            Ok(None) => {
-                                warn!("binlog stream closed by server; reconnecting");
-                                break;
-                            }
-                            Err(e) => {
-                                if Self::binlog_unusable(&e) {
-                                    self.on_missing_binlog(&e).await?;
-                                } else if binlog::is_duplicate_server_id(&e) {
-                                    self.reroll_server_id();
-                                } else {
-                                    warn!("binlog stream error: {e:#}; reconnecting");
-                                }
-                                break;
+                let mut read = drained.pop();
+                if read.is_some() && *shutdown.borrow() {
+                    break 'reconnect;
+                }
+                if read.is_none() {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                break 'reconnect;
                             }
                         }
+                        Some(done) = build_rx.recv() => self.on_build_done(done),
+                        item = reader.next() => {
+                            last_event = Instant::now();
+                            read = Some(item);
+                        }
+                        // Polled last: fires only while the stream has nothing to deliver.
+                        _ = tokio::time::sleep_until(sleep_until.into()), if deadline.is_some() && !self.in_txn => idle = true,
+                        _ = tokio::time::sleep_until((last_event + silence).into()) => {
+                            warn!("no binlog event or heartbeat for {silence:?}; reconnecting");
+                            break;
+                        }
                     }
-                    // Polled last: fires only while the stream has nothing to deliver.
-                    _ = tokio::time::sleep_until(sleep_until.into()), if deadline.is_some() && !self.in_txn => idle = true,
-                    _ = tokio::time::sleep_until((last_event + silence).into()) => {
-                        warn!("no binlog event or heartbeat for {silence:?}; reconnecting");
+                }
+                match read {
+                    None => {}
+                    Some(Ok(Some(item))) => {
+                        if !delivered {
+                            delivered = true;
+                            backoff = Duration::from_millis(500);
+                        }
+                        Metrics::add(&self.metrics.events, 1);
+                        if let Err(e) = self.on_item(&reader, item).await {
+                            error!("processing binlog event: {e:#}");
+                            return Err(e);
+                        }
+                    }
+                    Some(Ok(None)) => {
+                        warn!("binlog stream closed by server; reconnecting");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        if Self::binlog_unusable(&e) {
+                            self.on_missing_binlog(&e).await?;
+                        } else if binlog::is_duplicate_server_id(&e) {
+                            self.reroll_server_id();
+                        } else {
+                            warn!("binlog stream error: {e:#}; reconnecting");
+                        }
                         break;
                     }
                 }
@@ -2308,7 +2376,8 @@ impl Engine {
                     self.flush_due_within(CATCH_UP_BATCH)
                 };
                 if !self.in_txn && flush {
-                    self.flush().await?;
+                    self.flush_draining(&mut reader, &mut drained, &mut last_event)
+                        .await?;
                 }
                 if !self.in_txn {
                     self.housekeeping().await?;
@@ -2350,6 +2419,65 @@ impl Engine {
         }
         info!("stopped");
         Ok(())
+    }
+
+    /// [`Self::flush`] while the binlog keeps being read into `drained`, so the server keeps
+    /// streaming during the flush: without reading, its socket fills and the stream resumes in
+    /// small bursts on TCP's 200 ms timers, which can starve catch-up for minutes (CI run
+    /// 39346546709). Reading stops at the queue's bounds (backpressure), after an error or the
+    /// end of the stream, and after a ROTATE: queued rows decode with the table maps of their
+    /// own file, which the reader keeps for one rotate. The loop processes the queue in order
+    /// before it reads again, so positions, `pending_floor` and every other bookkeeping see the
+    /// events exactly as if they had been read after the flush; rows are decoded in `on_item`
+    /// then, as before (decode cost unchanged). A flush that starts while events are still
+    /// queued reads only while the reader is in the file of the oldest of them: after a ROTATE it
+    /// waits for the queue to drain, so no queued event is ever two rotates behind the reader.
+    ///
+    /// Cost per event that arrives while a flush runs: one more poll of the pending flush
+    /// future (the biased `select!` polls it first on every wake), the size match and the
+    /// length / byte / last-entry checks of [`Drained`], a binlog file-name compare (the rotate
+    /// check), the push with an emptiness check (a copy of the file name when the queue was
+    /// empty: once per drain) and, in the loop, the pop with its byte subtraction, an emptiness /
+    /// capacity check and a `shutdown` watch read. The queue grows by amortized reallocation
+    /// (doubling: up to the next power of two above [`DRAIN_MAX_EVENTS`] slots) and is shrunk to
+    /// [`DRAIN_KEEP_SLOTS`] once empty. Events
+    /// that arrive while no flush runs cost one pop of an empty queue and two `Option` tests.
+    async fn flush_draining(
+        &mut self,
+        reader: &mut BinlogReader,
+        drained: &mut Drained,
+        last_event: &mut Instant,
+    ) -> Result<()> {
+        // The file the oldest queued events came from, else the reader's current one.
+        let file = drained
+            .file
+            .clone()
+            .unwrap_or_else(|| reader.position().file.clone());
+        let (mut read_any, mut full) = (false, false);
+        let metrics = self.metrics.clone();
+        let flush = self.flush();
+        tokio::pin!(flush);
+        loop {
+            if !full && drained.full() {
+                full = true;
+                Metrics::add(&metrics.binlog_backpressure, 1);
+            }
+            let open = drained.open() && reader.position().file == file;
+            tokio::select! {
+                biased;
+                r = &mut flush => {
+                    if read_any {
+                        Metrics::add(&metrics.flushes_overlapped, 1);
+                    }
+                    return r;
+                }
+                read = reader.next(), if open => {
+                    *last_event = Instant::now();
+                    drained.push(read, &file);
+                    read_any = true;
+                }
+            }
+        }
     }
 
     /// ER 1236 from the dump thread (except a duplicate server id): the position cannot be
@@ -4870,4 +4998,39 @@ async fn build_task(
         generation,
         result,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The drain queue keeps its byte total and the file of its oldest events in step with
+    /// pushes and pops, stops at its bounds and at the end of the stream, and gives back its
+    /// capacity once empty.
+    #[test]
+    fn drained_queue_accounting() {
+        let mut d = Drained::default();
+        assert!(d.open() && !d.full() && d.file.is_none() && d.pop().is_none());
+        d.push(Ok(Some(Item::Heartbeat)), "binlog.000001");
+        d.push(Ok(Some(Item::Other)), "binlog.000002");
+        assert_eq!(
+            d.file.as_deref(),
+            Some("binlog.000001"),
+            "the oldest event's file"
+        );
+        assert_eq!(d.bytes, 128);
+        assert!(matches!(d.pop(), Some(Ok(Some(Item::Heartbeat)))));
+        assert_eq!((d.bytes, d.file.as_deref()), (64, Some("binlog.000001")));
+        assert!(d.pop().is_some());
+        assert_eq!((d.bytes, d.file.as_deref()), (0, None));
+        d.push(Ok(None), "binlog.000002");
+        assert!(!d.open(), "nothing is read past the end of the stream");
+        d.pop();
+        for _ in 0..DRAIN_MAX_EVENTS {
+            d.push(Ok(Some(Item::Heartbeat)), "binlog.000003");
+        }
+        assert!(d.full() && !d.open());
+        while d.pop().is_some() {}
+        assert!(d.queue.capacity() <= DRAIN_KEEP_SLOTS && d.bytes == 0);
+    }
 }
