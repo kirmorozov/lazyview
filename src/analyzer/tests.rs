@@ -3145,3 +3145,58 @@ fn known_limit_unit_follows_from_order() {
         assert_eq!(plan(parent_later).mode, Mode::Full(why.into()), "{parent_later}");
     }
 }
+
+/// Guard R4 on 7g: never_null reads the column's own join kind, every later join of its FROM
+/// entry, and (for a derived table / CTE) the derived item's position in the outer FROM and the
+/// output it maps to. Each `x NOT IN (…)` formulation below gets the same NOT EXISTS form and route
+/// as its written NOT EXISTS twin: the column's table followed by an inner, comma or LEFT join;
+/// the cascade forms with another table after the parent; a derived table / CTE inner- or
+/// comma-joined after another table; a multi-table inner block (the column on the head or on an
+/// inner-joined table); the NOT IN column not selected and not the first output.
+#[test]
+fn not_in_twins_across_join_placements() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    // (template with {P} for the predicate on x, x, subquery table, its key column, tracing)
+    let attr = ("attr a WHERE a.v > 5", "a.ent_id");
+    let item = ("item i WHERE TRUE", "i.ent_id");
+    for (template, x, (from, key), tracing) in [
+        ("SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE {P}", "e.id", attr, "e:unit,l:unit,a:unit"),
+        ("SELECT e.id FROM entity e, link l WHERE l.ent_id = e.id AND {P}", "e.id", attr, "e:unit,l:unit,a:unit"),
+        ("SELECT e.id FROM entity e LEFT JOIN link l ON l.ent_id = e.id WHERE {P}", "e.id", attr, "e:unit,l:unit,a:unit"),
+        ("SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE {P}", "e.id", item, "e:unit,l:unit,i:unit,^entity:unit"),
+        ("SELECT e.id FROM entity e, link l WHERE l.ent_id = e.id AND {P}", "e.id", item, "e:unit,l:unit,i:unit,^entity:unit"),
+        ("SELECT l.id FROM link l JOIN (SELECT e.id AS eid FROM entity e) x ON x.eid = l.ent_id WHERE {P}", "x.eid", attr, "l:unit,e:lineage,a:lookup"),
+        ("SELECT l.id FROM link l, (SELECT e.id AS eid FROM entity e) x WHERE x.eid = l.ent_id AND {P}", "x.eid", attr, "l:unit,e:lineage,a:lookup"),
+        ("WITH t AS (SELECT e.id AS eid FROM entity e) SELECT l.id FROM link l JOIN t ON t.eid = l.ent_id WHERE {P}", "t.eid", attr, "l:unit,e:lineage,a:lookup"),
+        ("SELECT x.lid FROM (SELECT l.id AS lid, e.id AS eid FROM link l JOIN entity e ON e.id = l.ent_id) x WHERE {P}", "x.eid", attr, "l:unit,e:lineage,a:lookup"),
+        ("SELECT x.eid FROM (SELECT e.id AS eid, l.id AS lid FROM entity e JOIN link l ON l.ent_id = e.id) x WHERE {P}", "x.eid", attr, "e:unit,l:unit,a:unit"),
+        // The NOT IN column not selected and not the derived block's first output.
+        ("SELECT e.v FROM entity e WHERE {P}", "e.id", attr, "e:unit,a:unit"),
+        ("SELECT x.v FROM (SELECT e.v AS v, e.id AS eid FROM entity e) x WHERE {P}", "x.eid", attr, "e:unit,a:unit"),
+        ("WITH t AS (SELECT e.v AS v, e.id AS eid FROM entity e) SELECT t.v FROM t WHERE {P}", "t.eid", attr, "e:unit,a:unit"),
+    ] {
+        let (table, cond) = from.split_once(" WHERE ").unwrap();
+        let col = key.split_once('.').unwrap();
+        let not_in = template.replace("{P}", &format!("{x} NOT IN (SELECT {key} FROM {table} WHERE {cond})"));
+        let twin = template.replace(
+            "{P}",
+            &format!("NOT EXISTS (SELECT 1 FROM {table} WHERE {cond} AND {}.{} = {x})", col.0, col.1),
+        );
+        let (a, b) = (plan(&not_in), plan(&twin));
+        assert_eq!(a.mode, Mode::Spj, "{not_in}");
+        assert_eq!(b.mode, Mode::Spj, "{twin}");
+        assert_eq!(a.tracing(), tracing, "{not_in}");
+        assert_eq!(b.tracing(), tracing, "{twin}");
+        let w = a.where_sql.unwrap_or_default();
+        assert!(w.contains("NOT EXISTS") && !w.contains("IS NULL"), "{not_in}: {w}");
+    }
+    // A derived table on the NULL side of an outer LEFT JOIN keeps the NULL-aware NOT IN form.
+    let sql = "SELECT l.id FROM link l LEFT JOIN (SELECT e.id AS eid FROM entity e) x ON x.eid = l.ent_id \
+               WHERE x.eid NOT IN (SELECT a.ent_id FROM attr a WHERE a.v > 5)";
+    let w = plan(sql).where_sql.unwrap_or_default();
+    assert!(w.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {w}");
+}
