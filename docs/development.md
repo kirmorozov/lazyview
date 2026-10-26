@@ -75,7 +75,11 @@ On a developer host `scripts/test-servers.sh compose ...` adds `docker-compose.l
 the binlog and the redo log. On a shared host with ZFS-backed Docker volumes this took an
 autocommit from 35-80 ms to 1-4 ms; DDL still syncs (a `RENAME TABLE` takes 0.1-0.6 s). A
 crash of the container can lose the last second of commits, which test servers can afford.
-Images, flags and memory limits stay exactly as in CI.
+The same file keeps the table caches small (`table_open_cache=400`,
+`table_open_cache_instances=1`, `table_definition_cache=400`), and `docker-compose.local.yml`
+sets `MALLOC_ARENA_MAX=2` in every server's environment. Hours of suites that create thousands
+of tables otherwise grow mysqld's memory (table caches, allocator arenas) until a container hits
+its memory limit and is killed. Images, flags and memory limits stay exactly as in CI.
 
 CI never loads the file: it runs `docker compose` on `docker-compose.test.yml` alone with the
 durable server defaults (`sync_binlog=1`, `innodb_flush_log_at_trx_commit=1`), and the script

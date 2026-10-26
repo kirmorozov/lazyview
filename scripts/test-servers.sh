@@ -3,8 +3,9 @@
 #
 #   compose   the official images pinned in docker-compose.test.yml (the exact builds CI runs,
 #             so local == CI); data in named docker volumes. On a developer host
-#             docker-compose.local.yml joins it: no fsync per commit (docker/local.cnf), nothing
-#             else differs. LV_COMPOSE_LOCAL=0 (or CI set, as on GitHub Actions) leaves it out.
+#             docker-compose.local.yml joins it: no fsync per commit and small table caches
+#             (docker/local.cnf), MALLOC_ARENA_MAX=2, nothing else differs. LV_COMPOSE_LOCAL=0
+#             (or CI set, as on GitHub Actions) leaves it out.
 #   tarball   official generic Linux x86_64 tarballs extracted under tmp/out/db/<flavor>/,
 #             started directly (no Docker needed); data under tmp/out/servers/<flavor>/.
 #
@@ -447,7 +448,7 @@ compose_up() {
     fi
   done
   if compose_local; then
-    echo "local speed settings on (docker-compose.local.yml: sync_binlog=0, innodb_flush_log_at_trx_commit=2; LV_COMPOSE_LOCAL=0 for the CI configuration)"
+    echo "local speed settings on (docker-compose.local.yml: sync_binlog=0, innodb_flush_log_at_trx_commit=2, table caches 400, MALLOC_ARENA_MAX=2; LV_COMPOSE_LOCAL=0 for the CI configuration)"
   else
     echo "CI configuration (durable defaults; docker-compose.local.yml left out)"
   fi
