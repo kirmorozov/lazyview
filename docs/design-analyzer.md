@@ -180,6 +180,16 @@ the missing piece:
 | correlated / uncorrelated aggregate scalar subquery (C6) | ``correlated aggregate subquery in the SELECT list`` / ``uncorrelated aggregate subquery in the WHERE clause`` | an internal grouped view joined on the correlation key, one value for all rows when uncorrelated (shelved) |
 | a server SQL view as a source (C5) | ``reads SQL view `v` `` | inline its `VIEW_DEFINITION` like a derived table (phase D) |
 
+**Known limits** (pre-existing, conservative: the view is Full or less direct than it could be,
+never wrong; tracked for the per-source-table key-map rewrite; each is pinned by a test that flips
+on purpose when the limit is lifted):
+
+| limit | example | today | test |
+|---|---|---|---|
+| semi- / anti-joins are extracted from WHERE conjuncts only | `… JOIN e ON e.id = l.ent_id AND e.id NOT IN (SELECT …)` | the predicate stays a subquery: Full `subquery` (its WHERE form is incremental) | `known_limit_on_form_semi_join_full` |
+| the unit of a select/join view is the first table's key | `FROM link l JOIN entity e … WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)`, `item` a cascading child of `entity` | not on the unit: Full ``EXISTS subquery over `item`: the units a cascade from `entity` changes are not known`` (with `entity` first: `^entity:unit`) | `known_limit_unit_follows_from_order` |
+| a one-element `x IN (y)` is not a key equality; window units are the PARTITION BY list as written | `… JOIN d ON d.id IN (i.doc_id) GROUP BY i.id, d.doc`, `PARTITION BY id, doc` | no key reduction (G5 with a JSON column: Full) | `json_columns_in_composite_units` |
+
 ### 3.4 Semi- and anti-joins in detail
 
 `P(l) = [NOT] EXISTS(σ k=x(l) ∧ p S)`; `x IN (π_k σ_p S)` normalizes to the EXISTS form. A change

@@ -2766,3 +2766,382 @@ fn semi_join_views_are_identified_by_their_from_tables() {
         assert!(!p(sql).rows_identified(), "{sql}");
     }
 }
+
+/// Catalog for the formulation tests below: `item` is a cascading child of `entity`, `pair_item`
+/// one of `pair` through a composite key; `attr` / `attr_n` reference `entity` without a foreign
+/// key (NOT NULL / nullable column).
+fn formulation_catalog() -> HashMap<TableRef, Arc<TableInfo>> {
+    use crate::catalog::{FkAction, ForeignKey};
+    let mut cat = catalog();
+    let col = |n: &str, nullable: bool| {
+        let mut c = Column::new(n, "int", "int", None, None, None, false);
+        c.nullable = nullable;
+        c
+    };
+    let fk = |parent: &str, child_cols: Vec<usize>, parent_cols: Vec<&str>| ForeignKey {
+        parent: ("db".into(), parent.into()),
+        child_cols,
+        parent_cols: parent_cols.into_iter().map(String::from).collect(),
+        on_delete: FkAction::Cascade,
+        on_update: FkAction::Cascade,
+    };
+    for (name, cols, pk, cascades) in [
+        (
+            "entity",
+            vec![col("id", false), col("v", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "attr",
+            vec![col("id", false), col("ent_id", false), col("v", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "attr_n",
+            vec![col("id", false), col("ent_id", true), col("v", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "link",
+            vec![col("id", false), col("ent_id", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "item",
+            vec![col("id", false), col("ent_id", false), col("v", false)],
+            vec![0],
+            vec![fk("entity", vec![1], vec!["id"])],
+        ),
+        (
+            "item_n",
+            vec![col("id", false), col("ent_id", true), col("v", false)],
+            vec![0],
+            vec![fk("entity", vec![1], vec!["id"])],
+        ),
+        (
+            "item_part",
+            vec![col("id", false), col("item_id", false), col("v", false)],
+            vec![0],
+            vec![fk("item", vec![1], vec!["id"])],
+        ),
+        (
+            "item_part_sub",
+            vec![col("id", false), col("part_id", false), col("v", false)],
+            vec![0],
+            vec![fk("item_part", vec![1], vec!["id"])],
+        ),
+        (
+            "pair",
+            vec![col("a", false), col("b", false), col("v", false)],
+            vec![0, 1],
+            vec![],
+        ),
+        (
+            "pair_item",
+            vec![
+                col("id", false),
+                col("pa", false),
+                col("pb", false),
+                col("v", false),
+            ],
+            vec![0],
+            vec![fk("pair", vec![1, 2], vec!["a", "b"])],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        let mut t = (*t).clone();
+        t.cascades = cascades;
+        cat.insert(k, Arc::new(t));
+    }
+    cat
+}
+
+/// Guard R4 on PR #3: `x NOT IN (SELECT k …)` with x and k never NULL is `NOT EXISTS (… AND k = x)`
+/// (direct units) in every formulation where x is a NOT NULL column of the head or an inner-joined
+/// table: written as NOT EXISTS, the outer column on an inner-joined table that is not first in
+/// FROM, a comma join. A NULL side or a nullable k keeps the NULL-aware NOT IN form.
+#[test]
+fn not_in_over_never_null_columns_formulations() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let anti = |sql: &str, tracing: &str| {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.tracing(), tracing, "{sql}");
+        let w = v.where_sql.unwrap_or_default();
+        assert!(
+            w.contains("NOT EXISTS") && !w.contains("IS NULL"),
+            "{sql}: {w}"
+        );
+    };
+    let not_in = |sql: &str, tracing: &str| {
+        let v = plan(sql);
+        assert_eq!(v.tracing(), tracing, "{sql}");
+        let w = v.where_sql.unwrap_or_default();
+        assert!(w.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {w}");
+    };
+    let sub = "(SELECT a.ent_id FROM attr a WHERE a.v > 5)";
+    anti(
+        &format!("SELECT e.id FROM entity e WHERE e.id NOT IN {sub}"),
+        "e:unit,a:unit",
+    );
+    anti(
+        "SELECT e.id FROM entity e WHERE NOT EXISTS (SELECT 1 FROM attr a WHERE a.v > 5 AND a.ent_id = e.id)",
+        "e:unit,a:unit",
+    );
+    // The outer column on an inner-joined table that is not first in FROM, and a comma join (the
+    // unit is the head's key: the subquery table is looked up).
+    anti(
+        &format!(
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id WHERE e.id NOT IN {sub}"
+        ),
+        "l:unit,e:lineage,a:lookup",
+    );
+    anti(
+        &format!("SELECT l.id FROM link l, entity e WHERE e.id = l.ent_id AND e.id NOT IN {sub}"),
+        "l:unit,e:lineage,a:lookup",
+    );
+    // The outer column on a NULL side, a nullable k: NOT IN with its NULL branches.
+    not_in(
+        &format!(
+            "SELECT l.id FROM link l LEFT JOIN entity e ON e.id = l.ent_id WHERE e.id NOT IN {sub}"
+        ),
+        "l:unit,e:lookup,a:lookup",
+    );
+    not_in(
+        "SELECT e.id FROM entity e WHERE e.id NOT IN (SELECT a.ent_id FROM attr_n a WHERE a.v > 5)",
+        "e:unit,a:lookup",
+    );
+    // Through a CTE / derived table with renamed columns, also nested: the derived output is the
+    // inner NOT NULL column, the same NOT EXISTS form and route as the base.
+    for sql in [
+        format!("WITH t AS (SELECT e.id AS eid FROM entity e) SELECT t.eid FROM t WHERE t.eid NOT IN {sub}"),
+        format!("SELECT x.eid FROM (SELECT e.id AS eid FROM entity e) x WHERE x.eid NOT IN {sub}"),
+        format!(
+            "WITH t AS (SELECT e.id AS eid FROM entity e), u AS (SELECT t.eid AS k FROM t) SELECT u.k FROM u WHERE u.k NOT IN {sub}"
+        ),
+    ] {
+        anti(&sql, "e:unit,a:unit");
+    }
+    // A derived output that may be NULL, or is not a plain column, keeps NOT IN: a nullable inner
+    // column, an inner LEFT JOIN's NULL side, the NULL side of a leading RIGHT JOIN (mirrored to a
+    // LEFT JOIN), an expression output.
+    for sql in [
+        format!("SELECT x.k FROM (SELECT a.ent_id AS k FROM attr_n a) x WHERE x.k NOT IN {sub}"),
+        format!(
+            "SELECT x.lid FROM (SELECT l.id AS lid, e.id AS eid FROM link l LEFT JOIN entity e ON e.id = l.ent_id) x WHERE x.eid NOT IN {sub}"
+        ),
+        format!(
+            "SELECT x.lid FROM (SELECT l.id AS lid FROM link l RIGHT JOIN entity e ON e.id = l.ent_id) x WHERE x.lid NOT IN {sub}"
+        ),
+        format!("SELECT x.eid FROM (SELECT e.id + 0 AS eid FROM entity e) x WHERE x.eid NOT IN {sub}"),
+        format!("SELECT x.k FROM (SELECT COALESCE(a.ent_id, 0) AS k FROM attr_n a) x WHERE x.k NOT IN {sub}"),
+    ] {
+        let w = plan(&sql).where_sql.unwrap_or_default();
+        assert!(w.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {w}");
+    }
+    // An aggregated derived block, and a RIGHT JOIN after the column's table, are Full anyway.
+    assert_eq!(
+        plan(&format!("SELECT x.eid FROM (SELECT e.id AS eid FROM entity e GROUP BY e.id) x WHERE x.eid NOT IN {sub}")).mode,
+        Mode::Full("GROUP BY in derived table `x` under an aggregate, DISTINCT, window or LIMIT".into())
+    );
+    assert_eq!(
+        plan(&format!("SELECT x.eid FROM (SELECT e.id AS eid FROM entity e JOIN link l ON l.ent_id = e.id RIGHT JOIN attr a ON a.ent_id = e.id) x WHERE x.eid NOT IN {sub}")).mode,
+        Mode::Full("RIGHT/FULL/other join".into())
+    );
+}
+
+/// Guard R4 on PR #3 (C3): a semi-join over a child of a cascading foreign key takes the parent's
+/// cascade route when it is correlated on the view's unit through the whole key (`^parent:unit`),
+/// in every formulation: swapped sides, IN, a CTE or derived table with renamed outputs, a
+/// composite key, the parent first with other tables after it; otherwise the view is Full.
+#[test]
+fn cascading_child_semi_join_formulations() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    for (sql, tracing) in [
+        (
+            "SELECT e.id FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id AND i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT e.id FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE e.id = i.ent_id AND i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT e.id FROM entity e WHERE e.id IN (SELECT i.ent_id FROM item i WHERE i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "WITH t AS (SELECT e.id AS eid FROM entity e) SELECT t.eid FROM t WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = t.eid AND i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT x.eid FROM (SELECT e.id AS eid FROM entity e) x WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = x.eid AND i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT p.a, p.b FROM pair p WHERE EXISTS (SELECT 1 FROM pair_item q WHERE q.pa = p.a AND q.pb = p.b)",
+            "p:unit,q:unit,^pair:unit",
+        ),
+        (
+            "SELECT p.a, p.b FROM pair p WHERE EXISTS (SELECT 1 FROM pair_item q WHERE p.b = q.pb AND p.a = q.pa)",
+            "p:unit,q:unit,^pair:unit",
+        ),
+        // The parent first, another table joined after it (JOIN or comma join).
+        (
+            "SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "e:unit,l:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT e.id FROM entity e, link l WHERE l.ent_id = e.id AND EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "e:unit,l:unit,i:unit,^entity:unit",
+        ),
+        // The parent key not selected.
+        (
+            "SELECT e.v FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        // Anti-joins: NOT EXISTS = NOT IN over never-NULL columns = its CTE / derived forms.
+        (
+            "SELECT e.id FROM entity e WHERE NOT EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT e.id FROM entity e WHERE e.id NOT IN (SELECT i.ent_id FROM item i)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "WITH t AS (SELECT e.id AS eid FROM entity e) SELECT t.eid FROM t WHERE t.eid NOT IN (SELECT i.ent_id FROM item i)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT x.eid FROM (SELECT e.id AS eid FROM entity e) x WHERE x.eid NOT IN (SELECT i.ent_id FROM item i)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.tracing(), tracing, "{sql}");
+    }
+    // NOT IN over a nullable child key keeps its NULL branches (no direct units): the units a
+    // cascade changes are not known.
+    assert_eq!(
+        plan("SELECT e.id FROM entity e WHERE e.id NOT IN (SELECT i.ent_id FROM item_n i)").mode,
+        Mode::Full(
+            "IN subquery over `item_n`: the units a cascade from `entity` changes are not known"
+                .into()
+        )
+    );
+    // A grouped view keyed on the parent key.
+    let v = plan("SELECT e.id, COUNT(*) AS n FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id) GROUP BY e.id");
+    assert_eq!(v.mode, Mode::Grouped);
+    assert_eq!(v.tracing(), "e:unit,i:unit,^entity:unit");
+    // Not correlated on the unit through the whole key, so Full: part of a composite key, a group
+    // key that is an expression of the parent key, a cascade that continues out of the subquery's
+    // child (2 and 3 hops). (The parent after another table: known_limit_unit_follows_from_order.)
+    for (sql, parent, child) in [
+        (
+            "SELECT p.a, p.b FROM pair p WHERE EXISTS (SELECT 1 FROM pair_item q WHERE q.pa = p.a)",
+            "pair",
+            "pair_item",
+        ),
+        // A group key that is an expression of the parent key gives no direct units.
+        (
+            "SELECT e.id + 0 AS k, COUNT(*) AS n FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id) GROUP BY e.id + 0",
+            "entity",
+            "item",
+        ),
+        // A cascade that continues out of the subquery's child (2 and 3 hops).
+        (
+            "SELECT e.id FROM entity e WHERE EXISTS (SELECT 1 FROM item i JOIN item_part q ON q.item_id = i.id WHERE i.ent_id = e.id)",
+            "item",
+            "item_part",
+        ),
+        (
+            "SELECT e.id FROM entity e WHERE EXISTS (SELECT 1 FROM item i JOIN item_part q ON q.item_id = i.id JOIN item_part_sub r ON r.part_id = q.id WHERE i.ent_id = e.id)",
+            "item",
+            "item_part",
+        ),
+        (
+            "SELECT i.id FROM item i WHERE EXISTS (SELECT 1 FROM item_part q WHERE q.item_id = i.id)",
+            "entity",
+            "item_part",
+        ),
+    ] {
+        assert_eq!(
+            plan(sql).mode,
+            Mode::Full(format!(
+                "EXISTS subquery over `{child}`: the units a cascade from `{parent}` changes are not known"
+            )),
+            "{sql}"
+        );
+    }
+}
+
+/// KNOWN LIMIT (pre-existing, conservative; tracked for the key-map rewrite): semi- and
+/// anti-joins are extracted from WHERE conjuncts only, so the same predicate in an inner join's ON
+/// stays a subquery and the view is Full, while its WHERE form is incremental. Lifting the limit
+/// flips these assertions on purpose.
+#[test]
+fn known_limit_on_form_semi_join_full() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    for (on, wh) in [
+        (
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id AND e.id NOT IN (SELECT a.ent_id FROM attr a WHERE a.v > 5)",
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id WHERE e.id NOT IN (SELECT a.ent_id FROM attr a WHERE a.v > 5)",
+        ),
+        (
+            "SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id AND EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+        ),
+    ] {
+        assert_eq!(plan(on).mode, Mode::Full("subquery".into()), "{on}");
+        assert_eq!(plan(wh).mode, Mode::Spj, "{wh}");
+    }
+}
+
+/// KNOWN LIMIT (pre-existing, conservative; tracked for the key-map rewrite): the unit of a
+/// select/join view is the first table's key, so a semi-join over a cascading child correlated on
+/// a parent that is not first in FROM is not on the unit and the view is Full, while the same view
+/// with the parent first is incremental (`^parent:unit`). Lifting the limit flips these
+/// assertions on purpose.
+#[test]
+fn known_limit_unit_follows_from_order() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let why =
+        "EXISTS subquery over `item`: the units a cascade from `entity` changes are not known";
+    for (parent_first, parent_later) in [
+        (
+            "SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "SELECT e.id FROM link l JOIN entity e ON l.ent_id = e.id WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+        ),
+        (
+            "SELECT e.id FROM entity e, link l WHERE l.ent_id = e.id AND EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "SELECT e.id FROM link l, entity e WHERE l.ent_id = e.id AND EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+        ),
+    ] {
+        let v = plan(parent_first);
+        assert_eq!(v.mode, Mode::Spj, "{parent_first}");
+        assert_eq!(v.tracing(), "e:unit,l:unit,i:unit,^entity:unit", "{parent_first}");
+        assert_eq!(plan(parent_later).mode, Mode::Full(why.into()), "{parent_later}");
+    }
+}

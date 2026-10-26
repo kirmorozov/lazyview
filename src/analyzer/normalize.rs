@@ -23,8 +23,8 @@ use sqlparser::parser::Parser;
 
 use super::ast::{
     and_all, conjuncts, exprs_of, factor_alias, factors, for_each_expr_mut, function_name,
-    has_column_ref, has_subquery, join_constraint, join_constraint_mut, kind_at, nested, qcol,
-    qident, table_factor, JoinKind,
+    has_column_ref, has_subquery, join_constraint, join_constraint_mut, join_kind, kind_at, nested,
+    qcol, qident, table_factor, JoinKind,
 };
 use super::build::{star_with_using, Builder, Res, Resolver};
 use super::ir::{Block, Item, Origin, Rel, Semi, SemiTable, Source};
@@ -1436,6 +1436,36 @@ pub(crate) fn query_of(select: Select) -> Query {
     }
 }
 
+/// Whether column `c` of `item` (in FROM `from`) is never NULL: NOT NULL in its table, which is
+/// the head or inner-joined (not on the NULL side of a LEFT JOIN: a merge onto a NULL side moves
+/// this WHERE into an ON, refused later) and not followed by a RIGHT / FULL / other join in its
+/// FROM entry (which would NULL-extend it); for a derived table or CTE, the column its output names
+/// in the inner block, recursively (not through aggregation, whose groups may add NULLs).
+fn never_null(from: &[TableWithJoins], item: &Item, c: usize) -> bool {
+    let (t, j) = item.pos;
+    let later = &from[t].joins[j.map_or(0, |j| j + 1)..];
+    if !matches!(kind_at(from, item.pos), JoinKind::Head | JoinKind::Inner)
+        || later
+            .iter()
+            .any(|x| matches!(join_kind(x), JoinKind::Other))
+    {
+        return false;
+    }
+    match &item.source {
+        Source::Table(_, t) => !t.columns[c].nullable,
+        Source::Derived(Rel::Block(inner)) => {
+            !aggregated(inner)
+                && inner.outputs.get(c).is_some_and(|o| {
+                    match Resolver::new(inner).resolve(&o.expr) {
+                        Res::Col(j, d) => never_null(&inner.select.from, &inner.items[j], d),
+                        _ => false,
+                    }
+                })
+        }
+        Source::Derived(_) => false,
+    }
+}
+
 /// Takes semi-/anti-join conjuncts over one table out of WHERE (see [`Semi`]).
 fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
     let Some(w) = &b.select.selection else {
@@ -1449,16 +1479,9 @@ fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
         return Ok(());
     }
     let outer = Resolver::new(b);
-    // A column of the block that is never NULL: NOT NULL in its table, which is not on the NULL
-    // side of a LEFT JOIN (a merge onto a NULL side moves this WHERE into an ON, refused later).
+    let (items, from) = (&b.items, &b.select.from);
     let not_null = |e: &Expr| match outer.resolve(e) {
-        Res::Col(i, c) => {
-            b.items[i].table().is_some_and(|t| !t.columns[c].nullable)
-                && matches!(
-                    kind_at(&b.select.from, b.items[i].pos),
-                    JoinKind::Head | JoinKind::Inner
-                )
-        }
+        Res::Col(i, c) => never_null(from, &items[i], c),
         _ => false,
     };
     let mut kept = Vec::new();
