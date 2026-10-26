@@ -1490,6 +1490,10 @@ pub struct Applied {
     pub inserted: u64,
     /// Of those, rows upserted by their row key.
     pub upserted: u64,
+    /// Of `inserted`, rows that replace an old row with the same row key in place.
+    pub updated: u64,
+    /// Old rows compared and found equal (not written).
+    pub unchanged: u64,
 }
 
 /// New (source) rows of a chunk, converted and grouped by unit once and shared by every target.
@@ -1533,6 +1537,10 @@ pub struct Diff {
     pub delete_keys: Vec<Key>,
     /// Old rows deleted.
     pub deleted_rows: u64,
+    /// Of `inserts`, rows that replace the old row of their row key in place.
+    pub updated_rows: u64,
+    /// Old rows equal to their new row (not written).
+    pub unchanged_rows: u64,
     /// New rows written: inserted (per unit) or upserted (by row key).
     pub inserts: Vec<Vec<Value>>,
     /// Rows compared (old + new), for statistics.
@@ -1617,6 +1625,7 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Result<Dif
         let o: Vec<&Row2> = old.get(k).unwrap_or(&none).iter().collect();
         let n: Vec<&Row2> = new.groups.get(k).unwrap_or(&none).iter().collect();
         if same_rows(&o, &n) {
+            d.unchanged_rows += o.len() as u64;
             continue;
         }
         d.changed.push(k.clone());
@@ -1646,6 +1655,7 @@ fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) -> R
     for (k, n) in by_key(key, new) {
         let o = old.remove(&k).unwrap_or_default();
         if same_rows(&o, &n) {
+            d.unchanged_rows += o.len() as u64;
             continue;
         }
         let null = crate::datum::key_has_null(&k);
@@ -1661,6 +1671,8 @@ fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) -> R
         if !o.is_empty() && (null || o.len() > 1) {
             d.delete_keys.push(k);
             d.deleted_rows += o.len() as u64;
+        } else if !o.is_empty() {
+            d.updated_rows += 1;
         }
         d.inserts.extend(n.iter().map(|r| r.1.clone()));
     }
@@ -1686,7 +1698,10 @@ pub async fn write_diff(
     began: &AtomicBool,
 ) -> Result<Applied> {
     if d.changed.is_empty() {
-        return Ok(Applied::default());
+        return Ok(Applied {
+            unchanged: d.unchanged_rows,
+            ..Default::default()
+        });
     }
     began.store(true, Ordering::SeqCst);
     let utc = layout.epoch_timestamps();
@@ -1721,6 +1736,8 @@ async fn write_tx(
         deleted: d.deleted_rows,
         inserted: d.inserts.len() as u64,
         upserted: if d.by_unit { 0 } else { d.inserts.len() as u64 },
+        updated: d.updated_rows,
+        unchanged: d.unchanged_rows,
     };
     let mut tx = conn.start_transaction(Default::default()).await?;
     if d.by_unit && d.deleted_rows > 0 {
@@ -2379,6 +2396,9 @@ mod tests {
         assert_eq!(d.inserts, vec![r(1, "B", Some(11))]);
         assert!(d.delete_keys.is_empty());
         assert_eq!(d.deleted_rows, 0);
+        // Row kinds: the changed row replaces its old one in place, the other rows are equal
+        // (the unit's two other rows, units 2 and 3).
+        assert_eq!((d.updated_rows, d.unchanged_rows), (1, 4));
         // The unit shrinks (12 vanishes) and grows (13 appears); unit 3 vanishes entirely.
         let new = vec![
             r(1, "a", Some(10)),

@@ -1012,6 +1012,63 @@ impl Engine {
     pub async fn wait_caught_up(&mut self, src: &mut Conn, timeout: Duration) -> Result<()> {
         self.wait_caught_up_rounds(src, timeout, 3).await
     }
+
+    /// Update statistics of view `view` of `db`, as `GET /stats` reports them (src/stats.rs):
+    /// folded at the end of every flush, so after a catch-up they include everything applied.
+    /// `None` until a flush listed the view.
+    pub fn view_stats(&self, db: &Db, view: &str) -> Option<ViewStats> {
+        self.metrics.view_stats.view(&format!("{}.{view}", db.name))
+    }
+
+    /// [`Self::view_stats`], failing when the view is not listed.
+    pub fn stats_of(&self, db: &Db, view: &str) -> Result<ViewStats> {
+        self.view_stats(db, view)
+            .with_context(|| format!("view `{view}` is not listed in /stats"))
+    }
+}
+
+pub use lazyview::stats::ViewSnapshot as ViewStats;
+
+/// A free local TCP address for an engine's `LAZYVIEW_HEALTH_ADDR`.
+pub fn free_local_addr() -> Result<String> {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    Ok(format!("127.0.0.1:{port}"))
+}
+
+/// `GET <path>` on an engine's health endpoint (`addr` as given in `LAZYVIEW_HEALTH_ADDR`):
+/// status and body.
+pub async fn http_get(addr: &str, path: &str) -> Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+        .await
+        .context("connect timeout")??;
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+        .await
+        .context("read timeout")??;
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .with_context(|| format!("bad HTTP response {text:?}"))?;
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .with_context(|| format!("bad status line in {head:?}"))?;
+    Ok((status, body.to_string()))
+}
+
+/// `GET /stats` of an engine started with `LAZYVIEW_HEALTH_ADDR=addr`, as JSON.
+pub async fn fetch_stats(addr: &str) -> Result<serde_json::Value> {
+    let (status, body) = http_get(addr, "/stats").await?;
+    if status != 200 {
+        bail!("GET {addr}/stats: status {status}: {body}");
+    }
+    serde_json::from_str(&body).with_context(|| format!("GET {addr}/stats: not JSON: {body}"))
 }
 
 /// `LAZYVIEW_FULL_REFRESH_MS` given to test engines: `LAZYVIEW_TEST_FULL_REFRESH_MS` (default 0 =

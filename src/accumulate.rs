@@ -9,6 +9,7 @@ use roaring::RoaringTreemap;
 use crate::analyze::{AliasPlan, CascadeRoute, ConstFilter, Mode, ViewPlan};
 use crate::catalog::FkAction;
 use crate::datum::{Datum, Key};
+use crate::stats::Tally;
 
 const SIGN: u64 = 1 << 63;
 
@@ -21,11 +22,12 @@ pub struct UnitSet {
 }
 
 impl UnitSet {
-    pub fn insert(&mut self, key: Key) {
+    /// `false`: the key was in the set already.
+    pub fn insert(&mut self, key: Key) -> bool {
         if let [Datum::Int(i)] = &*key {
-            self.ints.insert((*i as u64) ^ SIGN);
+            self.ints.insert((*i as u64) ^ SIGN)
         } else {
-            self.keys.insert(key);
+            self.keys.insert(key)
         }
     }
 
@@ -330,6 +332,9 @@ pub struct ViewDirty {
     pub all: bool,
     /// Incremental views: affected units unknown (cascading FK); rebuild in the background.
     pub rebuild: bool,
+    /// Marks counted for the view's statistics (stays with the buffer on [`Self::take`], not
+    /// carried by [`Self::merge`]; folded and reset once per flush).
+    pub tally: Tally,
 }
 
 impl ViewDirty {
@@ -379,10 +384,27 @@ impl ViewDirty {
         self.rebuild |= other.rebuild;
     }
 
+    /// Marks the target id `key`.
+    #[inline]
+    pub fn mark(&mut self, key: Key) {
+        let new = self.units.insert(key);
+        self.tally.id(new);
+    }
+
+    /// Marks the whole view (full and global views); a global view's one row counts as an id.
+    #[inline]
+    pub fn mark_all(&mut self, plan: &ViewPlan) {
+        if matches!(plan.mode, Mode::Global) {
+            self.tally.id(!self.all);
+        }
+        self.all = true;
+    }
+
     pub fn take(&mut self) -> ViewDirty {
         let n = self.images.len();
         let mut out = std::mem::take(self);
         self.images = vec![HashSet::new(); n];
+        self.tally = std::mem::take(&mut out.tally);
         if out.images.len() < n {
             out.images.resize(n, HashSet::new());
         }
@@ -453,12 +475,17 @@ pub fn feed(
         return Fed::Skipped;
     }
     if !matches!(plan.mode, Mode::Spj | Mode::Grouped) {
-        dirty.all = true;
+        dirty.mark_all(plan);
         return Fed::Recorded;
     }
     if let Some(cols) = &a.direct_unit {
-        for row in [before, after].into_iter().flatten() {
-            dirty.units.insert(project(row, a, cols));
+        // An update that keeps its unit marks it once.
+        let new = after.map(|row| project(row, a, cols));
+        let old = before
+            .map(|row| project(row, a, cols))
+            .filter(|o| new.as_ref() != Some(o));
+        for key in [old, new].into_iter().flatten() {
+            dirty.mark(key);
         }
         return Fed::Recorded;
     }
@@ -466,8 +493,14 @@ pub fn feed(
         if dirty.partial.len() <= set {
             dirty.partial.resize_with(set + 1, UnitSet::default);
         }
-        for row in [before, after].into_iter().flatten() {
-            dirty.partial[set].insert(project(row, a, cols));
+        // As for units: an update that keeps its key marks it once.
+        let new = after.map(|row| project(row, a, cols));
+        let old = before
+            .map(|row| project(row, a, cols))
+            .filter(|o| new.as_ref() != Some(o));
+        for key in [old, new].into_iter().flatten() {
+            let fresh = dirty.partial[set].insert(key);
+            dirty.tally.id(fresh);
         }
         return Fed::Recorded;
     }
@@ -484,11 +517,13 @@ pub fn feed(
         // materialized rows still carry the old one.
         let old = project(b, a, &a.image_cols);
         if membership_changed || new.as_ref() != Some(&old) {
-            dirty.images[alias].insert(old);
+            let fresh = dirty.images[alias].insert(old);
+            dirty.tally.image(fresh);
         }
     }
     if let Some(new) = new {
-        dirty.images[alias].insert(new);
+        let fresh = dirty.images[alias].insert(new);
+        dirty.tally.image(fresh);
     }
     Fed::Recorded
 }
@@ -537,7 +572,7 @@ pub fn feed_cascade(
         }
     }
     if !matches!(plan.mode, Mode::Spj | Mode::Grouped) {
-        dirty.all = true;
+        dirty.mark_all(plan);
         return Fed::Recorded;
     }
     if c.derived {
@@ -553,18 +588,14 @@ pub fn feed_cascade(
             .map(|&p| Datum::from_binlog(value_at(row, p), &c.parent.columns[p]))
             .collect()
     };
-    dirty.units.insert(unit(b));
+    dirty.mark(unit(b));
     if let Some(a) = after {
         match action {
-            FkAction::Cascade => dirty.units.insert(unit(a)),
-            _ => dirty
-                .units
-                .insert(pcols.iter().map(|_| Datum::Null).collect()),
+            FkAction::Cascade => dirty.mark(unit(a)),
+            _ => dirty.mark(pcols.iter().map(|_| Datum::Null).collect()),
         }
     } else if action == FkAction::SetNull {
-        dirty
-            .units
-            .insert(pcols.iter().map(|_| Datum::Null).collect());
+        dirty.mark(pcols.iter().map(|_| Datum::Null).collect());
     }
     Fed::Recorded
 }
@@ -622,13 +653,16 @@ fn feed_derived_cascade(
     }
     for (set, pcols) in &c.partial_from_parent {
         let key = |r: &BinlogRow| -> Key { pcols.iter().map(|&p| datum(r, p)).collect() };
-        dirty.partial[*set].insert(key(b));
-        match new_key {
-            Some(a) => dirty.partial[*set].insert(key(a)),
+        let new = match new_key {
+            Some(a) => Some(key(a)),
             None if action == FkAction::SetNull => {
-                dirty.partial[*set].insert(pcols.iter().map(|_| Datum::Null).collect())
+                Some(pcols.iter().map(|_| Datum::Null).collect())
             }
-            None => {}
+            None => None,
+        };
+        for k in std::iter::once(key(b)).chain(new) {
+            let fresh = dirty.partial[*set].insert(k);
+            dirty.tally.id(fresh);
         }
     }
     Fed::Recorded
@@ -738,6 +772,35 @@ mod tests {
         feed(&p, 1, &mut dirty, Some(&before), Some(&moved));
         let [old, new] = images(&before, &moved);
         assert!(dirty.images[1].contains(&old) && dirty.images[1].contains(&new));
+        // Each buffered image is counted, a repeat as absorbed.
+        let same = u64::from(old == new);
+        assert_eq!(
+            (dirty.tally.images_marked, dirty.tally.images_absorbed),
+            (2, same)
+        );
+        feed(&p, 1, &mut dirty, Some(&before), Some(&moved));
+        assert_eq!(
+            (dirty.tally.images_marked, dirty.tally.images_absorbed),
+            (4, 2 + same)
+        );
+
+        // Alias r carries the unit: an update that keeps it marks it once, a repeat is absorbed
+        // by the buffer, an update that moves it marks the old and the new unit.
+        assert!(p.aliases[0].direct_unit.is_some());
+        let mut dirty = ViewDirty::for_aliases(p.aliases.len());
+        feed(&p, 0, &mut dirty, Some(&row(1, "x")), Some(&row(1, "y")));
+        feed(&p, 0, &mut dirty, Some(&row(1, "y")), Some(&row(1, "z")));
+        feed(&p, 0, &mut dirty, None, Some(&row(2, "x")));
+        feed(&p, 0, &mut dirty, Some(&row(2, "x")), Some(&row(3, "x")));
+        assert_eq!((dirty.tally.ids_marked, dirty.tally.ids_absorbed), (5, 2));
+        assert_eq!(dirty.units.len(), 3);
+        // The counters stay with the buffer when its changes are taken, and a merge (a failed
+        // refresh) does not count them again.
+        let taken = dirty.take();
+        assert_eq!((taken.units.len(), taken.tally), (3, Tally::default()));
+        assert_eq!(dirty.tally.ids_marked, 5);
+        dirty.merge(taken);
+        assert_eq!((dirty.units.len(), dirty.tally.ids_marked), (3, 5));
     }
 
     /// Rows failing an alias's constant filters are not its rows: a change with both sides
@@ -1055,6 +1118,10 @@ mod tests {
             .map(|v| (v ^ SIGN) as i64)
             .collect();
         assert_eq!(got, vec![7, 8, 10], "entity 9 only had another key");
+        // Each partial key counts as a marked id.
+        assert_eq!((d.tally.ids_marked, d.tally.ids_absorbed), (3, 0));
+        feed(&p, 2, &mut d, None, Some(&row(3, 8, 7)));
+        assert_eq!((d.tally.ids_marked, d.tally.ids_absorbed), (4, 1));
     }
 
     /// A derived cascade: a parent row failing every pinned child alias's filters is skipped,
@@ -1288,10 +1355,14 @@ mod tests {
             let n = (rnd() % 600) as usize;
             for _ in 0..n {
                 match rnd() % 4 {
-                    0 => s.insert(Box::new([Datum::Bytes(
-                        format!("k{}", rnd() % 300).into_bytes(),
-                    )])),
-                    1 => s.insert(Box::new([Datum::Int((rnd() % 50) as i64), Datum::Null])),
+                    0 => {
+                        s.insert(Box::new([Datum::Bytes(
+                            format!("k{}", rnd() % 300).into_bytes(),
+                        )]));
+                    }
+                    1 => {
+                        s.insert(Box::new([Datum::Int((rnd() % 50) as i64), Datum::Null]));
+                    }
                     _ => s.insert_int((rnd() % 1000) as i64 - 500),
                 }
             }

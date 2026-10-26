@@ -138,7 +138,7 @@ the source plus 1 + `LAZYVIEW_MAX_TARGET_CONCURRENCY` on each other target, besi
 
 | variable | default | meaning |
 |---|---|---|
-| `LAZYVIEW_HEALTH_ADDR` | `0.0.0.0:8080` | listen address of the health and metrics endpoint. `off` (or empty) disables it. An unspecified address (`0.0.0.0` or `[::]`) listens on IPv4 and IPv6 |
+| `LAZYVIEW_HEALTH_ADDR` | `0.0.0.0:8080` | listen address of the health and metrics endpoint (also `/stats`, see [operations.md](operations.md#per-view-update-statistics)). `off` (or empty) disables it. An unspecified address (`0.0.0.0` or `[::]`) listens on IPv4 and IPv6 |
 | `LAZYVIEW_LIVENESS_STALL_SECS` | `120` | `/livez` fails after this many seconds without engine progress. At least `30`, and at least 2 × the heartbeat in seconds + 10 (an idle source only wakes the engine with binlog heartbeats). With a warning, a value below 30 falls back to the default and a value below the heartbeat minimum is raised to it. The default also rises to that minimum when `LAZYVIEW_HEARTBEAT_MS` is above 55000 |
 | `LAZYVIEW_LIVENESS_BOOT_STALL_SECS` | `900` | `/livez` limit while the engine boots (before the first binlog connect, also after a standby takes over); never lower than `LAZYVIEW_LIVENESS_STALL_SECS` |
 | `LAZYVIEW_READY_DISCONNECT_GRACE_SECS` | `30` | `/readyz` tolerates a disconnected binlog stream this long |

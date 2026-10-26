@@ -367,6 +367,8 @@ struct Slot {
     rebuild_asked: Option<Position>,
     /// Hash of the definition whose planning timed out: not planned again until it changes.
     plan_timed_out: Option<String>,
+    /// Refresh results and builds since the last fold into `/stats` (see `publish_stats`).
+    stats: crate::stats::Flush,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -682,6 +684,13 @@ fn columns_changed(before: &BinlogRow, after: &BinlogRow, cols: &[bool]) -> bool
         read && (before.as_ref(c) != after.as_ref(c)
             || matches!(after.as_ref(c), Some(BinlogValue::JsonDiff(_))))
     })
+}
+
+/// Target ids waiting in a buffer: its units and partial unit keys, or a global view's single
+/// row.
+fn pending_ids(d: &ViewDirty, plan: &ViewPlan) -> u64 {
+    (d.units.len() + d.partial.iter().map(UnitSet::len).sum::<usize>()) as u64
+        + u64::from(d.all && matches!(plan.mode, Mode::Global))
 }
 
 fn mode_name(plan: &ViewPlan) -> (&'static str, Option<String>) {
@@ -1744,6 +1753,7 @@ impl Engine {
             replan_after: false,
             rebuild_asked: None,
             plan_timed_out: None,
+            stats: Default::default(),
         });
         self.slots.len() - 1
     }
@@ -1988,6 +1998,17 @@ impl Engine {
             info!(view = %name, targets = %targets.join(","), mode = %plan.mode, tracing = %plan.tracing(), "building");
         }
         Metrics::add(&self.metrics.full_rebuilds, 1);
+        let reason = if partial {
+            "build on a target that was down"
+        } else if !routine {
+            "new version: definition, targets or source schema changed, or rebuild requested"
+        } else if matches!(plan.mode, Mode::Full(_)) {
+            "full-mode view: the definition is not maintained incrementally"
+        } else {
+            "affected ids unknown (cascading foreign key, lookup overflow or untraced change)"
+        };
+        let replaces_live = self.slots[idx].live.is_some();
+        self.slots[idx].stats.built(replaces_live, reason);
         self.slots[idx].last_full = Some(Instant::now());
         // Building again: views waiting for this one no longer show its error.
         let unblocked =
@@ -2942,6 +2963,7 @@ impl Engine {
                     },
                     RouteKind::Any => continue,
                 };
+                dirty.tally.row(fed == Fed::Skipped);
                 match fed {
                     Fed::Skipped => skipped += 1,
                     Fed::Recorded => {
@@ -3297,6 +3319,7 @@ impl Engine {
             let _ = meta::touch_refreshed(&mut self.meta, &names).await;
             self.last_touch = Instant::now();
         }
+        self.publish_stats();
         Metrics::add(&self.metrics.flushes, 1);
         self.update_gauges();
         self.after_boundary();
@@ -3315,6 +3338,40 @@ impl Engine {
         }
         tracing::trace!(elapsed = ?elapsed, "flush");
         Ok(())
+    }
+
+    /// Folds every view's counters since the last flush into `/stats` (one lock per flush;
+    /// see src/stats.rs).
+    fn publish_stats(&mut self) {
+        let schema = &self.schema;
+        let views = self
+            .slots
+            .iter_mut()
+            .map(|s| {
+                let plan = s
+                    .live
+                    .as_ref()
+                    .map(|l| &l.plan)
+                    .or(s.next.as_ref().map(|n| &n.plan))
+                    .or(s.last_plan.as_ref());
+                let mode = plan.map(|p| mode_name(p).0).unwrap_or("unknown");
+                let (tally, pending) = match s.live.as_mut() {
+                    Some(l) => (
+                        std::mem::take(&mut l.dirty.tally),
+                        pending_ids(&l.dirty, &l.plan),
+                    ),
+                    None => Default::default(),
+                };
+                crate::stats::Fold {
+                    view: format!("{schema}.{}", s.name),
+                    mode,
+                    tally,
+                    flush: std::mem::take(&mut s.stats),
+                    pending,
+                }
+            })
+            .collect();
+        self.metrics.view_stats.fold(views);
     }
 
     /// Waits until the transactions read from the binlog are visible to readers: binlog events
@@ -3828,6 +3885,8 @@ impl Engine {
         };
         let replan_after = std::mem::take(&mut self.slots[i].replan_after);
         let recent = std::mem::take(&mut n.recent);
+        // Ids the live version's buffer receives from the build (and of those already pending).
+        let mut carried = (pending_ids(&live_dirty, &n.plan), 0);
         match self.slots[i].live.as_mut().filter(|_| n.partial) {
             Some(l) => {
                 // New targets of the unchanged live version (also fed every change meanwhile).
@@ -3839,7 +3898,9 @@ impl Engine {
                 l.targets.sort();
                 l.recent.extend(recent);
                 if !live_dirty.is_empty() {
+                    let before = pending_ids(&l.dirty, &l.plan);
                     l.dirty.merge(live_dirty);
+                    carried.1 = before + carried.0 - pending_ids(&l.dirty, &l.plan);
                     if let Some(p) = since {
                         if l.since.as_ref().is_none_or(|s| p < *s) {
                             l.since = Some(p);
@@ -3862,6 +3923,7 @@ impl Engine {
                 });
             }
         }
+        self.slots[i].stats.carried(carried.0, carried.1);
         if replan_after {
             // The upstream data changed during this build: build once more from a new plan.
             self.schedule_replan(def_id, false, false);
@@ -4034,6 +4096,7 @@ impl Engine {
                         g.all |= r.all;
                     }
                 }
+                s.stats.refreshed(r.units, r.partial, r.all, &r.work);
                 if dirty.rebuild {
                     let live_since = l.since.clone();
                     if let Some(n) = s.next.as_mut() {
@@ -4151,6 +4214,7 @@ impl Engine {
             return finish_refresh(dirty, p, out);
         }
         let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
+        let mut work = crate::stats::Work::default();
         if matches!(plan.mode, Mode::Global) {
             if !dirty.all {
                 return Ok(Refreshed::default());
@@ -4158,10 +4222,12 @@ impl Engine {
             let fresh = self.flavor == Flavor::MariaDb;
             let rows =
                 mv::read_source(&mut self.src, plan, layout, None, &self.metrics, fresh).await?;
+            work.source_queries += 1;
             Metrics::add(&self.metrics.units_refreshed, 1);
             for t in targets {
-                if let Err(e) = self.apply_target(t, table, layout, None, &rows).await {
-                    failed.push((t.clone(), e));
+                match self.apply_target(t, table, layout, None, &rows).await {
+                    Ok(a) => work.rows.applied(&a),
+                    Err(e) => failed.push((t.clone(), e)),
                 }
             }
             dirty.all = false;
@@ -4170,11 +4236,13 @@ impl Engine {
                 partial: Vec::new(),
                 all: true,
                 failed,
+                work,
             });
         }
         // `dirty` is only cleared once everything succeeded, so a failure can be retried.
         let mut units = dirty.units.clone();
         let mut rebuild = dirty.rebuild;
+        let resolve = (units.len(), Metrics::get(&self.metrics.lookup_queries));
         if !self
             .lookups(
                 plan,
@@ -4197,6 +4265,8 @@ impl Engine {
             &mut units,
         )
         .await?;
+        work.ids_resolved = (units.len() - resolve.0) as u64;
+        work.lookup_queries = Metrics::get(&self.metrics.lookup_queries) - resolve.1;
         let partial = dirty.partial.clone();
         Metrics::add(
             &self.metrics.units_refreshed,
@@ -4229,15 +4299,17 @@ impl Engine {
                 self.flavor == Flavor::MariaDb,
             )
             .await?;
+            work.source_queries += 1;
             for t in targets {
                 if failed.iter().any(|(f, _)| f == t) {
                     continue;
                 }
-                if let Err(e) = self
+                match self
                     .apply_target(t, table, layout, Some(&chunk), &rows)
                     .await
                 {
-                    failed.push((t.clone(), e));
+                    Ok(a) => work.rows.applied(&a),
+                    Err(e) => failed.push((t.clone(), e)),
                 }
             }
         }
@@ -4252,6 +4324,7 @@ impl Engine {
             partial,
             all: false,
             failed,
+            work,
         })
     }
 
@@ -4283,6 +4356,7 @@ impl Engine {
         } else {
             // `dirty` is only cleared once everything succeeded, so a failure can be retried.
             let mut units = dirty.units.clone();
+            let resolve = (units.len(), Metrics::get(&self.metrics.lookup_queries));
             if !self
                 .lookups(
                     plan,
@@ -4305,6 +4379,8 @@ impl Engine {
                 &mut units,
             )
             .await?;
+            p.work.ids_resolved = (units.len() - resolve.0) as u64;
+            p.work.lookup_queries = Metrics::get(&self.metrics.lookup_queries) - resolve.1;
             p.partial = dirty.partial.clone();
             Metrics::add(
                 &self.metrics.units_refreshed,
@@ -4410,7 +4486,7 @@ impl Engine {
         layout: &Layout,
         chunk: Option<&UnitChunk>,
         rows: &[Vec<Value>],
-    ) -> Result<()> {
+    ) -> Result<mv::Applied> {
         let ts = self.targets[t].schema.clone();
         let metrics = self.metrics.clone();
         let timeout = self.cfg.target_timeout;
@@ -4427,15 +4503,14 @@ impl Engine {
         )
         .await
         {
-            Ok(r) => r.map(|_| ()),
+            Ok(r) => r,
             Err(_) => Err(anyhow!("timed out after {timeout:?}")),
         };
-        if let Err(e) = r {
+        r.map_err(|e| {
             // Drop the connection so the next attempt reconnects.
             self.targets.get_mut(t).unwrap().conn = None;
-            return Err(e.context(format!("target {t}")));
-        }
-        Ok(())
+            e.context(format!("target {t}"))
+        })
     }
 
     /// Resolves the buffered row images to units.
@@ -4865,6 +4940,8 @@ struct Refreshed {
     all: bool,
     /// Targets whose writes failed.
     failed: Vec<(String, anyhow::Error)>,
+    /// Queries and rows written, for the view's statistics.
+    work: crate::stats::Work,
 }
 
 /// A live refresh between [`Engine::live_begin`] and [`Engine::live_end`].
@@ -4898,6 +4975,8 @@ struct PendingRefresh {
     rebuild: bool,
     /// Targets that failed before the run.
     failed: Vec<(String, anyhow::Error)>,
+    /// Lookups done so far (the run adds its reads and writes).
+    work: crate::stats::Work,
 }
 
 /// Runs the chunk ops of a prepared refresh on the supervisor's pools.
@@ -4919,7 +4998,11 @@ fn finish_refresh(
         return Ok(Refreshed::default());
     }
     let mut failed = p.failed;
-    failed.extend(out?.failed);
+    let out = out?;
+    failed.extend(out.failed);
+    let mut work = p.work;
+    work.source_queries += out.chunks as u64;
+    work.rows = out.rows;
     if p.global {
         dirty.all = false;
         return Ok(Refreshed {
@@ -4927,6 +5010,7 @@ fn finish_refresh(
             partial: Vec::new(),
             all: true,
             failed,
+            work,
         });
     }
     let n = dirty.images.len();
@@ -4940,6 +5024,7 @@ fn finish_refresh(
         partial: p.partial,
         all: false,
         failed,
+        work,
     })
 }
 

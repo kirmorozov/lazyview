@@ -365,6 +365,8 @@ pub struct Outcome {
     /// Ops started (chunks read) and the most write ops in flight at once.
     pub chunks: usize,
     pub peak_writes: usize,
+    /// View rows written per kind, over every target.
+    pub rows: crate::stats::Rows,
 }
 
 /// State shared by the ops of one run.
@@ -380,6 +382,8 @@ struct Run {
     serial: Option<HashMap<String, Arc<Semaphore>>>,
     writes: AtomicUsize,
     peak: AtomicUsize,
+    /// Rows written (one lock per chunk and target).
+    rows: Mutex<crate::stats::Rows>,
 }
 
 /// The pools and limits of the refresh supervisor.
@@ -482,6 +486,7 @@ impl Supervisor {
             serial,
             writes: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            rows: Mutex::new(Default::default()),
         });
         // The units, then each set of partial unit keys.
         let mut cursors: Vec<(Option<Vec<usize>>, ChunkCursor)> = units
@@ -538,10 +543,12 @@ impl Supervisor {
             peak_writes = run.peak.load(Ordering::Relaxed),
             "refreshed concurrently"
         );
+        let rows = *run.rows.lock().unwrap();
         Ok(Outcome {
             failed: failed.into_iter().collect(),
             chunks,
             peak_writes: run.peak.load(Ordering::Relaxed),
+            rows,
         })
     }
 
@@ -651,8 +658,11 @@ async fn chunk_op(run: Arc<Run>, chunk: Option<UnitChunk>, permit: Permit) -> Re
             if run.failed.lock().unwrap().contains_key(&name) {
                 return;
             }
-            if let Err(e) = write_op(&run, t, &chunk, &prepared).await {
-                run.failed.lock().unwrap().entry(name).or_insert(e);
+            match write_op(&run, t, &chunk, &prepared).await {
+                Ok(a) => run.rows.lock().unwrap().applied(&a),
+                Err(e) => {
+                    run.failed.lock().unwrap().entry(name).or_insert(e);
+                }
             }
         });
     }

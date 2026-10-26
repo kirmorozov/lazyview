@@ -15,7 +15,7 @@ docker run -d --name lazyview --restart unless-stopped \
   Docker takes the values literally: no quotes, no `$` expansion.
 * The image runs as `65532:65532` and writes no files, so `--read-only`, `--cap-drop ALL` and
   `--security-opt no-new-privileges` work.
-* `-p 8080:8080` publishes `/metrics`, `/livez`, `/readyz` and `/startupz` outside the container.
+* `-p 8080:8080` publishes `/metrics`, `/stats`, `/livez`, `/readyz` and `/startupz` outside the container.
 * For a database on the Docker host itself, add `--add-host=host.docker.internal:host-gateway`
   and set `LAZYVIEW_HOST=host.docker.internal`.
 * The image has no shell, so there is nothing to `docker exec` into. Use
@@ -88,6 +88,7 @@ never stops the engine.
 | `/startupz` | the engine loop makes progress (the same verdict as `/livez`, with the boot limit while booting); `?verbose` shows the boot phase (booting, hot standby, binlog stream connected) | only when the engine is stalled | waiting for the database, migrating metadata, acquiring the lock |
 | `/readyz` | this instance is active, streams the binlog and every view has a live table | starting; hot standby (unless `?standby=ok`); binlog disconnected longer than `LAZYVIEW_READY_DISCONNECT_GRACE_SECS` (30); a view without a live table yet (first build; unless `?building=ok`); engine stalled; a view in error, only with `LAZYVIEW_READY_REQUIRE_ALL=true` | a view rebuilding behind its live table, short reconnects |
 | `/metrics` | always (Prometheus text format) | — | — |
+| `/stats` | always (JSON, [per-view update statistics](#per-view-update-statistics)) | — | — |
 
 * `?verbose` lists the individual checks. `?format=json` or `Accept: application/json` returns
   JSON. `?require_all=1` (or `=0`) overrides `LAZYVIEW_READY_REQUIRE_ALL` for one request.
@@ -145,10 +146,71 @@ Gauges:
 | `lazyview_applied_binlog_pos{file}` | binlog position up to which every change has been applied |
 | `lazyview_build_info{version}` | always 1 |
 
+Per view, labelled `{view="<schema>.<view>"}`: the counters of
+[`/stats`](#per-view-update-statistics) as `lazyview_view_<name>_total` (`source_rows`,
+`source_rows_skipped`, `ids_marked`, `ids_absorbed`, `images_marked`, `images_absorbed`,
+`entities_updated`, `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_unchanged`,
+`whole_view_refreshes`, `builds`, `source_queries`, `lookup_queries`, `flushes`) and the gauges
+`lazyview_view_ids_pending`, `lazyview_view_entities_distinct`,
+`lazyview_view_entities_distinct_60s` and `lazyview_view_last_flush_timestamp_seconds`.
+
 Alerts worth having: `lazyview_streaming == 0` for 10 minutes, `lazyview_views_error > 0`, and
 views without a live table for a long time (`lazyview_views - lazyview_views_ready -
 lazyview_views_error > 0` for 2 h). [docs/kubernetes.md](kubernetes.md#metrics) has these as a
-PrometheusRule.
+PrometheusRule. An incremental view rebuilt as a whole (`increase(lazyview_view_whole_view_refreshes_total[1h]) > 0`
+on a view whose `_lazyview_state.mode` is `incremental`) is worth a look too: row changes never
+cause that, so its reason (in `/stats`) says what did.
+
+## Per-view update statistics
+
+`GET /stats` returns, per view, whether the work follows the change: an update of one row may
+refresh rows in several views, but never a whole view. The numbers are kept in memory only: they
+start at zero when the process starts (`since_unix`) and are never written to the database.
+
+```sh
+curl -s localhost:8080/stats | jq '.views["mydb.my_view"]'
+```
+
+```json
+{ "since_unix": 1792990000, "now_unix": 1792990321, "window_secs": 60,
+  "views": { "<schema>.<view>": { "mode": "incremental", "ids_marked": 12000, "...": "..." } } }
+```
+
+| field | meaning |
+|---|---|
+| `mode` | as `_lazyview_state.mode`: `incremental` or `full` |
+| `source_rows`, `source_rows_skipped` | binlog row changes fed to the view (once per occurrence of their table in the definition), and of those the ones skipped as irrelevant (no column the view reads changed, or the row fails the view's constant filters) |
+| `ids_marked` | target ids (the view's units: group keys, or the key a row of the view hangs off) marked for a refresh, before deduplication. An update that keeps its id marks it once; one that moves a row marks the old and the new id. Ids found by lookups of row images are marked when the flush resolves them. A partial unit key (a table that carries only part of the unit; every unit matching it is refreshed) counts as one id |
+| `ids_absorbed` | marks of an id that was already pending (absorbed by deduplication) |
+| `ids_pending` | ids buffered and not refreshed yet |
+| `images_marked`, `images_absorbed` | row images of tables that do not carry the target id, buffered for a lookup at the flush, and of those the ones already buffered |
+| `entities_updated` | ids refreshed, summed over flushes (each id once per flush) |
+| `entities_distinct` | distinct ids refreshed since start: exact for integer ids, by a 64-bit hash for others (exact up to hash collisions) |
+| `entities_distinct_60s`, `window_start_unix` | distinct ids refreshed since `window_start_unix` (30 to 60 s ago) |
+| `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_unchanged` | view rows written by refreshes (summed over targets): new, replaced in place, deleted, and compared but equal (not written) |
+| `whole_view_refreshes`, `last_whole_view_refresh` | builds that replaced a live version of the view (a full-mode refresh, affected ids unknown, a changed definition or source schema, a target rebuilt after it was down), with the last one's `reason` and `unix` time |
+| `builds` | first builds (no live version yet) |
+| `source_queries`, `lookup_queries` | source reads and lookups the view's refreshes ran |
+| `flushes`, `last_flush_unix` | refreshes of the view, and the last one's time |
+| `balanced` | `ids_marked == ids_absorbed + entities_updated + ids_pending` |
+
+Every mark either finds its id pending or adds it to the buffer, from which the next flush
+refreshes it once, so `balanced` is true after every flush. A whole-view refresh drops the ids it
+covers; after one, `ids_marked` may be larger. `ids_marked / entities_updated` shows how much
+deduplication saves. For an incremental view `whole_view_refreshes` stays 0: a value above 0
+is an update storm, and `last_whole_view_refresh.reason` says why.
+
+`scripts/stats-check.sh [URL]` (curl + jq; URL defaults to `http://127.0.0.1:8080/stats`) prints
+marked / absorbed / updated / distinct / pending / whole-view refreshes per view and exits 1 when
+an incremental view was refreshed whole or a view's counters do not balance (2 when `/stats`
+cannot be read). Run it after a load test to confirm deduplication works. Full-mode views are
+listed but never fail it.
+
+Cost: per binlog row and view, a few additions to plain integers in the view's change buffer
+(whose insert already says whether the id was new). Everything else is folded in once per flush
+under one lock for all views, and the distinct-id sets are updated per refreshed id (integer ids
+by a bitmap union). Memory per view: three id sets (since start and two 30 s buckets), about
+2 bytes per dense integer id (up to 8 per sparse one) and about 16 bytes per other id.
 
 ## Logs
 
