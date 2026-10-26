@@ -40,6 +40,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -54,6 +55,26 @@ use mysql_async::binlog::{BinlogVersion, EventType};
 use mysql_async::consts::ColumnType;
 use mysql_async::prelude::Queryable;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Opts, OptsBuilder, Row, Value};
+
+/// Product name and environment-variable prefix named in this module's messages.
+static PRODUCT: OnceLock<(String, String)> = OnceLock::new();
+
+/// Sets the product name and environment-variable prefix this module names in its messages
+/// (defaults `lazyview` and `LAZYVIEW_`), for a program that embeds it. Only the first call takes
+/// effect; it returns whether this one did. lazyview itself never calls it.
+pub fn set_product(name: &str, env_prefix: &str) -> bool {
+    PRODUCT
+        .set((name.to_string(), env_prefix.to_string()))
+        .is_ok()
+}
+
+/// `(name, env_prefix)`, see [`set_product`].
+fn product() -> (&'static str, &'static str) {
+    match PRODUCT.get() {
+        Some((name, prefix)) => (name, prefix),
+        None => ("lazyview", "LAZYVIEW_"),
+    }
+}
 
 /// A binlog coordinate. `pos` is the offset of the next event to read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -131,7 +152,10 @@ pub fn replica_opts(dsn: &str) -> Result<Opts> {
     if !cas.is_empty() {
         for c in &cas {
             if !std::path::Path::new(c).is_file() {
-                bail!("TLS CA file `{c}` not found (LAZYVIEW_TLS_CA / tls_ca DSN parameter)");
+                bail!(
+                    "TLS CA file `{c}` not found ({}TLS_CA / tls_ca DSN parameter)",
+                    product().1
+                );
             }
         }
         let ssl = opts
@@ -264,12 +288,19 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
         }
     }
     if !problems.is_empty() {
-        bail!(
-            "server {version} does not meet lazyview's binlog requirements:\n  - {}",
-            problems.join("\n  - ")
-        );
+        bail!(unmet_requirements(&version, &problems));
     }
     Ok(ServerInfo { flavor, version })
+}
+
+/// The error message of a server that does not meet the binlog requirements (`problems`, see
+/// [`requirement_problems`]).
+fn unmet_requirements(version: &str, problems: &[String]) -> String {
+    format!(
+        "server {version} does not meet {}'s binlog requirements:\n  - {}",
+        product().0,
+        problems.join("\n  - ")
+    )
 }
 
 /// One message per violated requirement, each with the way to fix it on that flavor.
@@ -338,8 +369,9 @@ fn requirement_problems(
     if maria && !storage_engine.is_empty() {
         problems.push(format!(
             "binlog_storage_engine is {storage_engine} (must be unset: a binlog kept in the \
-             storage engine is only served to replicas that start from a GTID, lazyview reads \
-             it by file and position); fix: remove binlog_storage_engine from my.cnf and restart"
+             storage engine is only served to replicas that start from a GTID, {} reads \
+             it by file and position); fix: remove binlog_storage_engine from my.cnf and restart",
+            product().0
         ));
     }
     problems
@@ -837,8 +869,10 @@ impl BinlogReader {
             mysql_async::Error::Server(ref se) if is_duplicate_server_id_error(se) => {
                 let msg = format!(
                     "another replica connected with the same server_id {server_id} and the server \
-                     dropped this stream (at {at}); give every lazyview instance and every real \
-                     replica a unique server_id (LAZYVIEW_SERVER_ID)"
+                     dropped this stream (at {at}); give every {} instance and every real \
+                     replica a unique server_id ({}SERVER_ID)",
+                    product().0,
+                    product().1
                 );
                 anyhow::Error::new(e).context(msg)
             }
@@ -2250,6 +2284,48 @@ mod tests {
         assert!(
             ma[4].starts_with("binlog_storage_engine is innodb (must be unset")
                 && ma[4].contains("remove binlog_storage_engine")
+        );
+    }
+
+    /// The messages name lazyview by default, byte for byte as before [`set_product`] existed
+    /// (lazyview never calls it, and no test does: it is set once per process).
+    #[test]
+    fn default_product_names_in_messages() {
+        assert_eq!(product(), ("lazyview", "LAZYVIEW_"));
+        let err = replica_opts("mysql://u:p@127.0.0.1/db?tls_ca=/no/such/ca.pem").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "TLS CA file `/no/such/ca.pem` not found (LAZYVIEW_TLS_CA / tls_ca DSN parameter)"
+        );
+        assert_eq!(
+            unmet_requirements("8.4.11", &["a".into(), "b".into()]),
+            "server 8.4.11 does not meet lazyview's binlog requirements:\n  - a\n  - b"
+        );
+        assert_eq!(
+            requirement_problems(Flavor::MariaDb, "ON", "row", "full", "OFF", "innodb"),
+            vec![
+                "binlog_storage_engine is innodb (must be unset: a binlog kept in the storage engine \
+                 is only served to replicas that start from a GTID, lazyview reads it by file and \
+                 position); fix: remove binlog_storage_engine from my.cnf and restart"
+                    .to_string()
+            ]
+        );
+        let dup = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1236,
+            message: "A replica with the same server_uuid/server_id as this replica has connected \
+                      to the source"
+                .into(),
+            state: "HY000".into(),
+        });
+        let at = Position {
+            file: "binlog.000002".into(),
+            pos: 4,
+        };
+        assert_eq!(
+            BinlogReader::map_error(dup, &at, 77).to_string(),
+            "another replica connected with the same server_id 77 and the server dropped this \
+             stream (at binlog.000002:4); give every lazyview instance and every real replica a \
+             unique server_id (LAZYVIEW_SERVER_ID)"
         );
     }
 
