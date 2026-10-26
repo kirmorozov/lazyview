@@ -187,8 +187,11 @@ write_cnf() {
     if is_mariadb "$f"; then
       echo "log_basename=mariadb"
     else
-      echo "gtid_mode=ON"
-      echo "enforce_gtid_consistency=ON"
+      # mysql80 and percona84 run without GTIDs (docker-compose.test.yml): both fence modes.
+      if [[ $f != mysql80 && $f != percona84 ]]; then
+        echo "gtid_mode=ON"
+        echo "enforce_gtid_consistency=ON"
+      fi
       echo "mysqlx=OFF"
       echo "secure_file_priv=$d/tmp"
       # On by default since 8.4.x / 9.x; mbind() is often not permitted in containers and
@@ -223,7 +226,7 @@ init_instance() {
 setup_users() {
   local f=$1 d; d=$(dir_of "$f")
   [[ -f $d/.setup-done ]] && return 0
-  echo "[$f] creating user lv and database lvtest"
+  echo "[$f] creating users lv (all privileges) and lvdoc (the documented grants only), database lvtest"
   if is_mariadb "$f"; then
     # Drop anonymous accounts which could shadow lv.
     local h
@@ -235,6 +238,9 @@ setup_users() {
     CREATE USER IF NOT EXISTS 'lv'@'%' IDENTIFIED BY 'lv';
     GRANT ALL PRIVILEGES ON *.* TO 'lv'@'%' WITH GRANT OPTION;
     CREATE DATABASE IF NOT EXISTS lvtest;
+    CREATE USER IF NOT EXISTS 'lvdoc'@'%' IDENTIFIED BY 'doc';
+    GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lvdoc'@'%';
+    GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, CREATE VIEW, SHOW VIEW ON \`lvt\\_%\`.* TO 'lvdoc'@'%';
     FLUSH PRIVILEGES;"
   touch "$d/.setup-done"
 }

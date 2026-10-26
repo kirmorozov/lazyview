@@ -12,6 +12,10 @@
 //!   `tmp/out/test-logs/<schema>/engine-<n>.log` (kept on failure).
 //! * Seeds: `LAZYVIEW_TEST_SEED` (default: random, printed on failure). Size: `LAZYVIEW_TEST_SCALE`
 //!   (float, default 1). Per-run timeout: `LAZYVIEW_TEST_TIMEOUT_S` (default 900 × scale).
+//! * `LAZYVIEW_TEST_ENGINE_USER=user:password` runs every engine as that account instead of the
+//!   admin account of the DSN (setup and oracle queries stay on the admin account). CI sets it to
+//!   `lvdoc:doc`, the account `docker/initdb` creates with exactly the grants of
+//!   docs/server-setup.md, so every suite proves the documented privileges are enough.
 //! * Engine log filter: `LAZYVIEW_TEST_LOG` (falls back to `RUST_LOG`, default `lazyview=debug,warn`).
 
 #![allow(dead_code, unused_imports)]
@@ -168,6 +172,13 @@ fn run_timeout() -> Duration {
 }
 
 /// Replaces the schema (path) of a `mysql://` DSN, keeping credentials, host and `?options`.
+/// `dsn` with its credentials replaced by `user:password`.
+pub fn dsn_with_user(dsn: &str, user_pass: &str) -> String {
+    let (scheme, rest) = dsn.split_once("://").unwrap_or(("mysql", dsn));
+    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    format!("{scheme}://{user_pass}@{host}")
+}
+
 pub fn dsn_with_db(dsn: &str, db: &str) -> String {
     let (scheme, rest) = dsn.split_once("://").unwrap_or(("mysql", dsn));
     let (before_q, query) = match rest.find('?') {
@@ -495,7 +506,11 @@ impl Ctx {
     pub fn start_engine(&self, db: &Db, overrides: &[(&str, &str)]) -> Result<Engine> {
         let n = self.engine_seq.fetch_add(1, Ordering::SeqCst);
         let mut env: BTreeMap<String, String> = BTreeMap::new();
-        env.insert("LAZYVIEW_DSN".into(), db.dsn.clone());
+        let engine_dsn = match std::env::var("LAZYVIEW_TEST_ENGINE_USER") {
+            Ok(u) if !u.is_empty() => dsn_with_user(&db.dsn, &u),
+            _ => db.dsn.clone(),
+        };
+        env.insert("LAZYVIEW_DSN".into(), engine_dsn);
         env.insert("LAZYVIEW_SERVER_ID".into(), unique_server_id().to_string());
         env.insert("LAZYVIEW_INSTANCE_ID".into(), "test".into());
         env.insert("LAZYVIEW_BATCH_WINDOW_MS".into(), "50".into());

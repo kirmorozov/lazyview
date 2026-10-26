@@ -1719,6 +1719,64 @@ fn reg_saved_position_from_another_server() {
     });
 }
 
+/// Binlogs purged while the engine is down (the Amazon RDS / Aurora retention case): the saved
+/// position is gone, the engine fails by default naming that, and with
+/// LAZYVIEW_ON_MISSING_BINLOG=rebuild it rebuilds every view and streams on, equal to the oracle.
+#[test]
+fn reg_saved_position_purged_while_down() {
+    scenario("reg_purged_down", |ctx| async move {
+        let specs = vec![join_view()];
+        let (db, eng) = setup(&ctx, "reg_purged_down", &[], &specs, &[]).await?;
+        eng.stop().await?;
+        let mut c = db.conn().await?;
+        let saved = scalar(&mut c, "SELECT binlog_file FROM _lazyview_status")
+            .await?
+            .unwrap_or_default();
+        ensure!(!saved.is_empty(), "no saved binlog file");
+        // Writes in newer files, then everything before the newest file is purged.
+        for i in 0..2 {
+            exec(&mut c, "FLUSH BINARY LOGS").await?;
+            let update = format!("UPDATE customers SET name = 'purged{i}' WHERE id = 1");
+            run(&mut c, &[update.as_str()]).await?;
+        }
+        exec(&mut c, "FLUSH BINARY LOGS").await?;
+        let logs = common::rows(&mut c, "SHOW BINARY LOGS").await?;
+        let newest = logs
+            .last()
+            .and_then(|r| r.first().cloned().flatten())
+            .context("no binary logs listed")?;
+        exec(&mut c, &format!("PURGE BINARY LOGS TO '{newest}'")).await?;
+        let left = common::rows(&mut c, "SHOW BINARY LOGS").await?;
+        ensure!(
+            left.iter()
+                .all(|r| r.first().cloned().flatten().as_deref() != Some(saved.as_str())),
+            "{saved} was not purged"
+        );
+        let eng = ctx.start_engine(&db, &[])?;
+        match eng.wait_finished(Duration::from_secs(60)).await? {
+            Err(e) if e.contains("no longer available") => {}
+            other => bail!("expected a missing-binlog failure, got {other:?}"),
+        }
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_ON_MISSING_BINLOG", "rebuild")])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "rebuilt after the saved binlog was purged",
+        )
+        .await?;
+        run(
+            &mut c,
+            &["UPDATE customers SET name = 'after' WHERE id = 1"],
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "streaming after the rebuild").await?;
+        eng.stop().await
+    });
+}
+
 /// E6, lookup table without a primary key: its whole row is the lineage key. Equal duplicate
 /// rows, membership moves and an ENUM predicate in numeric context (`p.e + 0 >= 2`, which a
 /// row image bound as a label string evaluated wrongly) stay exact.

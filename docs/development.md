@@ -57,7 +57,10 @@ Flavors and ports (blocking): `mysql80` 33080 (AWS-only), `mysql84` 33084, `mysq
 fit one developer host (a heavy suite takes 1-3 GiB per server): start one to three at a time and
 `compose down` them afterwards.
 Every server listens on 127.0.0.1, has ROW binlogs with FULL row images (GTIDs on MySQL and
-Percona), a 128M InnoDB buffer pool, a user `lv`/`lv` with all privileges and a database
+Percona, except `mysql80` and `percona84`, which run without so both fence modes are tested), a 128M InnoDB buffer pool, a user `lv`/`lv` with all privileges (setup and oracle queries), a user `lvdoc`/`doc` with only the
+grants of [Server setup](server-setup.md#user-and-grants) (CI runs every engine as `lvdoc` through
+`LAZYVIEW_TEST_ENGINE_USER=lvdoc:doc`; set it locally to do the same, on servers started after
+this change) and a database
 `lvtest`. MySQL and Percona run without `performance_schema` (lazyview does not use it) and with
 `temptable_max_ram=1G` (8.4 would size it from the host's RAM, not the container's); their
 containers are limited to 3 GiB, MariaDB's to 2 GiB. Idle they take 200-400 MiB (MySQL,

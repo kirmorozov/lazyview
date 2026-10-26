@@ -20,7 +20,8 @@
 # matrix. Every server: ROW binlog, FULL row image, user lv/lv with ALL PRIVILEGES (created by
 # docker/initdb on the first start), database lvtest, 128M InnoDB buffer pool (several servers
 # share a developer host with the test runs), bound to 127.0.0.1, server id = host port. MySQL
-# and Percona additionally run with GTIDs on. The flag lists are kept identical by hand (YAML
+# and Percona additionally run with GTIDs on (except mysql80 and percona84: GTIDs off, so both
+# fence modes are tested per product). The flag lists are kept identical by hand (YAML
 # cannot splice a shared list into `command`).
 #
 # Memory: MySQL and Percona run without performance_schema (about 250 MiB of their ~900 MiB idle
@@ -87,6 +88,8 @@ services:
   # Community EOL (April 2026) but still run by RDS for MySQL 8.0 and Aurora MySQL 3: the AWS-only
   # tier. To drop it: this service, its volume, the `mysql80` entry of the ci.yml matrix and its
   # pins in scripts/test-servers.sh.
+  # GTIDs OFF here (as in a default RDS parameter group): the visibility fence falls back to the
+  # fixed delay. The other MySQL / Percona servers run GTIDs ON; MariaDB has no switch.
   mysql80:
     <<: *mysql-common
     image: mysql:8.0.46
@@ -96,8 +99,6 @@ services:
       - --log-bin=binlog
       - --binlog-format=ROW
       - --binlog-row-image=FULL
-      - --gtid-mode=ON
-      - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
       - --performance-schema=OFF
@@ -172,6 +173,7 @@ services:
       - mysql2610:/var/lib/mysql
 
   # ---- Percona Server: 8.4 LTS, 9.7 LTS -----------------------------------------------------
+  # GTIDs OFF here too (one Percona line without them).
   percona84:
     <<: *mysql-common
     image: percona/percona-server:8.4.11-11
@@ -181,8 +183,6 @@ services:
       - --log-bin=binlog
       - --binlog-format=ROW
       - --binlog-row-image=FULL
-      - --gtid-mode=ON
-      - --enforce-gtid-consistency=ON
       - --skip-name-resolve
       - --mysqlx=OFF
       - --performance-schema=OFF
@@ -320,10 +320,10 @@ services:
       - mariadb130:/var/lib/mysql
 
   # ---- Advisory: pre-releases (profile `prerelease`, never required) ------------------------------
-  # MariaDB 13.1.1 Release Candidate (Docker Hub).
+  # MariaDB 13.1.1 Release Candidate (Docker Hub), pinned by digest like lazy-wire-fire (the tag may move).
   mariadb131-rc:
     <<: *mariadb-common
-    image: mariadb:13.1.1-rc
+    image: mariadb:13.1.1-rc@sha256:a652753786e98d9f976aaab8cc21e49c16ea0cfe41a877694825a6ea73140fb1
     profiles: [prerelease]
     ports: ["127.0.0.1:33131:3306"]
     command:

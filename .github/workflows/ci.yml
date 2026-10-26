@@ -139,6 +139,9 @@ jobs:
           # One server here: the multi-server scenarios skip (visibly) instead of failing, which
           # the harness does by default when CI is set; integration-multi runs them.
           LAZYVIEW_TEST_REQUIRE_MULTI: "0"
+          # Every engine runs as the account with only the grants of docs/server-setup.md (the RDS /
+          # Aurora privilege model); setup and oracle queries stay on the admin account.
+          LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           # Empty: the default mode. The harness passes it to every engine a test starts.
           LAZYVIEW_SUPERVISOR: ${{ matrix.supervisor || '' }}
         # --no-fail-fast: run every suite and report all failures, not just the first.
