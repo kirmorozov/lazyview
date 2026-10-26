@@ -428,6 +428,16 @@ async fn run_workload(w: &mut Conn, w2: &mut Conn, tag: &str) -> Result<Workload
             .await?
             .unwrap_or_default()
     };
+    // Whether committed transactions carry a GTID: MariaDB always; MySQL / Percona follow the
+    // server's gtid_mode (ON and ON_PERMISSIVE assign one, OFF and OFF_PERMISSIVE do not).
+    let has_gtid = if maria {
+        true
+    } else {
+        let mode: Option<String> = w.query_first("SELECT @@GLOBAL.gtid_mode").await?;
+        mode.is_some_and(|m| {
+            m.eq_ignore_ascii_case("ON") || m.eq_ignore_ascii_case("ON_PERMISSIVE")
+        })
+    };
     let s = unique_schema(tag);
     w.query_drop(format!("CREATE DATABASE `{s}`")).await?;
     w.query_drop(format!("CREATE TABLE `{s}`.t {T_DDL}"))
@@ -458,7 +468,7 @@ async fn run_workload(w: &mut Conn, w2: &mut Conn, tag: &str) -> Result<Workload
         ($evs:expr, $kind:expr, $xa:expr) => {{
             groups.push(ExpGroup {
                 evs: $evs,
-                gtid: true,
+                gtid: has_gtid,
                 xa_start: $xa,
                 kind: $kind,
             });
@@ -659,7 +669,7 @@ async fn run_workload(w: &mut Conn, w2: &mut Conn, tag: &str) -> Result<Workload
         .await?;
     groups.push(ExpGroup {
         evs: vec![rows_ev("m", RowsKind::Insert, vec![ins(&[Some(2)])])],
-        gtid: true,
+        gtid: has_gtid,
         xa_start: None,
         kind: Close::Commit,
     });
