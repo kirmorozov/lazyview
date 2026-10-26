@@ -2290,7 +2290,7 @@ mod tests {
     /// The messages name lazyview by default, byte for byte as before [`set_product`] existed
     /// (lazyview never calls it, and no test does: it is set once per process).
     #[test]
-    fn default_product_names_in_messages() {
+    fn default_program_names_in_messages() {
         assert_eq!(product(), ("lazyview", "LAZYVIEW_"));
         let err = replica_opts("mysql://u:p@127.0.0.1/db?tls_ca=/no/such/ca.pem").unwrap_err();
         assert_eq!(
