@@ -2,10 +2,12 @@
 
 Status: phases A and B done and wired (`analyze::plan` delegates to `analyzer::plan`; the old
 planner body is the block planner `analyze::plan_block`); JSON columns are plain
-group keys since the engine's typed unit filters and JSON-aware comparison; phase C (internal views, UNION ALL branch plans) waits for the engine, those
-views are Full with a reason naming the missing piece (§3.3). Owner rule: **a view is maintained
-incrementally unless it is mathematically impossible to trace a source change to the output
-rows it affects.** Every Full fallback names the construct and states why no trace exists.
+group keys since the engine's typed unit filters and JSON-aware comparison. Internal views are
+**shelved by owner decision** (anything that adds work to the refresh hot path is out, §4); UNION
+ALL branch plans wait for the engine. Views that would need either are Full with a reason naming
+the construct (§3.3). Owner rule: **a view is maintained incrementally unless it is
+mathematically impossible to trace a source change to the output rows it affects.** Every Full
+fallback names the construct and states why no trace exists.
 
 ## 1. Tracing model
 
@@ -85,7 +87,8 @@ ParsedDef ─build─► IR ─normalize─► IR' ─classify─► Strategy tr
 Contract: `analyzer::analyze(def, schema, tables, opts) -> Outcome` with `Outcome::Plan`,
 `Outcome::NeedsInternal(Vec<InternalView>)` or `Outcome::Branches`; `analyzer::plan()` (what
 `analyze::plan` calls) runs it with internal views and branch plans disabled and turns those
-outcomes into Full plans whose reason ends in `(needs internal views)` / `(needs branch plans)`.
+outcomes into Full plans: an internal-view outcome's reason names the construct and the limit
+(internal views are shelved, §4), a branch-plan outcome's ends in `(needs branch plans)`.
 `ViewPlan` stays the executor contract; additions (`order_limit_sql`, `lookup_where_sql`,
 `AliasPlan.semi`, `AliasPlan.lookup_where`) are backward compatible.
 
@@ -103,11 +106,11 @@ outcomes into Full plans whose reason ends in `(needs internal views)` / `(needs
 | CTE name shadowing a table | resolved lexically (see build) | scoping only |
 | derived/CTE on the preserved side of LEFT JOIN | merge, inner WHERE stays in WHERE | σ on the preserved side commutes with ⟕ |
 | single-table derived/CTE on the NULL side | merge, inner WHERE into the ON; outputs that are not NULL-propagating become `IF(alias.pk IS NULL, NULL, e)`. NULL-propagating = columns, literals, strict operators and the strict builtins of `analyze::NULL_STRICT` (an allow-list: `CHAR`, `CHARSET`, `COERCIBILITY`, `NVL2`, `DECODE_ORACLE`, `IF`/`COALESCE`, aggregates, `CASE`, `<=>`, AND/OR and every unlisted function have a value for NULL and are guarded; A2) | `L ⟕c σq R = L ⟕(c∧q) R`; a NULL-extended row has NULL pk, a real one never |
-| multi-table derived on the NULL side | **internal view** (SPJ, lineage) joined as one table | `L ⟕ (R1⋈R2) ≠ (L⟕R1)⟕R2` (partial matches), so it cannot be flattened |
+| multi-table derived on the NULL side | Full ``derived table `d` joins several tables on the NULL side of a LEFT JOIN``; would need an **internal view** (SPJ, lineage) joined as one table (shelved, §4) | `L ⟕ (R1⋈R2) ≠ (L⟕R1)⟕R2` (partial matches), so it cannot be flattened |
 | ORDER BY without LIMIT inside | dropped | no effect on the bag |
 | aggregated / DISTINCT CTE as the only FROM item of a filter/project block | **merge-up**: one Grouped/Global block; outer predicates on group keys → WHERE, others → HAVING | `σp(γG(Q)) = γG(σp Q)` for `p` over G; `π` over aggregates is HAVING/projection |
 | aggregated / DISTINCT CTE joined on the other tables' keys | **pull-up**: one grouped block over the CTE's tables joined to the others, grouped by the CTE's keys plus the other tables' used columns; aggregate conditions → HAVING | each group joins ≤ 1 row per table (its whole PK equals group keys or bound columns, same type family, no TIMESTAMP), the same row for every base row of the group (Yan & Larson) |
-| aggregated / DISTINCT CTE joined otherwise | **internal grouped view** `_lv_int_<h>` (key = GROUP BY columns, unique) + outer as a chained view; joins on the key give direct units | the internal view is exact; the outer is a view over a table |
+| aggregated / DISTINCT CTE joined otherwise | Full ``GROUP BY in CTE `t` joined to other tables``; would need an **internal grouped view** `_lv_int_<h>` (key = GROUP BY columns, unique) + outer as a chained view; joins on the key give direct units (shelved, §4) | the internal view is exact; the outer is a view over a table |
 | LATERAL derived table (MySQL ≥ 8.0.14) | phase D: per-outer-row units (unit = outer key) | — |
 
 ### 3.2 Block shapes
@@ -115,11 +118,11 @@ outcomes into Full plans whose reason ends in `(needs internal views)` / `(needs
 | class | strategy | units / lineage | why it is exact |
 |---|---|---|---|
 | DISTINCT | GROUP BY all output columns; if the tuple contains a source key that determines it (anchor PK, key-preserving joins) the unit is reduced to that key (FD); DISTINCT over a global aggregate or over a full GROUP BY key is dropped | unit = tuple or key; presence = group non-empty | DISTINCT and GROUP BY use the same equality (NULL = NULL, collation-aware); with ci collations the representative of equal values is server-chosen in both |
-| GROUP BY with ≥ 2 lookup-resolved aliases, a NULL-side group key, or an inexact group key | **tuple-lineage internal view** `J = π(group exprs, agg args, lineage) σ FROM` + the grouped view over `J` | V's only alias is J; J's binlog rows carry the group key → direct units; J traces its aliases by lineage | γ over the materialized join equals γ over the join; J is maintained like any SPJ view |
+| GROUP BY with ≥ 2 lookup-resolved aliases, a NULL-side group key, or an inexact group key | ≥ 2 lookup aliases: incremental (the engine's remembered before-images); NULL-side key: Full `group key on the NULL side of a LEFT JOIN`; inexact key: Full with its reason. Exact for all three would need a **tuple-lineage internal view** `J = π(group exprs, agg args, lineage) σ FROM` + the grouped view over `J` (shelved, §4) | V's only alias is J; J's binlog rows carry the group key → direct units; J traces its aliases by lineage | γ over the materialized join equals γ over the join; J is maintained like any SPJ view |
 | COUNT(DISTINCT), GROUP_CONCAT(… ORDER BY), HAVING over aggregates | already per group | group key | a refresh recomputes whole groups |
 | UNION ALL (also in CTEs) | **branch plan**: each branch is planned by the block planner; rows tagged `_lv_branch`; one source row may feed several branches (all traced) | (branch, branch unit); per-branch lineage | ⊎ is per-branch; refreshing (b, u) rewrites exactly branch b's rows of u; multiplicities exact |
-| UNION / mixed | MySQL precedence: a DISTINCT union absorbs every branch to its left → `DISTINCT(A⊎…⊎C) ⊎ D`; DISTINCT part = internal UNION ALL view + grouped view over it | tuple | UNION = δ(⊎) |
-| INTERSECT / EXCEPT (8.0.31+, MariaDB) | internal UNION ALL view with branch counts + grouped view (`HAVING SUM(b=1)>0 AND SUM(b=2)>0` / `=0`) | tuple | set semantics by counting |
+| UNION / mixed | Full (construct name). MySQL precedence: a DISTINCT union absorbs every branch to its left → `DISTINCT(A⊎…⊎C) ⊎ D`; the DISTINCT part would need an internal UNION ALL view + grouped view over it (shelved, §4) | tuple | UNION = δ(⊎) |
+| INTERSECT / EXCEPT (8.0.31+, MariaDB) | Full (construct name); would need an internal UNION ALL view with branch counts + grouped view (`HAVING SUM(b=1)>0 AND SUM(b=2)>0` / `=0`) (shelved, §4) | tuple | set semantics by counting |
 | IN / EXISTS with a unique subquery key (its PK, key-preserving join) | **semi-join → inner join**, merged, when every key column equals an outer column of the same type family (for strings the same charset and collation; no TIMESTAMP on either side, G4) or, for an integer key, an integer expression (G1); otherwise a semi-join alias | normal alias | ⋉ = ⋈ when each outer row matches ≤ 1 inner row; IN's NULL logic ≡ `=`. A string key against a number (`'1'`, `'01'`, `'1.0'` all equal 1) or under a weaker `COLLATE` matches several key rows; so does a TIMESTAMP key under a time zone with DST (two instants of the fall-back hour show one local time) |
 | IN / EXISTS / NOT EXISTS whose correlation equals the unit | **semi-join alias**: predicate kept in the refresh, subquery table traced by direct units | unit | the predicate of unit u reads only subquery rows with key u |
 | IN / EXISTS / NOT EXISTS / NOT IN over an inner join of tables (L4) | **semi-join aliases, one per table** of the subquery: its ON conditions become conjuncts of its WHERE; a table whose correlation equals the unit is traced by direct units, the others by lookups whose EXISTS template names the subquery's other tables (`analyze::semi_table_marker`): a lookup that substitutes several of them (the engine's combinations of plain aliases) evaluates *one* subquery over all their rows. The subquery's aliases are renamed away from the block's final aliases (`o` → `o__m1`) before the outer expressions are filled in, so a merged derived table's inner alias or a qualified outer column is never captured (F3). Outer joins, LIMIT, aggregates, windows and derived tables inside stay subqueries with a reason naming the construct | direct / lookup | a change of one table's row changes `P` only for outer rows related to it through the other tables; with one changed table their current state is exact (a changed partner is traced by its own images), with several the joint substitution sees the old combinations |
@@ -132,7 +135,7 @@ outcomes into Full plans whose reason ends in `(needs internal views)` / `(needs
 | window without PARTITION BY | one unit (Global), **bounded recompute** (one query, diff; no swap) | — | the result is one partition |
 | named windows `… OVER w … WINDOW w AS (…)` | resolved like inline windows (partition from the named spec, also through `OVER (w ORDER BY …)`); the WINDOW clause is carried on the plan (`window_sql`) and rendered after HAVING in every refresh SELECT (L2) | as above | syntax |
 | top-N `ORDER BY … LIMIT n` | **bounded recompute**; the ORDER BY columns (plain, in expressions, aggregate inputs, of joined aliases) are read columns even when not projected, so an UPDATE of one reaches the recompute (L1): one unit (Global), the refresh query keeps `ORDER BY … LIMIT` (`order_limit_sql`). The ORDER BY goes through derived-table / CTE merges like the projection (L5). A subquery in it is traced: each table it reads becomes a recompute alias with the columns it names; the view's columns it correlates on are read columns (ORDER BY without LIMIT decides nothing and is not traced). Phase D: an internal `top-(n+B)` buffer view, changes ranked strictly below its last key skipped | one unit | the refresh recomputes the whole top-n; with ties at the boundary the definition itself picks rows arbitrarily (tests use a total ORDER BY) |
-| filter on a window result (top-N per partition) | window block as internal partitioned view + outer filter as chained view (unit = partition key) | partition key | composition |
+| filter on a window result (top-N per partition) | Full ``… with a window function``; would need the window block as an internal partitioned view + outer filter as chained view (unit = partition key) (shelved, §4) | partition key | composition |
 | RIGHT JOIN at the start, STRAIGHT_JOIN, NATURAL JOIN, parenthesized inner joins | rewritten to LEFT JOIN / JOIN / USING (common columns) / one chain | normal | syntax; inner joins associate |
 | `SELECT *` over USING / NATURAL joins of base tables (A4) | `*` expanded as the server does before any rewrite (`analyze::expand_star_over_using`): per join, the shared columns once, first, then the left side's remaining columns, then the right table's; a RIGHT JOIN is the mirrored LEFT JOIN (shared columns and the rest of the right table first); applied along the chain | normal | the servers define `*` exactly so (`COALESCE` of the shared columns equals the preserved side's value) |
 | LEFT JOIN with WHERE keeping NULL-extended rows (`IS NULL`, `COALESCE`, `OR`) | lookups of the NULL-side alias drop the conjuncts that are not NULL-rejecting on it (superset), refresh re-evaluates them | normal | dropping conjuncts can only add units |
@@ -141,7 +144,7 @@ outcomes into Full plans whose reason ends in `(needs internal views)` / `(needs
 | SQL view as a source | inlined like a derived table (needs `VIEW_DEFINITION` in the catalog) | as merged | a view is a named derived table |
 | BIT unit keys | plain units (BIT values compare exactly through typed placeholders) | unit | measured on all six servers (`edge_bit_group`) |
 | JSON unit keys | a JSON **column** is a plain unit: the engine binds its values as `CAST(? AS JSON)` on MySQL (typed unit filters, `UnitKind::Json` from the probed MV column type; engine A, main 882ee55) and compares JSON columns by the value the server stores (main 6e142a7); MariaDB JSON is LONGTEXT: text units. A JSON value **computed by a function** (`JSON_EXTRACT`, `->`, `CAST(… AS JSON)`) is Full ``group key `JSON_EXTRACT(meta, '$.lang')` is a JSON value computed by a function (MariaDB compares it as JSON, its unit filter as text): …``: measured on MariaDB 13.0, `JSON_EXTRACT(meta, '$.lang') = '"de"'` matches no row (the JSON side compares as `de`), so a refreshed group came back empty. Its text (`->>`, `JSON_UNQUOTE`) is a plain unit everywhere | unit | MySQL groups JSON-equal values and compares the bound JSON the same way; the MV keeps the server's representative text of each group |
-| opaque (UUID, INET6) unit keys | internal view computing a SQL surrogate (`HEX(k)`, `CAST(k AS CHAR)`) as the downstream unit | surrogate | SQL computes both sides of the comparison |
+| opaque (UUID, INET6) unit keys | Full ``UUID column `devices`.`id` decides which rows match, but its binlog value cannot be compared with its SQL value``; a SQL surrogate (`HEX(k)`, `CAST(k AS CHAR)`) as the downstream unit would need an internal view (shelved, §4) | surrogate | SQL computes both sides of the comparison |
 
 ### 3.3 Full fallbacks (impossibility arguments)
 
@@ -155,22 +158,26 @@ outcomes into Full plans whose reason ends in `(needs internal views)` / `(needs
 | `\|\|` | error: ``\`\|\|\` is OR on the server (sql_mode without PIPES_AS_CONCAT) but concatenation to the parser: write OR or CONCAT()`` | the two readings differ; the definition is refused as written |
 | sequences, advisory locks, `LOAD_FILE`, `RANDOM_BYTES`, `SYS_GUID`, replication waits | `non-deterministic function NEXTVAL` | as for `NOW()`: a value or side effect per evaluation |
 | a refresh SELECT past 1 MiB (the last guard after the budgets) | `the planned SELECT is N bytes (limit 1048576): too large to run on every refresh` | not impossible: a size limit, so a pathological definition cannot stall the engine's loop |
-| a join block (one SELECT with what is merged into it; each UNION branch on its own) whose inlined form exceeds `INLINE_BUDGET` (32 base-table references; A5, L6) | ``inlining the WITH clause reads 64 table references in one SELECT (budget 32): CTE `t5` is referenced 2 times (needs internal views)``; `… in UNION branch 2 …`; `inlining derived tables …` when there is no WITH | each CTE reference is inlined as a copy (2^n for a chain of double references); the size is measured once per body before building (linear, saturating), so planning stays bounded. A UNION ALL's branches are planned separately and measured separately (a 50-branch union of one-table SELECTs plans); a join written out without CTEs or derived tables is never refused (the server decides). A multiply-referenced CTE beyond the budget belongs in an internal view (§4) |
+| a join block (one SELECT with what is merged into it; each UNION branch on its own) whose inlined form exceeds `INLINE_BUDGET` (32 base-table references; A5, L6) | ``inlining the WITH clause reads 64 table references in one SELECT (budget 32): CTE `t5` is referenced 2 times``; `… in UNION branch 2 …`; `inlining derived tables …` when there is no WITH | each CTE reference is inlined as a copy (2^n for a chain of double references); the size is measured once per body before building (linear, saturating), so planning stays bounded. A UNION ALL's branches are planned separately and measured separately (a 50-branch union of one-table SELECTs plans); a join written out without CTEs or derived tables is never refused (the server decides). An internal view (§4, shelved) would materialize a multiply-referenced CTE once |
 | subquery in the ORDER BY of a top-N view whose FROM / WHERE the analyzer rewrites (L5) | `subquery in the ORDER BY of a top-N view over derived table `d``; `… whose other subqueries, DISTINCT or joins are rewritten` | not impossible: names in the subquery resolve in its own FROM first, so the analyzer leaves it as written, which is only valid over the FROM as written (scope-aware rewriting is future work) |
 | `SELECT *` over a USING / NATURAL join through a derived table or a comma join (A4, rest) | `SELECT * over a USING or NATURAL join (shared columns are coalesced): list the columns` | the chain expansion below covers only base tables in one join chain; elsewhere neither the per-table expansion (duplicate columns) nor an empty projection is a valid view |
 | cross join with a changing table | stays `table … contributes to every row` (an *all units* trace: every output row contains that row) | the minimal affected set is the whole view |
 
-Everything else is traceable; until its engine piece lands, the view is Full with a reason that
-names the construct and ends in the missing piece:
+Everything else is traceable in principle, but only through a piece that does not exist: an
+internal view (shelved by owner decision, §4) or a branch plan (waits for the engine). Those views
+are Full with a reason that names the construct and the limit; only the branch-plan reasons name
+the missing piece:
 
-| construct (today Full) | reason suffix | lands with |
+| construct (today Full) | reason | what would trace it |
 |---|---|---|
-| aggregated / DISTINCT / window / top-N CTE or derived table joined to other tables (no pull-up) | `(needs internal views)` | §4 |
-| group key on the NULL side of a LEFT JOIN; NULL-side DISTINCT | `group key on the NULL side of a LEFT JOIN (needs internal views)` | tuple lineage J |
+| aggregated / DISTINCT / window / top-N CTE or derived table joined to other tables (no pull-up) | ``GROUP BY in CTE `t` joined to other tables`` (`DISTINCT …`, `… with a window function`, `ORDER BY … LIMIT in …`) | an internal view of the CTE (shelved) |
+| group key on the NULL side of a LEFT JOIN; NULL-side DISTINCT | `group key on the NULL side of a LEFT JOIN` | tuple lineage J (shelved) |
+| multi-table derived table / CTE, or a subquery inside one, on the NULL side of a LEFT JOIN | ``derived table `d` joins several tables on the NULL side of a LEFT JOIN``, ``IN subquery in a derived table or CTE on the NULL side of a LEFT JOIN`` | an internal SPJ view joined as one table (shelved) |
+| parenthesized join that cannot be flattened (an inner join on the NULL side of a LEFT JOIN, a LEFT JOIN inside parentheses) | ``parenthesized join (…) that cannot be flattened into the FROM chain`` | an internal SPJ view (shelved) |
 | UNION ALL | `UNION ALL … (needs branch plans)` | branch plans |
-| UNION (distinct), INTERSECT, EXCEPT | construct name | §3.2 rows (phase C/D) |
-| ORDER BY … LIMIT over a set operation (C4) | ``ORDER BY … LIMIT over a UNION ALL (needs internal views)`` | an internal view of the union, bounded recompute over it |
-| correlated / uncorrelated aggregate scalar subquery (C6) | ``correlated aggregate subquery in the SELECT list (needs internal views)`` | an internal grouped view joined on the correlation key (one value for all rows when uncorrelated) |
+| UNION (distinct), INTERSECT, EXCEPT | construct name | internal views (shelved; §3.2 rows) |
+| ORDER BY … LIMIT over a set operation (C4) | ``ORDER BY … LIMIT over a UNION ALL`` | an internal view of the union, bounded recompute over it (shelved) |
+| correlated / uncorrelated aggregate scalar subquery (C6) | ``correlated aggregate subquery in the SELECT list`` / ``uncorrelated aggregate subquery in the WHERE clause`` | an internal grouped view joined on the correlation key, one value for all rows when uncorrelated (shelved) |
 | a server SQL view as a source (C5) | ``reads SQL view `v` `` | inline its `VIEW_DEFINITION` like a derived table (phase D) |
 
 ### 3.4 Semi- and anti-joins in detail
@@ -182,7 +189,14 @@ traced by its own images. The refresh re-evaluates `P` against the current state
 lookups may evaluate `P` on the current state: a unit whose `P` flipped is already traced through
 S. With S's key unique (`k` = PK of S), `P` is an inner join and S an ordinary alias.
 
-## 4. Internal views (`_lv_int_<hash16>`)
+## 4. Internal views (`_lv_int_<hash16>`): shelved
+
+**Not planned (owner decision, 2026-10-19).** An internal view is one more MV that every refresh
+of its parent waits on, so it adds work to the refresh hot path, and the owner rules out anything
+that does. The views of §3.3 that would need one stay Full with their reason. The analysis below is
+kept as the record of how those constructs could be traced. The analyzer side
+(`src/analyzer/internal.rs`, `Outcome::NeedsInternal`) is kept but never enabled: `analyzer::plan`
+runs with `internal_views: false`.
 
 * **What**: a subtree isolated by the classifier (grouped/DISTINCT CTE joined to tables,
   tuple-lineage J, top-N buffer, partitioned window block, multi-table NULL-side derived table,
@@ -242,7 +256,7 @@ pushdown (MySQL 8.0.22+, MariaDB 10.2+) only affects rebuild speed. Naming diffe
   shared CTE text across definitions, window ties and partition moves, top-N ties at the
   boundary, 30× hammering, big transactions, groups becoming empty, HAVING crossed both ways).
   Each view asserts mode/detail and MV == oracle (rows and column names).
-* State: `cargo test --lib` 134 tests; the differential is strict (an incremental plan that
+* State: `cargo test --lib` 136 tests; the differential is strict (an incremental plan that
   changes, or a Full plan that changes without an `improvements()` entry naming the new mode,
   fails). `tests/cte.rs`: 45 main cases and 19 edge cases; the mode/detail asserted is the
   engine's own (from `_lazyview_overview` after start) and equals the analyzer's plan.
@@ -252,8 +266,8 @@ pushdown (MySQL 8.0.22+, MariaDB 10.2+) only affects rebuild speed. Naming diffe
 * **A** (done; analyzer, no executor change): build/normalize/lower; merge family, merge-up,
   pull-up, DISTINCT→GROUP BY, semi-joins with unique keys or unit correlation, scalar lookups
   as LEFT JOINs, join syntax; analyzer side of internal views (`analyze()` with `Options`,
-  `Outcome::NeedsInternal`: aggregated / window / top-N CTEs, tuple lineage, distinct keys of
-  semi-joins) and of UNION ALL branch plans (`Outcome::Branches`); tests.
+  `Outcome::NeedsInternal`: aggregated / window / top-N CTEs, tuple lineage; kept, never enabled:
+  shelved, §4) and of UNION ALL branch plans (`Outcome::Branches`); tests.
 * **B** (done and wired, except JSON keys): `analyze::plan` / `referenced_tables` delegate;
   block-planner additions that need no engine change: partitioned windows, bounded recompute
   (top-N, windows without PARTITION BY), semi/anti-join forward-key lookups (EXISTS template
@@ -261,10 +275,12 @@ pushdown (MySQL 8.0.22+, MariaDB 10.2+) only affects rebuild speed. Naming diffe
   aliases filter with `lookup_where_sql` and carry no lineage), value units for PK-less
   anchors, BIT units, DISTINCT/GROUP BY unit reduction by FD closure (`reduce_unit`),
   RIGHT/NATURAL/STRAIGHT, JSON group keys (typed unit filters and JSON-aware comparison on main).
-* **C** (engine, other owners; spec sent to the coordinator): internal views (§4), branch plans
-  for UNION ALL (one slot, N plans sharing the table, `_lv_branch` in unit filters), NULL-safe
-  lineage filters, `detail` from the plan, `VIEW_DEFINITION` in the catalog.
-* **D**: top-N buffer, INTERSECT/EXCEPT, LATERAL, surrogate keys, DRed for recursion.
+* **C** (engine, other owners; spec sent to the coordinator): branch plans for UNION ALL (one
+  slot, N plans sharing the table, `_lv_branch` in unit filters), NULL-safe lineage filters,
+  `detail` from the plan, `VIEW_DEFINITION` in the catalog. Internal views (§4):
+  shelved by owner decision.
+* **D**: LATERAL, DRed for recursion. The top-N buffer, INTERSECT/EXCEPT and surrogate keys were
+  internal views: shelved with them.
 
 ## 9. Server schema & metadata
 

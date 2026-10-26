@@ -133,11 +133,7 @@ fn analyze_block(
     let full = |why: &str| lower::full_plan(def, default_schema, tables, why).map(Outcome::Plan);
     let set_op = matches!(def.query.body.as_ref(), SetExpr::SetOperation { .. });
     if !opts.internal_views && !(opts.branch_plans && set_op) && !needs_analysis(&def.query) {
-        // (A group key on the NULL side goes on to name what would trace it.)
-        let p = analyze::plan_block(def, default_schema, tables)?;
-        if !matches!(&p.mode, Mode::Full(r) if r == NULL_SIDE_KEY) {
-            return Ok(Outcome::Plan(p));
-        }
+        return plan_as_written();
     }
     // Spans must point into the text the item names are taken from.
     let Some((mut query, tokens)) = source::parse_query(&def.query_sql) else {
@@ -161,7 +157,7 @@ fn analyze_block(
             _ => String::new(),
         };
         return full(&format!(
-            "inlining {what} reads {} table references in {place} (budget {INLINE_BUDGET}){culprit} (needs internal views)",
+            "inlining {what} reads {} table references in {place} (budget {INLINE_BUDGET}){culprit}",
             size.refs
         ));
     }
@@ -211,12 +207,7 @@ fn analyze_block(
         .find(|i| matches!(i.source, Source::Derived(_)))
     {
         if !opts.internal_views {
-            let why = normalize::unmerged_reason(&b, it);
-            return full(&if internal::isolatable(&b, it) {
-                format!("{why} (needs internal views)")
-            } else {
-                why
-            });
+            return full(&normalize::unmerged_reason(&b, it));
         }
         match internal::isolate(&mut b, default_schema, tables) {
             Ok(missing) if !missing.is_empty() => return Ok(Outcome::NeedsInternal(missing)),
@@ -250,7 +241,8 @@ fn analyze_block(
     };
     let plan = match planned {
         Ok(p) => p,
-        // A group key on the NULL side is traced through the tuple-lineage view.
+        // A group key on the NULL side: the tuple-lineage view, with internal views (shelved:
+        // `plan` never enables them).
         Err(why) if why == NULL_SIDE_KEY => {
             return match internal::tuple_view(&b, default_schema, tables) {
                 Some((iv, None)) if opts.internal_views => Ok(Outcome::NeedsInternal(vec![iv])),
@@ -260,8 +252,7 @@ fn analyze_block(
                         Err(r) => full(&r.reason()),
                     }
                 }
-                Some(_) => full(&format!("{why} (needs internal views)")),
-                None => full(&why),
+                Some(_) | None => full(&why),
             };
         }
         // A subquery that stayed one: the reason the semi-join extraction recorded.
@@ -270,8 +261,8 @@ fn analyze_block(
         }
         Err(why) => return full(&why),
     };
-    // Grouped over two or more lookup tables: the tuple-lineage view where the engine has
-    // internal views (the engine's remembered before-images trace them meanwhile).
+    // Grouped over two or more lookup tables: the tuple-lineage view with internal views
+    // (shelved; the engine's remembered before-images trace them).
     if opts.internal_views && internal::needs_tuple_view(&plan) {
         match internal::tuple_view(&b, default_schema, tables) {
             Some((iv, None)) => return Ok(Outcome::NeedsInternal(vec![iv])),

@@ -12,6 +12,10 @@
 //!
 //! Names hash the schema and the view's SQL, so identical subtrees of different definitions
 //! share one internal view.
+//!
+//! Shelved by owner decision: an internal view adds work to the refresh hot path, so
+//! `analyzer::plan` never enables them and those views stay Full with their reason. Kept as the
+//! analysis of what would trace them (docs/design-analyzer.md §4).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;

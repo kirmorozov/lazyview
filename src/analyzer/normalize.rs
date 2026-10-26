@@ -1138,9 +1138,9 @@ fn scalars(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
                             *e = x;
                             self.joins.push((join, item));
                         }
-                        Ok(Err(Some(why))) => self
-                            .blockers
-                            .push(format!("{why} in {} (needs internal views)", self.place)),
+                        Ok(Err(Some(why))) => {
+                            self.blockers.push(format!("{why} in {}", self.place))
+                        }
                         Ok(Err(None)) => {}
                         Err(err) => {
                             self.err = Some(err);
@@ -1492,21 +1492,18 @@ fn semi_blocker(kind: &str, sb: &Block) -> String {
         .iter()
         .find(|i| !matches!(i.source, Source::Table(..)))
     {
-        return format!(
-            "{kind} over {} (needs internal views)",
-            it.origin.describe(&it.alias)
-        );
+        return format!("{kind} over {}", it.origin.describe(&it.alias));
     }
     if sb.limit {
         return format!("{kind} with LIMIT");
     }
     if windowed(sb) {
-        return format!("{kind} with a window function (needs internal views)");
+        return format!("{kind} with a window function");
     }
     if !sb.semis.is_empty() || block_has_subquery(sb) {
-        return format!("{kind} containing a subquery (needs internal views)");
+        return format!("{kind} containing a subquery");
     }
-    format!("{kind} with an aggregate (needs internal views)")
+    format!("{kind} with an aggregate")
 }
 
 /// The ON conditions of a subquery's FROM when its tables are joined by inner joins only (each
@@ -1528,7 +1525,7 @@ fn inner_join_conditions(kind: &str, sb: &Block) -> std::result::Result<Vec<Expr
             }
             // A lookup of the NULL side would have to drop the conditions that keep
             // NULL-extended rows (as the block planner does for the view's own FROM).
-            _ => return Err(format!("{kind} with an outer join (needs internal views)")),
+            _ => return Err(format!("{kind} with an outer join")),
         }
     }
     Ok(on)

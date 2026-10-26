@@ -218,7 +218,7 @@ fn cases() -> Vec<Case> {
         case(
             "cte_chain_64",
             "full",
-            "inlining the WITH clause reads 64 table references in one SELECT (budget 32): CTE `t5` is referenced 2 times (needs internal views)",
+            "inlining the WITH clause reads 64 table references in one SELECT (budget 32): CTE `t5` is referenced 2 times",
             "WITH t0 AS (SELECT id, customer_id, status FROM orders)
              , t1 AS (SELECT a.id, a.customer_id, a.status FROM t0 a JOIN t0 b ON b.id = a.id)
              , t2 AS (SELECT a.id, a.customer_id, a.status FROM t1 a JOIN t1 b ON b.id = a.id)
@@ -345,7 +345,7 @@ fn cases() -> Vec<Case> {
         case(
             "distinct_left",
             "full",
-            "group key on the NULL side of a LEFT JOIN (needs internal views)",
+            "group key on the NULL side of a LEFT JOIN",
             "SELECT DISTINCT o.status, c.tier FROM orders o LEFT JOIN customers c ON c.id = o.customer_id",
         ),
         // --- semi- and anti-joins
@@ -478,7 +478,7 @@ fn cases() -> Vec<Case> {
         case(
             "cte_agg_joined",
             "full",
-            "GROUP BY in CTE `t` joined to other tables (needs internal views)",
+            "GROUP BY in CTE `t` joined to other tables",
             "WITH t AS (SELECT customer_id, SUM(amount) AS total FROM events_log GROUP BY customer_id)
              SELECT c.id, c.name, t.total FROM customers c JOIN t ON t.customer_id = c.region_id",
         ),
@@ -493,7 +493,7 @@ fn cases() -> Vec<Case> {
         case(
             "cte_window",
             "full",
-            "window function in CTE `t` (needs internal views)",
+            "window function in CTE `t`",
             "WITH t AS (SELECT id, customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at, id) AS rn FROM orders)
              SELECT id, customer_id FROM t WHERE rn = 1",
         ),
@@ -507,7 +507,7 @@ fn cases() -> Vec<Case> {
         case(
             "cte_limit",
             "full",
-            "ORDER BY … LIMIT in CTE `t` (needs internal views)",
+            "ORDER BY … LIMIT in CTE `t`",
             "WITH t AS (SELECT id, price FROM products ORDER BY price DESC, id LIMIT 5) SELECT id, price FROM t",
         ),
         case(
@@ -905,7 +905,7 @@ fn edge_cases() -> Vec<Case> {
         case(
             "edge_left_distinct",
             "full",
-            "group key on the NULL side of a LEFT JOIN (needs internal views)",
+            "group key on the NULL side of a LEFT JOIN",
             "SELECT DISTINCT p.grp, c.qty FROM e_parent p LEFT JOIN e_child c ON c.parent_id = p.id",
         ),
         case(

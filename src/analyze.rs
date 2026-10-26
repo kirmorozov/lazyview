@@ -2309,8 +2309,8 @@ pub fn plan_block(
     };
     let select: &mut Select = match query.body.as_mut() {
         SetExpr::Select(s) => s,
-        // C4: name what blocks a top-N over a set operation (its rows are a bounded recompute
-        // of an internal view of the union).
+        // C4: name what blocks a top-N over a set operation (refreshed in full: tracing it
+        // would need an internal view of the union, shelved).
         SetExpr::SetOperation {
             op, set_quantifier, ..
         } if top_n_limit.is_some() => {
@@ -2324,9 +2324,7 @@ pub fn plan_block(
                 sqlparser::ast::SetOperator::Intersect => "INTERSECT",
                 _ => "EXCEPT",
             };
-            return Ok(full(&format!(
-                "ORDER BY … LIMIT over a {op} (needs internal views)"
-            )));
+            return Ok(full(&format!("ORDER BY … LIMIT over a {op}")));
         }
         _ => return Ok(full("set operation (UNION/INTERSECT/EXCEPT)")),
     };

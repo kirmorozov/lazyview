@@ -133,7 +133,7 @@ fn attach_semis(
     };
     if let Some(s) = b.semis.iter().find(|s| in_on(s.id)) {
         return Err(Refused::Reason(format!(
-            "{} in a derived table or CTE on the NULL side of a LEFT JOIN (needs internal views)",
+            "{} in a derived table or CTE on the NULL side of a LEFT JOIN",
             semi_kind(s)
         )));
     }

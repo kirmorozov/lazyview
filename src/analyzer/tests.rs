@@ -256,7 +256,7 @@ fn cte_inlining_is_bounded() {
         p.mode,
         Mode::Full(
             "inlining the WITH clause reads 64 table references in one SELECT (budget 32): \
-             CTE `t5` is referenced 2 times (needs internal views)"
+             CTE `t5` is referenced 2 times"
                 .into()
         )
     );
@@ -264,7 +264,7 @@ fn cte_inlining_is_bounded() {
     for n in [14, 18, 40] {
         let (p, dt) = plan(n);
         assert!(
-            matches!(p.mode, Mode::Full(ref r) if r.contains("(needs internal views)")),
+            matches!(p.mode, Mode::Full(ref r) if r.starts_with("inlining the WITH clause reads")),
             "{}",
             p.mode
         );
@@ -633,7 +633,7 @@ fn not_in_is_rendered_as_not_exists() {
     assert_eq!(
         reason("CREATE VIEW v AS SELECT o.id, d.id AS c FROM orders o LEFT JOIN (SELECT id FROM customers WHERE region_id NOT IN \
                 (SELECT r.id FROM regions r WHERE r.name = 'x')) d ON d.id = o.customer_id"),
-        "IN subquery in a derived table or CTE on the NULL side of a LEFT JOIN (needs internal views)"
+        "IN subquery in a derived table or CTE on the NULL side of a LEFT JOIN"
     );
     // Not a filter context: Full with the reason.
     assert_eq!(
@@ -967,7 +967,7 @@ fn timestamp_keys_are_not_key_exact() {
         // An aggregated CTE joined on a TIMESTAMP key is not pulled up; on a DATETIME key it is.
         (
             "WITH t AS (SELECT ts, COUNT(*) AS n FROM c GROUP BY ts) SELECT s.id, t.n FROM k_ts s JOIN t ON t.ts = s.k",
-            Mode::Full("GROUP BY in CTE `t` joined to other tables (needs internal views)".into()),
+            Mode::Full("GROUP BY in CTE `t` joined to other tables".into()),
         ),
         (
             "WITH t AS (SELECT dt, COUNT(*) AS n FROM c GROUP BY dt) SELECT s.id, t.n FROM k_dt s JOIN t ON t.dt = s.k",
@@ -1033,11 +1033,11 @@ fn validate_against_the_canonical_definition() {
 fn top_n_over_a_union_is_named() {
     assert_eq!(
         reason("CREATE VIEW v AS (SELECT id, total FROM orders) UNION ALL (SELECT id, price FROM order_items) ORDER BY total DESC LIMIT 5"),
-        "ORDER BY … LIMIT over a UNION ALL (needs internal views)"
+        "ORDER BY … LIMIT over a UNION ALL"
     );
     assert_eq!(
         reason("CREATE VIEW v AS SELECT id FROM orders UNION SELECT id FROM customers ORDER BY id LIMIT 5"),
-        "ORDER BY … LIMIT over a UNION (needs internal views)"
+        "ORDER BY … LIMIT over a UNION"
     );
     assert_eq!(
         reason("CREATE VIEW v AS SELECT id FROM orders UNION SELECT id FROM customers"),
@@ -1051,15 +1051,15 @@ fn aggregate_scalar_subqueries_are_named() {
     for (sql, why) in [
         (
             "SELECT c.id, (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS n FROM customers c",
-            "correlated aggregate subquery in the SELECT list (needs internal views)",
+            "correlated aggregate subquery in the SELECT list",
         ),
         (
             "SELECT o.id, (SELECT SUM(i.price) FROM order_items i WHERE i.order_id = o.id AND i.qty > 1) AS paid FROM orders o",
-            "correlated aggregate subquery in the SELECT list (needs internal views)",
+            "correlated aggregate subquery in the SELECT list",
         ),
         (
             "SELECT id FROM orders o WHERE o.total > (SELECT AVG(total) FROM orders)",
-            "uncorrelated aggregate subquery in the WHERE clause (needs internal views)",
+            "uncorrelated aggregate subquery in the WHERE clause",
         ),
     ] {
         assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
@@ -1112,7 +1112,7 @@ fn inlining_budget_is_per_join_block() {
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {wide}")),
         "inlining the WITH clause reads 64 table references in UNION branch 2 (budget 32): \
-         CTE `t5` is referenced 2 times (needs internal views)"
+         CTE `t5` is referenced 2 times"
     );
     // A 33-way join written out inlines nothing: planned as written.
     let mut join = "SELECT o0.id FROM orders o0".to_string();
@@ -1129,7 +1129,7 @@ fn inlining_budget_is_per_join_block() {
     }
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {derived}")),
-        "inlining derived tables reads 33 table references in one SELECT (budget 32) (needs internal views)"
+        "inlining derived tables reads 33 table references in one SELECT (budget 32)"
     );
 }
 
@@ -1214,7 +1214,7 @@ fn order_by_through_merges_and_subqueries() {
 
 /// C1: a string literal containing a newline before a semi-join marker does not break the
 /// marker replacement (token locations are converted with the literal's lines). C2: a
-/// parenthesized join that is not a chain of inner joins names what it needs.
+/// parenthesized join that is not a chain of inner joins names the construct.
 #[test]
 fn newlines_in_literals_and_nested_outer_joins() {
     let cat = catalog();
@@ -1236,7 +1236,7 @@ fn newlines_in_literals_and_nested_outer_joins() {
         p.mode,
         Mode::Full(
             "parenthesized join (customers c JOIN regions r ON r.id = c.region_id) that cannot \
-             be flattened into the FROM chain (needs internal views)"
+             be flattened into the FROM chain"
                 .into()
         )
     );
@@ -1329,17 +1329,17 @@ fn improvements() -> Vec<(&'static str, Result<Mode, &'static str>)> {
             "WHERE c.id IN (SELECT customer_id FROM orders WHERE total > 5) ORDER BY region_id LIMIT 3",
             Ok(Mode::Global),
         ),
-        // A group key on the NULL side: traced through the tuple-lineage view (internal views).
+        // A group key on the NULL side: Full (the tuple-lineage view is an internal view).
         (
             "SELECT i.order_id, COUNT(*) FROM orders o LEFT JOIN order_items i ON i.order_id = o.id GROUP BY i.order_id",
             Ok(Mode::Full(
-                "group key on the NULL side of a LEFT JOIN (needs internal views)".into(),
+                "group key on the NULL side of a LEFT JOIN".into(),
             )),
         ),
         (
             "SELECT COALESCE(c.name, '?') n, COUNT(*) FROM orders o LEFT JOIN customers c",
             Ok(Mode::Full(
-                "group key on the NULL side of a LEFT JOIN (needs internal views)".into(),
+                "group key on the NULL side of a LEFT JOIN".into(),
             )),
         ),
         // The server rejects the definition (2 columns for 1 name).
@@ -1553,21 +1553,21 @@ fn taxonomy_strategies_and_reasons() {
         m("WITH t AS (SELECT DISTINCT customer_id FROM orders) SELECT c.name FROM customers c JOIN t ON t.customer_id = c.id"),
         Mode::Grouped
     );
-    // Joined on anything else: kept apart (internal views pending).
+    // Joined on anything else: kept apart (Full).
     assert_eq!(
         full(
             "WITH t AS (SELECT customer_id, SUM(total) s FROM orders GROUP BY customer_id) \
               SELECT c.name, t.s FROM customers c JOIN t ON t.customer_id = c.region_id"
         ),
-        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
+        "GROUP BY in CTE `t` joined to other tables"
     );
     assert_eq!(
         full("WITH t AS (SELECT DISTINCT customer_id FROM orders) SELECT c.name FROM customers c JOIN t ON t.customer_id = c.region_id"),
-        "DISTINCT in CTE `t` joined to other tables (needs internal views)"
+        "DISTINCT in CTE `t` joined to other tables"
     );
     assert_eq!(
         full("WITH t AS (SELECT customer_id, COUNT(*) n FROM orders GROUP BY customer_id) SELECT n, COUNT(*) FROM t GROUP BY n"),
-        "GROUP BY in CTE `t` under an aggregate, DISTINCT, window or LIMIT (needs internal views)"
+        "GROUP BY in CTE `t` under an aggregate, DISTINCT, window or LIMIT"
     );
     // Set operations, LIMIT, windows, recursion, constants, non-determinism.
     assert_eq!(
@@ -1582,7 +1582,7 @@ fn taxonomy_strategies_and_reasons() {
     );
     assert_eq!(
         full("WITH t AS (SELECT id FROM orders ORDER BY total DESC LIMIT 5) SELECT id FROM t"),
-        "ORDER BY … LIMIT in CTE `t` (needs internal views)"
+        "ORDER BY … LIMIT in CTE `t`"
     );
     assert_eq!(
         full("WITH t AS (SELECT id FROM orders LIMIT 5) SELECT id FROM t"),
@@ -1590,7 +1590,7 @@ fn taxonomy_strategies_and_reasons() {
     );
     assert_eq!(
         full("WITH t AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) rn FROM orders) SELECT id FROM t WHERE rn = 1"),
-        "window function in CTE `t` (needs internal views)"
+        "window function in CTE `t`"
     );
     assert_eq!(
         full("WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT o.id FROM orders o JOIN r ON r.n = o.id"),
@@ -1692,10 +1692,7 @@ fn aggregation_pulled_up_through_key_joins() {
         "CREATE VIEW v AS WITH t AS (SELECT customer_id, SUM(total) AS s FROM orders GROUP BY customer_id) \
          SELECT c.id, t.s FROM customers c JOIN t ON t.customer_id = c.region_id"
     );
-    assert_eq!(
-        r,
-        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
-    );
+    assert_eq!(r, "GROUP BY in CTE `t` joined to other tables");
     // NULL side, and a key compared across type families: not pulled up.
     assert!(matches!(
         v(&format!(
@@ -1795,7 +1792,7 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
     // Without internal views: Full, naming the construct.
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {sql}")),
-        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
+        "GROUP BY in CTE `t` joined to other tables"
     );
 }
 
@@ -1966,7 +1963,7 @@ fn semi_joins_over_joined_subqueries() {
     for (sql, why) in [
         (
             "SELECT c.id FROM customers c WHERE c.id IN (SELECT o.customer_id FROM orders o LEFT JOIN order_items i ON i.order_id = o.id WHERE i.qty IS NULL)",
-            "IN subquery with an outer join (needs internal views)",
+            "IN subquery with an outer join",
         ),
         (
             "SELECT id FROM orders WHERE NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = orders.id LIMIT 1)",
@@ -1974,11 +1971,11 @@ fn semi_joins_over_joined_subqueries() {
         ),
         (
             "SELECT c.id FROM customers c WHERE c.id IN (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id GROUP BY o.customer_id HAVING SUM(i.qty) > 4)",
-            "IN subquery with an aggregate (needs internal views)",
+            "IN subquery with an aggregate",
         ),
         (
             "SELECT c.id FROM customers c WHERE c.id IN (SELECT d.customer_id FROM (SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id) d WHERE d.n > 2)",
-            "IN subquery with an aggregate (needs internal views)",
+            "IN subquery with an aggregate",
         ),
     ] {
         assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
@@ -2044,7 +2041,7 @@ fn internal_views_for_windows_and_top_n() {
     // Without internal views: Full, naming the construct.
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {win}")),
-        "window function in CTE `t` (needs internal views)"
+        "window function in CTE `t`"
     );
 }
 
@@ -2155,7 +2152,7 @@ fn scalar_lookups_unnested() {
         ),
         (
             "SELECT o.id, (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS n FROM orders o",
-            "correlated aggregate subquery in the SELECT list (needs internal views)",
+            "correlated aggregate subquery in the SELECT list",
         ),
     ] {
         assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
@@ -2191,7 +2188,7 @@ fn join_syntax_normalized() {
     // A LEFT JOIN inside parentheses keeps its own NULL semantics: not flattened.
     assert_eq!(
         reason("CREATE VIEW v AS SELECT o.id FROM orders o JOIN (customers c LEFT JOIN regions r ON r.id = c.region_id) ON c.id = o.customer_id"),
-        "parenthesized join (customers c LEFT JOIN regions r ON r.id = c.region_id) that cannot be flattened into the FROM chain (needs internal views)"
+        "parenthesized join (customers c LEFT JOIN regions r ON r.id = c.region_id) that cannot be flattened into the FROM chain"
     );
 }
 

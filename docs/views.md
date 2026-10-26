@@ -147,6 +147,7 @@ rows it affects. That covers:
 * subqueries: `IN`, `NOT IN`, `EXISTS`, `NOT EXISTS` and comparisons against them (semi-joins and
   anti-joins), also over joined subqueries;
 * CTEs (non-recursive) and derived tables, merged into the outer query;
+* `JSON` columns as `GROUP BY` keys (a JSON value computed by a function is full, see below);
 * window functions (the unit is the `PARTITION BY` group; without it the whole window is
   recomputed) and top-N (`ORDER BY … LIMIT n`: the `ORDER BY` columns count as read columns, so
   changing one that is not selected is noticed too);
@@ -166,7 +167,8 @@ yet. `detail` shows the text in the first column.
 | `LIMIT without ORDER BY` | `… LIMIT 10` (which rows are returned is up to the server) |
 | `recursive CTE `x`` | `WITH RECURSIVE x AS (…)` |
 | `LATERAL derived table `x`` | `JOIN LATERAL (SELECT …) x` |
-| `subquery` | a scalar subquery in the SELECT list |
+| `subquery` | a scalar subquery that is not a lookup by a whole key (`(SELECT name FROM t WHERE t.region = o.region)`) |
+| ``correlated aggregate subquery in the SELECT list`` (or `… in the WHERE clause`, `uncorrelated …`) | `(SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id)` |
 | `unsupported FROM item` | other FROM items, such as table functions |
 | `MATCH ... AGAINST` | full-text search |
 | `non-deterministic function <NAME>` | `NOW`, `SYSDATE`, `CURDATE`, `CURTIME`, `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`, `UTC_DATE`, `UTC_TIME`, `UTC_TIMESTAMP`, `UNIX_TIMESTAMP`, `RAND`, `UUID`, `UUID_SHORT`, `CONNECTION_ID`, `USER`, `CURRENT_USER`, `SESSION_USER`, `SYSTEM_USER`, `LAST_INSERT_ID`, `FOUND_ROWS`, `ROW_COUNT`, `SLEEP`, `BENCHMARK` (also inside the `ORDER BY` of a top-N view) |
@@ -178,16 +180,20 @@ yet. `detail` shows the text in the first column.
 | `SELECT * over a USING or NATURAL join …` | list the columns instead: the server coalesces the shared ones |
 | ``unaliased column `…` reads a VIRTUAL generated column: give it an alias`` | a select item over a `VIRTUAL` column whose text is longer than 64 characters (or ends in a space or contains a newline) and has no `AS` alias |
 | ``<TYPE> column `t`.`c` decides which rows match, but its binlog value cannot be compared with its SQL value`` | a filter or join on a column type whose binlog form differs from its SQL form |
-| ``IN subquery over `t`, a child of a cascading foreign key`` | `WHERE id IN (SELECT parent_id FROM child)` where `child` is a child of a cascading foreign key (see [foreign-key cascades](#foreign-key-cascades)) |
 | ``reads SQL view `v` `` | the definition reads a plain SQL view; lazyview watches the view's base tables |
+| ``group key `…` is a JSON value computed by a function …`` | `GROUP BY JSON_EXTRACT(doc, '$.type')` (MariaDB compares it as JSON, its refresh filter as text); group by the `JSON` column itself or by `doc->>'$.type'` |
+| `group key on the NULL side of a LEFT JOIN` | `… LEFT JOIN order_items i … GROUP BY i.order_id` (see [LEFT JOIN](#left-join)) |
+| ``GROUP BY in CTE `c` joined to other tables`` (also `DISTINCT`, window, `ORDER BY … LIMIT`, in a CTE or derived table) | an aggregated CTE joined on columns that are not its group key |
+| ``derived table `d` joins several tables on the NULL side of a LEFT JOIN`` (also an aggregate or window there) | `o LEFT JOIN (SELECT … FROM a JOIN b …) d ON …` |
+| ``parenthesized join (…) that cannot be flattened into the FROM chain`` | `x LEFT JOIN (a JOIN b ON …) ON …` |
+| ``ORDER BY … LIMIT over a UNION ALL`` | `(SELECT …) UNION ALL (SELECT …) ORDER BY total DESC LIMIT 5` |
+| reasons naming an IN / EXISTS subquery (``IN subquery with an aggregate``, ``EXISTS subquery with LIMIT``, `… with an outer join`, …) | what inside the subquery keeps it from being a semi-join |
 
-**Planned, still full today.** These reasons name a missing piece of lazyview, not a limit of the
+**Planned, still full today.** This reason names a missing piece of lazyview, not a limit of the
 idea. The view is correct, only rebuilt instead of maintained:
 
 | `detail` | example | waits for |
 |---|---|---|
-| `JSON group key (needs typed unit filters)` | `GROUP BY JSON_EXTRACT(doc, '$.type')`, or a `JSON` column | JSON-aware group keys |
-| reasons ending in `(needs internal views)` | a group key on the NULL side of a `LEFT JOIN`; an aggregated or `DISTINCT` CTE joined to other tables; an aggregate or window inside a derived table on the NULL side of a `LEFT JOIN`; a parenthesized join that cannot be flattened | internal views (an invisible chained view) |
 | reasons ending in `(needs branch plans)`, and `UNION ALL` | `SELECT … UNION ALL SELECT …` | branch plans for `UNION ALL` |
 
 How full mode behaves:
@@ -243,7 +249,7 @@ SELECT o.id FROM orders o LEFT JOIN customers c ON c.name = o.customer WHERE c.i
 ```
 
 The exception is a `GROUP BY` key taken from the NULL side: `… LEFT JOIN order_items i … GROUP BY
-i.order_id` is full (`group key on the NULL side of a LEFT JOIN (needs internal views)`; planned).
+i.order_id` is full (`group key on the NULL side of a LEFT JOIN`).
 Group by `o.id` instead:
 
 ```sql
@@ -286,6 +292,9 @@ reads.
   a.customer_id`, or `USING`). With any other condition (`… ON c.id = a.customer_id AND
   c.active = 1`), a child row whose parent fails it stays in the view without its parent, so the
   parent's row does not lead to it: such a view is rebuilt as described below.
+* A child read only in an `IN` / `EXISTS` subquery is handled the same way: correlated on the
+  view's unit through the foreign-key column (`WHERE EXISTS (SELECT 1 FROM kids k WHERE k.par_id =
+  p.id)`), the parent's row gives the units; otherwise the rule below applies.
 * Otherwise a delete or key update on the parent triggers an online rebuild of the view (at most
   once per `LAZYVIEW_FULL_REFRESH_MS`, never more than one at a time). lazyview logs a warning
   when such a view is created (with the `reasons` that apply): `reads a child of a cascading foreign key whose units cannot be
