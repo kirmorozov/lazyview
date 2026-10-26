@@ -67,6 +67,9 @@ pub struct Layout {
     /// identify (see [`ViewPlan::rows_identified`]). Empty when rows have no identity. Rows are
     /// upserted by it when it can be a unique index (see [`Layout::row_key`]).
     pub identity: Vec<usize>,
+    /// Sets of unit positions refreshed by partial unit keys (the plan's `partial.sets`): each
+    /// gets an index unless the unit index starts with it.
+    pub partial: Vec<Vec<usize>>,
 }
 
 /// The unique index behind [`Layout::row_key`].
@@ -130,7 +133,11 @@ impl Layout {
         if let Some(RowIndex::Unique(parts)) = &row {
             defs.push(format!("UNIQUE KEY `{ROW_INDEX}` ({parts})"));
         }
-        for (name, parts) in self.lineage_indexes() {
+        for (name, parts) in self
+            .lineage_indexes()
+            .into_iter()
+            .chain(self.partial_indexes())
+        {
             defs.push(format!("KEY {} ({parts})", q(&name)));
         }
         let comment = marker
@@ -328,6 +335,35 @@ impl Layout {
                     return None;
                 }
                 Some((format!("_lv_a{alias}"), fit_key(&parts)?))
+            })
+            .collect()
+    }
+
+    /// One non-unique index `_lv_p<k>` per set of partial unit positions the unit index does
+    /// not start with: a partial refresh reads and replaces the rows matching those columns
+    /// alone (an index range instead of a scan).
+    fn partial_indexes(&self) -> Vec<(String, String)> {
+        let unit_index = self.unit_index().is_some();
+        self.partial
+            .iter()
+            .enumerate()
+            .filter(|(_, at)| !(unit_index && at.iter().copied().eq(0..at.len())))
+            .filter_map(|(k, at)| {
+                let parts: Vec<(&MvCol, KeyPart)> = at
+                    .iter()
+                    .map(|&u| {
+                        (
+                            &self.cols[self.unit_pos[u]],
+                            self.cols[self.unit_pos[u]].key_part(),
+                        )
+                    })
+                    .take_while(|(_, k)| *k != KeyPart::None)
+                    .take(MAX_KEY_PARTS)
+                    .collect();
+                if parts.is_empty() {
+                    return None;
+                }
+                Some((format!("_lv_p{k}"), fit_key(&parts)?))
             })
             .collect()
     }
@@ -895,6 +931,7 @@ pub async fn probe(src: &mut Conn, src_schema: &str, plan: &ViewPlan) -> Result<
         lineage,
         epoch,
         identity,
+        partial: plan.partial.sets.clone(),
     })
 }
 
@@ -1785,7 +1822,24 @@ mod tests {
             lineage: Vec::new(),
             epoch: Vec::new(),
             identity: Vec::new(),
+            partial: Vec::new(),
         }
+    }
+
+    /// Partial unit sets get an index of their own unless the unit index starts with them.
+    #[test]
+    fn partial_sets_are_indexed() {
+        let cols = vec![
+            col("g", "int", "int", None),
+            col("o", "int", "int", None),
+            col("v", "int", "int", None),
+        ];
+        let mut l = layout(cols, 3, vec![0, 1], true);
+        l.partial = vec![vec![1], vec![0]];
+        let sql = l.create_sql("s", "t");
+        assert!(sql.contains("PRIMARY KEY (`g`, `o`)"), "{sql}");
+        assert!(sql.contains("KEY `_lv_p0` (`o`)"), "{sql}");
+        assert!(!sql.contains("_lv_p1"), "a prefix of the unit index: {sql}");
     }
 
     fn ev_plan(sql: &str) -> ViewPlan {

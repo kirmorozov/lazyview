@@ -1871,6 +1871,7 @@ async fn probe(
         epoch: Vec::new(),
         // JSON units: no row identity (written per unit).
         identity: Vec::new(),
+        partial: Vec::new(),
         cols,
     })
 }
@@ -3311,6 +3312,20 @@ async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
     eng.stop().await
 }
 
+/// Fails unless the constant filters pruned at least `per_row` alias routes per changed row on
+/// average: without them (an engine built without the filters, e.g. a stale test binary) the
+/// rebuild checks that follow would fail with a misleading message.
+fn ensure_pruned(d: &lazyview::metrics::Snapshot, per_row: u64) -> Result<()> {
+    ensure!(
+        d.rows_skipped >= per_row * d.rows_seen,
+        "the constant filters pruned only {} alias routes for {} changed rows (expected at least {per_row} \
+         per row): the engine under test does not apply them (a stale binary?)",
+        d.rows_skipped,
+        d.rows_seen
+    );
+    Ok(())
+}
+
 /// Key / value sources: one value table joined once per (key, scope), each alias pinned by
 /// constant equalities. Columns of one table use different integer types. Seeded so that every
 /// value row an alias reads exists where needed: (11, 3), (11, 5), (12, 3), (15, 3), (40, 3) for
@@ -3573,6 +3588,7 @@ fn reg_pinned_aliases_see_only_their_rows() {
         }
         let d = eng.snapshot().since(&before);
         ctx.log(format!("whole run: {}", fmt_snapshot(&d)));
+        ensure_pruned(&d, 10)?;
         ensure!(
             d.full_rebuilds == 0 && d.lookback_overflows == 0,
             "single-object transactions rebuilt the views ({} rebuilds, {} lookback overflows): {}",
@@ -3646,6 +3662,190 @@ fn reg_const_filters_at_integer_extremes() {
             run(&mut c, &[stmt]).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
+        eng.stop().await
+    });
+}
+
+/// Partial direct units: in a view grouped by (link group, object), an object value alias
+/// gives the object part of the unit and a group value alias the group part, through the join
+/// equalities. Their changes refresh every unit with that part, with no lookup query and no part
+/// in the lookup combinations: concurrent object and group transactions (which also touch more
+/// aliases together than the lookups combine) stay incremental without one lookup. A permuted
+/// formulation of the view runs alongside.
+#[test]
+fn reg_partial_units() {
+    scenario("reg_partial", |ctx| async move {
+        let mut ddl: Vec<String> = PIN_DDL.iter().map(|s| s.to_string()).collect();
+        ddl.extend(pin_seed());
+        ddl.push(
+            "CREATE TABLE grp (gid SMALLINT UNSIGNED PRIMARY KEY, name VARCHAR(20) NOT NULL)"
+                .into(),
+        );
+        ddl.push(
+            "CREATE TABLE grp_attr (vid INT AUTO_INCREMENT PRIMARY KEY, \
+             gid BIGINT NOT NULL, aid TINYINT UNSIGNED NOT NULL, \
+             scope SMALLINT NOT NULL, val INT NULL, \
+             UNIQUE KEY grp_aid_scope (gid, aid, scope))"
+                .into(),
+        );
+        ddl.push("INSERT INTO grp VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')".into());
+        let mut gi = Vec::new();
+        for g in 1..=4 {
+            for (a, s) in [(21, 3), (21, 5), (22, 3), (40, 3)] {
+                gi.push(format!("({g}, {a}, {s}, {})", (g + a) % 2));
+            }
+        }
+        ddl.push(format!(
+            "INSERT INTO grp_attr (gid, aid, scope, val) VALUES {}",
+            gi.join(", ")
+        ));
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let select = "SELECT c.gid, o.oid, MAX(c.pos) AS pos, COUNT(*) AS n, \
+             COALESCE(MAX(s1.val), MAX(s0.val)) AS a1, MAX(v0.val) AS a2, MAX(w0.val) AS a4, \
+             COALESCE(MAX(ka1.val), MAX(ka0.val)) AS g1, MAX(kn0.val) AS g2, MAX(k.name) AS gname";
+        let specs = vec![
+            ViewSpec::new(
+                "r_partial",
+                Kind::Incremental,
+                &format!(
+                    "{select} FROM obj_link c JOIN obj o ON o.oid = c.oid \
+                     JOIN grp k ON k.gid = c.gid \
+                     JOIN obj_attr s0 ON s0.oid = o.oid AND s0.aid = 11 AND s0.scope = 3 \
+                     LEFT JOIN obj_attr s1 ON s1.oid = o.oid AND s1.aid = 11 AND s1.scope = 5 \
+                     JOIN obj_attr v0 ON v0.oid = c.oid AND v0.aid = 12 AND v0.scope = 3 \
+                     LEFT JOIN obj_attr w0 ON w0.oid = o.oid AND w0.aid = 15 AND w0.scope = 3 \
+                     JOIN grp_attr ka0 ON ka0.gid = k.gid AND ka0.aid = 21 AND ka0.scope = 3 \
+                     LEFT JOIN grp_attr ka1 ON ka1.gid = k.gid AND ka1.aid = 21 AND ka1.scope = 5 \
+                     LEFT JOIN grp_attr kn0 ON kn0.gid = c.gid AND kn0.aid = 22 AND kn0.scope = 3 \
+                     GROUP BY c.gid, o.oid"
+                ),
+            ),
+            // Permuted joins, carrying equalities and constants in the WHERE, the group key
+            // not selected under its own name.
+            ViewSpec::new(
+                "r_partial_perm",
+                Kind::Incremental,
+                "SELECT c.gid AS grp_key, o.oid AS obj_key, MAX(c.pos) AS pos, COUNT(*) AS n, \
+                 COALESCE(MAX(s1.val), MAX(s0.val)) AS a1, MAX(v0.val) AS a2, MAX(w0.val) AS a4, \
+                 COALESCE(MAX(ka1.val), MAX(ka0.val)) AS g1, MAX(kn0.val) AS g2, MAX(k.name) AS gname \
+                 FROM obj_attr v0, grp_attr ka0 JOIN grp k ON k.gid = ka0.gid \
+                 JOIN obj_link c ON c.gid = k.gid JOIN obj o ON o.oid = c.oid \
+                 JOIN obj_attr s0 ON s0.oid = o.oid \
+                 LEFT JOIN grp_attr kn0 ON kn0.gid = c.gid AND kn0.aid = 22 AND kn0.scope = 3 \
+                 LEFT JOIN obj_attr w0 ON w0.oid = o.oid AND 15 = w0.aid AND w0.scope = 3 \
+                 LEFT JOIN grp_attr ka1 ON ka1.gid = k.gid AND ka1.scope = 5 AND ka1.aid = 21 \
+                 LEFT JOIN obj_attr s1 ON s1.oid = o.oid AND s1.aid IN (11) AND s1.scope = 5 \
+                 WHERE v0.oid = c.oid AND ka0.aid = 21 AND ka0.scope = 3 \
+                 AND s0.aid = 11 AND s0.scope = 3 AND v0.aid = 12 AND v0.scope = 3 \
+                 GROUP BY c.gid, o.oid",
+            ),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_partial", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        for s in &specs {
+            let mode: Option<String> = sc
+                .exec_first(
+                    "SELECT `mode` FROM _lazyview_state WHERE name = ?",
+                    (s.name.as_str(),),
+                )
+                .await?;
+            ensure!(
+                mode.as_deref() == Some("incremental"),
+                "{} is not maintained incrementally: {mode:?}",
+                s.name
+            );
+        }
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let before = eng.snapshot();
+        let mut writers = Vec::new();
+        for w in 0..4u32 {
+            let dsn = db.dsn.clone();
+            writers.push(tokio::spawn(async move {
+                let mut c = connect(&dsn).await?;
+                for i in 0..40u32 {
+                    let (table, key, id, attrs): (&str, &str, u32, &[(u32, u32)]) = if i % 3 == 2 {
+                        ("grp_attr", "gid", 1 + (w + i) % 4, &[(21, 3), (22, 3), (21, 5), (40, 3)])
+                    } else {
+                        ("obj_attr", "oid", 1 + w + 4 * (i % 6), &[(11, 3), (12, 3), (11, 5), (15, 3), (40, 3)])
+                    };
+                    let mut stmts = vec!["START TRANSACTION".to_string()];
+                    for (k, (a, s)) in attrs.iter().enumerate() {
+                        stmts.push(format!(
+                            "UPDATE {table} SET val = {} WHERE {key} = {id} AND aid = {a} AND scope = {s}",
+                            (i + w + k as u32) % 3
+                        ));
+                    }
+                    stmts.push("COMMIT".into());
+                    for s in &stmts {
+                        exec(&mut c, s).await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        for w in writers {
+            w.await.context("writer panicked")??;
+        }
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "concurrent object and group transactions",
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "a group value moves between aliases and scopes",
+                &[
+                    "UPDATE grp_attr SET aid = 22 WHERE gid = 2 AND aid = 21 AND scope = 5",
+                    "UPDATE grp_attr SET scope = 5 WHERE gid = 3 AND aid = 22 AND scope = 3",
+                ],
+            ),
+            (
+                "an object value moves to another object, a group value to another group",
+                &[
+                    "UPDATE obj_attr SET oid = 25 WHERE oid = 2 AND aid = 15 AND scope = 3",
+                    "UPDATE grp_attr SET gid = 9 WHERE gid = 4 AND aid = 21 AND scope = 3",
+                ],
+            ),
+            (
+                "they move back, with a link and a group change",
+                &[
+                    "START TRANSACTION",
+                    "UPDATE obj_attr SET oid = 2 WHERE oid = 25 AND aid = 15",
+                    "UPDATE grp_attr SET gid = 4 WHERE gid = 9",
+                    "UPDATE obj_link SET gid = 3 WHERE gid = 2 AND oid = 4",
+                    "UPDATE grp SET name = 'bb' WHERE gid = 2",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "rows deleted and inserted",
+                &[
+                    "DELETE FROM grp_attr WHERE gid = 1 AND aid = 22",
+                    "DELETE FROM obj_attr WHERE oid = 5 AND aid = 11 AND scope = 5",
+                    "INSERT INTO grp_attr (gid, aid, scope, val) VALUES (1, 22, 3, 7)",
+                    "INSERT INTO obj_link VALUES (1, 7, 3)",
+                ],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        let d = eng.snapshot().since(&before);
+        ctx.log(format!("whole run: {}", fmt_snapshot(&d)));
+        ensure_pruned(&d, 1)?;
+        ensure!(
+            d.full_rebuilds == 0 && d.lookback_overflows == 0 && d.lookup_queries == 0,
+            "partial units: {} rebuilds, {} lookback overflows, {} lookup queries: {}",
+            d.full_rebuilds,
+            d.lookback_overflows,
+            d.lookup_queries,
+            fmt_snapshot(&d)
+        );
         eng.stop().await
     });
 }

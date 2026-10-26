@@ -751,6 +751,16 @@ pub struct ConstFilter {
     pub values: Vec<Datum>,
 }
 
+/// Partial direct units (see `partial_units`): aliases whose rows give part of the unit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PartialUnits {
+    /// The distinct sets of unit positions (ascending) some alias gives.
+    pub sets: Vec<Vec<usize>>,
+    /// Per alias of the FROM clause (aliases past the end have none): the set it gives and, per
+    /// position of the set, its column equal to that unit expression.
+    pub aliases: Vec<Option<(usize, Vec<usize>)>>,
+}
+
 /// Lineage of a lookup-resolved alias (select/join views): hidden, indexed materialized columns
 /// carrying the primary key of that alias's row in each materialized row. A changed row of the
 /// table maps to the materialized rows it is part of by an index lookup on the materialized
@@ -838,6 +848,8 @@ pub struct ViewPlan {
     pub lookup_where_sql: Option<String>,
     /// Per alias of the FROM clause: its constant filters (aliases past the end have none).
     pub alias_filters: Vec<Vec<ConstFilter>>,
+    /// Aliases traced by partial units instead of lookups.
+    pub partial: PartialUnits,
 }
 
 impl ViewPlan {
@@ -883,7 +895,8 @@ impl ViewPlan {
 
     /// How a changed row of each table maps to the materialized rows it affects, for logs:
     /// `alias:unit` (straight from the row image), `alias:lineage` (old rows by the hidden key
-    /// columns, new rows by key), `alias:lookup` (images joined with the current state) or, for
+    /// columns, new rows by key), `alias:partial` (part of the unit from the row image, every unit
+    /// matching it refreshed), `alias:lookup` (images joined with the current state) or, for
     /// full-refresh views, `rebuild`; parents of cascading foreign keys as `^parent:unit|rebuild`.
     pub fn tracing(&self) -> String {
         if !self.is_incremental() && !matches!(self.mode, Mode::Global) {
@@ -900,6 +913,8 @@ impl ViewPlan {
                     "unit"
                 } else if self.lineage_of(i).is_some() {
                     "lineage"
+                } else if self.partial_of(i).is_some() {
+                    "partial"
                 } else {
                     "lookup"
                 };
@@ -958,6 +973,13 @@ impl ViewPlan {
     /// The constant filters of `alias`: a row failing one is never that alias's row.
     pub fn filters_of(&self, alias: usize) -> &[ConstFilter] {
         self.alias_filters.get(alias).map_or(&[], Vec::as_slice)
+    }
+
+    /// The partial unit of `alias`: the index of its set in `partial.sets` and its column for
+    /// each position of the set.
+    pub fn partial_of(&self, alias: usize) -> Option<(usize, &[usize])> {
+        let (set, cols) = self.partial.aliases.get(alias)?.as_ref()?;
+        Some((*set, cols))
     }
 
     /// `SELECT DISTINCT <units> FROM ... WHERE ... AND <filter>`: the units of the current rows
@@ -1619,6 +1641,67 @@ fn int_literal(e: &Expr) -> Option<Datum> {
     }
 }
 
+/// Partial direct units: an alias traced neither by direct units nor by lineage whose row still
+/// equals some unit expressions (plain columns of exact kinds) on every row it contributes to,
+/// through the same equality classes as `direct_unit` (inner-join / WHERE equalities plus its
+/// own LEFT JOIN condition). A changed row of it can only affect units with those values: its
+/// images give partial unit keys, and the refresh recomputes every unit matching one, with no
+/// lookup query and no part in the lookup combinations. (Select/join views keep lineage where
+/// it applies; grouped views are the main users.)
+fn partial_units(
+    alias_plans: &[AliasPlan],
+    lineage: &[LineageKey],
+    unit_cols: &[Option<ColRef>],
+    scope: &Scope,
+    base_edges: &[(ColRef, ColRef)],
+    own_edges: &[Vec<(ColRef, ColRef)>],
+) -> PartialUnits {
+    let mut out = PartialUnits::default();
+    for (ai, a) in alias_plans.iter().enumerate() {
+        let mut found = None;
+        if a.direct_unit.is_none() && !lineage.iter().any(|k| k.alias == ai) {
+            let mut cls = Classes::new();
+            for (x, y) in base_edges.iter().chain(&own_edges[ai]) {
+                cls.union(*x, *y);
+            }
+            let (mut at, mut cols) = (Vec::new(), Vec::new());
+            for (u, uc) in unit_cols.iter().enumerate() {
+                let Some(uc) = *uc else { continue };
+                if !scope.aliases[uc.0].1.columns[uc.1].exact_key() {
+                    continue;
+                }
+                let ru = cls.find(uc);
+                // (Not a generated column: an image need not carry its value.)
+                let col = (0..a.table.columns.len()).find(|&c| {
+                    let col = &a.table.columns[c];
+                    col.exact_key()
+                        && col.generated.is_none()
+                        && (uc == (ai, c) || cls.find((ai, c)) == ru)
+                });
+                if let Some(c) = col {
+                    at.push(u);
+                    cols.push(c);
+                }
+            }
+            if !at.is_empty() {
+                let set = match out.sets.iter().position(|s| *s == at) {
+                    Some(i) => i,
+                    None => {
+                        out.sets.push(at);
+                        out.sets.len() - 1
+                    }
+                };
+                found = Some((set, cols));
+            }
+        }
+        out.aliases.push(found);
+    }
+    if out.sets.is_empty() {
+        out.aliases.clear();
+    }
+    out
+}
+
 /// Column references in an expression (unresolvable identifiers are ignored).
 fn col_refs(e: &Expr, scope: &Scope) -> Vec<ColRef> {
     let mut out = Vec::new();
@@ -1848,6 +1931,7 @@ pub fn plan_block(
         window_sql: None,
         lookup_where_sql: None,
         alias_filters: Vec::new(),
+        partial: PartialUnits::default(),
         unit_unique: false,
         lineage: Vec::new(),
         output_names: output_names.clone(),
@@ -2701,6 +2785,14 @@ pub fn plan_block(
         ))
     };
     let alias_filters = const_filters(select, &joins, &scope, &base_edges, &own_edges);
+    let partial = partial_units(
+        &alias_plans[..n_alias],
+        &lineage,
+        &unit_cols,
+        &scope,
+        &base_edges,
+        &own_edges,
+    );
     Ok(ViewPlan {
         schema,
         name: def.name.clone(),
@@ -2747,6 +2839,7 @@ pub fn plan_block(
             .map(|w| w.join(" AND "))
             .filter(|w| !w.is_empty()),
         alias_filters,
+        partial,
         unit_unique,
         lineage,
         cascades,
@@ -4219,6 +4312,200 @@ mod tests {
                 "SELECT o.id, a.scope {from} WHERE a.aid IN (SELECT x.id FROM obj x WHERE x.id = 3)"
             ))["x"],
             ["id=[Int(3)]"]
+        );
+    }
+
+    /// Partial direct units: an alias that is neither a unit nor a lineage alias but whose row
+    /// equals some unit expressions (through inner-join, WHERE or its own LEFT JOIN equalities,
+    /// same type family, exact kinds, any integer width or sign) gives that part of the unit, for
+    /// every formulation of the same query; select/join views keep lineage.
+    #[test]
+    fn partial_units_per_alias() {
+        use std::collections::BTreeMap;
+
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let cat: HashMap<_, _> = [
+            typed(
+                "link",
+                vec![
+                    int("gid", "int"),
+                    int("oid", "mediumint unsigned"),
+                    int("pos", "int"),
+                ],
+                &[0, 1],
+            ),
+            typed(
+                "obj",
+                vec![int("oid", "bigint"), Column::simple("label", "varchar")],
+                &[0],
+            ),
+            typed(
+                "obj_attr",
+                vec![
+                    int("id", "int"),
+                    int("oid", "int unsigned"),
+                    int("aid", "smallint unsigned"),
+                    int("val", "int"),
+                ],
+                &[0],
+            ),
+            typed(
+                "grp_attr",
+                vec![
+                    int("id", "int"),
+                    int("gid", "smallint unsigned"),
+                    int("aid", "tinyint"),
+                    int("val", "int"),
+                ],
+                &[0],
+            ),
+            typed(
+                "gen_attr",
+                vec![int("id", "int"), int("src", "int unsigned"), {
+                    let mut g = int("oid", "int unsigned");
+                    g.generated = Some(crate::catalog::Generated {
+                        expr: "`src`".into(),
+                        stored: true,
+                        deps: Some(vec![1]),
+                    });
+                    g
+                }],
+                &[0],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let plan = |sql: &str| {
+            let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+            crate::analyzer::plan(&d, "db", &cat).unwrap()
+        };
+        // Per alias name: unit / lineage / lookup / partial with the unit positions it gives.
+        let routes = |sql: &str| -> BTreeMap<String, String> {
+            let v = plan(sql);
+            assert_eq!(v.mode, Mode::Grouped, "{sql}");
+            (0..v.aliases.len())
+                .map(|a| {
+                    let how = if v.aliases[a].direct_unit.is_some() {
+                        "unit".to_string()
+                    } else if v.lineage_of(a).is_some() {
+                        "lineage".to_string()
+                    } else if let Some((set, _)) = v.partial_of(a) {
+                        format!("partial{:?}", v.partial.sets[set])
+                    } else {
+                        "lookup".to_string()
+                    };
+                    (v.aliases[a].name.clone(), how)
+                })
+                .collect()
+        };
+        let map = |entries: &[(&str, &str)]| -> BTreeMap<String, String> {
+            entries
+                .iter()
+                .map(|(a, h)| (a.to_string(), h.to_string()))
+                .collect()
+        };
+        // Each alias gives the part of (group, object) its row carries: the object's attribute
+        // and the object itself the second, the group's attribute (own LEFT JOIN condition) the
+        // first; a table joined on a non-key value does not.
+        let v = plan(
+            "SELECT c.gid, o.oid, MAX(a.val) AS s, MAX(ga.val) AS t, MAX(x.val) AS x FROM link c \
+             JOIN obj o ON o.oid = c.oid JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 \
+             LEFT JOIN grp_attr ga ON ga.gid = c.gid AND ga.aid = 4 \
+             LEFT JOIN obj_attr x ON x.val = a.val GROUP BY c.gid, o.oid",
+        );
+        assert_eq!(
+            v.tracing(),
+            "c:unit,o:partial,a:partial,ga:partial,x:lookup"
+        );
+        assert_eq!(v.partial.sets, vec![vec![1], vec![0]]);
+        assert_eq!(v.partial_of(1), Some((0, &[0usize][..])));
+        assert_eq!(v.partial_of(2), Some((0, &[1usize][..])));
+        assert_eq!(v.partial_of(3), Some((1, &[1usize][..])));
+        assert_eq!(v.partial_of(4), None);
+        // The same routes for every formulation: join order, the carrying equality in the
+        // WHERE or the ON, comma joins, the joins in a CTE or a derived table with other
+        // output names, the group column not selected (a hidden unit column).
+        let want = map(&[("c", "unit"), ("o", "partial[1]"), ("a", "partial[1]")]);
+        for sql in [
+            "SELECT c.gid, o.oid, MAX(a.val) AS s FROM link c JOIN obj o ON o.oid = c.oid \
+             JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 GROUP BY c.gid, o.oid",
+            "SELECT c.gid, o.oid, MAX(a.val) AS s FROM obj_attr a JOIN obj o ON o.oid = a.oid \
+             JOIN link c ON c.oid = o.oid WHERE a.aid = 7 GROUP BY c.gid, o.oid",
+            "SELECT c.gid, o.oid, MAX(a.val) AS s FROM link c JOIN obj o JOIN obj_attr a \
+             ON a.aid = 7 WHERE o.oid = c.oid AND a.oid = o.oid GROUP BY c.gid, o.oid",
+            "SELECT c.gid, o.oid, MAX(a.val) AS s FROM link c, obj o, obj_attr a \
+             WHERE o.oid = c.oid AND a.oid = c.oid AND a.aid = 7 GROUP BY c.gid, o.oid",
+            "WITH w AS (SELECT c.gid AS g, o.oid AS ob, a.val AS v FROM link c \
+             JOIN obj o ON o.oid = c.oid JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7) \
+             SELECT g AS grp, ob AS object, MAX(v) AS s FROM w GROUP BY g, ob",
+            "SELECT d.g, d.ob, MAX(d.v) AS s FROM (SELECT c.gid AS g, o.oid AS ob, a.val AS v \
+             FROM link c JOIN obj o ON o.oid = c.oid JOIN obj_attr a ON a.oid = o.oid \
+             WHERE a.aid = 7) d GROUP BY d.g, d.ob",
+            "SELECT o.oid AS object, MAX(a.val) AS s FROM link c JOIN obj o ON o.oid = c.oid \
+             JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 GROUP BY c.gid, o.oid",
+        ] {
+            assert_eq!(routes(sql), want, "{sql}");
+        }
+        // A generated column (STORED too) is not read from images: no partial part from it.
+        assert_eq!(
+            routes(
+                "SELECT c.gid, o.oid, COUNT(*) AS n FROM link c JOIN obj o ON o.oid = c.oid \
+                 JOIN gen_attr g ON g.oid = o.oid GROUP BY c.gid, o.oid"
+            ),
+            map(&[("c", "unit"), ("o", "partial[1]"), ("g", "lookup")])
+        );
+        // An expression group key gives no partial position; the plain key next to it does.
+        assert_eq!(
+            routes(
+                "SELECT c.gid + 0 AS g, o.oid, MAX(a.val) AS s, MAX(ga.val) AS t FROM link c \
+                 JOIN obj o ON o.oid = c.oid JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 \
+                 LEFT JOIN grp_attr ga ON ga.gid = c.gid GROUP BY c.gid + 0, o.oid"
+            ),
+            map(&[
+                ("c", "partial[1]"),
+                ("o", "partial[1]"),
+                ("a", "partial[1]"),
+                ("ga", "lookup"),
+            ])
+        );
+        // Another type family does not carry the unit; a full match is a unit alias.
+        assert_eq!(
+            plan(
+                "SELECT c.gid, o.oid, COUNT(*) AS n FROM link c JOIN obj o ON o.oid = c.oid \
+                 JOIN obj_attr a ON a.oid = o.label GROUP BY c.gid, o.oid"
+            )
+            .tracing(),
+            "c:unit,o:partial,a:lookup"
+        );
+        let v = plan(
+            "SELECT a.oid, a.aid, COUNT(*) AS n FROM obj_attr a \
+             JOIN obj_attr b ON b.oid = a.oid AND b.aid = a.aid GROUP BY a.oid, a.aid",
+        );
+        assert_eq!(v.tracing(), "a:unit,b:unit");
+        assert!(v.partial.sets.is_empty() && v.partial.aliases.is_empty());
+        // Select/join: lineage stays; single-column units have no partial part.
+        assert_eq!(
+            plan("SELECT c.gid, c.oid, a.val FROM link c JOIN obj_attr a ON a.oid = c.oid AND a.aid = 7")
+                .tracing(),
+            "c:unit,a:lineage"
+        );
+        assert_eq!(
+            plan(
+                "SELECT o.oid, MAX(a.val) AS v FROM obj o JOIN obj_attr a ON a.val = o.oid + 1 \
+                 GROUP BY o.oid"
+            )
+            .tracing(),
+            "o:unit,a:lookup"
         );
     }
 

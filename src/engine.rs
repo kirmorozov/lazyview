@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::accumulate::{feed, feed_cascade, Fed, UnitChunk, UnitSet, ViewDirty};
+use crate::accumulate::{extend_partial, feed, feed_cascade, Fed, UnitChunk, UnitSet, ViewDirty};
 use crate::analyze::{self, Mode, ViewPlan};
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position};
 use crate::catalog::{Catalog, TableInfo, TableRef};
@@ -271,6 +271,8 @@ struct Version {
 
 struct Lag {
     units: UnitSet,
+    /// Partial unit keys still to apply (per set of the plan's partial units).
+    partial: Vec<UnitSet>,
     /// Global views: the single row must be recomputed on this target.
     all: bool,
     since: Position,
@@ -3925,6 +3927,7 @@ impl Engine {
                     warn!(view = %name, target = %t, "write failed: {e:#}; retrying");
                     l.lag.entry(t.clone()).or_insert(Lag {
                         units: UnitSet::default(),
+                        partial: Vec::new(),
                         all: false,
                         since: floor.clone(),
                         failures: 1,
@@ -3934,6 +3937,7 @@ impl Engine {
                 for t in r.failed.iter().map(|(t, _)| t).chain(&lagging) {
                     if let Some(g) = l.lag.get_mut(t) {
                         g.units.extend(r.units.clone());
+                        extend_partial(&mut g.partial, r.partial.clone());
                         g.all |= r.all;
                     }
                 }
@@ -3981,6 +3985,7 @@ impl Engine {
             let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
             let mut d = ViewDirty {
                 units: g.units.clone(),
+                partial: g.partial.clone(),
                 images: vec![HashSet::new(); plan.aliases.len()],
                 all: g.all,
                 ..Default::default()
@@ -4069,6 +4074,7 @@ impl Engine {
             dirty.all = false;
             return Ok(Refreshed {
                 units: UnitSet::default(),
+                partial: Vec::new(),
                 all: true,
                 failed,
             });
@@ -4090,14 +4096,28 @@ impl Engine {
             debug!(view = %plan.name, "too many changed rows to look up; rebuilding instead");
             rebuild = true;
         }
-        Metrics::add(&self.metrics.units_refreshed, units.len() as u64);
+        let partial = dirty.partial.clone();
+        Metrics::add(
+            &self.metrics.units_refreshed,
+            (units.len() + partial.iter().map(UnitSet::len).sum::<usize>()) as u64,
+        );
         // Unit filters bind one placeholder per unit column.
-        let per = self
-            .cfg
-            .query_chunk
-            .min(MAX_FILTER_PARAMS / plan.unit_exprs.len().max(1))
-            .max(1);
-        for chunk in units.chunks(per) {
+        let per = |n: usize| {
+            self.cfg
+                .query_chunk
+                .min(MAX_FILTER_PARAMS / n.max(1))
+                .max(1)
+        };
+        let mut chunks = units.chunks(per(plan.unit_exprs.len()));
+        // Partial units: each chunk recomputes every unit matching its keys.
+        for (at, keys) in plan.partial.sets.iter().zip(&partial) {
+            chunks.extend(
+                keys.chunks(per(at.len()))
+                    .into_iter()
+                    .map(|c| UnitChunk::Partial(at.clone(), Box::new(c))),
+            );
+        }
+        for chunk in chunks {
             self.metrics.beat();
             let rows = mv::read_source(
                 &mut self.src,
@@ -4128,6 +4148,7 @@ impl Engine {
         };
         Ok(Refreshed {
             units,
+            partial,
             all: false,
             failed,
         })
@@ -4175,7 +4196,11 @@ impl Engine {
                 debug!(view = %plan.name, "too many changed rows to look up; rebuilding instead");
                 p.rebuild = true;
             }
-            Metrics::add(&self.metrics.units_refreshed, units.len() as u64);
+            p.partial = dirty.partial.clone();
+            Metrics::add(
+                &self.metrics.units_refreshed,
+                (units.len() + p.partial.iter().map(UnitSet::len).sum::<usize>()) as u64,
+            );
             p.units = Some(units);
         }
         let mut jobs = Vec::new();
@@ -4333,8 +4358,13 @@ impl Engine {
                     .await?;
             }
         }
+        // (Unit, lineage and partial-unit aliases have no images to combine.)
         let plain: Vec<usize> = (0..plan.aliases.len())
-            .filter(|&a| plan.aliases[a].direct_unit.is_none() && plan.lineage_of(a).is_none())
+            .filter(|&a| {
+                plan.aliases[a].direct_unit.is_none()
+                    && plan.lineage_of(a).is_none()
+                    && plan.partial_of(a).is_none()
+            })
             .collect();
         if plain.len() < 2 {
             for &a in plain.iter().filter(|&&a| fresh(a)) {
@@ -4682,6 +4712,8 @@ impl Engine {
 struct Refreshed {
     /// Units refreshed (for targets that missed them).
     units: UnitSet,
+    /// Partial unit keys refreshed, per set (likewise).
+    partial: Vec<UnitSet>,
     /// Global view recomputed.
     all: bool,
     /// Targets whose writes failed.
@@ -4711,6 +4743,8 @@ struct PendingRefresh {
     job: Option<supervisor::Job>,
     /// The units (None: the whole view, a global aggregate).
     units: Option<UnitSet>,
+    /// Partial unit keys, per set of the plan's partial units.
+    partial: Vec<UnitSet>,
     global: bool,
     /// A global view without changes: nothing to do.
     idle: bool,
@@ -4722,7 +4756,7 @@ struct PendingRefresh {
 /// Runs the chunk ops of a prepared refresh on the supervisor's pools.
 async fn run_pending(sup: &Supervisor, p: &mut PendingRefresh) -> Result<supervisor::Outcome> {
     match p.job.take() {
-        Some(job) if !p.idle => sup.run(job, p.units.as_ref()).await,
+        Some(job) if !p.idle => sup.run(job, p.units.as_ref(), &p.partial).await,
         _ => Ok(supervisor::Outcome::default()),
     }
 }
@@ -4743,6 +4777,7 @@ fn finish_refresh(
         dirty.all = false;
         return Ok(Refreshed {
             units: UnitSet::default(),
+            partial: Vec::new(),
             all: true,
             failed,
         });
@@ -4755,6 +4790,7 @@ fn finish_refresh(
     };
     Ok(Refreshed {
         units: p.units.unwrap_or_default(),
+        partial: p.partial,
         all: false,
         failed,
     })

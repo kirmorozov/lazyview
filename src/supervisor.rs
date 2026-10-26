@@ -449,7 +449,14 @@ impl Supervisor {
     /// job. Fails if a source read fails (after its retries); a target whose write fails is
     /// reported in [`Outcome::failed`] and skipped from then on. Returns only once every op it
     /// started has finished.
-    pub async fn run(&self, job: Job, units: Option<&UnitSet>) -> Result<Outcome> {
+    /// `partial`: per set of the plan's partial units, partial unit keys; their chunks constrain
+    /// only those unit positions (every unit matching a key is refreshed).
+    pub async fn run(
+        &self,
+        job: Job,
+        units: Option<&UnitSet>,
+        partial: &[UnitSet],
+    ) -> Result<Outcome> {
         let parallel = job
             .targets
             .iter()
@@ -457,7 +464,8 @@ impl Supervisor {
             .min()
             .unwrap_or(1)
             .min(self.read.max);
-        let size = units.map(|u| Self::chunk_size(u.len(), parallel, job.max_chunk));
+        let keys = partial.iter().map(UnitSet::len).sum::<usize>();
+        let size = units.map(|u| Self::chunk_size(u.len() + keys, parallel, job.max_chunk));
         let serial = (!job.layout.has_unit_index()).then(|| {
             job.targets
                 .iter()
@@ -475,7 +483,15 @@ impl Supervisor {
             writes: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
         });
-        let mut cursor = units.map(|u| ChunkCursor::new(u.clone()));
+        // The units, then each set of partial unit keys.
+        let mut cursors: Vec<(Option<Vec<usize>>, ChunkCursor)> = units
+            .map(|u| (None, ChunkCursor::new(u.clone())))
+            .into_iter()
+            .chain(
+                run_sets(&run.job.plan.partial.sets, partial)
+                    .map(|(at, s)| (Some(at.clone()), ChunkCursor::new(s.clone()))),
+            )
+            .collect();
         let mut whole = units.is_none();
         let mut ops: JoinSet<Result<()>> = JoinSet::new();
         let mut read_err: Option<anyhow::Error> = None;
@@ -500,10 +516,7 @@ impl Supervisor {
                 whole = false;
                 Some(None)
             } else {
-                cursor
-                    .as_mut()
-                    .and_then(|c| c.next_chunk(size.unwrap_or(1)))
-                    .map(Some)
+                next_chunk(&mut cursors, size.unwrap_or(1)).map(Some)
             };
             let Some(chunk) = chunk else { break };
             self.budget.admit().await;
@@ -563,6 +576,33 @@ where
             r => return r,
         }
     }
+}
+
+/// The non-empty sets of partial unit keys with their unit positions.
+fn run_sets<'a>(
+    sets: &'a [Vec<usize>],
+    partial: &'a [UnitSet],
+) -> impl Iterator<Item = (&'a Vec<usize>, &'a UnitSet)> {
+    sets.iter().zip(partial).filter(|(_, s)| !s.is_empty())
+}
+
+/// The next chunk of at most `n` keys from the first cursor that has one (a partial set's
+/// chunks constrain only its positions).
+fn next_chunk(cursors: &mut Vec<(Option<Vec<usize>>, ChunkCursor)>, n: usize) -> Option<UnitChunk> {
+    while let Some((at, c)) = cursors.first_mut() {
+        match c.next_chunk(n) {
+            Some(chunk) => {
+                return Some(match at {
+                    Some(at) => UnitChunk::Partial(at.clone(), Box::new(chunk)),
+                    None => chunk,
+                })
+            }
+            None => {
+                cursors.remove(0);
+            }
+        }
+    }
+    None
 }
 
 /// Reads a chunk from the sources, then writes it to every target (concurrently).
@@ -752,6 +792,7 @@ mod tests {
             match c {
                 UnitChunk::Ints(v) => v.iter().map(|&i| Key::from([Datum::Int(i)])).collect(),
                 UnitChunk::Keys(v) => v.clone(),
+                UnitChunk::Partial(..) => unreachable!("no partial keys here"),
             }
         };
         for round in 0..300 {

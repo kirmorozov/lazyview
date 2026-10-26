@@ -135,6 +135,8 @@ pub enum UnitChunk {
     /// Sorted ascending.
     Ints(Vec<i64>),
     Keys(Vec<Key>),
+    /// Keys of some unit positions only (ascending): the chunk is every unit matching one.
+    Partial(Vec<usize>, Box<UnitChunk>),
 }
 
 /// How a unit column's keys must be bound in a filter (see [`UnitChunk::filter_typed`]).
@@ -163,6 +165,7 @@ impl UnitChunk {
                     set.insert(k.clone());
                 }
             }
+            UnitChunk::Partial(_, c) => c.insert_into(set),
         }
     }
 
@@ -170,6 +173,7 @@ impl UnitChunk {
         match self {
             UnitChunk::Ints(v) => v.len(),
             UnitChunk::Keys(v) => v.len(),
+            UnitChunk::Partial(_, c) => c.len(),
         }
     }
 
@@ -196,11 +200,21 @@ impl UnitChunk {
     ///   JSON-equal values (`{"a": 1}` with `{"a": 1.0}`) and compares a JSON column with a plain
     ///   string parameter as text, so a plain `doc IN (?)` never finds the group's rows. On
     ///   MariaDB JSON is LONGTEXT and never of this kind.
+    ///
+    /// A [`UnitChunk::Partial`] constrains only its positions of `exprs`.
     pub fn filter_typed(
         &self,
         exprs: &[String],
         kinds: &[UnitKind],
     ) -> (String, Vec<mysql_async::Value>) {
+        if let UnitChunk::Partial(at, c) = self {
+            let exprs: Vec<String> = at.iter().map(|&u| exprs[u].clone()).collect();
+            let kinds: Vec<UnitKind> = at
+                .iter()
+                .map(|&u| kinds.get(u).copied().unwrap_or_default())
+                .collect();
+            return c.filter_typed(&exprs, &kinds);
+        }
         let exprs: Vec<String> = exprs.iter().map(|e| format!("({e})")).collect();
         let kind = |i: usize| kinds.get(i).copied().unwrap_or_default();
         let local = |i: usize, d: &Datum| {
@@ -286,6 +300,7 @@ impl UnitChunk {
                 }
                 (or_join(parts), params)
             }
+            UnitChunk::Partial(..) => unreachable!("rendered above"),
         }
     }
 }
@@ -304,6 +319,8 @@ pub struct ViewDirty {
     pub units: UnitSet,
     /// Per alias: row images (membership columns) whose units still need a lookup query.
     pub images: Vec<HashSet<Key>>,
+    /// Per set of `ViewPlan::partial`: partial unit keys (every unit matching one is refreshed).
+    pub partial: Vec<UnitSet>,
     /// Full views: rebuild needed. Global views: recompute the single row.
     pub all: bool,
     /// Incremental views: affected units unknown (cascading FK); rebuild in the background.
@@ -324,10 +341,13 @@ impl ViewDirty {
             && !self.rebuild
             && self.units.is_empty()
             && self.images.iter().all(HashSet::is_empty)
+            && self.partial.iter().all(UnitSet::is_empty)
     }
 
     pub fn key_count(&self) -> usize {
-        self.units.len() + self.images.iter().map(HashSet::len).sum::<usize>()
+        self.units.len()
+            + self.images.iter().map(HashSet::len).sum::<usize>()
+            + self.partial.iter().map(UnitSet::len).sum::<usize>()
     }
 
     /// Adds everything buffered in `other` (e.g. to retry after a failed refresh).
@@ -339,6 +359,7 @@ impl ViewDirty {
         for (mine, theirs) in self.images.iter_mut().zip(other.images) {
             mine.extend(theirs);
         }
+        extend_partial(&mut self.partial, other.partial);
         self.all |= other.all;
         self.rebuild |= other.rebuild;
     }
@@ -351,6 +372,16 @@ impl ViewDirty {
             out.images.resize(n, HashSet::new());
         }
         out
+    }
+}
+
+/// Adds partial unit keys (per set of the plan's partial units) to `into`.
+pub fn extend_partial(into: &mut Vec<UnitSet>, from: Vec<UnitSet>) {
+    if into.len() < from.len() {
+        into.resize_with(from.len(), UnitSet::default);
+    }
+    for (mine, theirs) in into.iter_mut().zip(from) {
+        mine.extend(theirs);
     }
 }
 
@@ -407,6 +438,15 @@ pub fn feed(
     if let Some(cols) = &a.direct_unit {
         for row in [before, after].into_iter().flatten() {
             dirty.units.insert(project(row, a, cols));
+        }
+        return Fed::Recorded;
+    }
+    if let Some((set, cols)) = plan.partial_of(alias) {
+        if dirty.partial.len() <= set {
+            dirty.partial.resize_with(set + 1, UnitSet::default);
+        }
+        for row in [before, after].into_iter().flatten() {
+            dirty.partial[set].insert(project(row, a, cols));
         }
         return Fed::Recorded;
     }
@@ -675,12 +715,16 @@ mod tests {
         let (pass, pass2) = (row(1, 1, Some(7), 0), row(2, 2, Some(7), -1));
         let (other, null) = (row(3, 3, Some(9), 0), row(4, 4, None, 0));
         let other_scope = row(5, 5, Some(7), 1);
-        // Lookup alias (grouped by link group and entity): the images of the passing side only.
+        // Lookup alias (grouped by link group): the images of the passing side only.
         let p = view(
-            "SELECT c.gid, e.id, MAX(a.v) AS v FROM link c JOIN ent e ON e.id = c.eid \
-             JOIN attrs a ON a.e = e.id AND a.aid = 7 AND a.scope IN (0, -1) GROUP BY c.gid, e.id",
+            "SELECT c.gid, MAX(a.v) AS v FROM link c JOIN ent e ON e.id = c.eid \
+             JOIN attrs a ON a.e = e.id AND a.aid = 7 AND a.scope IN (0, -1) GROUP BY c.gid",
         );
-        assert!(p.aliases[2].direct_unit.is_none() && p.lineage_of(2).is_none());
+        assert!(
+            p.aliases[2].direct_unit.is_none()
+                && p.lineage_of(2).is_none()
+                && p.partial_of(2).is_none()
+        );
         let a = &p.aliases[2];
         let img = |r: &BinlogRow| project(r, a, &a.image_cols);
         // (before, after, expected images; None: skipped)
@@ -785,6 +829,124 @@ mod tests {
         );
     }
 
+    /// A partial chunk constrains only its unit positions, with their kinds.
+    #[test]
+    fn partial_chunks_filter_their_positions() {
+        let exprs: [String; 3] = ["`g`.`gid`".into(), "`o`.`oid`".into(), "ts".into()];
+        let c = UnitChunk::Partial(vec![1], Box::new(ints(&[5, 6, 7, 8, 11])));
+        assert_eq!(c.len(), 5);
+        assert_eq!(
+            c.filter(&exprs).0,
+            "((`o`.`oid`) BETWEEN 5 AND 8 OR (`o`.`oid`) IN (11))"
+        );
+        let k = UnitChunk::Partial(
+            vec![0, 2],
+            Box::new(UnitChunk::Keys(vec![Box::new([
+                Datum::Int(1),
+                Datum::Date(2021, 10, 31, 2, 30, 0, 0),
+            ])])),
+        );
+        let (f, p) = k.filter_typed(
+            &exprs,
+            &[UnitKind::Plain, UnitKind::Plain, UnitKind::Timestamp],
+        );
+        assert_eq!(
+            f,
+            "((`g`.`gid`) <=> ? AND (ts) BETWEEN ? - INTERVAL 1 HOUR AND ? + INTERVAL 1 HOUR \
+             AND CAST((ts) AS DATETIME(6)) = ?)"
+        );
+        assert_eq!(p.len(), 4);
+        // Buffered partial keys merge per set.
+        let mut a = ViewDirty::for_aliases(1);
+        let mut b = ViewDirty::for_aliases(1);
+        b.partial = vec![UnitSet::default(), UnitSet::default()];
+        b.partial[1].insert_int(3);
+        assert!(a.is_empty() && !b.is_empty());
+        a.merge(b);
+        assert_eq!((a.partial.len(), a.key_count()), (2, 1));
+        assert!(a.take().partial[1].contains(&[Datum::Int(3)]) && a.is_empty());
+    }
+
+    /// A partial alias records the unit part its passing images carry, nothing else.
+    #[test]
+    fn partial_aliases_record_unit_parts() {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        use mysql_async::Value;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, TableInfo};
+
+        let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>| {
+            let t = TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns,
+                pk,
+                unique_keys: vec![],
+                cascades: vec![],
+                is_view: false,
+                view_bases: vec![],
+            };
+            (("db".to_string(), name.to_string()), Arc::new(t))
+        };
+        let tables: std::collections::HashMap<_, _> = [
+            table("link", vec![int("gid"), int("eid")], vec![0, 1]),
+            table("ent", vec![int("id")], vec![0]),
+            table(
+                "attrs",
+                vec![int("id"), int("e"), int("aid"), int("scope"), int("v")],
+                vec![0],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let p = plan(
+            &parse_definition(
+                "CREATE VIEW v AS SELECT c.gid, e.id, MAX(a.v) AS v FROM link c JOIN ent e ON e.id = c.eid \
+                 JOIN attrs a ON a.e = e.id AND a.aid = 7 GROUP BY c.gid, e.id",
+            )
+            .unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        assert_eq!(
+            p.partial_of(2).map(|(s, c)| (s, c.to_vec())),
+            Some((0, vec![1]))
+        );
+        let row = |id: i64, e: i64, aid: i64| {
+            let cols: Arc<[mysql_async::Column]> = (0..5)
+                .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
+                .collect();
+            let v = |x: i64| Some(BinlogValue::Value(Value::Int(x)));
+            BinlogRow::new(vec![v(id), v(e), v(aid), v(0), v(id * 10)], cols)
+        };
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed(&p, 2, &mut d, Some(&row(1, 7, 9)), Some(&row(1, 7, 8))),
+            Fed::Skipped
+        );
+        assert!(d.is_empty());
+        assert_eq!(
+            feed(&p, 2, &mut d, Some(&row(1, 7, 7)), Some(&row(1, 8, 7))),
+            Fed::Recorded
+        );
+        assert_eq!(
+            feed(&p, 2, &mut d, Some(&row(2, 9, 9)), Some(&row(2, 10, 7))),
+            Fed::Recorded
+        );
+        assert!(d.units.is_empty() && d.images.iter().all(HashSet::is_empty));
+        let got: Vec<i64> = d.partial[0]
+            .ints
+            .iter()
+            .map(|v| (v ^ SIGN) as i64)
+            .collect();
+        assert_eq!(got, vec![7, 8, 10], "entity 9 only had another key");
+    }
+
     #[test]
     fn roaring_dedup_and_order() {
         let mut s = UnitSet::default();
@@ -807,6 +969,7 @@ mod tests {
         match c {
             UnitChunk::Ints(v) => v.iter().map(|&i| Key::from([Datum::Int(i)])).collect(),
             UnitChunk::Keys(v) => v.clone(),
+            UnitChunk::Partial(_, c) => chunk_keys(c),
         }
     }
 

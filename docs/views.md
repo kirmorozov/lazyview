@@ -221,6 +221,10 @@ How full mode behaves:
   w.item_id = i.id AND w.attr = 5`, `JOIN item_attr h ON h.item_id = i.id AND h.attr = 6`)
   therefore sends each changed value row only to the aliases of its own key, so a transaction
   that changes several values of one item stays a small incremental refresh.
+* In a grouped view, a table joined to part of the group key (in a view grouped by `g.id, i.id`,
+  a value table joined on `w.item_id = i.id`) is traced without a lookup query: its changed row
+  refreshes every group with that `i.id`. The materialized table gets an index on that part of
+  the key when its own key does not start with it.
 * A join without any condition between a table and the rest (`FROM orders o JOIN regions r`,
   `CROSS JOIN`) makes the view full: every row of that table belongs to every output row.
 

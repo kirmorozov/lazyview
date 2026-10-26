@@ -20,6 +20,7 @@ traced to units by one of:
 |---|---|---|
 | **direct unit** | the unit is (equal to) a column of the row: read it from the binlog image | same |
 | **lineage** | `SELECT DISTINCT <unit> FROM mv WHERE (_lv_a<i>_pk…) IN (…)`: MV rows derived from that source row | forward query restricted by the row's key on the current state |
+| **partial unit** | the row equals some unit expressions (`ViewPlan.partial`, same equality classes as direct units): every unit with those values is refreshed, the unit filter constraining only them on the source and the MV side (`UnitChunk::Partial`, MV index `_lv_p<k>`) | same |
 | **forward key query** | current state is enough when the traced attribute belongs to the outer row (semi/anti-joins, §3.4) | same |
 | **all units** | the change can affect every output row (cross join, global predicate) | same |
 
