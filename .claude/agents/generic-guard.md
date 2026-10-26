@@ -75,7 +75,14 @@ S4. REVIEW R1, no full-rebuild fallback. List the added lines matching
     (a) the planner classifying an untraceable definition as Mode::Full, with its reason;
     (b) inside the full-refresh executor;
     (c) the documented safety net for unsupported partial row images (binlog_row_image MINIMAL / NOBLOB), with
-        a rate-limited WARN.
+        a rate-limited WARN;
+    (d) recreating a view whose own materialized table was destroyed outside lazyview (TRUNCATE / DROP TABLE
+        of that table seen in the binlog), a changed view definition, or an explicit operator request
+        (`_lazyview.rebuild = 1`): no state is left to update incrementally. Source-table row changes never
+        qualify. A source-table schema change qualifies only when the new plan differs from the live one in
+        what the view reads (a column it reads dropped, retyped or recollated, a key it relies on removed); a
+        schema change that leaves those reads unchanged (an added index or unrelated column, an online-DDL
+        cut-over with the same columns) keeps the live table and only refreshes the decoding layout.
     Anything else that makes an incremental view rebuild, any executor handing work to the full-refresh
     executor, and any pause of the shared binlog reader for one target are FINDINGS. Overflow must be an
     executor hook.
