@@ -528,7 +528,7 @@ fn wired() -> bool {
 
 /// The analyzer's plan of a definition, against the server's catalog.
 async fn analyzer_plan(db: &Db, mariadb: bool, definition: &str) -> Result<ViewPlan> {
-    let d = parse_definition(definition)?;
+    let d = parse_definition(&rename_for(db, definition)?)?;
     let mut c = db.conn().await?;
     let mut cat = Catalog::default();
     let mut tables = HashMap::new();
@@ -548,7 +548,10 @@ async fn analyzer_plan(db: &Db, mariadb: bool, definition: &str) -> Result<ViewP
         }
     }
     c.disconnect().await.ok();
-    lazyview::analyzer::plan(&d, &db.name, &tables)
+    Ok(unrename_plan(
+        db,
+        lazyview::analyzer::plan(&d, &db.name, &tables)?,
+    ))
 }
 
 /// The flat SELECT of an incremental plan (no hidden columns).
@@ -608,7 +611,7 @@ async fn prepare(
             .await
             .with_context(|| format!("analyzer plan of {}", c.name))?;
         let got = mode_detail(&plan.mode);
-        if got != (c.mode.to_string(), c.detail.to_string()) {
+        if got.0 != c.mode || !same_text(db, &got.1, c.detail) {
             bad.push_str(&format!(
                 "\n  {}: analyzer chose {got:?}, expected ({}, {})",
                 c.name, c.mode, c.detail
@@ -665,7 +668,7 @@ async fn start_checked(
     let mut bad = String::new();
     for (name, (mode, detail)) in expect {
         let got = st.get(name).cloned().unwrap_or_default();
-        if got.0 != *mode || (!detail.is_empty() && got.1 != *detail) {
+        if got.0 != *mode || (!detail.is_empty() && !same_text(db, &got.1, detail)) {
             bad.push_str(&format!(
                 "\n  {name}: engine reports {got:?}, expected ({mode}, {detail})"
             ));
@@ -1632,13 +1635,13 @@ async fn run_schema(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
                 plan.tracing()
             ));
         }
-        if case.name == "sk_flat" && plan.unit_exprs != vec!["`sk_items`.`code`"] {
+        if case.name == "sk_flat" && !same_texts(&db, &plan.unit_exprs, &["`sk_items`.`code`"]) {
             bad.push_str(&format!("\n  sk_flat: units {:?}", plan.unit_exprs));
         }
-        if case.name == "sk_distinct" && plan.unit_exprs != vec!["code"] {
+        if case.name == "sk_distinct" && !same_texts(&db, &plan.unit_exprs, &["code"]) {
             bad.push_str(&format!("\n  sk_distinct: units {:?}", plan.unit_exprs));
         }
-        if case.name == "sk_distinct_ab" && plan.unit_exprs != vec!["a", "b"] {
+        if case.name == "sk_distinct_ab" && !same_texts(&db, &plan.unit_exprs, &["a", "b"]) {
             bad.push_str(&format!("\n  sk_distinct_ab: units {:?}", plan.unit_exprs));
         }
         plain.push(case);
@@ -2286,11 +2289,11 @@ async fn not_in_canary(ctx: &Ctx) -> Result<()> {
     }
     let sql =
         "SELECT id FROM t1 WHERE ref NOT IN (SELECT k FROM t2 WHERE amount > 400) ORDER BY id";
-    let st = c.prep(sql).await?;
+    let st = c.prep(renamed_sql(&c, sql)?.sql).await?;
     let _: Vec<i64> = c.exec(&st, ()).await?;
     exec(&mut c, "UPDATE t2 SET amount = 401").await?;
     let again: Vec<i64> = c.exec(&st, ()).await?;
-    let fresh: Vec<i64> = c.query(sql).await?;
+    let fresh: Vec<i64> = typed_rows(&mut c, sql).await?;
     ctx.log(format!(
         "NOT IN canary: re-executed {again:?}, text {fresh:?}{}",
         if again != fresh {
