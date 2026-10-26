@@ -14,11 +14,12 @@
 # Usage: scripts/test-servers.sh <command> [flavor...]
 #
 #   compose up [--pre] [flavor...]   start containers and wait until healthy (default: the
-#                                    blocking matrix; --pre adds the advisory pre-releases)
+#                                    12 blocking servers, which a developer host cannot hold at
+#                                    once: name the ones you test; --pre adds the advisory
+#                                    pre-releases)
 #   compose down [flavor...]         stop and remove containers (data volumes are kept)
 #   compose clean [flavor...]        down, and drop the data volumes
 #   compose logs <flavor>            server log
-#   compose load-pre                 `docker load` the MySQL 26.10 EA image (no registry has it)
 #   compose <docker compose args>    anything else goes to `docker compose -f docker-compose.test.yml`
 #   fetch [flavor...]      tarball mode: download the pinned tarball (checksum verified) and
 #                          install it as tmp/out/db/<flavor>. An older installed version is
@@ -28,7 +29,7 @@
 #                          the old one was running).
 #   start [flavor...]      tarball mode: start instances (default: the matrix flavors that are
 #                          installed). Every instance takes about 1 GB of memory: start only what
-#                          you test, e.g. `scripts/test-servers.sh start mysql267 mariadb130`.
+#                          you test, e.g. `scripts/test-servers.sh start mysql2610 mariadb130`.
 #   stop [flavor...]       tarball mode: stop instances (default: every running one).
 #   libs                   tarball mode: copy the shared libraries the MySQL tarballs need
 #                          (libaio, libnuma, libncurses, libtinfo) out of the Percona image into
@@ -39,51 +40,41 @@
 #                          (default: every flavor except the EOL ones).
 #
 # Test matrix (docs/server-setup.md "Supported servers"):
-#   blocking, oldest supported LTS + latest GA:  mysql84 mysql267 percona84 percona97 mariadb1011 mariadb130
-#   advisory, newest pre-release ("-pre"):       mariadb132-pre mysql2610-pre
-# Outside the matrix, on request only (name them):
-#   mysql97 mariadb114 mariadb118 mariadb123 (other vendor-supported lines; tarball mode only)
-#   mysql80 percona80 (EOL, never in a default list; tarball mode only)
+#   blocking, LTS:          mysql84 mysql97 percona84 percona97 mariadb1011 mariadb114 mariadb118 mariadb123
+#   blocking, latest GA:    mysql2610 mariadb130
+#   blocking, AWS-only:     mysql80 mariadb106 (community EOL, still run by RDS / Aurora)
+#   advisory, pre-release:  mariadb131-rc mariadb132-pre
+# Outside the matrix, on request only (name it): percona80 (EOL, tarball mode only).
 #
 # Every server binds 127.0.0.1 on a fixed port (= its server_id), has ROW binlogging with FULL
 # row images (plus GTIDs on MySQL/Percona), a 128M InnoDB buffer pool, a user lv/lv with ALL
 # PRIVILEGES and a database `lvtest`.
 #
 # Env overrides: LV_DB_ROOT (tarball dir), LV_SERVERS_ROOT (instance dir), LV_LIB_DIR (extra
-#                shared libraries for tarball binaries), LV_IMAGES_ROOT (downloaded image
-#                tarballs), LV_START_TIMEOUT (seconds, default 180), LV_COMPOSE_LOCAL (0: compose
-#                mode without docker-compose.local.yml, i.e. exactly the CI servers; default 1
-#                unless CI is set).
+#                shared libraries for tarball binaries), LV_START_TIMEOUT (seconds, default 180),
+#                LV_COMPOSE_LOCAL (0: compose mode without docker-compose.local.yml, i.e. exactly
+#                the CI servers; default 1 unless CI is set).
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DB_ROOT=${LV_DB_ROOT:-$REPO/tmp/out/db}
 SRV_ROOT=${LV_SERVERS_ROOT:-$REPO/tmp/out/servers}
 LIB_DIR=${LV_LIB_DIR:-$REPO/tmp/out/lib}
-IMAGES_ROOT=${LV_IMAGES_ROOT:-$REPO/tmp/out/images}
 START_TIMEOUT=${LV_START_TIMEOUT:-180}
 COMPOSE_FILE_PATH=$REPO/docker-compose.test.yml
 COMPOSE_LOCAL_PATH=$REPO/docker-compose.local.yml
 
-BLOCKING_FLAVORS=(mysql84 mysql267 percona84 percona97 mariadb1011 mariadb130)
-PRE_FLAVORS=(mariadb132-pre mysql2610-pre)
+BLOCKING_FLAVORS=(mysql80 mysql84 mysql97 mysql2610 percona84 percona97 mariadb106 mariadb1011 mariadb114 mariadb118 mariadb123 mariadb130)
+PRE_FLAVORS=(mariadb131-rc mariadb132-pre)
 MATRIX_FLAVORS=("${BLOCKING_FLAVORS[@]}" "${PRE_FLAVORS[@]}")
-OTHER_FLAVORS=(mysql97 mariadb114 mariadb118 mariadb123)
-EOL_FLAVORS=(mysql80 percona80)
-
-# MySQL 26.10.0 Early Access (labs.mysql.com): the only container image is a `docker load`
-# tarball; the name below is the one it loads as.
-MYSQL2610_IMAGE=localhost/mysql/community-server:26.10.0-er1-amd64
-MYSQL2610_DOCKER_TARBALL=mysql-community-server-26.10.0-labs-docker-el9-x86_64.tar.gz
-MYSQL2610_DOCKER_SHA=f26559a00a022c3685089848a42958eb1a29f52fc2bb8b1b10594b77770d23d6
-MYSQL2610_SNAPSHOTS=https://downloads.mysql.com/snapshots/pb/mysql-26.10.0-labs-release
+OTHER_FLAVORS=()
+EOL_FLAVORS=(percona80)
 
 port_of() {
   case $1 in
-    mysql80) echo 33080 ;; mysql84) echo 33084 ;; mysql97) echo 33097 ;; mysql267) echo 33267 ;;
-    mysql2610-pre) echo 33261 ;;
-    mariadb1011) echo 33111 ;; mariadb114) echo 33114 ;; mariadb118) echo 33118 ;;
-    mariadb123) echo 33123 ;; mariadb130) echo 33130 ;; mariadb132-pre) echo 33132 ;;
+    mysql80) echo 33080 ;; mysql84) echo 33084 ;; mysql97) echo 33097 ;; mysql2610) echo 33261 ;;
+    mariadb106) echo 33106 ;; mariadb1011) echo 33111 ;; mariadb114) echo 33114 ;; mariadb118) echo 33118 ;;
+    mariadb123) echo 33123 ;; mariadb130) echo 33130 ;; mariadb131-rc) echo 33131 ;; mariadb132-pre) echo 33132 ;;
     percona80) echo 33180 ;; percona84) echo 33184 ;; percona97) echo 33197 ;;
     *) echo "unknown flavor: $1" >&2; return 1 ;;
   esac
@@ -109,19 +100,19 @@ pin_of() {
   local v
   case $1 in
     mysql80) v=8.0.46; echo "$v e2777d490fcaadc5a4be06db89b6935c78909bd9c3382af859ab284af0c950b0 $(mysql_url $v glibc2.17) $(mysql_archive_url $v glibc2.17)" ;;
-    mysql84) v=8.4.11; echo "$v 383f54e124d5f325d67f0c6912a8f96814eedc761a17ea30112e52fa4cc6b143 $(mysql_url $v glibc2.28) $(mysql_archive_url $v glibc2.28)" ;;
-    mysql97) v=9.7.2; echo "$v 6fe0baf13792e56afa3d93d6a174b4d5700901db1c8d09665225423dc094d0bb $(mysql_url $v glibc2.28) $(mysql_archive_url $v glibc2.28)" ;;
-    mysql267) v=26.7.0; echo "$v 48a747f9e1591905a1e563ddd1c00818352b9201ca0911d66485c08614f4b3c2 $(mysql_url $v glibc2.28) $(mysql_archive_url $v glibc2.28)" ;;
-    # Early Access build (not minimal: the labs snapshot has no minimal tarball).
-    mysql2610-pre) v=26.10.0; echo "$v c5b0534c4d407455792bda7588b0d7ed97a82fae4f3d0490088c9220505143fa $MYSQL2610_SNAPSHOTS/mysql-26.10.0-er-linux-glibc2.28-x86_64.tar.gz" ;;
+    mysql84) v=8.4.13; echo "$v 5dfbb764f731df40ef9e4f5d69aed32bdac8ba1af20bd96b7d40a942d83d4ed2 $(mysql_url $v glibc2.28) $(mysql_archive_url $v glibc2.28)" ;;
+    mysql97) v=9.7.4; echo "$v 1b022d85e2901e85d6f4df5482a03b036b5b2cf55ad786c9a788f805c6687665 $(mysql_url $v glibc2.28) $(mysql_archive_url $v glibc2.28)" ;;
+    mysql2610) v=26.10.0; echo "$v 292e196560614eb5966e5034aaa949dbd4dd69870d67f090186023e35d0e835d $(mysql_url $v glibc2.28) $(mysql_archive_url $v glibc2.28)" ;;
     percona80) v=8.0.46-37; echo "$v 9a76c3e9c71e3eb354bc066289086bd347cf24a3ac7c4fc2bc74788ec3ce0fa6 $(percona_url $v)" ;;
     percona84) v=8.4.11-11; echo "$v a8048701a124737ca816d1c098146703d0387109dbf519a333873ddf0a53dde3 $(percona_url $v)" ;;
     percona97) v=9.7.2-2; echo "$v 2e89167a066076efad6751add426826b6a157825eabef097fdd0e2acad6c59b9 $(percona_url $v)" ;;
+    mariadb106) v=10.6.28; echo "$v 80ca39575e5dd9670d9015b674835cd1d37548576547425763694d1bcc686ce2 $(mariadb_url $v)" ;;
     mariadb1011) v=10.11.19; echo "$v 7efb257927f31f4422f496246b32590d0b7617f3d9dd900e575de761b302d919 $(mariadb_url $v)" ;;
     mariadb114) v=11.4.13; echo "$v 3cebf63914df3154b7cb6d548337eb2be42c773aeb641110446b72e2746cfed7 $(mariadb_url $v)" ;;
     mariadb118) v=11.8.9; echo "$v 32f8871a2aa38b36aa418b7f4abc6fc0c6ef1ba5a45798cacb2afa52c8a6113b $(mariadb_url $v)" ;;
     mariadb123) v=12.3.3; echo "$v a12bf7bce08a896cdd01f174f04b4ce1d5da43ec250a5e7fceb9972119514329 $(mariadb_url $v)" ;;
     mariadb130) v=13.0.2; echo "$v e1b15581cfb2441fb7f3df2cc559998980406999e4c4a150ca303289f58b673c $(mariadb_url $v)" ;;
+    mariadb131-rc) v=13.1.1; echo "$v 6866f268d30fe286de54e75d3d494506c88d9ac8248b571fe141131453e1c63f $(mariadb_url $v)" ;;
     mariadb132-pre) v=13.2.0; echo "$v 12879224974204f5218d8d272a141aea38517355c52777fd5e641971cd21bbeb $(mariadb_url $v)" ;;
     *) echo "unknown flavor: $1" >&2; return 1 ;;
   esac
@@ -434,19 +425,6 @@ compose_version() {
   compose exec -T "$1" "$client" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e 'SELECT VERSION()' 2>/dev/null
 }
 
-load_mysql2610_image() {
-  if docker image inspect "$MYSQL2610_IMAGE" >/dev/null 2>&1; then
-    echo "[mysql2610-pre] image $MYSQL2610_IMAGE is loaded"
-    return 0
-  fi
-  local tarball=$IMAGES_ROOT/$MYSQL2610_DOCKER_TARBALL
-  download_verified "$tarball" "$MYSQL2610_DOCKER_SHA" "$MYSQL2610_SNAPSHOTS/$MYSQL2610_DOCKER_TARBALL" || return 1
-  echo "[mysql2610-pre] docker load $tarball"
-  docker load -i "$tarball"
-  docker image inspect "$MYSQL2610_IMAGE" >/dev/null 2>&1 ||
-    { echo "[mysql2610-pre] the tarball did not load as $MYSQL2610_IMAGE; fix the name in $0 and docker-compose.test.yml" >&2; return 1; }
-}
-
 compose_up() {
   local pre=0 f
   if [[ ${1:-} == --pre ]]; then pre=1; shift; fi
@@ -461,7 +439,6 @@ compose_up() {
       echo "[$f] a tarball instance (pid $(cat "$(pidfile_of "$f")")) holds port $(port_of "$f"); stop it first: $0 stop $f" >&2
       return 1
     fi
-    if [[ $f == mysql2610-pre ]]; then load_mysql2610_image || return 1; fi
   done
   if compose_local; then
     echo "local speed settings on (docker-compose.local.yml: sync_binlog=0, innodb_flush_log_at_trx_commit=2; LV_COMPOSE_LOCAL=0 for the CI configuration)"
@@ -535,7 +512,7 @@ dsns() {
 }
 
 usage() {
-  echo "usage: $0 compose up [--pre] [flavor...] | compose down|clean [flavor...] | compose logs <flavor> | compose load-pre" >&2
+  echo "usage: $0 compose up [--pre] [flavor...] | compose down|clean [flavor...] | compose logs <flavor>" >&2
   echo "       $0 fetch|start|stop|status|dsns [flavor...] | libs" >&2
   exit 2
 }
@@ -550,7 +527,6 @@ if [[ $cmd == compose ]]; then
     down) compose_down "$@" ;;
     clean) compose_clean "$@" ;;
     logs) compose logs --no-color "$@" ;;
-    load-pre) load_mysql2610_image ;;
     *) compose "$sub" "$@" ;;
   esac
   exit $?

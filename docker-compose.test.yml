@@ -2,9 +2,10 @@
 # (same images, ports, credentials and settings as the tarball instances of
 # scripts/test-servers.sh). Policy and lifecycle dates: docs/server-setup.md "Supported servers".
 #
-#   scripts/test-servers.sh compose up            # the blocking matrix (default profile)
-#   scripts/test-servers.sh compose up mysql267   # one flavor
-#   scripts/test-servers.sh compose up --pre      # plus the advisory pre-releases
+#   scripts/test-servers.sh compose up            # the blocking matrix (default profile, 12 servers:
+#                                                 start only what you test, see Memory)
+#   scripts/test-servers.sh compose up mysql2610  # one flavor
+#   scripts/test-servers.sh compose up --pre      # plus the advisory pre-releases (2 more)
 #   scripts/test-servers.sh dsns                  # LAZYVIEW_TEST_DSNS for the servers that are up
 #   scripts/test-servers.sh compose down          # stop; `compose clean` also drops the data
 #
@@ -32,12 +33,14 @@
 # as in CI. scripts/test-servers.sh adds docker-compose.local.yml on a developer host, which
 # drops the per-commit fsyncs (docs/development.md "Local speed settings").
 #
-# Matrix (one image per flavor, pinned to the exact build; the preview image by digest):
-#   blocking   oldest supported LTS: mysql84 percona84 mariadb1011
-#   blocking   latest GA:            mysql267 percona97 mariadb130
-#   advisory   newest pre-release:   mariadb132-pre mysql2610-pre   (profile `prerelease`)
-# Percona publishes no pre-release. MySQL 26.10 EA has no registry image: `docker load` the
-# labs docker tarball first (scripts/test-servers.sh compose load-pre does that).
+# Matrix (one image per flavor, pinned to the exact build; the preview image by digest). Policy
+# and dates: docs/server-setup.md "Supported servers".
+#   blocking, LTS:             mysql84 mysql97 percona84 percona97 mariadb1011 mariadb114 mariadb118 mariadb123
+#   blocking, latest GA:       mysql2610 mariadb130   (Percona has no Innovation line: 9.7 LTS is its latest)
+#   blocking, AWS-only:        mysql80 mariadb106     (community EOL, still run by RDS / Aurora)
+#   advisory, pre-release:     mariadb131-rc mariadb132-pre   (profile `prerelease`)
+# Percona publishes no pre-release; no registry has a MySQL one (26.10 went GA, no newer EA).
+# The same tags and the preview digest as lazy-wire-fire's docker-compose.test.yml.
 #
 # Data lives in named volumes (lazyview_<flavor>): `down` keeps it, `down -v` drops it.
 
@@ -80,10 +83,34 @@ x-mariadb-common: &mariadb-common
   restart: "no"
 
 services:
-  # ---- MySQL: 8.4 LTS (oldest supported) + 26.7 Innovation (latest GA) ----------------------
+  # ---- MySQL: 8.0 (AWS-only), 8.4 LTS, 9.7 LTS, 26.10 Innovation (latest GA) ---------------------
+  # Community EOL (April 2026) but still run by RDS for MySQL 8.0 and Aurora MySQL 3: the AWS-only
+  # tier. To drop it: this service, its volume, the `mysql80` entry of the ci.yml matrix and its
+  # pins in scripts/test-servers.sh.
+  mysql80:
+    <<: *mysql-common
+    image: mysql:8.0.46
+    ports: ["127.0.0.1:33080:3306"]
+    command:
+      - --server-id=33080
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mysql80:/var/lib/mysql
+
   mysql84:
     <<: *mysql-common
-    image: mysql:8.4.11
+    image: mysql:8.4.13
     ports: ["127.0.0.1:33084:3306"]
     command:
       - --server-id=33084
@@ -102,12 +129,12 @@ services:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - mysql84:/var/lib/mysql
 
-  mysql267:
+  mysql97:
     <<: *mysql-common
-    image: mysql:26.7.0
-    ports: ["127.0.0.1:33267:3306"]
+    image: mysql:9.7.4
+    ports: ["127.0.0.1:33097:3306"]
     command:
-      - --server-id=33267
+      - --server-id=33097
       - --log-bin=binlog
       - --binlog-format=ROW
       - --binlog-row-image=FULL
@@ -121,9 +148,30 @@ services:
       - --max-connections=200
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
-      - mysql267:/var/lib/mysql
+      - mysql97:/var/lib/mysql
 
-  # ---- Percona Server: 8.4 LTS (oldest supported) + 9.7 LTS (latest GA) --------------------
+  mysql2610:
+    <<: *mysql-common
+    image: mysql:26.10.0
+    ports: ["127.0.0.1:33261:3306"]
+    command:
+      - --server-id=33261
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mysql2610:/var/lib/mysql
+
+  # ---- Percona Server: 8.4 LTS, 9.7 LTS -----------------------------------------------------
   percona84:
     <<: *mysql-common
     image: percona/percona-server:8.4.11-11
@@ -166,7 +214,26 @@ services:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - percona97:/var/lib/mysql
 
-  # ---- MariaDB: 10.11 LTS (oldest supported) + 13.0 rolling (latest GA) --------------------
+  # ---- MariaDB: 10.6 (AWS-only), 10.11 / 11.4 / 11.8 / 12.3 LTS, 13.0 rolling (latest GA) ---------
+  # Community EOL (2026-07-06) but RDS for MariaDB 10.6 is supported to 2026-12-31: the AWS-only
+  # tier (drop it like mysql80 above, after that date).
+  mariadb106:
+    <<: *mariadb-common
+    image: mariadb:10.6.28
+    ports: ["127.0.0.1:33106:3306"]
+    command:
+      - --server-id=33106
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb106:/var/lib/mysql
+
   mariadb1011:
     <<: *mariadb-common
     image: mariadb:10.11.19
@@ -183,6 +250,57 @@ services:
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - mariadb1011:/var/lib/mysql
+
+  mariadb114:
+    <<: *mariadb-common
+    image: mariadb:11.4.13
+    ports: ["127.0.0.1:33114:3306"]
+    command:
+      - --server-id=33114
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb114:/var/lib/mysql
+
+  mariadb118:
+    <<: *mariadb-common
+    image: mariadb:11.8.9
+    ports: ["127.0.0.1:33118:3306"]
+    command:
+      - --server-id=33118
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb118:/var/lib/mysql
+
+  mariadb123:
+    <<: *mariadb-common
+    image: mariadb:12.3.3
+    ports: ["127.0.0.1:33123:3306"]
+    command:
+      - --server-id=33123
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb123:/var/lib/mysql
 
   mariadb130:
     <<: *mariadb-common
@@ -201,7 +319,26 @@ services:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - mariadb130:/var/lib/mysql
 
-  # ---- Advisory: newest pre-releases (profile `prerelease`, never required) -----------------
+  # ---- Advisory: pre-releases (profile `prerelease`, never required) ------------------------------
+  # MariaDB 13.1.1 Release Candidate (Docker Hub).
+  mariadb131-rc:
+    <<: *mariadb-common
+    image: mariadb:13.1.1-rc
+    profiles: [prerelease]
+    ports: ["127.0.0.1:33131:3306"]
+    command:
+      - --server-id=33131
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb131-rc:/var/lib/mysql
+
   # MariaDB 13.2.0 Preview: no Docker Hub image, the MariaDB Foundation's devel image pinned by
   # digest (tag 13.2-preview moves).
   mariadb132-pre:
@@ -230,38 +367,18 @@ services:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - mariadb132-pre:/var/lib/mysql
 
-  # MySQL 26.10.0 Early Access (labs.mysql.com): no registry image. Load the labs docker tarball
-  # first: `scripts/test-servers.sh compose load-pre` (= docker load of
-  # mysql-community-server-26.10.0-labs-docker-el9-x86_64.tar.gz, verified by sha256).
-  mysql2610-pre:
-    <<: *mysql-common
-    image: localhost/mysql/community-server:26.10.0-er1-amd64
-    pull_policy: never
-    profiles: [prerelease]
-    ports: ["127.0.0.1:33261:3306"]
-    command:
-      - --server-id=33261
-      - --log-bin=binlog
-      - --binlog-format=ROW
-      - --binlog-row-image=FULL
-      - --gtid-mode=ON
-      - --enforce-gtid-consistency=ON
-      - --skip-name-resolve
-      - --mysqlx=OFF
-      - --performance-schema=OFF
-      - --temptable-max-ram=1G
-      - --innodb-buffer-pool-size=128M
-      - --max-connections=200
-    volumes:
-      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
-      - mysql2610-pre:/var/lib/mysql
-
 volumes:
+  mysql80:
   mysql84:
-  mysql267:
+  mysql97:
+  mysql2610:
   percona84:
   percona97:
+  mariadb106:
   mariadb1011:
+  mariadb114:
+  mariadb118:
+  mariadb123:
   mariadb130:
+  mariadb131-rc:
   mariadb132-pre:
-  mysql2610-pre:

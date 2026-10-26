@@ -20,11 +20,17 @@ x-mariadb-local: &mariadb-local
     - ./docker/local.cnf:/etc/mysql/conf.d/lazyview-local.cnf:ro
 
 services:
+  mysql80: *mysql-local
   mysql84: *mysql-local
-  mysql267: *mysql-local
+  mysql97: *mysql-local
+  mysql2610: *mysql-local
   percona84: *mysql-local
   percona97: *mysql-local
-  mysql2610-pre: *mysql-local
+  mariadb106: *mariadb-local
   mariadb1011: *mariadb-local
+  mariadb114: *mariadb-local
+  mariadb118: *mariadb-local
+  mariadb123: *mariadb-local
   mariadb130: *mariadb-local
+  mariadb131-rc: *mariadb-local
   mariadb132-pre: *mariadb-local

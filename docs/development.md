@@ -22,9 +22,9 @@ test harness do not care which one runs a flavor):
 * **As containers** (the default; the same pinned images CI runs, so local == CI):
 
   ```sh
-  scripts/test-servers.sh compose up               # the blocking matrix (or: make compose-up)
-  scripts/test-servers.sh compose up --pre         # plus the advisory pre-releases
-  scripts/test-servers.sh compose up mysql267      # one flavor
+  scripts/test-servers.sh compose up mysql84 mariadb130   # the flavors you test (or: make compose-up SERVICES=...)
+  scripts/test-servers.sh compose up --pre         # the 12 blocking servers plus the 2 advisory ones: too much for one host
+  scripts/test-servers.sh compose up mysql2610     # one flavor
   scripts/test-servers.sh status                   # mode, state, port, version per flavor
   scripts/test-servers.sh dsns                     # LAZYVIEW_TEST_DSNS for the servers that are up
   scripts/test-servers.sh compose logs mariadb130
@@ -32,9 +32,8 @@ test harness do not care which one runs a flavor):
   ```
 
   Plain `docker compose -f docker-compose.test.yml ...` works too (`--profile prerelease` for
-  the advisory flavors). The MySQL 26.10 Early Access image is not on any registry:
-  `scripts/test-servers.sh compose load-pre` downloads the labs docker tarball (sha256-verified)
-  and `docker load`s it; `compose up mysql2610-pre` does that on demand.
+  the advisory flavors). Every image is on a public registry; the MariaDB 13.2 preview is pinned by
+  digest because its tag moves.
 
 * **From official tarballs**, without Docker: `scripts/test-servers.sh fetch [flavor...]`
   downloads the pinned tarball (checksum verified) into `tmp/out/db/<flavor>/`, then
@@ -47,13 +46,16 @@ test harness do not care which one runs a flavor):
   Each instance lives in `tmp/out/servers/<flavor>/` (`my.cnf`, data, binlogs, error log).
   The MySQL tarballs need `libaio`, `libnuma` and (the client) `libncurses` on the host;
   `scripts/test-servers.sh libs` copies them out of the Percona image into `tmp/out/lib` when the
-  host lacks them. Overrides: `LV_DB_ROOT`, `LV_SERVERS_ROOT`, `LV_LIB_DIR`, `LV_IMAGES_ROOT`,
-  `LV_START_TIMEOUT` (seconds, default 180). Other vendor-supported lines (`mysql97`,
-  `mariadb114`, `mariadb118`, `mariadb123`) and the EOL `mysql80` / `percona80` exist in tarball
-  mode only, on request.
+  host lacks them. Overrides: `LV_DB_ROOT`, `LV_SERVERS_ROOT`, `LV_LIB_DIR`,
+  `LV_START_TIMEOUT` (seconds, default 180). Every compose flavor has a tarball pin too; the EOL `percona80` exists in
+  tarball mode only, on request.
 
-Flavors and ports: `mysql84` 33084, `mysql267` 33267, `percona84` 33184, `percona97` 33197,
-`mariadb1011` 33111, `mariadb130` 33130; advisory `mariadb132-pre` 33132, `mysql2610-pre` 33261.
+Flavors and ports (blocking): `mysql80` 33080 (AWS-only), `mysql84` 33084, `mysql97` 33097,
+`mysql2610` 33261, `percona84` 33184, `percona97` 33197, `mariadb106` 33106 (AWS-only),
+`mariadb1011` 33111, `mariadb114` 33114, `mariadb118` 33118, `mariadb123` 33123, `mariadb130`
+33130; advisory: `mariadb131-rc` 33131, `mariadb132-pre` 33132. The twelve blocking servers do not
+fit one developer host (a heavy suite takes 1-3 GiB per server): start one to three at a time and
+`compose down` them afterwards.
 Every server listens on 127.0.0.1, has ROW binlogs with FULL row images (GTIDs on MySQL and
 Percona), a 128M InnoDB buffer pool, a user `lv`/`lv` with all privileges and a database
 `lvtest`. MySQL and Percona run without `performance_schema` (lazyview does not use it) and with
@@ -211,8 +213,10 @@ cargo run --release --example throughput -- --dsn mysql://lv:lv@127.0.0.1:33084/
 Workflows in `.github/workflows/`:
 
 * `ci.yml` runs lint, unit tests, the integration matrix (every service of
-  `docker-compose.test.yml`, one server per job: the six blocking servers, plus the pre-releases
-  with `continue-on-error`, which only annotate the run when they fail), `integration-multi`
+  `docker-compose.test.yml`, one server per job: the twelve blocking servers (and one more
+  `mariadb1011` job with `LAZYVIEW_SUPERVISOR=off`), plus the two
+  pre-releases with `continue-on-error`, which only annotate the run when they fail; the tier
+  (LTS, GA, AWS-only, pre-release) is in each job's title), `integration-multi`
   (the multi-server scenarios against `mysql84`, `percona97` and `mariadb130` together, with
   `LAZYVIEW_TEST_REQUIRE_MULTI=1`; the single-server jobs set it to `0`) and the image smoke and
   end-to-end tests on every push and pull request. The servers run with the durable defaults
@@ -222,7 +226,7 @@ Workflows in `.github/workflows/`:
   QEMU). An end-to-end run of `docker-compose.example.yml` against MySQL 8.4 (amd64) follows.
 * `publish-image.yml` is called by `ci.yml`. Pushes to `main` publish `edge` once lint, unit and
   end-to-end tests pass. `v*` tags publish a release, which additionally needs the integration
-  tests on the six blocking servers and `integration-multi` (the advisory pre-releases cannot
+  tests on the twelve blocking servers and `integration-multi` (the advisory pre-releases cannot
   block it). Pull requests never get registry credentials and never push.
 * `ghcr-cleanup.yml` deletes untagged images and `sha-*` images beyond the newest 20. It runs
   after each publish, daily, and on demand (dry run by default). It never touches the platform and

@@ -4,8 +4,8 @@ name: ci
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
 #   main  -> `image`   (needs lint + unit + e2e; the integration jobs run alongside, not required)
 #   v*    -> `release` (needs lint + unit + e2e + the integration matrix + the multi-server job;
-#                       the matrix's advisory pre-release entries run with continue-on-error and
-#                       cannot block it)
+#                       the matrix's 12 blocking servers must pass, its 2 advisory pre-release
+#                       entries run with continue-on-error and cannot block it)
 # Pull requests never get registry credentials and never push.
 on:
   push:
@@ -70,9 +70,11 @@ jobs:
 
   integration:
     # One job per server flavor of docker-compose.test.yml (docs/server-setup.md "Supported
-    # servers"): the blocking matrix (oldest supported LTS + latest GA per product) must pass,
-    # the advisory pre-releases only annotate the run when they fail (continue-on-error).
-    name: integration (${{ matrix.flavor }}${{ matrix.supervisor && format(', supervisor {0}', matrix.supervisor) || '' }}${{ matrix.advisory && ', advisory' || '' }})
+    # servers"): the 12 blocking servers (every supported LTS line, the latest GA of each product,
+    # and the two AWS-only lines) must pass, the 2 advisory pre-releases only annotate the run
+    # when they fail (continue-on-error). The tier is in the job title: LTS, GA, AWS-only or
+    # pre-release.
+    name: integration (${{ matrix.flavor }}, ${{ matrix.tier }}${{ matrix.supervisor && format(', supervisor {0}', matrix.supervisor) || '' }}${{ matrix.advisory && ', advisory' || '' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     continue-on-error: ${{ matrix.advisory }}
@@ -81,18 +83,26 @@ jobs:
       matrix:
         # Service names and host ports from docker-compose.test.yml.
         include:
-          - { flavor: mysql84, port: 33084, advisory: false }
-          - { flavor: mysql267, port: 33267, advisory: false }
-          - { flavor: percona84, port: 33184, advisory: false }
-          - { flavor: percona97, port: 33197, advisory: false }
-          - { flavor: mariadb1011, port: 33111, advisory: false }
-          - { flavor: mariadb130, port: 33130, advisory: false }
+          - { flavor: mysql84, port: 33084, tier: LTS, advisory: false }
+          - { flavor: mysql97, port: 33097, tier: LTS, advisory: false }
+          - { flavor: mysql2610, port: 33261, tier: GA, advisory: false }
+          # AWS-only: community EOL, still run by Amazon RDS / Aurora (drop one = its entry here + its
+          # service in docker-compose.test.yml).
+          - { flavor: mysql80, port: 33080, tier: AWS-only, advisory: false }
+          - { flavor: percona84, port: 33184, tier: LTS, advisory: false }
+          - { flavor: percona97, port: 33197, tier: LTS, advisory: false }
+          - { flavor: mariadb1011, port: 33111, tier: LTS, advisory: false }
+          - { flavor: mariadb114, port: 33114, tier: LTS, advisory: false }
+          - { flavor: mariadb118, port: 33118, tier: LTS, advisory: false }
+          - { flavor: mariadb123, port: 33123, tier: LTS, advisory: false }
+          - { flavor: mariadb130, port: 33130, tier: GA, advisory: false }
+          - { flavor: mariadb106, port: 33106, tier: AWS-only, advisory: false }
           # The sequential refresh path (LAZYVIEW_SUPERVISOR=off) on one blocking flavor; the
           # other jobs run the default (concurrent) one.
-          - { flavor: mariadb1011, port: 33111, advisory: false, supervisor: "off" }
-          # Newest pre-releases (compose profile `prerelease`): never required.
-          - { flavor: mariadb132-pre, port: 33132, advisory: true }
-          - { flavor: mysql2610-pre, port: 33261, advisory: true }
+          - { flavor: mariadb1011, port: 33111, tier: LTS, advisory: false, supervisor: "off" }
+          # Pre-releases (compose profile `prerelease`): tested, not supported, never required.
+          - { flavor: mariadb131-rc, port: 33131, tier: pre-release, advisory: true }
+          - { flavor: mariadb132-pre, port: 33132, tier: pre-release, advisory: true }
     env:
       COMPOSE_FILE: docker-compose.test.yml
       COMPOSE_PROFILES: prerelease
@@ -101,11 +111,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # MySQL 26.10 Early Access has no registry image: `docker load` the labs tarball
-      # (sha256-verified by the script).
-      - name: load the ${{ matrix.flavor }} image
-        if: matrix.flavor == 'mysql2610-pre'
-        run: scripts/test-servers.sh compose load-pre
       - name: start ${{ matrix.flavor }} (in the background)
         run: docker compose up -d --quiet-pull "$FLAVOR"
       - name: rust ${{ env.RUST_TOOLCHAIN }}
@@ -141,7 +146,7 @@ jobs:
       - name: advisory flavor failed
         if: failure() && matrix.advisory
         run: |
-          echo "::warning title=advisory server failed::${FLAVOR} is a pre-release server (advisory, not required for a release): see the integration logs"
+          echo "::warning title=advisory server failed::${FLAVOR} is a pre-release server (advisory, tested but not supported, not required for a release): see the integration logs"
           echo "### :warning: ${FLAVOR}: advisory pre-release server failed" >> "$GITHUB_STEP_SUMMARY"
           echo "A pre-release server failed the integration suites. It does not block this run; check the logs before the release that moves the latest-GA pin." >> "$GITHUB_STEP_SUMMARY"
       - name: collect server logs

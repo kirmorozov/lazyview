@@ -43,40 +43,67 @@ are dynamic, but sessions that are already connected keep the old value until th
 
 ## Supported servers
 
-Per product, two lines are tested on every change and required for a release (**blocking**): the
-oldest line the vendor still supports and the latest GA line. The newest pre-release is tested
-as well, **advisory** only (it never blocks). Lines the vendor has retired are dropped. The exact
-builds are pinned in `docker-compose.test.yml` (CI and the local servers run the same images).
+Every major line a vendor supports is tested on every change and required for a release
+(**blocking**), the oldest included, plus the latest GA (Innovation or rolling) release of each
+product: 12 servers, latest patch release of each line. Two more lines are **AWS-only**: the
+community has retired them, but Amazon RDS and Aurora still run them, and lazyview claims both
+services. The published pre-releases are tested as well, **advisory** only: tested, not
+supported, and a failure never blocks a release or the `edge` image. The exact builds are pinned
+in `docker-compose.test.yml` (CI and the local servers run the same images).
 
-| Product | Line | Tested build | Tier | Vendor support ends |
-|---|---|---|---|---|
-| MySQL | 8.4 LTS | 8.4.11 | blocking, oldest LTS | Premier Apr 2029, Extended Apr 2032 |
-| MySQL | 26.7 Innovation | 26.7.0 | blocking, latest GA | with the next Innovation release (26.10, due October 2026) |
-| MySQL | 26.10 | 26.10.0 Early Access | advisory | pre-release, unsupported |
-| Percona Server | 8.4 LTS | 8.4.11-11 | blocking, oldest LTS | active (upstream 8.4: Apr 2032) |
-| Percona Server | 9.7 LTS | 9.7.2-2 | blocking, latest GA | active (upstream 9.7: Apr 2034) |
-| MariaDB | 10.11 LTS | 10.11.19 | blocking, oldest LTS | 2028-02-16 |
-| MariaDB | 13.0 rolling | 13.0.2 | blocking, latest GA | rolling: with the next rolling GA (Q4 2026) |
-| MariaDB | 13.2 | 13.2.0 Preview | advisory | pre-release, unsupported |
+| Product | Line | Tested build | Tier | GA | Community support ends | Amazon RDS / Aurora |
+|---|---|---|---|---|---|---|
+| MySQL | 8.0 | 8.0.46 | blocking, AWS-only | 2018-04-19 | retired 2026-04-30 (final 8.0.46) | RDS Extended Support to 2029-07-31; Aurora MySQL 3 (8.0-compatible) standard to 2028-04-30, Extended to 2029-07-31 |
+| MySQL | 8.4 LTS | 8.4.13 | blocking, LTS | 2024-04-30 | Premier 2029-04-30, Extended 2032-04 | RDS standard to 2029-07-31, Extended to 2032-07-31; Aurora MySQL 8.4 (GA 2026-05-21) to 2032-04 |
+| MySQL | 9.7 LTS | 9.7.4 | blocking, LTS | 2026-04-21 | Premier 2031-04, Extended 2034-04 | RDS Database Preview only |
+| MySQL | 26.10 Innovation | 26.10.0 | blocking, latest GA | 2026-10-20 | until the next Innovation release | not offered |
+| Percona Server | 8.4 LTS | 8.4.11-11 | blocking, LTS | 2024-08-28 (8.4.0-1) | follows upstream 8.4 (2032-04) | not offered |
+| Percona Server | 9.7 LTS | 9.7.2-2 | blocking, LTS (latest GA) | 2026 | follows upstream 9.7 (2034-04) | not offered |
+| MariaDB | 10.6 | 10.6.28 | blocking, AWS-only | 2021-07-06 | retired 2026-07-06 (final 10.6.28) | RDS standard to 2026-12-31 |
+| MariaDB | 10.11 LTS | 10.11.19 | blocking, LTS | 2023-02-16 | 2028-02-16 | RDS to 2028-02 |
+| MariaDB | 11.4 LTS | 11.4.13 | blocking, LTS | 2024-05-29 | 2029-05-29 | RDS to 2029-05 |
+| MariaDB | 11.8 LTS | 11.8.9 | blocking, LTS | 2025-06-04 | 2028-06-04 | RDS to 2028-06 |
+| MariaDB | 12.3 LTS | 12.3.3 | blocking, LTS | 2026-05-28 | 2029-06-12 | RDS to 2029-06 |
+| MariaDB | 13.0 rolling | 13.0.2 | blocking, latest GA | 2026-05 | with the next rolling GA (Q4 2026) | not offered |
+| MariaDB | 13.1 | 13.1.1 RC | advisory, pre-release | n/a | unsupported | not offered |
+| MariaDB | 13.2 | 13.2.0 Preview | advisory, pre-release | n/a | unsupported | not offered |
 
-Percona publishes no Innovation line and no pre-release, so its latest GA is 9.7 LTS. When MySQL
-26.10 goes GA, the latest-GA pin moves from 26.7.0 to it (and the advisory entry to the next
-Early Access); MariaDB's moves with each rolling GA (13.1, 13.2, ...).
+Percona publishes no Innovation line and no pre-release, so its latest GA is 9.7 LTS; no
+registry has a MySQL pre-release (26.10 went GA, and no newer Early Access exists). When a new
+GA arrives (MySQL 27.x, MariaDB 13.1, ...), the latest-GA pin moves to it and the advisory
+entries move on to the next pre-release. The AWS-only lines are dropped when AWS retires them
+(MariaDB 10.6 after 2026-12-31): one matrix entry in `ci.yml` and one service in
+`docker-compose.test.yml` each. Percona Server 8.0 (final 8.0.46-37, no RDS edition) is
+dropped; an opt-in tarball pin remains in `scripts/test-servers.sh`.
 
-Vendor-supported but **not tested**: MySQL 9.7 LTS (Apr 2031 / Apr 2034), MariaDB 11.4 LTS
-(2029-05-29), 11.8 LTS (2028-06-04 community) and 12.3 LTS (2029-06-12). They sit between the
-tested lines and lazyview runs on them, but a release does not check them.
+Sources: MySQL
+[RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/MySQL.Concepts.VersionMgmt.html) and
+[Aurora](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraMySQLReleaseNotes/AuroraMySQL.release-calendars.html)
+calendars ([Aurora MySQL 8.4 announcement](https://aws.amazon.com/about-aws/whats-new/2026/05/amazon-aurora-mysql/8-4/)),
+[MySQL 9.7 LTS](https://infoq.com/news/2026/05/mysql-97-lts/),
+[MySQL 26.10.0 release notes](https://dev.mysql.com/doc/relnotes/mysql/26.10/en/news-26-10-0.html),
+MariaDB [maintenance policy](https://mariadb.org/about/#maintenance-policy) and
+[RDS for MariaDB](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/MariaDB.Concepts.VersionMgmt.html),
+Percona [release notes](https://docs.percona.com/percona-server/latest/release-notes/release-notes-index.html).
+Dates are as published on 2026-10-25; Percona 9.7's GA date is not in the sources and is left
+at the year.
 
-**Dropped as end-of-life**: MySQL 8.0 (EOL April 2026, final 8.0.46), Percona Server 8.0 (EOL
-2026-04-01, final community build 8.0.46-37) and MariaDB 10.6 (community EOL 2026-07-06, final
-10.6.28). Earlier releases of lazyview were tested on MySQL 8.0 and Percona 8.0 and nothing in
-the binlog protocol changed for them, but they get no further testing.
-
-Also supported: Amazon RDS for MySQL / MariaDB and Aurora MySQL running one of the lines above
+Amazon RDS for MySQL / MariaDB and Aurora MySQL are supported on the lines above that they run
 (see below).
 
 ### Caveats per line
 
+* **MySQL 8.0 and Percona/MySQL 8.4 versus 9.x and 26.x**: 8.0 has none of the innovation
+  features and lazyview needs none of them. What differs: `SHOW MASTER STATUS` instead of `SHOW
+  BINARY LOG STATUS` (chosen by server version); `binlog_row_value_options` exists since 8.0.3
+  (`PARTIAL_JSON` is refused at startup, on 8.0 too); `binlog_transaction_compression` since
+  8.0.20; the `utf8` alias means `utf8mb3`; accounts use `caching_sha2_password` by default
+  (`mysql_native_password` is off by default in 8.4 and gone in 9.0, so create the lazyview
+  account without naming a plugin).
+* **MariaDB 10.6 and 10.11 versus 11.x and later**: `JSON` is an alias for `LONGTEXT` on every
+  MariaDB, so JSON columns arrive as text. The `UUID` type exists from 10.7, `INET4` / `INET6` from
+  10.10: 10.6 has none of them, the later lines send them as 16-byte / 4-byte binary values
+  that lazyview decodes. 10.6 lacks the `utf8mb4_uca1400_*` collations (11.5 and later).
 * **MySQL 9.x and 26.x**: `innodb_native_foreign_keys` is OFF by default, so foreign-key
   cascades run at the SQL layer and the cascaded child rows are logged in the binlog (before the
   parent's row event). lazyview handles both layouts: with native cascades (8.x) the children are
@@ -97,8 +124,12 @@ Also supported: Amazon RDS for MySQL / MariaDB and Aurora MySQL running one of t
   of another flavor (MySQL, Percona, MariaDB before 10.10) does not know it: the target table
   then gets the target's default collation for the charset (logged as a warning); the bytes are
   the same, only comparisons on the target follow its rules.
+* **MariaDB 11.4 and later**: a VIRTUAL generated column that is not the last column of a table is
+  missing from the UPDATE / DELETE row images the server writes (known issue, tracked in
+  [#7](https://github.com/kirmorozov/lazyview/issues/7)); views over such tables can be wrong
+  there until it is fixed.
 * **MariaDB, all versions**: `log_bin_compress` must be OFF.
-* **MariaDB, all versions tested (10.11, 13.0, 13.2)**: a prepared statement with
+* **MariaDB, all versions tested (10.11, 13.0, 13.2 at least)**: a prepared statement with
   `x NOT IN (subquery)` that is executed again after the subquery's result changed between empty
   and non-empty returns the result of the earlier execution (for example rows with a NULL `x` stay
   in). lazyview prepares every source read afresh on MariaDB, so its views are not affected; the
