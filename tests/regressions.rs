@@ -3001,6 +3001,115 @@ fn reg_not_in_prepared_statement_canary() {
     });
 }
 
+/// G6: a view grouped by a NULLable column with a UNIQUE index. A flush that refreshes only the
+/// NULL group read it with a prepared `(code) <=> ?` bound to NULL, which MySQL-family servers
+/// (8.4, 9.x, Percona) run as a one-row unique lookup: the NULL group lost all but one of its
+/// rows. NULL unit components are `IS NULL` literals now; the view (and a control view over the
+/// same rows without the index) stays equal to its oracle and never falls back to a rebuild. The
+/// prepared `<=> ?` answer is only noted (it tells whether the server still has the bug); a
+/// MariaDB server must answer it correctly, and `IS NULL` must be right on every flavor.
+#[test]
+fn reg_null_unit_on_nullable_unique_index() {
+    scenario("reg_null_uq", |ctx| async move {
+        use mysql_async::prelude::Queryable;
+        let specs = vec![
+            ViewSpec::new(
+                "r_nopk",
+                Kind::Incremental,
+                "SELECT n.code, SUM(n.v) AS s FROM s_nopk n GROUP BY n.code",
+            ),
+            ViewSpec::new(
+                "r_nokey",
+                Kind::Incremental,
+                "SELECT n.code, SUM(n.v) AS s FROM s_nokey n GROUP BY n.code",
+            ),
+        ];
+        let (db, mut eng) = setup(
+            &ctx,
+            "reg_null_uq",
+            &[
+                "CREATE TABLE s_nopk (code INT NULL, v INT NULL, UNIQUE KEY u_code (code))",
+                "CREATE TABLE s_nokey (code INT NULL, v INT NULL)",
+                "INSERT INTO s_nopk VALUES (NULL,1),(NULL,2),(5,3),(7,4)",
+                "INSERT INTO s_nokey VALUES (NULL,1),(NULL,2),(5,3),(7,4)",
+            ],
+            &specs,
+            &[],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        // Server canary.
+        let null = (mysql_async::Value::NULL,);
+        let prepared: Option<i64> = c
+            .exec_first("SELECT COUNT(*) FROM s_nopk WHERE (code) <=> ?", null)
+            .await?;
+        let literal: Option<i64> = c
+            .exec_first("SELECT COUNT(*) FROM s_nopk WHERE (code) IS NULL", ())
+            .await?;
+        ensure!(
+            literal == Some(2),
+            "prepared `IS NULL` found {literal:?} of the 2 NULL rows"
+        );
+        ensure!(
+            prepared == Some(2) || !ctx.servers[0].is_mariadb(),
+            "MariaDB: prepared `<=> ?` bound to NULL found {prepared:?} of the 2 NULL rows"
+        );
+        ctx.log(if prepared == Some(2) {
+            "prepared `(code) <=> ?` bound to NULL on a UNIQUE index: correct".to_string()
+        } else {
+            format!(
+                "prepared `(code) <=> ?` bound to NULL on a UNIQUE index: {prepared:?} of 2 rows \
+                 (MySQL-family bug present)"
+            )
+        });
+        let mode: Option<String> = c
+            .query_first("SELECT `mode` FROM _lazyview_state WHERE name = 'r_nopk'")
+            .await?;
+        ensure!(
+            mode.as_deref() == Some("incremental"),
+            "r_nopk is not maintained incrementally: {mode:?}"
+        );
+        let both = |stmt: &str| format!("{stmt}; {}", stmt.replace("s_nopk", "s_nokey"));
+        for (what, stmt) in [
+            (
+                "NULL-key rows: update one, delete the other",
+                "UPDATE s_nopk SET v = 9 WHERE code IS NULL AND v = 1; \
+                 DELETE FROM s_nopk WHERE code IS NULL AND v = 2",
+            ),
+            (
+                "NULL key becomes a value",
+                "UPDATE s_nopk SET code = 1 WHERE v = 9",
+            ),
+            (
+                "back to NULL plus a second NULL row",
+                "UPDATE s_nopk SET code = NULL WHERE v = 9; INSERT INTO s_nopk VALUES (NULL, 6)",
+            ),
+            ("a third NULL row", "INSERT INTO s_nopk VALUES (NULL, 100)"),
+            (
+                "update inside the NULL group only",
+                "UPDATE s_nopk SET v = v + 1 WHERE code IS NULL AND v = 6",
+            ),
+            (
+                "delete inside the NULL group only",
+                "DELETE FROM s_nopk WHERE code IS NULL AND v = 100",
+            ),
+        ] {
+            let before = eng.snapshot();
+            for s in both(stmt).split("; ") {
+                exec(&mut c, s).await?;
+            }
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+            let d = eng.snapshot().since(&before);
+            ensure!(
+                d.full_rebuilds == 0,
+                "{what}: fell back to a rebuild: {}",
+                fmt_snapshot(&d)
+            );
+        }
+        eng.stop().await
+    });
+}
+
 /// A view that rebuilds on a parent's cascading deletes logged only that it does, not why the
 /// cascade cannot be traced through the parent. The warning carries the analyzer's reason (here:
 /// the parent on the NULL side of a LEFT JOIN with a condition beyond the foreign-key equality),

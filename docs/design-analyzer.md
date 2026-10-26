@@ -28,7 +28,9 @@ lookup-resolved alias, `_lv_a<i>_pk<j>`, after the hidden unit columns `_lv_u<k>
 by engine worker A: `ViewPlan.lineage: Vec<LineageKey { alias, cols, exprs }>`). Extensions:
 aliases without a PK carry **value lineage** `_lv_a<i>_v<j>` (their referenced columns, exact
 kinds only, NULL-safe matching); UNION ALL rows carry `_lv_branch` with globally numbered aliases;
-lineage of NULL-extended rows is NULL for the missing side (filters must be NULL-safe, `<=>`).
+lineage of NULL-extended rows is NULL for the missing side (filters must be NULL-safe: a NULL
+component matches as an `IS NULL` literal, never as a prepared `<=> ?` bound to NULL, which MySQL-family
+servers run on a NULLable UNIQUE index as a one-row lookup).
 Lineage is by key, so it survives intermediate updates inside a batch, PK changes (old and new
 keys are both traced) and duplicates (one lineage value, many MV rows, refreshed as one unit).
 The overview reports, per view and alias, `direct` / `lineage` / `forward` / `all`.

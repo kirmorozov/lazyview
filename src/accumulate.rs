@@ -178,8 +178,9 @@ impl UnitChunk {
     }
 
     /// Predicate over `exprs` matching exactly the chunk's keys, plus its parameters.
-    /// Integer runs become `BETWEEN` ranges and inline literals (no parameters). Every expression
-    /// is parenthesized: a unit can be `NOT a`, `a OR b` or `a BETWEEN b AND c`.
+    /// Integer runs become `BETWEEN` ranges and inline literals (no parameters), NULL key
+    /// components `IS NULL` literals. Every expression is parenthesized: a unit can be `NOT a`,
+    /// `a OR b` or `a BETWEEN b AND c`.
     pub fn filter(&self, exprs: &[String]) -> (String, Vec<mysql_async::Value>) {
         self.filter_typed(exprs, &[])
     }
@@ -237,8 +238,8 @@ impl UnitChunk {
             UnitChunk::Keys(keys) => {
                 let mut params = Vec::new();
                 let mut parts = Vec::new();
-                // Keys with a NULL need `<=>`. So do TIME keys: on MySQL an `IN` list of two or
-                // more TIME(fsp > 0) parameters matches nothing.
+                // Keys with a NULL need a null-safe match. So do TIME keys: on MySQL an `IN` list
+                // of two or more TIME(fsp > 0) parameters matches nothing.
                 let (null_safe, plain): (Vec<&Key>, Vec<&Key>) = keys.iter().partition(|k| {
                     k.iter()
                         .enumerate()
@@ -265,7 +266,12 @@ impl UnitChunk {
                 for k in null_safe {
                     let mut conj = Vec::with_capacity(exprs.len());
                     for (i, (e, d)) in exprs.iter().zip(k.iter()).enumerate() {
-                        if local(i, d) {
+                        if matches!(d, Datum::Null) {
+                            // A literal, never `<=> ?` bound to NULL: MySQL-family servers run
+                            // that prepared comparison on a NULLable UNIQUE index as a one-row
+                            // lookup and miss the other NULL rows.
+                            conj.push(format!("{e} IS NULL"));
+                        } else if local(i, d) {
                             conj.push(format!(
                                 "{e} BETWEEN ? - INTERVAL 1 HOUR AND ? + INTERVAL 1 HOUR \
                                  AND CAST({e} AS DATETIME(6)) = ?"
@@ -686,7 +692,7 @@ mod tests {
         let (f, _) = k.filter(&["a BETWEEN 1 AND 2".into(), "b AND c".into()]);
         assert_eq!(
             f,
-            "(((a BETWEEN 1 AND 2), (b AND c)) IN ((?,?)) OR ((a BETWEEN 1 AND 2) <=> ? AND (b AND c) <=> ?))"
+            "(((a BETWEEN 1 AND 2), (b AND c)) IN ((?,?)) OR ((a BETWEEN 1 AND 2) IS NULL AND (b AND c) <=> ?))"
         );
     }
 
@@ -732,14 +738,14 @@ mod tests {
         assert_eq!(
             f,
             "(((g), (ts)) IN ((?,?)) OR ((g) <=> ? AND (ts) BETWEEN ? - INTERVAL 1 HOUR AND ? + INTERVAL 1 HOUR \
-             AND CAST((ts) AS DATETIME(6)) = ?) OR ((g) <=> ? AND (ts) <=> ?))"
+             AND CAST((ts) AS DATETIME(6)) = ?) OR ((g) <=> ? AND (ts) IS NULL))"
         );
-        assert_eq!(p.len(), 2 + 4 + 2);
+        assert_eq!(p.len(), 2 + 4 + 1);
         assert_eq!(p[3], dt.to_value());
         // Without types (and for DATETIME columns) nothing changes.
         assert_eq!(
             k.filter(&["g".into(), "ts".into()]).0,
-            "(((g), (ts)) IN ((?,?),(?,?)) OR ((g) <=> ? AND (ts) <=> ?))"
+            "(((g), (ts)) IN ((?,?),(?,?)) OR ((g) <=> ? AND (ts) IS NULL))"
         );
     }
 
@@ -750,8 +756,41 @@ mod tests {
             Box::new([Datum::Null, Datum::Bytes(b"b".to_vec())]),
         ]);
         let (f, p) = k.filter(&["a".into(), "b".into()]);
-        assert_eq!(f, "(((a), (b)) IN ((?,?)) OR ((a) <=> ? AND (b) <=> ?))");
-        assert_eq!(p.len(), 4);
+        assert_eq!(f, "(((a), (b)) IN ((?,?)) OR ((a) IS NULL AND (b) <=> ?))");
+        assert_eq!(p.len(), 3);
+    }
+
+    /// NULL components are `IS NULL` literals without a parameter (G6: a prepared `col <=> ?`
+    /// bound to NULL finds one row of a NULLable UNIQUE index on MySQL-family servers); the
+    /// parameters of the other components shift accordingly.
+    #[test]
+    fn null_components_are_literals() {
+        let b = |s: &str| Datum::Bytes(s.as_bytes().to_vec());
+        let k = UnitChunk::Keys(vec![Box::new([Datum::Null])]);
+        let (f, p) = k.filter(&["code".into()]);
+        assert_eq!(f, "((code) IS NULL)");
+        assert!(p.is_empty());
+        let k = UnitChunk::Keys(vec![
+            Box::new([Datum::Null, b("x")]),
+            Box::new([Datum::Int(3), Datum::Null]),
+            Box::new([Datum::Null, Datum::Null]),
+            Box::new([Datum::Int(4), b("y")]),
+        ]);
+        let (f, p) = k.filter(&["a".into(), "b".into()]);
+        assert_eq!(
+            f,
+            "(((a), (b)) IN ((?,?)) OR ((a) IS NULL AND (b) <=> ?) OR ((a) <=> ? AND (b) IS NULL) \
+             OR ((a) IS NULL AND (b) IS NULL))"
+        );
+        assert_eq!(
+            p,
+            vec![
+                Datum::Int(4).to_value(),
+                b("y").to_value(),
+                b("x").to_value(),
+                Datum::Int(3).to_value()
+            ]
+        );
     }
 
     /// JSON keys are bound as JSON values (a plain string parameter compares as text and never
@@ -767,9 +806,9 @@ mod tests {
         let (f, p) = k.filter_typed(&["doc".into()], &[UnitKind::Json]);
         assert_eq!(
             f,
-            "((doc) IN (CAST(? AS JSON),CAST(? AS JSON)) OR ((doc) <=> CAST(? AS JSON)))"
+            "((doc) IN (CAST(? AS JSON),CAST(? AS JSON)) OR ((doc) IS NULL))"
         );
-        assert_eq!(p.len(), 3);
+        assert_eq!(p.len(), 2);
         assert_eq!(p[0], j(r#"{"a":1.0}"#).to_value());
         // Composite units bind per position.
         let k = UnitChunk::Keys(vec![
@@ -785,9 +824,9 @@ mod tests {
         assert_eq!(
             f,
             "(((g), (doc)) IN ((?,CAST(? AS JSON)),(?,CAST(? AS JSON))) \
-             OR ((g) <=> ? AND (doc) <=> CAST(? AS JSON)) OR ((g) <=> ? AND (doc) <=> CAST(? AS JSON)))"
+             OR ((g) <=> ? AND (doc) IS NULL) OR ((g) IS NULL AND (doc) <=> CAST(? AS JSON)))"
         );
-        assert_eq!(p.len(), 8);
+        assert_eq!(p.len(), 6);
         // Plain kinds (MariaDB, where JSON is LONGTEXT) are unchanged.
         assert_eq!(
             k.filter_typed(
