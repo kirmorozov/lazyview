@@ -202,12 +202,22 @@ SELECT id, user, host, time FROM information_schema.PROCESSLIST
   position and releases its lock.
 * Being killed is safe as well. The changes since the saved position are applied again, and that
   gives the same result.
-* While idle, the position is saved every `LAZYVIEW_POSITION_PERSIST_MS` (5 s).
+* While idle, the position is saved every `LAZYVIEW_POSITION_PERSIST_MS` (5 s). It also moves on
+  while nothing is written: after a binlog rotation (`FLUSH BINARY LOGS`, a server restart) the
+  saved and reported position follow the server into the new file at the next heartbeat
+  (`LAZYVIEW_HEARTBEAT_MS`, 5 s).
 * After a fatal error, lazyview exits non-zero. Lost connections are not fatal: the binlog stream
-  reconnects with backoff, and the source connection is re-established.
+  reconnects with backoff, and the source connection is re-established. That includes a server
+  shutting down or restarting (`Server shutdown in progress`) and sessions killed by an admin or a
+  proxy; lazyview waits for the server and goes on.
 * If the saved binlog file has been purged in the meantime, lazyview fails with `saved binlog
-  position … is no longer available`. Set `LAZYVIEW_ON_MISSING_BINLOG=rebuild` (or start once
-  with `LAZYVIEW_START_MODE=rebuild`) to rebuild instead. Keep binlogs long enough
+  position … is no longer available`, and before it exits every view's state row says so
+  (`state = 'error'`, `last_error` starting with `stale: lazyview stopped:`), since the views no
+  longer follow the source. Other reasons the position cannot be read (a position saved on
+  another server, a replication error while the file still exists) stop lazyview too but leave
+  the state rows as they are: once the cause is fixed, the next start resumes. Set
+  `LAZYVIEW_ON_MISSING_BINLOG=rebuild` (or start once with `LAZYVIEW_START_MODE=rebuild`) to
+  rebuild instead; the rebuild clears it. Keep binlogs long enough
   ([server setup](server-setup.md#requirements)).
 
 ## Duplicate instances and hot standby
@@ -237,7 +247,7 @@ schema: each would maintain the same views.
 | ``database `app` does not exist`` | `CREATE DATABASE app`, or fix `LAZYVIEW_DATABASE` |
 | `TLS to source database at … failed` | set `LAZYVIEW_TLS_CA` to the server's CA bundle, or use `LAZYVIEW_TLS=required`; see [TLS](configuration.md#tls) |
 | `fatal: TLS CA file … not found` (exit 1) | the path in `LAZYVIEW_TLS_CA` does not exist in the container (mount it) |
-| `saved binlog position … is no longer available on the server` | binlogs were purged while lazyview was down; see [restart and resume](#restart-and-resume) |
+| `saved binlog position … is no longer available on the server` (also in `last_error` of every view) | binlogs were purged while lazyview was down; see [restart and resume](#restart-and-resume) |
 | `another replica connected with the same server_id N` | give every lazyview instance and every real replica a unique `LAZYVIEW_SERVER_ID` |
 | `Amazon RDS/Aurora binlog retention is …` (warning) | `CALL mysql.rds_set_configuration('binlog retention hours', 24);` |
 | a view in `error`: ``name `x` already used by row #N`` | the view name of its `CREATE VIEW` statement belongs to row N; rename one of the two views |

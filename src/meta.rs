@@ -308,6 +308,17 @@ pub async fn set_state(conn: &mut Conn, u: StateUpdate<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Puts every state row into `error` with `reason` (lazyview stops because the views can no longer
+/// be kept up to date, see `Engine::mark_unusable`).
+pub async fn mark_all_error(conn: &mut Conn, reason: &str) -> Result<()> {
+    conn.exec_drop(
+        "UPDATE `_lazyview_state` SET `state` = 'error', `last_error` = ?",
+        (reason,),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Removes leftover error rows of a definition under other names (e.g. `#7` before it parsed).
 pub async fn delete_stale_state(
     conn: &mut Conn,

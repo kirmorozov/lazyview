@@ -23,6 +23,9 @@ pub struct Leadership {
     pub epoch: u64,
 }
 
+/// How long [`reacquire`] waits for the leadership lock of a lost metadata connection.
+const REACQUIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn lock_name(schema: &str, instance_id: &str) -> String {
     format!(
         "lazyview:{}",
@@ -105,8 +108,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// server released the lock with it). Fails if another instance holds it now, or took over
 /// meanwhile (the fencing epoch moved on): this one must stop then.
 pub async fn reacquire(conn: &mut Conn, l: &Leadership, instance_id: &str) -> Result<()> {
+    // Our old session may still hold the lock for a moment: a killed connection releases its
+    // locks only when the server has finished it (KILL is asynchronous). Another instance that
+    // took over keeps it, and the epoch check below catches a takeover in between.
     let got: Option<Option<i64>> = conn
-        .exec_first("SELECT GET_LOCK(?, 0)", (&l.lock_name,))
+        .exec_first(
+            "SELECT GET_LOCK(?, ?)",
+            (&l.lock_name, REACQUIRE_WAIT.as_secs()),
+        )
         .await?;
     if got.flatten() != Some(1) {
         bail!(

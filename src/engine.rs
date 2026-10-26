@@ -130,7 +130,20 @@ async fn managed_service_checks(conn: &mut Conn) {
     }
 }
 
-/// Connection-class failures (socket closed, reset, timeouts): retry after reconnecting.
+/// Server errors that mean this connection, or the server itself, is going away: the statement
+/// is retried on a new connection (a clean server restart answers 1053 to statements that land in
+/// its shutdown window).
+const CONN_GONE_CODES: &[u16] = &[
+    1053, // ER_SERVER_SHUTDOWN: "Server shutdown in progress"
+    1927, // MariaDB ER_CONNECTION_KILLED: "Connection was killed"
+    3169, // MySQL ER_SESSION_WAS_KILLED: "Session was killed"
+    4031, // MySQL ER_CLIENT_INTERACTION_TIMEOUT: disconnected for inactivity
+    2006, // CR_SERVER_GONE_ERROR, when it arrives as a server error (proxies)
+    2013, // CR_SERVER_LOST, likewise
+];
+
+/// Connection-class failures (socket closed, reset, timeouts, the server or session going away,
+/// see [`CONN_GONE_CODES`]): retry after reconnecting.
 fn is_conn_error(e: &anyhow::Error) -> bool {
     e.chain()
         .any(|c| match c.downcast_ref::<mysql_async::Error>() {
@@ -138,6 +151,7 @@ fn is_conn_error(e: &anyhow::Error) -> bool {
             Some(mysql_async::Error::Driver(d)) => {
                 matches!(d, mysql_async::DriverError::ConnectionClosed)
             }
+            Some(mysql_async::Error::Server(se)) => CONN_GONE_CODES.contains(&se.code),
             _ => false,
         })
 }
@@ -579,15 +593,18 @@ struct Drained {
 }
 
 impl Drained {
-    /// Queues `r`, read from binlog file `file`.
+    /// Queues `r`, read from binlog file `file`. Heartbeats are dropped: they carry nothing, and
+    /// one taken from the queue would move the position to the reader's, past the events queued
+    /// behind it (see `Engine::on_item`); the next one read while idle does that instead.
     fn push(&mut self, r: Read, file: &str) {
+        let b = match &r {
+            Ok(Some(Item::Rows { event, .. })) => 64 + event.data().len(),
+            Ok(Some(Item::Heartbeat)) => return,
+            _ => 64,
+        };
         if self.queue.is_empty() {
             self.file = Some(file.to_string());
         }
-        let b = match &r {
-            Ok(Some(Item::Rows { event, .. })) => 64 + event.data().len(),
-            _ => 64,
-        };
         self.bytes += b;
         self.queue.push_back((r, b));
     }
@@ -884,26 +901,39 @@ impl Engine {
         let saved_identity = meta::load_identity(&mut e.meta, &e.cfg.instance_id)
             .await?
             .filter(|s| !s.is_empty());
+        // `(why, gone)`: `gone` = the saved file verifiably no longer exists on the source.
         let unusable = if rebuild_all {
             None
         } else if let Some(saved) =
             saved_identity.filter(|s| !identity.is_empty() && *s != identity)
         {
-            Some(format!(
-                "saved binlog position {start} was written by server {saved}, but the source is server {identity} (failover, restore or RESET MASTER?)"
+            Some((
+                format!(
+                    "saved binlog position {start} was written by server {saved}, but the source is server {identity} (failover, restore or RESET MASTER?)"
+                ),
+                false,
             ))
         } else if !binlog::binlog_exists(&mut e.src, &start.file).await? {
-            Some(format!(
-                "saved binlog position {start} is no longer available on the server"
+            Some((
+                format!("saved binlog position {start} is no longer available on the server"),
+                true,
             ))
         } else {
             None
         };
-        if let Some(why) = unusable {
+        if let Some((why, gone)) = unusable {
             match e.cfg.on_missing_binlog {
-                MissingBinlog::Fail => bail!(
-                    "{why}; set LAZYVIEW_ON_MISSING_BINLOG=rebuild or LAZYVIEW_START_MODE=rebuild"
-                ),
+                MissingBinlog::Fail => {
+                    let msg = format!(
+                        "{why}; set LAZYVIEW_ON_MISSING_BINLOG=rebuild or LAZYVIEW_START_MODE=rebuild"
+                    );
+                    // Only a purged file makes the views stale for good. A server mismatch can be
+                    // undone (the right server back): the rows stay, and that start resumes.
+                    if gone {
+                        e.mark_unusable(&msg).await;
+                    }
+                    bail!(msg)
+                }
                 MissingBinlog::Rebuild => {
                     warn!("{why}; rebuilding all views");
                     rebuild_all = true;
@@ -1360,6 +1390,17 @@ impl Engine {
         }
         warn!("{what}: {}; reconnecting", e.root_cause());
         self.heal_meta().await.map(|_| ())
+    }
+
+    /// lazyview exits because the views cannot be kept up to date from here (the saved binlog
+    /// file is verifiably gone from the source): every state row says so (`error` with `why`), so
+    /// whoever reads `_lazyview_overview` sees stale views instead of `ready` ones. Not
+    /// resumable: the next start that can run rebuilds them (and writes their state again).
+    async fn mark_unusable(&mut self, why: &str) {
+        let reason = format!("stale: lazyview stopped: {why}");
+        if let Err(e) = meta::mark_all_error(&mut self.meta, &reason).await {
+            warn!("recording the stop in _lazyview_state: {e:#}");
+        }
     }
 
     /// The whole view is in error (state `error` on every target, keeping the mode of its latest
@@ -2521,12 +2562,33 @@ impl Engine {
         true
     }
 
+    /// Whether the file of the saved position (where the next start resumes) is verifiably gone
+    /// from the source (not in `SHOW BINARY LOGS`). A failed check counts as not gone.
+    async fn saved_file_gone(&mut self) -> bool {
+        let Ok(Some(saved)) = meta::load_position(&mut self.meta, &self.cfg.instance_id).await
+        else {
+            return false;
+        };
+        matches!(
+            binlog::binlog_exists(&mut self.src, &saved.file).await,
+            Ok(false)
+        )
+    }
+
     async fn on_missing_binlog(&mut self, e: &anyhow::Error) -> Result<()> {
         match self.cfg.on_missing_binlog {
-            MissingBinlog::Fail => Err(anyhow!(
-                "binlog position {} is no longer available: {e:#}",
-                self.boundary
-            )),
+            MissingBinlog::Fail => {
+                let msg = format!(
+                    "binlog position {} is no longer available: {e:#}",
+                    self.boundary
+                );
+                // 1236 also carries dump errors that leave the position readable: only a saved
+                // file that is verifiably gone marks the views; otherwise the next start resumes.
+                if self.saved_file_gone().await {
+                    self.mark_unusable(&msg).await;
+                }
+                Err(anyhow!(msg))
+            }
             MissingBinlog::Rebuild => {
                 warn!(
                     "binlog position {} purged; rebuilding all views",
@@ -2686,7 +2748,21 @@ impl Engine {
                 }
                 self.after_boundary();
             }
-            Item::Heartbeat | Item::Other => {}
+            Item::Heartbeat => {
+                // The server sends heartbeats only while it has nothing else to send. Between
+                // transactions, one moves the boundary to the reader's position: on an idle
+                // source the applied and saved position would stay in the previous file after a
+                // binlog rotation (also a server restart). Pending changes still hold the saved
+                // position back (`pending_floor`). Heartbeats are never queued (`Drained::push`),
+                // so the reader has read nothing past this one.
+                let p = reader.position();
+                if !self.in_txn && self.xa_current.is_none() && *p > self.boundary {
+                    self.boundary = p.clone();
+                    self.persist_needed = true;
+                    self.after_boundary();
+                }
+            }
+            Item::Other => {}
         }
         Ok(())
     }
@@ -5059,6 +5135,11 @@ mod tests {
         let mut d = Drained::default();
         assert!(d.open() && !d.full() && d.file.is_none() && d.pop().is_none());
         d.push(Ok(Some(Item::Heartbeat)), "binlog.000001");
+        assert!(
+            d.file.is_none() && d.bytes == 0 && d.pop().is_none(),
+            "heartbeats are not queued"
+        );
+        d.push(Ok(Some(Item::Other)), "binlog.000001");
         d.push(Ok(Some(Item::Other)), "binlog.000002");
         assert_eq!(
             d.file.as_deref(),
@@ -5066,7 +5147,7 @@ mod tests {
             "the oldest event's file"
         );
         assert_eq!(d.bytes, 128);
-        assert!(matches!(d.pop(), Some(Ok(Some(Item::Heartbeat)))));
+        assert!(matches!(d.pop(), Some(Ok(Some(Item::Other)))));
         assert_eq!((d.bytes, d.file.as_deref()), (64, Some("binlog.000001")));
         assert!(d.pop().is_some());
         assert_eq!((d.bytes, d.file.as_deref()), (0, None));
@@ -5074,11 +5155,44 @@ mod tests {
         assert!(!d.open(), "nothing is read past the end of the stream");
         d.pop();
         for _ in 0..DRAIN_MAX_EVENTS {
-            d.push(Ok(Some(Item::Heartbeat)), "binlog.000003");
+            d.push(Ok(Some(Item::Other)), "binlog.000003");
         }
         assert!(d.full() && !d.open());
         while d.pop().is_some() {}
         assert!(d.queue.capacity() <= DRAIN_KEEP_SLOTS && d.bytes == 0);
+    }
+
+    fn server(code: u16) -> anyhow::Error {
+        anyhow::Error::new(mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: "test".into(),
+            state: "HY000".into(),
+        }))
+        .context("saving the binlog position")
+    }
+
+    /// A clean server restart answers 1053 to statements in its shutdown window: reconnect, do
+    /// not exit. Other server errors (lost leadership, SQL errors) stay fatal.
+    #[test]
+    fn server_going_away_is_a_connection_error() {
+        for code in [1053, 1927, 3169, 4031, 2006, 2013] {
+            assert!(is_conn_error(&server(code)), "{code}");
+        }
+        for code in [1045, 1062, 1146, 1205, 1213, 1236] {
+            assert!(!is_conn_error(&server(code)), "{code}");
+        }
+        let closed = anyhow::Error::new(mysql_async::Error::Driver(
+            mysql_async::DriverError::ConnectionClosed,
+        ));
+        assert!(is_conn_error(&closed));
+    }
+
+    #[test]
+    fn statement_keywords() {
+        assert_eq!(first_keyword("  TRUNCATE t"), "TRUNCATE");
+        assert_eq!(first_keyword("/* x */ drop table t"), "drop");
+        assert_eq!(first_keyword("-- c\nDROP TABLE t"), "DROP");
+        assert_eq!(first_keyword("/*!40000 DROP */"), "");
     }
 }
 

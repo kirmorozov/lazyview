@@ -498,6 +498,93 @@ fn lifecycle_start_modes() {
     });
 }
 
+/// A start whose saved position cannot be read while its binlog file still exists (a position
+/// past the end of the file, which the dump thread answers with 1236; a position saved on another
+/// server) stops lazyview but leaves the `ready` state rows alone: only a purged file makes the
+/// views stale for good (tests/exclusive.rs). Once the cause is undone, the next start resumes
+/// without a rebuild.
+#[test]
+fn lifecycle_unreadable_position_keeps_ready_rows() {
+    scenario("lc_unreadable", |ctx| async move {
+        use mysql_async::prelude::Queryable;
+        let db = ctx.new_db("lc_unreadable").await?;
+        let mut c = db.conn().await?;
+        for s in [
+            "CREATE TABLE entities (id INT PRIMARY KEY, grp INT NOT NULL, status VARCHAR(10) NOT NULL)",
+            "INSERT INTO entities VALUES (10, 1, 'new'), (11, 1, 'paid'), (12, 2, 'new')",
+        ] {
+            exec(&mut c, s).await?;
+        }
+        let specs = vec![ViewSpec::new(
+            "lc_counts",
+            Kind::Incremental,
+            "SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp",
+        )];
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        eng.stop().await?;
+        let (pos, identity): (u64, Option<String>) = c
+            .query_first("SELECT binlog_pos, CAST(server_identity AS CHAR) FROM _lazyview_status")
+            .await?
+            .context("no saved position")?;
+        ensure!(identity.is_some(), "no saved server identity");
+        for (what, set, expect) in [
+            (
+                "a position past the end of its file",
+                format!(
+                    "UPDATE _lazyview_status SET binlog_pos = {}",
+                    pos + 1_000_000_000
+                ),
+                "is no longer available",
+            ),
+            (
+                "a position saved on another server",
+                "UPDATE _lazyview_status SET server_identity = 'another-server'".to_string(),
+                "was written by server",
+            ),
+        ] {
+            exec(&mut c, &set).await?;
+            let eng = ctx.start_engine(&db, &[])?;
+            match eng.wait_finished(Duration::from_secs(60)).await? {
+                Ok(()) => bail!("{what}: lazyview did not stop"),
+                Err(e) => ensure!(e.contains(expect), "{what}: unexpected stop: {e}"),
+            }
+            let rows: Vec<(String, String)> = c
+                .query("SELECT CAST(name AS CHAR), CAST(state AS CHAR) FROM _lazyview_state")
+                .await?;
+            ensure!(
+                !rows.is_empty() && rows.iter().all(|(_, s)| s == "ready"),
+                "{what}: the state rows changed: {rows:?}"
+            );
+            c.exec_drop(
+                "UPDATE _lazyview_status SET binlog_pos = ?, server_identity = ?",
+                (pos, identity.clone()),
+            )
+            .await?;
+        }
+        exec(&mut c, "INSERT INTO entities VALUES (13, 3, 'new')").await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "resumed once the cause was undone",
+        )
+        .await?;
+        let snap = eng.snapshot();
+        ensure!(
+            snap.full_rebuilds == 0,
+            "the resume rebuilt: {}",
+            fmt_snapshot(&snap)
+        );
+        eng.stop().await
+    });
+}
+
 #[test]
 fn lifecycle_crash_consistency() {
     scenario("lc_crash", |ctx| async move {
