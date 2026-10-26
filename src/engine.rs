@@ -1671,6 +1671,15 @@ impl Engine {
             info!(view = %name, target = %t, "definition no longer exists; removing its table");
             self.drop_owned(&name, &t).await;
         }
+        // State rows without a table of definitions deleted or disabled while lazyview was
+        // stopped (views in error, waiting or never built): nothing else removes them.
+        if let Ok(rows) = meta::load_state(&mut self.meta).await {
+            for ((name, t), r) in rows {
+                if !r.managed && !used.contains(&(name.clone(), t.clone())) {
+                    let _ = meta::delete_state(&mut self.meta, &name, &t).await;
+                }
+            }
+        }
         // Tables marked as lazyview's in its own schema that no state row records (a crash
         // between creating or swapping a table and recording it).
         if self.cfg.drop_removed {
@@ -1706,9 +1715,12 @@ impl Engine {
         let parsed = analyze::parse_definition(&def).ok();
         self.slots.push(Slot {
             def_id: d.id,
+            // A definition that does not parse (any more) keeps the name recorded in
+            // `_lazyview.name`, so its last good table stays (it is in error, not deleted).
             name: parsed
                 .as_ref()
                 .map(|p| p.name.clone())
+                .or_else(|| d.name.clone())
                 .unwrap_or_else(|| format!("#{}", d.id)),
             wanted: parsed
                 .map(|p| analyze::referenced_tables(&p.query, &self.schema))
@@ -2738,12 +2750,16 @@ impl Engine {
                 let before = self.end_txn(pos);
                 self.txn_foreign = false;
                 self.persist_needed = true;
-                let tables = crate::ddl::statement_tables(&query, &schema);
+                let effects = crate::ddl::statement_effects(&query, &schema);
+                let tables = effects.tables;
                 if !tables.is_empty() {
                     tracing::trace!(%query, "statement affects tables {tables:?}");
                     self.on_tables_changed(&tables, &before);
                     if first_keyword(&query).eq_ignore_ascii_case("TRUNCATE") {
-                        self.on_view_table_truncated(&tables, &before);
+                        self.on_view_table_lost(&tables, &before, "truncated");
+                    } else if !effects.dropped.is_empty() {
+                        // Only removed tables: `DROP INDEX … ON t` names `t` but leaves it.
+                        self.on_view_table_lost(&effects.dropped, &before, "dropped");
                     }
                 }
                 self.after_boundary();
@@ -3055,9 +3071,10 @@ impl Engine {
         }
     }
 
-    /// A view's own table on the source was emptied by `TRUNCATE` (lazyview never truncates
-    /// one): rebuild the view online, as for a source schema change.
-    fn on_view_table_truncated(&mut self, tables: &[TableRef], since: &Position) {
+    /// A view's own table on the source was emptied (`TRUNCATE`) or removed (`DROP TABLE`) by
+    /// hand (lazyview does neither to a live table): rebuild the view online, as for a source
+    /// schema change. A dropped table is created again by the swap.
+    fn on_view_table_lost(&mut self, tables: &[TableRef], since: &Position, how: &str) {
         let hit: Vec<(u64, String)> = self
             .slots
             .iter()
@@ -3071,7 +3088,7 @@ impl Engine {
             })
             .collect();
         for (id, name) in hit {
-            warn!(view = %name, "the view's table was truncated outside lazyview; rebuilding it online");
+            warn!(view = %name, "the view's table was {how} outside lazyview; rebuilding it online");
             self.schedule_replan_at(id, false, false, since);
         }
     }

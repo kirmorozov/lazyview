@@ -210,6 +210,9 @@ SELECT id, user, host, time FROM information_schema.PROCESSLIST
   reconnects with backoff, and the source connection is re-established. That includes a server
   shutting down or restarting (`Server shutdown in progress`) and sessions killed by an admin or a
   proxy; lazyview waits for the server and goes on.
+* At startup every definition is planned again, views in error included: a view stays in
+  `error` only if it still fails (with a fresh `last_error` and `updated_at`), and the state rows
+  of definitions deleted while lazyview was stopped are removed.
 * If the saved binlog file has been purged in the meantime, lazyview fails with `saved binlog
   position … is no longer available`, and before it exits every view's state row says so
   (`state = 'error'`, `last_error` starting with `stale: lazyview stopped:`), since the views no

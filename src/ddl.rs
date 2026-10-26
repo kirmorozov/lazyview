@@ -32,15 +32,36 @@ use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 /// `/*M! … */`) whose content is treated as SQL. A statement the tokenizer rejects yields
 /// `(default_schema, "*")` when it starts like DDL (it cannot be analysed, so assume the worst).
 pub fn statement_tables(query: &str, default_schema: &str) -> Vec<(String, String)> {
+    statement_effects(query, default_schema).tables
+}
+
+/// What a non-row statement may affect.
+#[derive(Debug, Default, PartialEq)]
+pub struct StatementEffects {
+    /// The tables it may have changed, as [`statement_tables`].
+    pub tables: Vec<(String, String)>,
+    /// The base tables it removes: those of `DROP TABLE[S] [IF EXISTS] a, b`. Not `DROP TEMPORARY
+    /// TABLE` (it never removes a base table), `DROP INDEX i ON t` or `DROP VIEW`.
+    pub dropped: Vec<(String, String)>,
+}
+
+/// [`statement_tables`] plus the tables the statement removes (see [`StatementEffects`]).
+pub fn statement_effects(query: &str, default_schema: &str) -> StatementEffects {
     let toks = match lex(query) {
         Some(t) => t,
-        None => return fallback(query, default_schema),
+        None => {
+            return StatementEffects {
+                tables: fallback(query, default_schema),
+                dropped: Vec::new(),
+            }
+        }
     };
     let mut p = Parser {
         t: &toks,
         i: 0,
         schema: default_schema,
         out: Vec::new(),
+        dropped: Vec::new(),
     };
     loop {
         let start = p.i;
@@ -65,13 +86,19 @@ pub fn statement_tables(query: &str, default_schema: &str) -> Vec<(String, Strin
         }
         p.i += 1; // skip `;`
     }
-    let mut out: Vec<(String, String)> = Vec::with_capacity(p.out.len());
-    for t in p.out {
-        if !out.contains(&t) {
-            out.push(t);
+    let dedup = |v: Vec<(String, String)>| {
+        let mut out: Vec<(String, String)> = Vec::with_capacity(v.len());
+        for t in v {
+            if !out.contains(&t) {
+                out.push(t);
+            }
         }
+        out
+    };
+    StatementEffects {
+        tables: dedup(p.out),
+        dropped: dedup(p.dropped),
     }
-    out
 }
 
 /// Significant tokens: whitespace and comments dropped, executable comments expanded.
@@ -166,6 +193,8 @@ struct Parser<'a> {
     i: usize,
     schema: &'a str,
     out: Vec<(String, String)>,
+    /// Base tables removed (`DROP TABLE`), also in `out`.
+    dropped: Vec<(String, String)>,
 }
 
 impl Parser<'_> {
@@ -396,8 +425,16 @@ impl Parser<'_> {
     }
 
     fn drop(&mut self) {
-        self.eat_kw("TEMPORARY");
-        if self.eat_any(&["TABLE", "TABLES", "VIEW"]) {
+        let temporary = self.eat_kw("TEMPORARY");
+        if self.eat_any(&["TABLE", "TABLES"]) {
+            self.eat_if_exists();
+            let from = self.out.len();
+            self.push_name_list();
+            if !temporary {
+                let names = self.out[from..].to_vec();
+                self.dropped.extend(names);
+            }
+        } else if self.eat_kw("VIEW") {
             self.eat_if_exists();
             self.push_name_list();
         } else if self.eat_any(&["DATABASE", "SCHEMA"]) {
@@ -456,7 +493,7 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::statement_tables;
+    use super::{statement_effects, statement_tables};
 
     fn t(q: &str) -> Vec<(String, String)> {
         statement_tables(q, "d")
@@ -466,6 +503,37 @@ mod tests {
         v.iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect()
+    }
+
+    /// Only `DROP TABLE[S]` removes a base table; `DROP INDEX … ON t`, `DROP VIEW`, `DROP TEMPORARY
+    /// TABLE` and `ALTER TABLE … DROP …` name a table without removing it.
+    #[test]
+    fn dropped_tables() {
+        let dropped = |q: &str| statement_effects(q, "d").dropped;
+        assert_eq!(
+            dropped("DROP TABLE a, s.b"),
+            names(&[("d", "a"), ("s", "b")])
+        );
+        assert_eq!(dropped("drop tables if exists `a`"), names(&[("d", "a")]));
+        assert_eq!(dropped("/*!40000 DROP TABLE a */"), names(&[("d", "a")]));
+        assert_eq!(
+            dropped("DROP TABLE a; DROP TABLE b, a"),
+            names(&[("d", "a"), ("d", "b")])
+        );
+        for q in [
+            "DROP INDEX i ON a",
+            "DROP INDEX `i` ON s.a ALGORITHM = INPLACE",
+            "ALTER TABLE a DROP INDEX i",
+            "ALTER TABLE a DROP COLUMN x",
+            "DROP VIEW a",
+            "DROP TEMPORARY TABLE IF EXISTS a",
+            "DROP /*!40005 TEMPORARY */ TABLE IF EXISTS a",
+            "TRUNCATE TABLE a",
+            "DROP DATABASE d",
+        ] {
+            assert!(dropped(q).is_empty(), "{q}");
+            assert!(!statement_tables(q, "d").is_empty(), "{q}");
+        }
     }
 
     #[test]

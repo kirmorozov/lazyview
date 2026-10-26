@@ -58,7 +58,11 @@ UPDATE _lazyview SET rebuild = 1 WHERE name = 'paid_orders';
 A definition that cannot be planned does not stop the service. The view gets `state = 'error'`
 with the reason in `last_error`, and the other views keep working. Planning one definition may
 take at most `LAZYVIEW_PLAN_TIMEOUT_MS` (10 s); past that it is in error until it changes. A view in error because a table
-was missing is retried when the table appears.
+was missing is retried when the table appears. A live view whose definition is changed into one
+that does not parse or plan keeps its last good table (readable, no longer maintained) until the
+definition is fixed; the table is dropped only when the definition row is deleted or disabled.
+At startup every definition is planned again, views in error included: a view stays in error
+only if it still fails, with a fresh `last_error` and `updated_at`.
 
 ## The materialized table
 
@@ -332,7 +336,7 @@ maintained) until an atomic `RENAME TABLE` swap.
 | `targets` changed | built on the new targets; removed targets are dropped after the swap |
 | `enabled = 0` or row deleted | the table is dropped (with `LAZYVIEW_DROP_REMOVED=true`, the default) |
 | `UPDATE _lazyview SET rebuild = 1` | the view is rebuilt online like a changed definition; `rebuild` goes back to `0` once the new table is live. Set while lazyview is stopped, the view is rebuilt at startup instead of resumed |
-| `TRUNCATE` of a view's table on the source | the view is rebuilt online (lazyview never truncates its tables) |
+| `TRUNCATE` or `DROP TABLE` of a view's table on the source | the view is rebuilt online (lazyview never truncates its tables); after a `DROP` the table is missing until the rebuilt one is renamed into place |
 | `ALTER TABLE`, `TRUNCATE` or `RENAME TABLE` of a source table, or an online schema change tool's table swap (`RENAME TABLE t TO t_old, t_new TO t`) | the view is re-planned and rebuilt online. The old table stays readable but is not maintained until the swap |
 | `DROP TABLE` of a source table | the view goes into error (`table … does not exist`); the old table stays readable. It is rebuilt once the table exists again |
 | an upstream lazyview table is swapped (chained view) | the dependent view is rebuilt online; the old version stays maintained |
@@ -374,7 +378,9 @@ lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing column
 | `updated_at` | last change of this row |
 
 A state row deleted by hand is written back as it was within moments (`refreshed_at` restarts).
-The state rows are lazyview's record of which tables it built: do not edit them.
+The state rows are lazyview's record of which tables it built: do not edit them. The rows of a
+definition deleted while lazyview was stopped are removed at the next start (with the table, if
+lazyview built one).
 
 `_lazyview_status`: the saved binlog position per `LAZYVIEW_INSTANCE_ID` (`binlog_file`,
 `binlog_pos`) and the fencing `epoch`, which grows each time an instance takes over.

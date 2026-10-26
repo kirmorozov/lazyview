@@ -3217,6 +3217,237 @@ fn reg_untraced_cascade_reason_is_logged() {
     });
 }
 
+/// The table of the tests below (their own, with neutral names): `(id, grp, status)`.
+const ENTITIES: &[&str] = &[
+    "CREATE TABLE entities (id INT PRIMARY KEY, grp INT NOT NULL, status VARCHAR(10) NOT NULL)",
+    "INSERT INTO entities VALUES (10, 1, 'new'), (11, 1, 'paid'), (12, 2, 'new'), (13, 3, 'paid')",
+];
+
+/// A view's own table dropped by hand stayed `ready` while every refresh failed with 1146, until
+/// `rebuild = 1`. lazyview sees the DROP in the binlog (it never drops a live view's table) and
+/// rebuilds the view online, which creates the table again.
+#[test]
+fn reg_dropped_view_table_is_rebuilt() {
+    scenario("reg_drop_mv", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_counts",
+            Kind::Incremental,
+            "SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_drop_mv", ENTITIES, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let before = eng.snapshot();
+        // Nothing is written afterwards: no failing refresh can bring the table back.
+        exec(&mut c, "DROP TABLE r_counts").await?;
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &db,
+            &std::collections::HashMap::new(),
+            &specs,
+            t_ready(),
+            "after DROP of the view table",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds >= 1,
+            "the dropped table came back without a rebuild?: {}",
+            fmt_snapshot(&d)
+        );
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        exec(&mut c, "UPDATE entities SET grp = 3 WHERE id = 10").await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the rebuild").await?;
+        eng.stop().await
+    });
+}
+
+/// Only a removed view table is rebuilt: `DROP INDEX … ON <view table>` names the table but
+/// leaves it and its rows in place, as do `ALTER TABLE … ADD / DROP INDEX` and `DROP TEMPORARY
+/// TABLE` of the same name. None of them may send the incremental view through a rebuild.
+#[test]
+fn reg_index_ddl_on_view_table_does_not_rebuild() {
+    scenario("reg_idx_mv", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_idx",
+            Kind::Incremental,
+            "SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_idx_mv", ENTITIES, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let before = eng.snapshot();
+        run(
+            &mut c,
+            &[
+                "CREATE INDEX x_n ON r_idx (n)",
+                "DROP INDEX x_n ON r_idx",
+                "ALTER TABLE r_idx ADD INDEX x_n2 (n)",
+                "ALTER TABLE r_idx DROP INDEX x_n2",
+                "DROP TEMPORARY TABLE IF EXISTS r_idx",
+                "INSERT INTO entities VALUES (14, 2, 'new')",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "after index DDL on the view table",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0,
+            "index DDL on the view table rebuilt the view: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
+/// `updated_at` of a view's state row (as text, comparable).
+async fn state_updated_at(c: &mut mysql_async::Conn, name: &str) -> Result<Option<String>> {
+    Ok(c.exec_first(
+        "SELECT CAST(updated_at AS CHAR) FROM _lazyview_state WHERE name = ?",
+        (name,),
+    )
+    .await?)
+}
+
+/// `error` rows across a restart: a definition deleted while lazyview was stopped left its row
+/// behind for good (only rows of tables lazyview built were cleaned), and an error row written
+/// again unchanged kept its old `updated_at`, so it looked like nothing was checked. At startup
+/// every definition in error is planned again: still failing = error with a fresh `updated_at`,
+/// fixed while stopped = built; rows of deleted definitions go.
+#[test]
+fn reg_error_rows_are_rechecked_at_startup() {
+    scenario("reg_err_restart", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_ok",
+            Kind::Incremental,
+            "SELECT id, status FROM entities",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_err_restart", ENTITIES, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        run(
+            &mut c,
+            &[
+                "INSERT INTO _lazyview (name, definition) VALUES ('r_gone', 'SELECT id FROM no_such_a')",
+                "INSERT INTO _lazyview (name, definition) VALUES ('r_still', 'SELECT id FROM no_such_b')",
+                "INSERT INTO _lazyview (name, definition) VALUES ('r_fixed', 'SELECT id FROM no_such_c')",
+            ],
+        )
+        .await?;
+        for n in ["r_gone", "r_still", "r_fixed"] {
+            wait_state(&mut c, &mut eng, n, "error", t_ready()).await?;
+        }
+        let still_before = state_updated_at(&mut c, "r_still").await?;
+        eng.stop().await?;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        run(
+            &mut c,
+            &[
+                "DELETE FROM _lazyview WHERE name = 'r_gone'",
+                "CREATE TABLE no_such_c (id INT PRIMARY KEY)",
+                "INSERT INTO no_such_c VALUES (1), (2)",
+            ],
+        )
+        .await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        let all = vec![
+            specs[0].clone(),
+            ViewSpec::new("r_fixed", Kind::Incremental, "SELECT id FROM no_such_c"),
+        ];
+        // (Not wait_ready: until the new engine has planned it, r_fixed shows its old error.)
+        eng.wait_caught_up(&mut c, t_catchup()).await?;
+        for n in names(&all) {
+            wait_state(&mut c, &mut eng, n, "ready", t_ready()).await?;
+        }
+        let row = wait_state(&mut c, &mut eng, "r_still", "error", t_ready()).await?;
+        ensure!(
+            row.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("no_such_b") && e.contains("does not exist")),
+            "r_still: {row:?}"
+        );
+        let still_after = state_updated_at(&mut c, "r_still").await?;
+        ensure!(
+            still_after > still_before,
+            "r_still was not checked again at startup: updated_at {still_before:?} -> {still_after:?}"
+        );
+        let gone: Option<i64> = c
+            .query_first("SELECT COUNT(*) FROM _lazyview_state WHERE name = 'r_gone'")
+            .await?;
+        ensure!(
+            gone == Some(0),
+            "the state row of a definition deleted while stopped stayed"
+        );
+        verify(&ctx, &mut eng, &db, &all, "after the restart").await?;
+        eng.stop().await
+    });
+}
+
+/// A live definition edited into one that does not parse: the view is in error (the last good
+/// table stays readable), but at the next restart its table was dropped as if the definition
+/// had been deleted. It keeps its name and table until the row is deleted or fixed.
+#[test]
+fn reg_unparseable_definition_keeps_its_table() {
+    scenario("reg_bad_parse", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_keep",
+            Kind::Incremental,
+            "SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp",
+        )];
+        let (db, eng) = setup(&ctx, "reg_bad_parse", ENTITIES, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let good: Vec<(i64, i64)> = c.query("SELECT grp, n FROM r_keep ORDER BY grp").await?;
+        exec(
+            &mut c,
+            "UPDATE _lazyview SET definition = 'CREATE VIEW r_keep AS SELEC grp FROM entities' WHERE name = 'r_keep'",
+        )
+        .await?;
+        let mut eng = eng;
+        for when in ["running", "after a restart"] {
+            if when != "running" {
+                eng.stop().await?;
+                eng = ctx.start_engine(&db, &[])?;
+                // Startup (and its cleanup of tables of deleted definitions) is over.
+                eng.wait_caught_up(&mut c, t_catchup()).await?;
+            }
+            let row = wait_state(&mut c, &mut eng, "r_keep", "error", t_ready()).await?;
+            ensure!(
+                row.last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("SELEC")),
+                "{when}: {row:?}"
+            );
+            ensure!(
+                table_exists(&mut c, "r_keep").await?,
+                "{when}: the last good table of r_keep was dropped"
+            );
+            let now: Vec<(i64, i64)> = c.query("SELECT grp, n FROM r_keep ORDER BY grp").await?;
+            ensure!(now == good, "{when}: r_keep changed: {now:?} vs {good:?}");
+        }
+        exec(
+            &mut c,
+            "UPDATE _lazyview SET definition = 'SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp' WHERE name = 'r_keep'",
+        )
+        .await?;
+        exec(&mut c, "INSERT INTO entities VALUES (14, 2, 'new')").await?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "after the definition was fixed",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
 /// A global `sql_mode` with parser flags (`ANSI_QUOTES`, `PIPES_AS_CONCAT`) must not change
 /// what lazyview maintains: definitions are read and SQL is written in the default mode, so the
 /// engine's sessions drop those flags. Before, the build of a view with `status = "paid"` failed

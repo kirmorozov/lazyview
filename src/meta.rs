@@ -301,7 +301,8 @@ pub async fn set_state(conn: &mut Conn, u: StateUpdate<'_>) -> Result<()> {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, IF(?, CURRENT_TIMESTAMP(3), NULL)) \
          ON DUPLICATE KEY UPDATE `definition_id` = VALUES(`definition_id`), `definition_hash` = VALUES(`definition_hash`), \
          `mode` = VALUES(`mode`), `detail` = VALUES(`detail`), `state` = VALUES(`state`), `managed` = GREATEST(`managed`, VALUES(`managed`)), \
-         `last_error` = VALUES(`last_error`), `refreshed_at` = IF(?, CURRENT_TIMESTAMP(3), `refreshed_at`)",
+         `last_error` = VALUES(`last_error`), `refreshed_at` = IF(?, CURRENT_TIMESTAMP(3), `refreshed_at`), \
+         `updated_at` = CURRENT_TIMESTAMP(3)",
         (u.name, u.target, u.definition_id, u.hash, u.mode, u.detail, u.state, u.managed, u.error, refreshed, refreshed),
     )
     .await?;
