@@ -159,10 +159,35 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
 * `LAZYVIEW_TEST_FULL_REFRESH_MS` is the `LAZYVIEW_FULL_REFRESH_MS` the test engines get
   (default `0`: full-mode views are rebuilt on every flush, so checks are exact right after
   catch-up). With a larger value the checks poll the lazily rebuilt views for up to twice that.
+* `LAZYVIEW_TEST_RENAME=<seed>` runs the monkey-wrench rename test on any suite: every scenario
+  runs twice with the same workload seed, as written and with every name renamed (all schemas,
+  tables, columns, views, CTEs, table and column aliases, indexes and constraints, see
+  `src/analyzer/rename.rs`). The renamed names are opaque random ones plus some that look
+  meaningful or need care: a non-key column named `id`, a key column named `zz9`, plain columns
+  named `x_id` or `*_id`, tables named `*_link`, reserved words and names with spaces, dots,
+  dashes or backticks, mixed case (names that differ only in letter case stay different), and,
+  with `LAZYVIEW_TEST_RENAME_CASE=1`, columns written in a different letter case at each
+  occurrence (off by default while findings RI-1 to RI-4 are open: the analyzer compares some
+  expressions as text). The harness renames every statement a renamed run's connections send
+  (sqlparser's AST finds the names; only lazyview's reserved `_lv_*` / `__lv_*` / `_lazyview*`
+  names and the system schemas stay) and maps names back where a test reads them (result column names, the
+  results of queries on lazyview's metadata, `detail` and `last_error`). Both runs must pass;
+  at the end of the scenario the renamed run must have left the same `_lazyview_state` rows
+  (state, mode, detail, error) and its engines must have logged the same plans (`building
+  view=… mode=… tracing=…`) as the plain run, names mapped back. Engine metrics are compared and
+  printed; they must be equal only with `LAZYVIEW_TEST_RENAME_METRICS=strict` (batching follows
+  timing, so only quiesced, single-writer scenarios have reproducible metrics).
+  Tests that hand names or SQL to lazyview's own functions use `rename_for`, `name_for`,
+  `unrename_plan` and the `typed_*` query helpers of `tests/common`.
+  `tests/rename_invariance.rs` is the strict form: one view per pair of engines, plain and
+  renamed in lockstep, every step quiesced, the same metrics at every step. At the planner level
+  `cargo test --lib` always plans every statement of the block planner's and the analyzer's test
+  corpus under 8 fixed renamings (`src/analyzer/tests_rename.rs`); the known differences (RI-1 to
+  RI-4) run in the ignored `rename_findings`.
 
 Suites in `tests/`: `binlog_stream`, `brutal` (randomized correctness with many overlapping
-views), `ddl`, `efficiency`, `harness_selftest`, `health`, `lifecycle`, `migration`, `regressions`,
-`targets`, `types`, `xa`.
+views), `ddl`, `efficiency`, `harness_selftest`, `health`, `lifecycle`, `migration`,
+`regressions`, `rename_invariance`, `targets`, `types`, `xa`.
 
 Throughput benchmark:
 

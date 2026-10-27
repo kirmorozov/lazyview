@@ -1932,3 +1932,6 @@ fn semi_join_views_are_identified_by_their_from_tables() {
         assert!(!p(sql).rows_identified(), "{sql}");
     }
 }
+
+#[path = "tests_rename.rs"]
+mod rename;
