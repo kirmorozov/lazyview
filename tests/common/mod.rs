@@ -318,6 +318,15 @@ pub fn clip(s: &str, n: usize) -> String {
     }
 }
 
+/// The server's (major, minor) version, e.g. (10, 11) for `10.11.19-MariaDB-log`.
+pub async fn server_version(conn: &mut Conn) -> Result<(u32, u32)> {
+    let version = scalar(conn, "SELECT VERSION()").await?.unwrap_or_default();
+    let mut parts = version
+        .split(|ch: char| !ch.is_ascii_digit())
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    Ok((parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
+}
+
 /// Server's current binlog end (`SHOW BINARY LOG STATUS`, fallback `SHOW MASTER STATUS`).
 pub async fn server_position(conn: &mut Conn) -> Result<Position> {
     let mut res: Result<Vec<Row>> = conn
@@ -482,6 +491,18 @@ impl Ctx {
 
     pub fn note(&self, msg: impl Into<String>) {
         self.notes.lock().unwrap().push(msg.into());
+    }
+
+    /// Reports that this scenario (or a part of it) does not run on this flavor: the line goes to
+    /// the real stderr, past the test harness's capture, so it shows for passing tests too.
+    pub fn skip(&self, why: &str) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP {} on {}: {why}",
+            self.test,
+            self.label()
+        );
     }
 
     /// Seed for a sub-step, derived from the run seed.

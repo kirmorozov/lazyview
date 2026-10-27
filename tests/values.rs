@@ -1,7 +1,8 @@
 //! How values travel from the source through unit filters, lookups and MV writes: BIT values,
 //! unit expressions that are boolean operators, TIME and TIMESTAMP keys (fractions, negative,
-//! over 24 h, DST fall-back hour), long unit keys, zero dates, ENUM/SET in numeric context and
-//! negative TIME(1)/TIME(2) binlog values. Each test runs on every flavor in
+//! over 24 h, DST fall-back hour), long unit keys, zero dates, ENUM/SET in numeric context,
+//! negative TIME(1)/TIME(2) binlog values, BINARY(n) padding, non-UTF8 character sets (latin1,
+//! sjis) and MariaDB's UUID / INET4 / INET6. Each test runs on every flavor in
 //! `LAZYVIEW_TEST_DSNS`.
 
 mod common;
@@ -799,6 +800,371 @@ fn values_negative_short_fraction_time() {
                     "INSERT INTO tq VALUES ('-00:00:00.1', '-00:00:00.01', 5)",
                     "DELETE FROM tq WHERE t1 = '-100:00:00.1'",
                     "UPDATE tq SET t1 = '-800:00:00.9' WHERE t1 = '-838:59:59.0'",
+                ],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}
+
+/// BINARY(n) keys: the binlog drops the trailing 0x00 padding the stored value has, so unit
+/// filters, lookups and joins have to use the padded value (`X'61'` is stored as `X'61000000'`).
+/// Trailing 0x20 is data, a VARBINARY partner compares unpadded, and the PK case changes keys
+/// between padded variants.
+#[test]
+fn values_binary_padding() {
+    scenario("val_binpad", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new("v_entity", Kind::Incremental, "SELECT id, b, g FROM entity"),
+            ViewSpec::new(
+                "v_entity_by_b",
+                Kind::Incremental,
+                "SELECT b, COUNT(*) AS n, SUM(g) AS sg FROM entity GROUP BY b",
+            ),
+            ViewSpec::new(
+                "v_entity_item",
+                Kind::Incremental,
+                "SELECT e.id, e.b, i.attr FROM entity e JOIN item i ON i.k = e.b",
+            ),
+            ViewSpec::new(
+                "v_link_entity",
+                Kind::Incremental,
+                "SELECT l.id, l.attr, e.id AS eid FROM link l LEFT JOIN entity e ON e.b = l.b",
+            ),
+            ViewSpec::new("v_item", Kind::Incremental, "SELECT k, attr FROM item"),
+        ];
+        let ddl = [
+            "CREATE TABLE entity (id INT PRIMARY KEY, b BINARY(4) NULL, g INT NULL, KEY k_b (b))",
+            "CREATE TABLE item (k BINARY(4) NOT NULL PRIMARY KEY, attr VARCHAR(10) NULL)",
+            "CREATE TABLE link (id INT PRIMARY KEY, b VARBINARY(4) NULL, attr VARCHAR(10) NULL)",
+            "INSERT INTO entity VALUES (1, X'61', 1), (2, X'6100', 2), (3, X'61000000', 3), (4, X'00', 4), \
+             (5, '', 5), (6, X'20', 6), (7, X'61626364', 7), (8, NULL, 8), (9, X'FF', 9), (10, X'00000001', 10)",
+            "INSERT INTO item VALUES (X'61', 'a'), (X'', 'empty'), (X'FF', 'ff'), (X'61626364', 'abcd'), \
+             (X'00000001', 'one')",
+            "INSERT INTO link VALUES (1, X'61', 'short'), (2, X'61000000', 'padded'), (3, X'00000000', 'zeros'), \
+             (4, X'', 'empty'), (5, NULL, 'null'), (6, X'6100', 'mid')",
+        ];
+        let (db, mut eng) = setup(
+            &ctx,
+            "val_binpad",
+            &ddl,
+            &specs,
+            &[
+                ("LAZYVIEW_QUERY_CHUNK", "2"),
+                ("LAZYVIEW_BATCH_WINDOW_MS", "0"),
+            ],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        ensure_incremental(&mut c, &specs).await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "other column changes on padded keys",
+                &["UPDATE entity SET g = g + 10 WHERE b = X'61000000' OR b = X'00000000'"],
+            ),
+            (
+                "keys move to and from trailing-zero values",
+                &[
+                    "UPDATE entity SET b = X'610000' WHERE id = 7",
+                    "UPDATE entity SET b = X'00000002' WHERE id = 10",
+                    "UPDATE entity SET b = X'6100' WHERE id = 9",
+                ],
+            ),
+            (
+                "PK with trailing zeros: other column, key change, delete",
+                &[
+                    "UPDATE item SET attr = 'A' WHERE k = X'61000000'",
+                    "UPDATE item SET k = X'610000FF' WHERE k = X'61000000'",
+                    "DELETE FROM item WHERE k = X'00000000'",
+                    "INSERT INTO item VALUES (X'6100', 'again')",
+                ],
+            ),
+            (
+                "trailing 0x20 is data",
+                &[
+                    "UPDATE entity SET b = X'6120' WHERE id = 1",
+                    "INSERT INTO item VALUES (X'6120', 'sp')",
+                    "UPDATE link SET b = X'6120' WHERE id = 4",
+                ],
+            ),
+            (
+                "VARBINARY partner moves between padded and unpadded",
+                &[
+                    "UPDATE link SET b = X'610000' WHERE id = 1",
+                    "UPDATE link SET b = X'61000000' WHERE id = 6",
+                    "UPDATE link SET b = X'00' WHERE id = 3",
+                ],
+            ),
+            (
+                "insert / delete by padded value",
+                &[
+                    "INSERT INTO entity VALUES (11, X'FF000000', 11), (12, X'FF', 12), (13, X'', 13)",
+                    "DELETE FROM entity WHERE b = X'00000000'",
+                    "DELETE FROM item WHERE k = X'FF000000'",
+                ],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}
+
+/// Non-UTF8 character sets end to end: latin1 (bytes >= 0x80 are not UTF-8; latin1_swedish_ci
+/// has `e` = `é`, `ü` = `y` and pads with spaces) and sjis (two-byte characters whose second
+/// byte is 0x5C, the backslash, e.g. 表 = 0x955C; `CHAR(150)` is 300 bytes, a two-byte length
+/// in row images). Group views take `MIN(id)` as the group's name: which member's spelling the
+/// server shows for a group of equal keys is not defined. Such columns as keys (group, join,
+/// primary key) run on MySQL and Percona only: on MariaDB that is a known limitation (issue
+/// #25), its lookups turn their non-UTF-8 bytes into '?', so changes of such keys are not
+/// refreshed.
+#[test]
+fn values_non_utf8_charsets() {
+    scenario("val_charsets", |ctx| async move {
+        let mut specs = vec![
+            ViewSpec::new(
+                "v_entity",
+                Kind::Incremental,
+                "SELECT id, a, b, c, d, g FROM entity",
+            ),
+            ViewSpec::new(
+                "v_entity_by_g",
+                Kind::Incremental,
+                "SELECT g % 3 AS k, COUNT(*) AS n, GROUP_CONCAT(a ORDER BY id SEPARATOR '|') AS la, \
+                 GROUP_CONCAT(c ORDER BY id SEPARATOR '|') AS lc FROM entity GROUP BY g % 3",
+            ),
+        ];
+        let keys = vec![
+            ViewSpec::new(
+                "v_entity_by_a",
+                Kind::Incremental,
+                "SELECT MIN(id) AS k, COUNT(*) AS n, SUM(g) AS sg FROM entity GROUP BY a",
+            ),
+            ViewSpec::new(
+                "v_entity_by_c",
+                Kind::Incremental,
+                "SELECT MIN(id) AS k, COUNT(*) AS n, MAX(LENGTH(d)) AS ld FROM entity GROUP BY c",
+            ),
+            ViewSpec::new(
+                "v_entity_item",
+                Kind::Incremental,
+                "SELECT e.id, e.a, i.attr, i.label FROM entity e JOIN item i ON i.attr = e.a",
+            ),
+            ViewSpec::new(
+                "v_item",
+                Kind::Incremental,
+                "SELECT attr, label FROM item WHERE label <> '表'",
+            ),
+        ];
+        if ctx.server().is_mariadb() {
+            ctx.skip("key views: known limitation, issue #25");
+        } else {
+            specs.extend(keys);
+        }
+        let ddl = [
+            "CREATE TABLE entity (id INT PRIMARY KEY, a VARCHAR(10) CHARACTER SET latin1 NULL, \
+             b CHAR(10) CHARACTER SET latin1 NULL, c VARCHAR(10) CHARACTER SET sjis NULL, \
+             d CHAR(150) CHARACTER SET sjis NULL, g INT NULL, KEY k_a (a), KEY k_c (c))",
+            "CREATE TABLE item (attr VARCHAR(10) CHARACTER SET latin1 NOT NULL PRIMARY KEY, \
+             label VARCHAR(10) CHARACTER SET sjis NULL)",
+            "INSERT INTO entity VALUES (1, 'café', 'É', '表', REPEAT('表', 150), 1), \
+             (2, 'CAFE', 'e', 'ソ', 'ソ', 2), (3, 'cafe ', 'ü ', '能', '', 3), \
+             (4, 'naïve', 'ß', 'ﾊﾟ', NULL, 4), (5, 'ÿ', NULL, '\\\\', '表\\\\', 5), \
+             (6, 'y', 'y', 'a\\\\b', 'ﾊﾟ', 6), (7, 'ü', '×÷', '表', '能', 7), (8, '', '', '', '', 8), \
+             (9, NULL, NULL, NULL, NULL, 9), (10, _latin1 X'E9FFD7', _latin1 X'F7', '能能', REPEAT('ソ', 149), 10)",
+            "INSERT INTO item VALUES ('café', '表'), ('naïve', 'ソ'), ('ÿ', 'ﾊﾟ'), ('', '\\\\'), ('×', NULL)",
+        ];
+        let (db, mut eng) = setup(
+            &ctx,
+            "val_charsets",
+            &ddl,
+            &specs,
+            &[
+                ("LAZYVIEW_QUERY_CHUNK", "2"),
+                ("LAZYVIEW_BATCH_WINDOW_MS", "0"),
+            ],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        ensure_incremental(&mut c, &specs).await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "other column changes, keys unchanged",
+                &["UPDATE entity SET g = g + 10 WHERE id <= 5"],
+            ),
+            (
+                "case / accent / trailing-space-only key changes",
+                &[
+                    "UPDATE entity SET a = 'CAFÉ' WHERE id = 1",
+                    "UPDATE entity SET a = 'cafe' WHERE id = 3",
+                    "UPDATE entity SET a = 'Y' WHERE id = 7",
+                    "UPDATE entity SET b = 'É ' WHERE id = 1",
+                ],
+            ),
+            (
+                "join partner PK changes to an equal key",
+                &[
+                    "UPDATE item SET attr = 'CAFE' WHERE attr = 'café'",
+                    "UPDATE item SET label = 'ソ' WHERE attr = 'ÿ'",
+                ],
+            ),
+            (
+                "sjis keys with a 0x5C second byte",
+                &[
+                    "UPDATE entity SET c = '能' WHERE c = '表'",
+                    "UPDATE entity SET d = CONCAT(d, 'ソ') WHERE id = 2",
+                    "UPDATE entity SET c = '表\\\\' WHERE id = 5",
+                    "DELETE FROM entity WHERE c = 'ソ'",
+                ],
+            ),
+            (
+                "latin1 PK by value, non-UTF8 bytes as keys",
+                &[
+                    "DELETE FROM item WHERE attr = 'NAÏVE'",
+                    "INSERT INTO item VALUES (_latin1 X'E9FFD7', '能')",
+                    "UPDATE entity SET a = _latin1 X'E9FFD7' WHERE id = 4",
+                    "UPDATE item SET attr = 'y' WHERE attr = 'ÿ'",
+                ],
+            ),
+            (
+                "insert / delete a group of equal keys",
+                &[
+                    "INSERT INTO entity VALUES (11, 'É', 'e', 'ソ', 'ソ', 11), (12, 'ü ', NULL, '表', NULL, 12)",
+                    "DELETE FROM entity WHERE a = 'e'",
+                    "DELETE FROM entity WHERE a = 'cafe'",
+                ],
+            ),
+        ];
+        for (what, stmts) in steps {
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}
+
+/// MariaDB UUID, INET4 and INET6 values as SPJ columns, group keys, join keys and a PK: their
+/// row-image bytes are not what the server compares (UUIDs of version 1 are stored with their
+/// time fields swapped), so views whose rows they select are planned Full (the SPJ view over an
+/// integer key stays incremental). Zero / max values, IPv4-mapped IPv6, upper-case input and
+/// `UUID()`. The other servers have no such types.
+#[test]
+fn values_mariadb_uuid_inet() {
+    scenario("val_uuid_inet", |ctx| async move {
+        if !ctx.server().is_mariadb() {
+            ctx.skip("UUID / INET4 / INET6 are MariaDB types");
+            return Ok(());
+        }
+        let mut c = connect(&ctx.server().base_dsn).await?;
+        let version = server_version(&mut c).await?;
+        c.disconnect().await.ok();
+        if version < (10, 10) {
+            ctx.skip("UUID (MariaDB 10.7) and INET4 (10.10) are newer than this server");
+            return Ok(());
+        }
+        let specs = vec![
+            ViewSpec::new(
+                "v_entity",
+                Kind::Incremental,
+                "SELECT id, u, a, b, g FROM entity",
+            ),
+            ViewSpec::new(
+                "v_entity_by_a",
+                Kind::Full,
+                "SELECT a, COUNT(*) AS n, SUM(g) AS sg FROM entity GROUP BY a",
+            ),
+            ViewSpec::new(
+                "v_entity_by_u",
+                Kind::Full,
+                "SELECT u, COUNT(*) AS n FROM entity GROUP BY u",
+            ),
+            ViewSpec::new(
+                "v_entity_item",
+                Kind::Full,
+                "SELECT e.id, e.u, i.attr FROM entity e JOIN item i ON i.u = e.u",
+            ),
+            ViewSpec::new(
+                "v_link_entity",
+                Kind::Full,
+                "SELECT l.id, l.attr, e.id AS eid FROM link l LEFT JOIN entity e ON e.b = l.b",
+            ),
+            ViewSpec::new("v_item", Kind::Full, "SELECT u, attr FROM item"),
+        ];
+        let ddl = [
+            "CREATE TABLE entity (id INT PRIMARY KEY, u UUID NULL, a INET4 NULL, b INET6 NULL, g INT NULL, \
+             KEY k_u (u), KEY k_a (a))",
+            "CREATE TABLE item (u UUID NOT NULL PRIMARY KEY, attr VARCHAR(10) NULL)",
+            "CREATE TABLE link (id INT PRIMARY KEY, b INET6 NULL, attr VARCHAR(10) NULL)",
+            "INSERT INTO entity VALUES \
+             (1, '00000000-0000-0000-0000-000000000000', '0.0.0.0', '::', 1), \
+             (2, 'ffffffff-ffff-ffff-ffff-ffffffffffff', '255.255.255.255', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', 2), \
+             (3, '123e4567-e89b-12d3-a456-426614174000', '10.0.0.1', '::1', 3), \
+             (4, '550e8400-e29b-41d4-a716-446655440000', '10.0.0.1', '::ffff:192.0.2.1', 4), \
+             (5, 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', '192.0.2.1', '2001:db8::1', 5), \
+             (6, UUID(), NULL, NULL, 6), (7, NULL, '10.0.0.1', '::1', 7), \
+             (8, '123e4567-e89b-12d3-a456-426614174000', '192.0.2.1', '::ffff:192.0.2.1', 8)",
+            "INSERT INTO item VALUES ('00000000-0000-0000-0000-000000000000', 'zero'), \
+             ('123e4567-e89b-12d3-a456-426614174000', 'v1'), ('550e8400-e29b-41d4-a716-446655440000', 'v4'), \
+             ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'upper')",
+            "INSERT INTO link VALUES (1, '::1', 'loop'), (2, '::ffff:192.0.2.1', 'mapped'), (3, '::', 'any'), \
+             (4, NULL, 'null'), (5, '2001:db8::2', 'none')",
+        ];
+        let (db, mut eng) = setup(
+            &ctx,
+            "val_uuid_inet",
+            &ddl,
+            &specs,
+            &[
+                ("LAZYVIEW_QUERY_CHUNK", "2"),
+                ("LAZYVIEW_BATCH_WINDOW_MS", "0"),
+            ],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        ensure_incremental(&mut c, &specs).await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "other column changes, keys unchanged",
+                &["UPDATE entity SET g = g + 10 WHERE a = '10.0.0.1'"],
+            ),
+            (
+                "keys move",
+                &[
+                    "UPDATE entity SET u = 'ffffffff-ffff-ffff-ffff-ffffffffffff' WHERE id = 1",
+                    "UPDATE entity SET a = '255.255.255.255' WHERE id = 3",
+                    "UPDATE entity SET b = '::ffff:10.0.0.1' WHERE id = 4",
+                    "UPDATE entity SET u = '550E8400-E29B-41D4-A716-446655440000' WHERE id = 8",
+                ],
+            ),
+            (
+                "UUID PK: other column, key change, delete",
+                &[
+                    "UPDATE item SET attr = 'zero2' WHERE u = '00000000-0000-0000-0000-000000000000'",
+                    "UPDATE item SET u = UUID() WHERE attr = 'v4'",
+                    "UPDATE item SET u = 'ffffffff-ffff-ffff-ffff-ffffffffffff' WHERE attr = 'upper'",
+                    "DELETE FROM item WHERE u = '123e4567-e89b-12d3-a456-426614174000'",
+                ],
+            ),
+            (
+                "join partner moves",
+                &[
+                    "UPDATE link SET b = '::' WHERE id = 1",
+                    "UPDATE link SET b = '2001:db8::1' WHERE id = 5",
+                ],
+            ),
+            (
+                "insert / delete by value",
+                &[
+                    "INSERT INTO entity VALUES (9, UUID(), '0.0.0.0', '::', 9), \
+                     (10, '00000000-0000-0000-0000-000000000000', '10.0.0.1', '::1', 10)",
+                    "DELETE FROM entity WHERE b = '::1'",
+                    "INSERT INTO item VALUES ('123e4567-e89b-12d3-a456-426614174000', 'back')",
                 ],
             ),
         ];

@@ -111,6 +111,11 @@ and kept because AWS still runs them). The published pre-releases (MariaDB 13.1 
 are tested as advisory: tested, not supported. Details and dates:
 [Server setup](docs/server-setup.md#supported-servers).
 
+## Known limitations
+
+Known limitations are tracked as GitHub issues with the label "known limitation":
+https://github.com/kirmorozov/lazyview/issues?q=is:issue%20is:open%20label:%22known%20limitation%22
+
 ## Documentation
 
 * [Server setup](docs/server-setup.md): binlog settings per server, RDS and Aurora, user and grants.

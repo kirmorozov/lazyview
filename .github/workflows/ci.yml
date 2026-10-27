@@ -134,8 +134,10 @@ jobs:
         env:
           LAZYVIEW_TEST_DSNS: ${{ matrix.flavor }}=mysql://lv:lv@127.0.0.1:${{ matrix.port }}/lvtest
           LAZYVIEW_HEALTH_ADDR: "off"
-          # Suites run one binary at a time here, so the DST test may change GLOBAL time_zone.
+          # Suites run one binary at a time here, so the DST test may change GLOBAL time_zone and
+          # the MariaDB refusal test GLOBAL log_bin_compress.
           LAZYVIEW_TEST_GLOBAL_TZ: "1"
+          LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS: "1"
           # One server here: the multi-server scenarios skip (visibly) instead of failing, which
           # the harness does by default when CI is set; integration-multi runs them.
           LAZYVIEW_TEST_REQUIRE_MULTI: "0"

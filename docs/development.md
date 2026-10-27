@@ -153,6 +153,9 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
 * `LAZYVIEW_TEST_GLOBAL_SQL_MODE=1` enables the regression test that changes the servers' GLOBAL
   `sql_mode` (`tests/regressions.rs`, ANSI quotes); same rule: no other suite on the same servers
   at the same time.
+* `LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1` enables `lifecycle_refuses_log_bin_compress`, which
+  turns MariaDB's GLOBAL `log_bin_compress` on for a moment; same rule (CI sets it). Compressed
+  events other sessions write meanwhile would stop every engine reading them.
 * `LAZYVIEW_TEST_SKIP_VIEWS` and `LAZYVIEW_TEST_ONLY_VIEWS` (comma-separated view names) drop or
   keep views of the shared view sets, to look past a known bug in one view or to reduce a failure
   to a minimal reproduction. The run prints what was filtered.
