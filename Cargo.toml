@@ -24,7 +24,7 @@ thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
 serde_json = { version = "1", features = ["float_roundtrip"] }
-roaring = "0.11"
+roaring = "0.12"
 
 [dev-dependencies]
 rand = "0.10"
