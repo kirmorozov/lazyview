@@ -17,9 +17,12 @@ exits with one message per problem, and each message says how to fix it on that 
 Recommended:
 
 * **GTIDs** on MySQL and Percona (`gtid_mode=ON`, `enforce_gtid_consistency=ON`). Before reading
-  the sources after a change, lazyview then waits for that exact transaction to be visible
-  (`WAIT_FOR_EXECUTED_GTID_SET`). Without GTIDs, and always on MariaDB, it waits a fixed
-  `LAZYVIEW_VISIBILITY_DELAY_MS` (20 ms) instead.
+  the sources after a change, lazyview waits for that exact transaction to be visible
+  (`WAIT_FOR_EXECUTED_GTID_SET`). Without GTIDs, Percona Server and MariaDB are still exact:
+  lazyview waits until the binlog position of a consistent snapshot (`Binlog_snapshot_file` /
+  `Binlog_snapshot_position`) reaches the position it read. Only Oracle MySQL without GTIDs falls
+  back to a fixed `LAZYVIEW_VISIBILITY_DELAY_MS` (20 ms), which is not exact under load
+  ([#28](https://github.com/kirmorozov/lazyview/issues/28)).
 * **Binlog retention** longer than the longest lazyview outage you want to survive. If the saved
   position has been purged when lazyview comes back, it fails, or rebuilds every view with
   `LAZYVIEW_ON_MISSING_BINLOG=rebuild`. The settings are `binlog_expire_logs_seconds` (MySQL,
@@ -213,6 +216,9 @@ GRANT SELECT ON other_schema.* TO 'lazyview'@'%';
 * On each [target](views.md#targets-one-source-many-servers), the target's user needs the second
   `GRANT` on the target schema. Targets need no replication privileges.
 * If a privilege is missing, lazyview's error message includes the `GRANT` statements to run.
+* On MariaDB 10.5.2 and later, `REPLICATION CLIENT` is an alias of `BINLOG MONITOR`: `SHOW GRANTS`
+  prints `GRANT REPLICATION SLAVE, BINLOG MONITOR ON *.*` for the documented `GRANT`. Same
+  privilege, nothing to change.
 
 ## Verify
 
