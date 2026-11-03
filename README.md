@@ -68,6 +68,12 @@ UPDATE _lazyview SET definition = 'SELECT customer, COUNT(*) AS n FROM orders GR
 DELETE FROM _lazyview WHERE name = 'customer_totals';
 ```
 
+Platforms:
+
+* Linux: the static binary (x86_64, aarch64) or the Docker image (linux/amd64, linux/arm64).
+* macOS: use Docker; the image runs natively on Apple Silicon as linux/arm64.
+* Windows: use WSL 2 and follow the Linux steps, or Docker.
+
 ## How it works
 
 * The binlog says which rows changed; lazyview re-reads only the affected units (rows or groups)

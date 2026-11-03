@@ -2,6 +2,9 @@
 
 ## Building
 
+macOS: develop with Docker; building and testing inside a Linux container is the supported path.
+Windows: use WSL 2 (then everything below applies) or Docker.
+
 ```sh
 make build        # cargo build --release --locked → target/release/lazyview
 make cross        # static musl binaries for x86_64 and aarch64 (needs zig, cargo-zigbuild and both rustup targets)
@@ -15,7 +18,9 @@ in the `Dockerfile`).
 ## Local test servers
 
 Integration tests run against real MySQL, MariaDB and Percona servers: the matrix of
-[Server setup](server-setup.md#supported-servers), one flavor name per line. Two ways to get
+[Server setup](server-setup.md#supported-servers), one flavor name per line. Compose mode (Docker)
+works on macOS and Windows; on Windows, WSL 2 works too. The tarball mode needs the host libraries
+libaio, libnuma and libncurses, and is Linux only. Two ways to get
 them, with the same flavor names, ports, credentials and settings (so `LAZYVIEW_TEST_DSNS` and the
 test harness do not care which one runs a flavor):
 
