@@ -138,6 +138,8 @@ jobs:
           # the MariaDB refusal test GLOBAL log_bin_compress.
           LAZYVIEW_TEST_GLOBAL_TZ: "1"
           LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS: "1"
+          # visibility.rs sets GLOBAL sync_binlog, binlog_group_commit_sync_delay and binlog_order_commits (one binary at a time).
+          LAZYVIEW_TEST_GLOBAL_BINLOG_COMMIT: "1"
           # One server here: the multi-server scenarios skip (visibly) instead of failing, which
           # the harness does by default when CI is set; integration-multi runs them.
           LAZYVIEW_TEST_REQUIRE_MULTI: "0"

@@ -10,6 +10,7 @@ pub mod coord;
 pub mod datum;
 pub mod ddl;
 pub mod engine;
+pub mod fence;
 pub mod health;
 pub mod lookback;
 pub mod metrics;

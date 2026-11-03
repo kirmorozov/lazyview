@@ -29,8 +29,9 @@ The caller gives you either
 - A generic DEDUP CORE handles the consumer per source table, the per-target queue and deduplicating
   buffer, position bookkeeping and the target-action hooks.
 - Another tool copies these files VERBATIM: src/binlog.rs, src/datum.rs, src/catalog.rs, src/analyze.rs,
-  src/analyzer/*, and the dedup core files (src/dedup.rs, src/dedup/**, or whatever files the change
-  declares as the core). Together they form the COPY SET.
+  src/analyzer/*, src/fence.rs (the commit-order visibility fence, #28), and the dedup core files
+  (src/dedup.rs, src/dedup/**, or whatever files the change declares as the core). Together they form
+  the COPY SET.
 
 ## Procedure (run every step, in the order S1, S2, S3, S3b, S4 to S8; record each command and its result)
 
