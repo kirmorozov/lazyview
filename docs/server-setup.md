@@ -16,13 +16,17 @@ exits with one message per problem, and each message says how to fix it on that 
 
 Recommended:
 
-* **GTIDs** on MySQL and Percona (`gtid_mode=ON`, `enforce_gtid_consistency=ON`). Before reading
-  the sources after a change, lazyview waits for that exact transaction to be visible
-  (`WAIT_FOR_EXECUTED_GTID_SET`). Without GTIDs, Percona Server and MariaDB are still exact:
-  lazyview waits until the binlog position of a consistent snapshot (`Binlog_snapshot_file` /
-  `Binlog_snapshot_position`) reaches the position it read. Only Oracle MySQL without GTIDs falls
-  back to a fixed `LAZYVIEW_VISIBILITY_DELAY_MS` (20 ms), which is not exact under load
-  ([#28](https://github.com/kirmorozov/lazyview/issues/28)).
+* **GTIDs** on MySQL and Percona (`gtid_mode=ON`, `enforce_gtid_consistency=ON`) save one write per
+  refresh but are not needed for exact views. Before reading the sources after a change, lazyview
+  makes sure what it read from the binlog is visible: with GTIDs it waits for that transaction
+  (`WAIT_FOR_EXECUTED_GTID_SET`); MariaDB and Percona without GTIDs wait until the binlog position
+  of a consistent snapshot (`Binlog_snapshot_file` / `_position`) reaches the position read; Oracle
+  MySQL without GTIDs (also Amazon RDS / Aurora) commits one row of its own (`_lazyview_fence`, one
+  row per instance): with `binlog_order_commits=ON` (the default) MySQL commits in binlog order, so
+  every earlier transaction is visible when it returns. With `binlog_order_commits=OFF` lazyview
+  warns and waits a fixed `LAZYVIEW_VISIBILITY_DELAY_MS` (20 ms), which is not exact under load.
+* **binlog_order_commits=ON** (the default) on Oracle MySQL without GTIDs, so the visibility fence
+  above is exact. With OFF lazyview starts, logs one warning and uses the fixed delay.
 * **Binlog retention** longer than the longest lazyview outage you want to survive. If the saved
   position has been purged when lazyview comes back, it fails, or rebuilds every view with
   `LAZYVIEW_ON_MISSING_BINLOG=rebuild`. The settings are `binlog_expire_logs_seconds` (MySQL,
@@ -227,9 +231,10 @@ As the lazyview user, on the source:
 ```sql
 SHOW VARIABLES WHERE Variable_name IN
   ('log_bin', 'binlog_format', 'binlog_row_image', 'binlog_row_value_options',
-   'log_bin_compress', 'gtid_mode');
+   'log_bin_compress', 'binlog_order_commits', 'gtid_mode');
 -- expect log_bin ON, binlog_format ROW, binlog_row_image FULL,
--- binlog_row_value_options empty (MySQL), log_bin_compress OFF (MariaDB)
+-- binlog_row_value_options empty (MySQL), log_bin_compress OFF (MariaDB),
+-- binlog_order_commits ON (Oracle MySQL without GTIDs)
 SHOW GRANTS;
 SHOW BINARY LOGS;  -- works only with REPLICATION CLIENT; lists the retained binlog files
 ```

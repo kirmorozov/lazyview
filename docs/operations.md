@@ -244,6 +244,7 @@ SELECT * FROM _lazyview_overview;                     -- every view: state, mode
 SELECT name, target, state, last_error, refreshed_at
   FROM _lazyview_state WHERE state <> 'ready';        -- what is building or broken
 SELECT * FROM _lazyview_status;                       -- saved binlog position per LAZYVIEW_INSTANCE_ID
+SELECT * FROM _lazyview_fence;                        -- Oracle MySQL without GTIDs: visibility-fence counter per LAZYVIEW_INSTANCE_ID (safe to drop; re-created)
 SELECT id, user, host, time FROM information_schema.PROCESSLIST
  WHERE command LIKE 'Binlog Dump%';                   -- lazyview's replication connection
 ```

@@ -92,7 +92,7 @@ LAZYVIEW_TARGET_REPORTING_DSN=mysql://lazyview:change-me@reporting-db:3306/repor
 | `LAZYVIEW_WRITE_BATCH_ROWS` | `500` | rows per multi-row `INSERT` into a view table |
 | `LAZYVIEW_WRITE_BATCH_BYTES` | `4194304` | estimated bytes per `INSERT` or `DELETE` statement into a view table (at least `1024`), capped at half of each server's `max_allowed_packet`. A row larger than that is written alone. Statements also stay under 60,000 placeholders |
 | `LAZYVIEW_BUILD_CONCURRENCY` | `2` | view builds running at once; each holds one source connection plus one per target |
-| `LAZYVIEW_VISIBILITY_DELAY_MS` | `20` | wait before reading the sources when no GTID fence is available (MariaDB, or `gtid_mode=OFF`). Binlog events can arrive before their transaction is visible to readers |
+| `LAZYVIEW_VISIBILITY_DELAY_MS` | `20` | fallback wait before reading the sources when no exact visibility check is available: Oracle MySQL with GTIDs off and `binlog_order_commits=OFF`, or when lazyview cannot write `_lazyview_fence` (both logged as a warning). Unused otherwise |
 | `LAZYVIEW_HEARTBEAT_MS` | `5000` | replication heartbeat period (minimum `100`) |
 | `LAZYVIEW_POSITION_PERSIST_MS` | `5000` | how often the binlog position is saved when nothing else is written |
 

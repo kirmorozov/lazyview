@@ -22,9 +22,11 @@
   change those lookups could see is combined with them before they are dropped
   (`src/lookback.rs` has the argument). Too many remembered images rebuild that view online.
 * **Visibility fence.** Binlog events arrive before their transaction is visible. Before reading
-  the sources lazyview waits for it: `WAIT_FOR_EXECUTED_GTID_SET` (MySQL / Percona with GTIDs), or
-  the binlog position of a consistent snapshot (MariaDB and Percona Server commit in binlog
-  order), else `LAZYVIEW_VISIBILITY_DELAY_MS`.
+  the sources lazyview waits for it: `WAIT_FOR_EXECUTED_GTID_SET` (MySQL / Percona with GTIDs),
+  or the binlog position of a consistent snapshot (MariaDB, Percona), or else (Oracle MySQL
+  without GTIDs) one commit of its own to `_lazyview_fence`: with `binlog_order_commits=ON` the
+  server commits in binlog order, so when it returns every transaction read is visible. Only
+  with `binlog_order_commits=OFF` (warned) `LAZYVIEW_VISIBILITY_DELAY_MS`.
 * **De-duplication.** Unit keys are buffered for `LAZYVIEW_BATCH_WINDOW_MS` (200 ms), single-column
   integer keys in roaring bitmaps and others in hash sets. 30 writes to order 42 across `orders`,
   `order_items` and `payments` become one refresh of unit 42.

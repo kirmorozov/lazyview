@@ -161,6 +161,12 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
 * `LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1` enables `lifecycle_refuses_log_bin_compress`, which
   turns MariaDB's GLOBAL `log_bin_compress` on for a moment; same rule (CI sets it). Compressed
   events other sessions write meanwhile would stop every engine reading them.
+* `LAZYVIEW_TEST_GLOBAL_BINLOG_COMMIT=1` enables `tests/visibility.rs`, which changes the servers'
+  GLOBAL `sync_binlog`, `binlog_group_commit_sync_delay` and `binlog_order_commits` while each test
+  runs (restored afterwards). It only runs against Oracle MySQL with `gtid_mode=OFF`; every other
+  server skips it. Same rule: no other suite on the same server at the same time (CI sets it).
+* `LAZYVIEW_TEST_PURGE_BINLOGS=1` enables `reg_saved_position_purged_while_down`, which purges the
+  server's binlogs up to the newest file; only on a server no other binlog reader uses (CI sets it).
 * `LAZYVIEW_TEST_SKIP_VIEWS` and `LAZYVIEW_TEST_ONLY_VIEWS` (comma-separated view names) drop or
   keep views of the shared view sets, to look past a known bug in one view or to reduce a failure
   to a minimal reproduction. The run prints what was filtered.
