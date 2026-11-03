@@ -180,6 +180,52 @@ pub(crate) fn blocker(b: &Block) -> Option<String> {
     None
 }
 
+/// Rename-invariance key for an expression: identifiers are rewritten by the
+/// server's rules, then the result is rendered. A column identifier or alias
+/// (`Expr::Identifier` and the last part of an `Expr::CompoundIdentifier`)
+/// and a function name are case-insensitive, and quoting does not change an
+/// identifier; the other parts of a compound identifier keep their case;
+/// string literals and everything else keep their exact text.
+pub(crate) fn expr_key(e: &Expr) -> String {
+    use sqlparser::ast::{VisitMut, VisitorMut};
+
+    struct Keyer;
+
+    impl VisitorMut for Keyer {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+            match e {
+                Expr::Identifier(i) => {
+                    i.value = i.value.to_lowercase();
+                    i.quote_style = None;
+                }
+                Expr::CompoundIdentifier(parts) => {
+                    for p in parts.iter_mut() {
+                        p.quote_style = None;
+                    }
+                    if let Some(col) = parts.last_mut() {
+                        col.value = col.value.to_lowercase();
+                    }
+                }
+                Expr::Function(f) => {
+                    for part in &mut f.name.0 {
+                        if let ObjectNamePart::Identifier(i) = part {
+                            i.value = i.value.to_lowercase();
+                            i.quote_style = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut expr = e.clone();
+    let _ = expr.visit(&mut Keyer);
+    expr.to_string()
+}
+
 impl Block {
     fn converted_distinct(&self) -> bool {
         self.distinct_was
@@ -750,12 +796,12 @@ fn merge_up(b: &mut Block) -> Result<()> {
     let mut inner = *inner;
     qualify(&mut inner)?;
     let keys: HashSet<String> = group_exprs(&inner.select)
-        .map(|es| es.iter().map(|e| nested(e.clone()).to_string()).collect())
+        .map(|es| es.iter().map(|e| expr_key(&nested(e.clone()))).collect())
         .unwrap_or_default();
     let is_key: Vec<bool> = inner
         .outputs
         .iter()
-        .map(|o| keys.contains(&nested(o.expr.clone()).to_string()))
+        .map(|o| keys.contains(&expr_key(&nested(o.expr.clone()))))
         .collect();
     let subst: HashMap<(usize, usize), Expr> = inner
         .outputs
@@ -879,7 +925,7 @@ fn pull_up(b: &mut Block) -> Result<()> {
     let mut q = (**inner).clone();
     qualify(&mut q)?;
     let keys: HashSet<String> = group_exprs(&q.select)
-        .map(|es| es.iter().map(|e| nested(e.clone()).to_string()).collect())
+        .map(|es| es.iter().map(|e| expr_key(&nested(e.clone()))).collect())
         .unwrap_or_default();
     let qr = Resolver::new(&q);
     let column_of = |e: &Expr, r: &Resolver, items: &[Item]| -> Option<crate::catalog::Column> {
@@ -891,7 +937,7 @@ fn pull_up(b: &mut Block) -> Result<()> {
     let out_key: Vec<bool> = q
         .outputs
         .iter()
-        .map(|o| keys.contains(&nested(o.expr.clone()).to_string()))
+        .map(|o| keys.contains(&expr_key(&nested(o.expr.clone()))))
         .collect();
     let out_agg: Vec<bool> = q.outputs.iter().map(|o| has_aggregate(&o.expr)).collect();
     let out_col: Vec<Option<crate::catalog::Column>> = q
@@ -1079,11 +1125,11 @@ fn distinct_to_group(b: &mut Block) {
             let out: HashSet<String> = b
                 .outputs
                 .iter()
-                .map(|o| nested(o.expr.clone()).to_string())
+                .map(|o| expr_key(&nested(o.expr.clone())))
                 .collect();
             let resolved_ordinals = es.iter().all(|e| match e {
                 Expr::Value(v) => matches!(v.value, Value::Number(..)),
-                e => out.contains(&nested(e.clone()).to_string()),
+                e => out.contains(&expr_key(&nested(e.clone()))),
             });
             if !resolved_ordinals {
                 return;

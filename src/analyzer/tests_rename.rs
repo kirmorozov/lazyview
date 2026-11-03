@@ -27,10 +27,10 @@ fn seeds() -> Vec<u64> {
     (0..8).map(|k| 0x5eed_0000 + k).collect()
 }
 
-/// Corpus cases whose renamed plan differs today: (finding id, part of the statement, only when
-/// columns are written in varying letter case). Skipped by the always-on test, run by
-/// `rename_findings`. All four compare expressions by their rendered text, in which the letter
-/// case of a column name counts (columns are case-insensitive):
+/// Corpus cases that exercise the letter case of column names: (finding id, part of the
+/// statement, only when columns are written in varying letter case). Skipped by the always-on
+/// test, asserted by `rename_findings` under the case-varying seeds. The analyzer now keys these
+/// expressions case-insensitively (`expr_key`), so the plans agree:
 ///
 /// RI-1 (`analyze::plan_block`): the unit of a windowed view is the PARTITION BY its windows
 /// share; `customer_id` in one window and `CUSTOMER_ID` in the other are not shared, the view is
@@ -602,9 +602,9 @@ fn plans_are_invariant_under_renaming() {
     );
 }
 
-/// The known findings (see `FINDINGS`): they still differ.
+/// The letter-case variants of `FINDINGS`: with expressions keyed case-insensitively they plan
+/// identically under the case-varying seeds.
 #[test]
-#[ignore = "RI-1..RI-4: expressions compared as text (letter case of column names), see FINDINGS"]
 fn rename_findings() {
     let (_, failures) = run(true);
     assert!(failures.is_empty(), "{}", failures.join("\n"));

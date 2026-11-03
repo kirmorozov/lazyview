@@ -18,6 +18,7 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Word};
 
+use crate::analyzer::expr_key;
 use crate::catalog::{ColKind, FkAction, TableInfo, TableRef, TypeFamily};
 use crate::datum::Datum;
 
@@ -2627,7 +2628,7 @@ pub fn plan_block(
             .iter()
             .filter(|e| {
                 rest.iter()
-                    .all(|w| w.iter().any(|x| x.to_string() == e.to_string()))
+                    .all(|w| w.iter().any(|x| expr_key(x) == expr_key(e)))
             })
             .cloned()
             .collect(),
@@ -2921,7 +2922,7 @@ pub fn plan_block(
         .map(|(u, uc)| {
             proj_exprs.iter().position(|(e, _)| match uc {
                 Some(uc) => scope.resolve(e) == Some(*uc),
-                None => e.to_string() == u.to_string(),
+                None => expr_key(e) == expr_key(u),
             })
         })
         .collect();

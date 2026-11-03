@@ -416,10 +416,9 @@ fn same_execution_plain_and_renamed() {
     run_pairs("rename_invariance", views(), false);
 }
 
-/// The same for the views of findings RI-1 to RI-4 (their mode differs when the letter case of
-/// a column differs between its occurrences).
+/// The same for the views that exercise the RI-1 to RI-4 expression keys, when the letter case
+/// of a column differs between its occurrences (the analyzer keys them case-insensitively).
 #[test]
-#[ignore = "RI-1..RI-4: the analyzer compares expressions as text (letter case of column names)"]
 fn same_execution_with_case_varied_columns() {
     run_pairs("rename_invariance_case", case_findings(), true);
 }
