@@ -1721,9 +1721,19 @@ fn reg_saved_position_from_another_server() {
 /// Binlogs purged while the engine is down (the Amazon RDS / Aurora retention case): the saved
 /// position is gone, the engine fails by default naming that, and with
 /// LAZYVIEW_ON_MISSING_BINLOG=rebuild it rebuilds every view and streams on, equal to the oracle.
+/// Opt-in (purges the server's binlogs): LAZYVIEW_TEST_PURGE_BINLOGS=1.
 #[test]
 fn reg_saved_position_purged_while_down() {
     scenario("reg_purged_down", |ctx| async move {
+        if std::env::var("LAZYVIEW_TEST_PURGE_BINLOGS")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+        {
+            ctx.skip(
+                "purges the server's binlogs; set LAZYVIEW_TEST_PURGE_BINLOGS=1 to run it (only on a server no other binlog reader uses)",
+            );
+            return Ok(());
+        }
         let specs = vec![join_view()];
         let (db, eng) = setup(&ctx, "reg_purged_down", &[], &specs, &[]).await?;
         eng.stop().await?;
