@@ -3356,6 +3356,246 @@ fn reg_index_ddl_on_view_table_does_not_rebuild() {
     });
 }
 
+/// Writes to `entities` (unless `links_only`) and `links` until `stop`: inserts into both,
+/// flips the status of existing entities. Ids come from `seq`.
+async fn churn(
+    mut c: mysql_async::Conn,
+    seq: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    links_only: bool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        let i = seq.fetch_add(1, Relaxed);
+        if !links_only {
+            exec(
+                &mut c,
+                &format!(
+                    "INSERT INTO entities (id, grp, status) VALUES ({i}, {}, 'new')",
+                    i % 3
+                ),
+            )
+            .await?;
+            exec(
+                &mut c,
+                &format!(
+                    "UPDATE entities SET status = IF(status = 'new', 'paid', 'new') WHERE id = {}",
+                    10 + i % 4
+                ),
+            )
+            .await?;
+        }
+        let tag = ["a", "b", "c"][(i % 3) as usize];
+        exec(
+            &mut c,
+            &format!(
+                "INSERT INTO links (id, ref_id, tag) VALUES ({i}, {}, '{tag}')",
+                10 + i % 4
+            ),
+        )
+        .await?;
+        if stop.load(Relaxed) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A source DDL that keeps every row and leaves what a view reads alone (an added index, an added
+/// column, columns moved) must not rebuild the views that read the table. The re-planned view
+/// reads the same columns, keys and SQL, so its plan is put in place with the new column
+/// positions: zero rebuilds, and the views stay equal to their oracles with writes before, during
+/// and after the DDL. A retyped read column still rebuilds the view. An online schema change's
+/// table swap replaces the table's rows, so the views rebuild.
+#[test]
+fn reg_source_ddl_with_same_reads_needs_no_rebuild() {
+    scenario("reg_ddl_same", |ctx| async move {
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
+        use std::sync::Arc;
+        let specs = vec![
+            ViewSpec::new(
+                "r_grp",
+                Kind::Incremental,
+                "SELECT grp, COUNT(*) AS n, SUM(id) AS s FROM entities GROUP BY grp",
+            ),
+            ViewSpec::new(
+                "r_join",
+                Kind::Incremental,
+                "SELECT e.id, e.status, l.tag FROM entities e JOIN links l ON l.ref_id = e.id",
+            ),
+            ViewSpec::new(
+                "r_tags",
+                Kind::Incremental,
+                "SELECT l.tag, COUNT(*) AS n FROM links l JOIN entities e ON e.id = l.ref_id \
+                 WHERE e.status = 'new' GROUP BY l.tag",
+            ),
+        ];
+        let mut ddl: Vec<&str> = ENTITIES.to_vec();
+        ddl.extend([
+            "CREATE TABLE links (id INT PRIMARY KEY, ref_id INT NOT NULL, tag VARCHAR(10) NOT NULL)",
+            "INSERT INTO links VALUES (1, 10, 'a'), (2, 11, 'b'), (3, 12, 'a')",
+        ]);
+        let (db, mut eng) = setup(&ctx, "reg_ddl_same", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let seq = Arc::new(AtomicI64::new(100));
+        // (what, links_only, rebuilds, statements): `rebuilds` is true when a DDL replaces the
+        // table's rows, so the views that read it must rebuild.
+        let steps: [(&str, bool, bool, &[&str]); 4] = [
+            (
+                "added indexes",
+                false,
+                false,
+                &[
+                    "ALTER TABLE entities ADD INDEX x_status (status)",
+                    "CREATE INDEX x_tag ON links (tag)",
+                ],
+            ),
+            (
+                "added columns",
+                false,
+                false,
+                &[
+                    "ALTER TABLE entities ADD COLUMN extra INT NULL AFTER id",
+                    "ALTER TABLE links ADD COLUMN extra2 VARCHAR(5) NULL FIRST",
+                ],
+            ),
+            (
+                "columns moved",
+                false,
+                false,
+                &[
+                    "ALTER TABLE entities MODIFY status VARCHAR(10) NOT NULL AFTER id",
+                    "ALTER TABLE links MODIFY tag VARCHAR(10) NOT NULL FIRST",
+                ],
+            ),
+            // gh-ost / pt-osc: a copy with the new definition replaces the table by RENAME
+            // (writes during it go to `links` only: the copy does not follow `entities`).
+            (
+                "an online schema change's table swap",
+                true,
+                true,
+                &[
+                    "CREATE TABLE _entities_gho LIKE entities",
+                    "ALTER TABLE _entities_gho ADD COLUMN extra3 INT NULL",
+                    "INSERT INTO _entities_gho (id, extra, status, grp) \
+                     SELECT id, extra, status, grp FROM entities",
+                    "RENAME TABLE entities TO _entities_del, _entities_gho TO entities",
+                    "DROP TABLE _entities_del",
+                ],
+            ),
+        ];
+        for (what, links_only, rebuilds, stmts) in steps {
+            let before = eng.snapshot();
+            let stop = Arc::new(AtomicBool::new(false));
+            // Writes before the DDL (the gh-ost case stops writing to `entities` before its copy).
+            let first = tokio::spawn(churn(db.conn().await?, seq.clone(), false, stop.clone()));
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            stop.store(true, Relaxed);
+            first.await??;
+            let stop = Arc::new(AtomicBool::new(false));
+            let during = tokio::spawn(churn(
+                db.conn().await?,
+                seq.clone(),
+                links_only,
+                stop.clone(),
+            ));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            for s in stmts {
+                exec(&mut c, s).await?;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stop.store(true, Relaxed);
+            during.await??;
+            // And after it.
+            let stop = Arc::new(AtomicBool::new(true));
+            churn(db.conn().await?, seq.clone(), false, stop).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+            let d = eng.snapshot().since(&before);
+            if rebuilds {
+                ensure!(
+                    d.full_rebuilds >= 1,
+                    "{what}: a RENAME swap replaces the table's rows, so the views must rebuild: {}",
+                    fmt_snapshot(&d)
+                );
+            } else {
+                ensure!(
+                    d.full_rebuilds == 0,
+                    "{what}: the views were rebuilt: {}",
+                    fmt_snapshot(&d)
+                );
+            }
+        }
+        // The same table changed twice in a row, with rows between: when the re-plan for the
+        // first DDL already sees the second, those rows must not be decoded with the second's
+        // layout (here `grp` would read `y`); the view is rebuilt then. Right either way.
+        let before = eng.snapshot();
+        let stop = Arc::new(AtomicBool::new(false));
+        let during = tokio::spawn(churn(db.conn().await?, seq.clone(), false, stop.clone()));
+        for stmt in [
+            "ALTER TABLE entities ADD COLUMN y INT NOT NULL DEFAULT 7 AFTER id",
+            "INSERT INTO entities (id, grp, status) VALUES (90001, 1, 'new'), (90002, 2, 'new')",
+            "ALTER TABLE entities MODIFY y INT NOT NULL DEFAULT 7 AFTER status",
+        ] {
+            exec(&mut c, stmt).await?;
+        }
+        stop.store(true, Relaxed);
+        during.await??;
+        churn(
+            db.conn().await?,
+            seq.clone(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "the same table changed twice").await?;
+        let d = eng.snapshot().since(&before);
+        ctx.log(format!(
+            "the same table changed twice in a row: {} rebuild(s)",
+            d.full_rebuilds
+        ));
+        // While lazyview is stopped the same table changes twice, rows before, between and after:
+        // the resumed plan comes from the catalog after both DDLs and cannot decode the replayed
+        // rows before them, so the first replayed DDL rebuilds the views (no swap in place).
+        eng.stop().await?;
+        for stmt in [
+            "INSERT INTO entities (id, grp, status) VALUES (90011, 7, 'new')",
+            "ALTER TABLE entities ADD COLUMN z INT NOT NULL DEFAULT 5 AFTER id",
+            "INSERT INTO entities (id, grp, status) VALUES (90012, 8, 'new')",
+            "ALTER TABLE entities MODIFY z INT NOT NULL DEFAULT 5 AFTER status",
+            "INSERT INTO entities (id, grp, status) VALUES (90013, 0, 'new')",
+            "UPDATE entities SET grp = grp + 1 WHERE id IN (10, 11)",
+        ] {
+            exec(&mut c, stmt).await?;
+        }
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "DDLs while stopped").await?;
+        let rebuilt = eng.snapshot().full_rebuilds;
+        ensure!(
+            rebuilt >= 1,
+            "DDLs replayed after a restart were swapped in place (the resumed plan postdates them)"
+        );
+        // A column the views read changes type: they are rebuilt (and stay right).
+        let before = eng.snapshot();
+        exec(&mut c, "ALTER TABLE entities MODIFY grp BIGINT NOT NULL").await?;
+        churn(
+            db.conn().await?,
+            seq.clone(),
+            false,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "a read column retyped").await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds >= 1,
+            "a retyped read column did not rebuild: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
 /// `updated_at` of a view's state row (as text, comparable).
 async fn state_updated_at(c: &mut mysql_async::Conn, name: &str) -> Result<Option<String>> {
     typed_exec_first(

@@ -228,7 +228,8 @@ per line. The default level `info` logs lifecycle events and problems only:
 | `ready: N view(s) live` | every view has a table (`, M in error` if some failed) |
 | `streaming binlog position=…` | reading the binlog from that position |
 | `definition changed; building the new version online (current version stays live)` | an `UPDATE` of `_lazyview` was picked up |
-| `source schema changed; rebuilding online` | a source table was altered |
+| `source schema changed; the view reads the same columns: new column positions, no rebuild` | a source table was altered without changing what the view reads |
+| `source schema changed; rebuilding online` (with the difference in parentheses when re-planned on the spot) | a source table was altered in a way that changes what the view reads, or a change could not be checked in place |
 | `no views defined yet; add one with: INSERT INTO …` | `_lazyview` is empty |
 
 `RUST_LOG=lazyview=debug` adds a summary every 60 s (`last 60s: N binlog events, …`) and the

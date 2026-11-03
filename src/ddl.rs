@@ -24,6 +24,10 @@ use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 /// * `CREATE [OR REPLACE] / ALTER / DROP VIEW v` → `v` (views may be view sources)
 /// * `DROP DATABASE x` / `CREATE OR REPLACE DATABASE x` → `("x", "*")` (every table of `x`)
 ///
+/// [`StatementEffects::rows_kept`] is true only when every statement keeps every row of the
+/// tables it names: `ALTER TABLE` (without `RENAME TO/AS`), `CREATE … INDEX` and
+/// `DROP INDEX`. It is false for anything else, and for statements that cannot be analysed.
+///
 /// Empty for DML and for statements that cannot change table data or structure: `CREATE
 /// DATABASE`, `ALTER DATABASE`, `OPTIMIZE` / `ANALYZE` / `CHECK TABLE` (physical only), users,
 /// grants, routines, triggers, events, `SET`, `FLUSH`, ….
@@ -43,6 +47,11 @@ pub struct StatementEffects {
     /// The base tables it removes: those of `DROP TABLE[S] [IF EXISTS] a, b`. Not `DROP TEMPORARY
     /// TABLE` (it never removes a base table), `DROP INDEX i ON t` or `DROP VIEW`.
     pub dropped: Vec<(String, String)>,
+    /// Every row of each table in `tables` is still there after the statement: ALTER TABLE
+    /// (without RENAME), CREATE INDEX, DROP INDEX. False for anything else (RENAME TABLE,
+    /// ALTER TABLE ... RENAME TO/AS, TRUNCATE, REPAIR, CREATE [OR REPLACE] TABLE, DROP, database
+    /// statements, views, statements that cannot be parsed).
+    pub rows_kept: bool,
 }
 
 /// [`statement_tables`] plus the tables the statement removes (see [`StatementEffects`]).
@@ -53,6 +62,7 @@ pub fn statement_effects(query: &str, default_schema: &str) -> StatementEffects 
             return StatementEffects {
                 tables: fallback(query, default_schema),
                 dropped: Vec::new(),
+                rows_kept: false,
             }
         }
     };
@@ -62,6 +72,8 @@ pub fn statement_effects(query: &str, default_schema: &str) -> StatementEffects 
         schema: default_schema,
         out: Vec::new(),
         dropped: Vec::new(),
+        rows_kept: true,
+        kept_stmt: false,
     };
     loop {
         let start = p.i;
@@ -98,6 +110,7 @@ pub fn statement_effects(query: &str, default_schema: &str) -> StatementEffects 
     StatementEffects {
         tables: dedup(p.out),
         dropped: dedup(p.dropped),
+        rows_kept: p.rows_kept,
     }
 }
 
@@ -195,6 +208,12 @@ struct Parser<'a> {
     out: Vec<(String, String)>,
     /// Base tables removed (`DROP TABLE`), also in `out`.
     dropped: Vec<(String, String)>,
+    /// True while every parsed statement keeps every row of the tables it names
+    /// ([`StatementEffects::rows_kept`]).
+    rows_kept: bool,
+    /// Whether the statement being parsed keeps every row. Reset to false before each statement,
+    /// so a statement form that does not set it counts as removing rows.
+    kept_stmt: bool,
 }
 
 impl Parser<'_> {
@@ -326,28 +345,44 @@ impl Parser<'_> {
     /// statements that are not executed now).
     fn statement(&mut self) -> bool {
         let Some(Tok::Word(first)) = self.t.get(self.i) else {
+            self.rows_kept = false; // not a statement this parser understands
             return true;
         };
         let first = first.to_ascii_uppercase();
         self.i += 1;
-        match first.as_str() {
-            "ALTER" => self.alter(),
-            "CREATE" => return self.create(),
-            "DROP" => self.drop(),
-            "RENAME" => self.rename(),
+        self.kept_stmt = false;
+        let more = match first.as_str() {
+            "ALTER" => {
+                self.alter();
+                true
+            }
+            "CREATE" => self.create(),
+            "DROP" => {
+                self.drop();
+                true
+            }
+            "RENAME" => {
+                self.rename();
+                true
+            }
             "TRUNCATE" => {
+                // Removes the rows without row events.
                 self.eat_kw("TABLE");
                 self.push_name();
+                true
             }
             "REPAIR" => {
+                // May drop corrupt rows.
                 self.eat_any(&["NO_WRITE_TO_BINLOG", "LOCAL"]);
                 if self.eat_any(&["TABLE", "TABLES"]) {
                     self.push_name_list();
                 }
+                true
             }
-            _ => {}
-        }
-        true
+            _ => true,
+        };
+        self.rows_kept &= self.kept_stmt;
+        more
     }
 
     fn alter(&mut self) {
@@ -363,7 +398,9 @@ impl Parser<'_> {
         if !self.push_name() {
             return;
         }
-        // Scan the alter specifications (outside parentheses) for other tables.
+        self.kept_stmt = true;
+        // Scan the alter specifications (outside parentheses) for other tables and for
+        // specifications that replace or remove rows.
         let mut depth = 0i32;
         while let Some(t) = self.t.get(self.i) {
             match t {
@@ -379,6 +416,8 @@ impl Parser<'_> {
                         {
                             continue;
                         }
+                        // RENAME [TO|AS] t2 replaces the table's rows by another table's.
+                        self.kept_stmt = false;
                         self.eat_any(&["TO", "AS"]);
                         self.push_name();
                         continue;
@@ -386,9 +425,19 @@ impl Parser<'_> {
                     if (self.at_kw("WITH") || self.at_kw("CONVERT") || self.at_kw("TO"))
                         && self.peek_kw(1, "TABLE")
                     {
+                        // Table exchange / conversion: the rows come from the other table.
+                        self.kept_stmt = false;
                         self.i += 2;
                         self.push_name();
                         continue;
+                    }
+                    // Partition removal or exchange, tablespace discard or import, TRUNCATE
+                    // PARTITION: rows are removed or replaced.
+                    if ["PARTITION", "EXCHANGE", "TRUNCATE", "DISCARD", "IMPORT"]
+                        .iter()
+                        .any(|k| self.at_kw(k))
+                    {
+                        self.kept_stmt = false;
                     }
                 }
                 _ => {}
@@ -405,6 +454,7 @@ impl Parser<'_> {
             self.push_name();
         } else if self.eat_kw("INDEX") {
             self.index_target();
+            self.kept_stmt = true;
         } else if self.at_kw("DATABASE") || self.at_kw("SCHEMA") {
             self.i += 1;
             if replace {
@@ -444,6 +494,7 @@ impl Parser<'_> {
             }
         } else if self.eat_kw("INDEX") {
             self.index_target();
+            self.kept_stmt = true;
         }
     }
 
@@ -533,6 +584,45 @@ mod tests {
         ] {
             assert!(dropped(q).is_empty(), "{q}");
             assert!(!statement_tables(q, "d").is_empty(), "{q}");
+        }
+    }
+
+    /// Only statements that keep every row of their tables (ALTER TABLE without a RENAME or a
+    /// partition / tablespace change, CREATE INDEX, DROP INDEX) leave `rows_kept` set.
+    #[test]
+    fn rows_kept() {
+        let kept = |q: &str| statement_effects(q, "d").rows_kept;
+        for q in [
+            "ALTER TABLE t ADD INDEX i (a)",
+            "ALTER TABLE t ADD COLUMN c INT NULL",
+            "CREATE INDEX i ON t (a)",
+            "DROP INDEX i ON t",
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            "ALTER TABLE t ADD INDEX i (a); ALTER TABLE u DROP COLUMN x",
+        ] {
+            assert!(kept(q), "{q}");
+        }
+        for q in [
+            "RENAME TABLE a TO a_old, a_new TO a",
+            "ALTER TABLE t RENAME TO u",
+            "ALTER TABLE t RENAME AS u",
+            "ALTER TABLE t EXCHANGE PARTITION p WITH TABLE u",
+            "ALTER TABLE t DROP PARTITION p",
+            "ALTER TABLE t TRUNCATE PARTITION p",
+            "ALTER TABLE t DISCARD TABLESPACE",
+            "TRUNCATE TABLE t",
+            "REPAIR TABLE t",
+            "CREATE TABLE t2 LIKE t",
+            "CREATE TABLE t (a INT)",
+            "DROP TABLE t",
+            "DROP VIEW v",
+            "CREATE VIEW v AS SELECT 1",
+            "ALTER TABLE t ADD INDEX i (a); TRUNCATE TABLE t",
+            "ALTER TABLE t ADD INDEX i (a); DROP TABLE u",
+            "INSERT INTO t VALUES (1)",
+            "",
+        ] {
+            assert!(!kept(q), "{q:?}");
         }
     }
 

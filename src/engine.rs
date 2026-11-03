@@ -28,6 +28,7 @@ use crate::lookback::Lookback;
 use crate::meta::{self, StateUpdate, SOURCE_TARGET};
 use crate::metrics::Metrics;
 use crate::mv::{self, BuildTarget, Layout};
+use crate::plan_swap;
 use crate::supervisor::{self, Supervisor};
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
@@ -281,6 +282,26 @@ struct Version {
     lag: BTreeMap<String, Lag>,
     /// Remembered images of lookup tables without lineage (see [`Lookback`]).
     recent: Lookback,
+    /// Server binlog position right after the catalog read its plan was made from (see
+    /// [`Engine::swap_in_place`]); `None` when unknown.
+    catalog_head: Option<Position>,
+    /// Tables whose definition the plan took from a later catalog read, at a source DDL that
+    /// put it in place without a rebuild: (position right after that read, the DDL's position).
+    table_heads: HashMap<TableRef, (Position, Position)>,
+}
+
+impl Version {
+    /// A position right after every catalog read its plan's table definitions come from (the
+    /// latest of them).
+    fn plan_head(&self) -> Option<Position> {
+        let head = self.catalog_head.clone()?;
+        Some(
+            self.table_heads
+                .values()
+                .map(|h| &h.0)
+                .fold(head, |a, b| a.max(b.clone())),
+        )
+    }
 }
 
 struct Lag {
@@ -325,6 +346,8 @@ struct Next {
     routine: bool,
     /// The swap runs in the background (`task`); the live version pauses until it is done.
     swapping: bool,
+    /// As [`Version::catalog_head`], for its plan.
+    catalog_head: Option<Position>,
 }
 
 struct Slot {
@@ -355,6 +378,8 @@ struct Slot {
     down: BTreeMap<String, Down>,
     /// Latest plan of the current definition (its mode stays visible in state `error`).
     last_plan: Option<Arc<ViewPlan>>,
+    /// As [`Version::catalog_head`], for `last_plan`.
+    last_plan_head: Option<Position>,
     /// Consecutive failed refreshes of the live version.
     refresh_failures: u32,
     /// Of those, failures from an overloaded or unreachable server (supervised refreshes: they
@@ -859,7 +884,7 @@ impl Engine {
             let mut names: HashMap<String, u64> = HashMap::new();
             for d in defs.iter().filter(|d| d.enabled) {
                 match e
-                    .parse_and_plan(&d.effective_definition(), &d.targets, None)
+                    .parse_and_plan(&d.effective_definition(), &d.targets, None, &HashMap::new())
                     .await
                 {
                     Ok(p) => {
@@ -981,13 +1006,15 @@ impl Engine {
             .await
     }
 
-    /// Parses and plans a definition against the current catalog. `own_def` excludes the slot
-    /// itself from the chained-view check.
+    /// Parses and plans a definition against the current catalog, except for the tables in
+    /// `pinned` (their definitions as given). `own_def` excludes the slot itself from the
+    /// chained-view check.
     async fn parse_and_plan(
         &mut self,
         definition: &str,
         targets: &[String],
         own_def: Option<u64>,
+        pinned: &HashMap<TableRef, Arc<TableInfo>>,
     ) -> Result<ViewPlan> {
         let parsed = analyze::parse_definition(definition)?;
         if let Some(sch) = &parsed.schema {
@@ -1049,7 +1076,11 @@ impl Engine {
                     bail!("view reads `{}`, which is materialized only on other instances; chained views need the upstream view on target `source`", t.1);
                 }
             }
-            match self.table_info(t).await? {
+            let info = match pinned.get(t) {
+                Some(i) => Some(i.clone()),
+                None => self.table_info(t).await?,
+            };
+            match info {
                 Some(info) => {
                     infos.insert(t.clone(), info);
                 }
@@ -1354,6 +1385,25 @@ impl Engine {
         self.first_dirty.get_or_insert_with(Instant::now);
     }
 
+    /// The source's binlog position now (right after a catalog read: every DDL that read saw is
+    /// before it); `None` if it cannot be read.
+    async fn catalog_head(&mut self) -> Option<Position> {
+        binlog::current_position(&mut self.src).await.ok()
+    }
+
+    /// [`Version::catalog_head`] of `plan` in slot `idx`: that of the slot's latest plan or of
+    /// its live version when it is one of those, else unknown.
+    fn plan_head(&self, idx: usize, plan: &Arc<ViewPlan>) -> Option<Position> {
+        let s = &self.slots[idx];
+        if s.last_plan.as_ref().is_some_and(|p| Arc::ptr_eq(p, plan)) {
+            return s.last_plan_head.clone();
+        }
+        s.live
+            .as_ref()
+            .filter(|l| Arc::ptr_eq(&l.plan, plan))
+            .and_then(Version::plan_head)
+    }
+
     /// Re-establishes the source-read connection after a connection-class error.
     async fn heal_src(&mut self) {
         match connect(&self.src_opts).await {
@@ -1580,7 +1630,12 @@ impl Engine {
     async fn plan_slot(&mut self, idx: usize, d: &meta::DefRow) -> Option<Arc<ViewPlan>> {
         let id = d.id;
         let plan = match self
-            .parse_and_plan(&d.effective_definition(), &d.targets, Some(id))
+            .parse_and_plan(
+                &d.effective_definition(),
+                &d.targets,
+                Some(id),
+                &HashMap::new(),
+            )
             .await
         {
             Ok(p) => Arc::new(p),
@@ -1590,6 +1645,7 @@ impl Engine {
             }
         };
         self.slots[idx].last_plan = Some(plan.clone());
+        self.slots[idx].last_plan_head = self.catalog_head().await;
         let clash = match self.check_name(d, &plan).await {
             Err(e) => Some(e),
             Ok(()) if self.name_taken(idx, &plan.name) => Some(anyhow!(
@@ -1748,6 +1804,7 @@ impl Engine {
             retry_at: None,
             down: BTreeMap::new(),
             last_plan: None,
+            last_plan_head: None,
             refresh_failures: 0,
             overload_failures: 0,
             replan_after: false,
@@ -1883,6 +1940,7 @@ impl Engine {
             };
             self.shown.insert((name.clone(), t.clone()), shown);
         }
+        let catalog_head = self.plan_head(idx, plan);
         self.slots[idx].live = Some(Version {
             plan: plan.clone(),
             layout,
@@ -1896,6 +1954,8 @@ impl Engine {
             since: None,
             lag: BTreeMap::new(),
             recent: Lookback::default(),
+            catalog_head,
+            table_heads: HashMap::new(),
         });
         Ok(rest)
     }
@@ -1930,6 +1990,7 @@ impl Engine {
         }
         let def_id = self.slots[idx].def_id;
         let hash = self.slots[idx].hash.clone();
+        let catalog_head = self.plan_head(idx, &plan);
         // A routine rebuild (full-mode refresh, unknown affected rows) of the unchanged live
         // version: its tables and state rows are ours, and its state stays `ready`.
         let routine = !partial
@@ -2033,6 +2094,7 @@ impl Engine {
             recent: Lookback::default(),
             routine,
             swapping: false,
+            catalog_head,
         });
         self.rebuild_routes();
         if unblocked {
@@ -2111,6 +2173,7 @@ impl Engine {
             s.hash = hash;
             s.targets = d.targets.clone();
             s.last_plan = None;
+            s.last_plan_head = None;
             s.down.clear();
             if let Ok(p) = analyze::parse_definition(&d.effective_definition()) {
                 s.wanted = analyze::referenced_tables(&p.query, &self.schema);
@@ -2775,7 +2838,8 @@ impl Engine {
                 let tables = effects.tables;
                 if !tables.is_empty() {
                     tracing::trace!(%query, "statement affects tables {tables:?}");
-                    self.on_tables_changed(&tables, &before);
+                    self.on_tables_changed(&tables, effects.rows_kept, &before)
+                        .await;
                     if first_keyword(&query).eq_ignore_ascii_case("TRUNCATE") {
                         self.on_view_table_lost(&tables, &before, "truncated");
                     } else if !effects.dropped.is_empty() {
@@ -3036,7 +3100,7 @@ impl Engine {
         }
     }
 
-    fn on_tables_changed(&mut self, tables: &[TableRef], since: &Position) {
+    async fn on_tables_changed(&mut self, tables: &[TableRef], rows_kept: bool, since: &Position) {
         self.shapes.clear();
         for t in tables {
             if t.1 == "*" {
@@ -3086,11 +3150,136 @@ impl Engine {
             }
         }
         for (id, freeze) in todo {
-            self.schedule_replan_at(id, freeze, false, since);
+            // A schema change that keeps every row: the same reads swap in place. Anything else
+            // (a table swapped in or rows removed) rebuilds online.
+            if freeze && rows_kept && self.swap_in_place(id, since, tables).await {
+                continue;
+            }
+            let from = self.stale_from(id, since, tables);
+            self.schedule_replan_at(id, freeze, false, &from);
         }
         if !self.replan.is_empty() || self.defs_dirty {
             self.first_dirty.get_or_insert_with(Instant::now);
         }
+    }
+
+    /// A source DDL at `at` changed `tables`, some of which the live version of definition `id`
+    /// reads: re-plan it and, when the new plan reads the same columns, keys and SQL (see
+    /// [`plan_swap::same_reads`]), put it in place of the live plan. Only the column positions
+    /// the rows are decoded with change: no rebuild, the table and its rows stay; events after the
+    /// DDL decode with the new positions, those before it were decoded with the old ones.
+    ///
+    /// The tables the DDL did not change keep the live plan's definitions; those it changed are
+    /// read again. That holds only while the live plan describes their rows before the DDL: its
+    /// definition of each was read when the binlog ended at or before `at` (its head; after a
+    /// restart or a catch-up the plan may come from a later catalog). The new read's head likewise
+    /// bounds the DDLs it may include: a later DDL of those tables before it fails this check and
+    /// rebuilds the view, stale since this swap (see [`Self::stale_from`]). DDL path only.
+    async fn swap_in_place(&mut self, id: u64, at: &Position, tables: &[TableRef]) -> bool {
+        let Some(i) = self.idx_of(id) else {
+            return false;
+        };
+        let s = &self.slots[i];
+        let Some(l) = s
+            .live
+            .as_ref()
+            .filter(|l| !l.frozen && !matches!(l.plan.mode, Mode::Full(_)))
+        else {
+            return false;
+        };
+        if s.next.is_some()
+            || s.error.is_some()
+            || s.waiting.is_some()
+            || self.replan.contains_key(&id)
+        {
+            return false;
+        }
+        let hit = |x: &TableRef| {
+            tables
+                .iter()
+                .any(|t| t.0 == x.0 && (t.1 == "*" || t.1 == x.1))
+        };
+        // Definitions the live plan decodes rows with, per table.
+        let mut held: HashMap<TableRef, Arc<TableInfo>> = HashMap::new();
+        for info in l
+            .plan
+            .aliases
+            .iter()
+            .map(|a| &a.table)
+            .chain(l.plan.cascades.iter().map(|c| &c.parent))
+        {
+            held.entry((info.schema.clone(), info.name.clone()))
+                .or_insert_with(|| info.clone());
+        }
+        let touched: Vec<TableRef> = held.keys().filter(|t| hit(t)).cloned().collect();
+        let predates = |t: &TableRef| {
+            l.table_heads
+                .get(t)
+                .map(|h| &h.0)
+                .or(l.catalog_head.as_ref())
+                .is_some_and(|h| h <= at)
+        };
+        if touched.is_empty() || !touched.iter().all(predates) {
+            return false;
+        }
+        held.retain(|t, _| !touched.contains(t));
+        let (def, targets) = (s.definition.clone(), s.targets.clone());
+        // The catalog read below must see the DDL.
+        if !self.fence().await {
+            return false;
+        }
+        let plan = match self.parse_and_plan(&def, &targets, Some(id), &held).await {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(view = %self.slots[i].name, "re-plan after a source DDL failed: {e:#}");
+                return false;
+            }
+        };
+        let Some(head) = self.catalog_head().await else {
+            return false;
+        };
+        let Some(l) = self.slots[i].live.as_mut() else {
+            return false;
+        };
+        if let Err(why) = plan_swap::same_reads(&l.plan, &plan) {
+            info!(view = %l.name, "source schema changed ({why}); rebuilding online");
+            return false;
+        }
+        let plan = Arc::new(plan_swap::adopt(&l.plan, &plan));
+        l.plan = plan.clone();
+        for t in touched {
+            l.table_heads.insert(t, (head.clone(), at.clone()));
+        }
+        info!(
+            view = %l.name,
+            "source schema changed; the view reads the same columns: new column positions, no rebuild"
+        );
+        let plan_head = l.plan_head();
+        let s = &mut self.slots[i];
+        s.last_plan = Some(plan);
+        s.last_plan_head = plan_head;
+        self.rebuild_routes();
+        true
+    }
+
+    /// Where a view a source DDL at `at` of `tables` rebuilds is stale from: `at`, or the DDL
+    /// that put one of those tables' definitions in place when that definition may already
+    /// include this DDL (rows since then may have been decoded with this DDL's layout).
+    fn stale_from(&self, id: u64, at: &Position, tables: &[TableRef]) -> Position {
+        let hit = |x: &TableRef| {
+            tables
+                .iter()
+                .any(|t| t.0 == x.0 && (t.1 == "*" || t.1 == x.1))
+        };
+        let mut from = at.clone();
+        if let Some(l) = self.idx_of(id).and_then(|i| self.slots[i].live.as_ref()) {
+            for (t, (read, swapped)) in &l.table_heads {
+                if hit(t) && read > at && *swapped < from {
+                    from = swapped.clone();
+                }
+            }
+        }
+        from
     }
 
     /// A view's own table on the source was emptied (`TRUNCATE`) or removed (`DROP TABLE`) by
@@ -3511,10 +3700,14 @@ impl Engine {
         }
         self.slots[i].replan_after = false;
         self.rebuild_routes();
-        match self.parse_and_plan(&def, &targets, Some(id)).await {
+        match self
+            .parse_and_plan(&def, &targets, Some(id), &HashMap::new())
+            .await
+        {
             Ok(plan) => {
                 let plan = Arc::new(plan);
                 self.slots[i].last_plan = Some(plan.clone());
+                self.slots[i].last_plan_head = self.catalog_head().await;
                 self.slots[i].waiting = None;
                 let name = plan.name.clone();
                 if freeze {
@@ -3920,6 +4113,8 @@ impl Engine {
                     since: if empty { None } else { since },
                     lag: BTreeMap::new(),
                     recent,
+                    catalog_head: n.catalog_head,
+                    table_heads: HashMap::new(),
                 });
             }
         }
