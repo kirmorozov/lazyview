@@ -57,6 +57,12 @@ fn create_sql(t: &str) -> String {
     )
 }
 
+/// Counts the fence table in the current schema via `information_schema`; the table name is a
+/// bind parameter.
+fn exists_sql() -> &'static str {
+    "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?"
+}
+
 fn commit_sql(t: &str) -> String {
     format!(
         "INSERT INTO {} (`id`, `n`) VALUES (?, 1) ON DUPLICATE KEY UPDATE `n` = `n` + 1",
@@ -64,9 +70,11 @@ fn commit_sql(t: &str) -> String {
     )
 }
 
-/// Reads the server's commit-order settings on `conn` and creates the fence table when commits
-/// are ordered. `Ok(false)`: not ordered, nothing created. The table lives in the default schema
-/// of `conn`.
+/// Reads the server's commit-order settings on `conn` and creates the fence table only when it
+/// is missing, when commits are ordered. `Ok(false)`: not ordered, nothing created. The table
+/// lives in the default schema of `conn`. Because the table is created only when missing, an
+/// account without the CREATE privilege works once the table exists (for example created once
+/// by an administrator).
 pub async fn probe(conn: &mut Conn) -> Result<bool> {
     let var: Option<Option<String>> = conn
         .query_first("SELECT @@GLOBAL.binlog_order_commits")
@@ -79,7 +87,10 @@ pub async fn probe(conn: &mut Conn) -> Result<bool> {
     if !ordered(var.as_deref(), aurora.as_deref()) {
         return Ok(false);
     }
-    conn.query_drop(create_sql(table())).await?;
+    let n: Option<u64> = conn.exec_first(exists_sql(), (table(),)).await?;
+    if n.unwrap_or(0) == 0 {
+        conn.query_drop(create_sql(table())).await?;
+    }
     Ok(true)
 }
 
@@ -129,5 +140,15 @@ mod tests {
         );
         assert_eq!(quote("a`b"), "`a``b`");
         assert!(commit_sql("a`b").starts_with("INSERT INTO `a``b` "));
+    }
+
+    #[test]
+    fn exists_sql_counts_the_table_by_name_parameter() {
+        assert_eq!(
+            exists_sql(),
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() \
+             AND TABLE_NAME = ?"
+        );
+        assert!(exists_sql().contains("TABLE_NAME = ?"));
     }
 }
