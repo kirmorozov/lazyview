@@ -12,6 +12,7 @@ pub mod ddl;
 pub mod engine;
 pub mod fence;
 pub mod health;
+pub mod intset;
 pub mod lookback;
 pub mod metrics;
 pub mod stats;

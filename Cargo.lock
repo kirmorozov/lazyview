@@ -595,6 +595,7 @@ name = "lazyview"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "foldhash",
  "futures-util",
  "hex",
  "mysql_async",

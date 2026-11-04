@@ -49,6 +49,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo clippy (feature roaring)
+        run: cargo clippy --locked --all-targets --features roaring -- -D warnings
 
   unit:
     name: unit tests
@@ -67,6 +69,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo test --lib --bins
         run: cargo test --locked --lib --bins
+      - name: intset tests (feature roaring)
+        run: "cargo test --locked --lib --features roaring intset::"
 
   integration:
     # One job per server flavor of docker-compose.test.yml (docs/server-setup.md "Supported
