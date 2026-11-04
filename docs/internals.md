@@ -28,8 +28,9 @@
   server commits in binlog order, so when it returns every transaction read is visible. Only
   with `binlog_order_commits=OFF` (warned) `LAZYVIEW_VISIBILITY_DELAY_MS`.
 * **De-duplication.** Unit keys are buffered for `LAZYVIEW_BATCH_WINDOW_MS` (200 ms), single-column
-  integer keys in roaring bitmaps and others in hash sets. 30 writes to order 42 across `orders`,
-  `order_items` and `payments` become one refresh of unit 42.
+  integer keys in an IntSet (a foldhash hash set of ids; the Cargo feature `roaring` switches it
+  to a roaring bitmap for dense id ranges) and others in foldhash hash sets. 30 writes to order 42
+  across `orders`, `order_items` and `payments` become one refresh of unit 42.
 * **Non-blocking reads, diff writes.** Sources are read only with plain, non-locking `SELECT`s
   (READ COMMITTED), never with `INSERT … SELECT`. Fresh rows are compared with the materialized
   rows of each unit, and only the units that changed are written, one transaction per chunk of
