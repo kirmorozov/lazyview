@@ -1328,15 +1328,16 @@ fn json_columns_in_composite_units() {
         grouped(sql);
     }
     full("SELECT a, doc, COUNT(*) AS n FROM docs_ab GROUP BY a, doc");
-    // Window units are the PARTITION BY list as written (the unit planner does not reduce them by
-    // keys): a JSON column there is Full even next to the key (conservative, sound).
+    // A partition key that the rest of the key determines is reduced like a GROUP BY key (the
+    // partitions are the same sets): a JSON column next to the key drops out of the unit, while
+    // without the key's other column it is not determined and the view stays Full.
     for sql in [
         "SELECT id, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
         "SELECT a, SUM(grp) OVER (PARTITION BY a, b, doc) AS s FROM docs_ab",
-        "SELECT a, SUM(grp) OVER (PARTITION BY a, doc) AS s FROM docs_ab",
     ] {
-        full(sql);
+        grouped(sql);
     }
+    full("SELECT a, SUM(grp) OVER (PARTITION BY a, doc) AS s FROM docs_ab");
     // Through a CTE and a derived table with renamed columns.
     for (sql, json) in [
         ("WITH x AS (SELECT grp AS g, doc AS j FROM docs) SELECT g, j, COUNT(*) AS n FROM x GROUP BY g, j", true),

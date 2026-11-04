@@ -135,6 +135,49 @@ fn reg_one_element_in_join() {
     });
 }
 
+/// A window unit reduced by keys (step 5B): the JSON column in `PARTITION BY id, doc` is
+/// determined by the primary key, so the unit is `id` alone and updates to the JSON or to the
+/// other partition column stay incremental.
+#[test]
+fn reg_window_units_reduced_by_key() {
+    scenario("reg_win_red", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_doc_sum",
+            Kind::Incremental,
+            "SELECT id, grp, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
+        )];
+        let ddl = [
+            "CREATE TABLE docs (id INT PRIMARY KEY, grp INT NOT NULL, doc JSON NOT NULL)",
+            "INSERT INTO docs VALUES (1, 10, '{\"a\": 1}'), (2, 20, '{\"b\": 2}'), (3, 30, '{\"c\": 3}')",
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_win_red", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let mut sc = db.conn().await?;
+        let before = eng.snapshot();
+        run(&mut c, &["UPDATE docs SET doc = '{\"a\": 9}' WHERE id = 1"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "doc updated").await?;
+        run(&mut c, &["UPDATE docs SET grp = 11 WHERE id = 1"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "grp updated").await?;
+        run(
+            &mut c,
+            &[
+                "DELETE FROM docs WHERE id = 2",
+                "INSERT INTO docs VALUES (2, 20, '{\"b\": 2}')",
+            ],
+        )
+        .await?;
+        verify(&ctx, &mut eng, &db, &specs, "row deleted and re-inserted").await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0,
+            "window unit reduced by key still caused a full rebuild: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
 /// Anchor two joins away (composite-PK `items`): when a parent row changes its join key to a
 /// value that no longer joins (or the grandparent row is deleted), the units can only be found
 /// through the before-image — found as stale v_line_details rows after

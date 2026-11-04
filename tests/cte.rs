@@ -2972,23 +2972,14 @@ fn json_key_cases(mariadb: bool) -> Vec<Case> {
             "spj",
             "SELECT id, doc FROM docs WHERE grp = 1",
         ),
-        // A window unit is its PARTITION BY list as written: Full on the MySQL family even with
-        // the key next to doc (conservative).
-        if mariadb {
-            case(
-                "j_win",
-                "incremental",
-                "grouped",
-                "SELECT id, grp, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
-            )
-        } else {
-            case(
-                "j_win",
-                "full",
-                "JSON value `doc` in a composite group key: MySQL compares JSON by representation in multi-row IN lists",
-                "SELECT id, grp, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
-            )
-        },
+        // A window unit is reduced by keys like GROUP BY: the key `id` determines `doc`, so
+        // `PARTITION BY id, doc` is a plain key unit (the key alone) on both families.
+        case(
+            "j_win",
+            "incremental",
+            "grouped",
+            "SELECT id, grp, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
+        ),
     ]
 }
 

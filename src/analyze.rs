@@ -2956,9 +2956,9 @@ pub fn plan_block(
         }
     }
 
-    // A group key that the rest of the key determines adds nothing to the unit (DISTINCT over a
-    // table's primary key and its other columns, GROUP BY o.id, c.name with c joined on its key).
-    let unit_refs = if mode == Mode::Grouped && !windowed {
+    // A group or partition key that the rest of the key determines adds nothing to the unit (the
+    // partitions are the same sets).
+    let unit_refs = if mode == Mode::Grouped {
         reduce_unit(unit_refs, &scope, &base_edges, &own_edges)
     } else {
         unit_refs
@@ -6722,6 +6722,18 @@ mod tests {
         assert_eq!(
             p("CREATE VIEW v AS SELECT customer_id, SUM(total), RANK() OVER (ORDER BY SUM(total)) FROM orders GROUP BY customer_id").mode,
             Mode::Global
+        );
+        // A partition key that the rest of the key determines is reduced by keys, like GROUP BY.
+        assert_eq!(
+            p("CREATE VIEW v AS SELECT id, ROW_NUMBER() OVER (PARTITION BY id, status ORDER BY id) AS rn FROM orders")
+                .unit_exprs,
+            vec!["id"]
+        );
+        assert_eq!(
+            p("CREATE VIEW v AS SELECT o.id, ROW_NUMBER() OVER (PARTITION BY o.id, c.name ORDER BY o.id) AS rn \
+               FROM orders o JOIN customers c ON c.id = o.customer_id")
+                .unit_exprs,
+            vec!["o.id"]
         );
     }
 
