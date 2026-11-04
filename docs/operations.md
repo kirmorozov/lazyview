@@ -120,7 +120,8 @@ included), `mv_rows_upserted` (of those, rows upserted by their row key), `mv_ro
 `supervisor_cpu_offloads` (diffs run off the async threads). The binlog keeps being read while a
 flush runs, up to 100,000 events or 32 MiB queued: `flushes_overlapped` counts the flushes during
 which it was read, `binlog_backpressure` those during which the queue was full (the stream then
-waits).
+waits). `cascade_rows` sums over the views the child rows a mapped cascade changed, replayed
+from the in-memory cascade cache.
 
 Per connection pool of concurrent refreshes, labelled
 `{pool="read|write", endpoint="source|<target>"}`: `lazyview_supervisor_limit`, `_max` (pool
@@ -149,10 +150,12 @@ Gauges:
 Per view, labelled `{view="<schema>.<view>"}`: the counters of
 [`/stats`](#per-view-update-statistics) as `lazyview_view_<name>_total` (`source_rows`,
 `source_rows_skipped`, `ids_marked`, `ids_absorbed`, `images_marked`, `images_absorbed`,
-`entities_updated`, `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_unchanged`,
+`cascade_rows`, `cascade_gaps`, `entities_updated`,
+`rows_inserted`, `rows_updated`, `rows_deleted`, `rows_unchanged`,
 `whole_view_refreshes`, `builds`, `source_queries`, `lookup_queries`, `flushes`) and the gauges
 `lazyview_view_ids_pending`, `lazyview_view_entities_distinct`,
-`lazyview_view_entities_distinct_60s` and `lazyview_view_last_flush_timestamp_seconds`.
+`lazyview_view_entities_distinct_60s`, `lazyview_view_cascade_cached_rows` and
+`lazyview_view_last_flush_timestamp_seconds`.
 
 Alerts worth having: `lazyview_streaming == 0` for 10 minutes, `lazyview_views_error > 0`, and
 views without a live table for a long time (`lazyview_views - lazyview_views_ready -
@@ -184,6 +187,9 @@ curl -s localhost:8080/stats | jq '.views["mydb.my_view"]'
 | `ids_absorbed` | marks of an id that was already pending (absorbed by deduplication) |
 | `ids_pending` | ids buffered and not refreshed yet |
 | `images_marked`, `images_absorbed` | row images of tables that do not carry the target id, buffered for a lookup at the flush, and of those the ones already buffered |
+| `cascade_rows` | child rows replayed from the in-memory cascade cache for a parent delete or key update ([mapped cascade routes](views.md#foreign-key-cascades)) |
+| `cascade_gaps` | parent changes replayed from before the cache's startup seed: counted and warned about at most once a minute, no recovery — the rows heal on their next change |
+| `cascade_cached_rows` | child rows kept in the live version's in-memory cascade cache; the view holds one entry per kept row |
 | `entities_updated` | ids refreshed, summed over flushes (each id once per flush) |
 | `entities_distinct` | distinct ids refreshed since start: exact for integer ids, by a 64-bit hash for others (exact up to hash collisions) |
 | `entities_distinct_60s`, `window_start_unix` | distinct ids refreshed since `window_start_unix` (30 to 60 s ago) |
@@ -210,7 +216,10 @@ Cost: per binlog row and view, a few additions to plain integers in the view's c
 (whose insert already says whether the id was new). Everything else is folded in once per flush
 under one lock for all views, and the distinct-id sets are updated per refreshed id (integer ids
 by a bitmap union). Memory per view: three id sets (since start and two 30 s buckets), about
-2 bytes per dense integer id (up to 8 per sparse one) and about 16 bytes per other id.
+2 bytes per dense integer id (up to 8 per sparse one) and about 16 bytes per other id. The
+in-memory cascade cache adds one entry per kept child row of a view's mapped cascade routes:
+`cascade_cached_rows` shows how many, so a view over a large child table the plan cannot trace
+through the parent's row grows with that table's kept rows.
 
 ## Logs
 
@@ -231,6 +240,7 @@ per line. The default level `info` logs lifecycle events and problems only:
 | `source schema changed; the view reads the same columns: new column positions, no rebuild` | a source table was altered without changing what the view reads |
 | `source schema changed; rebuilding online` (with the difference in parentheses when re-planned on the spot) | a source table was altered in a way that changes what the view reads, or a change could not be checked in place |
 | `no views defined yet; add one with: INSERT INTO …` | `_lazyview` is empty |
+| `the cascade cache missed binlog events (gap); the kept rows under this parent key may be stale` (warning, at most once a minute per view) | a parent delete or key update was replayed from before the cache's startup seed; it is counted in `cascade_gaps` and the kept rows heal on their next change |
 
 `RUST_LOG=lazyview=debug` adds a summary every 60 s (`last 60s: N binlog events, …`) and the
 routine full-mode rebuilds.

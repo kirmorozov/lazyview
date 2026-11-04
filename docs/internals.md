@@ -56,6 +56,24 @@
   `'2020-00-00'` with `'0000-00-00'`. TIMESTAMP columns are read as `UNIX_TIMESTAMP(…)` and
   written in a `+00:00` session, so instants in a DST fall-back hour keep their hour. Other
   expressions keep the server's time zone. BIT values are written as integers.
+* **Cascade cache.** Changes made by a cascading foreign key are done by the storage engine and
+  never reach the binlog ([foreign-key cascades](views.md#foreign-key-cascades)). Where the plan
+  cannot trace such a route through the parent's row, and the child table has a primary or
+  NOT NULL unique key and the foreign key is compared by equality, the version keeps the child
+  rows the view can read — their key, their foreign-key value and the stored columns its routes
+  take values from, only the rows its aliases' filters keep — in an in-memory cache
+  (`src/cascade.rs`, one per version, no table). The cache is seeded from the source when the
+  version is built and when lazyview starts, and kept current from the child's own row events;
+  while a build seeds, the changes are logged and replayed in binlog order when the seed is
+  installed. A parent delete or key update takes the rows kept under the old key and replays
+  them as the deletes, or foreign-key updates, the storage engine made, through every route of
+  the child table; routes that cannot be mapped keep the online rebuild. After a restart, a
+  parent change whose event was logged before the seed may miss the child changes in between:
+  it is counted (`cascade_gaps`) and warned about at most once a minute, with no recovery — the
+  rows heal on their next change. Cost: per binlog event, one check of the cascade routes plus,
+  for a mapped one, its cache operation (a hash update for a child row, a lookup plus the
+  synthesized child events for a parent delete or key update); per flush, nothing; in memory,
+  one entry per kept child row.
 * **Full-refresh fallback.** Definitions that cannot be maintained per unit
   ([list](views.md#what-makes-a-view-full)) are rebuilt into a shadow table and swapped in. A
   change marks the view stale; the rebuild starts once `LAZYVIEW_FULL_REFRESH_MS` (60 s) has passed

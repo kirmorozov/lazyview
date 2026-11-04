@@ -281,25 +281,42 @@ reads.
   renumbering a pinned parent row refreshes exactly the rows that hold such children: the
   materialized table keeps a hidden column per pinned value (`_lv_c<k>`, a count per group or the
   child's key value per row) that names them. In a grouped view with `HAVING` this needs the child
-  inner-joined and pinned to one value; otherwise the pinned parent rows' deletes rebuild the view
+  inner-joined and pinned to one value; otherwise the pinned rows go through the cascade cache
   (below), while every other parent row still changes nothing. This holds wherever every alias of
-  the child is pinned on the foreign-key column, also when the view cannot follow the pinned rows:
-  the warning below then names the parent keys that still rebuild (``only `p`.`id` IN (5) reaches it``).
+  the child is pinned on the foreign-key column, also when the view cannot follow the pinned rows
+  from the parent's row.
 * These routes read the parent's row image: with `binlog_row_image` other than FULL a cascade
   from such a parent rebuilds the view, and lazyview warns about the incomplete image.
 * Through a `LEFT JOIN` with the parent on the NULL side, the parent is traced only when the join
   condition is the foreign-key equality and nothing else (`LEFT JOIN customers c ON c.id =
   a.customer_id`, or `USING`). With any other condition (`… ON c.id = a.customer_id AND
   c.active = 1`), a child row whose parent fails it stays in the view without its parent, so the
-  parent's row does not lead to it: such a view is rebuilt as described below.
+  parent's row does not lead to it: the cascade cache follows such a view (below); where it
+  cannot keep the child, such a view is rebuilt as described below.
 * A child read only in an `IN` / `EXISTS` subquery is handled the same way: correlated on the
   view's unit through the foreign-key column (`WHERE EXISTS (SELECT 1 FROM kids k WHERE k.par_id =
   p.id)`), the parent's row gives the units; otherwise the view is full (``EXISTS subquery over
   `kids`: the units a cascade from `pars` changes are not known``).
-* Otherwise a delete or key update on the parent triggers an online rebuild of the view (at most
-  once per `LAZYVIEW_FULL_REFRESH_MS`, never more than one at a time). lazyview logs a warning
-  when such a view is created (with the `reasons` that apply): `reads a child of a cascading foreign key whose units cannot be
-  derived from the parent`. Group or join by the foreign-key column to avoid the rebuilds.
+* Otherwise the **cascade cache** follows the cascade: when the child table has a primary or
+  NOT NULL unique key and the foreign key is compared by equality, lazyview keeps the child rows
+  the view can read (their key, their foreign-key value and the columns its routes take values
+  from; only rows some alias's filters keep) in memory. It seeds them from the source when the
+  view is built and when lazyview starts, and keeps them current from the child's own row
+  changes. A delete or key update on the parent takes the rows kept under the old key and
+  replays them as the deletes, or foreign-key updates, the storage engine made: every way the
+  view reads that table (units, lookups, further cascades) follows them as logged changes, and
+  only the affected rows are refreshed.
+* Where the cache cannot keep the child — no primary or NOT NULL unique key, or a foreign key
+  compared by collation or type conversion — a delete or key update on the parent triggers an
+  online rebuild of the view (at most once per `LAZYVIEW_FULL_REFRESH_MS`, never more than one at
+  a time). lazyview logs a warning when such a view is created (with the `reasons` that apply):
+  `reads a child of a cascading foreign key whose units cannot be derived from the parent`. Group
+  or join by the foreign-key column to avoid the rebuilds.
+* After a restart the cache is re-seeded from the source before the binlog is read again. A
+  parent delete or key update whose event was logged before that seed may miss the child changes
+  in between: each such event is counted (`cascade_gaps` in
+  [/stats](operations.md#per-view-update-statistics)) and warned about at most once a minute;
+  there is no recovery, and the rows heal on their next change.
 
 The same rate-limited online rebuild is used when too many changed keys were buffered to track
 individually: more than max(10 × `LAZYVIEW_BATCH_MAX_KEYS`, 100000) during a build.
