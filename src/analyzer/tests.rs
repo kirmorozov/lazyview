@@ -1384,13 +1384,12 @@ fn json_columns_in_composite_units() {
             full(&other);
         }
     }
-    // A one-element `IN (y)` is not a key equality for the unit planner: the key does not reduce
-    // the unit, so the JSON column stays in it and the view is Full (conservative, sound).
+    // A one-element `IN (y)` is a key equality for the unit planner: the key reduces the unit.
     for from in [
         "items i JOIN docs d ON d.id IN (i.doc_id)",
         "items i, docs d WHERE d.id IN (i.doc_id)",
     ] {
-        full(&format!(
+        grouped(&format!(
             "SELECT i.id, d.doc, COUNT(*) AS n FROM {from} GROUP BY i.id, d.doc"
         ));
     }

@@ -1562,6 +1562,7 @@ fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
     }
 }
 
+/// The column equalities of a conjunct. A one-element `x IN (y)` is `x = y`.
 fn equalities(e: &Expr, scope: &Scope) -> Vec<(ColRef, ColRef)> {
     let mut cs = Vec::new();
     conjuncts(e, &mut cs);
@@ -1572,6 +1573,11 @@ fn equalities(e: &Expr, scope: &Scope) -> Vec<(ColRef, ColRef)> {
                 op: BinaryOperator::Eq,
                 right,
             } => Some((scope.resolve(left)?, scope.resolve(right)?)),
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } if list.len() == 1 => Some((scope.resolve(expr)?, scope.resolve(&list[0])?)),
             _ => None,
         })
         .filter(|(a, b)| scope.same_family(*a, *b))
@@ -4261,6 +4267,14 @@ fn cascade_joined(
                         .resolve(left)
                         .zip(scope.resolve(right))
                         .filter(|(a, b)| scope.same_family(*a, *b)),
+                    Expr::InList {
+                        expr: left,
+                        list,
+                        negated: false,
+                    } if list.len() == 1 => scope
+                        .resolve(left)
+                        .zip(scope.resolve(&list[0]))
+                        .filter(|(a, b)| scope.same_family(*a, *b)),
                     _ => None,
                 };
                 match eq {
@@ -5387,6 +5401,8 @@ mod tests {
              ON 8 = b.aid AND c.oid = b.oid GROUP BY c.gid, c.oid HAVING MAX(b.val) IS NULL",
             "SELECT c.gid, c.oid, MAX(b.val) AS y FROM link c LEFT JOIN obj_attr b \
              ON b.oid = c.oid AND b.aid IN (8) GROUP BY c.gid, c.oid HAVING MAX(b.val) IS NULL",
+            "SELECT c.gid, c.oid, MAX(b.val) AS y FROM link c LEFT JOIN obj_attr b \
+             ON c.oid IN (b.oid) AND b.aid = 8 GROUP BY c.gid, c.oid HAVING MAX(b.val) IS NULL",
             "SELECT MAX(b.val) AS y FROM link c LEFT JOIN obj_attr b ON b.oid = c.oid \
              AND b.aid = 8 GROUP BY c.gid, c.oid HAVING MAX(b.val) IS NULL",
             "SELECT d.g, d.ob, MAX(d.v) AS y FROM (SELECT c.gid AS g, c.oid AS ob, b.val AS v \
@@ -6513,6 +6529,37 @@ mod tests {
             ),
             "{look}"
         );
+    }
+
+    #[test]
+    fn one_element_in_is_an_equality() {
+        let eq = p("CREATE VIEW v AS SELECT o.id, c.name FROM orders o \
+                    JOIN customers c ON c.id = o.customer_id");
+        let in_on = p("CREATE VIEW v AS SELECT o.id, c.name FROM orders o \
+                       JOIN customers c ON c.id IN (o.customer_id)");
+        let in_swapped = p("CREATE VIEW v AS SELECT o.id, c.name FROM orders o \
+                            JOIN customers c ON o.customer_id IN (c.id)");
+        let in_where = p(
+            "CREATE VIEW v AS SELECT o.id, c.name FROM orders o, customers c \
+                          WHERE c.id IN (o.customer_id)",
+        );
+        for (name, v) in [
+            ("ON `=`", &eq),
+            ("ON IN", &in_on),
+            ("swapped", &in_swapped),
+            ("WHERE", &in_where),
+        ] {
+            assert_eq!(v.tracing(), eq.tracing(), "{name} plans like `=`");
+            assert_eq!(
+                v.aliases[1].direct_unit, eq.aliases[1].direct_unit,
+                "{name} keeps customers' direct unit"
+            );
+        }
+        let grouped = p(
+            "CREATE VIEW v AS SELECT o.id, c.name, COUNT(*) n FROM orders o \
+                         JOIN customers c ON c.id IN (o.customer_id) GROUP BY o.id, c.name",
+        );
+        assert_eq!(grouped.unit_exprs, vec!["o.id"], "the key reduces the unit");
     }
 
     #[test]

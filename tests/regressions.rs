@@ -92,6 +92,49 @@ fn reg_join_partner_pk_update() {
     });
 }
 
+/// A one-element `IN (column)` join is a key equality: the grouped view plans incremental and a
+/// docs or items change refreshes it without a whole-view rebuild.
+#[test]
+fn reg_one_element_in_join() {
+    scenario("reg_in_eq", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_item_doc",
+            Kind::Incremental,
+            "SELECT i.id, d.doc, COUNT(*) n FROM items i JOIN docs d ON d.id IN (i.doc_id) GROUP BY i.id, d.doc",
+        )];
+        let ddl = [
+            "CREATE TABLE items (id INT PRIMARY KEY, doc_id INT NOT NULL)",
+            "CREATE TABLE docs (id INT PRIMARY KEY, doc JSON NOT NULL)",
+            "INSERT INTO items VALUES (1, 1), (2, 2), (3, 3)",
+            "INSERT INTO docs VALUES (1, '[1]'), (2, '[2]'), (3, '[3]')",
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_in_eq", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let mut sc = db.conn().await?;
+        let before = eng.snapshot();
+        run(&mut c, &["UPDATE docs SET doc = '[9]' WHERE id = 1"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "doc 1 updated").await?;
+        run(&mut c, &["DELETE FROM docs WHERE id = 2"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "doc 2 deleted").await?;
+        run(&mut c, &["INSERT INTO docs VALUES (2, '[2]')"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "doc 2 re-inserted").await?;
+        run(&mut c, &["UPDATE items SET doc_id = 2 WHERE id = 1"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "item 1 re-pointed to doc 2").await?;
+        run(&mut c, &["DELETE FROM items WHERE id = 3"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "item 3 deleted").await?;
+        run(&mut c, &["INSERT INTO items VALUES (3, 3)"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "item 3 re-inserted").await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0,
+            "one-element IN join caused a full rebuild: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
 /// Anchor two joins away (composite-PK `items`): when a parent row changes its join key to a
 /// value that no longer joins (or the grandparent row is deleted), the units can only be found
 /// through the before-image — found as stale v_line_details rows after
