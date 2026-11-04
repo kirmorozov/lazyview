@@ -145,6 +145,45 @@ impl Datum {
             (_, other) => Datum::from_value(other.clone()),
         }
     }
+
+    /// A binlog value that [`Self::from_binlog`] turns back into this datum for `col`: the
+    /// cascade map (`crate::cascade`) keeps datums and replays them as row images.
+    pub fn to_binlog(&self, col: &Column) -> Value {
+        match (&col.kind, self) {
+            (_, Datum::Null) => Value::NULL,
+            (ColKind::Enum(labels), Datum::Bytes(b)) => {
+                let i = labels.iter().position(|l| l.as_bytes() == b.as_slice());
+                Value::Int(i.map_or(0, |i| i as i64 + 1))
+            }
+            (ColKind::Set(labels), Datum::Bytes(b)) => {
+                let mut mask = 0u64;
+                for part in b.split(|&c| c == b',') {
+                    if let Some(i) = labels.iter().position(|l| l.as_bytes() == part) {
+                        mask |= 1u64 << i;
+                    }
+                }
+                Value::Bytes(mask.to_le_bytes()[..labels.len().div_ceil(8).max(1)].to_vec())
+            }
+            (ColKind::Unsigned(_), Datum::UInt(u)) => Value::Int(*u as i64),
+            (ColKind::Timestamp, Datum::Bytes(b)) => {
+                match std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(i) => Value::Int(i),
+                    None => Value::Bytes(b.clone()),
+                }
+            }
+            (ColKind::Bit(_), Datum::Int(i)) => Value::Bytes((*i as u64).to_be_bytes().to_vec()),
+            (ColKind::Bit(_), Datum::UInt(u)) => Value::Bytes(u.to_be_bytes().to_vec()),
+            (_, Datum::Int(i)) => Value::Int(*i),
+            (_, Datum::UInt(u)) => Value::UInt(*u),
+            (_, Datum::Float(b)) => Value::Double(f64::from_bits(*b)),
+            (_, Datum::Bytes(b)) => Value::Bytes(b.clone()),
+            (_, Datum::Date(y, m, d, h, i, s, us)) => Value::Date(*y, *m, *d, *h, *i, *s, *us),
+            (_, Datum::Time(neg, d, h, i, s, us)) => Value::Time(*neg, *d, *h, *i, *s, *us),
+        }
+    }
 }
 
 fn serde_json_text(j: &mysql_async::binlog::jsonb::Value<'_>) -> Option<String> {
@@ -203,5 +242,85 @@ mod tests {
         let wide = Column::new("f", "bit", "bit(64)", None, None, None, false);
         let d = Datum::from_binlog(Some(&bv(Value::Bytes(vec![0xff; 8]))), &wide);
         assert_eq!(d, Datum::UInt(u64::MAX));
+    }
+
+    /// Every binlog value of every column kind survives `from_binlog` -> `to_binlog` ->
+    /// `from_binlog` unchanged (the cascade map replays kept datums as row images).
+    #[test]
+    fn binlog_values_round_trip() {
+        let col = |dt: &str, ct: &str, octets: Option<u64>| {
+            Column::new("c", dt, ct, None, None, octets, false)
+        };
+        let cases: Vec<(Column, Vec<Value>)> = vec![
+            (
+                col("int", "int", None),
+                vec![Value::Int(-7), Value::Int(0), Value::NULL],
+            ),
+            (
+                col("bigint", "bigint unsigned", None),
+                vec![Value::Int(5), Value::Int(-1), Value::Int(i64::MIN)],
+            ),
+            (
+                col("tinyint", "tinyint unsigned", None),
+                vec![Value::Int(-1)],
+            ),
+            (
+                col("enum", "enum('a','b','c')", None),
+                vec![Value::Int(0), Value::Int(1), Value::Int(3)],
+            ),
+            (
+                col("set", "set('a','b','c','d','e','f','g','h','i')", None),
+                vec![Value::Bytes(vec![0, 0]), Value::Bytes(vec![0b101, 1])],
+            ),
+            (
+                col("timestamp", "timestamp", None),
+                vec![Value::Int(1_700_000_000)],
+            ),
+            (
+                col("timestamp", "timestamp(3)", None),
+                vec![Value::Bytes(b"1700000000.125".to_vec())],
+            ),
+            (
+                col("bit", "bit(12)", None),
+                vec![Value::Bytes(vec![0x0a, 0xbc])],
+            ),
+            (
+                col("bit", "bit(64)", None),
+                vec![Value::Bytes(vec![0xff; 8])],
+            ),
+            (
+                col("binary", "binary(4)", Some(4)),
+                vec![Value::Bytes(vec![1, 2])],
+            ),
+            (
+                col("varchar", "varchar(10)", Some(40)),
+                vec![Value::Bytes(b"x y".to_vec())],
+            ),
+            (
+                col("json", "json", None),
+                vec![Value::Bytes(br#"{"a":1}"#.to_vec())],
+            ),
+            (col("float", "float", None), vec![Value::Float(1.5)]),
+            (col("double", "double", None), vec![Value::Double(-2.25)]),
+            (
+                col("datetime", "datetime(6)", None),
+                vec![Value::Date(2024, 2, 29, 23, 59, 58, 1)],
+            ),
+            (
+                col("time", "time(6)", None),
+                vec![Value::Time(true, 34, 22, 59, 58, 990_000)],
+            ),
+            (
+                col("decimal", "decimal(10,2)", None),
+                vec![Value::Bytes(b"-12.50".to_vec())],
+            ),
+        ];
+        for (c, values) in cases {
+            for v in values {
+                let d = Datum::from_binlog(Some(&bv(v.clone())), &c);
+                let back = Datum::from_binlog(Some(&bv(d.to_binlog(&c))), &c);
+                assert_eq!(back, d, "{} {v:?}", c.data_type);
+            }
+        }
     }
 }

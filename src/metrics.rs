@@ -61,8 +61,7 @@ counters!(
     definition_reloads,
     // Definitions whose planning took longer than LAZYVIEW_PLAN_TIMEOUT_MS.
     plans_timed_out,
-    // Lookups of several lookup tables gave up (too many combinations or remembered images):
-    // the view was rebuilt instead (see src/lookback.rs).
+    // Kept for dashboards: lookups no longer give up (they run in chunks), so this stays 0.
     lookback_overflows,
     // Refresh supervisor (docs/design-supervisor.md §5).
     supervisor_increases,
@@ -73,6 +72,9 @@ counters!(
     supervisor_cpu_offloads,
     flushes_overlapped,
     binlog_backpressure,
+    // Child rows a mapped cascade changed, replayed from the in-memory cascade cache
+    // (src/cascade.rs): the global sum over views, added in publish_stats.
+    cascade_rows,
 );
 
 /// Point-in-time values (may go down), maintained by the engine.

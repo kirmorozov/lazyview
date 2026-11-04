@@ -17,9 +17,12 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::accumulate::{extend_partial, feed, feed_cascade, Fed, UnitChunk, UnitSet, ViewDirty};
+use crate::accumulate::{
+    self, extend_partial, feed, feed_cascade, feed_map, Fed, UnitChunk, UnitSet, ViewDirty,
+};
 use crate::analyze::{self, Mode, ViewPlan};
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position};
+use crate::cascade;
 use crate::catalog::{Catalog, TableInfo, TableRef};
 use crate::config::{Config, MissingBinlog, StartMode};
 use crate::coord;
@@ -415,6 +418,8 @@ enum RouteKind {
     Any,
     /// Parent of a cascading FK into a table the view reads (plan cascade index).
     Cascade(usize),
+    /// Child of a cascade whose rows the cascade map keeps (plan cascade index).
+    MapChild(usize),
 }
 
 type XaRow = (TableRef, Option<BinlogRow>, Option<BinlogRow>);
@@ -506,12 +511,13 @@ struct ShownState {
     error: Option<String>,
 }
 
-/// A finished build: its layout, the targets it could not be built on and those it already
-/// swapped in itself (routine rebuilds of full-mode views).
+/// A finished build: its layout, the targets it could not be built on, those it already
+/// swapped in itself (routine rebuilds of full-mode views) and the cascade cache it seeded.
 struct Built {
     layout: Layout,
     failed: Vec<(String, anyhow::Error)>,
     swapped: Vec<String>,
+    cache: cascade::Cache,
 }
 
 struct BuildDone {
@@ -1205,7 +1211,7 @@ impl Engine {
         let mut reasons: Vec<String> = plan
             .cascades
             .iter()
-            .filter(|c| c.unit_from_parent.is_none() && !c.traced && !c.derived)
+            .filter(|c| c.unit_from_parent.is_none() && !c.traced && !c.derived && c.map.is_none())
             .map(|c| {
                 c.untraced.clone().unwrap_or_else(|| {
                     format!(
@@ -1217,6 +1223,15 @@ impl Engine {
             .collect();
         reasons.sort();
         reasons.dedup();
+        let mapped: Vec<String> = plan
+            .cascades
+            .iter()
+            .filter(|c| c.map.is_some())
+            .map(|c| format!("`{}` -> `{}`", c.parent.name, c.child.1))
+            .collect();
+        if !mapped.is_empty() && plan.is_incremental() {
+            debug!(view = %plan.name, routes = %mapped.join(", "), "follows cascades through the cascade map");
+        }
         if !reasons.is_empty() && plan.is_incremental() {
             warn!(view = %plan.name, reasons = %reasons.join("; "), "reads a child of a cascading foreign key whose units cannot be derived from the parent; parent deletes/updates trigger an online rebuild");
         }
@@ -1936,6 +1951,11 @@ impl Engine {
         if resumed.is_empty() {
             return Ok(targets);
         }
+        // Seed the in-memory cascade cache on the source, then remember where the log stands:
+        // a cascade parent replayed from before that position is a gap until its child rows
+        // move again (the Cascade arm of feed_rows clears gap_until once the log passes it).
+        let mut cache = seed_cache(&mut self.src, plan).await?;
+        cache.gap_until = Some(binlog::current_position(&mut self.src).await?);
         let rest: Vec<String> = targets
             .iter()
             .filter(|t| !resumed.contains(t))
@@ -1963,6 +1983,7 @@ impl Engine {
             targets: resumed,
             dirty: ViewDirty {
                 images: vec![HashSet::new(); plan.aliases.len()],
+                cache,
                 ..Default::default()
             },
             frozen: false,
@@ -2092,6 +2113,11 @@ impl Engine {
         self.slots[idx].next = Some(Next {
             dirty: ViewDirty {
                 images: vec![HashSet::new(); plan.aliases.len()],
+                cache: if plan.cascades.iter().any(|c| c.map.is_some()) {
+                    cascade::Cache::seeding()
+                } else {
+                    cascade::Cache::default()
+                },
                 ..Default::default()
             },
             plan,
@@ -2317,6 +2343,18 @@ impl Engine {
                             kind: RouteKind::Cascade(ci),
                         });
                 }
+                for (ci, c) in plan
+                    .cascades
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.map.is_some())
+                {
+                    routes.entry(c.child.clone()).or_default().push(RouteT {
+                        slot: si,
+                        next,
+                        kind: RouteKind::MapChild(ci),
+                    });
+                }
             }
         }
         self.routes = routes.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
@@ -2362,6 +2400,7 @@ impl Engine {
         let expected = |plan: &ViewPlan, kind: RouteKind| match kind {
             RouteKind::Alias(a) => Some(plan.aliases[a].table.columns.len()),
             RouteKind::Cascade(c) => Some(plan.cascades[c].parent.columns.len()),
+            RouteKind::MapChild(c) => Some(plan.cascades[c].child_table.columns.len()),
             RouteKind::All(ti) => plan.table_columns[ti].as_ref().map(Vec::len),
             RouteKind::Any => None,
         };
@@ -3037,7 +3076,17 @@ impl Engine {
                 let fed = match r.kind {
                     RouteKind::Alias(a) => feed(plan, a, dirty, before.as_ref(), after.as_ref()),
                     RouteKind::Cascade(c) => {
+                        if let Some(gap_until) = dirty.cache.gap_until.clone() {
+                            let gap = since < &gap_until;
+                            dirty.cache.gap = gap;
+                            if !gap {
+                                dirty.cache.gap_until = None;
+                            }
+                        }
                         feed_cascade(plan, c, dirty, before.as_ref(), after.as_ref())
+                    }
+                    RouteKind::MapChild(c) => {
+                        feed_map(plan, c, dirty, before.as_ref(), after.as_ref())
                     }
                     RouteKind::All(ti) => match (before, after, &plan.table_columns[ti]) {
                         (Some(b), Some(a), Some(cols)) if !columns_changed(b, a, cols) => {
@@ -3567,19 +3616,27 @@ impl Engine {
                     .or(s.next.as_ref().map(|n| &n.plan))
                     .or(s.last_plan.as_ref());
                 let mode = plan.map(|p| mode_name(p).0).unwrap_or("unknown");
-                let (tally, pending) = match s.live.as_mut() {
+                let (tally, pending, cached) = match s.live.as_mut() {
                     Some(l) => (
                         std::mem::take(&mut l.dirty.tally),
                         pending_ids(&l.dirty, &l.plan),
+                        l.dirty
+                            .cache
+                            .routes
+                            .iter()
+                            .map(|r| r.rows.len() as u64)
+                            .sum(),
                     ),
                     None => Default::default(),
                 };
+                crate::metrics::Metrics::add(&self.metrics.cascade_rows, tally.cascade_rows);
                 crate::stats::Fold {
                     view: format!("{schema}.{}", s.name),
                     mode,
                     tally,
                     flush: std::mem::take(&mut s.stats),
                     pending,
+                    cascade_cached_rows: cached,
                 }
             })
             .collect();
@@ -3926,6 +3983,7 @@ impl Engine {
             layout,
             failed,
             swapped,
+            cache,
         } = match n.done.take().unwrap() {
             Ok(b) => b,
             Err(e) => {
@@ -3933,6 +3991,8 @@ impl Engine {
                 return;
             }
         };
+        let log = n.dirty.cache.install(cache);
+        accumulate::drain(&n.plan, &mut n.dirty, log);
         n.swapped.extend(swapped);
         // Targets the build could not use are retried later; the view goes live on the rest.
         let mut first_err = None;
@@ -4085,6 +4145,7 @@ impl Engine {
                         layout,
                         failed: Vec::new(),
                         swapped: Vec::new(),
+                        cache: cascade::Cache::default(),
                     }));
                     n.not_before = Some(Instant::now() + Duration::from_secs(5));
                     self.slots[i].next = Some(n);
@@ -4164,6 +4225,7 @@ impl Engine {
             images: vec![HashSet::new(); n.plan.aliases.len()],
             ..Default::default()
         };
+        live_dirty.cache = std::mem::take(&mut n.dirty.cache);
         live_dirty.merge(n.dirty);
         live_dirty.all |= full_again;
         // Changes not applied to the shadow (a swap that was retried, or ran in the background)
@@ -4533,22 +4595,17 @@ impl Engine {
         }
         // `dirty` is only cleared once everything succeeded, so a failure can be retried.
         let mut units = dirty.units.clone();
-        let mut rebuild = dirty.rebuild;
+        let rebuild = dirty.rebuild;
         let resolve = (units.len(), Metrics::get(&self.metrics.lookup_queries));
-        if !self
-            .lookups(
-                plan,
-                layout,
-                &dirty.images,
-                (targets, table),
-                (recent, since),
-                &mut units,
-            )
-            .await?
-        {
-            debug!(view = %plan.name, "too many changed rows to look up; rebuilding instead");
-            rebuild = true;
-        }
+        self.lookups(
+            plan,
+            layout,
+            &dirty.images,
+            (targets, table),
+            (recent, since),
+            &mut units,
+        )
+        .await?;
         self.presence_lookups(
             plan,
             layout,
@@ -4647,22 +4704,18 @@ impl Engine {
             Metrics::add(&self.metrics.units_refreshed, 1);
         } else {
             // `dirty` is only cleared once everything succeeded, so a failure can be retried.
+            p.rebuild |= dirty.rebuild;
             let mut units = dirty.units.clone();
             let resolve = (units.len(), Metrics::get(&self.metrics.lookup_queries));
-            if !self
-                .lookups(
-                    plan,
-                    layout,
-                    &dirty.images,
-                    (targets, table),
-                    (recent, since),
-                    &mut units,
-                )
-                .await?
-            {
-                debug!(view = %plan.name, "too many changed rows to look up; rebuilding instead");
-                p.rebuild = true;
-            }
+            self.lookups(
+                plan,
+                layout,
+                &dirty.images,
+                (targets, table),
+                (recent, since),
+                &mut units,
+            )
+            .await?;
             self.presence_lookups(
                 plan,
                 layout,
@@ -4817,7 +4870,8 @@ impl Engine {
     ///   with images remembered from earlier flushes; `since` is the replay position of the
     ///   oldest change in `images`.
     ///
-    /// `false`: too many combinations or remembered images; the caller rebuilds the view instead.
+    /// However many tables, combinations or statements that takes, they run one after the other
+    /// (owner rule: a lookup over its limits is chunked, never a rebuild).
     async fn lookups(
         &mut self,
         plan: &ViewPlan,
@@ -4826,7 +4880,7 @@ impl Engine {
         (targets, table): (&[String], &str),
         (recent, since): (&mut Lookback, Option<&Position>),
         units: &mut UnitSet,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let fresh = |a: usize| images.get(a).is_some_and(|s| !s.is_empty());
         for a in (0..plan.aliases.len()).filter(|&a| fresh(a)) {
             if plan.lineage_of(a).is_some() {
@@ -4844,32 +4898,17 @@ impl Engine {
             .collect();
         if plain.len() < 2 {
             for &a in plain.iter().filter(|&&a| fresh(a)) {
-                if !self.lookup(plan, &[(a, &images[a])], units).await? {
-                    return Ok(false);
-                }
+                self.lookup(plan, &[(a, &images[a])], units).await?;
             }
-            return Ok(true);
+            return Ok(());
         }
-        let metrics = self.metrics.clone();
-        let overflow = |what: &str| {
-            debug!(view = %plan.name, "{what}; rebuilding instead");
-            Metrics::add(&metrics.lookback_overflows, 1);
-        };
-        let Some(combos) = recent.combinations(&plain, images) else {
-            overflow("too many lookup tables changed together");
-            recent.clear();
-            return Ok(false);
-        };
-        for set in &combos.sets {
+        let combos = recent.combinations(&plain, images);
+        for set in combos.sets() {
             let parts: Vec<(usize, &HashSet<Key>)> = match set.as_slice() {
                 [a] => vec![(*a, &images[*a])],
                 _ => set.iter().map(|&a| (a, &combos.all[a])).collect(),
             };
-            if !self.lookup(plan, &parts, units).await? {
-                overflow("too many lookup combinations");
-                recent.clear();
-                return Ok(false);
-            }
+            self.lookup(plan, &parts, units).await?;
         }
         if plain.iter().any(|&a| fresh(a)) {
             // Every change visible to the lookups above is in the binlog before this position.
@@ -4878,12 +4917,7 @@ impl Engine {
             recent.remember(until, from, &plain, images);
         }
         recent.prune(&self.boundary);
-        if recent.key_count() > self.cfg.batch_max_keys.saturating_mul(10) {
-            overflow("too many remembered lookup images");
-            recent.clear();
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(())
     }
 
     /// Units of pinned cascade children whose parent key changed (see `ViewDirty::marks`):
@@ -5021,14 +5055,14 @@ impl Engine {
     }
 
     /// Looks up the units of the rows obtained by replacing every alias in `parts` by its images
-    /// (`SELECT DISTINCT <units>` over the view's FROM/WHERE). `false`: too many statements for
-    /// one combination.
+    /// (`SELECT DISTINCT <units>` over the view's FROM/WHERE), one statement per combination of
+    /// one chunk of images per alias.
     async fn lookup(
         &mut self,
         plan: &ViewPlan,
         parts: &[(usize, &HashSet<Key>)],
         units: &mut UnitSet,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         struct Part<'a> {
             alias: usize,
             first: String,
@@ -5068,9 +5102,6 @@ impl Engine {
         }
         let parts = subs;
         let counts: Vec<usize> = parts.iter().map(|p| p.keys.len().div_ceil(p.per)).collect();
-        if parts.len() > 1 && counts.iter().product::<usize>() > MAX_LOOKUP_COMBO_QUERIES {
-            return Ok(false);
-        }
         // Every combination of one chunk per alias (an odometer over the chunk indexes).
         let mut at = vec![0usize; parts.len()];
         loop {
@@ -5115,7 +5146,7 @@ impl Engine {
             let mut d = 0;
             loop {
                 if d == at.len() {
-                    return Ok(true);
+                    return Ok(());
                 }
                 at[d] += 1;
                 if at[d] < counts[d] {
@@ -5323,9 +5354,6 @@ fn finish_refresh(
 /// Placeholders per statement (the server limit is 65535).
 const MAX_FILTER_PARAMS: usize = 60_000;
 
-/// Statements one combination of image sets may take (chunks of each multiplied).
-const MAX_LOOKUP_COMBO_QUERIES: usize = 256;
-
 /// A lagging target is reported down after this many failed retries.
 const LAG_MAX_FAILURES: u32 = 5;
 
@@ -5423,6 +5451,7 @@ async fn swap_task(
             layout,
             failed: Vec::new(),
             swapped,
+            cache: cascade::Cache::default(),
         }),
     });
 }
@@ -5484,6 +5513,28 @@ async fn prepare_target(
     Ok((c, w))
 }
 
+/// Seeds this build's in-memory cascade cache from the source before the table is filled: a
+/// cascade after this read is in the binlog this version replays, so none falls between the
+/// two reads.
+async fn seed_cache(conn: &mut Conn, plan: &ViewPlan) -> Result<cascade::Cache> {
+    let mut cache = cascade::Cache::default();
+    for (ci, c) in plan.cascades.iter().enumerate() {
+        let Some(sql) = cascade::seed_sql(c) else {
+            continue;
+        };
+        let mut result = conn
+            .exec_iter(sql, ())
+            .await
+            .context("seeding the cascade cache")?;
+        while let Some(row) = result.next().await? {
+            let vals = row.unwrap();
+            let (key, kept) = cascade::seed_row(c, vals);
+            cache.put(ci, key, kept);
+        }
+    }
+    Ok(cache)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_task(
     src_opts: Opts,
@@ -5502,6 +5553,9 @@ async fn build_task(
         let _permit = slots.acquire_owned().await?;
         let mut src = connect(&src_opts).await?;
         let layout = mv::probe(&mut src, &src_schema, &plan).await?;
+        // The cascade cache is read on the source before the table is filled, so that no
+        // cascade falls between the two reads: the binlog this version replays holds the rest.
+        let cache = seed_cache(&mut src, &plan).await?;
         // Each target is prepared on its own: one that fails is reported, the others built.
         let mut conns = Vec::new();
         let mut failed = Vec::new();
@@ -5553,6 +5607,7 @@ async fn build_task(
             layout,
             failed,
             swapped,
+            cache,
         })
     }
     .await;

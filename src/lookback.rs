@@ -23,17 +23,15 @@
 //! was not visible then, flush k's lookup of X saw `S` and found the unit. If Z's change was
 //! visible, it is before `until_k`, so it is read while X's image is still remembered, and the
 //! combination of Z's new image with X's remembered one finds the unit. The same holds for more
-//! tables. Cost: up to 2^n - 1 lookups for n changed lookup tables per flush. The remembered sets
-//! pin the saved binlog position (a restart re-reads them). They are bounded: past the cap the
-//! caller drops them and rebuilds that view online instead.
+//! tables. Cost: up to 2^n - 1 lookups for n changed lookup tables per flush, run one after the
+//! other (never a rebuild instead, however many). The remembered sets pin the saved binlog
+//! position (a restart re-reads them); they are dropped once the binlog is read past their
+//! window, so they hold no more than the changes of that window.
 
 use std::collections::HashSet;
 
 use crate::binlog::Position;
 use crate::datum::Key;
-
-/// Lookups combine the images of at most this many tables (2^n - 1 combinations).
-pub const MAX_TABLES: usize = 6;
 
 /// Remembered images of one view version.
 #[derive(Default)]
@@ -54,17 +52,36 @@ struct Held {
 pub struct Combinations {
     /// Per alias: its new images plus the remembered ones.
     pub all: Vec<HashSet<Key>>,
-    /// Alias sets to replace together. A single alias is looked up with its new images only
-    /// (remembered ones were looked up on their own when they were new); a set of several with
-    /// `all` of each.
-    pub sets: Vec<Vec<usize>>,
+    /// The aliases with images, new or remembered.
+    with: Vec<usize>,
+    /// Bit `b`: `with[b]` has new images.
+    fresh: u64,
+}
+
+impl Combinations {
+    /// Alias sets to replace together, smallest first, each with at least one alias with new
+    /// images (the others were looked up before), generated one at a time. A single alias is
+    /// looked up with its new images only (remembered ones were looked up on their own when they
+    /// were new); a set of several with `all` of each.
+    pub fn sets(&self) -> impl Iterator<Item = Vec<usize>> + '_ {
+        let n = self.with.len() as u32;
+        (1..=n).flat_map(move |k| {
+            (1u64..1u64 << n)
+                .filter(move |m| m.count_ones() == k && m & self.fresh != 0)
+                .map(move |m| {
+                    (0..n as usize)
+                        .filter(|b| m >> b & 1 == 1)
+                        .map(|b| self.with[b])
+                        .collect()
+                })
+        })
+    }
 }
 
 impl Lookback {
     /// The combinations to look up for the new `images` (per alias) of the lookup tables
     /// `aliases`. Only those with at least one new image: the others were looked up before.
-    /// `None`: more than [`MAX_TABLES`] tables have images.
-    pub fn combinations(&self, aliases: &[usize], images: &[HashSet<Key>]) -> Option<Combinations> {
+    pub fn combinations(&self, aliases: &[usize], images: &[HashSet<Key>]) -> Combinations {
         let n = images.len();
         let fresh = |a: usize| images.get(a).is_some_and(|s| !s.is_empty());
         let mut all: Vec<HashSet<Key>> = vec![HashSet::new(); n];
@@ -82,21 +99,14 @@ impl Lookback {
             .iter()
             .copied()
             .filter(|&a| !all[a].is_empty())
+            .take(63)
             .collect();
-        if with.len() > MAX_TABLES {
-            return None;
-        }
-        let mut sets: Vec<Vec<usize>> = (1u32..1 << with.len())
-            .map(|m| {
-                (0..with.len())
-                    .filter(|b| m >> b & 1 == 1)
-                    .map(|b| with[b])
-                    .collect::<Vec<usize>>()
-            })
-            .filter(|set| set.iter().any(|&a| fresh(a)))
-            .collect();
-        sets.sort_by_key(Vec::len);
-        Some(Combinations { all, sets })
+        let fresh = with
+            .iter()
+            .enumerate()
+            .filter(|(_, &a)| fresh(a))
+            .fold(0u64, |m, (b, _)| m | 1 << b);
+        Combinations { all, with, fresh }
     }
 
     /// Remembers the new `images` of `aliases`, looked up against a state in which every visible
@@ -182,15 +192,15 @@ mod tests {
         let mut lb = Lookback::default();
         // Flush k: alias 1 changed (alias 0 has a direct unit, alias 2 had no change).
         let k = imgs(&[&[], &[10], &[]]);
-        let c = lb.combinations(&[1, 2], &k).unwrap();
-        assert_eq!(c.sets, vec![vec![1]]);
+        let c = lb.combinations(&[1, 2], &k);
+        assert_eq!(c.sets().collect::<Vec<_>>(), vec![vec![1]]);
         lb.remember(pos(500), pos(100), &[1, 2], &k);
         assert_eq!((lb.floor(), lb.key_count()), (Some(&pos(100)), 1));
         // Flush m: alias 2 changed; its partner's old image is remembered.
         lb.prune(&pos(300));
         let m = imgs(&[&[], &[], &[20]]);
-        let c = lb.combinations(&[1, 2], &m).unwrap();
-        assert_eq!(c.sets, vec![vec![2], vec![1, 2]]);
+        let c = lb.combinations(&[1, 2], &m);
+        assert_eq!(c.sets().collect::<Vec<_>>(), vec![vec![2], vec![1, 2]]);
         assert_eq!(c.all[1].len(), 1);
         lb.remember(pos(900), pos(300), &[1, 2], &m);
         // Read past flush k's window: its entry is dropped, flush m's kept.
@@ -200,18 +210,28 @@ mod tests {
         assert!(lb.is_empty() && lb.floor().is_none());
     }
 
+    /// Every combination holds a table with new images, smallest first; however many tables
+    /// changed together, all of them are generated (never given up).
     #[test]
-    fn combinations_need_a_new_image_and_are_bounded() {
+    fn combinations_need_a_new_image_and_are_all_generated() {
         let lb = Lookback::default();
         let three = imgs(&[&[1], &[2], &[3]]);
-        let c = lb.combinations(&[0, 1, 2], &three).unwrap();
-        assert_eq!(c.sets.len(), 7);
-        assert_eq!(c.sets.last().unwrap(), &vec![0, 1, 2]);
+        let sets: Vec<Vec<usize>> = lb.combinations(&[0, 1, 2], &three).sets().collect();
+        assert_eq!(sets.len(), 7);
+        assert_eq!(sets.last().unwrap(), &vec![0, 1, 2]);
+        assert!(sets.windows(2).all(|w| w[0].len() <= w[1].len()));
         let none = imgs(&[&[], &[]]);
-        assert!(lb.combinations(&[0, 1], &none).unwrap().sets.is_empty());
-        let many: Vec<HashSet<Key>> = (0..7).map(|i| imgs(&[&[i]]).remove(0)).collect();
-        assert!(lb
-            .combinations(&(0..7).collect::<Vec<_>>(), &many)
-            .is_none());
+        assert_eq!(lb.combinations(&[0, 1], &none).sets().count(), 0);
+        let many: Vec<HashSet<Key>> = (0..9).map(|i| imgs(&[&[i]]).remove(0)).collect();
+        let c = lb.combinations(&(0..9).collect::<Vec<_>>(), &many);
+        assert_eq!(c.sets().count(), (1 << 9) - 1);
+        // Remembered images only: combined with a new one, never alone.
+        let mut lb = Lookback::default();
+        lb.remember(pos(900), pos(100), &[0, 1], &imgs(&[&[1], &[2]]));
+        let c = lb.combinations(&[0, 1, 2], &imgs(&[&[], &[], &[3]]));
+        assert_eq!(
+            c.sets().collect::<Vec<_>>(),
+            vec![vec![2], vec![0, 2], vec![1, 2], vec![0, 1, 2]]
+        );
     }
 }

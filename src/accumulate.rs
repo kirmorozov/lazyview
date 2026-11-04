@@ -7,6 +7,8 @@ use mysql_async::binlog::value::BinlogValue;
 use roaring::RoaringTreemap;
 
 use crate::analyze::{AliasPlan, CascadeRoute, ConstFilter, Mode, ViewPlan};
+use crate::cascade;
+pub use crate::cascade::{kept_image, KeptRow};
 use crate::catalog::FkAction;
 use crate::datum::{Datum, Key};
 use crate::stats::Tally;
@@ -335,6 +337,8 @@ pub struct ViewDirty {
     /// Marks counted for the view's statistics (stays with the buffer on [`Self::take`], not
     /// carried by [`Self::merge`]; folded and reset once per flush).
     pub tally: Tally,
+    /// Per-version cascade cache (`crate::cascade`): kept by `take`, dropped by `merge`.
+    pub cache: crate::cascade::Cache,
 }
 
 impl ViewDirty {
@@ -405,6 +409,7 @@ impl ViewDirty {
         let mut out = std::mem::take(self);
         self.images = vec![HashSet::new(); n];
         self.tally = std::mem::take(&mut out.tally);
+        self.cache = std::mem::take(&mut out.cache);
         if out.images.len() < n {
             out.images.resize(n, HashSet::new());
         }
@@ -579,6 +584,9 @@ pub fn feed_cascade(
         return feed_derived_cascade(c, action, dirty, b, after);
     }
     let Some(pcols) = &c.unit_from_parent else {
+        if c.map.is_some() {
+            return feed_mapped_cascade(plan, c, ci, action, dirty, b, after);
+        }
         dirty.rebuild = true;
         return Fed::Recorded;
     };
@@ -666,6 +674,224 @@ fn feed_derived_cascade(
         }
     }
     Fed::Recorded
+}
+
+/// A cascade the map follows: the parent's old key, and the children's new FK (the new key of a
+/// CASCADE update, NULLs for SET NULL; none when they are deleted), for the next refresh to
+/// resolve. A parent row that is not a full image cannot be read: the safety net of
+/// [`feed_derived_cascade`].
+fn feed_mapped_cascade(
+    plan: &ViewPlan,
+    c: &CascadeRoute,
+    ci: usize,
+    action: FkAction,
+    dirty: &mut ViewDirty,
+    b: &BinlogRow,
+    after: Option<&BinlogRow>,
+) -> Fed {
+    let full = |r: &BinlogRow| r.len() == c.parent.columns.len();
+    if !full(b) || after.is_some_and(|a| !full(a)) {
+        partial_parent_image(&c.parent.name);
+        dirty.rebuild = true;
+        return Fed::Recorded;
+    }
+    let key = |r: &BinlogRow| -> Key {
+        c.parent_cols
+            .iter()
+            .map(|&p| Datum::from_binlog(value_at(r, p), &c.parent.columns[p]))
+            .collect()
+    };
+    let new = match (after, action) {
+        (Some(a), FkAction::Cascade) => Some(key(a)),
+        (None, FkAction::Cascade) => None,
+        _ => Some(c.parent_cols.iter().map(|_| Datum::Null).collect()),
+    };
+    let old = key(b);
+    if dirty.cache.gap {
+        dirty.tally.cascade_gaps += 1;
+        cascade_gap(&plan.name, &c.parent.name, &old, &mut dirty.cache.warned_at);
+    }
+    match dirty.cache.parent(ci, &old, new.as_ref()) {
+        // Logged while seeding: `drain` expands it once the cache is installed, so the
+        // version must hold this change's position until then.
+        None => Fed::Recorded,
+        // No kept child row under `old` (none exists, or a gap): no unit can change. Recorded
+        // would pin the version's replay position with nothing left to refresh it.
+        Some(rows) if rows.is_empty() => Fed::Skipped,
+        Some(rows) => expand(plan, ci, rows, new.as_ref(), dirty),
+    }
+}
+
+/// The kept child rows of a parent change, expanded into child row changes at event time: a
+/// complete row replays through the map (`replay`) with its kept image before, and after
+/// carrying the new FK (none when the children are deleted); an incomplete row (a stored
+/// column missing from the image) warns and marks the view for rebuild.
+fn expand(
+    plan: &ViewPlan,
+    ci: usize,
+    rows: Vec<KeptRow>,
+    new: Option<&Key>,
+    dirty: &mut ViewDirty,
+) -> Fed {
+    let c = &plan.cascades[ci];
+    dirty.tally.cascade_rows += rows.len() as u64;
+    // Kept rows whose replay buffers nothing (none of them reaches a unit, e.g. rows of a level
+    // the view does not read with no kept rows below) only changed the cache: skipped.
+    let mut fed = Fed::Skipped;
+    for row in &rows {
+        if !row.complete {
+            incomplete_cascade_row(&plan.name, &c.child.1);
+            dirty.rebuild = true;
+            fed = Fed::Recorded;
+            continue;
+        }
+        let before = kept_image(c, row, None);
+        let after = new.map(|fk| kept_image(c, row, Some(fk)));
+        if replay(plan, &c.child, dirty, Some(&before), after.as_ref()) == Fed::Recorded {
+            fed = Fed::Recorded;
+        }
+    }
+    fed
+}
+
+/// Records a change of a child row of cascade `ci` for its map (see `MapPlan`): the row entering
+/// or changing in the map, or leaving it (deleted, a new key, a NULL FK, or no alias's filters
+/// pass any more). An update of no stored column, or of a row the map does not keep, is
+/// skipped. A stored column missing from the image (not a full image, a partial JSON update)
+/// leaves the row incomplete: replaying it is the documented safety net (`crate::cascade`).
+pub fn feed_map(
+    plan: &ViewPlan,
+    ci: usize,
+    dirty: &mut ViewDirty,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+) -> Fed {
+    let c = &plan.cascades[ci];
+    let Some(m) = &c.map else {
+        return Fed::Skipped;
+    };
+    if let (Some(b), Some(a)) = (before, after) {
+        if !m.cols.iter().any(|&k| {
+            value_at(b, k) != value_at(a, k)
+                || matches!(value_at(a, k), Some(BinlogValue::JsonDiff(_)))
+        }) {
+            return Fed::Skipped;
+        }
+    }
+    let old = before.and_then(|r| cascade::kept(c, r));
+    let new = after.and_then(|r| cascade::kept(c, r));
+    if old.is_none() && new.is_none() {
+        return Fed::Skipped;
+    }
+    let old_key = old
+        .as_ref()
+        .map(|(k, _)| k.clone())
+        .filter(|k| new.as_ref().is_none_or(|(nk, _)| nk != k));
+    let seeding = dirty.cache.is_seeding();
+    dirty.cache.child(ci, old_key, new);
+    // A ready cache changes in memory only: nothing is buffered to refresh and a restart seeds
+    // the cache again, so no replay position is held (Recorded would pin the version's `since`
+    // on an empty buffer, e.g. a row of a level the view does not read). While seeding, the
+    // change is logged for `drain` and held until then.
+    if seeding {
+        Fed::Recorded
+    } else {
+        Fed::Skipped
+    }
+}
+
+/// Feeds a change of a row of `table` to every route of `plan` that reads it, as the binlog loop
+/// does for a logged row (`Engine::rebuild_routes`): its aliases, the cascades out of it, and the
+/// maps that keep its rows. Replays the child rows a mapped cascade changed (`crate::cascade`).
+/// `Recorded` when some route buffered the change for a refresh.
+pub fn replay(
+    plan: &ViewPlan,
+    table: &(String, String),
+    dirty: &mut ViewDirty,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+) -> Fed {
+    let is = |schema: &str, name: &str| (schema, name) == (table.0.as_str(), table.1.as_str());
+    let mut fed = Fed::Skipped;
+    for (ai, a) in plan.aliases.iter().enumerate() {
+        if is(&a.table.schema, &a.table.name)
+            && feed(plan, ai, dirty, before, after) == Fed::Recorded
+        {
+            fed = Fed::Recorded;
+        }
+    }
+    for (ci, c) in plan.cascades.iter().enumerate() {
+        if !c.traced
+            && is(&c.parent.schema, &c.parent.name)
+            && feed_cascade(plan, ci, dirty, before, after) == Fed::Recorded
+        {
+            fed = Fed::Recorded;
+        }
+        if c.map.is_some()
+            && c.child == *table
+            && feed_map(plan, ci, dirty, before, after) == Fed::Recorded
+        {
+            fed = Fed::Recorded;
+        }
+    }
+    fed
+}
+
+/// Drains the seeding log of `dirty.cache` (from `Cache::install`), re-applying each event in
+/// binlog order to the now-ready cache: children straight, parents re-run and their kept rows
+/// expanded; a missed binlog range (a gap) warns at most once a minute per view.
+pub fn drain(plan: &ViewPlan, dirty: &mut ViewDirty, log: Vec<cascade::Logged>) {
+    for entry in log {
+        match entry {
+            cascade::Logged::Child { route, old, new } => dirty.cache.child(route, old, new),
+            cascade::Logged::Parent { route, old, new } => {
+                let c = &plan.cascades[route];
+                if dirty.cache.gap {
+                    cascade_gap(&plan.name, &c.parent.name, &old, &mut dirty.cache.warned_at);
+                }
+                if let Some(rows) = dirty.cache.parent(route, &old, new.as_ref()) {
+                    expand(plan, route, rows, new.as_ref(), dirty);
+                }
+            }
+        }
+    }
+}
+
+/// Warns (at most once a minute, on the view's own `warned_at` clock) that the cascade cache of
+/// `view` missed binlog events (a gap): the kept child rows under the parent key `old` of table
+/// `parent` may be stale until a row under them changes again (no recovery, no rebuild).
+fn cascade_gap(view: &str, parent: &str, old: &Key, warned_at: &mut u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if now.saturating_sub(*warned_at) >= 60 {
+        *warned_at = now;
+        tracing::warn!(
+            view,
+            parent,
+            ?old,
+            "the cascade cache missed binlog events (gap); the kept rows under this parent key may be stale"
+        );
+    }
+}
+
+/// Warns (at most once a minute) that a child row the cascade map keeps lacked a stored column
+/// (not a full image, or a partial JSON update), so the units its cascade changes are unknown
+/// and the view is rebuilt (`binlog_row_image` FULL, no `PARTIAL_JSON` row value option).
+pub fn incomplete_cascade_row(view: &str, child: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) >= 60 {
+        LAST.store(now, Ordering::Relaxed);
+        tracing::warn!(
+            view,
+            child,
+            "a cascaded child row was kept without all its columns (binlog_row_image must be FULL, without partial JSON updates): the units its cascade changes are unknown, rebuilding the view"
+        );
+    }
 }
 
 /// Warns (at most once a minute) that a cascade parent's row image lacked columns, so the units
@@ -1271,8 +1497,8 @@ mod tests {
             .collect();
         assert_eq!(got, vec![5, 6, 9]);
         // Not derived (a HAVING over the NULL-side pinned alias), but bounded by the pins: a
-        // key outside them is skipped; the pinned key, a key update into or out of it, or a
-        // short image keep main's rebuild.
+        // key outside them is skipped; the pinned key, or a key update into or out of it, is
+        // resolved through the cascade map; a short image is the safety net (a rebuild).
         let p = plan(
             &parse_definition(
                 "CREATE VIEW v AS SELECT c.gid, c.oid, MAX(b.val) AS y FROM link c \
@@ -1300,17 +1526,350 @@ mod tests {
             Fed::Skipped
         );
         assert!(d.is_empty() && !d.rebuild);
-        let short = BinlogRow::new(vec![], Arc::from(Vec::new()));
+        assert!(p.cascades[kind].map.is_some());
         for (b, a) in [
             (row(8), None),
             (row(50), Some(row(8))),
             (row(8), Some(row(50))),
-            (short, None),
         ] {
             let mut d = ViewDirty::for_aliases(p.aliases.len());
             feed_cascade(&p, kind, &mut d, Some(&b), a.as_ref());
-            assert!(d.rebuild, "{b:?} -> {a:?}");
+            assert!(!d.rebuild && d.cache.rows(kind).is_none(), "{b:?} -> {a:?}");
         }
+        let short = BinlogRow::new(vec![], Arc::from(Vec::new()));
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        feed_cascade(&p, kind, &mut d, Some(&short), None);
+        assert!(d.rebuild && d.cache.rows(kind).is_none());
+    }
+
+    /// The cascade map's side of the feed: child rows kept where an alias's filters pass,
+    /// moved on FK updates, removed on deletes and when leaving the filters; updates of other
+    /// columns skipped. A parent change becomes a pending resolution (no rebuild), and a kept
+    /// row replays as the image the logged delete would have given: the same images and units.
+    #[test]
+    fn mapped_cascades_keep_and_replay_child_rows() {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        use mysql_async::Value;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, FkAction, ForeignKey, TableInfo};
+
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let fk = |parent: &str, child_col: usize, parent_col: &str| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols: vec![child_col],
+            parent_cols: vec![parent_col.into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades| {
+            let t = TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns,
+                pk,
+                unique_keys: vec![],
+                cascades,
+                is_view: false,
+                view_bases: vec![],
+            };
+            (("db".to_string(), name.to_string()), Arc::new(t))
+        };
+        let tables: std::collections::HashMap<_, _> = [
+            table("grp", vec![int("gid", "int unsigned")], vec![0], vec![]),
+            table("obj", vec![int("oid", "int unsigned")], vec![0], vec![]),
+            table(
+                "link",
+                vec![int("gid", "int unsigned"), int("oid", "int unsigned")],
+                vec![0, 1],
+                vec![fk("obj", 1, "oid")],
+            ),
+            table(
+                "attrs",
+                vec![
+                    int("id", "bigint unsigned"),
+                    int("oid", "int unsigned"),
+                    int("aid", "smallint unsigned"),
+                    int("val", "int"),
+                ],
+                vec![0],
+                vec![fk("obj", 1, "oid")],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let p = plan(
+            &parse_definition(
+                "CREATE VIEW v AS SELECT g.gid, COUNT(*) AS n, MAX(a.val) AS x FROM grp g \
+                 JOIN link c ON c.gid = g.gid JOIN attrs a ON a.oid = c.oid AND a.aid = 7 \
+                 GROUP BY g.gid",
+            )
+            .unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        let ci = |child: &str| p.cascades.iter().position(|c| c.child.1 == child).unwrap();
+        let (to_attrs, to_link) = (ci("attrs"), ci("link"));
+        assert!(p.cascades[to_attrs].map.is_some() && p.cascades[to_link].map.is_some());
+        let row = |vals: &[i64]| {
+            BinlogRow::new(
+                vals.iter()
+                    .map(|&v| Some(BinlogValue::Value(Value::Int(v))))
+                    .collect(),
+                Arc::from(
+                    vals.iter()
+                        .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        };
+        let a = p.aliases.iter().position(|a| a.name == "a").unwrap();
+        let fk10: Key = vec![Datum::Int(10)].into();
+        let fk11: Key = vec![Datum::Int(11)].into();
+        let fk12: Key = vec![Datum::Int(12)].into();
+        // Kept: a row the alias's filter passes; not kept: another key value. A ready cache
+        // changes in memory only, so both are skipped (the alias route records the row).
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        let r1 = row(&[1, 10, 7, 5]);
+        assert_eq!(
+            feed_map(&p, to_attrs, &mut d, None, Some(&r1)),
+            Fed::Skipped
+        );
+        assert!(d.is_empty() && d.cache.under(to_attrs, &fk10).len() == 1);
+        assert_eq!(
+            feed_map(&p, to_attrs, &mut d, None, Some(&row(&[2, 10, 8, 5]))),
+            Fed::Skipped
+        );
+        let kept = d.cache.under(to_attrs, &fk10)[0].clone();
+        assert_eq!(
+            (kept.fk.to_vec(), kept.complete),
+            (vec![Datum::Int(10)], true)
+        );
+        // An update of a column no route takes values from: skipped, the kept row stands.
+        assert_eq!(
+            feed_map(&p, to_attrs, &mut d, Some(&r1), Some(&row(&[1, 10, 7, 6]))),
+            Fed::Skipped
+        );
+        assert_eq!(d.cache.under(to_attrs, &fk10).len(), 1);
+        // A new FK: kept under it (same key, no removal); out of the filter: removed; deleted:
+        // removed.
+        feed_map(&p, to_attrs, &mut d, Some(&r1), Some(&row(&[1, 11, 7, 5])));
+        assert!(d.cache.under(to_attrs, &fk10).is_empty());
+        assert_eq!(d.cache.under(to_attrs, &fk11)[0].fk, fk11);
+        feed_map(
+            &p,
+            to_attrs,
+            &mut d,
+            Some(&row(&[1, 11, 7, 5])),
+            Some(&row(&[1, 11, 9, 5])),
+        );
+        assert!(d.cache.under(to_attrs, &fk11).is_empty());
+        feed_map(&p, to_attrs, &mut d, Some(&row(&[3, 12, 7, 5])), None);
+        assert!(d.cache.under(to_attrs, &fk12).is_empty());
+        // A short image passes the filters (conservatively) and is kept, but incomplete: its
+        // replay is the safety net.
+        let short = BinlogRow::new(
+            vec![
+                Some(BinlogValue::Value(Value::Int(4))),
+                Some(BinlogValue::Value(Value::Int(10))),
+            ],
+            Arc::from(vec![
+                mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG);
+                2
+            ]),
+        );
+        let mut d2 = ViewDirty::for_aliases(p.aliases.len());
+        feed_map(&p, to_attrs, &mut d2, None, Some(&short));
+        assert!(!d2.cache.under(to_attrs, &fk10)[0].complete);
+        // The parent's delete / key update on a ready cache: kept children resolve, no rebuild.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        feed_map(&p, to_attrs, &mut d, None, Some(&r1));
+        assert_eq!(
+            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
+            Fed::Recorded
+        );
+        assert!(!d.rebuild && d.cache.rows(to_attrs).unwrap().rows.is_empty());
+        // A parent with no kept children: irrelevant, so it holds no replay position.
+        assert_eq!(
+            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[20])), Some(&row(&[21]))),
+            Fed::Skipped
+        );
+        assert!(!d.rebuild && d.cache.rows(to_attrs).unwrap().rows.is_empty());
+        // A gap: a parent delete is counted, marks nothing, does not rebuild, and is skipped
+        // (Recorded would hold the view's replay position with nothing to refresh).
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        d.cache.gap = true;
+        assert_eq!(
+            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
+            Fed::Skipped
+        );
+        assert!(d.is_empty() && d.cache.rows(to_attrs).is_none());
+        assert_eq!(d.tally.cascade_gaps, 1);
+        // While seeding (a build's cache), the parent is logged for `drain`: recorded.
+        let mut s = ViewDirty::for_aliases(p.aliases.len());
+        s.cache = crate::cascade::Cache::seeding();
+        assert_eq!(
+            feed_cascade(&p, to_attrs, &mut s, Some(&row(&[10])), None),
+            Fed::Recorded
+        );
+        // Replayed: the same images (and cache removal) as the logged delete of that row.
+        let c = &p.cascades[to_attrs];
+        let mut logged = ViewDirty::for_aliases(p.aliases.len());
+        feed_map(&p, to_attrs, &mut logged, None, Some(&r1));
+        replay(&p, &c.child, &mut logged, Some(&r1), None);
+        let mut replayed = ViewDirty::for_aliases(p.aliases.len());
+        feed_map(&p, to_attrs, &mut replayed, None, Some(&r1));
+        let image = kept_image(c, &kept, None);
+        replay(&p, &c.child, &mut replayed, Some(&image), None);
+        assert!(!logged.images[a].is_empty());
+        assert_eq!(replayed.images, logged.images);
+        assert!(logged.cache.under(to_attrs, &fk10).is_empty());
+        assert_eq!(
+            replayed.cache.under(to_attrs, &fk10),
+            logged.cache.under(to_attrs, &fk10)
+        );
+        // ... and the FK update the storage engine made (CASCADE update): old and new images.
+        let mut moved = ViewDirty::for_aliases(p.aliases.len());
+        let new_fk: Key = vec![Datum::Int(30)].into();
+        let after = kept_image(c, &kept, Some(&new_fk));
+        replay(&p, &c.child, &mut moved, Some(&image), Some(&after));
+        assert_eq!(moved.images[a].len(), 2);
+        assert!(moved.cache.under(to_attrs, &fk10).is_empty());
+        assert_eq!(moved.cache.under(to_attrs, &new_fk)[0].fk, new_fk);
+        // The link table's kept row replays to its unit (the group) directly.
+        let l = &p.cascades[to_link];
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        feed_map(&p, to_link, &mut d, None, Some(&row(&[4, 10])));
+        let kept = d.cache.under(to_link, &fk10)[0].clone();
+        let mut r = ViewDirty::for_aliases(p.aliases.len());
+        replay(
+            &p,
+            &l.child,
+            &mut r,
+            Some(&kept_image(l, &kept, None)),
+            None,
+        );
+        assert!(
+            r.units.contains(&[Datum::Int(4)])
+                || r.partial.iter().any(|s| s.contains(&[Datum::Int(4)]))
+        );
+    }
+
+    #[test]
+    fn cache_only_cascade_changes_hold_no_replay_position() {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        use mysql_async::Value;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, FkAction, ForeignKey, TableInfo};
+
+        // grp -> mid -> leaf, both ON DELETE / UPDATE CASCADE; the view reads only leaf, so mid
+        // is a level it does not read: its rows are kept with no alias route on mid.
+        let int = |n: &str| Column::new(n, "int", "int", None, None, None, false);
+        let fk = |parent: &str, child_col: usize| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols: vec![child_col],
+            parent_cols: vec!["id".into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades| {
+            let t = TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns,
+                pk,
+                unique_keys: vec![],
+                cascades,
+                is_view: false,
+                view_bases: vec![],
+            };
+            (("db".to_string(), name.to_string()), Arc::new(t))
+        };
+        let tables: std::collections::HashMap<_, _> = [
+            table("grp", vec![int("id")], vec![0], vec![]),
+            table(
+                "mid",
+                vec![int("id"), int("gid")],
+                vec![0],
+                vec![fk("grp", 1)],
+            ),
+            table(
+                "leaf",
+                vec![int("mid_id"), int("seq"), int("qty")],
+                vec![0, 1],
+                vec![fk("mid", 0)],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let p = plan(
+            &parse_definition("CREATE VIEW v AS SELECT mid_id, seq, qty FROM leaf WHERE qty >= 0")
+                .unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        let ci = |child: &str| p.cascades.iter().position(|c| c.child.1 == child).unwrap();
+        let (to_mid, to_leaf) = (ci("mid"), ci("leaf"));
+        assert!(p.cascades[to_mid].map.is_some() && p.cascades[to_leaf].map.is_some());
+        let row = |vals: &[i64]| {
+            BinlogRow::new(
+                vals.iter()
+                    .map(|&v| Some(BinlogValue::Value(Value::Int(v))))
+                    .collect(),
+                Arc::from(
+                    vals.iter()
+                        .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        };
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        // A new row of the level the view does not read: kept, nothing to refresh, skipped.
+        assert_eq!(
+            feed_map(&p, to_mid, &mut d, None, Some(&row(&[5, 1]))),
+            Fed::Skipped
+        );
+        assert!(d.is_empty() && d.cache.rows(to_mid).is_some_and(|r| r.rows.len() == 1));
+        // Its parent deleted: the kept mid row replays, but no leaf row is kept under it, so
+        // nothing is buffered: skipped, not rebuilt.
+        assert_eq!(
+            feed_cascade(&p, to_mid, &mut d, Some(&row(&[1])), None),
+            Fed::Skipped
+        );
+        assert!(d.is_empty() && d.cache.rows(to_mid).unwrap().rows.is_empty());
+        // With a kept leaf row below: its units are buffered, recorded.
+        feed_map(&p, to_mid, &mut d, None, Some(&row(&[6, 2])));
+        feed_map(&p, to_leaf, &mut d, None, Some(&row(&[6, 1, 3])));
+        assert!(d.is_empty());
+        assert_eq!(
+            feed_cascade(&p, to_mid, &mut d, Some(&row(&[2])), None),
+            Fed::Recorded
+        );
+        assert!(!d.is_empty() && !d.rebuild);
+        // While seeding, the change is logged for `drain`: recorded (held until the drain).
+        let mut s = ViewDirty::for_aliases(p.aliases.len());
+        s.cache = crate::cascade::Cache::seeding();
+        assert_eq!(
+            feed_map(&p, to_mid, &mut s, None, Some(&row(&[5, 1]))),
+            Fed::Recorded
+        );
     }
 
     #[test]

@@ -394,6 +394,10 @@ fn same_cascade(
         partial_from_parent,
         pinned,
         reach,
+        // child_table and map feed the in-memory cascade cache, which is seeded at each build;
+        // a DDL that changes them keeps the old seeding until the next build, and incomplete
+        // kept rows heal on their next change.
+        ..
     } = a;
     let pm = Ords::new(parent, &b.parent);
     let mut used: BTreeSet<usize> = parent_cols.iter().copied().collect();

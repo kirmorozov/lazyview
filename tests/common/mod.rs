@@ -330,6 +330,17 @@ pub fn clip(s: &str, n: usize) -> String {
     }
 }
 
+/// Whether the server writes the child rows of foreign-key cascades to the binlog itself: MySQL
+/// 9.x / 26.x with `innodb_native_foreign_keys=OFF` (their default) cascade at the SQL layer and
+/// log the cascaded rows before the parent's row event. Elsewhere (the variable does not exist)
+/// the storage engine changes them without binlog events.
+pub async fn cascades_logged(conn: &mut Conn) -> Result<bool> {
+    let r = rows(conn, "SHOW VARIABLES LIKE 'innodb_native_foreign_keys'").await?;
+    Ok(r.first()
+        .and_then(|row| row.get(1).cloned().flatten())
+        .is_some_and(|v| v.eq_ignore_ascii_case("OFF")))
+}
+
 /// The server's (major, minor) version, e.g. (10, 11) for `10.11.19-MariaDB-log`.
 pub async fn server_version(conn: &mut Conn) -> Result<(u32, u32)> {
     let version = scalar(conn, "SELECT VERSION()").await?.unwrap_or_default();

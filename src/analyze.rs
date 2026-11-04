@@ -943,6 +943,42 @@ pub struct CascadeRoute {
     /// row, before or after the change, so the cascade changes nothing the view reads,
     /// whatever the route (`cascade_reach`).
     pub reach: Option<(usize, Vec<Datum>)>,
+    /// The child table itself (its columns, keys and cascades).
+    pub child_table: Arc<TableInfo>,
+    /// An untraced route of a select/join or grouped view keeps the child's rows in the
+    /// in-memory cascade cache (`crate::cascade`): a parent change replays them as the child row
+    /// changes the storage engine made, through every route of the child table
+    /// (`cascade_maps`). `None`: traced, unit, derived, another mode, or a child without a key
+    /// (named in `untraced`).
+    pub map: Option<MapPlan>,
+}
+
+/// What the cascade map keeps of a child's rows (see [`CascadeRoute::map`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapPlan {
+    /// The child's key columns: its primary key, else its shortest NOT NULL unique key.
+    pub key: Vec<usize>,
+    /// The stored columns (ascending): every column a route of the child table takes values
+    /// from (its aliases' images, units, partial units and filters; the parent columns of the
+    /// cascades out of it; the FK columns of the cascades into it) and the key. A replayed
+    /// update differs from its old row in FK columns only, so what else the aliases read
+    /// (`AliasPlan::referenced`) compares equal on both sides without being stored.
+    pub cols: Vec<usize>,
+    /// Per alias of the child: its constant filters. A row is kept when it passes those of some
+    /// alias (rows of no alias never reach the view). No alias (a level the view does not
+    /// read): every row is kept.
+    pub filters: Vec<Vec<ConstFilter>>,
+}
+
+impl MapPlan {
+    /// Whether the map keeps `row` (a binlog image of the child).
+    pub fn keeps(&self, row: &mysql_async::binlog::row::BinlogRow, table: &TableInfo) -> bool {
+        self.filters.is_empty()
+            || self
+                .filters
+                .iter()
+                .any(|f| ConstFilter::passes(f, row, table))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1076,6 +1112,8 @@ impl ViewPlan {
                 "traced"
             } else if c.derived {
                 "derived"
+            } else if c.map.is_some() {
+                "map"
             } else {
                 "rebuild"
             };
@@ -2020,6 +2058,79 @@ fn cascade_reach(
         ));
     }
     c.reach = Some((*pc, values));
+}
+
+/// The cascade map of every route that stays untraced (see [`CascadeRoute::map`]): what each
+/// child table's rows must keep so that replaying them through the child's routes reads only
+/// stored columns. A child without a key cannot be kept: its route stays a rebuild route, and
+/// its reason says so.
+fn cascade_maps(
+    cascades: &mut [CascadeRoute],
+    aliases: &[AliasPlan],
+    filters: &[Vec<ConstFilter>],
+    partial: &PartialUnits,
+) {
+    let same = |t: &TableInfo, r: &TableRef| t.schema == r.0 && t.name == r.1;
+    let untraced: Vec<usize> = (0..cascades.len())
+        .filter(|&i| {
+            let c = &cascades[i];
+            c.untraced.is_some() && !c.traced && !c.derived && c.unit_from_parent.is_none()
+        })
+        .collect();
+    for &i in &untraced {
+        let child = cascades[i].child_table.clone();
+        let child_ref = (child.schema.clone(), child.name.clone());
+        let why = match child.row_key() {
+            None => Some("has no primary or NOT NULL unique key".to_string()),
+            Some(_) => {
+                let fk = &cascades[i].child_cols;
+                if fk.iter().any(|&k| !filter_or_key_column(&child.columns[k])) {
+                    Some("has a foreign key compared by collation or type conversion".to_string())
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(why) = why {
+            if let Some(r) = &mut cascades[i].untraced {
+                r.push_str(&format!(
+                    " (`{}` {why}: the cascade map cannot keep its rows)",
+                    child.name
+                ));
+            }
+            continue;
+        }
+        let key = child.row_key().expect("checked").to_vec();
+        let mut cols: BTreeSet<usize> = key.iter().copied().collect();
+        let mut alias_filters = Vec::new();
+        for (ai, a) in aliases.iter().enumerate() {
+            if !same(&a.table, &child_ref) {
+                continue;
+            }
+            let mut read: Vec<usize> = a.image_cols.clone();
+            read.extend(a.direct_unit.iter().flatten());
+            if let Some(Some((_, pc))) = partial.aliases.get(ai) {
+                read.extend(pc);
+            }
+            let f = filters.get(ai).cloned().unwrap_or_default();
+            read.extend(f.iter().map(|f| f.col));
+            cols.extend(read);
+            alias_filters.push(f);
+        }
+        for c in cascades.iter() {
+            if same(&c.parent, &child_ref) {
+                cols.extend(&c.parent_cols);
+            }
+            if c.child == child_ref {
+                cols.extend(&c.child_cols);
+            }
+        }
+        cascades[i].map = Some(MapPlan {
+            key,
+            cols: cols.into_iter().collect(),
+            filters: alias_filters,
+        });
+    }
 }
 
 /// A parent key column whose binlog value is its SQL value (as for unit keys), not generated.
@@ -3218,6 +3329,9 @@ pub fn plan_block(
     for (c, &continues) in cascades.iter_mut().zip(&continuing) {
         cascade_reach(c, &alias_plans, &alias_filters, continues);
     }
+    if matches!(mode, Mode::Spj | Mode::Grouped) {
+        cascade_maps(&mut cascades, &alias_plans, &alias_filters, &partial);
+    }
     let window_sql = if select.named_window.is_empty() {
         None
     } else {
@@ -4258,6 +4372,8 @@ pub(crate) fn cascade_routes(
                 partial_from_parent: Vec::new(),
                 pinned: Vec::new(),
                 reach: None,
+                child_table: child.clone(),
+                map: None,
             });
             if depth < 8 && !read.contains(&fk.parent) {
                 // A cascade into the parent cascades further into the child: unknown units.
@@ -5298,6 +5414,160 @@ mod tests {
         }
     }
 
+    /// Cascades no derivation follows keep their child rows in the cascade map: a child read
+    /// through a unit alias whose unit is not the FK, a child read through a lookup alias (kept
+    /// only where that alias's filters pass), and a level the view does not read (a chain). The
+    /// map stores the key, the FK and what the child's routes take values from, the same for
+    /// every equivalent formulation. A child without a key is not kept: its route stays a
+    /// rebuild route, and its reason says why.
+    #[test]
+    fn cascade_maps_keep_untraced_children() {
+        use crate::catalog::{FkAction, ForeignKey};
+        use std::collections::BTreeMap;
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let fk = |parent: &str, child_col: usize, parent_col: &str| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols: vec![child_col],
+            parent_cols: vec![parent_col.into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let with_fk = |t: (TableRef, Arc<TableInfo>), f: Vec<ForeignKey>| {
+            let mut i = (*t.1).clone();
+            i.cascades = f;
+            (t.0, Arc::new(i))
+        };
+        let cat: HashMap<_, _> = [
+            typed("realm", vec![int("rid", "int unsigned")], &[0]),
+            with_fk(
+                typed(
+                    "kind",
+                    vec![int("kid", "smallint unsigned"), int("rid", "int unsigned")],
+                    &[0],
+                ),
+                vec![fk("realm", 1, "rid")],
+            ),
+            typed("grp", vec![int("gid", "int unsigned")], &[0]),
+            typed("obj", vec![int("oid", "int unsigned")], &[0]),
+            with_fk(
+                typed(
+                    "link",
+                    vec![
+                        int("gid", "int unsigned"),
+                        int("oid", "int unsigned"),
+                        int("pos", "int"),
+                    ],
+                    &[0, 1],
+                ),
+                vec![fk("obj", 1, "oid")],
+            ),
+            with_fk(
+                typed(
+                    "obj_attr",
+                    vec![
+                        int("id", "bigint unsigned"),
+                        int("oid", "int unsigned"),
+                        int("aid", "smallint unsigned"),
+                        int("val", "int"),
+                    ],
+                    &[0],
+                ),
+                vec![fk("obj", 1, "oid"), fk("kind", 2, "kid")],
+            ),
+            with_fk(
+                typed(
+                    "note",
+                    vec![int("oid", "int unsigned"), int("w", "int")],
+                    &[],
+                ),
+                vec![fk("obj", 0, "oid")],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let plan = |sql: &str| {
+            let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+            crate::analyzer::plan(&d, "db", &cat).unwrap()
+        };
+        // Per route (parent -> child): the map as (key, stored columns, filters), or the reason.
+        let maps = |sql: &str| -> BTreeMap<String, String> {
+            plan(sql)
+                .cascades
+                .iter()
+                .map(|c| {
+                    let what = match (&c.map, &c.untraced) {
+                        (Some(m), _) => format!(
+                            "map key={:?} cols={:?} filters={:?}",
+                            m.key,
+                            m.cols,
+                            m.filters
+                                .iter()
+                                .map(|f| f
+                                    .iter()
+                                    .map(|f| (f.col, f.values.clone()))
+                                    .collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                        ),
+                        (None, Some(r)) => format!("rebuild: {r}"),
+                        (None, None) => "followed".into(),
+                    };
+                    (format!("{}->{}", c.parent.name, c.child.1), what)
+                })
+                .collect()
+        };
+        let base = "SELECT g.gid, COUNT(*) AS n, MAX(a.val) AS x FROM grp g \
+                    JOIN link c ON c.gid = g.gid JOIN obj_attr a ON a.oid = c.oid AND a.aid = 7 \
+                    GROUP BY g.gid";
+        let want = maps(base);
+        // `c`'s unit is the group, not its FK: its rows are kept whole (key = FK + unit).
+        assert_eq!(want["obj->link"], "map key=[0, 1] cols=[0, 1] filters=[[]]");
+        // `a` is reached through `c` (a lookup): kept where its filter passes; stored: key, FK,
+        // the filter column and its image (the join column).
+        assert_eq!(
+            want["obj->obj_attr"],
+            "map key=[0] cols=[0, 1, 2] filters=[[(2, [Int(7)])]]"
+        );
+        // Pinned on the key FK, without HAVING: derived (patch 3), not mapped.
+        assert_eq!(want["kind->obj_attr"], "followed");
+        // A level the view does not read: every row, with the parent column of the next level.
+        assert_eq!(want["realm->kind"], "map key=[0] cols=[0, 1] filters=[]");
+        let v = plan(base);
+        assert!(v.tracing().contains("^obj:map") && v.tracing().contains("^realm:map"));
+        for sql in [
+            "SELECT g.gid, COUNT(*) AS n, MAX(a.val) AS x FROM obj_attr a \
+             JOIN link c ON c.oid = a.oid JOIN grp g ON g.gid = c.gid WHERE a.aid = 7 GROUP BY g.gid",
+            "SELECT g.gid, COUNT(*) AS n, MAX(a.val) AS x FROM grp g, link c, obj_attr a \
+             WHERE c.gid = g.gid AND a.oid = c.oid AND a.aid IN (7) GROUP BY g.gid",
+            "WITH w AS (SELECT g.gid AS k, a.val AS v FROM grp g JOIN link c ON c.gid = g.gid \
+             JOIN obj_attr a ON a.oid = c.oid AND 7 = a.aid) SELECT k AS grp_id, COUNT(*) AS n, \
+             MAX(v) AS x FROM w GROUP BY k",
+        ] {
+            assert_eq!(maps(sql), want, "{sql}");
+        }
+        // A child without a key: not kept, named.
+        let m = maps(
+            "SELECT g.gid, COUNT(*) AS n, MAX(t.w) AS x FROM grp g JOIN link c ON c.gid = g.gid \
+             LEFT JOIN note t ON t.oid = c.oid GROUP BY g.gid",
+        );
+        assert!(
+            m["obj->note"].starts_with("rebuild: ")
+                && m["obj->note"].ends_with(
+                    "(`note` has no primary or NOT NULL unique key: the cascade map cannot keep its rows)"
+                ),
+            "{m:?}"
+        );
+    }
+
     #[test]
     fn parse_noise() {
         let d = parse_definition(
@@ -5780,7 +6050,7 @@ mod tests {
             let v = plan_block(&d, "db", &cat).unwrap();
             assert_eq!(
                 v.tracing(),
-                "k:unit,g:lookup,^kids:traced,^pars:unit,^grps:rebuild"
+                "k:unit,g:lookup,^kids:traced,^pars:unit,^grps:map"
             );
             let d = parse_definition(
                 "CREATE VIEW v AS SELECT k.par_id, COUNT(*) AS n FROM kids k \
@@ -5788,10 +6058,8 @@ mod tests {
             )
             .unwrap();
             let v = plan_block(&d, "db", &cat).unwrap();
-            assert_eq!(
-                v.tracing(),
-                "k:unit,g:lookup,^kids:rebuild,^pars:rebuild,^grps:rebuild"
-            );
+            // Untraced: the cascade map keeps the rows of every level.
+            assert_eq!(v.tracing(), "k:unit,g:lookup,^kids:map,^pars:map,^grps:map");
             let r = v.cascades.iter().find(|c| c.parent.name == "pars").unwrap();
             assert!(
                 r.untraced.as_deref().is_some_and(|w| {
@@ -5802,14 +6070,15 @@ mod tests {
             );
         }
         // A3: a self-referential cascade reaches every descendant, also with the unit on the
-        // key column (the parent's image gives one level): never unit-derived, never traced.
+        // key column (the parent's image gives one level): never unit-derived, never traced;
+        // the cascade map follows it level by level (each kept row once).
         {
             let d = parse_definition(
                 "CREATE VIEW v AS SELECT n.parent_id, COUNT(*) AS n FROM nodes n GROUP BY n.parent_id",
             )
             .unwrap();
             let v = plan_block(&d, "db", &cat).unwrap();
-            assert_eq!(v.tracing(), "n:unit,^nodes:rebuild");
+            assert_eq!(v.tracing(), "n:unit,^nodes:map");
             assert!(v.cascades[0]
                 .untraced
                 .as_deref()

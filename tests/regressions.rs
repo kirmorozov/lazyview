@@ -1449,10 +1449,11 @@ fn reg_grouped_chain_changes_across_windows() {
     });
 }
 
-/// E6, grouped: a long catch-up remembers more images than the cap allows; the view is rebuilt
-/// online instead (counted in `lookback_overflows`) and ends up correct.
+/// E6, grouped: a long catch-up remembers many images (past the old cap of 10 x
+/// LAZYVIEW_BATCH_MAX_KEYS, which rebuilt the view). The lookups run in chunks, one combination
+/// after the other, never a rebuild instead; the view ends up correct.
 #[test]
-fn reg_grouped_chain_catch_up_hits_the_cap() {
+fn reg_grouped_chain_long_catch_up_is_chunked() {
     scenario("reg_chain_cap", |ctx| async move {
         let specs = vec![region_revenue()];
         let (db, eng) = setup(&ctx, "reg_chain_cap", CHAIN_DDL, &specs, &[]).await?;
@@ -1481,8 +1482,8 @@ fn reg_grouped_chain_catch_up_hits_the_cap() {
         verify(&ctx, &mut eng, &db, &specs, "after a long catch-up").await?;
         let d = eng.snapshot();
         ensure!(
-            d.lookback_overflows > 0 && d.full_rebuilds > 0,
-            "expected the cap to rebuild the view: {}",
+            d.lookback_overflows == 0 && d.full_rebuilds == 0 && d.lookup_queries > 0,
+            "the long catch-up gave up its lookups or rebuilt the view: {}",
             fmt_snapshot(&d)
         );
         eng.stop().await
@@ -3229,12 +3230,13 @@ fn reg_null_unit_on_nullable_unique_index() {
     });
 }
 
-/// A view that rebuilds on a parent's cascading deletes logged only that it does, not why the
-/// cascade cannot be traced through the parent. The warning carries the analyzer's reason (here:
-/// the parent on the NULL side of a LEFT JOIN with a condition beyond the foreign-key equality),
-/// and the view stays correct through the cascades.
+/// A child of a cascading foreign key whose units the parent cannot give (the parent on the NULL
+/// side of a LEFT JOIN with a condition beyond the foreign-key equality) but with a primary key
+/// and an FK compared by equality: the cascade map follows it. The engine logs the mapped route
+/// (not the rebuild warning, which is only for routes the map cannot keep), and the view stays
+/// correct through the cascades without a rebuild.
 #[test]
-fn reg_untraced_cascade_reason_is_logged() {
+fn reg_mapped_cascade_is_logged() {
     scenario("reg_fk_untraced", |ctx| async move {
         let ddl = [
             "CREATE TABLE pars (id INT PRIMARY KEY, label VARCHAR(20) NOT NULL)",
@@ -3251,17 +3253,19 @@ fn reg_untraced_cascade_reason_is_logged() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_fk_untraced", &ddl, &specs, &[]).await?;
         let log = std::fs::read_to_string(&eng.log_path)?;
+        ensure!(
+            !log.contains("reads a child of a cascading foreign key"),
+            "a cascade the map follows still warns about a rebuild"
+        );
         let line = log
             .lines()
-            .find(|l| l.contains("reads a child of a cascading foreign key"))
-            .context("no cascade warning in the engine log")?;
+            .find(|l| l.contains("follows cascades through the cascade map"))
+            .context("no cascade-map line in the engine log")?;
         ensure!(
-            line.contains("reasons=")
-                && line.contains(
-                    "is on the NULL side of a LEFT JOIN whose condition is not the foreign-key equality alone"
-                ),
-            "the cascade warning does not say why: {line}"
+            line.contains("view=r_kids_left") && line.contains("`pars` -> `kids`"),
+            "the cascade-map line does not name the route: {line}"
         );
+        let before = eng.snapshot();
         let mut c = db.conn().await?;
         for (what, stmt) in [
             (
@@ -3273,6 +3277,12 @@ fn reg_untraced_cascade_reason_is_logged() {
             exec(&mut c, stmt).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0,
+            "the mapped cascades rebuilt the view: {}",
+            fmt_snapshot(&d)
+        );
         eng.stop().await
     });
 }
@@ -4394,8 +4404,10 @@ fn reg_partial_units() {
 /// SET NULL); a child alias pinned by constant filters on the FK ignores other parent rows, and
 /// a pinned parent row finds its units through a presence column of the materialized table; a
 /// route the plan cannot derive (a HAVING over a NULL-side pinned alias) still ignores parent
-/// keys outside the pins. Parent deletes and key updates (the children's rows change without
-/// binlog events) leave the views exact without a rebuild.
+/// keys outside the pins, and follows its pinned key through the cascade map
+/// (or the binlog, where the server logs the cascaded rows). Parent deletes and
+/// key updates (the children's rows change without binlog events) leave the views exact without
+/// a rebuild.
 #[test]
 fn reg_cascades_derived_from_the_parent() {
     scenario("reg_casc_derived", |ctx| async move {
@@ -4543,7 +4555,8 @@ fn reg_cascades_derived_from_the_parent() {
             "cascades whose units the parent's row gives rebuilt the views: {}",
             fmt_snapshot(&d)
         );
-        // The key the HAVING view pins still reaches it (no derivation there: main's rebuild).
+        // The key the HAVING view pins still reaches it: no derivation there, its rows come
+        // back from the cascade map.
         let before = eng.snapshot();
         run(&mut c, &["DELETE FROM kind WHERE kid = 50"]).await?;
         verify(
@@ -4555,11 +4568,555 @@ fn reg_cascades_derived_from_the_parent() {
         )
         .await?;
         let d = eng.snapshot().since(&before);
+        // Where the server logs the cascaded child rows (before the parent's row event), they reach
+        // the view through the binlog and leave the cache empty under the parent key: nothing to
+        // replay from the map.
+        let logged = cascades_logged(&mut c).await?;
         ensure!(
-            d.full_rebuilds >= 1,
-            "a pinned key of a route the plan cannot derive was skipped: {}",
+            d.full_rebuilds == 0 && (logged || d.cascade_rows > 0),
+            "a pinned key of a route the plan cannot derive was not followed through the cascade map: {}",
             fmt_snapshot(&d)
         );
+        eng.stop().await
+    });
+}
+
+/// Cascades no derivation follows, through the cascade map: the child rows the storage engine
+/// deletes or re-keys without binlog events are replayed from the map through every route of
+/// the child table. Views keyed by group read the children through link hops: one hop (values
+/// pinned to one key, read through the link), two (boxes), three (box items, a cascade of a
+/// cascade), a SET NULL child, a select/join view, and equivalent formulations of the one-hop
+/// view. Steps: deletes through 1 / 2 / 3 hops, one transaction deleting values, links and their
+/// object, a key update (children follow), a link moving between groups, a delete and re-insert
+/// of a key in one transaction, rows inserted after the build then cascaded (in a later and in
+/// the same window), values moved out of the pinned key before their object goes, a key moved and
+/// the new key deleted in one transaction (children found under the key they moved to), a key
+/// deleted, re-inserted with new children and deleted again. Every step against the oracle,
+/// without a rebuild, refreshing only the groups it touches.
+#[test]
+fn reg_cascades_through_the_map() {
+    scenario("reg_casc_map", |ctx| async move {
+        let mut ddl: Vec<String> = vec![
+            "CREATE TABLE grp (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE obj (oid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE obj_link (gid INT UNSIGNED NOT NULL, oid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (gid, oid), \
+             FOREIGN KEY (oid) REFERENCES obj (oid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES grp (gid) ON DELETE CASCADE ON UPDATE CASCADE)"
+                .into(),
+            "CREATE TABLE obj_attr (vid BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+             oid INT UNSIGNED NOT NULL, aid SMALLINT UNSIGNED NOT NULL, val INT NULL, \
+             UNIQUE KEY obj_aid (oid, aid), \
+             FOREIGN KEY (oid) REFERENCES obj (oid) ON DELETE CASCADE ON UPDATE CASCADE)"
+                .into(),
+            "CREATE TABLE obj_part (pid INT PRIMARY KEY, oid INT UNSIGNED NULL, qty INT NOT NULL, \
+             FOREIGN KEY (oid) REFERENCES obj (oid) ON DELETE SET NULL ON UPDATE CASCADE)"
+                .into(),
+            "CREATE TABLE obj_box (bid INT PRIMARY KEY, oid INT UNSIGNED NOT NULL, \
+             FOREIGN KEY (oid) REFERENCES obj (oid) ON DELETE CASCADE ON UPDATE CASCADE)"
+                .into(),
+            "CREATE TABLE box_item (iid INT PRIMARY KEY, bid INT NOT NULL, w INT NOT NULL, \
+             FOREIGN KEY (bid) REFERENCES obj_box (bid) ON DELETE CASCADE ON UPDATE CASCADE)"
+                .into(),
+        ];
+        let groups: Vec<String> = (1..=8u32).map(|g| format!("({g}, 'g{g}')")).collect();
+        ddl.push(format!("INSERT INTO grp VALUES {}", groups.join(", ")));
+        let (mut objs, mut links, mut attrs, mut parts, mut boxes, mut items) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        for o in 1..=60u32 {
+            objs.push(format!("({o}, 'o{o}')"));
+            links.push(format!("({}, {o}, {})", 1 + o % 8, o * 10));
+            if o % 3 == 0 {
+                links.push(format!("({}, {o}, {})", 1 + (o + 3) % 8, o * 10 + 1));
+            }
+            for a in [11, 12] {
+                attrs.push(format!("({o}, {a}, {})", (o * a) % 17));
+            }
+            parts.push(format!("({o}, {o}, {})", o % 5 + 1));
+            boxes.push(format!("({}, {o})", 100 + o));
+            for k in 0..2 {
+                items.push(format!(
+                    "({}, {}, {})",
+                    1000 + 2 * o + k,
+                    100 + o,
+                    o % 7 + k
+                ));
+            }
+        }
+        ddl.push(format!("INSERT INTO obj VALUES {}", objs.join(", ")));
+        ddl.push(format!("INSERT INTO obj_link VALUES {}", links.join(", ")));
+        ddl.push(format!(
+            "INSERT INTO obj_attr (oid, aid, val) VALUES {}",
+            attrs.join(", ")
+        ));
+        ddl.push(format!("INSERT INTO obj_part VALUES {}", parts.join(", ")));
+        ddl.push(format!("INSERT INTO obj_box VALUES {}", boxes.join(", ")));
+        ddl.push(format!("INSERT INTO box_item VALUES {}", items.join(", ")));
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![
+            // One hop: the values of one key, through the link.
+            ViewSpec::new(
+                "r_map_hop1",
+                Kind::Incremental,
+                "SELECT c.gid, COUNT(*) AS n, SUM(a.val) AS s FROM obj_link c \
+                 JOIN obj_attr a ON a.oid = c.oid AND a.aid = 11 GROUP BY c.gid",
+            ),
+            // ... written another way: permuted, the pin in the WHERE.
+            ViewSpec::new(
+                "r_map_hop1_permuted",
+                Kind::Incremental,
+                "SELECT c.gid AS grp_id, SUM(a.val) AS total, COUNT(*) AS cnt FROM obj_attr a \
+                 JOIN obj_link c ON c.oid = a.oid WHERE a.aid IN (11) GROUP BY c.gid",
+            ),
+            // ... comma join, swapped equality.
+            ViewSpec::new(
+                "r_map_hop1_comma",
+                Kind::Incremental,
+                "SELECT c.gid, COUNT(*) AS n, SUM(a.val) AS s FROM obj_link c, obj_attr a \
+                 WHERE c.oid = a.oid AND 11 = a.aid GROUP BY c.gid",
+            ),
+            // ... wrapped in a CTE with renamed outputs.
+            ViewSpec::new(
+                "r_map_hop1_cte",
+                Kind::Incremental,
+                "WITH w AS (SELECT c.gid AS g, a.val AS v FROM obj_link c \
+                 JOIN obj_attr a ON a.oid = c.oid AND a.aid = 11) \
+                 SELECT g AS group_key, COUNT(*) AS n, SUM(v) AS s FROM w GROUP BY g",
+            ),
+            // Two hops (boxes) and three (their items: a cascade of a cascade).
+            ViewSpec::new(
+                "r_map_hop2",
+                Kind::Incremental,
+                "SELECT c.gid, COUNT(*) AS n, SUM(b.bid) AS sb FROM obj_link c \
+                 JOIN obj_box b ON b.oid = c.oid GROUP BY c.gid",
+            ),
+            ViewSpec::new(
+                "r_map_hop3",
+                Kind::Incremental,
+                "SELECT c.gid, COUNT(*) AS n, SUM(i.w) AS w FROM obj_link c \
+                 JOIN obj_box b ON b.oid = c.oid JOIN box_item i ON i.bid = b.bid GROUP BY c.gid",
+            ),
+            // A SET NULL child.
+            ViewSpec::new(
+                "r_map_setnull",
+                Kind::Incremental,
+                "SELECT c.gid, COUNT(p.pid) AS np, SUM(p.qty) AS q FROM obj_link c \
+                 LEFT JOIN obj_part p ON p.oid = c.oid GROUP BY c.gid",
+            ),
+            // Select/join, keyed by the value row.
+            ViewSpec::new(
+                "r_map_rows",
+                Kind::Incremental,
+                "SELECT a.vid, a.val, c.gid, c.pos FROM obj_attr a JOIN obj_link c \
+                 ON c.oid = a.oid WHERE a.aid IN (11, 12)",
+            ),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_casc_map", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let start = eng.snapshot();
+        let mut c = db.conn().await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "an object deleted: links, values, boxes and box items cascade away, parts lose it",
+                &["DELETE FROM obj WHERE oid = 3"],
+            ),
+            (
+                "one transaction deletes an object's values and links, then the object",
+                &[
+                    "START TRANSACTION",
+                    "DELETE FROM obj_attr WHERE oid = 4",
+                    "DELETE FROM obj_link WHERE oid = 4",
+                    "DELETE FROM obj WHERE oid = 4",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "a box deleted: its items cascade away",
+                &["DELETE FROM obj_box WHERE oid = 5"],
+            ),
+            (
+                "an object's key changes: its rows follow (parts too)",
+                &["UPDATE obj SET oid = 107 WHERE oid = 7"],
+            ),
+            (
+                "a link moves an object to another group",
+                &["UPDATE obj_link SET gid = 8 WHERE oid = 8 AND gid = 1"],
+            ),
+            (
+                "an object deleted and its key re-inserted with new rows in one transaction",
+                &[
+                    "START TRANSACTION",
+                    "DELETE FROM obj WHERE oid = 9",
+                    "INSERT INTO obj VALUES (9, 'again')",
+                    "INSERT INTO obj_link VALUES (1, 9, 90)",
+                    "INSERT INTO obj_attr (oid, aid, val) VALUES (9, 11, 5)",
+                    "INSERT INTO obj_box VALUES (900, 9)",
+                    "INSERT INTO box_item VALUES (9000, 900, 4)",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "rows inserted after the build",
+                &[
+                    "INSERT INTO obj VALUES (61, 'new')",
+                    "INSERT INTO obj_link VALUES (2, 61, 610)",
+                    "INSERT INTO obj_attr (oid, aid, val) VALUES (61, 11, 7)",
+                    "INSERT INTO obj_box VALUES (161, 61)",
+                    "INSERT INTO box_item VALUES (1161, 161, 3)",
+                ],
+            ),
+            (
+                "... their object deleted",
+                &["DELETE FROM obj WHERE oid = 61"],
+            ),
+            (
+                "rows inserted and their object deleted in the same window",
+                &[
+                    "INSERT INTO obj VALUES (62, 'brief')",
+                    "INSERT INTO obj_link VALUES (3, 62, 620)",
+                    "INSERT INTO obj_attr (oid, aid, val) VALUES (62, 11, 9)",
+                    "DELETE FROM obj WHERE oid = 62",
+                ],
+            ),
+            (
+                "values moved out of the pinned key, then their object deleted",
+                &[
+                    "UPDATE obj_attr SET aid = 13 WHERE oid = 10 AND aid = 11",
+                    "DELETE FROM obj WHERE oid = 10",
+                ],
+            ),
+            (
+                "an object's key changes and the new key is deleted, in one transaction",
+                &[
+                    "START TRANSACTION",
+                    "UPDATE obj SET oid = 120 WHERE oid = 12",
+                    "DELETE FROM obj WHERE oid = 120",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "an object deleted, its key re-inserted with new rows and deleted again",
+                &[
+                    "START TRANSACTION",
+                    "DELETE FROM obj WHERE oid = 13",
+                    "INSERT INTO obj VALUES (13, 'twice')",
+                    "INSERT INTO obj_link VALUES (4, 13, 130)",
+                    "INSERT INTO obj_attr (oid, aid, val) VALUES (13, 11, 3)",
+                    "COMMIT",
+                    "DELETE FROM obj WHERE oid = 13",
+                ],
+            ),
+            (
+                "a box's key changes and the new key is deleted: its items follow, then go",
+                &[
+                    "START TRANSACTION",
+                    "UPDATE obj_box SET bid = 2014 WHERE oid = 14",
+                    "DELETE FROM obj_box WHERE bid = 2014",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "a group deleted: its links cascade away (the unit's own key)",
+                &["DELETE FROM grp WHERE gid = 3"],
+            ),
+        ];
+        let mut cascade_replayed = 0u64;
+        for (what, stmts) in steps {
+            let before = eng.snapshot();
+            let vbefore: Vec<ViewStats> = specs
+                .iter()
+                .map(|sp| eng.stats_of(&db, &sp.name))
+                .collect::<Result<_>>()?;
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+            for (sp, s0) in specs.iter().zip(&vbefore) {
+                let s = eng.stats_of(&db, &sp.name)?;
+                cascade_replayed += s.cascade_rows - s0.cascade_rows;
+                ensure!(
+                    s.balanced() && s.whole_view_refreshes == s0.whole_view_refreshes,
+                    "{what}: view {} not balanced or refreshed whole: {s:?}",
+                    sp.name
+                );
+            }
+            let d = eng.snapshot().since(&before);
+            // A step touches at most three groups and a few value rows per view.
+            ensure!(
+                d.full_rebuilds == 0 && d.units_refreshed <= 8 * specs.len() as u64,
+                "{what}: more than the touched groups refreshed: {}",
+                fmt_snapshot(&d)
+            );
+        }
+        ensure!(
+            cascade_replayed > 0,
+            "cascades through the map replayed no row in the per-view stats"
+        );
+        let d = eng.snapshot().since(&start);
+        ctx.log(format!("cascades through the map: {}", fmt_snapshot(&d)));
+        ensure!(
+            d.full_rebuilds == 0 && d.lookback_overflows == 0 && d.cascade_rows > 0,
+            "cascades through the map rebuilt the views, or replayed no row: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
+/// Restart gap: with a cached route, a parent deleted while the engine is stopped is
+/// replayed from before the startup seed, and the cache counts it as a gap. The gap does
+/// not force a refresh (no whole-view refresh, no full rebuild): the groups it left stale heal
+/// when a row under each changes, and the view is then exact.
+#[test]
+fn reg_cascade_restart_gap() {
+    scenario("reg_casc_gap", |ctx| async move {
+        let mut ddl: Vec<String> = vec![
+            "CREATE TABLE grp (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE ent (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE ent_link (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (gid, eid), \
+             FOREIGN KEY (eid) REFERENCES ent (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES grp (gid) ON DELETE CASCADE ON UPDATE CASCADE)"
+                .into(),
+            "CREATE TABLE ent_val (vid BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+             eid INT UNSIGNED NOT NULL, aid SMALLINT UNSIGNED NOT NULL, val INT NULL, \
+             UNIQUE KEY ent_aid (eid, aid), \
+             FOREIGN KEY (eid) REFERENCES ent (eid) ON DELETE CASCADE ON UPDATE CASCADE)"
+                .into(),
+        ];
+        let groups: Vec<String> = (1..=8u32).map(|g| format!("({g}, 'g{g}')")).collect();
+        ddl.push(format!("INSERT INTO grp VALUES {}", groups.join(", ")));
+        ddl.push("INSERT INTO ent VALUES (5, 'e5'), (6, 'e6')".into());
+        ddl.push("INSERT INTO ent_link VALUES (1, 5, 50), (1, 6, 60), (3, 5, 51)".into());
+        ddl.push("INSERT INTO ent_val (eid, aid, val) VALUES (5, 11, 3), (6, 11, 7)".into());
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![ViewSpec::new(
+            "r_gap_hop1",
+            Kind::Incremental,
+            "SELECT l.gid, COUNT(*) AS n, SUM(v.val) AS s FROM ent_link l \
+             JOIN ent_val v ON v.eid = l.eid AND v.aid = 11 GROUP BY l.gid",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_casc_gap", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        eng.stop().await?;
+        // `ent` is the parent of the cached routes (`^ent:map` into ent_link and ent_val); a `grp`
+        // delete is a unit route (the view groups by `l.gid`) and never reaches the cache.
+        run(&mut sc, &["DELETE FROM ent WHERE eid = 5"]).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        let f0 = eng.snapshot();
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // /stats is published at the end of a flush; after the resume the only event is the
+        // skipped childless delete, so wait for the periodic flush (position save, 5 s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let s = loop {
+            if let Some(s) = eng.view_stats(&db, "r_gap_hop1") {
+                if s.cascade_gaps >= 1 {
+                    break s;
+                }
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "the pre-seed delete was never counted in /stats within 15 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            s.cascade_gaps >= 1 && s.whole_view_refreshes == 0 && d.full_rebuilds == 0,
+            "the pre-seed delete was not counted, or forced a refresh: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        // No recovery (breakdown §2 "Restart gap"): groups 1 and 3 keep ent 5's rows until a
+        // row under each changes.
+        run(
+            &mut sc,
+            &[
+                "UPDATE ent_val SET val = 8 WHERE eid = 6 AND aid = 11",
+                "INSERT INTO ent_link VALUES (3, 6, 61)",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the stale groups after a write under each",
+        )
+        .await?;
+        let s = eng.stats_of(&db, "r_gap_hop1")?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            s.cascade_gaps >= 1 && s.whole_view_refreshes == 0 && d.full_rebuilds == 0,
+            "the write under the stale id was not absorbed incrementally: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!("restart gap: {s:?} {}", fmt_snapshot(&d)));
+        eng.stop().await
+    });
+}
+
+/// Per-key delete cases (lazywf §12 / §9.4): a delete through 1 / 2 / 3 hops, an item and
+/// its links in one transaction, an explicit ON DELETE CASCADE, a SET NULL, a key move, and
+/// a delete + re-insert in one window. Each case is oracle-exact, refreshes no whole view,
+/// and the per-view `entities_updated` delta equals the case's known affected keys.
+#[test]
+fn reg_cascade_deletes_per_key() {
+    scenario("reg_casc_del_key", |ctx| async move {
+        let ddl: Vec<&str> = vec![
+            "CREATE TABLE item (iid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)",
+            "CREATE TABLE item_link (child_id INT UNSIGNED NOT NULL, parent_id INT UNSIGNED NOT NULL, \
+             PRIMARY KEY (parent_id, child_id), \
+             FOREIGN KEY (parent_id) REFERENCES item (iid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (child_id) REFERENCES item (iid) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "CREATE TABLE item_value (vid BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+             item_id INT UNSIGNED NOT NULL, key_id SMALLINT UNSIGNED NOT NULL, scope_id TINYINT NOT NULL, \
+             val INT NULL, UNIQUE KEY item_key_scope (item_id, key_id, scope_id), \
+             FOREIGN KEY (item_id) REFERENCES item (iid) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "CREATE TABLE item_child (mid INT PRIMARY KEY, item_id INT UNSIGNED NOT NULL, \
+             FOREIGN KEY (item_id) REFERENCES item (iid) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "CREATE TABLE child_item (cid INT PRIMARY KEY, mid INT NOT NULL, w INT NOT NULL, \
+             FOREIGN KEY (mid) REFERENCES item_child (mid) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "CREATE TABLE item_soft (sid INT PRIMARY KEY, item_id INT UNSIGNED NULL, qty INT NOT NULL, \
+             FOREIGN KEY (item_id) REFERENCES item (iid) ON DELETE SET NULL ON UPDATE CASCADE)",
+            "INSERT INTO item VALUES (1,'g1'),(5,'g5'),(9,'g9'),(2,'a'),(3,'b'),(4,'c'),(6,'d'),\
+             (7,'e'),(8,'f'),(10,'h'),(11,'i'),(12,'j')",
+            "INSERT INTO item_link VALUES (2,1),(3,1),(4,1),(6,5),(7,5),(8,5),(10,9),(11,9),(12,9)",
+            "INSERT INTO item_value (item_id, key_id, scope_id, val) VALUES \
+             (2,99,3,20),(3,99,3,30),(4,99,3,40),(6,99,3,60),(7,99,3,70),(8,99,3,80),\
+             (10,99,3,100),(11,99,3,110),(12,99,3,120),(2,50,3,2),(6,50,3,6)",
+            "INSERT INTO item_child VALUES \
+             (102,2),(103,3),(104,4),(106,6),(107,7),(108,8),(110,10),(111,11),(112,12)",
+            "INSERT INTO child_item VALUES \
+             (1002,102,2),(1003,103,3),(1004,104,4),(1006,106,6),(1007,107,7),\
+             (1008,108,8),(1010,110,10),(1011,111,11),(1012,112,12)",
+            "INSERT INTO item_soft VALUES \
+             (202,2,21),(203,3,31),(204,4,41),(206,6,61),(207,7,71),(208,8,81),\
+             (210,10,101),(211,11,111),(212,12,121)",
+        ];
+        let specs = vec![
+            ViewSpec::new(
+                "r_del_hop1",
+                Kind::Incremental,
+                "SELECT l.parent_id AS g, COUNT(*) AS n, \
+             SUM(v.val) AS s FROM item_link l JOIN item_value v ON v.item_id = l.child_id \
+             AND v.key_id = 99 AND v.scope_id = 3 GROUP BY l.parent_id",
+            ),
+            ViewSpec::new(
+                "r_del_hop2",
+                Kind::Incremental,
+                "SELECT l.parent_id AS g, COUNT(*) AS n \
+             FROM item_link l JOIN item_child c ON c.item_id = l.child_id GROUP BY l.parent_id",
+            ),
+            ViewSpec::new(
+                "r_del_hop3",
+                Kind::Incremental,
+                "SELECT l.parent_id AS g, COUNT(*) AS n, \
+             SUM(ci.w) AS sw FROM item_link l JOIN item_child c ON c.item_id = l.child_id \
+             JOIN child_item ci ON ci.mid = c.mid GROUP BY l.parent_id",
+            ),
+            ViewSpec::new(
+                "r_del_soft",
+                Kind::Incremental,
+                "SELECT l.parent_id AS g, COUNT(s.sid) AS ns, \
+             SUM(s.qty) AS q FROM item_link l LEFT JOIN item_soft s ON s.item_id = l.child_id \
+             GROUP BY l.parent_id",
+            ),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_casc_del_key", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let start = eng.snapshot();
+        let mut c = db.conn().await?;
+        // A deleted item also marks its own id: `item_link.parent_id` cascades from `item` and is
+        // the views' unit, so the parent's key is marked from its row (a unit route; no rows
+        // under it). Each delete case gives 2: the group plus the deleted item.
+        let steps: &[(&str, &[&str], u64)] = &[
+            (
+                "a delete through 1 / 2 / 3 hops (item 2 under g1)",
+                &["DELETE FROM item WHERE iid = 2"],
+                2,
+            ),
+            (
+                "an item and its links in one transaction (item 3 under g1)",
+                &[
+                    "START TRANSACTION",
+                    "DELETE FROM item_value WHERE item_id = 3",
+                    "DELETE FROM item_child WHERE item_id = 3",
+                    "DELETE FROM item WHERE iid = 3",
+                    "COMMIT",
+                ],
+                2,
+            ),
+            (
+                "ON DELETE CASCADE (item 6 under g5)",
+                &["DELETE FROM item WHERE iid = 6"],
+                2,
+            ),
+            (
+                "SET NULL (item 10 under g9)",
+                &["DELETE FROM item WHERE iid = 10"],
+                2,
+            ),
+            (
+                "a key move (item 7 from g5 to g9)",
+                &["UPDATE item_link SET parent_id = 9 WHERE parent_id = 5 AND child_id = 7"],
+                2,
+            ),
+            (
+                "delete + re-insert in one window (item 8 under g5)",
+                &[
+                    "START TRANSACTION",
+                    "DELETE FROM item WHERE iid = 8",
+                    "INSERT INTO item VALUES (8, 'again')",
+                    "INSERT INTO item_link VALUES (8, 5)",
+                    "INSERT INTO item_value (item_id, key_id, scope_id, val) VALUES (8, 99, 3, 88)",
+                    "INSERT INTO item_child VALUES (108, 8)",
+                    "INSERT INTO child_item VALUES (1008, 108, 9)",
+                    "INSERT INTO item_soft VALUES (2080, 8, 88)",
+                    "COMMIT",
+                ],
+                2,
+            ),
+        ];
+        for (what, stmts, want) in steps {
+            let vbefore: Vec<ViewStats> = specs
+                .iter()
+                .map(|sp| eng.stats_of(&db, &sp.name))
+                .collect::<Result<_>>()?;
+            run(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+            for (sp, s0) in specs.iter().zip(&vbefore) {
+                let s = eng.stats_of(&db, &sp.name)?;
+                ensure!(
+                    s.entities_updated - s0.entities_updated == *want,
+                    "{what}: view {} entities_updated delta != {want}: {s:?}",
+                    sp.name
+                );
+                ensure!(
+                    s.whole_view_refreshes == 0,
+                    "{what}: view {} refreshed whole: {s:?}",
+                    sp.name
+                );
+            }
+            let d = eng.snapshot().since(&start);
+            ensure!(
+                d.full_rebuilds == 0,
+                "{what}: a full rebuild: {}",
+                fmt_snapshot(&d)
+            );
+        }
+        ctx.log(format!(
+            "per-key deletes: {}",
+            fmt_snapshot(&eng.snapshot().since(&start))
+        ));
         eng.stop().await
     });
 }

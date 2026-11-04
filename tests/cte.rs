@@ -1276,10 +1276,12 @@ fn cascade_traced_cases() -> Vec<(Case, &'static str)> {
     ]
 }
 
-/// Views whose cascades cannot be traced (A1: a NULL-side parent with a condition beyond the
-/// key leaves kids of failing parents without lineage; A3: a self-referential key cascades to
-/// every descendant): routed to a rebuild, which must keep them equal to the oracle.
-fn cascade_rebuild_cases() -> Vec<(Case, &'static str)> {
+/// Views whose cascades cannot be traced from the parent's row (A1: a NULL-side parent with a
+/// condition beyond the key leaves kids of failing parents without lineage; A3: a
+/// self-referential key cascades to every descendant): the cascade map keeps the children and
+/// replays what the storage engine changed, which must keep them equal to the oracle without a
+/// rebuild.
+fn cascade_map_cases() -> Vec<(Case, &'static str)> {
     vec![
         // C3: a semi-join over the cascading child not correlated on the unit: the units a
         // parent's delete / key update changes are not known, so the view is Full.
@@ -1298,35 +1300,35 @@ fn cascade_rebuild_cases() -> Vec<(Case, &'static str)> {
         (
             case("a1_left", "incremental", "spj",
                  "SELECT k.id, k.qty, p.name FROM c_kids k LEFT JOIN c_pars p ON p.id = k.par_id AND p.active = 1"),
-            "k:unit,p:lineage,^c_pars:rebuild",
+            "k:unit,p:lineage,^c_pars:map",
         ),
         (
             case("a1_chain", "incremental", "spj",
                  "SELECT o.id, k.qty, p.name FROM c_orders o LEFT JOIN c_kids k ON k.id = o.kid_id LEFT JOIN c_pars p ON p.id = k.par_id AND p.active = 1"),
-            "o:unit,k:lineage,p:lineage,^c_pars:rebuild",
+            "o:unit,k:lineage,p:lineage,^c_pars:map",
         ),
         (
             case("a1_set_null", "incremental", "spj",
                  "SELECT k.id, k.par_id, p.name FROM sn_kids k LEFT JOIN sn_pars p ON p.id = k.par_id AND p.active = 1"),
-            "k:unit,p:lineage,^sn_pars:rebuild",
+            "k:unit,p:lineage,^sn_pars:map",
         ),
         (
             case("sn_flat", "incremental", "spj", "SELECT k.id, k.par_id, k.qty FROM sn_kids k"),
-            "k:unit,^sn_pars:rebuild",
+            "k:unit,^sn_pars:map",
         ),
         (
             case("self_flat", "incremental", "spj", "SELECT n.id, n.parent_id, n.label FROM nodes n"),
-            "n:unit,^nodes:rebuild",
+            "n:unit,^nodes:map",
         ),
         (
             case("self_join", "incremental", "spj",
                  "SELECT n.id, n.label, p.label AS plabel FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id"),
-            "n:unit,p:lineage,^nodes:rebuild,^nodes:rebuild",
+            "n:unit,p:lineage,^nodes:map,^nodes:map",
         ),
         (
             case("self_grp", "incremental", "grouped",
                  "SELECT n.parent_id, COUNT(*) AS n FROM nodes n GROUP BY n.parent_id"),
-            "n:unit,^nodes:rebuild",
+            "n:unit,^nodes:map",
         ),
     ]
 }
@@ -1385,7 +1387,7 @@ async fn run_cascade(
     ctx: &Ctx,
     label: &str,
     cases: Vec<(Case, &'static str)>,
-    rebuilds: bool,
+    mapped: bool,
     window_ms: &str,
 ) -> Result<()> {
     let db = ctx.new_db(&format!("cte_casc_{label}")).await?;
@@ -1422,39 +1424,54 @@ async fn run_cascade(
     )
     .await?;
     let before = eng.snapshot();
+    // Full-mode views (C3) are rebuilt on every change by design; incremental ones never are.
+    let incremental: Vec<&str> = specs
+        .iter()
+        .filter(|s| s.kind == Kind::Incremental)
+        .map(|s| s.name.as_str())
+        .collect();
+    let whole0: Vec<u64> = incremental
+        .iter()
+        .map(|v| eng.view_stats(&db, v).map_or(0, |s| s.whole_view_refreshes))
+        .collect();
     for (what, stmt) in cascade_steps() {
         exec(&mut c, stmt).await.with_context(|| what.to_string())?;
         verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
     }
     let d = eng.snapshot().since(&before);
-    if rebuilds {
+    for (v, w0) in incremental.iter().zip(&whole0) {
+        let s = eng.stats_of(&db, v)?;
         anyhow::ensure!(
-            d.full_rebuilds >= 1,
-            "{label}: untraced cascades were expected to rebuild: {}",
-            fmt_snapshot(&d)
-        );
-    } else {
-        anyhow::ensure!(
-            d.full_rebuilds == 0,
-            "{label}: traced cascades rebuilt the views: {}",
+            s.whole_view_refreshes == *w0,
+            "{label}: cascades rebuilt the incremental view {v}: {s:?} {}",
             fmt_snapshot(&d)
         );
     }
+    anyhow::ensure!(
+        incremental.len() < specs.len() || d.full_rebuilds == 0,
+        "{label}: cascades rebuilt the views: {}",
+        fmt_snapshot(&d)
+    );
+    anyhow::ensure!(
+        !mapped || d.cascade_rows > 0,
+        "{label}: no cascaded row was replayed from the cascade map: {}",
+        fmt_snapshot(&d)
+    );
     assert_ready(&mut c, &names(&specs)).await?;
     eng.stop().await?;
     c.disconnect().await.ok();
     Ok(())
 }
 
-/// A1 / A3: every cascade shape against its oracle: traced and unit-derived routes without a
-/// rebuild; NULL-side parents with extra conditions, SET NULL keys and self-referential keys
-/// through the rebuild route.
+/// A1 / A3: every cascade shape against its oracle, none with a rebuild: traced and unit-derived
+/// routes from the parent's row; NULL-side parents with extra conditions, SET NULL keys and
+/// self-referential keys through the cascade map (rows replayed).
 #[test]
 fn cte_cascades_match_their_oracles() {
     scenario("cte_cascade", |ctx| async move {
         run_cascade(&ctx, "traced_w0", cascade_traced_cases(), false, "0").await?;
-        run_cascade(&ctx, "rebuild_w0", cascade_rebuild_cases(), true, "0").await?;
-        run_cascade(&ctx, "rebuild_w50", cascade_rebuild_cases(), true, "50").await?;
+        run_cascade(&ctx, "map_w0", cascade_map_cases(), true, "0").await?;
+        run_cascade(&ctx, "map_w50", cascade_map_cases(), true, "50").await?;
         Ok(())
     });
 }

@@ -55,6 +55,10 @@ pub struct Tally {
     pub images_marked: u64,
     /// Of those, already buffered.
     pub images_absorbed: u64,
+    /// Kept child rows replayed for a parent change (the in-memory cascade cache).
+    pub cascade_rows: u64,
+    /// Parent changes replayed from before the startup seed (a cache gap).
+    pub cascade_gaps: u64,
 }
 
 impl Tally {
@@ -85,6 +89,8 @@ impl Tally {
         self.ids_absorbed += o.ids_absorbed;
         self.images_marked += o.images_marked;
         self.images_absorbed += o.images_absorbed;
+        self.cascade_rows += o.cascade_rows;
+        self.cascade_gaps += o.cascade_gaps;
     }
 }
 
@@ -216,6 +222,8 @@ pub struct Fold {
     pub flush: Flush,
     /// Ids in the live version's buffer.
     pub pending: u64,
+    /// Rows kept in the live version's in-memory cascade cache.
+    pub cascade_cached_rows: u64,
 }
 
 /// No-op hasher for values that are hashes already.
@@ -287,6 +295,7 @@ struct ViewStats {
     tally: Tally,
     updated: u64,
     pending: u64,
+    cascade_cached_rows: u64,
     refreshes: u64,
     work: Work,
     builds: u64,
@@ -327,6 +336,7 @@ impl ViewStats {
             mut tally,
             flush,
             pending,
+            cascade_cached_rows,
             ..
         } = f;
         self.mode = mode;
@@ -335,6 +345,7 @@ impl ViewStats {
         self.tally.add(&tally);
         self.updated += flush.updated;
         self.pending = pending;
+        self.cascade_cached_rows = cascade_cached_rows;
         self.refreshes += flush.refreshes;
         self.work.add(&flush.work);
         self.builds += flush.builds;
@@ -367,6 +378,9 @@ impl ViewStats {
             ids_pending: self.pending,
             images_marked: self.tally.images_marked,
             images_absorbed: self.tally.images_absorbed,
+            cascade_rows: self.tally.cascade_rows,
+            cascade_gaps: self.tally.cascade_gaps,
+            cascade_cached_rows: self.cascade_cached_rows,
             entities_updated: self.updated,
             entities_distinct: self.distinct.len(),
             entities_distinct_60s: self.cur.union_len(&self.prev),
@@ -397,6 +411,12 @@ pub struct ViewSnapshot {
     pub ids_pending: u64,
     pub images_marked: u64,
     pub images_absorbed: u64,
+    /// Kept child rows replayed for a parent change (the in-memory cascade cache).
+    pub cascade_rows: u64,
+    /// Parent changes replayed from before the startup seed (a cache gap).
+    pub cascade_gaps: u64,
+    /// Rows kept in the live version's in-memory cascade cache.
+    pub cascade_cached_rows: u64,
     pub entities_updated: u64,
     pub entities_distinct: u64,
     /// Distinct ids refreshed since `window_start_unix` (30 to 60 s ago).
@@ -435,6 +455,9 @@ impl ViewSnapshot {
             "ids_pending": self.ids_pending,
             "images_marked": self.images_marked,
             "images_absorbed": self.images_absorbed,
+            "cascade_rows": self.cascade_rows,
+            "cascade_gaps": self.cascade_gaps,
+            "cascade_cached_rows": self.cascade_cached_rows,
             "entities_updated": self.entities_updated,
             "entities_distinct": self.entities_distinct,
             "entities_distinct_60s": self.entities_distinct_60s,
@@ -458,7 +481,7 @@ impl ViewSnapshot {
     }
 
     /// `(name, help, counter)` and value of each `/metrics` series.
-    fn series(&self) -> [(&'static str, &'static str, bool, u64); 20] {
+    fn series(&self) -> [(&'static str, &'static str, bool, u64); 23] {
         [
             (
                 "source_rows",
@@ -501,6 +524,24 @@ impl ViewSnapshot {
                 "Of those, already buffered.",
                 true,
                 self.images_absorbed,
+            ),
+            (
+                "cascade_rows",
+                "Kept child rows replayed for a parent change.",
+                true,
+                self.cascade_rows,
+            ),
+            (
+                "cascade_gaps",
+                "Parent changes replayed from before the startup seed.",
+                true,
+                self.cascade_gaps,
+            ),
+            (
+                "cascade_cached_rows",
+                "Rows kept in the live version's in-memory cascade cache.",
+                false,
+                self.cascade_cached_rows,
             ),
             (
                 "entities_updated",
@@ -715,6 +756,7 @@ mod tests {
             tally,
             flush,
             pending,
+            cascade_cached_rows: 0,
         }
     }
 
@@ -745,6 +787,8 @@ mod tests {
                 ids_absorbed: 3,
                 images_marked: 2,
                 images_absorbed: 1,
+                cascade_rows: 0,
+                cascade_gaps: 0,
             }
         );
         assert_eq!(buf.len(), 3);

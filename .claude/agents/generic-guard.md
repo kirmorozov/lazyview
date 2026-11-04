@@ -30,7 +30,7 @@ The caller gives you either
   buffer, position bookkeeping and the target-action hooks.
 - Another tool copies these files VERBATIM: src/binlog.rs, src/datum.rs, src/catalog.rs, src/analyze.rs,
   src/analyzer/*, src/fence.rs (the commit-order visibility fence, #28), src/intset.rs (the shared
-integer set), and the dedup core files
+integer set), src/cascade.rs (the in-memory cascade cache), and the dedup core files
   (src/dedup.rs, src/dedup/**, or whatever files the change declares as the core). Together they form
   the COPY SET.
 

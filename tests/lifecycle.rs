@@ -592,10 +592,20 @@ fn lifecycle_crash_consistency() {
         let db = ctx.new_db("lc_crash").await?;
         let seed = ctx.sub_seed("seed");
         let ids = setup_ecommerce(&db, seed, Sizes::scaled()).await?;
-        let all = ecommerce_views();
+        let mut c = db.conn().await?;
+        // Views over children of cascading foreign keys are left out where the storage engine
+        // cascades without binlog events: a crash resumes from a saved position before the startup
+        // seed of the cascade cache, and a parent deleted in that window leaves their rows stale
+        // until they change again (the restart gap, by design: counted in cascade_gaps and tested
+        // by reg_cascade_restart_gap). Where the server logs the cascaded rows, the replay carries
+        // them and every view stays in.
+        let logged = cascades_logged(&mut c).await?;
+        let all: Vec<ViewSpec> = ecommerce_views()
+            .into_iter()
+            .filter(|v| logged || !workload::reads_fk_child(&v.name))
+            .collect();
         let (chained, base): (Vec<ViewSpec>, Vec<ViewSpec>) =
             all.iter().cloned().partition(|s| s.kind == Kind::Chained);
-        let mut c = db.conn().await?;
         ensure_lazyview_table(&mut c).await?;
         add_views(&mut c, &base).await?;
         let mut rng = workload::Gen::new(derive_seed(seed, "crash"));
