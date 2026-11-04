@@ -357,12 +357,18 @@ impl ViewStats {
         self.rotate(now);
         let mut hashed: Vec<u64> = flush.ids.keys.iter().map(key_hash).collect();
         for (set, keys) in flush.partial.iter().enumerate() {
-            hashed.extend(keys.ints.iter().map(|v| partial_hash(set, v)));
+            hashed.extend(
+                keys.ints
+                    .to_sorted_vec()
+                    .iter()
+                    .map(|v| partial_hash(set, v)),
+            );
             hashed.extend(keys.keys.iter().map(|k| partial_hash(set, k)));
         }
         if !flush.ids.is_empty() || !hashed.is_empty() {
-            self.distinct.add(&flush.ids.ints, &hashed);
-            self.cur.add(&flush.ids.ints, &hashed);
+            let ints: RoaringTreemap = flush.ids.ints.to_sorted_vec().into_iter().collect();
+            self.distinct.add(&ints, &hashed);
+            self.cur.add(&ints, &hashed);
         }
     }
 

@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::accumulate::{
-    self, extend_partial, feed, feed_cascade, feed_map, Fed, UnitChunk, UnitSet, ViewDirty,
+    self, extend_partial, feed, feed_cascade, feed_map, Fed, KeySet, UnitChunk, UnitSet, ViewDirty,
 };
 use crate::analyze::{self, Mode, ViewPlan};
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position};
@@ -1982,7 +1982,7 @@ impl Engine {
             name,
             targets: resumed,
             dirty: ViewDirty {
-                images: vec![HashSet::new(); plan.aliases.len()],
+                images: vec![KeySet::default(); plan.aliases.len()],
                 cache,
                 ..Default::default()
             },
@@ -2112,7 +2112,7 @@ impl Engine {
             self.slots[idx].error.take().is_some() | self.slots[idx].blocked.take().is_some();
         self.slots[idx].next = Some(Next {
             dirty: ViewDirty {
-                images: vec![HashSet::new(); plan.aliases.len()],
+                images: vec![KeySet::default(); plan.aliases.len()],
                 cache: if plan.cascades.iter().any(|c| c.map.is_some()) {
                     cascade::Cache::seeding()
                 } else {
@@ -3517,7 +3517,7 @@ impl Engine {
                 if n.dirty.key_count() > cap {
                     let len = n.dirty.images.len();
                     n.dirty = ViewDirty {
-                        images: vec![HashSet::new(); len],
+                        images: vec![KeySet::default(); len],
                         rebuild: true,
                         ..Default::default()
                     };
@@ -4222,7 +4222,7 @@ impl Engine {
         }
         // Changes that arrived after the buffered ones were applied (swap retries).
         let mut live_dirty = ViewDirty {
-            images: vec![HashSet::new(); n.plan.aliases.len()],
+            images: vec![KeySet::default(); n.plan.aliases.len()],
             ..Default::default()
         };
         live_dirty.cache = std::mem::take(&mut n.dirty.cache);
@@ -4496,7 +4496,7 @@ impl Engine {
             let mut d = ViewDirty {
                 units: g.units.clone(),
                 partial: g.partial.clone(),
-                images: vec![HashSet::new(); plan.aliases.len()],
+                images: vec![KeySet::default(); plan.aliases.len()],
                 all: g.all,
                 ..Default::default()
             };
@@ -4664,7 +4664,7 @@ impl Engine {
         }
         let n = dirty.images.len();
         *dirty = ViewDirty {
-            images: vec![HashSet::new(); n],
+            images: vec![KeySet::default(); n],
             rebuild,
             ..Default::default()
         };
@@ -4876,7 +4876,7 @@ impl Engine {
         &mut self,
         plan: &ViewPlan,
         layout: &Layout,
-        images: &[HashSet<Key>],
+        images: &[KeySet],
         (targets, table): (&[String], &str),
         (recent, since): (&mut Lookback, Option<&Position>),
         units: &mut UnitSet,
@@ -4904,7 +4904,7 @@ impl Engine {
         }
         let combos = recent.combinations(&plain, images);
         for set in combos.sets() {
-            let parts: Vec<(usize, &HashSet<Key>)> = match set.as_slice() {
+            let parts: Vec<(usize, &KeySet)> = match set.as_slice() {
                 [a] => vec![(*a, &images[*a])],
                 _ => set.iter().map(|&a| (a, &combos.all[a])).collect(),
             };
@@ -4966,7 +4966,7 @@ impl Engine {
         plan: &ViewPlan,
         layout: &Layout,
         alias: usize,
-        keys: &HashSet<Key>,
+        keys: &KeySet,
         targets: &[String],
         table: &str,
         units: &mut UnitSet,
@@ -5060,7 +5060,7 @@ impl Engine {
     async fn lookup(
         &mut self,
         plan: &ViewPlan,
-        parts: &[(usize, &HashSet<Key>)],
+        parts: &[(usize, &KeySet)],
         units: &mut UnitSet,
     ) -> Result<()> {
         struct Part<'a> {
@@ -5338,7 +5338,7 @@ fn finish_refresh(
     }
     let n = dirty.images.len();
     *dirty = ViewDirty {
-        images: vec![HashSet::new(); n],
+        images: vec![KeySet::default(); n],
         rebuild: p.rebuild,
         ..Default::default()
     };

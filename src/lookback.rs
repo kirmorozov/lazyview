@@ -30,8 +30,8 @@
 
 use std::collections::HashSet;
 
+use crate::accumulate::KeySet;
 use crate::binlog::Position;
-use crate::datum::Key;
 
 /// Remembered images of one view version.
 #[derive(Default)]
@@ -45,13 +45,13 @@ struct Held {
     /// Replay position of the oldest change among the images.
     from: Position,
     /// Per alias.
-    images: Vec<HashSet<Key>>,
+    images: Vec<KeySet>,
 }
 
 /// The lookups to run for one flush (see [`Lookback::combinations`]).
 pub struct Combinations {
     /// Per alias: its new images plus the remembered ones.
-    pub all: Vec<HashSet<Key>>,
+    pub all: Vec<KeySet>,
     /// The aliases with images, new or remembered.
     with: Vec<usize>,
     /// Bit `b`: `with[b]` has new images.
@@ -81,10 +81,10 @@ impl Combinations {
 impl Lookback {
     /// The combinations to look up for the new `images` (per alias) of the lookup tables
     /// `aliases`. Only those with at least one new image: the others were looked up before.
-    pub fn combinations(&self, aliases: &[usize], images: &[HashSet<Key>]) -> Combinations {
+    pub fn combinations(&self, aliases: &[usize], images: &[KeySet]) -> Combinations {
         let n = images.len();
         let fresh = |a: usize| images.get(a).is_some_and(|s| !s.is_empty());
-        let mut all: Vec<HashSet<Key>> = vec![HashSet::new(); n];
+        let mut all: Vec<KeySet> = vec![KeySet::default(); n];
         for &a in aliases {
             if let Some(s) = images.get(a) {
                 all[a].extend(s.iter().cloned());
@@ -116,9 +116,9 @@ impl Lookback {
         until: Position,
         from: Position,
         aliases: &[usize],
-        images: &[HashSet<Key>],
+        images: &[KeySet],
     ) {
-        let mut kept = vec![HashSet::new(); images.len()];
+        let mut kept = vec![KeySet::default(); images.len()];
         for &a in aliases {
             if let Some(s) = images.get(a) {
                 kept[a] = s.clone();
@@ -177,7 +177,7 @@ mod tests {
         }
     }
 
-    fn imgs(sets: &[&[i64]]) -> Vec<HashSet<Key>> {
+    fn imgs(sets: &[&[i64]]) -> Vec<KeySet> {
         sets.iter()
             .map(|s| {
                 s.iter()
@@ -222,7 +222,7 @@ mod tests {
         assert!(sets.windows(2).all(|w| w[0].len() <= w[1].len()));
         let none = imgs(&[&[], &[]]);
         assert_eq!(lb.combinations(&[0, 1], &none).sets().count(), 0);
-        let many: Vec<HashSet<Key>> = (0..9).map(|i| imgs(&[&[i]]).remove(0)).collect();
+        let many: Vec<KeySet> = (0..9).map(|i| imgs(&[&[i]]).remove(0)).collect();
         let c = lb.combinations(&(0..9).collect::<Vec<_>>(), &many);
         assert_eq!(c.sets().count(), (1 << 9) - 1);
         // Remembered images only: combined with a new one, never alone.

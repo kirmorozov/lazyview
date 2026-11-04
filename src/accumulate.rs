@@ -4,37 +4,47 @@ use std::collections::HashSet;
 
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
-use roaring::RoaringTreemap;
 
 use crate::analyze::{AliasPlan, CascadeRoute, ConstFilter, Mode, ViewPlan};
 use crate::cascade;
 pub use crate::cascade::{kept_image, KeptRow};
 use crate::catalog::FkAction;
 use crate::datum::{Datum, Key};
+use crate::intset::{self, IntSet};
 use crate::stats::Tally;
 
-const SIGN: u64 = 1 << 63;
+/// Hash set of non-integer keys (and row images): std HashSet with the foldhash hasher.
+pub type KeySet = HashSet<Key, foldhash::fast::RandomState>;
 
-/// Unit keys. Single-column integer keys live in a roaring bitmap (order-preserving encoding of
-/// i64), everything else in a hash set.
+/// Unit keys. Single-column integer keys live in an `IntSet` (src/intset.rs), everything else
+/// in a `KeySet`.
 #[derive(Default, Debug, Clone)]
 pub struct UnitSet {
-    pub ints: RoaringTreemap,
-    pub keys: HashSet<Key>,
+    pub ints: IntSet,
+    pub keys: KeySet,
 }
 
 impl UnitSet {
     /// `false`: the key was in the set already.
     pub fn insert(&mut self, key: Key) -> bool {
         if let [Datum::Int(i)] = &*key {
-            self.ints.insert((*i as u64) ^ SIGN)
+            self.ints.insert(intset::from_i64(*i))
         } else {
             self.keys.insert(key)
         }
     }
 
-    pub fn insert_int(&mut self, i: i64) {
-        self.ints.insert((i as u64) ^ SIGN);
+    /// `false`: the id was in the set already.
+    pub fn insert_int(&mut self, i: i64) -> bool {
+        self.ints.insert(intset::from_i64(i))
+    }
+
+    /// A one-column key; an integer never builds a `Key` (no per-event allocation).
+    pub fn insert_datum(&mut self, d: Datum) -> bool {
+        match d {
+            Datum::Int(i) => self.insert_int(i),
+            d => self.keys.insert(Key::from([d])),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -46,13 +56,13 @@ impl UnitSet {
     }
 
     pub fn extend(&mut self, other: UnitSet) {
-        self.ints |= other.ints;
+        self.ints.union_with(other.ints);
         self.keys.extend(other.keys);
     }
 
     pub fn contains(&self, key: &[Datum]) -> bool {
         match key {
-            [Datum::Int(i)] => self.ints.contains((*i as u64) ^ SIGN),
+            [Datum::Int(i)] => self.ints.contains(intset::from_i64(*i)),
             k => self.keys.contains(k),
         }
     }
@@ -60,9 +70,10 @@ impl UnitSet {
     /// Splits into chunks of at most `n` keys: sorted integer chunks first, then other keys.
     pub fn chunks(&self, n: usize) -> Vec<UnitChunk> {
         let mut out = Vec::new();
-        let mut cur = Vec::with_capacity(n.min(self.ints.len() as usize));
-        for v in self.ints.iter() {
-            cur.push((v ^ SIGN) as i64);
+        let ints = self.ints.to_sorted_vec();
+        let mut cur = Vec::with_capacity(n.min(ints.len()));
+        for v in ints {
+            cur.push(intset::to_i64(v));
             if cur.len() == n {
                 out.push(UnitChunk::Ints(std::mem::take(&mut cur)));
             }
@@ -82,7 +93,7 @@ impl UnitSet {
 /// (the chunk size may change from one chunk to the next). Order as in [`UnitSet::chunks`]:
 /// sorted integer keys first, then the other keys.
 pub struct ChunkCursor {
-    ints: std::iter::Peekable<roaring::treemap::IntoIter>,
+    ints: IntSet,
     keys: std::iter::Peekable<std::collections::hash_set::IntoIter<Key>>,
     left: usize,
 }
@@ -91,7 +102,7 @@ impl ChunkCursor {
     pub fn new(units: UnitSet) -> ChunkCursor {
         let left = units.len();
         ChunkCursor {
-            ints: units.ints.into_iter().peekable(),
+            ints: units.ints,
             keys: units.keys.into_iter().peekable(),
             left,
         }
@@ -105,12 +116,12 @@ impl ChunkCursor {
     /// The next chunk of at most `n` (≥ 1) keys; integer and other keys are never mixed.
     pub fn next_chunk(&mut self, n: usize) -> Option<UnitChunk> {
         let n = n.max(1);
-        if self.ints.peek().is_some() {
+        if !self.ints.is_empty() {
             let v: Vec<i64> = self
                 .ints
-                .by_ref()
-                .take(n)
-                .map(|v| (v ^ SIGN) as i64)
+                .pop_smallest(n)
+                .into_iter()
+                .map(intset::to_i64)
                 .collect();
             self.left -= v.len();
             return Some(UnitChunk::Ints(v));
@@ -125,12 +136,10 @@ impl ChunkCursor {
 
     /// Everything not handed out yet, back as a set (carry-over of an interrupted run).
     pub fn into_rest(self) -> UnitSet {
-        let mut s = UnitSet::default();
-        for v in self.ints {
-            s.ints.insert(v);
+        UnitSet {
+            ints: self.ints,
+            keys: self.keys.collect(),
         }
-        s.keys.extend(self.keys);
-        s
     }
 }
 
@@ -322,7 +331,7 @@ fn or_join(parts: Vec<String>) -> String {
 pub struct ViewDirty {
     pub units: UnitSet,
     /// Per alias: row images (membership columns) whose units still need a lookup query.
-    pub images: Vec<HashSet<Key>>,
+    pub images: Vec<KeySet>,
     /// Per set of `ViewPlan::partial`: partial unit keys (every unit matching one is refreshed).
     pub partial: Vec<UnitSet>,
     /// Pinned cascade children (see `CascadeRoute::pinned`) whose parent key changed, as
@@ -345,7 +354,7 @@ impl ViewDirty {
     /// An empty buffer for a plan with `aliases` aliases.
     pub fn for_aliases(aliases: usize) -> ViewDirty {
         ViewDirty {
-            images: vec![HashSet::new(); aliases],
+            images: vec![KeySet::default(); aliases],
             ..Default::default()
         }
     }
@@ -372,7 +381,7 @@ impl ViewDirty {
     pub fn merge(&mut self, other: ViewDirty) {
         self.units.extend(other.units);
         if self.images.len() < other.images.len() {
-            self.images.resize(other.images.len(), HashSet::new());
+            self.images.resize(other.images.len(), KeySet::default());
         }
         for (mine, theirs) in self.images.iter_mut().zip(other.images) {
             mine.extend(theirs);
@@ -407,11 +416,11 @@ impl ViewDirty {
     pub fn take(&mut self) -> ViewDirty {
         let n = self.images.len();
         let mut out = std::mem::take(self);
-        self.images = vec![HashSet::new(); n];
+        self.images = vec![KeySet::default(); n];
         self.tally = std::mem::take(&mut out.tally);
         self.cache = std::mem::take(&mut out.cache);
         if out.images.len() < n {
-            out.images.resize(n, HashSet::new());
+            out.images.resize(n, KeySet::default());
         }
         out
     }
@@ -484,6 +493,17 @@ pub fn feed(
         return Fed::Recorded;
     }
     if let Some(cols) = &a.direct_unit {
+        if let [c] = cols[..] {
+            // One-column unit: compare the Datums, an integer never builds a `Key`.
+            let datum = |row: &BinlogRow| Datum::from_binlog(value_at(row, c), &a.table.columns[c]);
+            let new = after.map(datum);
+            let old = before.map(datum).filter(|o| new.as_ref() != Some(o));
+            for x in [old, new].into_iter().flatten() {
+                let fresh = dirty.units.insert_datum(x);
+                dirty.tally.id(fresh);
+            }
+            return Fed::Recorded;
+        }
         // An update that keeps its unit marks it once.
         let new = after.map(|row| project(row, a, cols));
         let old = before
@@ -498,6 +518,17 @@ pub fn feed(
         if dirty.partial.len() <= set {
             dirty.partial.resize_with(set + 1, UnitSet::default);
         }
+        if let [c] = cols[..] {
+            // One-column partial unit: as above, but into the partial set.
+            let datum = |row: &BinlogRow| Datum::from_binlog(value_at(row, c), &a.table.columns[c]);
+            let new = after.map(datum);
+            let old = before.map(datum).filter(|o| new.as_ref() != Some(o));
+            for x in [old, new].into_iter().flatten() {
+                let fresh = dirty.partial[set].insert_datum(x);
+                dirty.tally.id(fresh);
+            }
+            return Fed::Recorded;
+        }
         // As for units: an update that keeps its key marks it once.
         let new = after.map(|row| project(row, a, cols));
         let old = before
@@ -510,7 +541,7 @@ pub fn feed(
         return Fed::Recorded;
     }
     if dirty.images.len() <= alias {
-        dirty.images.resize(plan.aliases.len(), HashSet::new());
+        dirty.images.resize(plan.aliases.len(), KeySet::default());
     }
     let membership_changed = match (before, after) {
         (Some(b), Some(af)) => changed(b, af, &a.membership),
@@ -1029,6 +1060,108 @@ mod tests {
         assert_eq!((dirty.units.len(), dirty.tally.ids_marked), (3, 5));
     }
 
+    /// A single-column unit key takes `feed`'s fast path: an integer lands in `UnitSet::ints`
+    /// (no `Key` built per event), a `Bytes` one in `UnitSet::keys`; the tally is as before.
+    #[test]
+    fn single_column_units_skip_the_key() {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        use mysql_async::Value;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, TableInfo};
+
+        let table = |name: &str, cols: &[(&str, &str)]| {
+            let t = TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns: cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
+                pk: vec![0],
+                unique_keys: vec![],
+                cascades: vec![],
+                is_view: false,
+                view_bases: vec![],
+            };
+            (("db".to_string(), name.to_string()), Arc::new(t))
+        };
+
+        // One-column integer unit: an insert, an update that keeps it, an update that moves it.
+        let tables: std::collections::HashMap<_, _> =
+            [table("ent", &[("id", "int"), ("label", "varchar")])]
+                .into_iter()
+                .collect();
+        let p = plan(
+            &parse_definition("CREATE VIEW v AS SELECT id, label FROM ent").unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        let a = &p.aliases[0];
+        assert!(a.direct_unit.is_some());
+        let row = |id: i64, label: &str| {
+            let cols: Arc<[mysql_async::Column]> = [
+                ColumnType::MYSQL_TYPE_LONG,
+                ColumnType::MYSQL_TYPE_VAR_STRING,
+            ]
+            .into_iter()
+            .map(mysql_async::Column::new)
+            .collect();
+            BinlogRow::new(
+                vec![
+                    Some(BinlogValue::Value(Value::Int(id))),
+                    Some(BinlogValue::Value(Value::Bytes(label.as_bytes().to_vec()))),
+                ],
+                cols,
+            )
+        };
+        let mut dirty = ViewDirty::for_aliases(p.aliases.len());
+        feed(&p, 0, &mut dirty, None, Some(&row(1, "x")));
+        feed(&p, 0, &mut dirty, Some(&row(1, "x")), Some(&row(1, "y")));
+        feed(&p, 0, &mut dirty, Some(&row(1, "y")), Some(&row(2, "y")));
+        assert_eq!((dirty.tally.ids_marked, dirty.tally.ids_absorbed), (4, 2));
+        assert_eq!(dirty.units.ints.len(), 2);
+        assert!(dirty.units.keys.is_empty());
+        assert!(dirty.units.contains(&[Datum::Int(1)]) && dirty.units.contains(&[Datum::Int(2)]));
+
+        // One-column Bytes unit: it lands in `keys`.
+        let tables: std::collections::HashMap<_, _> =
+            [table("tag", &[("name", "varchar"), ("value", "int")])]
+                .into_iter()
+                .collect();
+        let p = plan(
+            &parse_definition("CREATE VIEW w AS SELECT name, value FROM tag").unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        assert!(p.aliases[0].direct_unit.is_some());
+        let row = |name: &str, value: i64| {
+            let cols: Arc<[mysql_async::Column]> = [
+                ColumnType::MYSQL_TYPE_VAR_STRING,
+                ColumnType::MYSQL_TYPE_LONG,
+            ]
+            .into_iter()
+            .map(mysql_async::Column::new)
+            .collect();
+            BinlogRow::new(
+                vec![
+                    Some(BinlogValue::Value(Value::Bytes(name.as_bytes().to_vec()))),
+                    Some(BinlogValue::Value(Value::Int(value))),
+                ],
+                cols,
+            )
+        };
+        let mut dirty = ViewDirty::for_aliases(p.aliases.len());
+        feed(&p, 0, &mut dirty, None, Some(&row("a", 1)));
+        assert_eq!((dirty.tally.ids_marked, dirty.tally.ids_absorbed), (1, 0));
+        assert!(dirty.units.ints.is_empty());
+        assert!(dirty
+            .units
+            .keys
+            .contains(&Key::from([Datum::Bytes(b"a".to_vec())])));
+    }
+
     /// Rows failing an alias's constant filters are not its rows: a change with both sides
     /// failing is skipped, one with a side failing is recorded as the insert or delete of the
     /// other side, for unit, lineage and lookup aliases alike.
@@ -1152,7 +1285,7 @@ mod tests {
                 }
                 Some(want) => {
                     assert_eq!(fed, Fed::Recorded, "case {i}");
-                    let want: HashSet<Key> = want.iter().cloned().collect();
+                    let want: KeySet = want.iter().cloned().collect();
                     assert_eq!(d.images[2], want, "case {i}");
                     assert!(d.units.is_empty(), "case {i}");
                 }
@@ -1177,7 +1310,7 @@ mod tests {
         );
         assert_eq!(
             d.images[1],
-            HashSet::from([Key::from([Datum::Int(1)])]),
+            KeySet::from_iter([Key::from([Datum::Int(1)])]),
             "the key of the row that left"
         );
         let mut d = ViewDirty::for_aliases(p.aliases.len());
@@ -1185,7 +1318,7 @@ mod tests {
             feed(&p, 1, &mut d, Some(&other_scope), Some(&pass)),
             Fed::Recorded
         );
-        assert_eq!(d.images[1], HashSet::from([Key::from([Datum::Int(1)])]));
+        assert_eq!(d.images[1], KeySet::from_iter([Key::from([Datum::Int(1)])]));
         // Unit alias (grouped by entity): units of the passing side only.
         let p = view(
             "SELECT e.id, MAX(a.v) AS v FROM ent e LEFT JOIN attrs a ON a.e = e.id AND a.aid = 7 \
@@ -1340,8 +1473,9 @@ mod tests {
         assert!(d.units.is_empty() && d.images.iter().all(HashSet::is_empty));
         let got: Vec<i64> = d.partial[0]
             .ints
-            .iter()
-            .map(|v| (v ^ SIGN) as i64)
+            .to_sorted_vec()
+            .into_iter()
+            .map(intset::to_i64)
             .collect();
         assert_eq!(got, vec![7, 8, 10], "entity 9 only had another key");
         // Each partial key counts as a marked id.
@@ -1492,8 +1626,9 @@ mod tests {
         assert!(!d.rebuild && d.units.is_empty());
         let got: Vec<i64> = d.partial[0]
             .ints
-            .iter()
-            .map(|v| (v ^ SIGN) as i64)
+            .to_sorted_vec()
+            .into_iter()
+            .map(intset::to_i64)
             .collect();
         assert_eq!(got, vec![5, 6, 9]);
         // Not derived (a HAVING over the NULL-side pinned alias), but bounded by the pins: a
@@ -1873,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn roaring_dedup_and_order() {
+    fn int_dedup_and_order() {
         let mut s = UnitSet::default();
         for _ in 0..30 {
             s.insert(Box::new([Datum::Int(42)]));
@@ -1922,7 +2057,9 @@ mod tests {
                     1 => {
                         s.insert(Box::new([Datum::Int((rnd() % 50) as i64), Datum::Null]));
                     }
-                    _ => s.insert_int((rnd() % 1000) as i64 - 500),
+                    _ => {
+                        s.insert_int((rnd() % 1000) as i64 - 500);
+                    }
                 }
             }
             let all: HashSet<Key> = {

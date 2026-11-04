@@ -69,8 +69,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo test --lib --bins
         run: cargo test --locked --lib --bins
-      - name: intset tests (feature roaring)
-        run: "cargo test --locked --lib --features roaring intset::"
+      - name: lib tests (feature roaring)
+        run: cargo test --locked --lib --features roaring
 
   integration:
     # One job per server flavor of docker-compose.test.yml (docs/server-setup.md "Supported
