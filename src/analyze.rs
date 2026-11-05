@@ -872,7 +872,7 @@ impl Presence {
 }
 
 /// An integer datum (constant filters hold only integers) as an SQL literal.
-fn int_sql(d: &Datum) -> String {
+pub(crate) fn int_sql(d: &Datum) -> String {
     match d {
         Datum::Int(i) => i.to_string(),
         Datum::UInt(u) => u.to_string(),

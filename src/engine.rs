@@ -2093,6 +2093,8 @@ impl Engine {
             debug!(view = %name, "rebuilding");
         } else {
             info!(view = %name, targets = %targets.join(","), mode = %plan.mode, tracing = %plan.tracing(), "building");
+            let ap = crate::access::AccessPlan::of(&plan);
+            info!(view = %name, route = %ap.route_name(), fp = %ap.fingerprint, "access plan\n{ap}");
         }
         Metrics::add(&self.metrics.full_rebuilds, 1);
         let reason = if partial {

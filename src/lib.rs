@@ -1,6 +1,7 @@
 //! lazyview: materialized views for MySQL-family servers, maintained from the binlog.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod access;
 pub mod analyze;
 pub mod analyzer;
 pub mod binlog;
