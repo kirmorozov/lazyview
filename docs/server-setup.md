@@ -32,6 +32,23 @@ Recommended:
   `LAZYVIEW_ON_MISSING_BINLOG=rebuild`. The settings are `binlog_expire_logs_seconds` (MySQL,
   Percona, MariaDB 10.6+) or `expire_logs_days`.
 
+### binlog-do-db / binlog-ignore-db
+
+The server's binlog filters must not exclude the schema lazyview works in (the
+database named in `LAZYVIEW_DSN` / `LAZYVIEW_DATABASE`, where its metadata
+tables and the `_lazyview_fence` table live) or the source DSN's default
+schema when it differs: row events are filtered by the table's own schema, so
+an excluded schema is invisible in the binlog. At startup lazyview reads
+`Binlog_Do_DB` and `Binlog_Ignore_DB` from the same status statement that
+gives the current binlog position (`SHOW BINARY LOG STATUS`, `SHOW MASTER
+STATUS` on older servers) and warns when either schema is excluded; it cannot
+detect the filters on the target servers it writes to. While lazyview's own
+schema is excluded its metadata and visibility-fence writes are not binlogged,
+so the visibility fence proves nothing; changes to tables in an excluded
+source schema never reach lazyview at all. The filters are startup options:
+changing them needs a server restart, then restart lazyview to clear the
+warning.
+
 ### sql_mode
 
 lazyview's own sessions reset the parts of the server's `sql_mode` that change how SQL text is
