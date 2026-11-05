@@ -312,3 +312,58 @@ should take. Risk: **W** = wrong results possible, **M** = missed incremental op
 | flavor-specific functions | one `MySqlDialect`, one non-deterministic list | **W** | add `NEXTVAL`/`LASTVAL`/`SETVAL`/`NEXT VALUE FOR` (MariaDB sequences), `LOAD_FILE`, `GET_LOCK`/`RELEASE_LOCK`/`IS_FREE_LOCK`/`IS_USED_LOCK` to the non-deterministic set; reject sequences as sources. MariaDB JSON is LONGTEXT (text units, correct) |
 | session variables (`group_concat_max_len`, `div_precision_increment`, `time_zone`, `lc_time_names`, `default_week_format`) | the service's session values | — | they change values, not traces; MV and oracle agree when sessions agree; document |
 | CHECK constraints, other FDs | not loaded | M | skip |
+
+## 10. AccessPlan
+
+One public per-source-table projection of a `ViewPlan` — `src/access.rs`, plain data, the copy
+set, depends only on `analyze`, `catalog` and `datum`: `AccessPlan::of(&ViewPlan)`, computed
+on demand at build time. Step 5 logs it once per plan build, right after the `building` line
+(`engine.rs`); nothing acts on the route until step 6. No behaviour change: `feed_rows` never
+consults the plan, and the `building` line keeps its format (the rename-invariance harness
+compares it).
+
+### Types
+
+| type | fields | source in `ViewPlan` |
+|---|---|---|
+| `AccessPlan` | `view`, `hash`, `id`, `route`, `occurrences`, `cascades`, `fingerprint` | `(schema, name)`, `hash`; `fingerprint` = `definition_hash` of the EXPLAIN text without its header (16 hex) |
+| `TargetId` / `IdPart` | `parts`, `unique`; `expr`, `output` | `unit_exprs` / `unit_in_projection` (`None` = the hidden column `_lv_u<i>`), `unit_unique` |
+| `Route` | `Dedup`, `ViewPlan { reason }`, `Recompute`, `Full { reason }` | static, by traceability (rule below) |
+| `Occurrence` | `table`, `alias`, `read_columns`, `filters`, `path` | per `aliases[i]` (Spj/Grouped/Global, same index) or per `tables[i]` (Full): `AliasPlan.table`/`.name`, `.referenced` (`None` = any column), `filters_of(i)` (integers, NULL never passes) |
+| `Path` | `Direct { cols }`, `Partial { set, positions, cols }`, `Lineage { cols }`, `Untraced { reason }`, `Whole` | `direct_unit`; `partial_of(i)` + `partial.sets[set]`; `lineage_of(i)` (the materialized key columns); else untraced; `Whole` for the `Recompute`/`Full` routes. (Step 5 has no `Hop`: lookup aliases stay untraced until PR 5E.) |
+| `CascadeAccess` | `parent`, `parent_cols`, `child`, `child_cols`, `on_delete`, `on_update`, `via`, `reach` | one per `cascades[i]`, same index |
+| `Via` | `Direct { parent_cols }`, `Traced`, `Derived { partial, presence }`, `Map { key, cols }`, `Untraced { reason }` | `unit_from_parent` / `traced` / `derived` (`pinned` → `presence` names) / `map` / else untraced (default: `` `parent` cascades into `schema`.`child` ``) |
+
+### Route rule (static, by traceability)
+
+- `Mode::Full(reason)` → `full (reason)`; `Mode::Global` → `recompute`, every occurrence `Whole`.
+- Spj / Grouped: the first occurrence whose path is `Lineage` or `Untraced` makes the route
+  ``viewplan (`alias` (`table`): <why>)`` (lineage: `lineage only: no hop derivation yet` until
+  PR 5E; untraced: its reason). Else the first untraced cascade makes
+  ``viewplan (cascade `parent` -> `child`: <reason>)``. Else `dedup`.
+- `Derived` (presence columns) and `Map` (the in-memory cascade cache) are clear derivations.
+  No runtime input, no size threshold, no flag: until PR 5E, only views whose aliases are all
+  direct or partial show `dedup`.
+
+### EXPLAIN
+
+The plan's `Display` is the log message: a header, then one line per id part, occurrence and
+cascade. The `fp` is the `definition_hash` of the text without the header.
+
+```
+view <schema>.<name> route <dedup|viewplan|recompute|full>[ (<reason>)] fp <16 hex>
+id <i> <unit expression> (output <n>) | (hidden _lv_u<i>)
+occ <alias> <schema>.<table> read <…>[ filter <col> IN (<values>)[ AND …]] -> <path>
+  read <…>: * | (0-based column ordinals, ascending)
+  path: direct id = (<ordinals>) | partial id[<positions>] = (<ordinals>)
+        | lineage (<materialized key columns>) | untraced (<reason>) | whole
+cascade <schema>.<parent> -> <schema>.<child> (<parent col ordinals>) on delete <A> on update <B> via <…>[ reach <col> IN (<values>)]
+  <A>/<B>: CASCADE | RESTRICT | SET NULL
+  via: direct (<ordinals>) | traced | derived partial (<entries>)[ presence (<names>)]
+        | map key (<ordinals>) | untraced (<reason>)
+```
+
+Column sets print 0-based ordinals in step 5; the two places the plan stores names instead
+(the materialized lineage columns, `Lineage.cols`, and the derived `presence` names) print
+those names. Values are typed integer literals. The `fp` hashes only the id, occurrence and
+cascade lines: it changes when any of them changes, and only then.
