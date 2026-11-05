@@ -3,6 +3,7 @@
 #   make build              release build for the host
 #   make test               unit tests (lib + bins)
 #   make test-integration   integration tests against running servers
+#   make coverage           production line coverage -> target/coverage/report.md (LAZYVIEW_TEST_DSNS, or ARGS=--lib-only)
 #   make cross              static musl binaries for x86_64 + aarch64 (cargo-zigbuild)
 #   make docker             distroless image for the host arch, loaded into the local docker
 #   make docker PLATFORMS=linux/amd64,linux/arm64 [PUSH=1 IMAGE=ghcr.io/kirmorozov/lazyview:tag]
@@ -44,7 +45,7 @@ SOURCE   ?= $(shell git config --get remote.origin.url 2>/dev/null | sed -E -e '
 # Keep in sync with the FROM lines in the Dockerfile.
 BASE_IMAGE_REFS := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
-.PHONY: build test test-integration cross docker docker-smoke image-digests fmt fmt-check lint compose-up compose-down
+.PHONY: build test test-integration coverage cross docker docker-smoke image-digests fmt fmt-check lint compose-up compose-down
 
 build:
 	$(CARGO) build --release --locked
@@ -60,6 +61,9 @@ test-integration:
 	if [[ -z $$dsns ]]; then dsns='$(COMPOSE_DSNS)'; fi; \
 	echo "LAZYVIEW_TEST_DSNS=$$dsns"; \
 	LAZYVIEW_TEST_DSNS="$$dsns" $(CARGO) test --locked --test '*' -- --test-threads=1
+
+coverage:
+	scripts/coverage.sh $(ARGS)
 
 # Requires zig + cargo-zigbuild on PATH and `rustup target add` for both targets.
 cross:
