@@ -1,6 +1,7 @@
 //! Buffered, de-duplicated change sets per view (hot path: hash/bitmap inserts only).
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
@@ -11,6 +12,7 @@ pub use crate::cascade::{kept_image, KeptRow};
 use crate::catalog::FkAction;
 use crate::datum::{Datum, Key};
 use crate::intset::{self, IntSet};
+use crate::metrics::unix_now;
 use crate::stats::Tally;
 
 /// Hash set of non-integer keys (and row images): std HashSet with the foldhash hasher.
@@ -888,14 +890,27 @@ pub fn drain(plan: &ViewPlan, dirty: &mut ViewDirty, log: Vec<cascade::Logged>) 
     }
 }
 
+/// The once-a-minute throttle of the warnings below: `Some(now)` (unix seconds) when at least
+/// 60 s have passed since `last`, the time of the previous warning, else `None`; the caller
+/// stores `now` as its new `last`.
+fn warn_due(last: u64) -> Option<u64> {
+    let now = unix_now();
+    (now.saturating_sub(last) >= 60).then_some(now)
+}
+
+/// Runs `warn` at most once a minute on the process-wide clock `last` (see [`warn_due`]).
+fn warn_throttled(last: &AtomicU64, warn: impl FnOnce()) {
+    if let Some(now) = warn_due(last.load(Ordering::Relaxed)) {
+        last.store(now, Ordering::Relaxed);
+        warn();
+    }
+}
+
 /// Warns (at most once a minute, on the view's own `warned_at` clock) that the cascade cache of
 /// `view` missed binlog events (a gap): the kept child rows under the parent key `old` of table
 /// `parent` may be stale until a row under them changes again (no recovery, no rebuild).
 fn cascade_gap(view: &str, parent: &str, old: &Key, warned_at: &mut u64) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    if now.saturating_sub(*warned_at) >= 60 {
+    if let Some(now) = warn_due(*warned_at) {
         *warned_at = now;
         tracing::warn!(
             view,
@@ -910,42 +925,44 @@ fn cascade_gap(view: &str, parent: &str, old: &Key, warned_at: &mut u64) {
 /// (not a full image, or a partial JSON update), so the units its cascade changes are unknown
 /// and the view is rebuilt (`binlog_row_image` FULL, no `PARTIAL_JSON` row value option).
 pub fn incomplete_cascade_row(view: &str, child: &str) {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    if now.saturating_sub(LAST.load(Ordering::Relaxed)) >= 60 {
-        LAST.store(now, Ordering::Relaxed);
+    warn_throttled(&LAST, || {
         tracing::warn!(
             view,
             child,
             "a cascaded child row was kept without all its columns (binlog_row_image must be FULL, without partial JSON updates): the units its cascade changes are unknown, rebuilding the view"
         );
-    }
+    });
 }
 
 /// Warns (at most once a minute) that a cascade parent's row image lacked columns, so the units
 /// its cascade changes were unknown and the view is rebuilt (`binlog_row_image` other than FULL,
 /// or a server leaving generated columns out of the image).
 fn partial_parent_image(parent: &str) {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    if now.saturating_sub(LAST.load(Ordering::Relaxed)) >= 60 {
-        LAST.store(now, Ordering::Relaxed);
+    warn_throttled(&LAST, || {
         tracing::warn!(
             parent,
             "a cascade parent's row image lacks columns (binlog_row_image must be FULL): the units its cascade changes are unknown, rebuilding the view"
         );
-    }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warnings_are_throttled_to_one_a_minute() {
+        let now = warn_due(0).expect("a zero clock is due");
+        assert_eq!(warn_due(now), None);
+        let last = AtomicU64::new(0);
+        let mut runs = 0;
+        warn_throttled(&last, || runs += 1);
+        warn_throttled(&last, || runs += 1);
+        assert_eq!(runs, 1);
+        assert!(last.load(Ordering::Relaxed) >= now);
+    }
 
     fn ints(v: &[i64]) -> UnitChunk {
         UnitChunk::Ints(v.to_vec())
