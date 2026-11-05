@@ -162,10 +162,7 @@ impl Endpoint {
             .with_reset_connection(false)
             .with_inactive_connection_ttl(INACTIVE_TTL)
             .with_ttl_check_interval(Duration::from_secs(5));
-        let setup = vec![
-            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
-            format!("SET SESSION sql_mode = '{}'", sql_mode.replace('\'', "")),
-        ];
+        let setup = Vec::from(mv::session_setup(sql_mode));
         let pool = Pool::new(
             OptsBuilder::from_opts(opts.clone())
                 .pool_opts(pool_opts)

@@ -765,19 +765,27 @@ fn side_name(name: &str, suffix: &str) -> String {
 /// Session settings for every connection the service opens: non-locking reads, and an sql_mode
 /// in which values are stored as they were read (zero dates, no strict-mode rejections).
 pub async fn init_session(conn: &mut Conn) -> Result<()> {
-    conn.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
-        .await?;
     let mode: Option<String> = conn
         .query_first("SELECT CAST(@@SESSION.sql_mode AS CHAR)")
         .await?;
-    if let Some(mode) = mode {
-        let permissive = permissive_sql_mode(&mode);
-        if permissive != mode {
-            conn.query_drop(format!("SET SESSION sql_mode = '{permissive}'"))
-                .await?;
-        }
+    let mode = mode.unwrap_or_default();
+    let permissive = permissive_sql_mode(&mode);
+    let [isolation, set_mode] = session_setup(&permissive);
+    conn.query_drop(isolation).await?;
+    if permissive != mode {
+        conn.query_drop(set_mode).await?;
     }
     Ok(())
+}
+
+/// The statements that give a connection the service's session settings with `sql_mode` (a mode
+/// `permissive_sql_mode` returned): [`init_session`] runs them on a direct connection, the
+/// supervisor's pools (src/supervisor.rs) on every new pooled connection.
+pub fn session_setup(sql_mode: &str) -> [String; 2] {
+    [
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+        format!("SET SESSION sql_mode = '{}'", sql_mode.replace('\'', "")),
+    ]
 }
 
 /// `mode` without the flags that reject values the source holds (strict mode, zero dates) and
@@ -2490,5 +2498,18 @@ mod tests {
             ),
             "REAL_AS_FLOAT,ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"
         );
+    }
+
+    #[test]
+    fn session_setup_statements() {
+        assert_eq!(
+            session_setup("ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"),
+            [
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'".to_string(),
+            ]
+        );
+        // A quote cannot end the string literal early.
+        assert_eq!(session_setup("A'B")[1], "SET SESSION sql_mode = 'AB'");
     }
 }
