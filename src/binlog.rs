@@ -445,6 +445,57 @@ pub async fn current_position(conn: &mut Conn) -> Result<Position> {
     )
 }
 
+/// The server's `binlog-do-db` / `binlog-ignore-db` filters: columns 2 and 3 (`Binlog_Do_DB`,
+/// `Binlog_Ignore_DB`) of the same status statement [`current_position`] reads (comma-separated
+/// lists; empty when the filter is unset).
+pub async fn binlog_filters(conn: &mut Conn) -> Result<(String, String)> {
+    let (major, minor, _) = conn.server_version();
+    let mut parse_errors = Vec::new();
+    for q in status_statements(major, minor) {
+        match conn.query_first::<Row, _>(q).await {
+            Ok(Some(row)) => {
+                // Row: File, Position, Binlog_Do_DB, Binlog_Ignore_DB[, Executed_Gtid_Set].
+                return Ok((value_str(row.as_ref(2)), value_str(row.as_ref(3))));
+            }
+            Ok(None) => bail!(
+                "{q} returned no rows: binary logging is disabled on the server (log_bin=OFF)"
+            ),
+            // Syntax not known to this server version: try the other spelling.
+            Err(mysql_async::Error::Server(e)) if e.code == ER_PARSE_ERROR => {
+                parse_errors.push(format!("{q}: {}", e.message))
+            }
+            Err(e) => {
+                return Err(with_hint(
+                    anyhow::Error::new(e).context(format!("{q} failed")),
+                ))
+            }
+        }
+    }
+    bail!(
+        "cannot read the binlog filters: {}",
+        parse_errors.join("; ")
+    )
+}
+
+/// Whether the server's `binlog-do-db` / `binlog-ignore-db` filters keep row events of `schema`
+/// out of the binlog (the filters name the table's own schema): `do_db` is non-empty and does
+/// not list the schema, or `ignore_db` does. The columns are comma-separated lists, spaces
+/// around the entries are ignored, and names match exactly, case-sensitively, as the server
+/// compares database names on this platform.
+pub fn schema_filtered(do_db: &str, ignore_db: &str, schema: &str) -> bool {
+    fn names(list: &str) -> Vec<&str> {
+        list.split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .collect()
+    }
+    let do_names = names(do_db);
+    if !do_names.is_empty() && !do_names.contains(&schema) {
+        return true;
+    }
+    names(ignore_db).contains(&schema)
+}
+
 /// Whether `file` is still listed by `SHOW BINARY LOGS`.
 pub async fn binlog_exists(conn: &mut Conn, file: &str) -> Result<bool> {
     let rows: Vec<Row> = conn
@@ -2252,6 +2303,29 @@ mod tests {
         for (major, minor) in [(8, 2), (8, 4), (9, 0), (9, 7), (26, 7), (26, 10), (27, 1)] {
             assert_eq!(status_statements(major, minor)[0], new, "{major}.{minor}");
         }
+    }
+
+    #[test]
+    fn schema_filtered_by_binlog_filters() {
+        // No filters: nothing is excluded.
+        assert!(!schema_filtered("", "", "app"));
+        assert!(!schema_filtered(" , ", " , ", "app"));
+        // do-db lists only the schemas that are binlogged.
+        assert!(!schema_filtered("app,other", "", "app"));
+        assert!(schema_filtered("app,other", "", "sales"));
+        // Spaces around the entries are ignored.
+        assert!(!schema_filtered(" app , other ", "", "app"));
+        assert!(!schema_filtered("app , other", "", "other"));
+        assert!(schema_filtered("app , other", "", "sales"));
+        // ignore-db excludes the schemas it lists.
+        assert!(!schema_filtered("app", "other", "app"));
+        assert!(schema_filtered("", "sales", "sales"));
+        assert!(schema_filtered("app,sales", "sales", "sales"));
+        // ignore-db wins over do-db for the schema it lists.
+        assert!(schema_filtered("app", "app", "app"));
+        // The server compares names exactly, case-sensitively.
+        assert!(schema_filtered("APP", "", "app"));
+        assert!(!schema_filtered("APP", "app", "APP"));
     }
 
     #[test]

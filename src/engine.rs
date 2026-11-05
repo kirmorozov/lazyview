@@ -106,6 +106,40 @@ fn wants_gtid_tip(aurora: bool, gtid_mode: Option<&str>) -> bool {
     !aurora && gtid_mode.is_some_and(|g| !g.eq_ignore_ascii_case("ON"))
 }
 
+/// Startup warnings for the source's `binlog-do-db` / `binlog-ignore-db` filters: they name the
+/// table's own schema, so an excluded schema is invisible in the binlog. lazyview's schema
+/// (`schema`, the metadata connection's, where the metadata tables and the commit fence live)
+/// must be binlogged, and so must the source DSN's default schema when it differs from it
+/// (source reads). The filters are read once; an unreadable status is debug-logged, not warned.
+async fn binlog_filter_checks(conn: &mut Conn, schema: &str, source_schema: Option<&str>) {
+    let (do_db, ignore_db) = match binlog::binlog_filters(conn).await {
+        Ok(f) => f,
+        Err(e) => {
+            debug!(
+                "cannot read the binlog filters at startup: {}",
+                e.root_cause()
+            );
+            return;
+        }
+    };
+    let excluded = |s: &str| binlog::schema_filtered(&do_db, &ignore_db, s);
+    if excluded(schema) {
+        warn!(
+            "binlog-do-db / binlog-ignore-db exclude schema {schema}: lazyview's metadata and \
+             visibility-fence writes are not binlogged, so the fence cannot prove visibility; \
+             remove the filter or include {schema}"
+        );
+    }
+    if let Some(s) = source_schema.filter(|s| *s != schema) {
+        if excluded(s) {
+            warn!(
+                "binlog-do-db / binlog-ignore-db exclude schema {s}: changes to tables in {s} \
+                 never reach lazyview"
+            );
+        }
+    }
+}
+
 /// Amazon RDS / Aurora purge binlogs aggressively by default; a short retention means a restart
 /// after an outage cannot resume and must rebuild every view. Warn once at startup.
 async fn managed_service_checks(conn: &mut Conn) {
@@ -763,6 +797,7 @@ impl Engine {
             src_opts.tcp_port()
         );
         managed_service_checks(&mut src).await;
+        binlog_filter_checks(&mut src, &schema, src_opts.db_name()).await;
         let Some(mut meta_conn) =
             connect_wait(&src_opts, "source database", &metrics, shutdown).await?
         else {
