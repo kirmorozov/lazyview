@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Conn;
 
@@ -373,7 +373,7 @@ pub async fn load_table(
     for (_, _, _, cs, ..) in &rows {
         if let Some(cs) = cs.as_deref().map(str::to_ascii_lowercase) {
             if let Entry::Vacant(e) = default_collations.entry(cs) {
-                let co = default_collation(conn, e.key()).await;
+                let co = default_collation(conn, e.key()).await?;
                 e.insert(co);
             }
         }
@@ -593,22 +593,21 @@ fn generated_deps(expr: &str, names: &[String]) -> Option<Vec<usize>> {
 
 /// The collation `CONVERT(... USING charset)` yields on this server (its default for the
 /// charset, which MariaDB's `character_set_collations` can override). None if unknown.
-async fn default_collation(conn: &mut Conn, charset: &str) -> Option<String> {
+async fn default_collation(conn: &mut Conn, charset: &str) -> Result<Option<String>> {
     if charset.is_empty()
         || !charset
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        return None;
+        return Ok(None);
     }
-    conn.query_first::<Option<String>, _>(format!(
-        "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
-    ))
-    .await
-    .ok()
-    .flatten()
-    .flatten()
-    .map(|c| c.to_ascii_lowercase())
+    let v = conn
+        .query_first::<Option<String>, _>(format!(
+            "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
+        ))
+        .await
+        .with_context(|| format!("default collation of character set {charset}"))?;
+    Ok(v.flatten().map(|c| c.to_ascii_lowercase()))
 }
 
 pub fn col_kind(data_type: &str, column_type: &str) -> ColKind {
