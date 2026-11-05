@@ -1270,3 +1270,131 @@ fn lifecycle_refuses_log_bin_compress() {
         eng.stop().await
     });
 }
+
+/// The analyzer's plan of a spec's definition, against the live schema (unqualified names).
+async fn plan_of(db: &Db, s: &ViewSpec) -> Result<lazyview::analyze::ViewPlan> {
+    use lazyview::catalog::Catalog;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let d = lazyview::analyze::parse_definition(&s.definition)?;
+    let mut c = db.conn().await?;
+    let mut cat = Catalog::default();
+    let mut tables: HashMap<lazyview::catalog::TableRef, Arc<lazyview::catalog::TableInfo>> =
+        HashMap::new();
+    let mut queue: Vec<(lazyview::catalog::TableRef, usize)> =
+        lazyview::analyzer::referenced_tables(&d.query, &db.name)
+            .into_iter()
+            .map(|t| (t, 0))
+            .collect();
+    let mariadb = db.flavor.contains("mariadb");
+    while let Some((t, depth)) = queue.pop() {
+        if tables.contains_key(&t) || depth > 8 {
+            continue;
+        }
+        if let Some(info) = cat.get(&mut c, &t.0, &t.1, mariadb).await? {
+            queue.extend(info.cascades.iter().map(|f| (f.parent.clone(), depth + 1)));
+            tables.insert(t, info);
+        }
+    }
+    c.disconnect().await.ok();
+    lazyview::analyzer::plan(&d, &db.name, &tables).context("analyzer plan")
+}
+
+/// `_lazyview_state.route` and `.access` hold the view's access plan (route + EXPLAIN text),
+/// and `LAZYVIEW_SYNC=false` compares the fresh plans against the stored ones.
+#[test]
+fn lifecycle_state_carries_route_and_access() {
+    scenario("lc_state_access", |ctx| async move {
+        use mysql_async::prelude::Queryable;
+        let db = ctx.new_db("lc_state_access").await?;
+        let mut c = db.conn().await?;
+        for s in [
+            "CREATE TABLE entities (id INT PRIMARY KEY, grp INT NOT NULL)",
+            "INSERT INTO entities VALUES (1, 1), (2, 2)",
+        ] {
+            exec(&mut c, s).await?;
+        }
+        let specs = vec![
+            ViewSpec::new("lc_a", Kind::Incremental, "SELECT id, grp FROM entities"),
+            ViewSpec::new(
+                "lc_b",
+                Kind::Incremental,
+                "SELECT COUNT(*) AS n FROM entities",
+            ),
+        ];
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        eng.stop().await?;
+
+        // (1) the state rows hold the route and the EXPLAIN text the plan gives.
+        for s in &specs {
+            let ap = lazyview::access::AccessPlan::of(&plan_of(&db, s).await?);
+            let (route, access): (Option<String>, Option<String>) = c
+                .query_first(
+                    format!(
+                        "SELECT CAST(route AS CHAR), CAST(access AS CHAR) FROM _lazyview_state WHERE name = {} AND target = 'source'",
+                        q(&s.name)
+                    ),
+                )
+                .await?
+                .context("no state row")?;
+            ensure!(
+                route.as_deref() == Some(ap.route_name()),
+                "{}: stored route {route:?} != {}",
+                s.name,
+                ap.route_name()
+            );
+            ensure!(
+                access.as_deref() == Some(&ap.to_string()),
+                "{}: stored access differs:\n{access:?}\n!=\n{}",
+                s.name,
+                ap
+            );
+        }
+
+        // (2) change one definition, add one without a state row, then run the sync check.
+        let old_a = specs[0].clone();
+        let new_a = ViewSpec::new("lc_a", Kind::Incremental, "SELECT id FROM entities");
+        exec(
+            &mut c,
+            &format!(
+                "UPDATE _lazyview SET definition = {} WHERE name = {}",
+                q(&new_a.definition),
+                q(&new_a.name)
+            ),
+        )
+        .await?;
+        add_definition(
+            &mut c,
+            &ViewSpec::new("lc_c", Kind::Incremental, "SELECT grp FROM entities").definition,
+            None,
+        )
+        .await?;
+        let fp_old = lazyview::access::AccessPlan::of(&plan_of(&db, &old_a).await?).fingerprint;
+        let fp_new = lazyview::access::AccessPlan::of(&plan_of(&db, &new_a).await?).fingerprint;
+        ensure!(
+            fp_old != fp_new,
+            "the definition change must move the fingerprint"
+        );
+
+        let eng = ctx.start_engine(&db, &[("LAZYVIEW_SYNC", "false")])?;
+        let log_path = eng.log_path.clone();
+        match eng.wait_finished(Duration::from_secs(60)).await? {
+            Ok(()) => {}
+            Err(e) => bail!("LAZYVIEW_SYNC=false did not exit cleanly: {e}"),
+        }
+        let log = std::fs::read_to_string(&log_path)?;
+        ensure!(log.contains("access same"), "no 'access same' line: {log}");
+        ensure!(
+            log.contains(&format!("access changed (stored {fp_old}, now {fp_new})")),
+            "no 'access changed' for lc_a: {log}"
+        );
+        ensure!(
+            log.contains("access new (no state)"),
+            "no 'access new' for lc_c: {log}"
+        );
+        Ok(())
+    });
+}
