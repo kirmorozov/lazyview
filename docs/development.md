@@ -200,8 +200,9 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
   RI-4) run in the ignored `rename_findings`.
 
 Suites in `tests/`: `binlog_stream`, `brutal` (randomized correctness with many overlapping
-views), `ddl`, `efficiency`, `harness_selftest`, `health`, `lifecycle`, `migration`,
-`regressions`, `rename_invariance`, `targets`, `types`, `xa`.
+views), `cte`, `ddl`, `efficiency`, `exclusive`, `harness_selftest`, `health`,
+`lifecycle`, `migration`, `regressions`, `rename_invariance`, `supervisor`, `targets`,
+`types`, `upsert`, `values`, `view_stats`, `visibility`, `xa`.
 
 Throughput benchmark:
 

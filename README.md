@@ -105,7 +105,7 @@ All settings are environment variables. The most used ones are listed here. See
 | `LAZYVIEW_TLS`, `LAZYVIEW_TLS_CA` | `disabled`, — | `required`, `verify-ca` or `verify-full`; CA bundle for private or managed CAs |
 | `LAZYVIEW_START_MODE` | `resume` | `resume`, `rebuild` (rebuild everything, then stream) or `once` (rebuild every view, exit non-zero if any fails) |
 | `LAZYVIEW_FULL_REFRESH_MS` | `60000` | full-mode views are rebuilt at most once per interval |
-| `LAZYVIEW_HEALTH_ADDR` | `0.0.0.0:8080` | `/livez`, `/readyz`, `/startupz`, `/metrics`; `off` disables |
+| `LAZYVIEW_HEALTH_ADDR` | `0.0.0.0:8080` | `/livez`, `/readyz`, `/startupz`, `/metrics`, `/stats`; `off` disables |
 | `RUST_LOG`, `LAZYVIEW_LOG_FORMAT` | `info`, `text` | log level; `json` for log shippers |
 
 ## Supported servers
