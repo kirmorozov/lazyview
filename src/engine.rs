@@ -1400,7 +1400,9 @@ impl Engine {
                 .insert((name.to_string(), target.to_string()), hash.to_string());
         }
         if state != "error" {
-            let _ = meta::delete_stale_state(&mut self.meta, def_id, name).await;
+            if let Err(e) = meta::delete_stale_state(&mut self.meta, def_id, name).await {
+                warn!("deleting stale state rows of {name}: {e:#}");
+            }
         }
     }
 
@@ -1847,7 +1849,9 @@ impl Engine {
         if let Ok(rows) = meta::load_state(&mut self.meta).await {
             for ((name, t), r) in rows {
                 if !r.managed && !used.contains(&(name.clone(), t.clone())) {
-                    let _ = meta::delete_state(&mut self.meta, &name, &t).await;
+                    if let Err(e) = meta::delete_state(&mut self.meta, &name, &t).await {
+                        warn!("deleting state row {name}@{t}: {e:#}");
+                    }
                 }
             }
         }
@@ -2364,7 +2368,9 @@ impl Engine {
     async fn drop_owned(&mut self, name: &str, target: &str) {
         let key = (name.to_string(), target.to_string());
         if self.owned.remove(&key).is_none() {
-            let _ = meta::delete_state(&mut self.meta, name, target).await;
+            if let Err(e) = meta::delete_state(&mut self.meta, name, target).await {
+                warn!("deleting state row {name}@{target}: {e:#}");
+            }
             return;
         }
         if self.cfg.drop_removed {
@@ -2380,7 +2386,9 @@ impl Engine {
                 }
             }
         }
-        let _ = meta::delete_state(&mut self.meta, name, target).await;
+        if let Err(e) = meta::delete_state(&mut self.meta, name, target).await {
+            warn!("deleting state row {name}@{target}: {e:#}");
+        }
     }
 
     fn rebuild_routes(&mut self) {
@@ -2697,7 +2705,9 @@ impl Engine {
             }
         }
         if !self.in_txn {
-            let _ = self.flush().await;
+            if let Err(e) = self.flush().await {
+                debug!("final flush at shutdown: {e:#}");
+            }
         }
         if let Some(sup) = &self.sup {
             sup.disconnect().await;
@@ -3663,7 +3673,9 @@ impl Engine {
         }
         if !self.refreshed.is_empty() && self.last_touch.elapsed() >= Duration::from_secs(10) {
             let names: Vec<String> = self.refreshed.drain().collect();
-            let _ = meta::touch_refreshed(&mut self.meta, &names).await;
+            if let Err(e) = meta::touch_refreshed(&mut self.meta, &names).await {
+                warn!("recording refresh times: {e:#}");
+            }
             self.last_touch = Instant::now();
         }
         self.publish_stats();
