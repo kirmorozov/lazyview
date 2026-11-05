@@ -1763,7 +1763,7 @@ pub fn t_catchup() -> Duration {
 // Metadata tables
 // ---------------------------------------------------------------------------------------------
 
-/// Creates `_lazyview` as the engine does (PLAN.md §1 + `name`, `targets`), if missing. Used to
+/// Creates `_lazyview` as the engine does (src/meta.rs, plus `name`, `targets`), if missing. Used to
 /// pre-load definitions before the first engine start; the engine itself creates it otherwise.
 pub async fn ensure_lazyview_table(conn: &mut Conn) -> Result<()> {
     exec(

@@ -1,4 +1,4 @@
-//! Service configuration from environment variables (see README / PLAN.md §2).
+//! Service configuration from environment variables (see docs/configuration.md).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
