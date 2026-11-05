@@ -1010,16 +1010,7 @@ pub fn layout_matches(layout: &Layout, existing: &[(String, String)]) -> bool {
         })
 }
 
-pub async fn create_shadow(
-    conn: &mut Conn,
-    schema: &str,
-    name: &str,
-    layout: &Layout,
-) -> Result<String> {
-    create_shadow_with(conn, schema, name, layout, None).await
-}
-
-/// [`create_shadow`] with an ownership marker (see [`marker`]) as the table comment.
+/// Creates the shadow table with an ownership marker (see [`marker`]) as the table comment.
 pub async fn create_shadow_marked(
     conn: &mut Conn,
     schema: &str,

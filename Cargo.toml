@@ -2,6 +2,7 @@
 name = "lazyview"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.99"
 description = "Materialized views for MySQL/MariaDB/Percona maintained from the binlog"
 license = "MIT"
 
@@ -15,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "binlog"] }
 sqlparser = { version = "0.63", features = ["visitor"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "net", "io-util"] }
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
@@ -31,7 +32,7 @@ foldhash = "0.2"
 # `roaring` switches src/intset.rs to its RoaringTreemap backend (meant for
 # dense id ranges; the default plain hash set is the general choice).
 # The dependency stays non-optional: lazyview still uses roaring directly
-# (UnitSet, stats) until they move to IntSet. lazy-wire-fire declares
+# (the /stats distinct-id sets in src/stats.rs) until they move to IntSet. lazy-wire-fire declares
 # `roaring = ["dep:roaring"]`; the cfg name in src/intset.rs is the contract.
 roaring = []
 

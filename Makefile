@@ -18,7 +18,6 @@ SHELL := bash
 CARGO     ?= cargo
 IMAGE     ?= lazyview:dev
 OUT_DIR   ?= tmp/out
-COMPOSE   ?= docker compose -f docker-compose.test.yml
 TEST_SERVERS := scripts/test-servers.sh
 MUSL_TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 

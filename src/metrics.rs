@@ -92,12 +92,6 @@ pub struct Gauges {
     pub standby: AtomicU64,
     /// 1 from process start until the binlog stream is first connected.
     pub starting: AtomicU64,
-    /// 1 while a data flush runs in the background (the binlog keeps being read).
-    pub flush_inflight: AtomicU64,
-    /// Duration of the last completed flush, seconds as `f64` bits (see [`Metrics::set_f64`]).
-    pub flush_last_seconds: AtomicU64,
-    /// Keys buffered for live views, not yet handed to a flush.
-    pub buffered_keys: AtomicU64,
     /// Rows read from the sources and not yet written to every target.
     pub inflight_rows: AtomicU64,
 }
