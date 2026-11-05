@@ -2169,6 +2169,11 @@ impl Engine {
             info!(view = %name, targets = %targets.join(","), mode = %plan.mode, tracing = %plan.tracing(), "building");
             let ap = crate::access::AccessPlan::of(&plan);
             info!(view = %name, route = %ap.route_name(), fp = %ap.fingerprint, "access plan\n{ap}");
+            for o in &ap.occurrences {
+                if let crate::access::Path::Hop(h) = &o.path {
+                    debug!(view = %name, alias = %o.alias, "hop {name}.{}: {}", o.alias, h.select);
+                }
+            }
         }
         Metrics::add(&self.metrics.full_rebuilds, 1);
         let reason = if partial {

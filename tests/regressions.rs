@@ -178,6 +178,133 @@ fn reg_window_units_reduced_by_key() {
     });
 }
 
+/// Hop paths (step 5E): for the views of the one-element IN join, the window-unit reduction
+/// and the partner-PK join, each `Hop.select`, pinned to all partner values, parses on the
+/// server and returns ids covering the view's unit ids.
+#[test]
+fn reg_hop_selects_cover_the_view_ids() {
+    scenario("reg_hop", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_item_doc",
+                Kind::Incremental,
+                "SELECT i.id, d.doc, COUNT(*) n FROM items i JOIN docs d ON d.id IN (i.doc_id) GROUP BY i.id, d.doc",
+            ),
+            ViewSpec::new(
+                "r_entity_sum",
+                Kind::Incremental,
+                "SELECT id, grp, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM entities",
+            ),
+            join_view(),
+        ];
+        let ddl = [
+            "CREATE TABLE items (id INT PRIMARY KEY, doc_id INT NOT NULL)",
+            "CREATE TABLE docs (id INT PRIMARY KEY, doc JSON NOT NULL)",
+            "INSERT INTO items VALUES (1, 1), (2, 2), (3, 3)",
+            "INSERT INTO docs VALUES (1, '[1]'), (2, '[2]'), (3, '[3]')",
+            "CREATE TABLE entities (id INT PRIMARY KEY, grp INT NOT NULL, doc JSON NOT NULL)",
+            "INSERT INTO entities VALUES (1, 10, '{\"a\": 1}'), (2, 20, '{\"b\": 2}')",
+        ];
+        let (db, eng) = setup(&ctx, "reg_hop", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        let mut collations = std::collections::HashMap::new();
+        let mut tables = std::collections::HashMap::new();
+        for name in ["items", "docs", "entities", "orders", "customers"] {
+            let t = lazyview::catalog::load_table(
+                &mut c,
+                &db.name,
+                name,
+                ctx.server().is_mariadb(),
+                &mut collations,
+            )
+            .await?
+            .with_context(|| format!("table {name}"))?;
+            tables.insert((db.name.clone(), name.to_string()), std::sync::Arc::new(t));
+        }
+        let mut hops = 0usize;
+        for s in &specs {
+            let p = lazyview::analyze::plan(
+                &lazyview::analyze::parse_definition(&s.definition).unwrap(),
+                &db.name,
+                &tables,
+            )
+            .unwrap();
+            let ap = lazyview::access::AccessPlan::of(&p);
+            let id = p
+                .unit_in_projection
+                .first()
+                .copied()
+                .flatten()
+                .with_context(|| format!("{}: the unit is not an output column", s.name))?;
+            let id_name = p.projection[id]
+                .rsplit_once(" AS ")
+                .map(|(_, a)| a.to_string())
+                .unwrap_or_else(|| {
+                    p.projection[id]
+                        .rsplit_once('.')
+                        .map_or_else(|| p.projection[id].clone(), |(_, c)| c.to_string())
+                })
+                .trim_matches('`')
+                .to_string();
+            let want: std::collections::BTreeSet<i64> = typed_rows(
+                &mut c,
+                &format!(
+                    "SELECT DISTINCT `{id_name}` FROM `{}` WHERE `{id_name}` IS NOT NULL",
+                    s.name
+                ),
+            )
+            .await?
+            .into_iter()
+            .map(|(v,)| v)
+            .collect();
+            for o in &ap.occurrences {
+                let lazyview::access::Path::Hop(h) = &o.path else {
+                    continue;
+                };
+                hops += 1;
+                let (pa, pc) = h.partner[0]
+                    .split_once("`.`")
+                    .map(|(a, b)| {
+                        (
+                            a.trim_matches('`').to_string(),
+                            b.trim_matches('`').to_string(),
+                        )
+                    })
+                    .with_context(|| format!("{}: partner {}", s.name, h.partner[0]))?;
+                let ai = p.aliases.iter().position(|a| a.name == pa).unwrap();
+                let tbl = p.aliases[ai].table.name.clone();
+                let vals: Vec<(i64,)> = typed_rows(
+                    &mut c,
+                    &format!("SELECT DISTINCT `{pc}` FROM `{tbl}` WHERE `{pc}` IS NOT NULL"),
+                )
+                .await?;
+                let full = format!(
+                    "{} AND {} IN ({})",
+                    h.select,
+                    h.partner[0],
+                    vals.iter()
+                        .map(|(v,)| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let got: Vec<(i64, i64)> = typed_rows(&mut c, &full).await?;
+                let got_ids: std::collections::BTreeSet<i64> = got.iter().map(|r| r.1).collect();
+                ensure!(
+                    got_ids.is_superset(&want),
+                    "hop of {} ({}): view ids {want:?} not covered by {got_ids:?}",
+                    o.alias,
+                    full
+                );
+            }
+        }
+        ensure!(
+            hops >= 2,
+            "expected hops on the IN-join and partner-PK views, got {hops}"
+        );
+        eng.stop().await
+    });
+}
+
 /// Anchor two joins away (composite-PK `items`): when a parent row changes its join key to a
 /// value that no longer joins (or the grandparent row is deleted), the units can only be found
 /// through the before-image — found as stale v_line_details rows after

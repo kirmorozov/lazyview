@@ -981,6 +981,16 @@ impl MapPlan {
     }
 }
 
+/// An equality between two alias columns, valid on every view row when `only_with` is `None`
+/// (a WHERE conjunct or an inner-join ON) and, when `Some(j)`, only on the rows where the
+/// alias `j` participates (its own LEFT-join ON). The hop paths of `crate::access` walk them.
+#[derive(Debug, Clone)]
+pub struct Edge {
+    pub a: (usize, usize),
+    pub b: (usize, usize),
+    pub only_with: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ViewPlan {
     pub schema: String,
@@ -1031,6 +1041,10 @@ pub struct ViewPlan {
     pub partial: PartialUnits,
     /// Hidden presence columns of pinned cascade children (after the lineage columns).
     pub presence: Vec<Presence>,
+    /// The equality edges between alias columns ([`Edge`]).
+    pub edges: Vec<Edge>,
+    /// Per reduced unit expression: the alias columns it reads.
+    pub unit_refs: Vec<Vec<(usize, usize)>>,
 }
 
 impl ViewPlan {
@@ -2428,6 +2442,8 @@ pub fn plan_block(
         unit_unique: false,
         lineage: Vec::new(),
         output_names: output_names.clone(),
+        edges: Vec::new(),
+        unit_refs: Vec::new(),
     };
     let full = |reason: &str| {
         let columns = read_columns(&def.query, &all_tables, tables);
@@ -2963,6 +2979,24 @@ pub fn plan_block(
     } else {
         unit_refs
     };
+    // The plan's equality edges (the WHERE / inner ON, plus each LEFT-joined alias's own ON)
+    // and the column refs of the reduced units: the hop paths of `crate::access` walk them.
+    let edges: Vec<Edge> = base_edges
+        .iter()
+        .map(|&(a, b)| Edge {
+            a,
+            b,
+            only_with: None,
+        })
+        .chain(own_edges.iter().enumerate().flat_map(|(ja, es)| {
+            es.iter().map(move |&(a, b)| Edge {
+                a,
+                b,
+                only_with: Some(ja),
+            })
+        }))
+        .collect();
+    let unit_refs_cols: Vec<Vec<ColRef>> = unit_refs.iter().map(|e| col_refs(e, &scope)).collect();
     // Units and WHERE are evaluated on literal row images in lookups; that is only sound when the
     // NULL-extended rows of LEFT JOINs cannot change them.
     let null_side: Vec<usize> = joins
@@ -3404,6 +3438,8 @@ pub fn plan_block(
         cascades,
         aliases: alias_plans,
         output_names,
+        edges,
+        unit_refs: unit_refs_cols,
     })
 }
 

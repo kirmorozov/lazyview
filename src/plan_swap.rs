@@ -84,6 +84,9 @@ pub fn same_reads(old: &ViewPlan, new: &ViewPlan) -> Result<(), String> {
         alias_filters,
         partial,
         presence,
+        // Derived from the FROM / WHERE / units this function already compares.
+        edges: _,
+        unit_refs: _,
     } = old;
     eq("schema", schema, &new.schema)?;
     eq("name", name, &new.name)?;

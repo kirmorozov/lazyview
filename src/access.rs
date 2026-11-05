@@ -1,7 +1,9 @@
 //! The analyzer's public, per-source-table output; plain data; the copy set.
 //! One projection per view definition ([`AccessPlan::of`]).
 
-use crate::analyze::{definition_hash, int_sql, quote_ident, ConstFilter, Mode, ViewPlan};
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::analyze::{definition_hash, int_sql, quote_ident, ConstFilter, Edge, Mode, ViewPlan};
 use crate::catalog::{FkAction, TableRef};
 use crate::datum::Datum;
 
@@ -65,10 +67,25 @@ pub enum Path {
     },
     /// The units come through the materialized key columns (`cols`).
     Lineage { cols: Vec<String> },
+    /// The id through link tables.
+    Hop(Hop),
     /// No clear derivation; `reason`.
     Untraced { reason: String },
     /// One unit (the `Recompute` route) or the whole view (the `Full` route).
     Whole,
+}
+
+/// The id through the occurrence's link tables: its columns on the chain's edges, the matching
+/// chain columns as `alias`.`col`, the id positions the chain reaches (all: the full id), the
+/// chain's aliases (not including the occurrence) and the parameterized SELECT mapping the
+/// partner values to the id values; the key filter on the partners is appended by the executor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hop {
+    pub link_cols: Vec<usize>,
+    pub partner: Vec<String>,
+    pub positions: Vec<usize>,
+    pub aliases: Vec<usize>,
+    pub select: String,
 }
 
 /// One cascading foreign key whose parent deletes / key updates the view must handle.
@@ -167,13 +184,15 @@ fn occurrences(p: &ViewPlan) -> Vec<Occurrence> {
                         positions: p.partial.sets[set].clone(),
                         cols: cols.to_vec(),
                     }
-                } else if let Some(k) = p.lineage_of(i) {
-                    Path::Lineage {
-                        cols: k.cols.clone(),
-                    }
                 } else {
-                    Path::Untraced {
-                        reason: "no hop derivation yet".into(),
+                    // Lineage and lookup aliases try the id through link tables; a refusal keeps
+                    // the alias's lineage (when it has one) or is untraced with the reason.
+                    match (hop(p, i), p.lineage_of(i)) {
+                        (Ok(h), _) => Path::Hop(h),
+                        (Err(_), Some(k)) => Path::Lineage {
+                            cols: k.cols.clone(),
+                        },
+                        (Err(r), None) => Path::Untraced { reason: r },
                     }
                 };
                 let mut o = alias_occurrence(i, a);
@@ -182,6 +201,203 @@ fn occurrences(p: &ViewPlan) -> Vec<Occurrence> {
             })
             .collect(),
     }
+}
+
+/// The chain found for an occurrence: the chain's aliases (ascending, without the occurrence),
+/// its link pairs (its column -> the partner's alias column), the id positions the chain
+/// reaches and the edge indexes of the chain's shortest paths.
+struct Chain {
+    aliases: Vec<usize>,
+    links: Vec<(usize, (usize, usize))>,
+    positions: Vec<usize>,
+    edges: Vec<usize>,
+}
+
+/// The hop rule for an occurrence that is neither Direct nor Partial: a breadth-first search
+/// from it over the usable edges (the equalities valid on every view row that involves the
+/// occurrence: the WHERE / inner ON, plus its own LEFT JOIN ON), in alias-index order, reaches
+/// the aliases the id parts read. The chain is the union of the shortest paths, without the
+/// occurrence; the positions are the id parts whose refs all lie in the chain. Each refusal
+/// is the `Err` reason.
+fn search(p: &ViewPlan, y: usize) -> Result<Chain, String> {
+    let a = &p.aliases[y];
+    if a.semi.is_some() {
+        return Err(format!("`{}` is a semi-join table", a.name));
+    }
+    if a.pos.0 == usize::MAX {
+        return Err(format!("`{}` is an ORDER BY subquery table", a.name));
+    }
+    let id_refs = &p.unit_refs;
+    if id_refs
+        .iter()
+        .any(|refs| refs.iter().any(|(al, _)| *al == y))
+    {
+        return Err(format!("the id reads `{}`", a.name));
+    }
+    let targets: BTreeSet<usize> = id_refs.iter().flatten().map(|(al, _)| *al).collect();
+    if targets.is_empty() {
+        return Err("not joined to the id by equalities".into());
+    }
+    let usable: Vec<(usize, &Edge)> = p
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.only_with.is_none_or(|j| j == y))
+        .collect();
+    let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); p.aliases.len()];
+    for &(ei, e) in &usable {
+        adj[e.a.0].push((e.b.0, ei));
+        adj[e.b.0].push((e.a.0, ei));
+    }
+    let mut visited: BTreeSet<usize> = BTreeSet::from([y]);
+    let mut parent: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    let mut frontier = vec![y];
+    loop {
+        if targets.iter().all(|t| visited.contains(t)) {
+            break;
+        }
+        let mut next: Vec<usize> = Vec::new();
+        for &al in &frontier {
+            for &(nb, ei) in &adj[al] {
+                if visited.insert(nb) {
+                    parent.insert(nb, (al, ei));
+                    next.push(nb);
+                }
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    let mut sset: BTreeSet<usize> = BTreeSet::new();
+    let mut edges: Vec<usize> = Vec::new();
+    for &t in &targets {
+        if !visited.contains(&t) {
+            continue;
+        }
+        let mut al = t;
+        while al != y {
+            sset.insert(al);
+            let (prev, ei) = parent[&al];
+            edges.push(ei);
+            al = prev;
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let positions: Vec<usize> = (0..id_refs.len())
+        .filter(|&i| id_refs[i].iter().all(|(al, _)| sset.contains(al)))
+        .collect();
+    let mut links: Vec<(usize, (usize, usize))> = Vec::new();
+    for &ei in &edges {
+        let e = &p.edges[ei];
+        let (yc, pc) = if e.a.0 == y {
+            (e.a.1, e.b)
+        } else if e.b.0 == y {
+            (e.b.1, e.a)
+        } else {
+            continue;
+        };
+        if !links.iter().any(|(c, q)| *c == yc && *q == pc) {
+            links.push((yc, pc));
+        }
+    }
+    links.sort_unstable();
+    if links.is_empty() || positions.is_empty() {
+        return Err("not joined to the id by equalities".into());
+    }
+    Ok(Chain {
+        aliases: sset.into_iter().collect(),
+        links,
+        positions,
+        edges,
+    })
+}
+
+/// The chain of the occurrence: its aliases (without the occurrence), its link pairs
+/// (its column -> the partner's alias column) and the id positions the chain reaches.
+/// (The triple projection of [`search`]; the hop SQL and the EXPLAIN use [`hop`] instead.)
+#[cfg(test)]
+fn chain(
+    p: &ViewPlan,
+    y: usize,
+) -> Result<(Vec<usize>, Vec<(usize, (usize, usize))>, Vec<usize>), String> {
+    let c = search(p, y)?;
+    Ok((c.aliases, c.links, c.positions))
+}
+
+/// The id of the occurrence through its link tables: the hop SQL maps the partner values to
+/// the id values and drops the view's other conditions (a superset of the ids, sound).
+fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
+    let c = search(p, y)?;
+    // Both sides of every edge of the chain carry binlog values that compare as their SQL
+    // values do; a collation-compared link would make the step-6 cache inexact.
+    for &ei in &c.edges {
+        let e = &p.edges[ei];
+        if !p.aliases[e.a.0].table.columns[e.a.1].exact_key()
+            || !p.aliases[e.b.0].table.columns[e.b.1].exact_key()
+        {
+            return Err("link compared by collation".into());
+        }
+    }
+    let qcol = |al: usize, col: usize| {
+        format!(
+            "{}.{}",
+            quote_ident(&p.aliases[al].name),
+            quote_ident(&p.aliases[al].table.columns[col].name)
+        )
+    };
+    let partner: Vec<String> = c
+        .links
+        .iter()
+        .map(|&(_, (al, col))| qcol(al, col))
+        .collect();
+    let mut sel = partner.clone();
+    sel.extend(c.positions.iter().map(|&i| p.unit_exprs[i].clone()));
+    let from: Vec<String> = std::iter::once(y)
+        .chain(c.aliases.iter().copied())
+        .map(|al| {
+            let a = &p.aliases[al];
+            format!(
+                "{}.{} AS {}",
+                quote_ident(&a.table.schema),
+                quote_ident(&a.table.name),
+                quote_ident(&a.name)
+            )
+        })
+        .collect();
+    let mut where_parts: Vec<String> = c
+        .edges
+        .iter()
+        .map(|&ei| {
+            let e = &p.edges[ei];
+            format!("{} = {}", qcol(e.a.0, e.a.1), qcol(e.b.0, e.b.1))
+        })
+        .collect();
+    for &al in &c.aliases {
+        for f in p.filters_of(al) {
+            where_parts.push(format!(
+                "{} IN ({})",
+                qcol(al, f.col),
+                f.values.iter().map(int_sql).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(Hop {
+        link_cols: c.links.iter().map(|&(col, _)| col).collect(),
+        partner,
+        positions: c.positions,
+        aliases: c.aliases,
+        select: format!(
+            "SELECT DISTINCT {} FROM {} WHERE {}",
+            sel.join(", "),
+            from.join(", "),
+            where_parts.join(" AND ")
+        ),
+    })
 }
 
 /// One access per cascading foreign key of the plan, in `ViewPlan.cascades` order; the
@@ -262,15 +478,18 @@ impl AccessPlan {
         } else {
             match occurrences
                 .iter()
-                .find(|o| matches!(o.path, Path::Lineage { .. } | Path::Untraced { .. }))
+                .enumerate()
+                .find(|(_, o)| matches!(o.path, Path::Lineage { .. } | Path::Untraced { .. }))
             {
-                Some(o) => Route::ViewPlan {
+                Some((i, o)) => Route::ViewPlan {
                     reason: format!(
                         "{} ({}): {}",
                         quote_ident(&o.alias),
                         quote_ident(&o.table.1),
                         match &o.path {
-                            Path::Lineage { .. } => "lineage only: no hop derivation yet".into(),
+                            // The hop was refused for this occurrence; the refusal is the why.
+                            Path::Lineage { .. } =>
+                                format!("lineage only: {}", hop(p, i).err().unwrap_or_default()),
                             Path::Untraced { reason } => reason.clone(),
                             _ => unreachable!(),
                         }
@@ -413,6 +632,13 @@ fn path_str(p: &Path) -> String {
         } => {
             format!("partial id[{}] = ({})", ordinals(positions), ordinals(cols))
         }
+        Path::Hop(h) => format!(
+            "hop {} = {} -> id[{}] ({} tables)",
+            ordinals(&h.link_cols),
+            h.partner.join(", "),
+            ordinals(&h.positions),
+            1 + h.aliases.len()
+        ),
         Path::Lineage { cols } => format!("lineage ({})", cols.join(", ")),
         Path::Untraced { reason } => format!("untraced ({reason})"),
     }
@@ -505,6 +731,11 @@ mod tests {
                 &[0, 1],
             ),
             table("owners", &[("id", "int"), ("name", "varchar")], &[0]),
+            table(
+                "item_links",
+                &[("child_id", "int"), ("parent_id", "int")],
+                &[0, 1],
+            ),
         ]
         .into_iter()
         .collect()
@@ -529,16 +760,24 @@ mod tests {
 
     #[test]
     fn lineage_alias_is_viewplan() {
+        // `k` hops to the id; `l` reaches only `k` (its own LEFT-join edge), so it keeps its
+        // lineage and the view stays on the viewplan route.
         let ap = AccessPlan::of(&plan(
-            "SELECT i.id, k.name FROM items i JOIN kinds k ON k.id = i.kind_id",
+            "SELECT i.id, k.name, l.parent_id FROM items i LEFT JOIN kinds k ON k.id = i.kind_id \
+             LEFT JOIN item_links l ON l.parent_id = k.id",
         ));
+        assert!(matches!(ap.occurrences[1].path, Path::Hop(_)));
+        assert!(matches!(ap.occurrences[2].path, Path::Lineage { .. }));
         match &ap.route {
             Route::ViewPlan { reason } => {
-                assert!(reason.starts_with("`k` (`kinds`): "), "{reason}");
+                assert!(reason.starts_with("`l` (`item_links`): "), "{reason}");
+                assert!(
+                    reason.ends_with("lineage only: not joined to the id by equalities"),
+                    "{reason}"
+                );
             }
             r => panic!("route: {r:?}"),
         }
-        assert!(matches!(ap.occurrences[1].path, Path::Lineage { .. }));
     }
 
     #[test]
@@ -632,6 +871,14 @@ mod tests {
                 let kind = match &o.path {
                     Path::Direct { .. } => "unit",
                     Path::Partial { .. } => "partial",
+                    // A hop is a lineage for a lineage alias and a lookup for any other alias.
+                    Path::Hop(_) => {
+                        if v.lineage_of(i).is_some() {
+                            "lineage"
+                        } else {
+                            "lookup"
+                        }
+                    }
                     Path::Lineage { .. } => "lineage",
                     Path::Untraced { .. } => "lookup",
                     Path::Whole => "whole",
@@ -639,5 +886,287 @@ mod tests {
                 assert_eq!(kind, label, "{def}: occurrence {i} ({})", o.alias);
             }
         }
+    }
+
+    #[test]
+    fn one_hop_reaches_the_full_id() {
+        // `l` joins to `i` by a non-unit column: its row image gives no id part, so the id is
+        // reached through the link (`item_links` from `items`), one hop, the full id.
+        let v = plan(
+            "SELECT i.id, l.child_id FROM items i JOIN item_links l ON l.parent_id = i.kind_id",
+        );
+        let (aliases, links, positions) = chain(&v, 1).unwrap();
+        assert_eq!(
+            (aliases, links, positions),
+            (vec![0], vec![(1, (0, 1))], vec![0])
+        );
+        let ap = AccessPlan::of(&v);
+        match &ap.occurrences[1].path {
+            Path::Hop(h) => {
+                // One hop: `l` reaches `i`, the id's only alias; the full id is reached.
+                assert_eq!(h.link_cols, vec![1]);
+                assert_eq!(h.partner, vec![r#"`i`.`kind_id`"#.to_string()]);
+                assert_eq!(h.positions, vec![0]);
+                assert_eq!(h.aliases, vec![0]);
+                assert!(
+                    h.select.starts_with("SELECT DISTINCT `i`.`kind_id`"),
+                    "{}",
+                    h.select
+                );
+                assert!(
+                    h.select.ends_with("WHERE `l`.`parent_id` = `i`.`kind_id`"),
+                    "{}",
+                    h.select
+                );
+                assert!(
+                    h.select.contains("AS `l`, `db`.`items` AS `i`"),
+                    "{}",
+                    h.select
+                );
+            }
+            other => panic!("expected a hop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_hops_through_two_tables() {
+        // The id is reached from `o` through two tables: `o` -> `item_links` -> `items`.
+        let v = plan(
+            "SELECT i.id, MAX(o.name) n FROM items i JOIN item_links l ON l.parent_id = i.kind_id \
+             JOIN owners o ON o.id = l.child_id GROUP BY i.id",
+        );
+        let ap = AccessPlan::of(&v);
+        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+        match &ap.occurrences[2].path {
+            Path::Hop(h) => {
+                assert_eq!(h.aliases, vec![0, 1]);
+                assert_eq!(h.partner, vec![r#"`l`.`child_id`"#.to_string()]);
+                assert_eq!(h.positions, vec![0]);
+                assert!(
+                    h.select.contains("`o`.`id` = `l`.`child_id`"),
+                    "{}",
+                    h.select
+                );
+                assert!(
+                    h.select.contains("`l`.`parent_id` = `i`.`kind_id`"),
+                    "{}",
+                    h.select
+                );
+            }
+            other => panic!("expected a hop, got {other:?}"),
+        }
+    }
+
+    /// A synthetic plan (the live planner either reduces or fully rejects the shape): the
+    /// chain from `l` reaches the `i.id` part but not the `o.id` part, which sits behind `o`'s
+    /// own LEFT-join edge.
+    fn partial_plan() -> ViewPlan {
+        let alias = |i: usize, name: &str, t: Arc<TableInfo>| {
+            let n = t.columns.len();
+            crate::analyze::AliasPlan {
+                name: name.into(),
+                table: t,
+                referenced: vec![true; n],
+                membership: vec![true; n],
+                direct_unit: None,
+                image_cols: vec![],
+                subst_from: (String::new(), String::new()),
+                pos: (i, None),
+                semi: None,
+                lookup_where: false,
+            }
+        };
+        let cat = catalog();
+        let i = cat[&("db".into(), "items".into())].clone();
+        let l = cat[&("db".into(), "item_links".into())].clone();
+        let o = cat[&("db".into(), "owners".into())].clone();
+        ViewPlan {
+            schema: "db".into(),
+            name: "v".into(),
+            hash: "h".into(),
+            mode: Mode::Grouped,
+            tables: vec![],
+            table_columns: vec![],
+            aliases: vec![alias(0, "i", i), alias(1, "l", l), alias(2, "o", o)],
+            projection: vec![],
+            from_sql: String::new(),
+            from_items: vec![],
+            where_sql: None,
+            group_sql: None,
+            having_sql: None,
+            unit_exprs: vec!["`i`.`id`".into(), "`o`.`id`".into()],
+            unit_in_projection: vec![Some(0), Some(1)],
+            full_select: String::new(),
+            unit_unique: false,
+            lineage: vec![],
+            cascades: vec![],
+            output_names: None,
+            order_limit_sql: None,
+            window_sql: None,
+            lookup_where_sql: None,
+            alias_filters: vec![vec![], vec![], vec![]],
+            partial: crate::analyze::PartialUnits::default(),
+            presence: vec![],
+            edges: vec![
+                // `l` joins to `i` (usable for every occurrence).
+                Edge {
+                    a: (1, 1),
+                    b: (0, 1),
+                    only_with: None,
+                },
+                // `o` is LEFT JOINed: its edge is usable for `o` only.
+                Edge {
+                    a: (2, 0),
+                    b: (0, 2),
+                    only_with: Some(2),
+                },
+            ],
+            unit_refs: vec![vec![(0, 0)], vec![(2, 0)]],
+        }
+    }
+
+    #[test]
+    fn hops_reach_partial_positions() {
+        let v = partial_plan();
+        // The chain of `l` reaches `i` only: one of the two id parts.
+        let (aliases, links, positions) = chain(&v, 1).unwrap();
+        assert_eq!(
+            (aliases, links, positions),
+            (vec![0], vec![(1, (0, 1))], vec![0])
+        );
+        let ap = AccessPlan::of(&v);
+        match &ap.occurrences[1].path {
+            Path::Hop(h) => {
+                assert_eq!(h.positions, vec![0]);
+                assert_eq!(h.aliases, vec![0]);
+            }
+            other => panic!("expected a hop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn left_join_owns_its_on_equality() {
+        // `l`'s only usable edge is its own LEFT-join ON: it still hops.
+        let v = plan("SELECT i.id, l.child_id FROM items i LEFT JOIN item_links l ON l.parent_id = i.kind_id");
+        let ap = AccessPlan::of(&v);
+        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+        match &ap.occurrences[1].path {
+            Path::Hop(h) => assert_eq!(h.partner, vec![r#"`i`.`kind_id`"#.to_string()]),
+            other => panic!("expected a hop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn semi_join_tables_do_not_hop() {
+        // The semi table is not in the FROM: the analyzer keeps the negated, key-exact
+        // semi-join as a semi alias (the positive, key-covered ones are joined in place).
+        let d = parse_definition(
+            "CREATE VIEW v AS SELECT i.id FROM items i WHERE i.id NOT IN (SELECT id FROM kinds k)",
+        )
+        .unwrap();
+        let v = crate::analyze::plan(&d, "db", &catalog()).unwrap();
+        let ap = AccessPlan::of(&v);
+        let semi = ap
+            .occurrences
+            .iter()
+            .find(|o| o.table == ("db".to_string(), "kinds".to_string()))
+            .unwrap();
+        let want = format!("`{}` is a semi-join table", semi.alias);
+        match &semi.path {
+            Path::Untraced { reason } => assert_eq!(reason, &want),
+            other => panic!("path: {other:?}"),
+        }
+        match &ap.route {
+            Route::ViewPlan { reason } => assert!(reason.ends_with(&want), "{reason}"),
+            r => panic!("route: {r:?}"),
+        }
+    }
+
+    #[test]
+    fn collated_links_do_not_hop() {
+        // A non-utf8-liked varchar is compared by collation: the binlog value cannot stand
+        // for the SQL value, so the hop is refused.
+        let latin = |n: &str| {
+            crate::catalog::Column::new(
+                n,
+                "varchar",
+                "varchar(10)",
+                Some("latin1"),
+                Some("latin1_swedish_ci"),
+                None,
+                false,
+            )
+        };
+        let mk = |name: &str, cols: Vec<crate::catalog::Column>| {
+            let t = crate::catalog::TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns: cols,
+                pk: vec![0],
+                unique_keys: vec![],
+                cascades: vec![],
+                is_view: false,
+                view_bases: vec![],
+            };
+            (("db".into(), name.into()), Arc::new(t))
+        };
+        let tables = std::collections::HashMap::from([
+            mk("entities", vec![latin("id"), latin("code")]),
+            mk("links", vec![latin("ref"), latin("id")]),
+        ]);
+        let d = parse_definition(
+            "CREATE VIEW v AS SELECT e.id FROM entities e JOIN links l ON l.ref = e.id",
+        )
+        .unwrap();
+        let v = plan_block(&d, "db", &tables).unwrap();
+        let ap = AccessPlan::of(&v);
+        match &ap.occurrences[1].path {
+            Path::Untraced { reason } => assert_eq!(reason, "link compared by collation"),
+            other => panic!("path: {other:?}"),
+        }
+    }
+
+    /// Equivalent formulations of the same view plan identical EXPLAIN bodies.
+    #[test]
+    fn equivalent_formulations_same_body() {
+        let defs = [
+            "SELECT i.id, l.child_id, o.name FROM items i JOIN item_links l ON l.parent_id = i.kind_id \
+             JOIN owners o ON o.id = i.owner_id",
+            "SELECT i.id, l.child_id, o.name FROM items i JOIN item_links l ON l.parent_id IN (i.kind_id) \
+             JOIN owners o ON o.id IN (i.owner_id)",
+            "SELECT i.id, l.child_id, o.name FROM items i JOIN item_links l ON i.kind_id = l.parent_id \
+             JOIN owners o ON i.owner_id = o.id",
+            "SELECT i.id, l.child_id, o.name FROM items i, item_links l, owners o \
+             WHERE l.parent_id = i.kind_id AND o.id = i.owner_id",
+            "SELECT i.id, l.child_id, o.name FROM items i, item_links l, owners o \
+             WHERE o.id = i.owner_id AND l.parent_id = i.kind_id",
+        ];
+        let mut bodies = Vec::new();
+        for def in defs {
+            let v = plan(def);
+            assert!(matches!(AccessPlan::of(&v).route, Route::Dedup), "{def}");
+            bodies.push(AccessPlan::of(&v).body());
+        }
+        for b in &bodies[1..] {
+            assert_eq!(b, &bodies[0], "differing body:\n{b}\n---\n{}", bodies[0]);
+        }
+    }
+
+    /// A view whose lookup aliases all hop is on the dedup route.
+    #[test]
+    fn all_hops_are_dedup() {
+        let v = plan(
+            "SELECT i.id, l.child_id, o.name FROM items i JOIN item_links l ON l.parent_id = i.kind_id \
+             JOIN owners o ON o.id = i.owner_id",
+        );
+        let ap = AccessPlan::of(&v);
+        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+        assert_eq!(ap.route_name(), "dedup");
+        assert!(
+            ap.occurrences[1..]
+                .iter()
+                .all(|o| matches!(o.path, Path::Hop(_))),
+            "{ap}"
+        );
     }
 }
