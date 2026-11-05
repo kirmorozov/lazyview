@@ -87,4 +87,7 @@
   read once, and the result is written to each target.
 * **Crash, restart, resume.** The binlog position is saved in `_lazyview_status`. On a fatal error
   lazyview exits non-zero. After a restart it resumes from the saved position and re-applies the
-  changes since then, which is safe to do twice.
+  changes since then, which is safe to do twice. Each `_lazyview_state` row also carries `route`
+  (the access plan's route: `dedup`, `viewplan`, `recompute`, `full`) and `access` (the plan's
+  EXPLAIN text, its fingerprint in the header), written at every state change;
+  `LAZYVIEW_SYNC=false` compares the fresh plans' fingerprints against the stored ones.

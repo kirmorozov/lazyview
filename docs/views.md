@@ -451,6 +451,7 @@ lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing column
 | `name`, `target` | primary key |
 | `definition_id`, `definition_hash` | which definition the table was built from |
 | `mode`, `detail` | `incremental` / `full` / `unknown` (not planned), and the kind or reason (see [above](#incremental-or-full)); a view in `error` keeps those of its plan |
+| `route`, `access` | the access plan's route (`dedup`, `viewplan`, `recompute`, `full`; NULL while no plan is known) and its EXPLAIN text, whose header carries the fingerprint (`fp …`) |
 | `state` | `building`, `ready`, `waiting` (a chained view whose upstream view is not built yet) or `error` |
 | `managed` | `1` once lazyview created the table; only such tables are ever replaced or dropped |
 | `last_error` | the error message in state `error` |
@@ -466,11 +467,16 @@ lazyview built one).
 `binlog_pos`) and the fencing `epoch`, which grows each time an instance takes over.
 
 `_lazyview_overview`: a view that joins definitions and state: `id`, `name`, `target`,
-`enabled`, `state`, `mode`, `detail`, `last_error`, `refreshed_at`, `definition_updated_at`,
-`definition`. A definition that never got a state row shows up with NULL state.
+`enabled`, `state`, `mode`, `detail`, `route`, `access`, `last_error`, `refreshed_at`,
+`definition_updated_at`, `definition`. A definition that never got a state row shows up with
+NULL state. `route` is `dedup`, `viewplan`, `recompute` or `full` (the view's access plan
+route, or NULL while no plan is known); `access` is the access plan's EXPLAIN text, whose
+header carries its fingerprint (`fp …`), so it names every source table, its read columns,
+filters and path, and the cascades.
 
 ```sql
 SELECT * FROM _lazyview_overview;
 SELECT name, target, last_error FROM _lazyview_overview WHERE state = 'error';
 SELECT name, detail FROM _lazyview_overview WHERE mode = 'full' AND state <> 'error';
+SELECT name, route, access FROM _lazyview_overview WHERE route = 'viewplan';
 ```

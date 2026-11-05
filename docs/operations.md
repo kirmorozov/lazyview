@@ -335,6 +335,7 @@ schema: each would maintain the same views.
 | ``chained views need the upstream view on target `source` `` | add `source` to the upstream view's `targets` |
 | `view calls stored function …` | stored and loadable functions are not supported; inline the logic |
 | a view is `full` but should be incremental | `detail` names the construct; see [views](views.md#what-makes-a-view-full). `SELECT name, detail FROM _lazyview_overview WHERE mode = 'full' AND state <> 'error'` lists them (a view in `error` keeps the mode of its plan) |
+| a view is on the `viewplan` route (it is refreshed through the view plan, not by per-table keys) | `access` in `_lazyview_overview` names the occurrence (or cascade) and why, e.g. `` `g` (`groups`): lineage only: …`` or `cascade … via … untraced`; the plan log prints the same text at build time (`RUST_LOG=info`, the default) |
 | a full-mode view lags | it is rebuilt at most once per `LAZYVIEW_FULL_REFRESH_MS`; lower it, or make the view incremental |
 | the container is `unhealthy` with `LAZYVIEW_HEALTH_ADDR=off` | run it with `--no-healthcheck` |
 | `/readyz` stays 503 on an otherwise fine instance | `curl 'localhost:8080/readyz?verbose'` names the failing check |
@@ -353,3 +354,8 @@ schema: each would maintain the same views.
    NULL after the upgrade that introduced it) until they are next rebuilt.
    `LAZYVIEW_SYNC=false` with another `LAZYVIEW_INSTANCE_ID` prints the current classification of
    every definition.
+5. Before an upgrade you can preview which views plan differently: run `LAZYVIEW_SYNC=false`
+   with another `LAZYVIEW_INSTANCE_ID`. It prints each definition's access plan and, per
+   (view, target), `access same`, `access changed (stored X, now Y)` or `access new (no state)`.
+   A change is not an error — the new binary may plan better — but `access changed` lists the
+   views whose routes or traced columns differ from what the running instance stored.
