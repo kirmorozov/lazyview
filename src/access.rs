@@ -1152,6 +1152,81 @@ mod tests {
         }
     }
 
+    /// The hop of an alias does not depend on where the tables sit in the FROM / JOIN order:
+    /// link or partner tables first give the same paths, partner columns and id positions.
+    #[test]
+    fn permuted_from_orders_same_hops() {
+        let defs = [
+            "SELECT i.id, MAX(o.name) n, MAX(l.child_id) m FROM items i JOIN item_links l \
+             ON l.parent_id = i.kind_id JOIN owners o ON o.id = i.owner_id GROUP BY i.id",
+            "SELECT i.id, MAX(o.name) n, MAX(l.child_id) m FROM item_links l JOIN items i \
+             ON i.kind_id = l.parent_id JOIN owners o ON o.id = i.owner_id GROUP BY i.id",
+            "SELECT i.id, MAX(o.name) n, MAX(l.child_id) m FROM owners o JOIN items i \
+             ON o.id = i.owner_id JOIN item_links l ON l.parent_id = i.kind_id GROUP BY i.id",
+        ];
+        for def in defs {
+            let v = plan(def);
+            let ap = AccessPlan::of(&v);
+            assert!(matches!(ap.route, Route::Dedup), "{def}\n{ap}");
+            let l = ap.occurrences.iter().find(|o| o.alias == "l").unwrap();
+            let o = ap.occurrences.iter().find(|o| o.alias == "o").unwrap();
+            match (&l.path, &o.path) {
+                (Path::Hop(lh), Path::Hop(oh)) => {
+                    assert_eq!(lh.link_cols, vec![1], "{def}");
+                    assert_eq!(lh.partner, vec![r#"`i`.`kind_id`"#.to_string()], "{def}");
+                    assert_eq!(lh.positions, vec![0], "{def}");
+                    assert_eq!(oh.link_cols, vec![0], "{def}");
+                    assert_eq!(oh.partner, vec![r#"`i`.`owner_id`"#.to_string()], "{def}");
+                    assert_eq!(oh.positions, vec![0], "{def}");
+                }
+                other => panic!("{def}: {other:?}"),
+            }
+        }
+    }
+
+    /// A depth-3 chain: the id is reached from `o` through three tables
+    /// (`o` -> `item_links` -> `item_values` -> `items`), the union of the one shortest path.
+    #[test]
+    fn three_hops_depth_three_chain() {
+        let v = plan(
+            "SELECT i.id, MAX(o.name) n FROM items i JOIN item_values v ON v.item_id = i.id \
+             JOIN item_links l ON l.child_id = v.key_id JOIN owners o ON o.id = l.parent_id \
+             GROUP BY i.id",
+        );
+        let ap = AccessPlan::of(&v);
+        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+        let o = ap.occurrences.iter().find(|o| o.alias == "o").unwrap();
+        match &o.path {
+            Path::Hop(h) => {
+                assert_eq!(h.aliases, vec![0, 1, 2], "{ap}");
+                assert_eq!(h.link_cols, vec![0], "{ap}");
+                assert_eq!(h.partner, vec![r#"`l`.`parent_id`"#.to_string()], "{ap}");
+                assert_eq!(h.positions, vec![0], "{ap}");
+                assert!(
+                    h.select.contains("`v`.`item_id` = `i`.`id`"),
+                    "{}",
+                    h.select
+                );
+                assert!(
+                    h.select.contains("`l`.`child_id` = `v`.`key_id`"),
+                    "{}",
+                    h.select
+                );
+                assert!(
+                    h.select.contains("`o`.`id` = `l`.`parent_id`"),
+                    "{}",
+                    h.select
+                );
+                assert!(
+                    h.select.starts_with("SELECT DISTINCT `l`.`parent_id`"),
+                    "{}",
+                    h.select
+                );
+            }
+            other => panic!("expected a hop, got {other:?}"),
+        }
+    }
+
     /// A view whose lookup aliases all hop is on the dedup route.
     #[test]
     fn all_hops_are_dedup() {
