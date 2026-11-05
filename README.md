@@ -130,6 +130,7 @@ https://github.com/kirmorozov/lazyview/issues?q=is:issue%20is:open%20label:%22kn
 * [Operations](docs/operations.md): Docker, health, metrics, logs, restarts, troubleshooting.
 * [Kubernetes](docs/kubernetes.md): kustomize manifests, probes, rollouts.
 * [Internals](docs/internals.md): units, de-duplication, diff writes, resume.
+* [Comparison](docs/comparison.md): similar projects and when not to use lazyview.
 * [Development](docs/development.md): building, tests, the container image, CI.
 
 License: [MIT](LICENSE).
