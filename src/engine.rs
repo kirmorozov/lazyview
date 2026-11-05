@@ -541,6 +541,9 @@ struct ShownState {
     hash: String,
     mode: String,
     detail: Option<String>,
+    /// The route and access plan written with the state (NULL when no plan).
+    route: Option<String>,
+    access: Option<String>,
     state: String,
     error: Option<String>,
 }
@@ -934,6 +937,7 @@ impl Engine {
             // Validate definitions only (usable in CI: non-zero exit on any problem).
             let mut bad = 0;
             let mut names: HashMap<String, u64> = HashMap::new();
+            let stored = meta::load_state(&mut e.meta).await.unwrap_or_default();
             for d in defs.iter().filter(|d| d.enabled) {
                 match e
                     .parse_and_plan(&d.effective_definition(), &d.targets, None, &HashMap::new())
@@ -954,6 +958,29 @@ impl Engine {
                                 p.mode,
                                 d.targets.join(",")
                             );
+                            let ap = crate::access::AccessPlan::of(&p);
+                            info!("{ap}");
+                            for t in &d.targets {
+                                let key = (p.name.clone(), t.clone());
+                                let fp = stored
+                                    .get(&key)
+                                    .and_then(|s| s.access.as_deref())
+                                    .and_then(crate::access::AccessPlan::fingerprint_of);
+                                match fp {
+                                    Some(f) if f == ap.fingerprint => {
+                                        info!(view = %p.name, target = %t, "access same")
+                                    }
+                                    Some(f) => info!(
+                                        view = %p.name,
+                                        target = %t,
+                                        "access changed (stored {f}, now {})",
+                                        ap.fingerprint
+                                    ),
+                                    None => {
+                                        info!(view = %p.name, target = %t, "access new (no state)")
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(err) => {
@@ -1326,6 +1353,9 @@ impl Engine {
         err: Option<&str>,
     ) {
         let (mode, detail) = plan.map(mode_name).unwrap_or(("unknown", None));
+        let ap = plan.map(crate::access::AccessPlan::of);
+        let route_text = ap.as_ref().map(|a| a.route_name().to_string());
+        let access_text = ap.as_ref().map(|a| a.to_string());
         self.shown.insert(
             (name.to_string(), target.to_string()),
             ShownState {
@@ -1333,6 +1363,8 @@ impl Engine {
                 hash: hash.to_string(),
                 mode: mode.to_string(),
                 detail: detail.clone(),
+                route: route_text.clone(),
+                access: access_text.clone(),
                 state: state.to_string(),
                 error: err.map(str::to_string),
             },
@@ -1346,6 +1378,8 @@ impl Engine {
                 hash,
                 mode,
                 detail: detail.as_deref(),
+                route: ap.as_ref().map(|a| a.route_name()),
+                access: access_text.as_deref(),
                 state,
                 error: err,
                 // Ownership is recorded only once our table is in place under `name`.
@@ -1640,6 +1674,8 @@ impl Engine {
                     hash: &v.hash,
                     mode: &v.mode,
                     detail: v.detail.as_deref(),
+                    route: v.route.as_deref(),
+                    access: v.access.as_deref(),
                     state: &v.state,
                     error: v.error.as_deref(),
                     managed: self.owned.contains_key(&(name.clone(), target.clone())),
@@ -1999,12 +2035,15 @@ impl Engine {
         info!(view = %name, targets = %resumed.join(","), "resuming existing materialized table");
         // The state rows say `ready` already (as written by the run that built them).
         let (mode, detail) = mode_name(plan);
+        let ap = crate::access::AccessPlan::of(plan);
         for t in &resumed {
             let shown = ShownState {
                 definition_id: self.slots[idx].def_id,
                 hash: hash.clone(),
                 mode: mode.to_string(),
                 detail: detail.clone(),
+                route: Some(ap.route_name().to_string()),
+                access: Some(ap.to_string()),
                 state: "ready".to_string(),
                 error: None,
             };

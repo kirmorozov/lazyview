@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use mysql_async::prelude::*;
 use mysql_async::Conn;
+use mysql_async::Params;
 
 use crate::binlog::Position;
 
@@ -88,12 +89,14 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER `binlog_pos`",
     ),
     (STATUS, "server_identity", "VARCHAR(255) NULL AFTER `epoch`"),
+    (STATE, "route", "VARCHAR(16) NULL AFTER `detail`"),
+    (STATE, "access", "TEXT NULL AFTER `route`"),
 ];
 
 /// One-stop status: every definition with its per-target state.
 const CREATE_OVERVIEW: &str = "CREATE OR REPLACE SQL SECURITY INVOKER VIEW `_lazyview_overview` AS
 SELECT d.`id`, COALESCE(d.`name`, s.`name`, CONCAT('#', d.`id`)) AS `name`, s.`target`, d.`enabled`, s.`state`, s.`mode`,
-       s.`detail`, s.`last_error`, s.`refreshed_at`, d.`updated_at` AS `definition_updated_at`, d.`definition`
+       s.`detail`, s.`route`, s.`access`, s.`last_error`, s.`refreshed_at`, d.`updated_at` AS `definition_updated_at`, d.`definition`
 FROM `_lazyview` d LEFT JOIN `_lazyview_state` s ON s.`definition_id` = d.`id`";
 
 pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
@@ -145,7 +148,7 @@ pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
         .await?;
     let up_to_date = current
         .flatten()
-        .map(|d| d.contains("`d`.`name`") || d.contains("d.name"))
+        .map(|d| (d.contains("`d`.`name`") || d.contains("d.name")) && d.contains("route"))
         .unwrap_or(false);
     if !up_to_date {
         // A convenience only: never fatal.
@@ -259,15 +262,17 @@ pub struct StateRow {
     pub state: String,
     /// The table was created by lazyview (and may be replaced or dropped by it).
     pub managed: bool,
+    /// The access plan EXPLAIN text written with the state (NULL before the column existed).
+    pub access: Option<String>,
 }
 
 pub async fn load_state(conn: &mut Conn) -> Result<HashMap<(String, String), StateRow>> {
-    let rows: Vec<(String, String, u64, String, String, i64)> = conn
-        .query("SELECT `name`, `target`, `definition_id`, `definition_hash`, `state`, `managed` FROM `_lazyview_state`")
+    let rows: Vec<(String, String, u64, String, String, i64, Option<String>)> = conn
+        .query("SELECT `name`, `target`, `definition_id`, `definition_hash`, `state`, `managed`, `access` FROM `_lazyview_state`")
         .await?;
     Ok(rows
         .into_iter()
-        .map(|(n, t, id, hash, state, managed)| {
+        .map(|(n, t, id, hash, state, managed, access)| {
             (
                 (n, t),
                 StateRow {
@@ -275,6 +280,7 @@ pub async fn load_state(conn: &mut Conn) -> Result<HashMap<(String, String), Sta
                     hash,
                     state,
                     managed: managed != 0,
+                    access,
                 },
             )
         })
@@ -288,6 +294,8 @@ pub struct StateUpdate<'a> {
     pub hash: &'a str,
     pub mode: &'a str,
     pub detail: Option<&'a str>,
+    pub route: Option<&'a str>,
+    pub access: Option<&'a str>,
     pub state: &'a str,
     pub error: Option<&'a str>,
     /// Marks the table as created by lazyview; never cleared by later updates.
@@ -297,13 +305,29 @@ pub struct StateUpdate<'a> {
 pub async fn set_state(conn: &mut Conn, u: StateUpdate<'_>) -> Result<()> {
     let refreshed = u.state == "ready";
     conn.exec_drop(
-        "INSERT INTO `_lazyview_state` (`name`, `target`, `definition_id`, `definition_hash`, `mode`, `detail`, `state`, `managed`, `last_error`, `refreshed_at`) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, IF(?, CURRENT_TIMESTAMP(3), NULL)) \
+        "INSERT INTO `_lazyview_state` (`name`, `target`, `definition_id`, `definition_hash`, `mode`, `detail`, `route`, `access`, `state`, `managed`, `last_error`, `refreshed_at`) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, IF(?, CURRENT_TIMESTAMP(3), NULL)) \
          ON DUPLICATE KEY UPDATE `definition_id` = VALUES(`definition_id`), `definition_hash` = VALUES(`definition_hash`), \
-         `mode` = VALUES(`mode`), `detail` = VALUES(`detail`), `state` = VALUES(`state`), `managed` = GREATEST(`managed`, VALUES(`managed`)), \
+         `mode` = VALUES(`mode`), `detail` = VALUES(`detail`), `route` = VALUES(`route`), `access` = VALUES(`access`), \
+         `state` = VALUES(`state`), `managed` = GREATEST(`managed`, VALUES(`managed`)), \
          `last_error` = VALUES(`last_error`), `refreshed_at` = IF(?, CURRENT_TIMESTAMP(3), `refreshed_at`), \
          `updated_at` = CURRENT_TIMESTAMP(3)",
-        (u.name, u.target, u.definition_id, u.hash, u.mode, u.detail, u.state, u.managed, u.error, refreshed, refreshed),
+        // A 13-element list: `Params` tuples top out at 12.
+        Params::Positional(vec![
+            u.name.into(),
+            u.target.into(),
+            u.definition_id.into(),
+            u.hash.into(),
+            u.mode.into(),
+            u.detail.into(),
+            u.route.into(),
+            u.access.into(),
+            u.state.into(),
+            u.managed.into(),
+            u.error.into(),
+            refreshed.into(),
+            refreshed.into(),
+        ]),
     )
     .await?;
     Ok(())

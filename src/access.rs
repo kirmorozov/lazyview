@@ -311,6 +311,11 @@ impl AccessPlan {
         }
     }
 
+    /// The fingerprint token of an EXPLAIN text: after ` fp ` on the header line.
+    pub fn fingerprint_of(text: &str) -> Option<&str> {
+        text.lines().next()?.rsplit_once(" fp ").map(|(_, t)| t)
+    }
+
     /// The route, for logs: `dedup` | `viewplan` | `recompute` | `full`.
     pub fn route_name(&self) -> &'static str {
         match self.route {
