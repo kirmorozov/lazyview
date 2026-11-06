@@ -1244,4 +1244,110 @@ mod tests {
             "{ap}"
         );
     }
+
+    /// The exact EXPLAIN text of an incremental view: one cascade traced directly (the units
+    /// straight from the parent's image) and one derived through a pinned presence column; the
+    /// header fingerprint is read back by `fingerprint_of`.
+    #[test]
+    fn explain_pins_cascade_traced_directly() {
+        use crate::catalog::{FkAction, ForeignKey};
+        let cat = catalog();
+        let mut i = (*cat[&("db".into(), "item_values".into())]).clone();
+        let fk = |parent: &str, cols: Vec<usize>, pcols: &[&str]| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols: cols,
+            parent_cols: pcols.iter().map(|c| c.to_string()).collect(),
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        i.cascades = vec![
+            fk("item_links", vec![0, 1], &["child_id", "parent_id"]),
+            fk("kinds", vec![1], &["id"]),
+        ];
+        let mut cat = cat;
+        cat.insert(("db".into(), "item_values".into()), Arc::new(i));
+        let d = parse_definition(
+            "CREATE VIEW v AS SELECT v.item_id, v.key_id, v.val FROM item_values v WHERE v.key_id = 7",
+        )
+        .unwrap();
+        let ap = AccessPlan::of(&plan_block(&d, "db", &cat).unwrap());
+        let want = [
+            format!("view db.v route dedup fp {}", ap.fingerprint),
+            "id 0 `v`.`item_id` (output 0)".into(),
+            "id 1 `v`.`key_id` (output 1)".into(),
+            "occ v db.item_values read (0, 1, 2) filter 1 IN (7) -> direct id = (0, 1)".into(),
+            "cascade db.item_links -> db.item_values (0, 1) on delete CASCADE on update CASCADE \
+             via direct (0, 1)"
+                .into(),
+            "cascade db.kinds -> db.item_values (0) on delete CASCADE on update CASCADE \
+             via derived partial () presence (_lv_c0) reach 0 IN (7)"
+                .into(),
+        ]
+        .join("\n")
+            + "\n";
+        assert_eq!(ap.to_string(), want);
+        assert_eq!(
+            AccessPlan::fingerprint_of(&ap.to_string()),
+            Some(ap.fingerprint.as_str())
+        );
+    }
+
+    /// The exact EXPLAIN text of an incremental view whose cascading parent the view reads
+    /// through a lineage alias: the cascade is traced, the parent occurrence hops to the id.
+    #[test]
+    fn explain_pins_traced_cascade() {
+        use crate::catalog::{FkAction, ForeignKey};
+        let cat = catalog();
+        let mut i = (*cat[&("db".into(), "items".into())]).clone();
+        i.cascades = vec![ForeignKey {
+            parent: ("db".into(), "kinds".into()),
+            child_cols: vec![1],
+            parent_cols: vec!["id".into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        }];
+        let mut cat = cat;
+        cat.insert(("db".into(), "items".into()), Arc::new(i));
+        let d = parse_definition(
+            "CREATE VIEW v AS SELECT i.id, k.name FROM items i LEFT JOIN kinds k ON k.id = i.kind_id",
+        )
+        .unwrap();
+        let ap = AccessPlan::of(&plan_block(&d, "db", &cat).unwrap());
+        let want = [
+            format!("view db.v route dedup fp {}", ap.fingerprint),
+            "id 0 `i`.`id` (output 0)".into(),
+            "occ i db.items read (0, 1) -> direct id = (0)".into(),
+            "occ k db.kinds read (0, 1) -> hop 0 = `i`.`kind_id` -> id[0] (2 tables)".into(),
+            "cascade db.kinds -> db.items (0) on delete CASCADE on update CASCADE via traced"
+                .into(),
+        ]
+        .join("\n")
+            + "\n";
+        assert_eq!(ap.to_string(), want);
+        assert_eq!(
+            AccessPlan::fingerprint_of(&ap.to_string()),
+            Some(ap.fingerprint.as_str())
+        );
+    }
+
+    /// The exact EXPLAIN text of a Full route: the reason in the header, one whole occurrence.
+    #[test]
+    fn explain_pins_full_route_reason() {
+        let ap = AccessPlan::of(&plan("SELECT DISTINCT kind_id FROM items"));
+        match &ap.route {
+            Route::Full { reason } => assert_eq!(reason, "DISTINCT"),
+            r => panic!("route: {r:?}"),
+        }
+        let want = [
+            format!("view db.v route full (DISTINCT) fp {}", ap.fingerprint),
+            "occ items db.items read (1) -> whole".into(),
+        ]
+        .join("\n")
+            + "\n";
+        assert_eq!(ap.to_string(), want);
+        assert_eq!(
+            AccessPlan::fingerprint_of(&ap.to_string()),
+            Some(ap.fingerprint.as_str())
+        );
+    }
 }
