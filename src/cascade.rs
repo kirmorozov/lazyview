@@ -403,6 +403,58 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyze::{ConstFilter, MapPlan};
+    use crate::catalog::{FkAction, TableInfo};
+    use std::sync::Arc;
+
+    /// A table in schema `db` with the given columns and `pk` over column 0.
+    fn table(name: &str, cols: Vec<Column>) -> Arc<TableInfo> {
+        Arc::new(TableInfo {
+            schema: "db".into(),
+            name: name.into(),
+            columns: cols,
+            pk: vec![0],
+            unique_keys: vec![],
+            cascades: vec![],
+            is_view: false,
+            view_bases: vec![],
+        })
+    }
+
+    /// A mapped route on `items`: key `id`, FKs `p1`/`p2`, stored `ts` (timestamp) and `flag`
+    /// (bit(4)), the given per-alias constant filters.
+    fn route(filters: Vec<Vec<ConstFilter>>) -> CascadeRoute {
+        CascadeRoute {
+            parent: table("parents", vec![Column::simple("id", "int")]),
+            parent_cols: vec![0],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+            unit_from_parent: None,
+            child: ("db".into(), "items".into()),
+            child_cols: vec![1, 2],
+            traced: false,
+            untraced: None,
+            derived: false,
+            partial_from_parent: vec![],
+            pinned: vec![],
+            reach: None,
+            child_table: table(
+                "items",
+                vec![
+                    Column::simple("id", "int"),
+                    Column::simple("p1", "int"),
+                    Column::simple("p2", "int"),
+                    Column::simple("ts", "timestamp"),
+                    Column::new("flag", "bit", "bit(4)", None, None, None, false),
+                ],
+            ),
+            map: Some(MapPlan {
+                key: vec![0],
+                cols: vec![3, 4],
+                filters,
+            }),
+        }
+    }
 
     #[test]
     fn cache_follows_child_rows_and_cascades() {
@@ -450,5 +502,82 @@ mod tests {
         assert!(!c.rows(0).unwrap().by_fk.contains_key(&key(1)));
         assert!(c.parent(0, &key(1), None).unwrap().is_empty());
         assert_eq!(c.parent(0, &key(2), None), Some(vec![row(2)]));
+    }
+
+    #[test]
+    fn seed_expr_pins_the_type_wrappers() {
+        // TIMESTAMP and BIT carry different binlog representations; the seed must wrap them.
+        assert_eq!(
+            seed_expr(&Column::simple("ts", "timestamp")),
+            "UNIX_TIMESTAMP(`ts`)"
+        );
+        assert_eq!(
+            seed_expr(&Column::new(
+                "flag", "bit", "bit(4)", None, None, None, false
+            )),
+            "CAST(`flag` AS UNSIGNED)"
+        );
+        // Every other kind is selected as is.
+        assert_eq!(seed_expr(&Column::simple("p1", "int")), "`p1`");
+    }
+
+    #[test]
+    fn seed_sql_pins_the_exact_query() {
+        // No alias filters: only the FK IS NOT NULL conditions.
+        let c = route(vec![]);
+        assert_eq!(
+            seed_sql(&c),
+            Some(
+                "SELECT `id`, `p1`, `p2`, UNIX_TIMESTAMP(`ts`), CAST(`flag` AS UNSIGNED) \
+                 FROM `db`.`items` WHERE `p1` IS NOT NULL AND `p2` IS NOT NULL"
+                    .into()
+            )
+        );
+        // Two alias groups: an OR of AND-ed IN lists over the filter columns.
+        let c = route(vec![
+            vec![ConstFilter {
+                col: 3,
+                values: vec![Datum::Int(2), Datum::UInt(7)],
+            }],
+            vec![ConstFilter {
+                col: 1,
+                values: vec![Datum::Int(5)],
+            }],
+        ]);
+        assert_eq!(
+            seed_sql(&c).unwrap(),
+            "SELECT `id`, `p1`, `p2`, UNIX_TIMESTAMP(`ts`), CAST(`flag` AS UNSIGNED) \
+             FROM `db`.`items` WHERE `p1` IS NOT NULL AND `p2` IS NOT NULL AND \
+             ((`ts` IN (2, 7)) OR (`p1` IN (5)))"
+        );
+        // An unmapped route has no seed query.
+        let mut c = route(vec![]);
+        c.map = None;
+        assert_eq!(seed_sql(&c), None);
+    }
+
+    #[test]
+    fn seed_row_splits_the_fetched_row() {
+        // vals in the seed_sql order: key `id`, FKs `p1`/`p2`, stored `ts`/`flag`.
+        let c = route(vec![]);
+        let vals = vec![
+            Value::Int(10),
+            Value::Int(100),
+            Value::Int(200),
+            Value::Int(1_234_567),
+            Value::UInt(u64::MAX),
+        ];
+        let (key, row) = seed_row(&c, vals);
+        assert_eq!(key, vec![Datum::Int(10)].into());
+        assert_eq!(row.fk, vec![Datum::Int(100), Datum::Int(200)].into());
+        // The timestamp comes back as epoch-second text; the bit as its integer value.
+        assert_eq!(
+            row.values,
+            vec![
+                Some(Datum::Bytes(b"1234567".to_vec())),
+                Some(Datum::UInt(u64::MAX))
+            ]
+        );
+        assert!(row.complete);
     }
 }
