@@ -496,4 +496,66 @@ mod tests {
             refset.iter().copied().collect::<Vec<u64>>()
         );
     }
+
+    #[test]
+    fn clear_empties_and_reinserts() {
+        let mut s = IntSet::new();
+        for v in [1, 2, 3] {
+            s.insert(v);
+        }
+        s.remove(2);
+        s.clear();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert!(!s.contains(1));
+        assert!(!s.contains(3));
+        assert_eq!(s.to_sorted_vec(), Vec::<u64>::new());
+        assert_eq!(s.pop_smallest(3), Vec::<u64>::new());
+        // The set is usable after clear.
+        s.insert(5);
+        s.insert(1);
+        assert_eq!(s.to_sorted_vec(), [1, 5]);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn partial_eq_equal_len_differs_in_content() {
+        let mut a = IntSet::new();
+        a.insert(1);
+        a.insert(2);
+        let mut b = IntSet::new();
+        b.insert(3);
+        b.insert(4);
+        // Same length, different contents: not equal either way.
+        assert_ne!(a, b);
+        assert_ne!(b, a);
+        // Same contents, different cache state: still equal.
+        let mut c = IntSet::new();
+        for v in [0, 1, 2] {
+            c.insert(v);
+        }
+        c.pop_smallest(1); // c now holds 1 and 2
+        assert_eq!(a, c);
+        assert_eq!(c, a);
+        // Different lengths: not equal.
+        let mut d = IntSet::new();
+        for v in [1, 2, 3] {
+            d.insert(v);
+        }
+        assert_ne!(a, d);
+        assert_ne!(d, a);
+    }
+
+    #[test]
+    fn sorted_vec_fresh_with_empty_pending() {
+        let mut s = IntSet::new();
+        s.insert(2);
+        s.insert(1);
+        assert_eq!(s.pop_smallest(1), [1]);
+        // The cache is now fresh with an empty pending run; the merge
+        // loop must stop exactly at that run's end.
+        assert_eq!(s.to_sorted_vec(), [2]);
+        s.insert(0);
+        assert_eq!(s.to_sorted_vec(), [0, 2]);
+    }
 }
