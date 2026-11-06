@@ -330,7 +330,8 @@ compares it).
 | `TargetId` / `IdPart` | `parts`, `unique`; `expr`, `output` | `unit_exprs` / `unit_in_projection` (`None` = the hidden column `_lv_u<i>`), `unit_unique` |
 | `Route` | `Dedup`, `ViewPlan { reason }`, `Recompute`, `Full { reason }` | static, by traceability (rule below) |
 | `Occurrence` | `table`, `alias`, `read_columns`, `filters`, `path` | per `aliases[i]` (Spj/Grouped/Global, same index) or per `tables[i]` (Full): `AliasPlan.table`/`.name`, `.referenced` (`None` = any column), `filters_of(i)` (integers, NULL never passes) |
-| `Path` | `Direct { cols }`, `Partial { set, positions, cols }`, `Lineage { cols }`, `Untraced { reason }`, `Whole` | `direct_unit`; `partial_of(i)` + `partial.sets[set]`; `lineage_of(i)` (the materialized key columns); else untraced; `Whole` for the `Recompute`/`Full` routes. (Step 5 has no `Hop`: lookup aliases stay untraced until PR 5E.) |
+| `Path` | `Direct { cols }`, `Partial { set, positions, cols }`, `Lineage { cols }`, `Hop(Hop)`, `Untraced { reason }`, `Whole` | `direct_unit`; `partial_of(i)` + `partial.sets[set]`; then the hop (below): the id through the occurrence's link tables, for a lookup / lineage alias joined to the id's aliases by equalities; `lineage_of(i)` (the materialized key columns, kept when the hop is refused); else untraced; `Whole` for the `Recompute`/`Full` routes |
+| `Hop` | `link_cols`, `partner`, `positions`, `aliases`, `select` | the occurrence's columns on the chain's edges; the matching chain columns as `alias`.`col`; the id positions the chain reaches; the chain's aliases (without the occurrence); the parameterized SELECT mapping the partner values to the id values — the key filter on the partners is appended by the executor |
 | `CascadeAccess` | `parent`, `parent_cols`, `child`, `child_cols`, `on_delete`, `on_update`, `via`, `reach` | one per `cascades[i]`, same index |
 | `Via` | `Direct { parent_cols }`, `Traced`, `Derived { partial, presence }`, `Map { key, cols }`, `Untraced { reason }` | `unit_from_parent` / `traced` / `derived` (`pinned` → `presence` names) / `map` / else untraced (default: `` `parent` cascades into `schema`.`child` ``) |
 
@@ -338,12 +339,41 @@ compares it).
 
 - `Mode::Full(reason)` → `full (reason)`; `Mode::Global` → `recompute`, every occurrence `Whole`.
 - Spj / Grouped: the first occurrence whose path is `Lineage` or `Untraced` makes the route
-  ``viewplan (`alias` (`table`): <why>)`` (lineage: `lineage only: no hop derivation yet` until
-  PR 5E; untraced: its reason). Else the first untraced cascade makes
+  ``viewplan (`alias` (`table`): <why>)`` (lineage: `lineage only: <hop refusal>` — the hop was
+  tried and refused; untraced: its reason). Else the first untraced cascade makes
   ``viewplan (cascade `parent` -> `child`: <reason>)``. Else `dedup`.
-- `Derived` (presence columns) and `Map` (the in-memory cascade cache) are clear derivations.
-  No runtime input, no size threshold, no flag: until PR 5E, only views whose aliases are all
-  direct or partial show `dedup`.
+- `Derived` (presence columns), `Map` (the in-memory cascade cache) and `Hop` are clear
+  derivations. No runtime input, no size threshold, no flag: views whose aliases are all
+  direct, partial or hop show `dedup`.
+
+### Hop rule
+
+For an occurrence `y` that is neither `Direct` nor `Partial` (a lookup / lineage alias), the
+id is tried through the occurrence's link tables:
+
+- **Edges.** The usable edges are `ViewPlan.edges` with `only_with` ∈ {`None`, `Some(y)`}: the
+  equalities valid on every view row that involves `y` — the WHERE / inner-join ON, plus `y`'s
+  own LEFT-join ON.
+- **Chain.** A breadth-first search from `y` over the usable edges, in alias-index order,
+  reaches the aliases the id parts read (`ViewPlan.unit_refs`). The chain `S` is the union of
+  the shortest paths, without `y`.
+- **Positions.** `positions` are the id parts whose refs all lie in `S`; with none, the
+  occurrence is `Untraced("not joined to the id by equalities")`.
+- **Refusals** (each leaves the occurrence `Untraced` with the reason, keeping `Lineage` when
+  the alias has one): `y` is a semi-join table or an ORDER BY subquery table; an id part reads
+  `y`; an edge of the chain has a side without `Column::exact_key()` ("link compared by
+  collation" — the step-6 hop cache stays exact only on values that compare as their SQL
+  values do).
+- **SQL.** `SELECT DISTINCT <partner>, <id parts> FROM <y's table>, <S's tables> WHERE <the
+  chain's equalities> AND <S's constant filters>`: the key filter on the partner columns is
+  appended by the executor (step 6), with `filter_typed`. The SQL drops the view's other
+  conditions, which yields a superset of the ids — sound. It never contains a derived table.
+
+### Why it is sound
+
+Every view row that includes a `y` row satisfies the chain's equalities, so it is reached from
+that row's link value, old and new images alike. A partner that changed is traced by its own
+occurrence. A link row deleted in the same window emits through its own path.
 
 ### EXPLAIN
 
@@ -356,14 +386,16 @@ id <i> <unit expression> (output <n>) | (hidden _lv_u<i>)
 occ <alias> <schema>.<table> read <…>[ filter <col> IN (<values>)[ AND …]] -> <path>
   read <…>: * | (0-based column ordinals, ascending)
   path: direct id = (<ordinals>) | partial id[<positions>] = (<ordinals>)
-        | lineage (<materialized key columns>) | untraced (<reason>) | whole
+        | lineage (<materialized key columns>)
+        | hop <link ordinals> = <partner columns> -> id[<positions>] (<n> tables)
+        | untraced (<reason>) | whole
 cascade <schema>.<parent> -> <schema>.<child> (<parent col ordinals>) on delete <A> on update <B> via <…>[ reach <col> IN (<values>)]
   <A>/<B>: CASCADE | RESTRICT | SET NULL
   via: direct (<ordinals>) | traced | derived partial (<entries>)[ presence (<names>)]
         | map key (<ordinals>) | untraced (<reason>)
 ```
 
-Column sets print 0-based ordinals in step 5; the two places the plan stores names instead
-(the materialized lineage columns, `Lineage.cols`, and the derived `presence` names) print
-those names. Values are typed integer literals. The `fp` hashes only the id, occurrence and
-cascade lines: it changes when any of them changes, and only then.
+Column sets print 0-based ordinals in step 5; the three places the plan stores names instead
+(the materialized lineage columns, `Lineage.cols`, the hop's `partner` columns and the derived
+`presence` names) print those names. Values are typed integer literals. The `fp` hashes only
+the id, occurrence and cascade lines: it changes when any of them changes, and only then.

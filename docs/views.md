@@ -218,7 +218,7 @@ How full mode behaves:
 Every build logs the view's access plan (`route` and `fp` in the structured fields; the
 EXPLAIN text in the message) one line after the existing `building` line. The EXPLAIN names,
 per source table, how a changed row reaches the view's units (`direct` / `partial` / `lineage`
-/ `untraced` / `whole`), the view's unit expressions, and, per cascading foreign key, how the
+/ `hop` / `untraced` / `whole`), the view's unit expressions, and, per cascading foreign key, how the
 parent's change reaches the child. For `SELECT i.id FROM items i`:
 
 ```
@@ -228,13 +228,13 @@ occ i db.items read (0) -> direct id = (0)
 ```
 
 and for `SELECT i.id, k.name FROM items i JOIN kinds k ON k.id = i.kind_id`, where the joined
-table is reached only by lineage:
+table's id is reached through the link (one hop):
 
 ```
-view db.item_kind_names route viewplan (`k` (`kinds`): lineage only: no hop derivation yet) fp 33ed0112bde69dac
+view db.item_kind_names route dedup fp f3e361947762550a
 id 0 `i`.`id` (output 0)
 occ i db.items read (0, 1) -> direct id = (0)
-occ k db.kinds read (0, 1) -> lineage (_lv_a1_pk0)
+occ k db.kinds read (0, 1) -> hop 0 = `i`.`kind_id` -> id[0] (2 tables)
 ```
 
 The `route` is how the view's changes will be maintained: `dedup` (the row images give the
@@ -244,6 +244,13 @@ recomputed per batch) or `full` (rebuilt; the reason is the planner's). Step 5 r
 route but nothing acts on it: `dedup` views are still maintained by the view plan until step
 6. (The `route` and `access` overview columns and the `LAZYVIEW_SYNC=false` comparison arrive
 with PR 5D.)
+
+The `hop` line (`hop <link columns> = <partner columns> -> id[<positions>] (<n> tables)`) says
+the occurrence's id is read through `n - 1` link hops: `<partner columns>` are the chain's
+columns the executor pins with the occurrence's link values. The hop SQL itself is logged at
+debug level, one line per hop (`hop <view>.<alias>: SELECT DISTINCT …`). Views whose lookup
+aliases all hop are on the `dedup` route; a refused hop keeps the alias's `lineage` /
+`untraced` line, with the refusal as the why.
 
 The `fp` token is a fingerprint of the EXPLAIN text: it changes only when an access path,
 filter, read column, unit, cascade or route changes (a new binary may plan the same
