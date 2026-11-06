@@ -2,7 +2,7 @@
 //! positions, workload generator + all view SQL on every flavor, the oracle (hand-filled table vs
 //! view, mismatch detection and diff formatting).
 //!
-//! `cargo test --test harness_selftest -- --ignored cleanup_test_schemas` drops leftover
+//! `cargo test --test harness_selftest -- --ignored selftest_cleanup_test_schemas` drops leftover
 //! `lvt_*` schemas (kept by failed runs) on every server.
 
 mod common;
@@ -332,7 +332,7 @@ fn selftest_multi_skip_probe() {
 /// Drops leftover `lvt_*` schemas on every server (run explicitly with `--ignored`).
 #[test]
 #[ignore]
-fn cleanup_test_schemas() {
+fn selftest_cleanup_test_schemas() {
     let Some(servers) = servers() else { return };
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -352,10 +352,10 @@ fn cleanup_test_schemas() {
 
 /// Debug tool: prints the statements of a workload seed (as used by brutal/crash runs) to
 /// `tmp/out/workload-<seed>.sql`. `LAZYVIEW_DUMP_SEED=<sub-seed> LAZYVIEW_DUMP_BATCHES=150 cargo
-/// test --test harness_selftest -- --ignored dump_workload`.
+/// test --test harness_selftest -- --ignored selftest_dump_workload`.
 #[test]
 #[ignore]
-fn dump_workload() {
+fn selftest_dump_workload() {
     let seed: u64 = std::env::var("LAZYVIEW_DUMP_SEED")
         .expect("LAZYVIEW_DUMP_SEED")
         .parse()

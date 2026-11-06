@@ -430,14 +430,6 @@ pub async fn fingerprint(conn: &mut Conn, table: &str) -> Result<(usize, u64)> {
     Ok((rows.len(), h))
 }
 
-/// Errors unless `cond` (used for small sanity assertions in scenarios).
-pub fn ensure_eq<T: PartialEq + std::fmt::Debug>(what: &str, actual: T, expected: T) -> Result<()> {
-    if actual != expected {
-        return Err(anyhow!("{what}: expected {expected:?}, got {actual:?}"));
-    }
-    Ok(())
-}
-
 /// `CREATE TABLE` DDL with the column types of an existing table/view (every column NULLable),
 /// built from information_schema — the same approach the engine uses for MV tables.
 pub async fn table_ddl_like(conn: &mut Conn, source: &str, new_name: &str) -> Result<String> {

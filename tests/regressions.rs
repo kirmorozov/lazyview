@@ -2885,7 +2885,11 @@ async fn rebuild_flag(c: &mut mysql_async::Conn, name: &str) -> Result<i64> {
 }
 
 /// Waits until lazyview cleared `_lazyview.rebuild` of `name`.
-async fn wait_rebuilt(c: &mut mysql_async::Conn, eng: &mut Engine, name: &str) -> Result<()> {
+async fn wait_rebuild_flag_cleared(
+    c: &mut mysql_async::Conn,
+    eng: &mut Engine,
+    name: &str,
+) -> Result<()> {
     let t = std::time::Instant::now();
     while rebuild_flag(c, name).await? != 0 {
         eng.check_alive()?;
@@ -2943,7 +2947,7 @@ fn reg_rebuild_flag_rebuilds_one_view() {
                 typed_first(&mut c, updated_sql).await?
             };
             let before = eng.snapshot();
-            wait_rebuilt(&mut c, &mut eng, "r_counts").await?;
+            wait_rebuild_flag_cleared(&mut c, &mut eng, "r_counts").await?;
             wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
             let what = if restart { "restart" } else { "running" };
             verify(

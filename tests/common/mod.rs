@@ -1215,14 +1215,6 @@ where
 /// [`skip_multi`]).
 static MULTI_SKIPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Number of multi-server scenarios skipped so far in this test binary.
-pub fn multi_skipped() -> usize {
-    MULTI_SKIPPED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .len()
-}
-
 /// Repeats the skipped multi-server scenarios after the test harness's own summary, which counts
 /// them as passed. Runs at process exit (registered with `atexit` by the first skip).
 extern "C" fn print_multi_skipped() {
@@ -2113,17 +2105,6 @@ pub fn fmt_snapshot(s: &Snapshot) -> String {
         .filter(|p| !p.ends_with(": 0") && !p.is_empty())
         .collect();
     format!("{{{}}}", parts.join(", "))
-}
-
-/// Metric delta over an async block.
-pub async fn measure<F, Fut, T>(engine: &Engine, f: F) -> Result<(T, Snapshot)>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    let before = engine.snapshot();
-    let out = f().await?;
-    Ok((out, engine.snapshot().since(&before)))
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -412,14 +412,14 @@ fn case_findings() -> Vec<ViewSpec> {
 
 /// Plain and renamed: oracle-exact, the same view state and the same metrics at every step.
 #[test]
-fn same_execution_plain_and_renamed() {
+fn ri_same_execution_plain_and_renamed() {
     run_pairs("rename_invariance", views(), false);
 }
 
 /// The same for the views that exercise the RI-1 to RI-4 expression keys, when the letter case
 /// of a column differs between its occurrences (the analyzer keys them case-insensitively).
 #[test]
-fn same_execution_with_case_varied_columns() {
+fn ri_same_execution_with_case_varied_columns() {
     run_pairs("rename_invariance_case", case_findings(), true);
 }
 
@@ -470,7 +470,7 @@ fn idents(sql: &str) -> Vec<Ident> {
 /// mapping the names back gives the statement as written (up to the letter case and quoting of
 /// names).
 #[test]
-fn renamer_round_trips_the_suites_statements() {
+fn ri_renamer_round_trips_the_suites_statements() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .unwrap()

@@ -986,95 +986,98 @@ async fn stream_items_rows_positions_and_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn server_checks_and_missing_binlog() {
-    on_all_servers("server_checks_and_missing_binlog", |name, dsn| async move {
-        let mut c = connect(&dsn).await?;
-        let info = server_info(&mut c).await?;
-        let want = if name.starts_with("mariadb") {
-            Flavor::MariaDb
-        } else {
-            Flavor::MySql
-        };
-        ensure!(
-            info.flavor == want,
-            "flavor {:?} for {}",
-            info.flavor,
-            info.version
-        );
+async fn stream_server_checks_and_missing_binlog() {
+    on_all_servers(
+        "stream_server_checks_and_missing_binlog",
+        |name, dsn| async move {
+            let mut c = connect(&dsn).await?;
+            let info = server_info(&mut c).await?;
+            let want = if name.starts_with("mariadb") {
+                Flavor::MariaDb
+            } else {
+                Flavor::MySql
+            };
+            ensure!(
+                info.flavor == want,
+                "flavor {:?} for {}",
+                info.flavor,
+                info.version
+            );
 
-        let pos = current_position(&mut c).await?;
-        ensure!(pos.pos >= 4 && pos.file_seq() > 0, "odd position {pos}");
-        ensure!(
-            binlog_exists(&mut c, &pos.file).await?,
-            "{} not listed",
-            pos.file
-        );
-        let (base, _) = pos.file.rsplit_once('.').unwrap();
-        let gone = Position {
-            file: format!("{base}.999999"),
-            pos: 4,
-        };
-        ensure!(
-            !binlog_exists(&mut c, &gone.file).await?,
-            "{} listed",
-            gone.file
-        );
+            let pos = current_position(&mut c).await?;
+            ensure!(pos.pos >= 4 && pos.file_seq() > 0, "odd position {pos}");
+            ensure!(
+                binlog_exists(&mut c, &pos.file).await?,
+                "{} not listed",
+                pos.file
+            );
+            let (base, _) = pos.file.rsplit_once('.').unwrap();
+            let gone = Position {
+                file: format!("{base}.999999"),
+                pos: 4,
+            };
+            ensure!(
+                !binlog_exists(&mut c, &gone.file).await?,
+                "{} listed",
+                gone.file
+            );
 
-        let err = match BinlogReader::connect(
-            replica_opts(&dsn)?,
-            server_id(),
-            info.flavor,
-            &gone,
-            Duration::from_secs(5),
-        )
-        .await
-        {
-            Ok(_) => bail!("streaming from {gone} succeeded"),
-            Err(e) => e,
-        };
-        ensure!(
-            is_missing_binlog(&err),
-            "not recognised as missing binlog: {err:#}"
-        );
-        ensure!(
-            !is_access_denied(&err) && !is_duplicate_server_id(&err),
-            "missing binlog misclassified: {err:#}"
-        );
-
-        // A position past the end of the file is a different (non-"missing") error.
-        let past = Position {
-            file: pos.file.clone(),
-            pos: pos.pos + 1_000_000_000,
-        };
-        let res = async {
-            let mut r = BinlogReader::connect(
+            let err = match BinlogReader::connect(
                 replica_opts(&dsn)?,
                 server_id(),
                 info.flavor,
-                &past,
+                &gone,
                 Duration::from_secs(5),
             )
-            .await?;
-            r.next().await
-        }
-        .await;
-        match res {
-            Ok(item) => bail!("streaming from {past} returned {item:?}"),
-            Err(e) => ensure!(
-                !is_missing_binlog(&e),
-                "position past EOF reported as missing binlog: {e:#}"
-            ),
-        }
-        Ok(())
-    })
+            .await
+            {
+                Ok(_) => bail!("streaming from {gone} succeeded"),
+                Err(e) => e,
+            };
+            ensure!(
+                is_missing_binlog(&err),
+                "not recognised as missing binlog: {err:#}"
+            );
+            ensure!(
+                !is_access_denied(&err) && !is_duplicate_server_id(&err),
+                "missing binlog misclassified: {err:#}"
+            );
+
+            // A position past the end of the file is a different (non-"missing") error.
+            let past = Position {
+                file: pos.file.clone(),
+                pos: pos.pos + 1_000_000_000,
+            };
+            let res = async {
+                let mut r = BinlogReader::connect(
+                    replica_opts(&dsn)?,
+                    server_id(),
+                    info.flavor,
+                    &past,
+                    Duration::from_secs(5),
+                )
+                .await?;
+                r.next().await
+            }
+            .await;
+            match res {
+                Ok(item) => bail!("streaming from {past} returned {item:?}"),
+                Err(e) => ensure!(
+                    !is_missing_binlog(&e),
+                    "position past EOF reported as missing binlog: {e:#}"
+                ),
+            }
+            Ok(())
+        },
+    )
     .await;
 }
 
 /// Plain TCP (caching_sha2_password full authentication via RSA key exchange), the unix socket
 /// mysql_async switches to for local hosts, and TLS where the server has certificates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connection_modes() {
-    on_all_servers("connection_modes", |name, dsn| async move {
+async fn stream_connection_modes() {
+    on_all_servers("stream_connection_modes", |name, dsn| async move {
         let mut c = connect(&dsn).await?;
         let host: Option<String> = c
             .query_first(
@@ -1131,9 +1134,9 @@ async fn connection_modes() {
 /// problems (no REPLICATION CLIENT / BINLOG MONITOR / REPLICATION SLAVE, wrong password) are
 /// recognisable and say how to fix them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn duplicate_server_id_and_privileges() {
+async fn stream_duplicate_server_id_and_privileges() {
     on_all_servers(
-        "duplicate_server_id_and_privileges",
+        "stream_duplicate_server_id_and_privileges",
         |_name, dsn| async move {
             let mut c = connect(&dsn).await?;
             let info = server_info(&mut c).await?;
@@ -1376,8 +1379,8 @@ async fn partial_rows_workload(dsn: &str, w: &mut Conn, s: &str, start: &Positio
 /// minimum (1 KiB) every rows event of this workload is fragmented (up to 140 fragments).
 /// Other servers, and MariaDB without the variable, skip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mariadb_partial_rows_reassembled() {
-    on_all_servers("mariadb_partial_rows_reassembled", |name, dsn| async move {
+async fn stream_mariadb_partial_rows_reassembled() {
+    on_all_servers("stream_mariadb_partial_rows_reassembled", |name, dsn| async move {
         let mut w = connect(&dsn).await?;
         let info = server_info(&mut w).await?;
         let threshold: Option<u64> = if info.flavor == Flavor::MariaDb {
@@ -1389,7 +1392,7 @@ async fn mariadb_partial_rows_reassembled() {
         };
         let Some(default) = threshold else {
             println!(
-                "mariadb_partial_rows_reassembled [{name}]: no binlog_row_event_fragment_threshold on {}, skipping",
+                "stream_mariadb_partial_rows_reassembled [{name}]: no binlog_row_event_fragment_threshold on {}, skipping",
                 info.version
             );
             return Ok(());
