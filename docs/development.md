@@ -212,6 +212,30 @@ cargo run --release --example throughput -- --dsn mysql://lv:lv@127.0.0.1:33084/
     --scenario join_direct --seconds 30 --writers 8 --batch 50
 ```
 
+## Coverage
+
+`make coverage` (which runs `scripts/coverage.sh $(ARGS)`) measures the production-line
+coverage figure quoted in the README: an instrumented build (`-C instrument-coverage`), the
+lib tests, then every integration test binary against each server of `LAZYVIEW_TEST_DSNS`,
+one at a time (as CI runs them), merged and exported with `llvm-profdata` / `llvm-cov`
+(needs the `llvm-tools` rustup component).
+
+* The figure counts production code only: `tests/`, test-only files and inline
+  `#[cfg(test)]` modules are excluded.
+* `make coverage` needs `LAZYVIEW_TEST_DSNS` set; `make coverage ARGS=--lib-only` gives the
+  lib-test-only figure.
+* The suites that need more than one server, a server of their own, or a change of `GLOBAL`
+  state skip visibly unless their opt-in variable is set (each is documented in
+  [Tests](#tests) above): `LAZYVIEW_TEST_REQUIRE_MULTI` (multi-server scenarios; they fail
+  instead of skipping when `CI=true` or `=1`), `LAZYVIEW_TEST_EXCLUSIVE` (scenarios that
+  restart a server, purge its binlogs, kill its sessions or need it idle),
+  `LAZYVIEW_TEST_GLOBAL_BINLOG_COMMIT`, `LAZYVIEW_TEST_GLOBAL_TZ`,
+  `LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS`, `LAZYVIEW_TEST_PURGE_BINLOGS` (GLOBAL changes).
+* `CARGO_BUILD_JOBS` defaults to 1 inside the script: instrumented builds of the lazyview
+  crate need much more memory than plain ones (export a higher value to override).
+* The report lands in `target/coverage/`: `report.md`, `summary.json`, `cov.lcov`, `html/`
+  and `logs/`.
+
 ## Image
 
 * `ghcr.io/kirmorozov/lazyview` is based on `gcr.io/distroless/static-debian12:nonroot`, pinned by

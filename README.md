@@ -124,6 +124,7 @@ https://github.com/kirmorozov/lazyview/issues?q=is:issue%20is:open%20label:%22kn
 
 ## Documentation
 
+* Test coverage: 90.6 % of production lines (2026-11-05, commit 21c950a; how it is measured: docs/development.md "Coverage").
 * [Server setup](docs/server-setup.md): binlog settings per server, RDS and Aurora, user and grants.
 * [Configuration](docs/configuration.md): every environment variable, TLS.
 * [Writing views](docs/views.md): definitions, incremental and full mode, joins, targets, metadata.
