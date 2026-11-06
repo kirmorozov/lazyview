@@ -324,6 +324,14 @@ pub fn definition_hash(def: &str) -> String {
 /// Parses `CREATE [OR REPLACE] [ALGORITHM=..] [DEFINER=..] [SQL SECURITY ..] VIEW name [(cols)] AS
 /// SELECT ... [WITH [CASCADED|LOCAL] CHECK OPTION]`.
 pub fn parse_definition(def: &str) -> Result<ParsedDef> {
+    // MySQL and MariaDB execute the content of `/*! ... */`, `/*!NNNNN ... */` and `/*M! ... */`: sqlparser expands
+    // the first two unconditionally (whatever the version gate says) and ignores the third, so what lazyview plans
+    // could differ from what the server runs. Refuse them anywhere in the text (also inside a string literal: no
+    // quote-aware scan that could disagree with the server's escape rules).
+    if def.contains("/*!") || def.to_ascii_uppercase().contains("/*M!") {
+        bail!("the definition contains an executable comment (`/*!` or `/*M!`): the server would run its content; write the SQL without it");
+    }
+
     let dialect = MySqlDialect {};
     let tokens = tokenize(def)?;
     // Indexes of the non-whitespace tokens.
@@ -7235,5 +7243,27 @@ mod tests {
             v.full_select,
             "SELECT DISTINCT  COUNT( * ) , 'a' 'b' FROM orders"
         );
+    }
+
+    #[test]
+    fn executable_comments_are_refused() {
+        let err = |sql: &str| format!("{:#}", parse_definition(sql).unwrap_err());
+        for sql in [
+            "CREATE VIEW v AS SELECT id /*! , 1 */ FROM items",
+            "CREATE VIEW v AS SELECT id FROM items /*!50100 WHERE 1 */",
+            "CREATE VIEW v AS SELECT id FROM items /*M! WHERE 1 */",
+            "CREATE VIEW v AS SELECT id FROM items /*m!100500 WHERE 1 */",
+            "CREATE VIEW v AS SELECT id FROM items WHERE note = '/*!x*/'",
+        ] {
+            let e = err(sql);
+            assert!(e.contains("executable comment"), "{sql}: {e}");
+        }
+        for sql in [
+            "CREATE VIEW v AS SELECT id /* a note */ FROM items",
+            "CREATE VIEW v AS SELECT id FROM items -- a note",
+            "CREATE VIEW v AS SELECT /*+ MAX_EXECUTION_TIME(1000) */ id FROM items",
+        ] {
+            assert!(parse_definition(sql).is_ok(), "{sql}");
+        }
     }
 }
