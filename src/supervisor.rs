@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 use crate::accumulate::{ChunkCursor, UnitChunk, UnitSet};
 use crate::analyze::ViewPlan;
 use crate::config::{SupervisorConfig, SupervisorMode};
-use crate::metrics::{Metrics, PoolGauges};
+use crate::metrics::{self, Metrics, PoolGauges};
 use crate::mv::{self, Applied, Diff, Layout, Prepared, WriteOpts};
 
 /// Smallest chunk a view's units are split into (unless `LAZYVIEW_QUERY_CHUNK` is smaller).
@@ -532,7 +532,7 @@ impl Supervisor {
         if let Some(e) = read_err {
             return Err(e);
         }
-        let failed = std::mem::take(&mut *run.failed.lock().unwrap());
+        let failed = std::mem::take(&mut *metrics::lock(&run.failed));
         debug!(
             view = %run.job.plan.name,
             chunks,
@@ -540,7 +540,7 @@ impl Supervisor {
             peak_writes = run.peak.load(Ordering::Relaxed),
             "refreshed concurrently"
         );
-        let rows = *run.rows.lock().unwrap();
+        let rows = *metrics::lock(&run.rows);
         Ok(Outcome {
             failed: failed.into_iter().collect(),
             chunks,
@@ -652,13 +652,13 @@ async fn chunk_op(run: Arc<Run>, chunk: Option<UnitChunk>, permit: Permit) -> Re
         let (run, chunk, prepared) = (run.clone(), chunk.clone(), prepared.clone());
         writes.spawn(async move {
             let name = run.job.targets[t].name.clone();
-            if run.failed.lock().unwrap().contains_key(&name) {
+            if metrics::lock(&run.failed).contains_key(&name) {
                 return;
             }
             match write_op(&run, t, &chunk, &prepared).await {
-                Ok(a) => run.rows.lock().unwrap().applied(&a),
+                Ok(a) => metrics::lock(&run.rows).applied(&a),
                 Err(e) => {
-                    run.failed.lock().unwrap().entry(name).or_insert(e);
+                    metrics::lock(&run.failed).entry(name).or_insert(e);
                 }
             }
         });

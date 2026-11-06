@@ -1,7 +1,7 @@
 //! Counters exposed for logs and tests.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::binlog::Position;
 
@@ -167,6 +167,13 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Locks `m`, recovering a poisoned mutex (a thread panicked while holding it): the mutexes this
+/// is used for hold metrics and per-refresh bookkeeping, where the value a panicking thread left
+/// is still usable, so one panic does not turn into a panic in every later caller.
+pub fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Metrics {
     /// Marks the engine as making progress (liveness).
     pub fn beat(&self) {
@@ -191,11 +198,11 @@ impl Metrics {
 
     /// Registers the gauges of a supervisor pool (rendered on `/metrics`).
     pub fn register_pool(&self, g: Arc<PoolGauges>) {
-        self.pools.lock().unwrap().push(g);
+        lock(&self.pools).push(g);
     }
 
     pub fn pool_gauges(&self) -> Vec<Arc<PoolGauges>> {
-        self.pools.lock().unwrap().clone()
+        lock(&self.pools).clone()
     }
 
     pub fn add(c: &AtomicU64, n: u64) {
@@ -204,10 +211,27 @@ impl Metrics {
 
     /// Binlog position up to which every change has been applied to the views.
     pub fn applied(&self) -> Option<Position> {
-        self.applied.lock().unwrap().clone()
+        lock(&self.applied).clone()
     }
 
     pub fn set_applied(&self, p: Position) {
-        *self.applied.lock().unwrap() = Some(p);
+        *lock(&self.applied) = Some(p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_recovers_a_poisoned_mutex() {
+        let m = Mutex::new(1);
+        let r = std::panic::catch_unwind(|| {
+            let _g = m.lock().unwrap();
+            panic!("poisons the mutex");
+        });
+        assert!(r.is_err() && m.is_poisoned());
+        *lock(&m) += 1;
+        assert_eq!(*lock(&m), 2);
     }
 }
