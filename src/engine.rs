@@ -932,8 +932,8 @@ impl Engine {
             sup,
         };
 
-        let defs = meta::load_definitions(&mut e.meta).await?;
         if !e.cfg.sync {
+            let defs = meta::load_definitions(&mut e.meta).await?;
             // Validate definitions only (usable in CI: non-zero exit on any problem).
             let mut bad = 0;
             let mut names: HashMap<String, u64> = HashMap::new();
@@ -1058,6 +1058,11 @@ impl Engine {
             meta::save_identity(&mut e.meta, &e.cfg.instance_id, &identity).await?;
         }
         e.boundary = start.clone();
+        // Read the definitions only now that `start` is fixed: a definition committed while the engine
+        // starts is then in this snapshot, in the stream from `start`, or both (reloading an unchanged
+        // definition is a no-op). Read before the position, a commit in between was in neither and its
+        // view was never built.
+        let defs = meta::load_definitions(&mut e.meta).await?;
         e.load_slots(defs, !rebuild_all).await?;
         e.rebuild_routes();
 
