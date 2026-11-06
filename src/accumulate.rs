@@ -2299,4 +2299,193 @@ mod tests {
             k.filter(&["g".into(), "doc".into()]).0
         );
     }
+
+    /// One table `items(id int)` under schema `db`; the plan of `def` over it.
+    fn plan_for(def: &str) -> ViewPlan {
+        use std::sync::Arc;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, TableInfo};
+
+        let t = TableInfo {
+            schema: "db".into(),
+            name: "items".into(),
+            columns: vec![Column::simple("id", "int")],
+            pk: vec![0],
+            unique_keys: vec![],
+            cascades: vec![],
+            is_view: false,
+            view_bases: vec![],
+        };
+        let tables: std::collections::HashMap<_, _> =
+            [(("db".to_string(), "items".to_string()), Arc::new(t))]
+                .into_iter()
+                .collect();
+        plan(&parse_definition(def).unwrap(), "db", &tables).unwrap()
+    }
+
+    /// A failed chunk's keys come back into the set (ints, keys, nested partials); every
+    /// empty shape is empty.
+    #[test]
+    fn chunk_insert_into_and_is_empty() {
+        let mut set = UnitSet::default();
+        UnitChunk::Ints(vec![5, 9]).insert_into(&mut set);
+        UnitChunk::Keys(vec![vec![Datum::UInt(1), Datum::Int(2)].into()]).insert_into(&mut set);
+        UnitChunk::Partial(vec![0], Box::new(ints(&[7]))).insert_into(&mut set);
+        assert_eq!(set.len(), 4);
+        assert!(set.contains(&[Datum::Int(5)]));
+        assert!(set.contains(&[Datum::Int(7)]));
+        assert!(set.contains(&[Datum::UInt(1), Datum::Int(2)]));
+        assert!(UnitChunk::Ints(vec![]).is_empty());
+        assert!(UnitChunk::Keys(vec![]).is_empty());
+        assert!(UnitChunk::Partial(vec![], Box::new(ints(&[]))).is_empty());
+        assert!(!UnitChunk::Ints(vec![1]).is_empty());
+    }
+
+    /// The disjunction of one part is the part itself, of no parts is FALSE.
+    #[test]
+    fn or_join_renders_zero_one_and_many_parts() {
+        assert_eq!(or_join(vec![]), "FALSE");
+        assert_eq!(or_join(vec!["a".into()]), "a");
+        assert_eq!(or_join(vec!["a".into(), "b".into()]), "(a OR b)");
+    }
+
+    #[test]
+    fn for_aliases_sizes_the_image_sets() {
+        let d = ViewDirty::for_aliases(3);
+        assert_eq!(d.images.len(), 3);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn key_count_adds_every_buffered_kind() {
+        let mut d = ViewDirty::for_aliases(2);
+        d.units.insert_int(1);
+        d.units.insert_int(2);
+        d.images[0].insert(vec![Datum::UInt(9)].into());
+        d.images[1].extend([vec![Datum::UInt(8)].into(), vec![Datum::UInt(7)].into()]);
+        let mut p = UnitSet::default();
+        p.insert_int(10);
+        d.partial.push(p);
+        d.marks.push((0, Datum::Int(5)));
+        d.marks.push((1, Datum::Int(6)));
+        d.holds.push((0, Datum::Int(7)));
+        assert_eq!(d.key_count(), 2 + 3 + 1 + 2 + 1);
+        assert_eq!(ViewDirty::for_aliases(1).key_count(), 0);
+    }
+
+    /// A failed refresh's buffer goes back: nothing lost or dropped, images grown to the
+    /// bigger side, all/rebuild or-ed, a repeated mark pushed once.
+    #[test]
+    fn merge_keeps_everything_of_both_buffers() {
+        let mut a = ViewDirty::for_aliases(2);
+        let mut b = ViewDirty::for_aliases(4);
+        let k11: Key = vec![Datum::UInt(11)].into();
+        let k99: Key = vec![Datum::UInt(99)].into();
+        a.units.insert_int(1);
+        a.images[0].insert(k11.clone());
+        b.images[3].insert(k99.clone());
+        b.all = true;
+        b.rebuild = true;
+        b.marks.push((0, Datum::Int(5)));
+        a.merge(b);
+        assert_eq!(a.images.len(), 4);
+        assert!(a.images[0].contains(&k11));
+        assert!(a.images[3].contains(&k99));
+        assert!(a.all && a.rebuild);
+        assert_eq!(a.units.len(), 1);
+        assert_eq!(a.marks.len(), 1);
+        // The bigger buffer's surplus images survive a merge with a smaller one.
+        let mut c = ViewDirty::for_aliases(4);
+        let mut d = ViewDirty::for_aliases(2);
+        let k88: Key = vec![Datum::UInt(88)].into();
+        c.images[3].insert(k88.clone());
+        d.marks.push((0, Datum::Int(5)));
+        c.merge(d);
+        assert_eq!(c.images.len(), 4);
+        assert!(c.images[3].contains(&k88));
+        assert_eq!(c.marks.len(), 1);
+    }
+
+    /// A global view's one row counts as an id: the first mark_all records it, a repeat
+    /// absorbs.
+    #[test]
+    fn mark_all_tallies_the_global_id_once() {
+        let p = plan_for("CREATE VIEW v AS SELECT COUNT(*) FROM items");
+        assert!(matches!(p.mode, Mode::Global));
+        let mut d = ViewDirty::for_aliases(1);
+        d.mark_all(&p);
+        assert!(d.all);
+        assert_eq!((d.tally.ids_marked, d.tally.ids_absorbed), (1, 0));
+        d.mark_all(&p);
+        assert_eq!((d.tally.ids_marked, d.tally.ids_absorbed), (2, 1));
+    }
+
+    /// take hands over the buffer and leaves a fresh one of the same image size; merging it
+    /// back loses nothing.
+    #[test]
+    fn take_resets_the_buffer_and_back() {
+        let mut d = ViewDirty::for_aliases(2);
+        let k3: Key = vec![Datum::UInt(3)].into();
+        d.units.insert_int(1);
+        d.images[1].insert(k3.clone());
+        d.all = true;
+        let taken = d.take();
+        assert_eq!(taken.units.len(), 1);
+        assert!(taken.all);
+        assert!(taken.images[1].contains(&k3));
+        assert_eq!(d.images.len(), 2);
+        assert!(d.is_empty());
+        d.merge(taken);
+        assert_eq!(d.units.len(), 1);
+        assert!(d.all);
+        assert!(d.images[1].contains(&k3));
+    }
+
+    /// changed sees only the masked columns: an unmasked difference is not a change, and
+    /// equal rows never are.
+    #[test]
+    fn changed_follows_the_column_mask() {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        use mysql_async::Value;
+
+        let cols: Arc<[mysql_async::Column]> = (0..2)
+            .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
+            .collect();
+        let row = |a: i64, b: i64| {
+            BinlogRow::new(
+                vec![
+                    Some(BinlogValue::Value(Value::Int(a))),
+                    Some(BinlogValue::Value(Value::Int(b))),
+                ],
+                cols.clone(),
+            )
+        };
+        assert!(changed(&row(1, 2), &row(4, 2), &[true, false]));
+        assert!(!changed(&row(1, 2), &row(1, 9), &[true, false]));
+        assert!(!changed(&row(1, 2), &row(1, 2), &[true, true]));
+    }
+
+    /// drain re-applies the child events the next cache logged while seeding: they are not
+    /// there until drain runs, and after it they are kept.
+    #[test]
+    fn drain_reapplies_the_seeding_log() {
+        let p = plan_for("CREATE VIEW v AS SELECT id FROM items");
+        let mut dirty = ViewDirty::for_aliases(1);
+        dirty.cache = cascade::Cache::seeding();
+        let key: Key = vec![Datum::UInt(4)].into();
+        let row = KeptRow {
+            fk: key.clone(),
+            values: vec![],
+            complete: true,
+        };
+        dirty.cache.child(0, None, Some((key.clone(), row.clone())));
+        let log = dirty.cache.install(cascade::Cache::default());
+        assert!(!dirty.cache.is_seeding());
+        drain(&p, &mut dirty, log);
+        assert!(dirty.cache.rows(0).unwrap().rows.contains_key(&key));
+        assert_eq!(dirty.cache.rows(0).unwrap().rows.get(&key), Some(&row));
+    }
 }
