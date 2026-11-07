@@ -3,6 +3,8 @@
 //! verbatim; these files import only std, external crates and the copy-set modules access, analyze,
 //! catalog, cascade, datum and intset. No logging, no environment, no IO, no tokio.
 
+pub mod buffer;
 pub mod key;
 
+pub use buffer::IdSet;
 pub use key::{HopId, Item, Key, NoItem, NoJob, Op, SpaceId, Spaces};
