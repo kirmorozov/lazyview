@@ -231,7 +231,7 @@ and for `SELECT i.id, k.name FROM items i JOIN kinds k ON k.id = i.kind_id`, whe
 table's id is reached through the link (one hop):
 
 ```
-view db.item_kind_names route dedup fp f3e361947762550a
+view db.item_kind_names route dedup fp ef3c6e199471321c
 id 0 `i`.`id` (output 0)
 occ i db.items read (0, 1) -> direct id = (0)
 occ k db.kinds read (0, 1) -> hop 0 = `i`.`kind_id` -> id[0] (2 tables)
