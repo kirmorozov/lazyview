@@ -1044,6 +1044,155 @@ mod tests {
         }
     }
 
+    /// Three aliases `i` (0), occurrence `l` (1) and `o` (2), with the given id parts and
+    /// edges (synthetic shapes the live planner reduces or rejects).
+    fn three_alias_plan(
+        i: Arc<TableInfo>,
+        l: Arc<TableInfo>,
+        o: Arc<TableInfo>,
+        unit_refs: Vec<Vec<(usize, usize)>>,
+        edges: Vec<Edge>,
+    ) -> ViewPlan {
+        let alias = |i: usize, name: &str, t: Arc<TableInfo>| {
+            let n = t.columns.len();
+            crate::analyze::AliasPlan {
+                name: name.into(),
+                table: t,
+                referenced: vec![true; n],
+                membership: vec![true; n],
+                direct_unit: None,
+                image_cols: vec![],
+                subst_from: (String::new(), String::new()),
+                pos: (i, None),
+                semi: None,
+                lookup_where: false,
+            }
+        };
+        ViewPlan {
+            schema: "db".into(),
+            name: "v".into(),
+            hash: "h".into(),
+            mode: Mode::Grouped,
+            tables: vec![],
+            table_columns: vec![],
+            aliases: vec![alias(0, "i", i), alias(1, "l", l), alias(2, "o", o)],
+            projection: vec![],
+            from_sql: String::new(),
+            from_items: vec![],
+            where_sql: None,
+            group_sql: None,
+            having_sql: None,
+            unit_exprs: vec!["`i`.`id`".to_string(); unit_refs.len()],
+            unit_in_projection: (0..unit_refs.len()).map(Some).collect(),
+            full_select: String::new(),
+            unit_unique: false,
+            lineage: vec![],
+            cascades: vec![],
+            output_names: None,
+            order_limit_sql: None,
+            window_sql: None,
+            lookup_where_sql: None,
+            alias_filters: vec![vec![], vec![], vec![]],
+            partial: crate::analyze::PartialUnits::default(),
+            presence: vec![],
+            edges,
+            unit_refs,
+        }
+    }
+
+    #[test]
+    fn search_keeps_two_links_on_one_id_column() {
+        // Both edges sit on `l.child_id` (col 0) with different partners: the link dedup must
+        // keep both; only a true duplicate of the pair would be dropped.
+        let c = catalog();
+        let pick = |t: &str| c[&("db".into(), t.into())].clone();
+        let p = three_alias_plan(
+            pick("items"),
+            pick("item_links"),
+            pick("owners"),
+            vec![vec![(0, 0)], vec![(2, 0)]],
+            vec![
+                Edge {
+                    a: (1, 0),
+                    b: (0, 0),
+                    only_with: None,
+                },
+                Edge {
+                    a: (1, 0),
+                    b: (2, 0),
+                    only_with: None,
+                },
+            ],
+        );
+        let (aliases, links, positions) = chain(&p, 1).unwrap();
+        assert_eq!(aliases, vec![0, 2]);
+        assert_eq!(positions, vec![0, 1]);
+        assert_eq!(links, vec![(0, (0, 0)), (0, (2, 0))]);
+    }
+
+    #[test]
+    fn search_rejects_a_chain_that_covers_no_id_part() {
+        // `l` reaches `i` (one link), but every id part also reads the unreachable `o`:
+        // no position survives, so the chain cannot stand for the id.
+        let c = catalog();
+        let pick = |t: &str| c[&("db".into(), t.into())].clone();
+        let p = three_alias_plan(
+            pick("items"),
+            pick("item_links"),
+            pick("owners"),
+            vec![vec![(0, 0), (2, 0)], vec![(2, 1)]],
+            vec![Edge {
+                a: (1, 0),
+                b: (0, 0),
+                only_with: None,
+            }],
+        );
+        assert_eq!(
+            chain(&p, 1).unwrap_err(),
+            "not joined to the id by equalities"
+        );
+    }
+
+    #[test]
+    fn hop_rejects_a_link_compared_by_collation() {
+        // `o.ts` (timestamp) is not an exact key: a link whose one side is inexact must fail
+        // even when the other side is exact.
+        let c = catalog();
+        let pick = |t: &str| c[&("db".into(), t.into())].clone();
+        let o = Arc::new(TableInfo {
+            schema: "db".into(),
+            name: "owners".into(),
+            columns: vec![
+                Column::simple("id", "int"),
+                Column::simple("ts", "timestamp"),
+            ],
+            pk: vec![0],
+            unique_keys: vec![],
+            cascades: vec![],
+            is_view: false,
+            view_bases: vec![],
+        });
+        let p = three_alias_plan(
+            pick("items"),
+            pick("item_links"),
+            o,
+            vec![vec![(0, 0)], vec![(2, 0)]],
+            vec![
+                Edge {
+                    a: (1, 0),
+                    b: (0, 0),
+                    only_with: None,
+                },
+                Edge {
+                    a: (1, 0),
+                    b: (2, 1),
+                    only_with: None,
+                },
+            ],
+        );
+        assert_eq!(hop(&p, 1).unwrap_err(), "link compared by collation");
+    }
+
     #[test]
     fn left_join_owns_its_on_equality() {
         // `l`'s only usable edge is its own LEFT-join ON: it still hops.
