@@ -6842,6 +6842,53 @@ mod tests {
     }
 
     #[test]
+    fn id_outputs_view_column_list() {
+        let mut d = parse_definition(
+            "CREATE VIEW v (k, idcol) AS SELECT o.customer_id, o.id FROM orders o",
+        )
+        .unwrap();
+        d.id_outputs = vec!["K".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.unit_exprs, vec!["o.customer_id"]);
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![1]));
+        assert!(!v.unit_unique);
+    }
+
+    #[test]
+    fn id_outputs_windowed_need_shared_partition_keys() {
+        let sql = "SELECT o.customer_id, o.status, \
+                   ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.id) rn FROM orders o";
+        let mut d = parse_select(sql, "q").unwrap();
+        d.id_outputs = vec!["customer_id".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(
+            v.unit_exprs,
+            vec!["o.customer_id"],
+            "the shared partition key, unreduced"
+        );
+        assert!(!v.unit_unique);
+
+        let mut d = parse_select(sql, "q").unwrap();
+        d.id_outputs = vec!["status".to_string()];
+        let e = plan_block(&d, "db", &catalog()).unwrap_err().to_string();
+        assert!(
+            e.contains("is not a GROUP BY or shared PARTITION BY key"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn id_outputs_composite() {
+        let mut d = parse_select("SELECT o.customer_id, o.status FROM orders o", "q").unwrap();
+        d.id_outputs = vec!["customer_id".to_string(), "status".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.unit_exprs, vec!["o.customer_id", "o.status"]);
+        assert_eq!(v.unit_in_projection, vec![Some(0), Some(1)]);
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![1, 2]));
+        assert!(!v.unit_unique, "a chosen id is not known to be unique");
+    }
+
+    #[test]
     fn reserved_tables_are_refused_as_sources() {
         assert!(set_reserved(&["zz_reserved_t"], &["zz_reserved_"]));
         let mut cat = catalog();
