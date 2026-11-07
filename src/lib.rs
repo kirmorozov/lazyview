@@ -11,6 +11,7 @@ pub mod config;
 pub mod coord;
 pub mod datum;
 pub mod ddl;
+pub mod dedup;
 pub mod engine;
 pub mod fence;
 pub mod health;
