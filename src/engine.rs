@@ -657,6 +657,27 @@ const DRAIN_MAX_BYTES: usize = 32 << 20;
 /// Queue slots kept once a drained queue is empty again (a larger queue is shrunk to this).
 const DRAIN_KEEP_SLOTS: usize = 1024;
 
+/// Byte budget of the changes buffered for building versions, all of them together: a build
+/// cannot take its changes before it is done, so past this the binlog reader waits for the
+/// builds (`Engine::hold_for_builds`) instead of dropping changes. The roadmap's buffer bound
+/// (8 × [`DRAIN_MAX_BYTES`], 256 MiB), a constant.
+const BUILD_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
+/// Estimated memory of one buffered integer id, and of any other key, row image or mark (hash
+/// slot, boxed datums and a short value; wide images count low).
+const INT_KEY_BYTES: usize = 16;
+const KEY_BYTES: usize = 96;
+
+/// Estimated memory of a change buffer, from the sizes of its sets (no walk over the keys).
+fn buffer_bytes(d: &ViewDirty) -> usize {
+    let ints = d.units.ints.len() + d.partial.iter().map(|p| p.ints.len()).sum::<u64>();
+    let keys = d.units.keys.len()
+        + d.partial.iter().map(|p| p.keys.len()).sum::<usize>()
+        + d.images.iter().map(HashSet::len).sum::<usize>()
+        + d.marks.len()
+        + d.holds.len();
+    ints as usize * INT_KEY_BYTES + keys * KEY_BYTES
+}
+
 /// A binlog read result as the loop handles it (`Ok(None)`: the server closed the stream).
 type Read = Result<Option<Item>>;
 
@@ -2159,6 +2180,13 @@ impl Engine {
         // binlog loop.
         let first = self.slots[idx].live.is_none() && !partial;
         let swap = (routine || first) && matches!(plan.mode, Mode::Full(_));
+        // LAZYVIEW_TEST_BUILD_DELAY: a long build, for tests.
+        let test_delay = self
+            .cfg
+            .test_build_delay
+            .as_ref()
+            .filter(|(marker, _)| self.slots[idx].definition.contains(marker.as_str()))
+            .map(|(_, d)| *d);
         let task = tokio::spawn(build_task(
             self.src_opts.clone(),
             self.schema.clone(),
@@ -2171,6 +2199,7 @@ impl Engine {
             self.build_slots.clone(),
             (def_id, generation),
             swap,
+            test_delay,
         ));
         if routine {
             debug!(view = %name, "rebuilding");
@@ -2676,6 +2705,21 @@ impl Engine {
                 if !self.in_txn && flush {
                     self.flush_draining(&mut reader, &mut drained, &mut last_event)
                         .await?;
+                    // Once per flush, never per event: building versions over their budget hold
+                    // the reader until a build is applied.
+                    if self.builds_over_budget().is_some()
+                        && !self
+                            .hold_for_builds(
+                                &mut reader,
+                                &mut drained,
+                                &mut last_event,
+                                &mut build_rx,
+                                shutdown,
+                            )
+                            .await?
+                    {
+                        break 'reconnect;
+                    }
                 }
                 if !self.in_txn {
                     self.housekeeping().await?;
@@ -2778,6 +2822,46 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Holds the binlog reader while [`Self::builds_over_budget`]: a building version cannot take
+    /// its buffered changes before its build is done, and dropping them would cost the view a
+    /// rebuild after the swap (owner rule: never). Nothing is read meanwhile, so the server's
+    /// socket fills and the stream waits; build results are taken, a due flush runs (applying a
+    /// finished build's changes is what lifts the hold), and the loop keeps beating (`/livez`)
+    /// and housekeeping. Called only after a flush, between transactions; counted once per hold
+    /// in `binlog_backpressure`. `Ok(false)`: shutdown was requested meanwhile.
+    async fn hold_for_builds(
+        &mut self,
+        reader: &mut BinlogReader,
+        drained: &mut Drained,
+        last_event: &mut Instant,
+        build_rx: &mut mpsc::UnboundedReceiver<BuildDone>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<bool> {
+        Metrics::add(&self.metrics.binlog_backpressure, 1);
+        let held = self.builds_over_budget().unwrap_or(0);
+        warn!(buffered_mib = held >> 20, "changes buffered for building views exceed their budget; binlog reading paused until a build is applied");
+        let since = Instant::now();
+        while self.builds_over_budget().is_some() {
+            let tick = Instant::now() + Duration::from_secs(1);
+            let wake = self.flush_deadline().map_or(tick, |d| d.min(tick));
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => if *shutdown.borrow() { return Ok(false); },
+                Some(done) = build_rx.recv() => self.on_build_done(done),
+                _ = tokio::time::sleep_until(wake.into()) => {}
+            }
+            self.metrics.beat();
+            if self.flush_due() {
+                self.flush_draining(reader, drained, last_event).await?;
+            }
+            self.housekeeping().await?;
+        }
+        info!(paused = ?since.elapsed(), "binlog reading resumed");
+        // Not read meanwhile: the silence check starts afresh.
+        *last_event = Instant::now();
+        Ok(true)
     }
 
     /// ER 1236 from the dump thread (except a duplicate server id): the position cannot be
@@ -3483,6 +3567,20 @@ impl Engine {
         }
     }
 
+    /// The estimated bytes buffered for building versions, when they exceed their budget
+    /// ([`BUILD_HOLD_BYTES`]; `LAZYVIEW_TEST_BUILD_HOLD_BYTES` in tests). One pass over the
+    /// slots: evaluated once per flush, never per event.
+    fn builds_over_budget(&self) -> Option<usize> {
+        let budget = self.cfg.test_build_hold_bytes.unwrap_or(BUILD_HOLD_BYTES);
+        let held: usize = self
+            .slots
+            .iter()
+            .filter_map(|s| s.next.as_ref())
+            .map(|n| buffer_bytes(&n.dirty))
+            .sum();
+        (held > budget).then_some(held)
+    }
+
     fn key_count(&self) -> usize {
         self.slots
             .iter()
@@ -3605,21 +3703,8 @@ impl Engine {
             .map(|(id, (_, f))| (*id, *f))
             .collect();
         ready.sort();
-        // Buffered changes for a long build must not grow without bound: fall back to a
-        // rebuild after the swap instead.
-        let cap = self.cfg.batch_max_keys.saturating_mul(10).max(100_000);
-        for s in self.slots.iter_mut() {
-            if let Some(n) = s.next.as_mut() {
-                if n.dirty.key_count() > cap {
-                    let len = n.dirty.images.len();
-                    n.dirty = ViewDirty {
-                        images: vec![KeySet::default(); len],
-                        rebuild: true,
-                        ..Default::default()
-                    };
-                }
-            }
-        }
+        // Changes buffered for building versions stay until their build is applied (never a
+        // rebuild); past their byte budget the reader waits instead (see `hold_for_builds`).
         // Builds, refreshes and lookups below must see every transaction read so far.
         let has_reads = !ready.is_empty()
             || self.slots.iter().any(|s| {
@@ -5646,9 +5731,13 @@ async fn build_task(
     slots: Arc<tokio::sync::Semaphore>,
     (def_id, generation): (u64, u64),
     swap: bool,
+    test_delay: Option<Duration>,
 ) {
     let result = async {
         let _permit = slots.acquire_owned().await?;
+        if let Some(d) = test_delay {
+            tokio::time::sleep(d).await;
+        }
         let mut src = connect(&src_opts).await?;
         let layout = mv::probe(&mut src, &src_schema, &plan).await?;
         // The cascade cache is read on the source before the table is filled, so that no
@@ -5761,6 +5850,22 @@ mod tests {
         assert!(d.full() && !d.open());
         while d.pop().is_some() {}
         assert!(d.queue.capacity() <= DRAIN_KEEP_SLOTS && d.bytes == 0);
+    }
+
+    /// The memory estimate of a change buffer counts every kind of entry at its size.
+    #[test]
+    fn buffer_bytes_by_kind() {
+        let mut d = ViewDirty::for_aliases(1);
+        assert_eq!(buffer_bytes(&d), 0);
+        d.units.insert_int(1);
+        d.units.insert_int(2);
+        d.units.insert(Key::from([Datum::Bytes(b"k".to_vec())]));
+        d.images[0].insert(Key::from([Datum::Int(7), Datum::Null]));
+        d.partial.push(UnitSet::default());
+        d.partial[0].insert_int(3);
+        d.marks.push((0, Datum::Int(1)));
+        assert_eq!(buffer_bytes(&d), 3 * INT_KEY_BYTES + 3 * KEY_BYTES);
+        assert_eq!(BUILD_HOLD_BYTES, 256 << 20);
     }
 
     fn server(code: u16) -> anyhow::Error {

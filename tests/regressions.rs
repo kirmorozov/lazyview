@@ -3245,6 +3245,92 @@ fn reg_slow_planning_is_bounded() {
     });
 }
 
+/// A building version kept its buffered changes only up to max(10 × LAZYVIEW_BATCH_MAX_KEYS,
+/// 100 000) keys and traded them for a rebuild after the swap (owner rule: an incremental view
+/// never falls back to a rebuild). It keeps them now; past the byte budget of building buffers
+/// the binlog reader waits for the build instead, counted in `binlog_backpressure`. The hooks
+/// make the build long (`LAZYVIEW_TEST_BUILD_DELAY`) and the budget small
+/// (`LAZYVIEW_TEST_BUILD_HOLD_BYTES`: 1 700 000 bytes, about 106 000 integer ids).
+#[test]
+fn reg_long_build_keeps_its_keys() {
+    scenario("reg_build_keys", |ctx| async move {
+        let nums: Vec<String> = (0..400).map(|i| format!("({i})")).collect();
+        let ddl = [
+            "CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)"
+                .to_string(),
+            "CREATE TABLE nums (n INT PRIMARY KEY)".to_string(),
+            format!("INSERT INTO nums VALUES {}", nums.join(",")),
+        ];
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let mut specs = vec![ViewSpec::new(
+            "r_fast",
+            Kind::Incremental,
+            "SELECT id, status FROM orders",
+        )];
+        let ov = [
+            ("LAZYVIEW_TEST_BUILD_DELAY", "/*long_build*/:20000"),
+            ("LAZYVIEW_TEST_BUILD_HOLD_BYTES", "1700000"),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_build_keys", &ddl, &specs, &ov).await?;
+        let mut c = db.conn().await?;
+        let before = eng.snapshot();
+        let items = ViewSpec::new(
+            "r_items",
+            Kind::Incremental,
+            "SELECT id, grp, val FROM items /*long_build*/",
+        );
+        add_definition(&mut c, &items.definition, None).await?;
+        wait_state(
+            &mut c,
+            &mut eng,
+            "r_items",
+            "building",
+            Duration::from_secs(10),
+        )
+        .await?;
+        // 112 000 new ids while the build sleeps: more than the old cap of 100 000 keys, and
+        // past the budget.
+        exec(
+            &mut c,
+            "INSERT INTO items (grp, val) SELECT x.n, y.n FROM nums x JOIN nums y WHERE y.n < 280",
+        )
+        .await?;
+        let t = std::time::Instant::now();
+        while eng.snapshot().since(&before).rows_seen < 112_000 {
+            ensure!(
+                t.elapsed() < Duration::from_secs(15),
+                "the new rows were not read: {}",
+                fmt_snapshot(&eng.snapshot().since(&before))
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let states = view_state(&mut c, "r_items").await?;
+        ensure!(
+            states.iter().all(|s| s.state == "building"),
+            "the build ended before its changes were read (raise LAZYVIEW_TEST_BUILD_DELAY): {states:?}"
+        );
+        // Committed while the reader is held: read once the build is applied.
+        run(
+            &mut c,
+            &[
+                "UPDATE items SET val = val + 1 WHERE id <= 10",
+                "UPDATE orders SET status = 'held' WHERE id = 11",
+            ],
+        )
+        .await?;
+        specs.push(items);
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the long build").await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 1 && d.binlog_backpressure >= 1,
+            "expected one build (no rebuild after the swap) and one hold: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
 /// Server canary: MariaDB (10.11, 13.0 and 13.2 at least) returns a stale result for a
 /// re-executed prepared statement with `NOT IN (subquery)` once the subquery's result changes
 /// between empty and non-empty: it keeps answering as for the empty subquery (rows with a NULL
