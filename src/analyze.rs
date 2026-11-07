@@ -334,6 +334,9 @@ pub struct ParsedDef {
     /// Source text of each projection item of a plain top-level SELECT (None where it cannot be
     /// recovered exactly; empty for other query shapes).
     pub item_sql: Vec<Option<String>>,
+    /// The output columns the caller names as the target id (`IdSpec::Outputs`), in order; empty: the
+    /// view's own unit. lazyview never sets it.
+    pub id_outputs: Vec<String>,
 }
 
 pub fn definition_hash(def: &str) -> String {
@@ -520,6 +523,7 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
         hash: definition_hash(def),
         query_sql,
         item_sql,
+        id_outputs: Vec::new(),
     })
 }
 
@@ -2394,6 +2398,62 @@ fn reduce_unit(
         .collect()
 }
 
+/// The expressions of the output columns `def.id_outputs` names (see `ParsedDef::id_outputs`): a name
+/// is a `CREATE VIEW` column-list name, an output alias, or the column name of an unaliased column
+/// reference (case-insensitive). Grouped plans take group keys only, windowed plans shared partition
+/// keys only.
+fn chosen_id(
+    def: &ParsedDef,
+    proj: &[(&Expr, Option<String>)],
+    keys: Option<&[Expr]>,
+    scope: &Scope,
+) -> Result<Vec<Expr>> {
+    let mut chosen = Vec::new();
+    for n in &def.id_outputs {
+        let index: Option<usize> = if !def.columns.is_empty() {
+            def.columns.iter().position(|c| c.eq_ignore_ascii_case(n))
+        } else {
+            let mut hits = Vec::new();
+            for (i, (e, a)) in proj.iter().enumerate() {
+                let named = match a {
+                    Some(a) => a.eq_ignore_ascii_case(n),
+                    None => match e {
+                        Expr::Identifier(id) => ident_name(id).eq_ignore_ascii_case(n),
+                        Expr::CompoundIdentifier(parts) => parts
+                            .last()
+                            .is_some_and(|id| ident_name(id).eq_ignore_ascii_case(n)),
+                        _ => false,
+                    },
+                };
+                if named {
+                    hits.push(i);
+                }
+            }
+            match hits.len() {
+                0 => None,
+                1 => Some(hits[0]),
+                k => bail!("id output `{n}` names {k} output columns"),
+            }
+        };
+        let i = match index {
+            Some(i) => i,
+            None => bail!("id output `{n}` is not an output column of the SELECT"),
+        };
+        let e = proj[i].0;
+        if let Some(ks) = keys {
+            let is_key = ks.iter().any(|k| {
+                expr_key(e) == expr_key(k)
+                    || (scope.resolve(e).is_some() && scope.resolve(e) == scope.resolve(k))
+            });
+            if !is_key {
+                bail!("id output `{n}` is not a GROUP BY or shared PARTITION BY key");
+            }
+        }
+        chosen.push(e.clone());
+    }
+    Ok(chosen)
+}
+
 fn quote(id: &str) -> String {
     format!("`{}`", id.replace('`', "``"))
 }
@@ -2941,7 +3001,30 @@ pub fn plan_block(
     };
 
     // Units.
+    // The caller's id (`ParsedDef::id_outputs`) replaces the unit; a single-row aggregate has none.
+    let chosen = if def.id_outputs.is_empty() {
+        None
+    } else if matches!(mode, Mode::Global) {
+        bail!("a single-row aggregate has no id outputs");
+    } else {
+        let keys = match mode {
+            Mode::Grouped if windowed => Some(partition.as_slice()),
+            Mode::Grouped => Some(resolved_groups.as_slice()),
+            _ => None,
+        };
+        Some(chosen_id(def, &proj_exprs, keys, &scope)?)
+    };
     let unit_refs: Vec<Expr> = match mode {
+        _ if chosen.is_some() => {
+            let c = chosen.clone().unwrap();
+            for e in &c {
+                for (a, col) in col_refs(e, &scope) {
+                    referenced[a][col] = true;
+                    membership[a][col] = true;
+                }
+            }
+            c
+        }
         Mode::Spj => {
             let (n, t) = &aliases[0];
             // Without a row key (primary key or a UNIQUE NOT NULL key), equal rows are one
@@ -3015,7 +3098,7 @@ pub fn plan_block(
 
     // A group or partition key that the rest of the key determines adds nothing to the unit (the
     // partitions are the same sets).
-    let unit_refs = if mode == Mode::Grouped {
+    let unit_refs = if mode == Mode::Grouped && chosen.is_none() {
         reduce_unit(unit_refs, &scope, &base_edges, &own_edges)
     } else {
         unit_refs
@@ -3228,11 +3311,13 @@ pub fn plan_block(
         &base_edges,
         &own_edges,
     );
-    let unit_unique = match mode {
-        Mode::Spj => n_alias == 1 && aliases[0].1.row_key().is_some(),
-        Mode::Grouped => !windowed,
-        _ => false,
-    };
+    // A chosen id is the caller's: not reduced, and not known to be unique.
+    let unit_unique = chosen.is_none()
+        && match mode {
+            Mode::Spj => n_alias == 1 && aliases[0].1.row_key().is_some(),
+            Mode::Grouped => !windowed,
+            _ => false,
+        };
     // Tables read by subqueries in the ORDER BY of a top-N view: a change of a column they name
     // recomputes it, like a change of its own tables (cascades into them too).
     let order_tables = match (&order_usage, &top_n) {
@@ -6658,6 +6743,149 @@ mod tests {
     fn parse_select_refuses_create_and_two_statements() {
         assert!(parse_select("CREATE VIEW x AS SELECT 1", "q").is_err());
         assert!(parse_select("SELECT 1; SELECT 2", "q").is_err());
+    }
+
+    #[test]
+    fn id_outputs_take_the_named_column() {
+        let mut d = parse_select(
+            "SELECT o.customer_id AS _key, o.id, o.status FROM orders o",
+            "q",
+        )
+        .unwrap();
+        d.id_outputs = vec!["_key".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.mode, Mode::Spj);
+        assert_eq!(v.unit_exprs, vec!["o.customer_id"]);
+        assert_eq!(v.unit_in_projection, vec![Some(0)]);
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![1]));
+        assert!(!v.unit_unique, "a chosen id is not known to be unique");
+    }
+
+    #[test]
+    fn id_outputs_through_joins() {
+        let mut d = parse_select(
+            "SELECT c.id AS _key, o.id FROM orders o JOIN customers c ON c.id = o.customer_id",
+            "q",
+        )
+        .unwrap();
+        d.id_outputs = vec!["_key".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![1]));
+        assert_eq!(v.aliases[1].direct_unit, Some(vec![0]));
+
+        // The same with the two joins permuted:
+        let mut d = parse_select(
+            "SELECT c.id AS _key, o.id FROM customers c JOIN orders o ON c.id = o.customer_id",
+            "q",
+        )
+        .unwrap();
+        d.id_outputs = vec!["_key".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![0]));
+        assert_eq!(v.aliases[1].direct_unit, Some(vec![1]));
+
+        // ... and with the equality in WHERE:
+        let mut d = parse_select(
+            "SELECT c.id AS _key, o.id FROM orders o, customers c WHERE c.id = o.customer_id",
+            "q",
+        )
+        .unwrap();
+        d.id_outputs = vec!["_key".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![1]));
+        assert_eq!(v.aliases[1].direct_unit, Some(vec![0]));
+    }
+
+    #[test]
+    fn id_outputs_grouped_need_group_keys() {
+        let sql = "SELECT o.customer_id, o.status, COUNT(*) n \
+                   FROM orders o GROUP BY o.customer_id, o.status";
+        let mut d = parse_select(sql, "q").unwrap();
+        d.id_outputs = vec!["customer_id".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(
+            v.unit_exprs,
+            vec!["o.customer_id"],
+            "a chosen id is not reduced"
+        );
+
+        for (out, msg) in [
+            ("n", "is not a GROUP BY"),
+            ("nope", "is not an output column"),
+        ] {
+            let mut d = parse_select(sql, "q").unwrap();
+            d.id_outputs = vec![out.to_string()];
+            let e = plan_block(&d, "db", &catalog()).unwrap_err().to_string();
+            assert!(e.contains(msg), "{out}: {e}");
+        }
+
+        let mut d = parse_select("SELECT COUNT(*) n FROM orders", "q").unwrap();
+        d.id_outputs = vec!["n".to_string()];
+        let e = plan_block(&d, "db", &catalog()).unwrap_err().to_string();
+        assert!(e.contains("single-row aggregate"), "{e}");
+    }
+
+    #[test]
+    fn id_outputs_survive_the_front_end() {
+        let mut d = parse_select("SELECT o.customer_id AS _key, o.id FROM orders o", "q").unwrap();
+        d.id_outputs = vec!["_key".to_string()];
+        let inline = plan_block(&d, "db", &catalog()).unwrap();
+
+        let mut d = parse_select(
+            "WITH x AS (SELECT o.customer_id AS k, o.id FROM orders o) SELECT k AS _key, id FROM x",
+            "q",
+        )
+        .unwrap();
+        d.id_outputs = vec!["_key".to_string()];
+        let v = crate::analyzer::plan(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.aliases[0].direct_unit, inline.aliases[0].direct_unit);
+    }
+
+    #[test]
+    fn id_outputs_view_column_list() {
+        let mut d = parse_definition(
+            "CREATE VIEW v (k, idcol) AS SELECT o.customer_id, o.id FROM orders o",
+        )
+        .unwrap();
+        d.id_outputs = vec!["K".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.unit_exprs, vec!["o.customer_id"]);
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![1]));
+        assert!(!v.unit_unique);
+    }
+
+    #[test]
+    fn id_outputs_windowed_need_shared_partition_keys() {
+        let sql = "SELECT o.customer_id, o.status, \
+                   ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.id) rn FROM orders o";
+        let mut d = parse_select(sql, "q").unwrap();
+        d.id_outputs = vec!["customer_id".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(
+            v.unit_exprs,
+            vec!["o.customer_id"],
+            "the shared partition key, unreduced"
+        );
+        assert!(!v.unit_unique);
+
+        let mut d = parse_select(sql, "q").unwrap();
+        d.id_outputs = vec!["status".to_string()];
+        let e = plan_block(&d, "db", &catalog()).unwrap_err().to_string();
+        assert!(
+            e.contains("is not a GROUP BY or shared PARTITION BY key"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn id_outputs_composite() {
+        let mut d = parse_select("SELECT o.customer_id, o.status FROM orders o", "q").unwrap();
+        d.id_outputs = vec!["customer_id".to_string(), "status".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.unit_exprs, vec!["o.customer_id", "o.status"]);
+        assert_eq!(v.unit_in_projection, vec![Some(0), Some(1)]);
+        assert_eq!(v.aliases[0].direct_unit, Some(vec![1, 2]));
+        assert!(!v.unit_unique, "a chosen id is not known to be unique");
     }
 
     #[test]

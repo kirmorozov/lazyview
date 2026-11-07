@@ -88,6 +88,7 @@ pub(crate) fn plan_block(
         hash: def.hash.clone(),
         query_sql: def.query_sql.clone(),
         item_sql,
+        id_outputs: def.id_outputs.clone(),
     };
     let mut plan = match analyze::plan_block(&flat, schema, tables) {
         Ok(p) => p,
