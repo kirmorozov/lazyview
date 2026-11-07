@@ -51,7 +51,7 @@ S2. HARD CHECK H1, no special-casing by name. Over the ADDED lines under `src/` 
     example a specific attribute id or store id compared in code). Each one is an H1 FAIL.
 
 S3. HARD CHECK H2, copyable layering. For every file of the COPY SET that the change touches or adds:
-    `grep -nE 'crate::(engine|mv|meta|config|health|coord|supervisor|metrics|accumulate|lookback|ddl|lib)\b' FILES`
+    `grep -nE 'crate::(engine|mv|meta|config|health|coord|supervisor|metrics|accumulate|lookback|ddl|stats|plan_swap|lib)\b' FILES`
     Any hit = FAIL H2: COPY SET files may only reference other COPY SET modules, std and external crates.
     Also FAIL H2 if a COPY SET file reads lazyview-only state (environment variables named LAZYVIEW_*, the
     lazyview metadata tables) except through a parameter / setter whose defaults are lazyview's.
