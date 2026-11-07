@@ -113,6 +113,25 @@ const METADATA_TABLES: &[&str] = &[
     "_lazyview_overview",
 ];
 
+/// Tables an embedding program owns (see [`set_reserved`]): exact names and name prefixes, lowercase.
+static RESERVED: std::sync::OnceLock<(Vec<String>, Vec<String>)> = std::sync::OnceLock::new();
+
+/// Sets the tables an embedding program owns: exact `names` and name `prefixes`, compared
+/// case-insensitively, refused as view sources like lazyview's metadata tables. Only the first call
+/// takes effect; it returns whether this one did. lazyview itself never calls it.
+pub fn set_reserved(names: &[&str], prefixes: &[&str]) -> bool {
+    let low = |v: &[&str]| v.iter().map(|s| s.to_ascii_lowercase()).collect::<Vec<_>>();
+    RESERVED.set((low(names), low(prefixes))).is_ok()
+}
+
+/// Whether `table` is an embedding program's table (see [`set_reserved`]).
+fn reserved(table: &str) -> bool {
+    let t = table.to_ascii_lowercase();
+    RESERVED.get().is_some_and(|(names, prefixes)| {
+        names.contains(&t) || prefixes.iter().any(|p| t.starts_with(p.as_str()))
+    })
+}
+
 /// Builtins that are NULL whenever one of their arguments is NULL (strict). Any function not
 /// listed is taken as able to return a value for NULL arguments (`IF`, `COALESCE`, `CHAR`,
 /// `CHARSET`, `COERCIBILITY`, MariaDB `NVL2` / `DECODE_ORACLE`, aggregates, ...), so an
@@ -528,6 +547,17 @@ pub fn is_create_statement(def: &str) -> bool {
             .next()
             .is_some_and(|w| w.eq_ignore_ascii_case("CREATE")),
     }
+}
+
+/// A bare SELECT (an embedding program's query) parsed as the definition of view `name`: the same
+/// checks and the same plan as `CREATE VIEW name AS <sql>`; `hash` is the definition hash of `sql`.
+pub fn parse_select(sql: &str, name: &str) -> Result<ParsedDef> {
+    if is_create_statement(sql) {
+        bail!("expected a SELECT statement, found CREATE");
+    }
+    let mut def = parse_definition(&format!("CREATE VIEW {} AS {sql}", quote_ident(name)))?;
+    def.hash = definition_hash(sql);
+    Ok(def)
 }
 
 fn tokenize(sql: &str) -> Result<Vec<TokenWithSpan>> {
@@ -2409,6 +2439,9 @@ pub fn plan_block(
     for t in &all_tables {
         if METADATA_TABLES.iter().any(|m| m.eq_ignore_ascii_case(&t.1)) {
             bail!("lazyview metadata table `{}` cannot be a view source", t.1);
+        }
+        if reserved(&t.1) {
+            bail!("reserved table `{}` cannot be a view source", t.1);
         }
         if !tables.contains_key(t) {
             bail!("table `{}`.`{}` does not exist", t.0, t.1);
@@ -6604,6 +6637,54 @@ mod tests {
                          JOIN customers c ON c.id IN (o.customer_id) GROUP BY o.id, c.name",
         );
         assert_eq!(grouped.unit_exprs, vec!["o.id"], "the key reduces the unit");
+    }
+
+    #[test]
+    fn parse_select_plans_like_create_view() {
+        let sql = "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id";
+        let q = parse_select(sql, "q").unwrap();
+        assert_eq!(q.hash, definition_hash(sql), "the hash is the definition's");
+        let via = plan_block(&q, "db", &catalog()).unwrap();
+        let cv = p(&format!("CREATE VIEW q AS {sql}"));
+        assert_eq!(via.mode, cv.mode, "same mode");
+        assert_eq!(via.tracing(), cv.tracing(), "same tracing");
+        assert_eq!(via.unit_exprs, cv.unit_exprs, "same unit exprs");
+        for (a, b) in via.aliases.iter().zip(&cv.aliases) {
+            assert_eq!(a.direct_unit, b.direct_unit, "same direct unit");
+        }
+    }
+
+    #[test]
+    fn parse_select_refuses_create_and_two_statements() {
+        assert!(parse_select("CREATE VIEW x AS SELECT 1", "q").is_err());
+        assert!(parse_select("SELECT 1; SELECT 2", "q").is_err());
+    }
+
+    #[test]
+    fn reserved_tables_are_refused_as_sources() {
+        assert!(set_reserved(&["zz_reserved_t"], &["zz_reserved_"]));
+        let mut cat = catalog();
+        for t in [
+            table("zz_reserved_t", &[("id", "int")], &[0]),
+            table("zz_reserved_x", &[("id", "int")], &[0]),
+        ] {
+            cat.insert(t.0, t.1);
+        }
+        for name in ["zz_reserved_t", "zz_reserved_x"] {
+            let e = plan_block(
+                &parse_definition(&format!("CREATE VIEW v AS SELECT id FROM {name}")).unwrap(),
+                "db",
+                &cat,
+            )
+            .unwrap_err();
+            assert!(e.to_string().contains("reserved table"), "{name}: {e}");
+        }
+        plan_block(
+            &parse_definition("CREATE VIEW v AS SELECT o.id FROM orders o").unwrap(),
+            "db",
+            &cat,
+        )
+        .unwrap();
     }
 
     #[test]
