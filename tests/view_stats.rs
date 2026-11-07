@@ -107,7 +107,7 @@ fn view_stats_burst_follows_the_change() {
         verify(&ctx, &mut eng, &db, &specs, "initial").await?;
         let s0 = eng.stats_of(&db, "vs_pinned")?;
         ensure!(
-            s0.entities_distinct == 0 && s0.whole_view_refreshes == 0,
+            s0.entities_updated == 0 && s0.whole_view_refreshes == 0,
             "before the burst: {s0:?}"
         );
 
@@ -149,15 +149,10 @@ fn view_stats_burst_follows_the_change() {
             "the burst rebuilt the whole view: {s:?}"
         );
         ensure!(
-            s.entities_distinct == changed,
-            "distinct ids refreshed {} != items changed {changed}: {s:?}",
-            s.entities_distinct
-        );
-        ensure!(
             d.entities_updated >= changed
-                && d.entities_updated <= d.flushes * s.entities_distinct
+                && d.entities_updated <= d.flushes * changed
                 && d.entities_updated <= (1 + rounds) * changed,
-            "entities_updated {} outside [{changed}, min(flushes {} x distinct, {} x changed)]: {s:?}",
+            "entities_updated {} outside [{changed}, min(flushes {} x changed, {} x changed)]: {s:?}",
             d.entities_updated,
             d.flushes,
             1 + rounds
@@ -203,7 +198,8 @@ fn view_stats_burst_follows_the_change() {
             .with_context(|| format!("{key} missing in /stats: {j}"))?;
         ctx.log(format!("GET /stats → views[{key}] = {v}"));
         ensure!(
-            v["entities_distinct"] == changed
+            v["ids_marked"] == s.ids_marked
+                && v["entities_updated"] == s.entities_updated
                 && v["whole_view_refreshes"] == 0
                 && v["balanced"] == true
                 && v["mode"] == "incremental",
@@ -214,7 +210,10 @@ fn view_stats_burst_follows_the_change() {
             "/stats vs_entity: {j}"
         );
         let (status, metrics) = http_get(&addr, "/metrics").await?;
-        let series = format!("lazyview_view_entities_distinct{{view=\"{key}\"}} {changed}\n");
+        let series = format!(
+            "lazyview_view_entities_updated_total{{view=\"{key}\"}} {}\n",
+            s.entities_updated
+        );
         ensure!(
             status == 200 && metrics.contains(&series),
             "/metrics lacks {series:?}"
@@ -276,7 +275,6 @@ fn view_stats_dedup_absorbs_repeated_marks() {
             s.balanced() && s.ids_pending == 0 && d.whole_view_refreshes == 0,
             "invariant: {s:?}"
         );
-        ensure!(s.entities_distinct == n, "distinct: {s:?}");
         c.disconnect().await.ok();
         eng.stop().await?;
         Ok(())

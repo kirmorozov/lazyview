@@ -3,10 +3,11 @@
 //! (see docs/operations.md).
 //!
 //! They show per view whether the work follows the change: the binlog rows that reached the
-//! view, the target ids (units) they marked, how many of those marks the buffer absorbed because
-//! the id was already pending, the ids refreshed (in total and distinct), the view rows written,
-//! and how often the whole view was rebuilt. An incremental view is never rebuilt because rows
-//! changed, so `whole_view_refreshes` > 0 there is the storm alarm.
+//! view, the target ids (units) they marked before deduplication, how many of those marks the
+//! buffer absorbed because the id was already pending, the ids refreshed after deduplication
+//! (`entities_updated`), the view rows written, and how often the whole view was rebuilt. An
+//! incremental view is never rebuilt because rows changed, so `whole_view_refreshes` > 0 there
+//! is the storm alarm.
 //!
 //! Accounting: every mark either finds its id pending (`ids_absorbed`) or adds it to the buffer,
 //! from which it is refreshed once (`entities_updated`) or still waits (`ids_pending`), so
@@ -16,28 +17,18 @@
 //!
 //! Cost: per binlog row and view the binlog loop adds to plain integers in the view's buffer
 //! ([`Tally`]; the buffer's insert already says whether the id was new). Refresh results are
-//! collected in plain fields of the engine's view slot ([`Flush`]) and folded into the shared
-//! [`Registry`] once per flush, under one lock for all views. The distinct-id sets are updated
-//! there per refreshed id (integer ids by a bitmap union), so their cost follows the writes,
-//! not the binlog events. Memory per view: three id sets (since start and two 30 s buckets),
-//! about 2 bytes per dense integer id (up to 8 per sparse one) and about 16 per other id.
+//! counted in plain fields of the engine's view slot ([`Flush`]) and folded into the shared
+//! [`Registry`] once per flush, under one lock for all views. Every statistic is a counter
+//! summed since start (or a gauge): no per-id state, so the memory per view is constant.
 
 use std::collections::{BTreeMap, HashSet};
-use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
 
-use roaring::RoaringTreemap;
 use serde_json::{json, Value};
 
 use crate::accumulate::UnitSet;
-use crate::datum::Key;
 use crate::metrics::unix_now;
 use crate::mv::Applied;
-
-/// Length of the recent window of `entities_distinct_60s`.
-pub const WINDOW_SECS: u64 = 60;
-/// The window is two rotating buckets of this length.
-const BUCKET_SECS: u64 = WINDOW_SECS / 2;
 
 /// Counted by the binlog loop while it feeds one view's buffer: plain integers, folded into the
 /// view's statistics once per flush.
@@ -150,10 +141,6 @@ pub struct Flush {
     carried_absorbed: u64,
     refreshes: u64,
     updated: u64,
-    /// The ids refreshed (for the distinct counts).
-    ids: UnitSet,
-    /// The partial unit keys refreshed, per set.
-    partial: Vec<UnitSet>,
     work: Work,
     builds: u64,
     whole: u64,
@@ -165,7 +152,8 @@ impl Flush {
     /// A refresh of the live version took `units` and the partial unit keys `partial` (per set
     /// of the plan's partial units; each counts as one id) from the buffer and refreshed them;
     /// `all`: the single row of a global view. One that neither refreshed nor queried anything
-    /// (a global view without a change) is not counted.
+    /// (a global view without a change) is not counted. Only the number of ids is kept: the
+    /// sets are dropped here.
     pub fn refreshed(&mut self, units: UnitSet, partial: Vec<UnitSet>, all: bool, work: &Work) {
         let n =
             (units.len() + partial.iter().map(UnitSet::len).sum::<usize>()) as u64 + u64::from(all);
@@ -176,21 +164,6 @@ impl Flush {
         self.refreshes += 1;
         self.updated += n;
         self.last_refresh_unix = unix_now();
-        if self.ids.is_empty() {
-            self.ids = units;
-        } else {
-            self.ids.extend(units);
-        }
-        if all {
-            // The global view's one unit.
-            self.ids.insert(Key::from([]));
-        }
-        if self.partial.len() < partial.len() {
-            self.partial.resize_with(partial.len(), UnitSet::default);
-        }
-        for (mine, keys) in self.partial.iter_mut().zip(partial) {
-            mine.extend(keys);
-        }
     }
 
     /// A build of the view started: `whole` when it replaces a live version (a whole-view
@@ -226,68 +199,6 @@ pub struct Fold {
     pub cascade_cached_rows: u64,
 }
 
-/// No-op hasher for values that are hashes already.
-#[derive(Default)]
-struct Prehashed(u64);
-
-impl Hasher for Prehashed {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(b);
-        }
-    }
-
-    fn write_u64(&mut self, v: u64) {
-        self.0 = v;
-    }
-}
-
-/// 64-bit hash of a non-integer or composite id (exact distinct counts up to hash collisions).
-fn key_hash(k: &Key) -> u64 {
-    let mut h = DefaultHasher::new();
-    k.hash(&mut h);
-    h.finish()
-}
-
-/// 64-bit hash of a partial unit key of partial set `set` (apart from full ids and other sets).
-fn partial_hash(set: usize, k: impl Hash) -> u64 {
-    let mut h = DefaultHasher::new();
-    (set, k).hash(&mut h);
-    h.finish()
-}
-
-/// Distinct ids: integer ids exactly in a bitmap, others by their 64-bit hash.
-#[derive(Debug, Default)]
-struct IdSet {
-    ints: RoaringTreemap,
-    hashed: HashSet<u64, BuildHasherDefault<Prehashed>>,
-}
-
-impl IdSet {
-    fn add(&mut self, ints: &RoaringTreemap, hashed: &[u64]) {
-        self.ints |= ints;
-        self.hashed.extend(hashed.iter().copied());
-    }
-
-    fn len(&self) -> u64 {
-        self.ints.len() + self.hashed.len() as u64
-    }
-
-    fn union_len(&self, o: &IdSet) -> u64 {
-        let (small, big) = if self.hashed.len() <= o.hashed.len() {
-            (&self.hashed, &o.hashed)
-        } else {
-            (&o.hashed, &self.hashed)
-        };
-        let shared = small.iter().filter(|h| big.contains(h)).count();
-        self.ints.union_len(&o.ints) + (small.len() + big.len() - shared) as u64
-    }
-}
-
 /// The shared statistics of one view.
 #[derive(Debug, Default)]
 struct ViewStats {
@@ -302,35 +213,10 @@ struct ViewStats {
     whole: u64,
     last_whole: Option<(&'static str, u64)>,
     last_refresh_unix: u64,
-    distinct: IdSet,
-    /// Ids refreshed since `cur_start`, and in the bucket before it.
-    cur: IdSet,
-    prev: IdSet,
-    cur_start: u64,
 }
 
 impl ViewStats {
-    fn new(now: u64) -> ViewStats {
-        ViewStats {
-            cur_start: now,
-            ..Default::default()
-        }
-    }
-
-    /// Moves the recent-window buckets on to `now`.
-    fn rotate(&mut self, now: u64) {
-        let age = now.saturating_sub(self.cur_start);
-        if age >= 2 * BUCKET_SECS {
-            self.prev = IdSet::default();
-            self.cur = IdSet::default();
-            self.cur_start = now - age % BUCKET_SECS;
-        } else if age >= BUCKET_SECS {
-            self.prev = std::mem::take(&mut self.cur);
-            self.cur_start += BUCKET_SECS;
-        }
-    }
-
-    fn fold(&mut self, f: Fold, now: u64) {
+    fn fold(&mut self, f: Fold) {
         let Fold {
             mode,
             mut tally,
@@ -354,26 +240,9 @@ impl ViewStats {
             self.last_whole = flush.last_whole;
         }
         self.last_refresh_unix = self.last_refresh_unix.max(flush.last_refresh_unix);
-        self.rotate(now);
-        let mut hashed: Vec<u64> = flush.ids.keys.iter().map(key_hash).collect();
-        for (set, keys) in flush.partial.iter().enumerate() {
-            hashed.extend(
-                keys.ints
-                    .to_sorted_vec()
-                    .iter()
-                    .map(|v| partial_hash(set, v)),
-            );
-            hashed.extend(keys.keys.iter().map(|k| partial_hash(set, k)));
-        }
-        if !flush.ids.is_empty() || !hashed.is_empty() {
-            let ints: RoaringTreemap = flush.ids.ints.to_sorted_vec().into_iter().collect();
-            self.distinct.add(&ints, &hashed);
-            self.cur.add(&ints, &hashed);
-        }
     }
 
-    fn snapshot(&mut self, now: u64) -> ViewSnapshot {
-        self.rotate(now);
+    fn snapshot(&self) -> ViewSnapshot {
         let r = &self.work.rows;
         ViewSnapshot {
             mode: self.mode.to_string(),
@@ -388,9 +257,6 @@ impl ViewStats {
             cascade_gaps: self.tally.cascade_gaps,
             cascade_cached_rows: self.cascade_cached_rows,
             entities_updated: self.updated,
-            entities_distinct: self.distinct.len(),
-            entities_distinct_60s: self.cur.union_len(&self.prev),
-            window_start_unix: self.cur_start.saturating_sub(BUCKET_SECS),
             rows_inserted: r.inserted,
             rows_updated: r.updated,
             rows_deleted: r.deleted,
@@ -412,7 +278,9 @@ pub struct ViewSnapshot {
     pub mode: String,
     pub source_rows: u64,
     pub source_rows_skipped: u64,
+    /// Target ids marked, before deduplication.
     pub ids_marked: u64,
+    /// Of those, already pending (absorbed by deduplication).
     pub ids_absorbed: u64,
     pub ids_pending: u64,
     pub images_marked: u64,
@@ -423,11 +291,8 @@ pub struct ViewSnapshot {
     pub cascade_gaps: u64,
     /// Rows kept in the live version's in-memory cascade cache.
     pub cascade_cached_rows: u64,
+    /// Target ids refreshed, after deduplication (each id once per flush).
     pub entities_updated: u64,
-    pub entities_distinct: u64,
-    /// Distinct ids refreshed since `window_start_unix` (30 to 60 s ago).
-    pub entities_distinct_60s: u64,
-    pub window_start_unix: u64,
     pub rows_inserted: u64,
     pub rows_updated: u64,
     pub rows_deleted: u64,
@@ -465,9 +330,6 @@ impl ViewSnapshot {
             "cascade_gaps": self.cascade_gaps,
             "cascade_cached_rows": self.cascade_cached_rows,
             "entities_updated": self.entities_updated,
-            "entities_distinct": self.entities_distinct,
-            "entities_distinct_60s": self.entities_distinct_60s,
-            "window_start_unix": self.window_start_unix,
             "rows_inserted": self.rows_inserted,
             "rows_updated": self.rows_updated,
             "rows_deleted": self.rows_deleted,
@@ -487,7 +349,7 @@ impl ViewSnapshot {
     }
 
     /// `(name, help, counter)` and value of each `/metrics` series.
-    fn series(&self) -> [(&'static str, &'static str, bool, u64); 23] {
+    fn series(&self) -> [(&'static str, &'static str, bool, u64); 21] {
         [
             (
                 "source_rows",
@@ -551,21 +413,9 @@ impl ViewSnapshot {
             ),
             (
                 "entities_updated",
-                "Target ids refreshed, summed over flushes.",
+                "Target ids refreshed after deduplication, summed over flushes.",
                 true,
                 self.entities_updated,
-            ),
-            (
-                "entities_distinct",
-                "Distinct target ids refreshed since start.",
-                false,
-                self.entities_distinct,
-            ),
-            (
-                "entities_distinct_60s",
-                "Distinct target ids refreshed within the last 30 to 60 seconds.",
-                false,
-                self.entities_distinct_60s,
             ),
             (
                 "rows_inserted",
@@ -642,7 +492,6 @@ impl Snapshot {
         json!({
             "since_unix": self.since_unix,
             "now_unix": self.now_unix,
-            "window_secs": WINDOW_SECS,
             "views": views,
         })
     }
@@ -692,18 +541,12 @@ impl Registry {
     /// Folds the state of every current view into the statistics (one lock); views not listed
     /// (removed definitions) are forgotten.
     pub fn fold(&self, views: Vec<Fold>) {
-        self.fold_at(views, unix_now());
-    }
-
-    fn fold_at(&self, views: Vec<Fold>, now: u64) {
         let mut m = self.views.lock().unwrap_or_else(|e| e.into_inner());
         let listed: HashSet<&str> = views.iter().map(|f| f.view.as_str()).collect();
         m.retain(|k, _| listed.contains(k.as_str()));
         for mut f in views {
             let key = std::mem::take(&mut f.view);
-            m.entry(key)
-                .or_insert_with(|| ViewStats::new(now))
-                .fold(f, now);
+            m.entry(key).or_default().fold(f);
         }
     }
 
@@ -712,29 +555,25 @@ impl Registry {
     }
 
     fn snapshot_at(&self, now: u64) -> Snapshot {
-        let mut m = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        let m = self.views.lock().unwrap_or_else(|e| e.into_inner());
         Snapshot {
             since_unix: self.since_unix,
             now_unix: now,
-            views: m
-                .iter_mut()
-                .map(|(k, v)| (k.clone(), v.snapshot(now)))
-                .collect(),
+            views: m.iter().map(|(k, v)| (k.clone(), v.snapshot())).collect(),
         }
     }
 
     /// The statistics of one view (`<schema>.<view>`).
     pub fn view(&self, name: &str) -> Option<ViewSnapshot> {
-        let now = unix_now();
-        let mut m = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        m.get_mut(name).map(|v| v.snapshot(now))
+        let m = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(name).map(ViewStats::snapshot)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum::Datum;
+    use crate::datum::{Datum, Key};
 
     fn ints(v: &[i64]) -> UnitSet {
         let mut s = UnitSet::default();
@@ -828,10 +667,9 @@ mod tests {
     }
 
     /// Marks, absorption, refreshes and pending ids over several flushes keep
-    /// `ids_marked = ids_absorbed + entities_updated + ids_pending`, and the distinct counts are
-    /// exact (integer and composite ids).
+    /// `ids_marked = ids_absorbed + entities_updated + ids_pending` (integer and composite ids).
     #[test]
-    fn folds_keep_the_invariant_and_count_distinct_ids() {
+    fn folds_keep_the_invariant() {
         let reg = Registry::default();
         let now = 1_000_000;
         // Flush 1: ids 1..=100 marked three times each; all refreshed.
@@ -854,12 +692,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        reg.fold_at(vec![fold("s.v", t, f, 0)], now);
+        reg.fold(vec![fold("s.v", t, f, 0)]);
         let s = reg.snapshot_at(now).views["s.v"].clone();
         assert_eq!(s.ids_marked, 300);
         assert_eq!(s.ids_absorbed, 200);
         assert_eq!(s.entities_updated, 100);
-        assert_eq!(s.entities_distinct, 100);
         assert_eq!(s.flushes, 1);
         assert_eq!(s.rows_updated, 100);
         assert!(s.balanced(), "{s:?}");
@@ -881,13 +718,11 @@ mod tests {
             },
         );
         mark(&mut t, &mut buf, &(151..=160).collect::<Vec<_>>());
-        reg.fold_at(vec![fold("s.v", t, f, buf.len() as u64)], now + 1);
+        reg.fold(vec![fold("s.v", t, f, buf.len() as u64)]);
         let s = reg.snapshot_at(now + 1).views["s.v"].clone();
         assert_eq!(s.ids_marked, 300 + 100 + 5 + 10);
         assert_eq!(s.entities_updated, 100 + 105);
         assert_eq!(s.ids_pending, 10);
-        assert_eq!(s.entities_distinct, 150 + 5);
-        assert_eq!(s.entities_distinct_60s, 155);
         assert!(s.balanced(), "{s:?}");
 
         // Flush 3: the pending ids are refreshed; a build hands 3 ids over, one already pending.
@@ -899,10 +734,13 @@ mod tests {
             &Work::default(),
         );
         f.carried(3, 1);
-        reg.fold_at(vec![fold("s.v", Tally::default(), f, 2)], now + 2);
+        reg.fold(vec![fold("s.v", Tally::default(), f, 2)]);
         let s = reg.snapshot_at(now + 2).views["s.v"].clone();
         assert_eq!(s.ids_pending, 2);
-        assert_eq!(s.entities_distinct, 165);
+        assert_eq!(
+            (s.ids_marked, s.ids_absorbed, s.entities_updated),
+            (418, 201, 215)
+        );
         assert!(s.balanced(), "{s:?}");
         assert_eq!(s.whole_view_refreshes, 0);
     }
@@ -925,7 +763,7 @@ mod tests {
         assert_eq!((f.refreshes, f.updated, f.work.lookup_queries), (1, 0, 2));
     }
 
-    /// Partial unit keys count as ids, distinct per partial set and apart from full units.
+    /// Partial unit keys count as ids: one per key of each partial set, added to the full units.
     #[test]
     fn partial_keys_count_as_ids() {
         let reg = Registry::default();
@@ -940,13 +778,12 @@ mod tests {
             false,
             &Work::default(),
         );
-        reg.fold_at(vec![fold("s.p", t, f, 0)], 1);
+        reg.fold(vec![fold("s.p", t, f, 0)]);
         let s = reg.view_at("s.p", 1);
         assert_eq!(
             (s.ids_marked, s.ids_absorbed, s.entities_updated),
             (5, 1, 4)
         );
-        assert_eq!(s.entities_distinct, 4);
         assert!(s.balanced(), "{s:?}");
     }
 
@@ -958,18 +795,17 @@ mod tests {
         t.id(false);
         let mut f = Flush::default();
         f.refreshed(UnitSet::default(), Vec::new(), true, &Work::default());
-        reg.fold_at(vec![fold("s.g", t, f, 0)], 10);
+        reg.fold(vec![fold("s.g", t, f, 0)]);
         let mut f = Flush::default();
         let mut t = Tally::default();
         t.id(true);
         f.refreshed(UnitSet::default(), Vec::new(), true, &Work::default());
-        reg.fold_at(vec![fold("s.g", t, f, 0)], 11);
+        reg.fold(vec![fold("s.g", t, f, 0)]);
         let s = reg.view_at("s.g", 11);
         assert_eq!(
             (s.ids_marked, s.ids_absorbed, s.entities_updated),
             (3, 1, 2)
         );
-        assert_eq!(s.entities_distinct, 1);
         assert!(s.balanced());
     }
 
@@ -978,13 +814,13 @@ mod tests {
         let reg = Registry::default();
         let mut f = Flush::default();
         f.built(false, "first build");
-        reg.fold_at(vec![fold("s.v", Tally::default(), f, 0)], 5);
+        reg.fold(vec![fold("s.v", Tally::default(), f, 0)]);
         let s = reg.view_at("s.v", 5);
         assert_eq!((s.builds, s.whole_view_refreshes), (1, 0));
         assert_eq!(s.last_whole_view_refresh, None);
         let mut f = Flush::default();
         f.built(true, "affected ids unknown");
-        reg.fold_at(vec![fold("s.v", Tally::default(), f, 0)], 6);
+        reg.fold(vec![fold("s.v", Tally::default(), f, 0)]);
         let s = reg.view_at("s.v", 6);
         assert_eq!((s.builds, s.whole_view_refreshes), (1, 1));
         assert_eq!(
@@ -998,60 +834,9 @@ mod tests {
             "affected ids unknown"
         );
         // A view no longer listed is forgotten.
-        reg.fold_at(vec![fold("s.w", Tally::default(), Flush::default(), 0)], 7);
+        reg.fold(vec![fold("s.w", Tally::default(), Flush::default(), 0)]);
         let snap = reg.snapshot_at(7);
         assert_eq!(snap.views.keys().collect::<Vec<_>>(), ["s.w"]);
-    }
-
-    /// The recent window holds the ids of the current and the previous 30 s bucket.
-    #[test]
-    fn distinct_window_rotates() {
-        let reg = Registry::default();
-        let t0 = 1_000;
-        let refresh = |reg: &Registry, ids: &[i64], at: u64| {
-            let mut f = Flush::default();
-            f.refreshed(ints(ids), Vec::new(), false, &Work::default());
-            reg.fold_at(vec![fold("s.v", Tally::default(), f, 0)], at);
-        };
-        refresh(&reg, &[1, 2, 3], t0);
-        refresh(&reg, &[3, 4], t0 + 10);
-        let s = reg.view_at("s.v", t0 + 10);
-        assert_eq!((s.entities_distinct, s.entities_distinct_60s), (4, 4));
-        // Next bucket: the first one is still in the window.
-        refresh(&reg, &[5], t0 + 35);
-        let s = reg.view_at("s.v", t0 + 35);
-        assert_eq!((s.entities_distinct, s.entities_distinct_60s), (5, 5));
-        assert_eq!(s.window_start_unix, t0);
-        // Two buckets on: only the ids since t0 + 30.
-        let s = reg.view_at("s.v", t0 + 61);
-        assert_eq!((s.entities_distinct, s.entities_distinct_60s), (5, 1));
-        assert_eq!(s.window_start_unix, t0 + 30);
-        refresh(&reg, &[5, 6], t0 + 70);
-        let s = reg.view_at("s.v", t0 + 70);
-        assert_eq!(s.entities_distinct_60s, 2);
-        // Quiet for minutes: empty window, aligned to the bucket grid.
-        let s = reg.view_at("s.v", t0 + 300);
-        assert_eq!((s.entities_distinct, s.entities_distinct_60s), (6, 0));
-        assert_eq!(s.window_start_unix, t0 + 270);
-        // Composite ids: exact union across buckets.
-        let mut f = Flush::default();
-        f.refreshed(
-            keys(&[("x", 1), ("y", 1)]),
-            Vec::new(),
-            false,
-            &Work::default(),
-        );
-        reg.fold_at(vec![fold("s.v", Tally::default(), f, 0)], t0 + 301);
-        let mut f = Flush::default();
-        f.refreshed(
-            keys(&[("y", 1), ("z", 1)]),
-            Vec::new(),
-            false,
-            &Work::default(),
-        );
-        reg.fold_at(vec![fold("s.v", Tally::default(), f, 0)], t0 + 331);
-        let s = reg.view_at("s.v", t0 + 331);
-        assert_eq!((s.entities_distinct, s.entities_distinct_60s), (9, 3));
     }
 
     #[test]
@@ -1062,13 +847,10 @@ mod tests {
         t.id(true);
         let mut f = Flush::default();
         f.refreshed(ints(&[1]), Vec::new(), false, &Work::default());
-        reg.fold_at(
-            vec![
-                fold("s.a", t, f, 0),
-                fold("s.b\"q", Tally::default(), Flush::default(), 0),
-            ],
-            1,
-        );
+        reg.fold(vec![
+            fold("s.a", t, f, 0),
+            fold("s.b\"q", Tally::default(), Flush::default(), 0),
+        ]);
         let mut out = String::new();
         reg.snapshot_at(1)
             .write_prometheus(&mut out, |v| v.replace('"', "\\\""));

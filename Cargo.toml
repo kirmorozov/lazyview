@@ -25,16 +25,15 @@ thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
 serde_json = { version = "1", features = ["float_roundtrip"] }
-roaring = "0.12"
+roaring = { version = "0.12", optional = true }
 foldhash = "0.2"
 
 [features]
 # `roaring` switches src/intset.rs to its RoaringTreemap backend (meant for
-# dense id ranges; the default plain hash set is the general choice).
-# The dependency stays non-optional: lazyview still uses roaring directly
-# (the /stats distinct-id sets in src/stats.rs) until they move to IntSet. lazy-wire-fire declares
-# `roaring = ["dep:roaring"]`; the cfg name in src/intset.rs is the contract.
-roaring = []
+# dense id ranges; the default plain hash set is the general choice). It is
+# the only user of the optional `roaring` dependency. lazy-wire-fire declares
+# the same `roaring = ["dep:roaring"]`; the cfg name in src/intset.rs is the contract.
+roaring = ["dep:roaring"]
 
 [dev-dependencies]
 rand = "0.10"
