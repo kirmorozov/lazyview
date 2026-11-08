@@ -7,7 +7,7 @@ docker run -d --name lazyview --restart unless-stopped \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   -p 8080:8080 \
   --env-file lazyview.env \
-  ghcr.io/kirmorozov/lazyview:edge
+  ghcr.io/kirmorozov/lazyview:0.1.0
 ```
 
 * `lazyview.env` holds `NAME=value` lines (`LAZYVIEW_HOST=…`, `LAZYVIEW_USER=…`,
@@ -21,15 +21,16 @@ docker run -d --name lazyview --restart unless-stopped \
 * The image has no shell, so there is nothing to `docker exec` into. Use
   `docker exec lazyview /lazyview healthcheck`, the HTTP endpoints, the logs and the
   [database tables](#status-from-the-database).
-* Image tags: `edge` is the latest build of `main`, `sha-<commit>` is every published build, and
-  releases are `X.Y.Z`, `X.Y`, `X` and `latest`. Details: [development](development.md#image).
+* Image tags: releases are `X.Y.Z`, `X.Y` and `latest` (for 0.x there is no bare `X` tag), `edge`
+  is the nightly build of `main` and may be unstable, `sha-<commit>` is every published build.
+  Details: [development](development.md#image).
 
 As a Compose service for an existing database:
 
 ```yaml
 services:
   lazyview:
-    image: ghcr.io/kirmorozov/lazyview:edge
+    image: ghcr.io/kirmorozov/lazyview:0.1.0
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]

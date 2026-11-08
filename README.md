@@ -29,13 +29,13 @@ docker run -d --name lazyview --restart unless-stopped \
   -e LAZYVIEW_USER=lazyview \
   -e LAZYVIEW_PASSWORD='change-me' \
   -e LAZYVIEW_DATABASE=app \
-  ghcr.io/kirmorozov/lazyview:edge
+  ghcr.io/kirmorozov/lazyview:0.1.0
 ```
 
-`edge` is the latest build of `main`; once a release exists, pin a version (`:0.1.0`) or use
-`latest`. To try it with a bundled MySQL 8.4, run
+Releases are tagged `X.Y.Z`, `X.Y` and `latest`; `edge` is the nightly build of `main` and may be
+unstable — for trying what is coming, not for production. To try it with a bundled MySQL 8.4, run
 `docker compose -f docker-compose.example.yml up -d --build --wait` from a checkout, or set
-`LAZYVIEW_IMAGE=ghcr.io/kirmorozov/lazyview:edge` to use the published image (see the header of
+`LAZYVIEW_IMAGE=ghcr.io/kirmorozov/lazyview:0.1.0` to use the published image (see the header of
 [docker-compose.example.yml](docker-compose.example.yml)). Kubernetes: [docs/kubernetes.md](docs/kubernetes.md).
 
 **3. Define a view.** lazyview creates the `_lazyview` table on startup. Each row is one view, here
