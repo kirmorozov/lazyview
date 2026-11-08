@@ -1075,14 +1075,6 @@ fn edge_random(g: &mut Gen) -> Vec<String> {
     stmts
 }
 
-async fn txn(c: &mut mysql_async::Conn, stmts: &[String]) -> Result<()> {
-    exec(c, "START TRANSACTION").await?;
-    for s in stmts {
-        exec(c, s).await?;
-    }
-    exec(c, "COMMIT").await
-}
-
 async fn run_edge(ctx: &Ctx, label: &str, seed: u64, window_ms: &str) -> Result<()> {
     let db = ctx.new_db(&format!("cte_edge_{label}")).await?;
     let mut c = db.conn().await?;
@@ -1104,7 +1096,7 @@ async fn run_edge(ctx: &Ctx, label: &str, seed: u64, window_ms: &str) -> Result<
     .await?;
     let mut last = "";
     for (what, stmts) in edge_steps() {
-        txn(&mut c, &stmts)
+        txn(&mut c, &stmts, false)
             .await
             .with_context(|| what.to_string())?;
         if what == "hammer" {
@@ -1125,7 +1117,7 @@ async fn run_edge(ctx: &Ctx, label: &str, seed: u64, window_ms: &str) -> Result<
     let mut g = Gen::new(seed);
     for round in 1..=3 {
         for _ in 0..scaled(60) {
-            txn(&mut c, &edge_random(&mut g)).await?;
+            txn(&mut c, &edge_random(&mut g), false).await?;
         }
         verify(
             ctx,

@@ -1154,12 +1154,12 @@ fn lifecycle_compressed_transactions() {
         exec_all(
             &mut c,
             &[
-                "START TRANSACTION".into(),
-                "UPDATE order_items SET qty = qty + 1".into(),
-                "UPDATE orders SET status = 'paid' WHERE id % 3 = 0".into(),
-                "UPDATE payments SET amount = amount + 1".into(),
-                "COMMIT".into(),
-                "FLUSH BINARY LOGS".into(),
+                "START TRANSACTION".to_string(),
+                "UPDATE order_items SET qty = qty + 1".to_string(),
+                "UPDATE orders SET status = 'paid' WHERE id % 3 = 0".to_string(),
+                "UPDATE payments SET amount = amount + 1".to_string(),
+                "COMMIT".to_string(),
+                "FLUSH BINARY LOGS".to_string(),
             ],
         )
         .await?;

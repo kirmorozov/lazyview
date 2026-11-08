@@ -170,13 +170,6 @@ fn both<T>(run: Result<T>, restored: Result<()>) -> Result<T> {
     Ok(v)
 }
 
-async fn run(c: &mut Conn, stmts: &[&str]) -> Result<()> {
-    for s in stmts {
-        exec(c, s).await?;
-    }
-    Ok(())
-}
-
 /// Creates the source table and the view, starts an engine (batch window 0, so every change is
 /// refreshed at once) and waits until the view is ready.
 async fn start(ctx: &Ctx, db: &Db, specs: &[ViewSpec]) -> Result<(Conn, Engine)> {
@@ -206,7 +199,7 @@ async fn exact_run(ctx: &Ctx, db: &Db, specs: &[ViewSpec]) -> Result<std::path::
         verify(ctx, &mut eng, db, specs, &format!("autocommit update {i}")).await?;
     }
     // XA COMMIT runs the same ordered commit stage as an autocommit statement.
-    run(
+    exec_all(
         &mut c,
         &[
             "XA START 'vis28'",

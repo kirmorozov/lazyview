@@ -63,19 +63,7 @@ fn spec() -> Vec<ViewSpec> {
 }
 
 async fn setup(ctx: &Ctx, tag: &str, ov: &[(&str, &str)]) -> Result<(Db, Engine)> {
-    let db = ctx.new_db(tag).await?;
-    let mut c = db.conn().await?;
-    for s in DDL {
-        exec(&mut c, s).await?;
-    }
-    ensure_lazyview_table(&mut c).await?;
-    let specs = spec();
-    add_views(&mut c, &specs).await?;
-    let mut eng = ctx.start_engine(&db, ov)?;
-    let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-    wait_ready(&mut c, &mut eng, &names, t_ready()).await?;
-    verify(ctx, &mut eng, &db, &specs, "initial").await?;
-    Ok((db, eng))
+    setup_views(ctx, tag, DDL, &spec(), ov).await
 }
 
 /// A clean server restart while lazyview streams and saves its position: statements that land

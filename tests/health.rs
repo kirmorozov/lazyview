@@ -42,13 +42,6 @@ fn init_env() {
 /// The readiness probe of deploy/k8s/base/deployment.yaml.
 const K8S_READY: &str = "/readyz?standby=ok&building=ok";
 
-fn free_addr() -> Result<String> {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port();
-    Ok(format!("127.0.0.1:{port}"))
-}
-
 struct Resp {
     status: u16,
     head: String,
@@ -161,9 +154,9 @@ fn health_probe_transitions() {
         let mut c = setup(&db).await?;
 
         // 1. Database unreachable at boot: alive (the connect loop beats), started, not ready.
-        let dead = free_addr()?;
+        let dead = free_local_addr()?;
         let dead_dsn = with_authority_host(&db.dsn, &dead);
-        let w = free_addr()?;
+        let w = free_local_addr()?;
         let waiting = ctx.start_engine(
             &db,
             &[
@@ -232,7 +225,7 @@ fn health_probe_transitions() {
             .context("stop the engine waiting for the database")?;
 
         // 2. First engine: ready once the view is built.
-        let a_addr = free_addr()?;
+        let a_addr = free_local_addr()?;
         let mut a = ctx.start_engine(&db, &[("LAZYVIEW_HEALTH_ADDR", a_addr.as_str())])?;
         wait_status(&a_addr, "/livez", 200, Duration::from_secs(30)).await?;
         wait_ready(&mut c, &mut a, &["v_sum"], t_ready()).await?;
@@ -285,7 +278,7 @@ fn health_probe_transitions() {
         assert_alive(&a_addr, "with a view in error").await?;
 
         // 4. Second engine on the same schema: hot standby.
-        let b_addr = free_addr()?;
+        let b_addr = free_local_addr()?;
         let mut b = ctx.start_engine(&db, &[("LAZYVIEW_HEALTH_ADDR", b_addr.as_str())])?;
         wait_until("second engine in standby", Duration::from_secs(60), || {
             let b = b_addr.clone();
@@ -559,7 +552,7 @@ fn health_database_outage() {
             "{dsn}{}prefer_socket=false",
             if dsn.contains('?') { '&' } else { '?' }
         );
-        let addr = free_addr()?;
+        let addr = free_local_addr()?;
         let mut eng = ctx.start_engine(
             &db,
             &[

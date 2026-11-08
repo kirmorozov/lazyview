@@ -33,12 +33,6 @@ async fn setup_typed(
     Ok((db, g))
 }
 
-async fn txn(c: &mut mysql_async::Conn, stmts: &[String], rollback: bool) -> Result<()> {
-    exec(c, "START TRANSACTION").await?;
-    exec_all(c, stmts).await?;
-    exec(c, if rollback { "ROLLBACK" } else { "COMMIT" }).await
-}
-
 #[test]
 fn types_all_types_roundtrip() {
     scenario("types_all", |ctx| async move {

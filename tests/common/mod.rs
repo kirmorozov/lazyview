@@ -232,11 +232,18 @@ pub async fn exec(conn: &mut Conn, sql: &str) -> Result<()> {
 }
 
 /// Executes statements in order.
-pub async fn exec_all(conn: &mut Conn, stmts: &[String]) -> Result<()> {
+pub async fn exec_all<S: AsRef<str>>(conn: &mut Conn, stmts: &[S]) -> Result<()> {
     for s in stmts {
-        exec(conn, s).await?;
+        exec(conn, s.as_ref()).await?;
     }
     Ok(())
+}
+
+/// Runs `stmts` in one transaction, committed, or rolled back when `rollback`.
+pub async fn txn(conn: &mut Conn, stmts: &[String], rollback: bool) -> Result<()> {
+    exec(conn, "START TRANSACTION").await?;
+    exec_all(conn, stmts).await?;
+    exec(conn, if rollback { "ROLLBACK" } else { "COMMIT" }).await
 }
 
 /// Rows as text (NULL → None); binary values are hex-escaped.
@@ -2274,4 +2281,25 @@ pub async fn start_with_views(
     }
     c.disconnect().await.ok();
     Ok((eng, ids))
+}
+
+/// Creates a fresh schema for `tag`, runs `ddl` in it, adds `specs` to `_lazyview`, starts an
+/// engine with the overrides `ov`, waits until every view is ready and verifies them against
+/// their oracles ("initial"). Returns the schema and the running engine.
+pub async fn setup_views(
+    ctx: &Ctx,
+    tag: &str,
+    ddl: &[&str],
+    specs: &[ViewSpec],
+    ov: &[(&str, &str)],
+) -> Result<(Db, Engine)> {
+    let db = ctx.new_db(tag).await?;
+    let mut c = db.conn().await?;
+    exec_all(&mut c, ddl).await?;
+    ensure_lazyview_table(&mut c).await?;
+    add_views(&mut c, specs).await?;
+    let mut eng = ctx.start_engine(&db, ov)?;
+    wait_ready(&mut c, &mut eng, &workload::names(specs), t_ready()).await?;
+    verify(ctx, &mut eng, &db, specs, "initial").await?;
+    Ok((db, eng))
 }

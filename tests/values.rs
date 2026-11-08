@@ -8,40 +8,12 @@
 mod common;
 
 use anyhow::{bail, ensure, Context, Result};
+use common::workload::names;
 use common::*;
 use lazyview::accumulate::UnitChunk;
 use lazyview::datum::{Datum, Key};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Row};
-
-async fn setup(
-    ctx: &Ctx,
-    tag: &str,
-    ddl: &[&str],
-    specs: &[ViewSpec],
-    ov: &[(&str, &str)],
-) -> Result<(Db, Engine)> {
-    let db = ctx.new_db(tag).await?;
-    let mut c = db.conn().await?;
-    run(&mut c, ddl).await?;
-    ensure_lazyview_table(&mut c).await?;
-    add_views(&mut c, specs).await?;
-    let mut eng = ctx.start_engine(&db, ov)?;
-    wait_ready(&mut c, &mut eng, &names(specs), t_ready()).await?;
-    verify(ctx, &mut eng, &db, specs, "initial").await?;
-    Ok((db, eng))
-}
-
-fn names(specs: &[ViewSpec]) -> Vec<&str> {
-    specs.iter().map(|s| s.name.as_str()).collect()
-}
-
-async fn run(c: &mut Conn, stmts: &[&str]) -> Result<()> {
-    for s in stmts {
-        exec(c, s).await?;
-    }
-    Ok(())
-}
 
 /// The views expected to be incremental are maintained per unit (the paths under test), not
 /// rebuilt in full.
@@ -92,7 +64,7 @@ fn values_bit_columns() {
              (3, 3, '', NULL, NULL, NULL, NULL), (4, 4, X'FF', 'multi\nline', b'10000000', b'1', 0x8000000000000000)",
             "INSERT INTO bit_labels VALUES (1, b'11111111', 'all'), (2, b'10000000', 'high'), (3, b'0', 'zero')",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_bit",
             &ddl,
@@ -132,7 +104,7 @@ fn values_bit_columns() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -171,7 +143,7 @@ fn values_unit_expressions_are_operands() {
             "CREATE TABLE flags (id INT PRIMARY KEY, a INT NULL, b INT NULL, f TINYINT NULL, v INT NULL)",
             "INSERT INTO flags VALUES (1, 1, 1, 0, 10), (2, 2, 6, 1, 20), (3, 3, 4, NULL, 30), (4, NULL, 2, 1, 40), (5, 5, 5, 0, 50)",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_unit_ops",
             &ddl,
@@ -205,7 +177,7 @@ fn values_unit_expressions_are_operands() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -235,7 +207,7 @@ fn values_time_unit_keys() {
     scenario("val_time_keys", |ctx| async move {
         let db = ctx.new_db("val_time_keys").await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "CREATE TABLE tk (id INT PRIMARY KEY, t3 TIME(3) NULL, t6 TIME(6) NULL, t0 TIME NULL, v INT NULL)",
@@ -335,7 +307,7 @@ fn values_time_unit_keys() {
         ];
         for (what, stmts) in steps {
             exec(&mut c, "START TRANSACTION").await?;
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             exec(&mut c, "COMMIT").await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
@@ -370,7 +342,7 @@ fn values_long_unit_keys() {
              (4, CONCAT(REPEAT('é', 999), 'x'), REPEAT('a', 299), 'b', 'c', 'e', 4)",
             "INSERT INTO lk VALUES (REPEAT('ü', 768), 1), ('a', 2), (CONCAT(REPEAT('ü', 767), 'x'), 3)",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_long_keys",
             &ddl,
@@ -420,7 +392,7 @@ fn values_long_unit_keys() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -452,7 +424,7 @@ fn values_zero_dates() {
         ];
         let db = ctx.new_db("val_zero_dates").await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "SET SESSION sql_mode = ''",
@@ -502,7 +474,7 @@ fn values_zero_dates() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &oracle_checked, what).await?;
             ensure_same(&mut c, &grouped, what).await?;
         }
@@ -587,7 +559,7 @@ async fn dst_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
     }
     let mut c = db.conn().await?;
     // Instants are written in UTC: 00:30 and 01:30 UTC are both 02:30 in Berlin.
-    run(
+    exec_all(
         &mut c,
         &[
             "SET SESSION time_zone = '+00:00'",
@@ -623,7 +595,7 @@ async fn dst_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
         ),
     ];
     for (what, stmts) in steps {
-        run(&mut c, stmts).await?;
+        exec_all(&mut c, stmts).await?;
         verify(ctx, &mut eng, db, &specs, what).await?;
         ensure_same(&mut c, &checks, what).await?;
     }
@@ -651,7 +623,7 @@ fn values_case_variant_join_partner() {
             "CREATE TABLE tci (id BIGINT UNSIGNED PRIMARY KEY, ci VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL, i INT NULL, KEY (ci))",
             "CREATE TABLE rci (id INT PRIMARY KEY, ci VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL, label VARCHAR(40) NOT NULL, KEY (ci))",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_ci_join",
             &ddl,
@@ -682,7 +654,7 @@ fn values_case_variant_join_partner() {
         ];
         for (what, stmts) in steps {
             exec(&mut c, "START TRANSACTION").await?;
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             exec(&mut c, "COMMIT").await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
@@ -723,7 +695,7 @@ fn values_enum_set_numeric_context() {
             "INSERT INTO p VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'x,z')",
             "INSERT INTO o VALUES (10, 1), (11, 2), (12, 3), (13, 1)",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_enum_num",
             &ddl,
@@ -749,7 +721,7 @@ fn values_enum_set_numeric_context() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -775,7 +747,7 @@ fn values_negative_short_fraction_time() {
             "INSERT INTO tq VALUES ('-00:00:01.5', '-00:00:01.25', 1), ('-100:00:00.1', '-838:59:58.99', 2), \
              ('12:00:00.5', '12:00:00.75', 3), ('-838:59:59.0', '-700:00:00.01', 4)",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_time_fsp12",
             &ddl,
@@ -804,7 +776,7 @@ fn values_negative_short_fraction_time() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -848,7 +820,7 @@ fn values_binary_padding() {
             "INSERT INTO link VALUES (1, X'61', 'short'), (2, X'61000000', 'padded'), (3, X'00000000', 'zeros'), \
              (4, X'', 'empty'), (5, NULL, 'null'), (6, X'6100', 'mid')",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_binpad",
             &ddl,
@@ -909,7 +881,7 @@ fn values_binary_padding() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -980,7 +952,7 @@ fn values_non_utf8_charsets() {
              (9, NULL, NULL, NULL, NULL, 9), (10, _latin1 X'E9FFD7', _latin1 X'F7', '能能', REPEAT('ソ', 149), 10)",
             "INSERT INTO item VALUES ('café', '表'), ('naïve', 'ソ'), ('ÿ', 'ﾊﾟ'), ('', '\\\\'), ('×', NULL)",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_charsets",
             &ddl,
@@ -1042,7 +1014,7 @@ fn values_non_utf8_charsets() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -1115,7 +1087,7 @@ fn values_mariadb_uuid_inet() {
             "INSERT INTO link VALUES (1, '::1', 'loop'), (2, '::ffff:192.0.2.1', 'mapped'), (3, '::', 'any'), \
              (4, NULL, 'null'), (5, '2001:db8::2', 'none')",
         ];
-        let (db, mut eng) = setup(
+        let (db, mut eng) = setup_views(
             &ctx,
             "val_uuid_inet",
             &ddl,
@@ -1169,7 +1141,7 @@ fn values_mariadb_uuid_inet() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await

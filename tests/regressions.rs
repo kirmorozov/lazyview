@@ -6,6 +6,7 @@ mod common;
 use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
+use common::workload::names;
 use common::*;
 use lazyview::accumulate::UnitChunk;
 use lazyview::mv::{Layout, MvCol};
@@ -21,6 +22,7 @@ const DDL: &[&str] = &[
     "INSERT INTO products VALUES (1, 'a', 5.00, 1), (2, 'b', 50.00, 1), (3, 'c', 20.00, 1), (4, 'd', 99.00, 0), (5, 'e', 70.00, 1), (6, 'f', 1.00, 1)",
 ];
 
+/// [`setup_views`] with the tiny schema [`DDL`] first, then `extra_ddl`.
 async fn setup(
     ctx: &Ctx,
     tag: &str,
@@ -28,28 +30,8 @@ async fn setup(
     specs: &[ViewSpec],
     ov: &[(&str, &str)],
 ) -> Result<(Db, Engine)> {
-    let db = ctx.new_db(tag).await?;
-    let mut c = db.conn().await?;
-    for s in DDL.iter().chain(extra_ddl) {
-        exec(&mut c, s).await?;
-    }
-    ensure_lazyview_table(&mut c).await?;
-    add_views(&mut c, specs).await?;
-    let mut eng = ctx.start_engine(&db, ov)?;
-    wait_ready(&mut c, &mut eng, &names(specs), t_ready()).await?;
-    verify(ctx, &mut eng, &db, specs, "initial").await?;
-    Ok((db, eng))
-}
-
-fn names(specs: &[ViewSpec]) -> Vec<&str> {
-    specs.iter().map(|s| s.name.as_str()).collect()
-}
-
-async fn run(c: &mut mysql_async::Conn, stmts: &[&str]) -> Result<()> {
-    for s in stmts {
-        exec(c, s).await?;
-    }
-    Ok(())
+    let ddl: Vec<&str> = DDL.iter().chain(extra_ddl).copied().collect();
+    setup_views(ctx, tag, &ddl, specs, ov).await
 }
 
 fn join_view() -> ViewSpec {
@@ -68,7 +50,7 @@ fn reg_join_partner_pk_update() {
         let specs = vec![join_view()];
         let (db, mut eng) = setup(&ctx, "reg_join_pk", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(&mut c, &["UPDATE customers SET id = 100 WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE customers SET id = 100 WHERE id = 1"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -77,7 +59,7 @@ fn reg_join_partner_pk_update() {
             "customer PK 1 → 100 (orders 10, 11 must vanish)",
         )
         .await?;
-        run(&mut c, &["UPDATE customers SET id = 1 WHERE id = 100"]).await?;
+        exec_all(&mut c, &["UPDATE customers SET id = 1 WHERE id = 100"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -86,7 +68,7 @@ fn reg_join_partner_pk_update() {
             "customer PK 100 → 1 (orders come back)",
         )
         .await?;
-        run(&mut c, &["DELETE FROM customers WHERE id = 2"]).await?;
+        exec_all(&mut c, &["DELETE FROM customers WHERE id = 2"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "customer 2 deleted").await?;
         eng.stop().await
     });
@@ -112,17 +94,17 @@ fn reg_one_element_in_join() {
         let mut c = db.conn().await?;
         let mut sc = db.conn().await?;
         let before = eng.snapshot();
-        run(&mut c, &["UPDATE docs SET doc = '[9]' WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE docs SET doc = '[9]' WHERE id = 1"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "doc 1 updated").await?;
-        run(&mut c, &["DELETE FROM docs WHERE id = 2"]).await?;
+        exec_all(&mut c, &["DELETE FROM docs WHERE id = 2"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "doc 2 deleted").await?;
-        run(&mut c, &["INSERT INTO docs VALUES (2, '[2]')"]).await?;
+        exec_all(&mut c, &["INSERT INTO docs VALUES (2, '[2]')"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "doc 2 re-inserted").await?;
-        run(&mut c, &["UPDATE items SET doc_id = 2 WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE items SET doc_id = 2 WHERE id = 1"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "item 1 re-pointed to doc 2").await?;
-        run(&mut c, &["DELETE FROM items WHERE id = 3"]).await?;
+        exec_all(&mut c, &["DELETE FROM items WHERE id = 3"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "item 3 deleted").await?;
-        run(&mut c, &["INSERT INTO items VALUES (3, 3)"]).await?;
+        exec_all(&mut c, &["INSERT INTO items VALUES (3, 3)"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "item 3 re-inserted").await?;
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
         let d = eng.snapshot().since(&before);
@@ -154,11 +136,11 @@ fn reg_window_units_reduced_by_key() {
         let mut c = db.conn().await?;
         let mut sc = db.conn().await?;
         let before = eng.snapshot();
-        run(&mut c, &["UPDATE docs SET doc = '{\"a\": 9}' WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE docs SET doc = '{\"a\": 9}' WHERE id = 1"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "doc updated").await?;
-        run(&mut c, &["UPDATE docs SET grp = 11 WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE docs SET grp = 11 WHERE id = 1"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "grp updated").await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "DELETE FROM docs WHERE id = 2",
@@ -323,7 +305,7 @@ fn reg_before_image_lookup_when_after_image_no_longer_joins() {
         ];
         let (db, mut eng) = setup(&ctx, "reg_before_img", &ddl, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &["UPDATE orders SET customer_id = 999 WHERE id = 10"],
         )
@@ -336,7 +318,7 @@ fn reg_before_image_lookup_when_after_image_no_longer_joins() {
             "order 10 → non-existent customer (its items must vanish)",
         )
         .await?;
-        run(&mut c, &["UPDATE orders SET customer_id = 2 WHERE id = 10"]).await?;
+        exec_all(&mut c, &["UPDATE orders SET customer_id = 2 WHERE id = 10"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -345,7 +327,7 @@ fn reg_before_image_lookup_when_after_image_no_longer_joins() {
             "order 10 → customer 2 (items back)",
         )
         .await?;
-        run(&mut c, &["DELETE FROM customers WHERE id = 2"]).await?;
+        exec_all(&mut c, &["DELETE FROM customers WHERE id = 2"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -354,13 +336,13 @@ fn reg_before_image_lookup_when_after_image_no_longer_joins() {
             "customer 2 deleted (items of orders 10, 12 vanish)",
         )
         .await?;
-        run(
+        exec_all(
             &mut c,
             &["UPDATE orders SET customer_id = NULL WHERE id = 13"],
         )
         .await?;
         verify(&ctx, &mut eng, &db, &specs, "order 13 → NULL customer").await?;
-        run(&mut c, &["UPDATE customers SET id = 50 WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE customers SET id = 50 WHERE id = 1"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -393,7 +375,7 @@ fn reg_before_image_lookup_fk_parent_two_joins_away() {
         ];
         let (db, mut eng) = setup(&ctx, "reg_before_img_fk", &ddl, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(&mut c, &["UPDATE customers SET id = 67 WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE customers SET id = 67 WHERE id = 1"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -402,7 +384,7 @@ fn reg_before_image_lookup_fk_parent_two_joins_away() {
             "FK-parent customer PK 1 → 67 (items of orders 10, 11 vanish)",
         )
         .await?;
-        run(
+        exec_all(
             &mut c,
             &["UPDATE orders SET customer_id = 59 WHERE id = 10"],
         )
@@ -415,7 +397,7 @@ fn reg_before_image_lookup_fk_parent_two_joins_away() {
             "order 10 → non-existent customer",
         )
         .await?;
-        run(&mut c, &["DELETE FROM customers WHERE id = 2"]).await?;
+        exec_all(&mut c, &["DELETE FROM customers WHERE id = 2"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "FK-parent customer 2 deleted").await?;
         eng.stop().await
     });
@@ -433,7 +415,7 @@ fn reg_join_partner_pk_update_fk_parent() {
         ];
         let (db, mut eng) = setup(&ctx, "reg_join_pk_fk", &fk, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(&mut c, &["UPDATE customers SET id = 100 WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE customers SET id = 100 WHERE id = 1"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -442,7 +424,7 @@ fn reg_join_partner_pk_update_fk_parent() {
             "FK parent customer PK 1 → 100 (orders 10, 11 must vanish)",
         )
         .await?;
-        run(&mut c, &["DELETE FROM customers WHERE id = 2"]).await?;
+        exec_all(&mut c, &["DELETE FROM customers WHERE id = 2"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "FK parent customer 2 deleted").await?;
         eng.stop().await
     });
@@ -460,7 +442,7 @@ fn reg_order_by_limit() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_limit", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(&mut c, &["UPDATE products SET price = 1000 WHERE id = 6"]).await?;
+        exec_all(&mut c, &["UPDATE products SET price = 1000 WHERE id = 6"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "new top product").await?;
         eng.stop().await
     });
@@ -521,7 +503,7 @@ fn reg_bit_column() {
         )
         .await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "UPDATE bits SET b = b'11111111' WHERE id = 2",
@@ -531,7 +513,7 @@ fn reg_bit_column() {
         .await?;
         verify(&ctx, &mut eng, &db, &specs, "BIT values after changes").await?;
         // Other columns change, BIT stays 0xff: the refresh re-reads and re-writes the row.
-        run(
+        exec_all(
             &mut c,
             &[
                 "UPDATE bits SET m = m + 1, txt = CONCAT(COALESCE(txt, ''), '!')",
@@ -547,7 +529,7 @@ fn reg_bit_column() {
             "other columns changed, BIT unchanged",
         )
         .await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "REPLACE INTO bits VALUES (1, 9, NULL, 'r', b'11111111', b'1')",
@@ -592,9 +574,9 @@ fn reg_case_only_change_of_join_partner() {
         )
         .await?;
         let mut c = db.conn().await?;
-        run(&mut c, &["UPDATE rk SET k = 'abc' WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE rk SET k = 'abc' WHERE id = 1"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "partner key 'ABC' → 'abc'").await?;
-        run(&mut c, &["UPDATE tk SET k = 'Abc' WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE tk SET k = 'Abc' WHERE id = 1"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "anchor key 'abc' → 'Abc'").await?;
         eng.stop().await
     });
@@ -634,7 +616,7 @@ fn reg_unreferenced_update_on_fk_parent() {
         let mut sc = db.conn().await?;
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
         let before = eng.snapshot();
-        run(
+        exec_all(
             &mut c,
             &[
                 "UPDATE customers SET note = 'touched'",
@@ -650,7 +632,7 @@ fn reg_unreferenced_update_on_fk_parent() {
             fmt_snapshot(&d)
         );
         // A real cascade must still be applied.
-        run(
+        exec_all(
             &mut c,
             &[
                 "UPDATE customers SET id = 30 WHERE id = 3",
@@ -784,7 +766,7 @@ fn reg_chained_definitions_in_one_transaction() {
         }
         exec(&mut c, "COMMIT").await?;
         wait_ready(&mut c, &mut eng, &names(&more), t_ready()).await?;
-        run(&mut c, &["INSERT INTO orders VALUES (14, 2, 'new')"]).await?;
+        exec_all(&mut c, &["INSERT INTO orders VALUES (14, 2, 'new')"]).await?;
         verify(&ctx, &mut eng, &db, &more, "chained view after writes").await?;
         eng.stop().await
     });
@@ -822,7 +804,7 @@ fn reg_multi_target_with_one_down() {
             "built on b although 'down' is unreachable",
         )
         .await?;
-        run(&mut c, &["UPDATE customers SET name = 'zed' WHERE id = 3"]).await?;
+        exec_all(&mut c, &["UPDATE customers SET name = 'zed' WHERE id = 3"]).await?;
         eventually_equal(
             &ctx,
             &mut eng,
@@ -863,9 +845,9 @@ fn reg_full_view_refresh_around_xa() {
         ];
         let (db, mut eng) = setup(&ctx, "reg_full_xa", &ddl, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(&mut c, &["INSERT INTO pay VALUES (3, 'cash', 'pending')"]).await?;
+        exec_all(&mut c, &["INSERT INTO pay VALUES (3, 'cash', 'pending')"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "plain insert").await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "XA START 'r1'",
@@ -876,9 +858,9 @@ fn reg_full_view_refresh_around_xa() {
         )
         .await?;
         verify(&ctx, &mut eng, &db, &specs, "XA prepared").await?;
-        run(&mut c, &["XA COMMIT 'r1'"]).await?;
+        exec_all(&mut c, &["XA COMMIT 'r1'"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "XA committed").await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "XA START 'r2'",
@@ -889,7 +871,7 @@ fn reg_full_view_refresh_around_xa() {
             ],
         )
         .await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "INSERT INTO pay VALUES (6, 'paypal', 'ok')",
@@ -905,7 +887,7 @@ fn reg_full_view_refresh_around_xa() {
             "XA rolled back, then plain writes",
         )
         .await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "XA START 'r3'",
@@ -1079,7 +1061,7 @@ fn reg_failed_full_rebuild_backs_off() {
         let mut sc = db.conn().await?;
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
         let before = eng.snapshot();
-        run(&mut c, &["UPDATE products SET sku = 'zz' WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE products SET sku = 'zz' WHERE id = 1"]).await?;
         tokio::time::sleep(Duration::from_secs(4)).await;
         let d = eng.snapshot().since(&before);
         ensure!(
@@ -1129,13 +1111,13 @@ fn reg_ddl_on_cascade_parent() {
         ];
         let (db, mut eng) = setup(&ctx, "reg_fk_parent_ddl", &fk, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &["ALTER TABLE customers ADD COLUMN c0 INT NULL FIRST"],
         )
         .await?;
         verify(&ctx, &mut eng, &db, &specs, "after ALTER of the FK parent").await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "UPDATE customers SET name = 'zed' WHERE id = 3",
@@ -1200,7 +1182,7 @@ fn reg_chained_defined_first_at_startup() {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        run(&mut c, &["INSERT INTO orders VALUES (14, 2, 'new')"]).await?;
+        exec_all(&mut c, &["INSERT INTO orders VALUES (14, 2, 'new')"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "chained view after writes").await?;
         eng.stop().await
     });
@@ -1245,7 +1227,7 @@ fn reg_rename_via_definition() {
             async move { Ok(!table_exists(&mut connect(&dsn).await?, "r_order_customer").await?) }
         })
         .await?;
-        run(&mut c, &["UPDATE customers SET name = 'zed' WHERE id = 1"]).await?;
+        exec_all(&mut c, &["UPDATE customers SET name = 'zed' WHERE id = 1"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -1322,7 +1304,7 @@ fn reg_crash_with_stale_full_view() {
         )
         .await?;
         let mut c = db.conn().await?;
-        run(&mut c, &["UPDATE orders SET status = 'void' WHERE id = 10"]).await?;
+        exec_all(&mut c, &["UPDATE orders SET status = 'void' WHERE id = 10"]).await?;
         // Long enough for several position saves (and the incremental refresh).
         tokio::time::sleep(Duration::from_secs(2)).await;
         eng.crash().await?;
@@ -1353,7 +1335,7 @@ fn reg_two_lookup_tables_change_together() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_two_lookups", TWO_HOP_DDL, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "START TRANSACTION",
@@ -1371,7 +1353,7 @@ fn reg_two_lookup_tables_change_together() {
             "customer moved to a region deleted with it",
         )
         .await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "START TRANSACTION",
@@ -1408,7 +1390,7 @@ fn reg_two_lookup_tables_change_together_grouped() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_two_lookups_g", TWO_HOP_DDL, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "START TRANSACTION",
@@ -1462,7 +1444,7 @@ fn reg_unit_chunks_stay_below_placeholder_limit() {
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
         let before = eng.snapshot();
         // 40000 groups in one transaction.
-        run(
+        exec_all(
             &mut c,
             &["INSERT INTO ev (a, b) SELECT x.n, y.n FROM nums x JOIN nums y"],
         )
@@ -1502,7 +1484,7 @@ fn reg_held_back_position_does_not_spin() {
         )
         .await?;
         let mut c = db.conn().await?;
-        run(&mut c, &["UPDATE orders SET status = 'void' WHERE id = 10"]).await?;
+        exec_all(&mut c, &["UPDATE orders SET status = 'void' WHERE id = 10"]).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let before = eng.snapshot();
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1549,7 +1531,7 @@ async fn replay_after_restart(
 ) -> Result<Engine> {
     eng.stop().await?;
     let mut c = db.conn().await?;
-    run(&mut c, stmts).await?;
+    exec_all(&mut c, stmts).await?;
     let mut ov = ov.to_vec();
     ov.push(("LAZYVIEW_BATCH_WINDOW_MS", "0"));
     ctx.start_engine(db, &ov)
@@ -1595,7 +1577,7 @@ fn reg_grouped_chain_changes_in_one_window() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -1757,7 +1739,7 @@ fn reg_lineage_traces_old_rows_across_windows() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -1869,7 +1851,7 @@ fn reg_cascade_traced_through_the_parent() {
             ("group key moved", &["UPDATE grps SET id = 30 WHERE id = 3"]),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         let d = eng.snapshot().since(&before);
@@ -1903,7 +1885,7 @@ fn reg_saved_position_from_another_server() {
             "UPDATE _lazyview_status SET server_identity = 'another-server'",
         )
         .await?;
-        run(
+        exec_all(
             &mut c,
             &["UPDATE customers SET name = 'moved' WHERE id = 1"],
         )
@@ -1960,7 +1942,7 @@ fn reg_saved_position_purged_while_down() {
         for i in 0..2 {
             exec(&mut c, "FLUSH BINARY LOGS").await?;
             let update = format!("UPDATE customers SET name = 'purged{i}' WHERE id = 1");
-            run(&mut c, &[update.as_str()]).await?;
+            exec_all(&mut c, &[update.as_str()]).await?;
         }
         exec(&mut c, "FLUSH BINARY LOGS").await?;
         let logs = common::rows(&mut c, "SHOW BINARY LOGS").await?;
@@ -1990,7 +1972,7 @@ fn reg_saved_position_purged_while_down() {
             "rebuilt after the saved binlog was purged",
         )
         .await?;
-        run(
+        exec_all(
             &mut c,
             &["UPDATE customers SET name = 'after' WHERE id = 1"],
         )
@@ -2049,7 +2031,7 @@ fn reg_lineage_without_primary_key() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -2161,7 +2143,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
 
         let db = ctx.new_db("reg_json_units").await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "CREATE TABLE jt (id INT PRIMARY KEY, g INT NULL, doc JSON NULL)",
@@ -2282,7 +2264,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
         )
         .await?;
         check(&mut c, "mv_gj", orc_gj, on_gj, "initial fill (composite)").await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 r#"INSERT INTO jt VALUES (6, 1, '{"a": 1.0}'), (7, NULL, '{"a":1}'), (8, 3, NULL)"#,
@@ -2388,7 +2370,7 @@ fn reg_json_unit_delete_with_epoch_timestamps() {
 
         let db = ctx.new_db("reg_json_epoch").await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "CREATE TABLE jt (id INT PRIMARY KEY, doc JSON NULL, ts TIMESTAMP(6) NULL)",
@@ -2488,7 +2470,7 @@ fn reg_json_decimal_values_converge() {
         let specs = vec![ViewSpec::new("r_json_dec", Kind::Incremental, &select)];
         let db = ctx.new_db("reg_json_dec").await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "CREATE TABLE amounts (id INT PRIMARY KEY, g INT NOT NULL, amount DECIMAL(10,2) NOT NULL, \
@@ -2702,9 +2684,9 @@ fn reg_dependent_of_view_in_error_shows_its_error() {
     scenario("reg_blocked", |ctx| async move {
         let db = ctx.new_db("reg_blocked").await?;
         let mut c = db.conn().await?;
-        run(&mut c, DDL).await?;
+        exec_all(&mut c, DDL).await?;
         ensure_lazyview_table(&mut c).await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "INSERT INTO _lazyview (name, definition) VALUES ('lz_bad', 'SELECT nope FROM orders')",
@@ -2840,9 +2822,9 @@ fn reg_failed_build_keeps_planned_mode() {
     scenario("reg_err_mode", |ctx| async move {
         let db = ctx.new_db("reg_err_mode").await?;
         let mut c = db.conn().await?;
-        run(&mut c, DDL).await?;
+        exec_all(&mut c, DDL).await?;
         ensure_lazyview_table(&mut c).await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "CREATE TABLE manual (id INT PRIMARY KEY)",
@@ -3002,7 +2984,7 @@ fn reg_truncated_view_table_is_rebuilt() {
         let (db, mut eng) = setup(&ctx, "reg_truncate_mv", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
         let before = eng.snapshot();
-        run(
+        exec_all(
             &mut c,
             &[
                 "TRUNCATE r_counts",
@@ -3128,7 +3110,7 @@ fn reg_view_named_like_its_source_table() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_self_named", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "INSERT INTO _lazyview (name, definition) VALUES ('orders', 'SELECT id FROM orders')",
@@ -3310,7 +3292,7 @@ fn reg_long_build_keeps_its_keys() {
             "the build ended before its changes were read (raise LAZYVIEW_TEST_BUILD_DELAY): {states:?}"
         );
         // Committed while the reader is held: read once the build is applied.
-        run(
+        exec_all(
             &mut c,
             &[
                 "UPDATE items SET val = val + 1 WHERE id <= 10",
@@ -3344,7 +3326,7 @@ fn reg_not_in_prepared_statement_canary() {
         use lazyview::mv::exec_source;
         let db = ctx.new_db("reg_nin_ps").await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "CREATE TABLE c (id INT PRIMARY KEY, ref INT NULL)",
@@ -3649,7 +3631,7 @@ fn reg_index_ddl_on_view_table_does_not_rebuild() {
         let (db, mut eng) = setup(&ctx, "reg_idx_mv", ENTITIES, &specs, &[]).await?;
         let mut c = db.conn().await?;
         let before = eng.snapshot();
-        run(
+        exec_all(
             &mut c,
             &[
                 "CREATE INDEX x_n ON r_idx (n)",
@@ -3944,7 +3926,7 @@ fn reg_error_rows_are_rechecked_at_startup() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_err_restart", ENTITIES, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        run(
+        exec_all(
             &mut c,
             &[
                 "INSERT INTO _lazyview (name, definition) VALUES ('r_gone', 'SELECT id FROM no_such_a')",
@@ -3959,7 +3941,7 @@ fn reg_error_rows_are_rechecked_at_startup() {
         let still_before = state_updated_at(&mut c, "r_still").await?;
         eng.stop().await?;
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        run(
+        exec_all(
             &mut c,
             &[
                 "DELETE FROM _lazyview WHERE name = 'r_gone'",
@@ -4108,7 +4090,7 @@ async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
         mode.contains("ANSI_QUOTES"),
         "new sessions do not inherit the global mode: {mode}"
     );
-    run(
+    exec_all(
         &mut c,
         &[
             "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT NOT NULL, status VARCHAR(10) NOT NULL)",
@@ -4434,7 +4416,7 @@ fn reg_pinned_aliases_see_only_their_rows() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         let d = eng.snapshot().since(&before);
@@ -4510,7 +4492,7 @@ fn reg_const_filters_at_integer_extremes() {
             ),
         ];
         for (what, stmt) in steps {
-            run(&mut c, &[stmt]).await?;
+            exec_all(&mut c, &[stmt]).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         eng.stop().await
@@ -4683,7 +4665,7 @@ fn reg_partial_units() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         let d = eng.snapshot().since(&before);
@@ -4845,7 +4827,7 @@ fn reg_cascades_derived_from_the_parent() {
             ),
         ];
         for (what, stmts) in steps {
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }
         let d = eng.snapshot().since(&before);
@@ -4861,7 +4843,7 @@ fn reg_cascades_derived_from_the_parent() {
         // The key the HAVING view pins still reaches it: no derivation there, its rows come
         // back from the cascade map.
         let before = eng.snapshot();
-        run(&mut c, &["DELETE FROM kind WHERE kid = 50"]).await?;
+        exec_all(&mut c, &["DELETE FROM kind WHERE kid = 50"]).await?;
         verify(
             &ctx,
             &mut eng,
@@ -5137,7 +5119,7 @@ fn reg_cascades_through_the_map() {
                 .iter()
                 .map(|sp| eng.stats_of(&db, &sp.name))
                 .collect::<Result<_>>()?;
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
             for (sp, s0) in specs.iter().zip(&vbefore) {
                 let s = eng.stats_of(&db, &sp.name)?;
@@ -5210,7 +5192,7 @@ fn reg_cascade_restart_gap() {
         eng.stop().await?;
         // `ent` is the parent of the cached routes (`^ent:map` into ent_link and ent_val); a `grp`
         // delete is a unit route (the view groups by `l.gid`) and never reaches the cache.
-        run(&mut sc, &["DELETE FROM ent WHERE eid = 5"]).await?;
+        exec_all(&mut sc, &["DELETE FROM ent WHERE eid = 5"]).await?;
         let mut eng = ctx.start_engine(&db, &[])?;
         wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
         let f0 = eng.snapshot();
@@ -5238,7 +5220,7 @@ fn reg_cascade_restart_gap() {
         );
         // No recovery (breakdown §2 "Restart gap"): groups 1 and 3 keep ent 5's rows until a
         // row under each changes.
-        run(
+        exec_all(
             &mut sc,
             &[
                 "UPDATE ent_val SET val = 8 WHERE eid = 6 AND aid = 11",
@@ -5394,7 +5376,7 @@ fn reg_cascade_deletes_per_key() {
                 .iter()
                 .map(|sp| eng.stats_of(&db, &sp.name))
                 .collect::<Result<_>>()?;
-            run(&mut c, stmts).await?;
+            exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
             for (sp, s0) in specs.iter().zip(&vbefore) {
                 let s = eng.stats_of(&db, &sp.name)?;
