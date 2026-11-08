@@ -4,6 +4,7 @@
 //! catalog, cascade, datum and intset. No logging, no environment, no IO, no tokio.
 
 pub mod buffer;
+pub mod hop;
 pub mod key;
 
 pub use buffer::IdSet;
