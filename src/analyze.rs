@@ -6889,6 +6889,50 @@ mod tests {
     }
 
     #[test]
+    fn id_outputs_expression_keys() {
+        // An aliased expression as group key: the key comparison is on the expression text, so
+        // the output has to match it exactly, and the unit keeps it unreduced.
+        let sql = "SELECT DATE(o.note) d, UPPER(o.status) u, o.id \
+                   FROM orders o GROUP BY DATE(o.note), o.id";
+        let mut d = parse_select(sql, "q").unwrap();
+        d.id_outputs = vec!["d".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.mode, Mode::Grouped);
+        assert_eq!(
+            v.unit_exprs,
+            vec!["DATE(o.note)"],
+            "the expression key, unreduced"
+        );
+        assert!(!v.unit_unique);
+
+        // An expression that is not one of the group keys:
+        let mut d = parse_select(sql, "q").unwrap();
+        d.id_outputs = vec!["u".to_string()];
+        let e = plan_block(&d, "db", &catalog()).unwrap_err().to_string();
+        assert!(
+            e.contains("is not a GROUP BY or shared PARTITION BY key"),
+            "{e}"
+        );
+
+        // The same expression as the shared PARTITION BY key of every window:
+        let mut d = parse_select(
+            "SELECT DATE(o.note) d, o.id, \
+             ROW_NUMBER() OVER (PARTITION BY DATE(o.note), o.id ORDER BY o.id) rn FROM orders o",
+            "q",
+        )
+        .unwrap();
+        d.id_outputs = vec!["d".to_string()];
+        let v = plan_block(&d, "db", &catalog()).unwrap();
+        assert_eq!(v.mode, Mode::Grouped);
+        assert_eq!(
+            v.unit_exprs,
+            vec!["DATE(o.note)"],
+            "the shared partition key, unreduced"
+        );
+        assert!(!v.unit_unique);
+    }
+
+    #[test]
     fn reserved_tables_are_refused_as_sources() {
         assert!(set_reserved(&["zz_reserved_t"], &["zz_reserved_"]));
         let mut cat = catalog();
