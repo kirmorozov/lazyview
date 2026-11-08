@@ -236,11 +236,12 @@ async fn connect_wait(
     what: &str,
     metrics: &Metrics,
     shutdown: &mut watch::Receiver<bool>,
+    lock_wait_s: u64,
 ) -> Result<Option<Conn>> {
     let mut backoff = Duration::from_secs(1);
     let mut waited = false;
     loop {
-        match connect(opts).await {
+        match connect(opts, lock_wait_s).await {
             Ok(c) => {
                 if waited {
                     info!(
@@ -302,6 +303,10 @@ fn target_backoff(n: u32) -> Duration {
 
 /// One connect attempt to a target (TCP + handshake), well inside the liveness window.
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Consecutive failed refreshes of a live view after which its state rows show the error (it is
+/// retried with backoff all the same, never re-planned or rebuilt).
+const REFRESH_ERROR_SHOWN_AFTER: u32 = 3;
 
 struct Version {
     plan: Arc<ViewPlan>,
@@ -420,9 +425,6 @@ struct Slot {
     last_plan_head: Option<Position>,
     /// Consecutive failed refreshes of the live version.
     refresh_failures: u32,
-    /// Of those, failures from an overloaded or unreachable server (supervised refreshes: they
-    /// never lead to a rebuild).
-    overload_failures: u32,
     /// Re-plan once the build in flight is done (its source data was replaced meanwhile).
     replan_after: bool,
     /// `_lazyview.rebuild` was set when the binlog was here: cleared once a build started at or
@@ -735,8 +737,9 @@ impl Drained {
     }
 }
 
-/// Opens a connection with the service's session settings.
-async fn connect(opts: &Opts) -> Result<Conn> {
+/// Opens a connection with the service's session settings (at most `lock_wait_s` for a table
+/// lock, see `mv::init_session`).
+async fn connect(opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
     let mut c = match tokio::time::timeout(CONNECT_TIMEOUT, Conn::new(opts.clone())).await {
         Ok(r) => r?,
         Err(_) => bail!(
@@ -745,7 +748,7 @@ async fn connect(opts: &Opts) -> Result<Conn> {
             opts.tcp_port()
         ),
     };
-    mv::init_session(&mut c).await?;
+    mv::init_session(&mut c, lock_wait_s).await?;
     Ok(c)
 }
 
@@ -812,7 +815,14 @@ impl Engine {
         Metrics::set(&metrics.gauges.starting, 1);
         let src_opts = binlog::replica_opts(&cfg.dsn)?;
         let schema = schema_of(&src_opts, "LAZYVIEW_DSN")?;
-        let Some(mut src) = connect_wait(&src_opts, "source database", &metrics, shutdown).await?
+        let Some(mut src) = connect_wait(
+            &src_opts,
+            "source database",
+            &metrics,
+            shutdown,
+            cfg.lock_wait_s,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -825,8 +835,14 @@ impl Engine {
         );
         managed_service_checks(&mut src).await;
         binlog_filter_checks(&mut src, &schema, src_opts.db_name()).await;
-        let Some(mut meta_conn) =
-            connect_wait(&src_opts, "source database", &metrics, shutdown).await?
+        let Some(mut meta_conn) = connect_wait(
+            &src_opts,
+            "source database",
+            &metrics,
+            shutdown,
+            cfg.lock_wait_s,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -886,6 +902,7 @@ impl Engine {
             &cfg.supervisor,
             &src_opts,
             &session_sql_mode(&mut src).await?,
+            cfg.lock_wait_s,
             metrics.clone(),
         );
         match cfg.supervisor.mode {
@@ -1434,6 +1451,25 @@ impl Engine {
         }
     }
 
+    /// Shows (`Some`) or clears (`None`) the error of a live view whose refreshes keep failing, in
+    /// `last_error` of its `ready` state rows (state and `refreshed_at` stay as they are).
+    async fn show_refresh_error(&mut self, i: usize, err: Option<&str>) {
+        let Some(l) = self.slots[i].live.as_ref() else {
+            return;
+        };
+        let (name, targets) = (l.name.clone(), l.targets.clone());
+        for t in &targets {
+            if let Err(e) = meta::set_last_error(&mut self.meta, &name, t, err).await {
+                warn!("writing _lazyview_state.last_error of {name}@{t}: {e:#}");
+            }
+            if let Some(st) = self.shown.get_mut(&(name.clone(), t.clone())) {
+                if st.state == "ready" {
+                    st.error = err.map(str::to_string);
+                }
+            }
+        }
+    }
+
     /// The view name in a `CREATE VIEW` definition is the source of truth: `_lazyview.name` is
     /// filled in or updated to it (a renaming definition renames the view online). A bare SELECT
     /// takes its name from `name`, so the two always agree then.
@@ -1536,7 +1572,7 @@ impl Engine {
 
     /// Re-establishes the source-read connection after a connection-class error.
     async fn heal_src(&mut self) {
-        match connect(&self.src_opts).await {
+        match connect(&self.src_opts, self.cfg.lock_wait_s).await {
             Ok(c) => {
                 self.src = c;
                 // The new connection probes the commit order again (and re-creates a dropped
@@ -1555,7 +1591,7 @@ impl Engine {
     /// another instance took over meanwhile this one stops (`Err`). `Ok(false)`: still
     /// unreachable, try again later.
     async fn heal_meta(&mut self) -> Result<bool> {
-        let conn = connect(&self.src_opts).await;
+        let conn = connect(&self.src_opts, self.cfg.lock_wait_s).await;
         self.metrics.beat();
         let mut conn = match conn {
             Ok(c) => c,
@@ -1944,7 +1980,6 @@ impl Engine {
             last_plan: None,
             last_plan_head: None,
             refresh_failures: 0,
-            overload_failures: 0,
             replan_after: false,
             rebuild_asked: None,
             plan_timed_out: None,
@@ -1985,7 +2020,7 @@ impl Engine {
             }
             let (rows, bytes) = (self.cfg.write_batch_rows, self.cfg.write_batch_bytes);
             let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, async {
-                let mut c = connect(&target.opts).await?;
+                let mut c = connect(&target.opts, self.cfg.lock_wait_s).await?;
                 let w = mv::write_opts(&mut c, rows, bytes).await?;
                 let mode = session_sql_mode(&mut c).await?;
                 Ok::<_, anyhow::Error>((c, w, mode))
@@ -2201,6 +2236,7 @@ impl Engine {
             plan.clone(),
             name.clone(),
             (self.cfg.write_batch_rows, self.cfg.write_batch_bytes),
+            self.cfg.lock_wait_s,
             self.metrics.clone(),
             self.build_tx.clone(),
             self.build_slots.clone(),
@@ -4586,34 +4622,36 @@ impl Engine {
                 if is_conn_error(&e) {
                     self.heal_src().await;
                 }
-                // Keep the changes for the next attempt (after a backoff); rebuild only if it
-                // keeps failing.
+                // Keep the changes for the next attempt, after a backoff, however often it fails: a
+                // failed refresh never re-plans or rebuilds the view (owner rule). From the third
+                // failure in a row the state rows show the error (`show_refresh_error`).
                 let s = &mut self.slots[i];
                 if let Some(l) = s.live.as_mut() {
                     l.dirty.merge(dirty);
                 }
                 s.refresh_failures += 1;
                 let n = s.refresh_failures;
-                // Supervised: an overloaded or unreachable server is waited out, never answered
-                // with a rebuild (design-supervisor.md, I5).
-                if self.sup.is_some() && supervisor::is_overload(&e) {
-                    s.overload_failures += 1;
-                }
-                let escalating = n - s.overload_failures;
                 let delay = Duration::from_millis(250 << n.min(7)).min(Duration::from_secs(30));
                 s.retry_at = Some(Instant::now() + delay);
+                Metrics::add(&self.metrics.refresh_errors, 1);
                 warn!(view = %name, attempt = n, "refresh failed: {e:#}; retrying in {delay:?}");
-                if escalating == 3 && !replan_pending && s.overload_failures < n {
-                    self.schedule_replan(def_id, false, true);
+                if n == REFRESH_ERROR_SHOWN_AFTER {
+                    let msg = format!(
+                        "refresh failed {n} times in a row, retrying with backoff (the table is stale \
+                         meanwhile; rebuild = 1 in _lazyview re-plans the view): {e:#}"
+                    );
+                    self.show_refresh_error(i, Some(&msg)).await;
                 }
             }
             Ok(r) => {
                 let s = &mut self.slots[i];
                 s.retry_at = None;
-                s.refresh_failures = 0;
-                s.overload_failures = 0;
+                let shown = std::mem::take(&mut s.refresh_failures) >= REFRESH_ERROR_SHOWN_AFTER;
                 if s.next.is_none() && !replan_pending {
                     self.failures.remove(&def_id);
+                }
+                if shown {
+                    self.show_refresh_error(i, None).await;
                 }
                 self.refreshed.insert(name.clone());
                 let s = &mut self.slots[i];
@@ -4942,7 +4980,7 @@ impl Engine {
                 .sup
                 .as_mut()
                 .expect("supervised refresh")
-                .write_endpoint(t, &opts, &mode);
+                .write_endpoint(t, &opts, &mode, self.cfg.lock_wait_s);
             jobs.push(supervisor::TargetJob {
                 name: t.clone(),
                 schema,
@@ -5603,7 +5641,11 @@ async fn swap_task(
     let mut swapped = Vec::new();
     for (t, opts, schema, check) in targets {
         let r = async {
-            let mut c = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT * 3, connect(&opts)).await
+            let mut c = match tokio::time::timeout(
+                TARGET_CONNECT_TIMEOUT * 3,
+                connect(&opts, crate::config::DEFAULT_LOCK_WAIT_S),
+            )
+            .await
             {
                 Ok(r) => r?,
                 Err(_) => bail!("connecting to target {t}: timed out"),
@@ -5670,7 +5712,12 @@ async fn prepare_target(
     (batch_rows, batch_bytes): (usize, usize),
 ) -> Result<(Conn, mv::WriteOpts)> {
     let (t, ts) = (&spec.target, &spec.schema);
-    let mut c = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT * 3, connect(&spec.opts)).await {
+    let mut c = match tokio::time::timeout(
+        TARGET_CONNECT_TIMEOUT * 3,
+        connect(&spec.opts, crate::config::DEFAULT_LOCK_WAIT_S),
+    )
+    .await
+    {
         Ok(r) => r.with_context(|| format!("connecting to target {t}"))?,
         Err(_) => bail!("connecting to target {t}: timed out"),
     };
@@ -5733,6 +5780,7 @@ async fn build_task(
     plan: Arc<ViewPlan>,
     name: String,
     batch: (usize, usize),
+    lock_wait_s: u64,
     metrics: Arc<Metrics>,
     tx: mpsc::UnboundedSender<BuildDone>,
     slots: Arc<tokio::sync::Semaphore>,
@@ -5745,7 +5793,7 @@ async fn build_task(
         if let Some(d) = test_delay {
             tokio::time::sleep(d).await;
         }
-        let mut src = connect(&src_opts).await?;
+        let mut src = connect(&src_opts, lock_wait_s).await?;
         let layout = mv::probe(&mut src, &src_schema, &plan).await?;
         // The cascade cache is read on the source before the table is filled, so that no
         // cascade falls between the two reads: the binlog this version replays holds the rest.

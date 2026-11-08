@@ -59,6 +59,8 @@ counters!(
     mv_rows_upserted,
     mv_rows_deleted,
     full_rebuilds,
+    // Failed refresh attempts of live views (each retried with backoff, never a rebuild).
+    refresh_errors,
     definition_reloads,
     // Definitions whose planning took longer than LAZYVIEW_PLAN_TIMEOUT_MS.
     plans_timed_out,

@@ -146,7 +146,8 @@ impl Drop for Permit {
 
 impl Endpoint {
     /// A pool of at most `max` connections, created on demand with the service's session
-    /// settings (`sql_mode`: the permissive mode `mv::init_session` sets, see there) and never
+    /// settings (`sql_mode`: the permissive mode `mv::init_session` sets, see there; a table
+    /// lock wait of at most `lock_wait_s` s) and never
     /// reset between uses, closing when idle for [`INACTIVE_TTL`].
     pub fn new(
         kind: &str,
@@ -154,6 +155,7 @@ impl Endpoint {
         opts: &Opts,
         max: usize,
         sql_mode: &str,
+        lock_wait_s: u64,
         metrics: &Metrics,
     ) -> Arc<Endpoint> {
         let max = max.max(1);
@@ -162,7 +164,7 @@ impl Endpoint {
             .with_reset_connection(false)
             .with_inactive_connection_ttl(INACTIVE_TTL)
             .with_ttl_check_interval(Duration::from_secs(5));
-        let setup = Vec::from(mv::session_setup(sql_mode));
+        let setup = Vec::from(mv::session_setup(sql_mode, lock_wait_s));
         let pool = Pool::new(
             OptsBuilder::from_opts(opts.clone())
                 .pool_opts(pool_opts)
@@ -401,6 +403,7 @@ impl Supervisor {
         cfg: &SupervisorConfig,
         src_opts: &Opts,
         src_sql_mode: &str,
+        lock_wait_s: u64,
         metrics: Arc<Metrics>,
     ) -> Option<Supervisor> {
         if cfg.mode == SupervisorMode::Off {
@@ -412,6 +415,7 @@ impl Supervisor {
             src_opts,
             cfg.max_source,
             src_sql_mode,
+            lock_wait_s,
             &metrics,
         );
         Some(Supervisor {
@@ -430,12 +434,20 @@ impl Supervisor {
     }
 
     /// The write pool of target `name` (created on first use).
-    pub fn write_endpoint(&mut self, name: &str, opts: &Opts, sql_mode: &str) -> Arc<Endpoint> {
+    pub fn write_endpoint(
+        &mut self,
+        name: &str,
+        opts: &Opts,
+        sql_mode: &str,
+        lock_wait_s: u64,
+    ) -> Arc<Endpoint> {
         let max = self.cfg.max_for_target(name);
         let metrics = self.metrics.clone();
         self.write
             .entry(name.to_string())
-            .or_insert_with(|| Endpoint::new("write", name, opts, max, sql_mode, &metrics))
+            .or_insert_with(|| {
+                Endpoint::new("write", name, opts, max, sql_mode, lock_wait_s, &metrics)
+            })
             .clone()
     }
 

@@ -762,29 +762,34 @@ fn side_name(name: &str, suffix: &str) -> String {
     }
 }
 
-/// Session settings for every connection the service opens: non-locking reads, and an sql_mode
-/// in which values are stored as they were read (zero dates, no strict-mode rejections).
-pub async fn init_session(conn: &mut Conn) -> Result<()> {
+/// Session settings for every connection the service opens: non-locking reads, an sql_mode
+/// in which values are stored as they were read (zero dates, no strict-mode rejections), and a
+/// bounded table-lock wait (`lock_wait_s`) so a session blocked by a `LOCK TABLES` fails with
+/// 1205 instead of waiting out the server default (a year).
+pub async fn init_session(conn: &mut Conn, lock_wait_s: u64) -> Result<()> {
     let mode: Option<String> = conn
         .query_first("SELECT CAST(@@SESSION.sql_mode AS CHAR)")
         .await?;
     let mode = mode.unwrap_or_default();
     let permissive = permissive_sql_mode(&mode);
-    let [isolation, set_mode] = session_setup(&permissive);
+    let [isolation, set_mode, lock_wait] = session_setup(&permissive, lock_wait_s);
     conn.query_drop(isolation).await?;
     if permissive != mode {
         conn.query_drop(set_mode).await?;
     }
+    conn.query_drop(lock_wait).await?;
     Ok(())
 }
 
 /// The statements that give a connection the service's session settings with `sql_mode` (a mode
-/// `permissive_sql_mode` returned): [`init_session`] runs them on a direct connection, the
-/// supervisor's pools (src/supervisor.rs) on every new pooled connection.
-pub fn session_setup(sql_mode: &str) -> [String; 2] {
+/// `permissive_sql_mode` returned) and a table-lock wait of at most `lock_wait_s` seconds:
+/// [`init_session`] runs them on a direct connection, the supervisor's pools (src/supervisor.rs)
+/// on every new pooled connection.
+pub fn session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
     [
         "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
         format!("SET SESSION sql_mode = '{}'", sql_mode.replace('\'', "")),
+        format!("SET SESSION lock_wait_timeout = {lock_wait_s}"),
     ]
 }
 
@@ -2503,13 +2508,15 @@ mod tests {
     #[test]
     fn session_setup_statements() {
         assert_eq!(
-            session_setup("ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"),
+            session_setup("ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION", 60),
             [
                 "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
                 "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'".to_string(),
+                "SET SESSION lock_wait_timeout = 60".to_string(),
             ]
         );
         // A quote cannot end the string literal early.
-        assert_eq!(session_setup("A'B")[1], "SET SESSION sql_mode = 'AB'");
+        assert_eq!(session_setup("A'B", 2)[1], "SET SESSION sql_mode = 'AB'");
+        assert_eq!(session_setup("", 2)[2], "SET SESSION lock_wait_timeout = 2");
     }
 }

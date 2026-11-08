@@ -80,6 +80,9 @@ impl Default for SupervisorConfig {
 /// adaptive limiter).
 pub const DEFAULT_MAX_SOURCE: usize = 4;
 pub const DEFAULT_MAX_TARGET: usize = 2;
+/// Default upper bound (seconds) for one table-lock wait of a session the engine opens
+/// (`LAZYVIEW_TEST_LOCK_WAIT_S`); the server default (a year) would hang a blocked refresh.
+pub const DEFAULT_LOCK_WAIT_S: u64 = 60;
 
 /// `min(4, max(1, cores / 4))`.
 pub fn default_cpu_workers() -> usize {
@@ -129,6 +132,10 @@ pub struct Config {
     /// Test hook `LAZYVIEW_TEST_BUILD_HOLD_BYTES=<bytes>`: the byte budget of changes buffered
     /// for building versions instead of the engine's constant (see `Engine::hold_for_builds`).
     pub test_build_hold_bytes: Option<usize>,
+    /// Test hook `LAZYVIEW_TEST_LOCK_WAIT_S=<s>` (default 60): how long at most a session the
+    /// engine opens waits for a table lock (`SET SESSION lock_wait_timeout`, the third statement
+    /// of `mv::session_setup`); a refresh blocked longer fails and is retried with backoff.
+    pub lock_wait_s: u64,
     /// Background builds running at once (each holds 1 + targets connections).
     pub build_concurrency: usize,
     /// Wait before reading sources when no GTID fence is available (binlog events can arrive
@@ -308,6 +315,7 @@ impl Config {
             test_build_delay: marker_delay("LAZYVIEW_TEST_BUILD_DELAY")?,
             test_build_hold_bytes: Some(num("LAZYVIEW_TEST_BUILD_HOLD_BYTES", 0)? as usize)
                 .filter(|&b| b > 0),
+            lock_wait_s: num("LAZYVIEW_TEST_LOCK_WAIT_S", DEFAULT_LOCK_WAIT_S)?.max(1),
             heartbeat: Duration::from_millis(num("LAZYVIEW_HEARTBEAT_MS", 5_000)?.max(100)),
             visibility_delay: Duration::from_millis(num("LAZYVIEW_VISIBILITY_DELAY_MS", 20)?),
             position_persist_interval: Duration::from_millis(num(
@@ -458,6 +466,7 @@ mod tests {
         let c = cfg(&[("LAZYVIEW_DSN", "x")]).unwrap();
         assert_eq!(c.plan_timeout, Duration::from_secs(10));
         assert_eq!(c.test_plan_delay, None);
+        assert_eq!(c.lock_wait_s, DEFAULT_LOCK_WAIT_S);
         assert_eq!(
             (c.test_build_delay.clone(), c.test_build_hold_bytes),
             (None, None)
@@ -468,9 +477,11 @@ mod tests {
             ("LAZYVIEW_TEST_PLAN_DELAY", "/*slow:x*/:250"),
             ("LAZYVIEW_TEST_BUILD_DELAY", "/*long_build*/:20000"),
             ("LAZYVIEW_TEST_BUILD_HOLD_BYTES", "1700000"),
+            ("LAZYVIEW_TEST_LOCK_WAIT_S", "2"),
         ])
         .unwrap();
         assert_eq!(c.plan_timeout, Duration::from_millis(1500));
+        assert_eq!(c.lock_wait_s, 2);
         assert_eq!(
             c.test_plan_delay,
             Some(("/*slow:x*/".to_string(), Duration::from_millis(250)))

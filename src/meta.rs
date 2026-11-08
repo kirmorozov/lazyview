@@ -344,6 +344,22 @@ pub async fn mark_all_error(conn: &mut Conn, reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// Sets (`Some`) or clears (`None`) `last_error` of a `ready` state row without touching its state
+/// or `refreshed_at` (a live view whose refreshes fail stays `ready` and keeps being retried).
+pub async fn set_last_error(
+    conn: &mut Conn,
+    name: &str,
+    target: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    conn.exec_drop(
+        "UPDATE `_lazyview_state` SET `last_error` = ? WHERE `name` = ? AND `target` = ? AND `state` = 'ready'",
+        (error, name, target),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Removes leftover error rows of a definition under other names (e.g. `#7` before it parsed).
 pub async fn delete_stale_state(
     conn: &mut Conn,

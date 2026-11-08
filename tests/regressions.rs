@@ -3661,6 +3661,81 @@ fn reg_index_ddl_on_view_table_does_not_rebuild() {
     });
 }
 
+/// A refresh that kept failing for another reason than an overloaded server re-planned the view
+/// after three attempts, which rebuilt it (owner rule: an incremental view never falls back to
+/// a rebuild). It is retried with backoff until it succeeds; from the third failure on
+/// `last_error` of the view's `ready` state rows says so, and the next success clears it. A
+/// source table held by `LOCK TABLES … WRITE` fails every refresh with a lock wait timeout after
+/// the source session's `LAZYVIEW_TEST_LOCK_WAIT_S` (2 s here; the default 60 s would be too
+/// slow for a test): three failures cost 3 × 2 s of blocking plus the 0.5 s + 1 s backoffs,
+/// about 7.5 s. Only the supervisor counts that as overload, so the engine runs unsupervised.
+#[test]
+fn reg_failing_refresh_retries_without_rebuild() {
+    scenario("reg_refresh_retry", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_entities",
+            Kind::Incremental,
+            "SELECT id, grp, status FROM entities",
+        )];
+        let ov = [
+            ("LAZYVIEW_SUPERVISOR", "off"),
+            ("LAZYVIEW_TEST_LOCK_WAIT_S", "2"),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_refresh_retry", ENTITIES, &specs, &ov).await?;
+        let mut c = db.conn().await?;
+        let mut lock = db.conn().await?;
+        let before = eng.snapshot();
+        exec(&mut lock, "LOCK TABLES entities WRITE").await?;
+        exec(
+            &mut lock,
+            "UPDATE entities SET status = 'held' WHERE id = 10",
+        )
+        .await?;
+        let t = std::time::Instant::now();
+        loop {
+            eng.check_alive()?;
+            let rows = view_state(&mut c, "r_entities").await?;
+            let shown = !rows.is_empty()
+                && rows.iter().all(|r| {
+                    r.state == "ready"
+                        && r.last_error
+                            .as_deref()
+                            .is_some_and(|e| e.contains("refresh failed"))
+                });
+            if shown {
+                break;
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(90),
+                "no refresh error shown while the table is locked: {rows:?}; {}",
+                fmt_snapshot(&eng.snapshot().since(&before))
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        exec(&mut lock, "UNLOCK TABLES").await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the lock is released").await?;
+        let t = std::time::Instant::now();
+        while view_state(&mut c, "r_entities")
+            .await?
+            .iter()
+            .any(|r| r.last_error.is_some())
+        {
+            ensure!(
+                t.elapsed() < Duration::from_secs(30),
+                "the refresh error stayed after a successful refresh"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0 && d.refresh_errors >= 3,
+            "failed refreshes must be retried, never rebuilt: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
 /// Writes to `entities` (unless `links_only`) and `links` until `stop`: inserts into both,
 /// flips the status of existing entities. Ids come from `seq`.
 async fn churn(
