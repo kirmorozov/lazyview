@@ -20,6 +20,19 @@ fn container(ctx: &Ctx) -> Option<String> {
     })
 }
 
+/// The MySQL account the engine connects as: `LAZYVIEW_TEST_ENGINE_USER` (CI: `lvdoc:doc`) when
+/// set, the schema DSN's admin user otherwise — the harness starts every engine that way.
+fn engine_user(db: &Db) -> String {
+    let raw = match std::env::var("LAZYVIEW_TEST_ENGINE_USER") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            let rest = db.dsn.split_once("://").map_or(db.dsn.as_str(), |(_, r)| r);
+            rest.split_once('@').unwrap_or(("", "")).0.to_string()
+        }
+    };
+    raw.split(':').next().unwrap_or_default().to_string()
+}
+
 /// `docker restart` (a clean shutdown, then a start) and wait until the server answers again.
 async fn restart(db: &Db, container: &str) -> Result<()> {
     let c = container.to_string();
@@ -250,10 +263,38 @@ fn exclusive_killed_connections_are_not_fatal() {
         let (db, mut eng) = setup(&ctx, "x_kill", &ov).await?;
         let specs = spec();
         let mut c = db.conn().await?;
+        // The sessions to kill are the engine's, and the engine runs as `engine_user` (CI:
+        // lvdoc), not as the schema's admin user. They appear only while the engine is
+        // connected (after a kill it takes a moment to come back), so poll for them.
+        let user = engine_user(&db);
         for round in 1..=3 {
-            // Every other session of the test user on this (exclusive) server: the engine's.
+            let (dsn, u) = (db.dsn.clone(), user.clone());
+            wait_until(
+                "engine sessions in the PROCESSLIST",
+                Duration::from_secs(30),
+                || {
+                    let (dsn, u) = (dsn.clone(), u.clone());
+                    async move {
+                        let mut p = connect(&dsn).await?;
+                        let n = scalar_i64(
+                            &mut p,
+                            &format!(
+                                "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
+                             WHERE USER = '{u}' AND ID <> CONNECTION_ID()"
+                            ),
+                        )
+                        .await?;
+                        p.disconnect().await.ok();
+                        Ok(n > 0)
+                    }
+                },
+            )
+            .await?;
+            // Every other session of the engine user on this (exclusive) server: the engine's.
             let ids: Vec<u64> = c
-                .query("SELECT ID FROM information_schema.PROCESSLIST WHERE USER = 'lv' AND ID <> CONNECTION_ID()")
+                .query(format!(
+                    "SELECT ID FROM information_schema.PROCESSLIST WHERE USER = '{user}' AND ID <> CONNECTION_ID()"
+                ))
                 .await?;
             ensure!(!ids.is_empty(), "no engine sessions to kill");
             for id in ids {

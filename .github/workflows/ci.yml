@@ -154,6 +154,8 @@ jobs:
           LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           # Empty: the default mode. The harness passes it to every engine a test starts.
           LAZYVIEW_SUPERVISOR: ${{ matrix.supervisor || '' }}
+          # The exclusive suite (server restarts, killed connections, idle binlog rotation) restarts this job's own disposable server; compose names the container <project>-<service>-1 and the project is the checkout dir (lazyview).
+          LAZYVIEW_TEST_EXCLUSIVE: ${{ matrix.flavor }}=lazyview-${{ matrix.flavor }}-1
         # --no-fail-fast: run every suite and report all failures, not just the first.
         run: cargo test --locked --no-fail-fast --test '*' -- --test-threads=1
       - name: advisory flavor failed
