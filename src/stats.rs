@@ -17,18 +17,30 @@
 //!
 //! Cost: per binlog row and view the binlog loop adds to plain integers in the view's buffer
 //! ([`Tally`]; the buffer's insert already says whether the id was new). Refresh results are
-//! counted in plain fields of the engine's view slot ([`Flush`]) and folded into the shared
-//! [`Registry`] once per flush, under one lock for all views. Every statistic is a counter
-//! summed since start (or a gauge): no per-id state, so the memory per view is constant.
+//! counted in plain fields of the engine's view slot ([`Flush`]). Once per flush the engine
+//! hands every view's counters to the aggregator task with one non-blocking channel send
+//! ([`FoldSender::send`], no lock); the task folds them and publishes a snapshot that `/stats`
+//! and `/metrics` read ([`Registry`]). Best effort: the snapshot may lag the engine, and a
+//! batch the full channel refuses is dropped and counted (`stats_batches_dropped`; the
+//! counters then miss it and `balanced` may turn false). Every statistic is a counter summed
+//! since start (or a gauge): no per-id state, so the memory per view is constant.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::accumulate::UnitSet;
 use crate::metrics::unix_now;
 use crate::mv::Applied;
+
+/// Flush batches the channel to the aggregator task holds (see [`spawn_aggregator`]); a batch
+/// that does not fit is dropped and counted instead of making the engine wait. A batch holds
+/// one [`Fold`] per view (about 300 bytes), so this also bounds the memory of a backlog.
+const CHANNEL_BATCHES: usize = 64;
 
 /// Counted by the binlog loop while it feeds one view's buffer: plain integers, folded into the
 /// view's statistics once per flush.
@@ -185,7 +197,7 @@ impl Flush {
     }
 }
 
-/// A view's state at a fold (see [`Registry::fold`]).
+/// A view's counters since the last flush, sent to the aggregator (see [`FoldSender::send`]).
 pub struct Fold {
     /// `<schema>.<view>`.
     pub view: String,
@@ -199,7 +211,7 @@ pub struct Fold {
     pub cascade_cached_rows: u64,
 }
 
-/// The shared statistics of one view.
+/// The statistics of one view, owned by the aggregator task.
 #[derive(Debug, Default)]
 struct ViewStats {
     mode: &'static str,
@@ -479,6 +491,12 @@ pub struct Snapshot {
     pub now_unix: u64,
     /// `<schema>.<view>` → its statistics.
     pub views: BTreeMap<String, ViewSnapshot>,
+    /// Flush batches the aggregator had applied when it published this (see
+    /// [`Registry::includes`]); not part of `/stats`.
+    pub batches: u64,
+    /// Flush batches dropped because the channel to the aggregator was full: the counters miss
+    /// what they carried (`/stats` `batches_dropped`, `lazyview_stats_batches_dropped_total`).
+    pub batches_dropped: u64,
 }
 
 impl Snapshot {
@@ -492,13 +510,20 @@ impl Snapshot {
         json!({
             "since_unix": self.since_unix,
             "now_unix": self.now_unix,
+            "batches_dropped": self.batches_dropped,
             "views": views,
         })
     }
 
-    /// Appends the per-view series (label `view`) in the Prometheus text format.
+    /// Appends the dropped-batches counter and the per-view series (label `view`) in the
+    /// Prometheus text format.
     pub fn write_prometheus(&self, out: &mut String, escape: impl Fn(&str) -> String) {
         use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "# HELP lazyview_stats_batches_dropped_total Flush batches of per-view statistics dropped because the aggregator lagged (the lazyview_view_* counters miss them).\n# TYPE lazyview_stats_batches_dropped_total counter\nlazyview_stats_batches_dropped_total {}",
+            self.batches_dropped
+        );
         let Some(first) = self.views.values().next() else {
             return;
         };
@@ -521,53 +546,138 @@ impl Snapshot {
     }
 }
 
-/// Per-view statistics shared by the engine (writes once per flush) and the health endpoint.
+/// Per-view statistics as the aggregator task last published them (see [`spawn_aggregator`]),
+/// read by the health endpoint. The engine only counts in `sent` / `dropped` (no lock).
 #[derive(Debug)]
 pub struct Registry {
     since_unix: u64,
-    views: Mutex<BTreeMap<String, ViewStats>>,
+    /// The latest snapshot, swapped whole by the aggregator; readers clone the `Arc`.
+    published: Mutex<Arc<Snapshot>>,
+    /// Batches handed to [`FoldSender::send`], and of those the ones dropped (channel full).
+    sent: AtomicU64,
+    dropped: AtomicU64,
 }
 
 impl Default for Registry {
     fn default() -> Registry {
         Registry {
             since_unix: unix_now(),
-            views: Mutex::new(BTreeMap::new()),
+            published: Mutex::default(),
+            sent: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
         }
     }
 }
 
 impl Registry {
-    /// Folds the state of every current view into the statistics (one lock); views not listed
-    /// (removed definitions) are forgotten.
-    pub fn fold(&self, views: Vec<Fold>) {
-        let mut m = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        let listed: HashSet<&str> = views.iter().map(|f| f.view.as_str()).collect();
-        m.retain(|k, _| listed.contains(k.as_str()));
-        for mut f in views {
-            let key = std::mem::take(&mut f.view);
-            m.entry(key).or_default().fold(f);
-        }
+    fn lock(&self) -> MutexGuard<'_, Arc<Snapshot>> {
+        self.published.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Swaps in the aggregator's latest snapshot.
+    fn publish(&self, s: Snapshot) {
+        *self.lock() = Arc::new(s);
+    }
+
+    /// The latest published statistics. Best effort: they may lag the engine by a flush or
+    /// more, and miss the batches counted in `batches_dropped`.
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot_at(unix_now())
-    }
-
-    fn snapshot_at(&self, now: u64) -> Snapshot {
-        let m = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        let s: Arc<Snapshot> = self.lock().clone();
         Snapshot {
             since_unix: self.since_unix,
-            now_unix: now,
-            views: m.iter().map(|(k, v)| (k.clone(), v.snapshot())).collect(),
+            now_unix: unix_now(),
+            batches_dropped: self.dropped.load(Ordering::Relaxed),
+            ..(*s).clone()
         }
     }
 
-    /// The statistics of one view (`<schema>.<view>`).
+    /// The statistics of one view (`<schema>.<view>`), as last published.
     pub fn view(&self, name: &str) -> Option<ViewSnapshot> {
-        let m = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        m.get(name).map(ViewStats::snapshot)
+        let s: Arc<Snapshot> = self.lock().clone();
+        s.views.get(name).cloned()
     }
+
+    /// Batches handed to [`FoldSender::send`] so far.
+    pub fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+
+    /// Whether the published snapshot accounts for the first `sent` batches (applied or
+    /// dropped). Read [`Registry::sent`] first, then wait for this to see every earlier flush.
+    pub fn includes(&self, sent: u64) -> bool {
+        self.lock().batches + self.dropped.load(Ordering::Relaxed) >= sent
+    }
+}
+
+/// The per-view statistics, owned by the aggregator task (see [`spawn_aggregator`]).
+#[derive(Debug, Default)]
+struct Aggregator {
+    views: BTreeMap<String, ViewStats>,
+    /// Batches applied.
+    batches: u64,
+}
+
+impl Aggregator {
+    /// Folds one flush's views into the statistics; views not listed (removed definitions)
+    /// are forgotten.
+    fn apply(&mut self, views: Vec<Fold>) {
+        let listed: HashSet<&str> = views.iter().map(|f| f.view.as_str()).collect();
+        self.views.retain(|k, _| listed.contains(k.as_str()));
+        for mut f in views {
+            let key = std::mem::take(&mut f.view);
+            self.views.entry(key).or_default().fold(f);
+        }
+        self.batches += 1;
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            views: self
+                .views
+                .iter()
+                .map(|(k, v)| (k.clone(), v.snapshot()))
+                .collect(),
+            batches: self.batches,
+            ..Snapshot::default()
+        }
+    }
+}
+
+/// The engine's end of the channel to the aggregator task.
+pub struct FoldSender {
+    tx: mpsc::Sender<Vec<Fold>>,
+    registry: Arc<Registry>,
+}
+
+impl FoldSender {
+    /// Hands one flush's views to the aggregator without waiting and without a lock. A full
+    /// channel (the task lags) drops the batch and counts it (`stats_batches_dropped`).
+    pub fn send(&self, views: Vec<Fold>) {
+        self.registry.sent.fetch_add(1, Ordering::Relaxed);
+        if self.tx.try_send(views).is_err() {
+            self.registry.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Starts the aggregator task on the current tokio runtime. It applies the batches the
+/// returned [`FoldSender`] hands over and publishes a snapshot into `registry` whenever it has
+/// drained the channel; once the sender is dropped (the engine stopped) it ends, with every
+/// applied batch published.
+pub fn spawn_aggregator(registry: Arc<Registry>) -> (FoldSender, JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::channel::<Vec<Fold>>(CHANNEL_BATCHES);
+    let published = registry.clone();
+    let task = tokio::spawn(async move {
+        let mut agg = Aggregator::default();
+        while let Some(views) = rx.recv().await {
+            agg.apply(views);
+            while let Ok(views) = rx.try_recv() {
+                agg.apply(views);
+            }
+            published.publish(agg.snapshot());
+        }
+    });
+    (FoldSender { tx, registry }, task)
 }
 
 #[cfg(test)]
@@ -670,8 +780,7 @@ mod tests {
     /// `ids_marked = ids_absorbed + entities_updated + ids_pending` (integer and composite ids).
     #[test]
     fn folds_keep_the_invariant() {
-        let reg = Registry::default();
-        let now = 1_000_000;
+        let mut agg = Aggregator::default();
         // Flush 1: ids 1..=100 marked three times each; all refreshed.
         let mut t = Tally::default();
         let mut buf = UnitSet::default();
@@ -692,8 +801,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        reg.fold(vec![fold("s.v", t, f, 0)]);
-        let s = reg.snapshot_at(now).views["s.v"].clone();
+        agg.apply(vec![fold("s.v", t, f, 0)]);
+        let s = agg.snapshot().views["s.v"].clone();
         assert_eq!(s.ids_marked, 300);
         assert_eq!(s.ids_absorbed, 200);
         assert_eq!(s.entities_updated, 100);
@@ -718,8 +827,8 @@ mod tests {
             },
         );
         mark(&mut t, &mut buf, &(151..=160).collect::<Vec<_>>());
-        reg.fold(vec![fold("s.v", t, f, buf.len() as u64)]);
-        let s = reg.snapshot_at(now + 1).views["s.v"].clone();
+        agg.apply(vec![fold("s.v", t, f, buf.len() as u64)]);
+        let s = agg.snapshot().views["s.v"].clone();
         assert_eq!(s.ids_marked, 300 + 100 + 5 + 10);
         assert_eq!(s.entities_updated, 100 + 105);
         assert_eq!(s.ids_pending, 10);
@@ -734,8 +843,8 @@ mod tests {
             &Work::default(),
         );
         f.carried(3, 1);
-        reg.fold(vec![fold("s.v", Tally::default(), f, 2)]);
-        let s = reg.snapshot_at(now + 2).views["s.v"].clone();
+        agg.apply(vec![fold("s.v", Tally::default(), f, 2)]);
+        let s = agg.snapshot().views["s.v"].clone();
         assert_eq!(s.ids_pending, 2);
         assert_eq!(
             (s.ids_marked, s.ids_absorbed, s.entities_updated),
@@ -766,7 +875,7 @@ mod tests {
     /// Partial unit keys count as ids: one per key of each partial set, added to the full units.
     #[test]
     fn partial_keys_count_as_ids() {
-        let reg = Registry::default();
+        let mut agg = Aggregator::default();
         let mut t = Tally::default();
         for new in [true, true, true, true, false] {
             t.id(new);
@@ -778,8 +887,8 @@ mod tests {
             false,
             &Work::default(),
         );
-        reg.fold(vec![fold("s.p", t, f, 0)]);
-        let s = reg.view_at("s.p", 1);
+        agg.apply(vec![fold("s.p", t, f, 0)]);
+        let s = agg.view("s.p");
         assert_eq!(
             (s.ids_marked, s.ids_absorbed, s.entities_updated),
             (5, 1, 4)
@@ -789,19 +898,19 @@ mod tests {
 
     #[test]
     fn global_views_count_their_single_unit() {
-        let reg = Registry::default();
+        let mut agg = Aggregator::default();
         let mut t = Tally::default();
         t.id(true);
         t.id(false);
         let mut f = Flush::default();
         f.refreshed(UnitSet::default(), Vec::new(), true, &Work::default());
-        reg.fold(vec![fold("s.g", t, f, 0)]);
+        agg.apply(vec![fold("s.g", t, f, 0)]);
         let mut f = Flush::default();
         let mut t = Tally::default();
         t.id(true);
         f.refreshed(UnitSet::default(), Vec::new(), true, &Work::default());
-        reg.fold(vec![fold("s.g", t, f, 0)]);
-        let s = reg.view_at("s.g", 11);
+        agg.apply(vec![fold("s.g", t, f, 0)]);
+        let s = agg.view("s.g");
         assert_eq!(
             (s.ids_marked, s.ids_absorbed, s.entities_updated),
             (3, 1, 2)
@@ -811,64 +920,134 @@ mod tests {
 
     #[test]
     fn builds_and_whole_view_refreshes() {
-        let reg = Registry::default();
+        let mut agg = Aggregator::default();
         let mut f = Flush::default();
         f.built(false, "first build");
-        reg.fold(vec![fold("s.v", Tally::default(), f, 0)]);
-        let s = reg.view_at("s.v", 5);
+        agg.apply(vec![fold("s.v", Tally::default(), f, 0)]);
+        let s = agg.view("s.v");
         assert_eq!((s.builds, s.whole_view_refreshes), (1, 0));
         assert_eq!(s.last_whole_view_refresh, None);
         let mut f = Flush::default();
         f.built(true, "affected ids unknown");
-        reg.fold(vec![fold("s.v", Tally::default(), f, 0)]);
-        let s = reg.view_at("s.v", 6);
+        agg.apply(vec![fold("s.v", Tally::default(), f, 0)]);
+        let s = agg.view("s.v");
         assert_eq!((s.builds, s.whole_view_refreshes), (1, 1));
         assert_eq!(
             s.last_whole_view_refresh.as_ref().map(|r| r.0.as_str()),
             Some("affected ids unknown")
         );
-        let j = reg.snapshot_at(6).to_json();
+        let j = agg.snapshot().to_json();
         assert_eq!(j["views"]["s.v"]["whole_view_refreshes"], 1);
         assert_eq!(
             j["views"]["s.v"]["last_whole_view_refresh"]["reason"],
             "affected ids unknown"
         );
         // A view no longer listed is forgotten.
-        reg.fold(vec![fold("s.w", Tally::default(), Flush::default(), 0)]);
-        let snap = reg.snapshot_at(7);
+        agg.apply(vec![fold("s.w", Tally::default(), Flush::default(), 0)]);
+        let snap = agg.snapshot();
         assert_eq!(snap.views.keys().collect::<Vec<_>>(), ["s.w"]);
     }
 
     #[test]
     fn prometheus_series_per_view() {
-        let reg = Registry::default();
+        let mut agg = Aggregator::default();
         let mut t = Tally::default();
         t.row(false);
         t.id(true);
         let mut f = Flush::default();
         f.refreshed(ints(&[1]), Vec::new(), false, &Work::default());
-        reg.fold(vec![
+        agg.apply(vec![
             fold("s.a", t, f, 0),
             fold("s.b\"q", Tally::default(), Flush::default(), 0),
         ]);
         let mut out = String::new();
-        reg.snapshot_at(1)
+        agg.snapshot()
             .write_prometheus(&mut out, |v| v.replace('"', "\\\""));
         assert!(out.contains("# TYPE lazyview_view_entities_updated_total counter\n"));
         assert!(out.contains("lazyview_view_entities_updated_total{view=\"s.a\"} 1\n"));
         assert!(out.contains("lazyview_view_entities_updated_total{view=\"s.b\\\"q\"} 0\n"));
         assert!(out.contains("# TYPE lazyview_view_ids_pending gauge\n"));
         assert!(out.contains("lazyview_view_whole_view_refreshes_total{view=\"s.a\"} 0\n"));
+        // Without views only the dropped-batches counter is written.
         let mut empty = String::new();
-        Registry::default()
+        Aggregator::default()
             .snapshot()
             .write_prometheus(&mut empty, |v| v.to_string());
-        assert!(empty.is_empty());
+        assert_eq!(
+            empty
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .collect::<Vec<_>>(),
+            ["lazyview_stats_batches_dropped_total 0"]
+        );
     }
 
-    impl Registry {
-        fn view_at(&self, name: &str, now: u64) -> ViewSnapshot {
-            self.snapshot_at(now).views[name].clone()
+    /// The task applies every batch handed over, publishes them for `/stats`, and ends once
+    /// the sender is dropped (the engine stopped).
+    #[tokio::test(flavor = "current_thread")]
+    async fn aggregator_publishes_batches_and_ends_with_the_sender() {
+        let reg = Arc::new(Registry::default());
+        let (tx, task) = spawn_aggregator(reg.clone());
+        let mut t = Tally::default();
+        t.id(true);
+        t.id(false);
+        tx.send(vec![fold("s.v", t, Flush::default(), 1)]);
+        tx.send(vec![fold("s.v", t, Flush::default(), 2)]);
+        let sent = reg.sent();
+        assert_eq!(sent, 2);
+        // The current-thread runtime has not run the task yet: nothing is published.
+        assert!(!reg.includes(sent) && reg.view("s.v").is_none());
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the task ends once the sender is dropped")
+            .expect("the task does not panic");
+        assert!(reg.includes(sent));
+        let s = reg.view("s.v").expect("published");
+        assert_eq!((s.ids_marked, s.ids_absorbed, s.ids_pending), (4, 2, 2));
+        let snap = reg.snapshot();
+        assert_eq!((snap.batches, snap.batches_dropped), (2, 0));
+        let j = snap.to_json();
+        assert_eq!(j["views"]["s.v"]["ids_marked"], 4);
+        assert_eq!(j["batches_dropped"], 0);
+        assert!(j.get("batches").is_none());
+    }
+
+    /// A full channel (the task lags) drops the batch instead of waiting and counts it, in
+    /// the snapshot and as `lazyview_stats_batches_dropped_total`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_channel_drops_and_counts_the_batch() {
+        let reg = Arc::new(Registry::default());
+        let (tx, task) = spawn_aggregator(reg.clone());
+        // The current-thread runtime runs the task only at an await: nothing is consumed here.
+        for _ in 0..=CHANNEL_BATCHES {
+            tx.send(vec![fold("s.v", Tally::default(), Flush::default(), 0)]);
+        }
+        assert_eq!(reg.snapshot().batches_dropped, 1);
+        drop(tx);
+        task.await.expect("the task does not panic");
+        let snap = reg.snapshot();
+        assert_eq!(
+            (snap.batches, snap.batches_dropped),
+            (CHANNEL_BATCHES as u64, 1)
+        );
+        assert!(reg.includes(reg.sent()));
+        let mut out = String::new();
+        snap.write_prometheus(&mut out, |v| v.to_string());
+        assert!(
+            out.contains("# HELP lazyview_stats_batches_dropped_total "),
+            "{out}"
+        );
+        assert!(
+            out.contains("# TYPE lazyview_stats_batches_dropped_total counter\nlazyview_stats_batches_dropped_total 1\n"),
+            "{out}"
+        );
+        assert_eq!(snap.to_json()["batches_dropped"], 1);
+    }
+
+    impl Aggregator {
+        fn view(&self, name: &str) -> ViewSnapshot {
+            self.snapshot().views[name].clone()
         }
     }
 }

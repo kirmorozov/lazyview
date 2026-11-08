@@ -1676,11 +1676,18 @@ impl Engine {
         self.wait_caught_up_rounds(src, timeout, 3).await
     }
 
-    /// Update statistics of view `view` of `db`, as `GET /stats` reports them (src/stats.rs):
-    /// folded at the end of every flush, so after a catch-up they include everything applied.
-    /// `None` until a flush listed the view.
+    /// Update statistics of view `view` of `db`, as `GET /stats` reports them (src/stats.rs).
+    /// Every flush hands them to the aggregator task before it advances the applied position;
+    /// this waits (at most 5 s) until the task published every batch handed over so far, so
+    /// after a catch-up they include everything applied. `None` until a flush listed the view.
     pub fn view_stats(&self, db: &Db, view: &str) -> Option<ViewStats> {
-        self.metrics.view_stats.view(&format!("{}.{view}", db.name))
+        let reg = &self.metrics.view_stats;
+        let sent = reg.sent();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reg.includes(sent) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        reg.view(&format!("{}.{view}", db.name))
     }
 
     /// [`Self::view_stats`], failing when the view is not listed.

@@ -430,7 +430,7 @@ struct Slot {
     rebuild_asked: Option<Position>,
     /// Hash of the definition whose planning timed out: not planned again until it changes.
     plan_timed_out: Option<String>,
-    /// Refresh results and builds since the last fold into `/stats` (see `publish_stats`).
+    /// Refresh results and builds since the last hand-over to `/stats` (see `publish_stats`).
     stats: crate::stats::Flush,
 }
 
@@ -631,6 +631,9 @@ struct Engine {
     refreshed: HashSet<String>,
     last_touch: Instant,
     last_stats: (Instant, crate::metrics::Snapshot),
+    /// Hands each flush's per-view counters to the statistics aggregator task (src/stats.rs);
+    /// the task ends when this, its only sender, is dropped with the engine.
+    stats_tx: crate::stats::FoldSender,
     last_meta_ping: Instant,
     /// Concurrent refreshes on connection pools; `None` with `LAZYVIEW_SUPERVISOR=off` (one
     /// sequential refresh on the connections above).
@@ -903,6 +906,9 @@ impl Engine {
             file: String::new(),
             pos: 0,
         };
+        // Detached: the task ends when the engine, owner of its only sender, is dropped.
+        let (stats_tx, stats_task) = crate::stats::spawn_aggregator(metrics.view_stats.clone());
+        drop(stats_task);
         let mut e = Engine {
             cfg,
             metrics,
@@ -949,6 +955,7 @@ impl Engine {
             refreshed: HashSet::new(),
             last_touch: Instant::now(),
             last_stats: (Instant::now(), Default::default()),
+            stats_tx,
             last_meta_ping: Instant::now(),
             sup,
         };
@@ -3784,8 +3791,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Folds every view's counters since the last flush into `/stats` (one lock per flush;
-    /// see src/stats.rs).
+    /// Hands every view's counters since the last flush to the statistics aggregator: one
+    /// non-blocking channel send per flush, no lock (see src/stats.rs).
     fn publish_stats(&mut self) {
         let schema = &self.schema;
         let views = self
@@ -3823,7 +3830,7 @@ impl Engine {
                 }
             })
             .collect();
-        self.metrics.view_stats.fold(views);
+        self.stats_tx.send(views);
     }
 
     /// Waits until the transactions read from the binlog are visible to readers: binlog events

@@ -8,7 +8,9 @@
 # refreshed (after it, entities_updated) / pending, and whole-view refreshes. Exits non-zero when an
 # incremental view was refreshed whole (whole_view_refreshes > 0: an update storm), or when
 # a view's counters do not balance (ids_marked != ids_absorbed + entities_updated +
-# ids_pending; only checked without whole-view refreshes, which drop the ids they cover).
+# ids_pending; only checked without whole-view refreshes, which drop the ids they cover, and
+# while /stats reports no dropped statistics batches: batches_dropped > 0 means the counters
+# are incomplete, see docs/operations.md).
 # Full-mode views are rebuilt by design: listed, never failed.
 #
 # Needs curl and jq. Load-test scripts can run it after the load to confirm deduplication.
@@ -22,15 +24,19 @@ json=$(curl -fsS --max-time 10 "$url") || { echo "stats-check: GET $url failed" 
 
 printf '%s\n' "$json" | jq -r '
   def ratio(a; b): if b > 0 then ((a / b * 100 | round) / 100 | tostring) else "-" end;
+  (.batches_dropped // 0) as $dropped |
   ["view", "mode", "marked", "absorbed", "updated", "pending", "marked/updated", "whole", "check"],
   (.views | to_entries[] | .key as $k | .value as $v |
     (if $v.mode != "full" and $v.whole_view_refreshes > 0 then "FAIL whole-view refresh: \($v.last_whole_view_refresh.reason // "")"
-     elif $v.whole_view_refreshes == 0 and ($v.balanced | not) then "FAIL marked != absorbed + updated + pending"
+     elif $dropped == 0 and $v.whole_view_refreshes == 0 and ($v.balanced | not) then "FAIL marked != absorbed + updated + pending"
      else "ok" end) as $check |
     [$k, $v.mode, $v.ids_marked, $v.ids_absorbed, $v.entities_updated,
      $v.ids_pending, ratio($v.ids_marked; $v.entities_updated), $v.whole_view_refreshes, $check])
   | @tsv' | if command -v column >/dev/null 2>&1; then column -t -s "$(printf '\t')"; else cat; fi
+printf '%s\n' "$json" | jq -r 'select((.batches_dropped // 0) > 0) |
+  "stats-check: \(.batches_dropped) statistics batches dropped: counters incomplete, balance not checked"' >&2
 
 printf '%s\n' "$json" | jq -e '
+  (.batches_dropped // 0) as $dropped |
   [.views[] | select((.mode != "full" and .whole_view_refreshes > 0)
-                     or (.whole_view_refreshes == 0 and (.balanced | not)))] | length == 0' >/dev/null
+                     or ($dropped == 0 and .whole_view_refreshes == 0 and (.balanced | not)))] | length == 0' >/dev/null
