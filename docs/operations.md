@@ -114,14 +114,18 @@ no view needed), `flushes`, `units_refreshed`, `units_changed`, `lookup_queries`
 included), `mv_rows_upserted` (of those, rows upserted by their row key), `mv_rows_deleted`,
 `full_rebuilds` (every table build: first builds, changed definitions and full-mode refreshes),
 `definition_reloads`, `plans_timed_out` (definitions whose planning took longer than
-`LAZYVIEW_PLAN_TIMEOUT_MS`), and for [concurrent refreshes](configuration.md#concurrent-refreshes)
+`LAZYVIEW_PLAN_TIMEOUT_MS`), `stats_batches_dropped` (flush batches of per-view statistics dropped
+because the aggregator lagged; see [per-view update statistics](#per-view-update-statistics)), and
+for [concurrent refreshes](configuration.md#concurrent-refreshes)
 `supervisor_overload_errors` (ops that failed with an overload error), `supervisor_retries`,
 `supervisor_zombie_kills` (writes killed after a timeout inside their transaction) and
 `supervisor_cpu_offloads` (diffs run off the async threads). The binlog keeps being read while a
 flush runs, up to 100,000 events or 32 MiB queued: `flushes_overlapped` counts the flushes during
 which it was read, `binlog_backpressure` those during which the queue was full (the stream then
-waits). `cascade_rows` sums over the views the child rows a mapped cascade changed, replayed
-from the in-memory cascade cache.
+waits). `binlog_backpressure` also counts the pauses while the changes buffered for building views
+exceed their 256 MiB budget (logged as `binlog reading paused until a build is applied`): every
+view lags meanwhile. `cascade_rows` sums over the views the child rows a mapped cascade changed,
+replayed from the in-memory cascade cache.
 
 Per connection pool of concurrent refreshes, labelled
 `{pool="read|write", endpoint="source|<target>"}`: `lazyview_supervisor_limit`, `_max` (pool
@@ -153,8 +157,7 @@ Per view, labelled `{view="<schema>.<view>"}`: the counters of
 `cascade_rows`, `cascade_gaps`, `entities_updated`,
 `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_unchanged`,
 `whole_view_refreshes`, `builds`, `source_queries`, `lookup_queries`, `flushes`) and the gauges
-`lazyview_view_ids_pending`, `lazyview_view_entities_distinct`,
-`lazyview_view_entities_distinct_60s`, `lazyview_view_cascade_cached_rows` and
+`lazyview_view_ids_pending`, `lazyview_view_cascade_cached_rows` and
 `lazyview_view_last_flush_timestamp_seconds`.
 
 Alerts worth having: `lazyview_streaming == 0` for 10 minutes, `lazyview_views_error > 0`, and
@@ -170,12 +173,18 @@ cause that, so its reason (in `/stats`) says what did.
 refresh rows in several views, but never a whole view. The numbers are kept in memory only: they
 start at zero when the process starts (`since_unix`) and are never written to the database.
 
+The numbers are best effort. Each flush hands them to a background task, which folds them and
+publishes the snapshot `/stats` and `/metrics` serve, so they may lag the binlog by about a
+second. When that task falls 64 flushes behind, a flush's batch is dropped instead of slowing the
+engine and counted in `batches_dropped` (`/stats`) and `lazyview_stats_batches_dropped_total`
+(`/metrics`). After a drop the counters are low and `balanced` may be false.
+
 ```sh
 curl -s localhost:8080/stats | jq '.views["mydb.my_view"]'
 ```
 
 ```json
-{ "since_unix": 1792990000, "now_unix": 1792990321, "window_secs": 60,
+{ "since_unix": 1792990000, "now_unix": 1792990321, "batches_dropped": 0,
   "views": { "<schema>.<view>": { "mode": "incremental", "ids_marked": 12000, "...": "..." } } }
 ```
 
@@ -190,9 +199,7 @@ curl -s localhost:8080/stats | jq '.views["mydb.my_view"]'
 | `cascade_rows` | child rows replayed from the in-memory cascade cache for a parent delete or key update ([mapped cascade routes](views.md#foreign-key-cascades)) |
 | `cascade_gaps` | parent changes replayed from before the cache's startup seed: counted and warned about at most once a minute, no recovery — the rows heal on their next change |
 | `cascade_cached_rows` | child rows kept in the live version's in-memory cascade cache; the view holds one entry per kept row |
-| `entities_updated` | ids refreshed, summed over flushes (each id once per flush) |
-| `entities_distinct` | distinct ids refreshed since start: exact for integer ids, by a 64-bit hash for others (exact up to hash collisions) |
-| `entities_distinct_60s`, `window_start_unix` | distinct ids refreshed since `window_start_unix` (30 to 60 s ago) |
+| `entities_updated` | target ids refreshed after deduplication (each id once per flush), summed over flushes |
 | `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_unchanged` | view rows written by refreshes (summed over targets): new, replaced in place, deleted, and compared but equal (not written) |
 | `whole_view_refreshes`, `last_whole_view_refresh` | builds that replaced a live version of the view (a full-mode refresh, affected ids unknown, a changed definition or source schema, a target rebuilt after it was down), with the last one's `reason` and `unix` time |
 | `builds` | first builds (no live version yet) |
@@ -201,22 +208,25 @@ curl -s localhost:8080/stats | jq '.views["mydb.my_view"]'
 | `balanced` | `ids_marked == ids_absorbed + entities_updated + ids_pending` |
 
 Every mark either finds its id pending or adds it to the buffer, from which the next flush
-refreshes it once, so `balanced` is true after every flush. A whole-view refresh drops the ids it
-covers; after one, `ids_marked` may be larger. `ids_marked / entities_updated` shows how much
-deduplication saves. For an incremental view `whole_view_refreshes` stays 0: a value above 0
-is an update storm, and `last_whole_view_refresh.reason` says why.
+refreshes it once, so `balanced` is true after every flush unless batches were dropped. A
+whole-view refresh drops the ids it covers; after one, `ids_marked` may be larger. `ids_marked /
+entities_updated` shows how much deduplication saves. For an incremental view
+`whole_view_refreshes` stays 0: a value above 0 is an update storm, and
+`last_whole_view_refresh.reason` says why. There are no recent-window fields; for a recent rate
+use `/metrics`, e.g. `rate(lazyview_view_ids_marked_total[1m])` or
+`rate(lazyview_view_entities_updated_total[1m])`.
 
 `scripts/stats-check.sh [URL]` (curl + jq; URL defaults to `http://127.0.0.1:8080/stats`) prints
-marked / absorbed / updated / distinct / pending / whole-view refreshes per view and exits 1 when
-an incremental view was refreshed whole or a view's counters do not balance (2 when `/stats`
-cannot be read). Run it after a load test to confirm deduplication works. Full-mode views are
-listed but never fail it.
+marked / absorbed / updated / pending / whole-view refreshes per view and exits 1 when an
+incremental view was refreshed whole or a view's counters do not balance (2 when `/stats` cannot
+be read); with `batches_dropped` above 0 it prints a note and does not fail on balance. Run it
+after a load test to confirm deduplication works. Full-mode views are listed but never fail it.
 
 Cost: per binlog row and view, a few additions to plain integers in the view's change buffer
-(whose insert already says whether the id was new). Everything else is folded in once per flush
-under one lock for all views, and the distinct-id sets are updated per refreshed id (integer ids
-by a bitmap union). Memory per view: three id sets (since start and two 30 s buckets), about
-2 bytes per dense integer id (up to 8 per sparse one) and about 16 bytes per other id. The
+(whose insert already says whether the id was new). Everything else is handed to a background
+task once per flush (one non-blocking channel send, no lock on the engine's path), which folds it
+and publishes a snapshot. Every statistic is a counter summed since start (or a gauge): no per-id
+state, so the memory per view is constant. The
 in-memory cascade cache adds one entry per kept child row of a view's mapped cascade routes:
 `cascade_cached_rows` shows how many, so a view over a large child table the plan cannot trace
 through the parent's row grows with that table's kept rows.

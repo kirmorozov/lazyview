@@ -155,6 +155,11 @@ LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --tes
 * `LAZYVIEW_TEST_PLAN_DELAY=<marker>:<ms>` (an engine setting, for tests only): planning a
   definition whose text contains `marker` first sleeps `ms` milliseconds
   (`reg_slow_planning_is_bounded` uses it to test `LAZYVIEW_PLAN_TIMEOUT_MS`).
+* `LAZYVIEW_TEST_BUILD_DELAY=<marker>:<ms>` (an engine setting, for tests only): a build of a
+  definition whose text contains `marker` first sleeps `ms` milliseconds, after it took its build
+  slot.
+* `LAZYVIEW_TEST_BUILD_HOLD_BYTES=<bytes>` (an engine setting, for tests only): the byte budget of
+  changes buffered for building versions, instead of the engine's constant (256 MiB).
 * `LAZYVIEW_TEST_GLOBAL_SQL_MODE=1` enables the regression test that changes the servers' GLOBAL
   `sql_mode` (`tests/regressions.rs`, ANSI quotes); same rule: no other suite on the same servers
   at the same time.

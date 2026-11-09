@@ -45,8 +45,9 @@ Priorities follow: (1) parallel refresh, (2) pipelining, (3) adaptive limiter, (
 Dedicated connections stay as today: binlog, `meta` (lock, position, state), `src` control (catalog, probe),
 one control connection per target (swaps, DDL, table checks), and builds (own connections,
 `LAZYVIEW_BUILD_CONCURRENCY`). Each pool is a `mysql_async::Pool` with `PoolConstraints::new(0, max)`,
-`with_reset_connection(false)`, `setup(["SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"])` (re-run
-after any reset; replaces `mv::init_session`) and `inactive_connection_ttl` 30 s, so connections above the
+`with_reset_connection(false)`, `setup(mv::session_setup(sql_mode))` (READ COMMITTED plus the source
+connection's permissive sql_mode, the same statements `mv::init_session` runs; re-run after any
+reset) and `inactive_connection_ttl` 30 s, so connections above the
 current limit close. The pool caps connections; the limiter (§4) caps how many are in use.
 
 **Flush job.** Input: one `ViewJob` per live, incremental, non-frozen version (`Arc<ViewPlan>`, `Layout`,
@@ -174,8 +175,7 @@ Metrics (`src/metrics.rs`, rendered by `health::prometheus`, also in `?format=js
 * **Per-pool gauges**, labelled `{pool="read|write", endpoint="source|<target>"}`: `lazyview_supervisor_limit`
   (float), `_max`, `_inflight`, `_queued`, `_connections`, `_rtt_seconds` (last round median),
   `_rtt_baseline_seconds` (bucket with the most samples in that round), `_gradient` (last g).
-* **Engine gauges**: `lazyview_flush_inflight`, `lazyview_flush_last_seconds`, `lazyview_buffered_keys`,
-  `lazyview_inflight_rows`.
+* **Engine gauges**: `lazyview_inflight_rows`.
 
 Registry: `Metrics.pools: Mutex<Vec<Arc<PoolGauges>>>`, floats as `f64` bits in `AtomicU64`. Logging: `info`
 when L changes by ≥ 50 % or enters / leaves 1 ("source read concurrency 8 → 4: rtt 2.6× baseline"), at most

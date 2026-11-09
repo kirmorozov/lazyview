@@ -51,6 +51,11 @@ UPDATE _lazyview SET rebuild = 1 WHERE name = 'paid_orders';
   `orders`) is refused like any table lazyview does not manage: ``refusing to replace existing
   base table … that lazyview does not manage (the view reads it: give the view another name)``. lazyview cannot see the tables those functions read, so
   it could not keep the view correct.
+* An executable comment — `/*! … */`, `/*!NNNNN … */` or `/*M! … */` (case-insensitive `M`) — is
+  refused anywhere in the definition text, including inside string literals, because MySQL and
+  MariaDB execute its content: ``the definition contains an executable comment (`/*!` or `/*M!`):
+  the server would run its content; write the SQL without it``. Optimizer hints (`/*+ … */`) and
+  ordinary `/* … */` and `--` comments are fine.
 * To check definitions without changing anything (for example in CI), run lazyview with
   `LAZYVIEW_SYNC=false`. It logs ``definition #N: `name` ok — <mode> → <targets>`` for each
   definition and exits with code `1` if any is invalid.
@@ -362,8 +367,10 @@ reads.
   [/stats](operations.md#per-view-update-statistics)) and warned about at most once a minute;
   there is no recovery, and the rows heal on their next change.
 
-The same rate-limited online rebuild is used when too many changed keys were buffered to track
-individually: more than max(10 × `LAZYVIEW_BATCH_MAX_KEYS`, 100000) during a build.
+Changes that arrive while a view is being built are kept, however many, and applied to the new
+table before it is swapped in; they never cause a rebuild. If the changes buffered for all views
+being built exceed about 256 MiB, lazyview stops reading the binlog until a build is applied (a
+warning; `binlog_backpressure`): every view lags meanwhile.
 
 ## XA transactions
 
