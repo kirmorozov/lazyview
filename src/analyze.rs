@@ -4837,26 +4837,117 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let marked = |sql: &str| {
-            plan_block(
+        let marked = |cat: &HashMap<TableRef, Arc<TableInfo>>, sql: &str| {
+            crate::analyzer::plan(
                 &parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap(),
                 "db",
-                &cat,
+                cat,
             )
             .unwrap()
             .has_explicit_collate
         };
         assert!(
-            marked("SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)"),
+            marked(&cat, "SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)"),
             "a COLLATE of its own in the WHERE"
         );
         assert!(
-            !marked("SELECT c.id FROM c WHERE c.name IN (SELECT b.code FROM s_bin b)"),
+            !marked(
+                &cat,
+                "SELECT c.id FROM c WHERE c.name IN (SELECT b.code FROM s_bin b)"
+            ),
             "the same view without it"
         );
         assert!(
-            marked("SELECT c.id FROM c ORDER BY c.name COLLATE utf8mb4_general_ci"),
+            marked(
+                &cat,
+                "SELECT c.id FROM c ORDER BY c.name COLLATE utf8mb4_general_ci"
+            ),
             "the ORDER BY counts as much as the WHERE"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id, b.code COLLATE utf8mb4_general_ci AS cd FROM c \
+                 JOIN s_bin b ON b.code COLLATE utf8mb4_general_ci = c.name"
+            ),
+            "a COLLATE in a JOIN ... ON"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id, c.name COLLATE utf8mb4_general_ci AS nm FROM c"
+            ),
+            "a COLLATE in the projection"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.name COLLATE utf8mb4_general_ci AS nm, COUNT(*) AS n FROM c \
+                 GROUP BY c.name COLLATE utf8mb4_general_ci"
+            ),
+            "a COLLATE in the GROUP BY"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id FROM c GROUP BY c.id \
+                 HAVING MAX(c.name COLLATE utf8mb4_general_ci) = 'x'"
+            ),
+            "a COLLATE in the HAVING"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id, (SELECT b.code COLLATE utf8mb4_general_ci FROM s_bin b LIMIT 1) AS x FROM c"
+            ),
+            "a COLLATE in a standalone subquery"
+        );
+        assert!(
+            marked(
+                &cat,
+                "WITH s AS (SELECT b.code COLLATE utf8mb4_general_ci AS cd FROM s_bin b) \
+                 SELECT t.cd FROM s AS t JOIN c ON c.name = t.cd"
+            ),
+            "a COLLATE in a view wrapped in a CTE / derived table with renamed aliases"
+        );
+        // The only COLLATE comes from an inlined VIRTUAL column: its inlined string form carries
+        // an EXPLICIT collation the definition as written never shows (inline_virtual_columns).
+        let mut gn = Column::new(
+            "gn",
+            "varchar",
+            "varchar(64)",
+            Some("utf8mb4"),
+            Some("utf8mb4_bin"),
+            None,
+            true,
+        );
+        gn.generated = Some(crate::catalog::Generated {
+            expr: "(CAST(`code` AS CHAR))".into(),
+            stored: false,
+            deps: Some(vec![0]),
+        });
+        let vcat: HashMap<TableRef, Arc<TableInfo>> = [(
+            ("db".to_string(), "skus".to_string()),
+            Arc::new(TableInfo {
+                schema: "db".into(),
+                name: "skus".into(),
+                columns: vec![Column::simple("code", "varchar"), gn],
+                pk: vec![0],
+                unique_keys: vec![],
+                cascades: vec![],
+                is_view: false,
+                view_bases: vec![],
+            }),
+        )]
+        .into_iter()
+        .collect();
+        assert!(
+            marked(&vcat, "SELECT gn FROM skus"),
+            "the inlined form of a VIRTUAL column carries a COLLATE of its own"
+        );
+        assert!(
+            !marked(&vcat, "SELECT code FROM skus"),
+            "the same table read without the VIRTUAL column"
         );
     }
 
