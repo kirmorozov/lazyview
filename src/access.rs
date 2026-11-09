@@ -10,7 +10,7 @@ use crate::analyze::{
     definition_hash, int_sql, is_create_statement, parse_definition, parse_select, quote_ident,
     referenced_tables, ConstFilter, Edge, Mode, ParsedDef, ViewPlan,
 };
-use crate::catalog::{FkAction, TableInfo, TableRef};
+use crate::catalog::{Column, FkAction, TableInfo, TableRef};
 use crate::datum::Datum;
 
 /// The view's unit, by expression.
@@ -81,14 +81,16 @@ pub enum Path {
     Whole,
 }
 
-/// The id through the occurrence's link tables: its columns on the chain's edges, the matching
-/// chain columns as `alias`.`col`, the id positions the chain reaches (all: the full id), the
-/// chain's aliases (not including the occurrence) and the parameterized SELECT mapping the
-/// partner values to the id values; the key filter on the partners is appended by the executor.
+/// The SELECT reads the chain's tables only, not the occurrence's: the executor appends
+/// `AND (<partner>) IN (<link values from the occurrence's images>)`, so a link row deleted or
+/// moved in the same window still finds the ids its old value reached (the chain rows exist
+/// unless their own, traced, events removed them).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hop {
     pub link_cols: Vec<usize>,
     pub partner: Vec<String>,
+    /// The partner columns as (alias, column) ordinals, in `link_cols` order.
+    pub partner_cols: Vec<(usize, usize)>,
     pub positions: Vec<usize>,
     pub aliases: Vec<usize>,
     pub select: String,
@@ -475,10 +477,19 @@ fn chain(
     Ok((c.aliases, c.links, c.positions))
 }
 
-/// The id of the occurrence through its link tables: the hop SQL maps the partner values to
-/// the id values and drops the view's other conditions (a superset of the ids, sound).
+/// The SELECT reads the chain's tables only, not the occurrence's: the executor appends
+/// `AND (<partner>) IN (<link values from the occurrence's images>)`, so a link row deleted or
+/// moved in the same window still finds the ids its old value reached (the chain rows exist
+/// unless their own, traced, events removed them).
 fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
     let c = search(p, y)?;
+    // Executor (a) refreshes the full id or the ids of one partial set (`ViewPlan::partial`).
+    if c.positions.len() != p.unit_exprs.len() && !p.partial.sets.contains(&c.positions) {
+        return Err(format!(
+            "the hop reaches id[{}], which no partial id has",
+            ordinals(&c.positions)
+        ));
+    }
     // Both sides of every edge of the chain carry binlog values that compare as their SQL
     // values do; a collation-compared link would make the step-6 cache inexact.
     for &ei in &c.edges {
@@ -487,6 +498,14 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
             || !p.aliases[e.b.0].table.columns[e.b.1].exact_key()
         {
             return Err("link compared by collation".into());
+        }
+        if (e.a.0 == y || e.b.0 == y)
+            && !same_link_type(
+                &p.aliases[e.a.0].table.columns[e.a.1],
+                &p.aliases[e.b.0].table.columns[e.b.1],
+            )
+        {
+            return Err("link columns of different types".into());
         }
     }
     let qcol = |al: usize, col: usize| {
@@ -503,8 +522,10 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
         .collect();
     let mut sel = partner.clone();
     sel.extend(c.positions.iter().map(|&i| p.unit_exprs[i].clone()));
-    let from: Vec<String> = std::iter::once(y)
-        .chain(c.aliases.iter().copied())
+    let from: Vec<String> = c
+        .aliases
+        .iter()
+        .copied()
         .map(|al| {
             let a = &p.aliases[al];
             format!(
@@ -518,6 +539,7 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
     let mut where_parts: Vec<String> = c
         .edges
         .iter()
+        .filter(|&&ei| p.edges[ei].a.0 != y && p.edges[ei].b.0 != y)
         .map(|&ei| {
             let e = &p.edges[ei];
             format!("{} = {}", qcol(e.a.0, e.a.1), qcol(e.b.0, e.b.1))
@@ -535,15 +557,36 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
     Ok(Hop {
         link_cols: c.links.iter().map(|&(col, _)| col).collect(),
         partner,
+        partner_cols: c.links.iter().map(|&(_, pc)| pc).collect(),
         positions: c.positions,
         aliases: c.aliases,
         select: format!(
             "SELECT DISTINCT {} FROM {} WHERE {}",
             sel.join(", "),
             from.join(", "),
-            where_parts.join(" AND ")
+            if where_parts.is_empty() {
+                "TRUE".to_string()
+            } else {
+                where_parts.join(" AND ")
+            }
         ),
     })
+}
+
+/// Whether a link column and its partner decode to equal datums for equal SQL values (the hop
+/// cache keys answers by the partner's query values and looks them up by the link's binlog
+/// values): both integer columns, or the same data type.
+fn same_link_type(a: &Column, b: &Column) -> bool {
+    const INTS: [&str; 6] = [
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "int",
+        "integer",
+        "bigint",
+    ];
+    let int = |c: &Column| INTS.iter().any(|t| c.data_type.eq_ignore_ascii_case(t));
+    (int(a) && int(b)) || a.data_type.eq_ignore_ascii_case(&b.data_type)
 }
 
 /// One access per cascading foreign key of the plan, in `ViewPlan.cascades` order; the
@@ -1060,15 +1103,12 @@ mod tests {
                     h.select
                 );
                 assert!(
-                    h.select.ends_with("WHERE `l`.`parent_id` = `i`.`kind_id`"),
+                    h.select.ends_with("FROM `db`.`items` AS `i` WHERE TRUE"),
                     "{}",
                     h.select
                 );
-                assert!(
-                    h.select.contains("AS `l`, `db`.`items` AS `i`"),
-                    "{}",
-                    h.select
-                );
+                assert!(!h.select.contains("`item_links`"), "{}", h.select);
+                assert_eq!(h.partner_cols, vec![(0, 1)]);
             }
             other => panic!("expected a hop, got {other:?}"),
         }
@@ -1089,10 +1129,11 @@ mod tests {
                 assert_eq!(h.partner, vec![r#"`l`.`child_id`"#.to_string()]);
                 assert_eq!(h.positions, vec![0]);
                 assert!(
-                    h.select.contains("`o`.`id` = `l`.`child_id`"),
+                    !h.select.contains("`o`.`id` = `l`.`child_id`"),
                     "{}",
                     h.select
                 );
+                assert!(!h.select.contains("`owners`"), "{}", h.select);
                 assert!(
                     h.select.contains("`l`.`parent_id` = `i`.`kind_id`"),
                     "{}",
@@ -1151,7 +1192,10 @@ mod tests {
             window_sql: None,
             lookup_where_sql: None,
             alias_filters: vec![vec![], vec![], vec![]],
-            partial: crate::analyze::PartialUnits::default(),
+            partial: crate::analyze::PartialUnits {
+                sets: vec![vec![0]],
+                aliases: vec![Some((0, vec![0])), None, None],
+            },
             presence: vec![],
             edges: vec![
                 // `l` joins to `i` (usable for every occurrence).
@@ -1189,6 +1233,80 @@ mod tests {
             }
             other => panic!("expected a hop, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hop_positions_need_a_partial_set() {
+        // The chain of `l` reaches one of the two id parts and no partial id has that set:
+        // executor (a) could not refresh it, so the hop is refused and the view keeps the
+        // viewplan route.
+        let mut v = partial_plan();
+        v.partial = crate::analyze::PartialUnits::default();
+        let ap = AccessPlan::of(&v);
+        match &ap.occurrences[1].path {
+            Path::Untraced { reason } => {
+                assert!(reason.contains("which no partial id has"), "{reason}");
+            }
+            other => panic!("expected an untraced occurrence, got {other:?}"),
+        }
+        assert!(matches!(ap.route, Route::ViewPlan { .. }), "{ap}");
+    }
+
+    #[test]
+    fn hop_select_leaves_out_the_occurrence() {
+        // The SELECT reads the chain's tables only: it never names the occurrence's own
+        // `AS <alias>` and its partner columns parallel `partner`.
+        let views = [
+            "SELECT i.id, l.child_id FROM items i JOIN item_links l ON l.parent_id = i.kind_id",
+            "SELECT i.id, MAX(o.name) n FROM items i JOIN item_links l ON l.parent_id = i.kind_id \
+             JOIN owners o ON o.id = l.child_id GROUP BY i.id",
+            "SELECT i.id, MAX(o.name) n FROM items i JOIN item_values v ON v.item_id = i.id \
+             JOIN item_links l ON l.child_id = v.key_id JOIN owners o ON o.id = l.parent_id \
+             GROUP BY i.id",
+            "SELECT i.id, l.child_id, o.name FROM items i JOIN item_links l ON l.parent_id = i.kind_id \
+             JOIN owners o ON o.id = i.owner_id",
+        ];
+        let mut hops = 0usize;
+        for sql in views {
+            let ap = AccessPlan::of(&plan(sql));
+            for o in &ap.occurrences {
+                if let Path::Hop(h) = &o.path {
+                    hops += 1;
+                    assert!(
+                        !h.select.contains(&format!("AS `{}`", o.alias)),
+                        "the SELECT of {} names the occurrence `{}`: {}",
+                        sql,
+                        o.alias,
+                        h.select
+                    );
+                    assert_eq!(h.partner_cols.len(), h.partner.len(), "{:?}", h.select);
+                }
+            }
+        }
+        assert!(hops >= 4, "expected hops on these views, got {hops}");
+    }
+
+    #[test]
+    fn link_types() {
+        // The hop cache keys answers by the partner's query values and looks them up by the
+        // link's binlog values: the pair must decode equal datums, i.e. both integers or the
+        // same data type.
+        assert!(same_link_type(
+            &Column::simple("a", "int"),
+            &Column::simple("b", "bigint")
+        ));
+        assert!(same_link_type(
+            &Column::simple("a", "varchar"),
+            &Column::simple("b", "varchar")
+        ));
+        assert!(!same_link_type(
+            &Column::simple("a", "int"),
+            &Column::simple("b", "decimal")
+        ));
+        assert!(!same_link_type(
+            &Column::simple("a", "int"),
+            &Column::simple("b", "varchar")
+        ));
     }
 
     /// Three aliases `i` (0), occurrence `l` (1) and `o` (2), with the given id parts and
@@ -1510,7 +1628,7 @@ mod tests {
                     h.select
                 );
                 assert!(
-                    h.select.contains("`o`.`id` = `l`.`parent_id`"),
+                    !h.select.contains("`o`.`id` = `l`.`parent_id`"),
                     "{}",
                     h.select
                 );

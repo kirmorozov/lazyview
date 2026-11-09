@@ -287,6 +287,67 @@ fn reg_hop_selects_cover_the_view_ids() {
     });
 }
 
+/// A link row deleted in the same window (F2-F5): the hop SELECT reads the chain's tables
+/// only, so pinning it to the occurrence's old link value still finds the ids that value
+/// reached, with no join to the occurrence's own table.
+#[test]
+fn reg_hop_select_after_link_delete() {
+    scenario("reg_hop_del", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_item_doc",
+            Kind::Incremental,
+            "SELECT i.id, d.doc, COUNT(*) n FROM items i JOIN docs d ON d.id IN (i.doc_id) GROUP BY i.id, d.doc",
+        )];
+        let ddl = [
+            "CREATE TABLE items (id INT PRIMARY KEY, doc_id INT NOT NULL)",
+            "CREATE TABLE docs (id INT PRIMARY KEY, doc JSON NOT NULL)",
+            "INSERT INTO items VALUES (1, 1), (2, 2), (3, 3)",
+            "INSERT INTO docs VALUES (1, '[1]'), (2, '[2]'), (3, '[3]')",
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_hop_del", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        exec_all(&mut c, &["DELETE FROM docs WHERE id = 1"]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "doc 1 deleted").await?;
+        let mut collations = std::collections::HashMap::new();
+        let mut tables = std::collections::HashMap::new();
+        for name in ["items", "docs"] {
+            let t = lazyview::catalog::load_table(
+                &mut c,
+                &db.name,
+                name,
+                ctx.server().is_mariadb(),
+                &mut collations,
+            )
+            .await?
+            .with_context(|| format!("table {name}"))?;
+            tables.insert((db.name.clone(), name.to_string()), std::sync::Arc::new(t));
+        }
+        let p = lazyview::analyze::plan(
+            &lazyview::analyze::parse_definition(&specs[0].definition).unwrap(),
+            &db.name,
+            &tables,
+        )
+        .unwrap();
+        let ap = lazyview::access::AccessPlan::of(&p);
+        let o = ap
+            .occurrences
+            .iter()
+            .find(|o| o.alias == "d")
+            .with_context(|| "no occurrence `d`".to_string())?;
+        let lazyview::access::Path::Hop(h) = &o.path else {
+            bail!("expected a hop for `d`, got {:?}", o.path);
+        };
+        let sql = format!("{} AND {} IN (1)", h.select, h.partner[0]);
+        let got: Vec<(i64, i64)> = typed_rows(&mut c, &sql).await?;
+        let ids: Vec<i64> = got.iter().map(|r| r.1).collect();
+        ensure!(
+            ids.contains(&1),
+            "item 1 not reached through its doc id after the doc row was gone: {sql} -> {got:?}"
+        );
+        eng.stop().await
+    });
+}
+
 /// Anchor two joins away (composite-PK `items`): when a parent row changes its join key to a
 /// value that no longer joins (or the grandparent row is deleted), the units can only be found
 /// through the before-image — found as stale v_line_details rows after
