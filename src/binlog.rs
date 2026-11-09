@@ -1266,8 +1266,10 @@ impl Tracker {
         Ok(Some(rows))
     }
 
-    /// Updates the position bookkeeping for `ev` and maps it to an [`Item`].
-    fn map_event(&mut self, ev: Event) -> Result<Item> {
+    /// Updates the position bookkeeping for one event: consumes bytes of an open transaction
+    /// payload (`TRANSACTION_PAYLOAD`) and advances `pos` by the header unless the event is
+    /// inner, artificial or a heartbeat.
+    fn advance(&mut self, ev: &Event) -> Result<()> {
         let header = ev.header();
         let et = header.event_type_raw();
         let log_pos = u64::from(header.log_pos());
@@ -1307,35 +1309,81 @@ impl Tracker {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The ROTATE arm of [`Tracker::map_event`]: switch to the next binlog file.
+    fn on_rotate(&mut self, ev: &Event) -> Result<Item> {
+        let header = ev.header();
+        let artificial = header.flags_raw() & ARTIFICIAL_FLAG != 0;
+        let real = u64::from(header.log_pos()) != 0 && !artificial;
+        let (file, pos) = rotate_target(ev, !real)?;
+        if real {
+            // Keep table maps of the file just finished, drop older ones.
+            let g = self.generation;
+            self.tables.retain(|_, (gen, _, _)| *gen >= g);
+            self.generation += 1;
+        }
+        self.pos = Position {
+            file,
+            pos: pos.max(4),
+        };
+        Ok(Item::Other)
+    }
+
+    /// The TABLE_MAP arm of [`Tracker::map_event`]: remember the layout behind a table id.
+    fn on_table_map(&mut self, ev: &Event) -> Result<Item> {
+        let tme: TableMapEvent<'_> = ev.read_event().context("parsing TABLE_MAP event")?;
+        let item = Item::TableMap {
+            table_id: tme.table_id(),
+            schema: tme.database_name().into_owned(),
+            table: tme.table_name().into_owned(),
+            columns: tme.columns_count(),
+        };
+        let twin = time2_twin(ev, &tme);
+        self.tables
+            .insert(tme.table_id(), (self.generation, tme.into_owned(), twin));
+        Ok(item)
+    }
+
+    /// The QUERY arm of [`Tracker::map_event`]: classify the statement into an [`Item`].
+    fn on_query(&mut self, ev: &Event) -> Result<Item> {
+        let qe: QueryEvent<'_> = ev.read_event().context("parsing QUERY event")?;
+        let query = qe.query();
+        let item = match classify_query(&query) {
+            QueryKind::InTxn => Item::Other,
+            QueryKind::TxnEnd => Item::Commit {
+                pos: self.boundary_here(),
+            },
+            QueryKind::XaStart(xid) => Item::XaStart { xid },
+            QueryKind::XaPrepare(xid) => Item::XaPrepare {
+                xid,
+                pos: self.boundary_here(),
+            },
+            QueryKind::XaEnd(xid, commit) => Item::XaEnd {
+                xid,
+                commit,
+                pos: self.boundary_here(),
+            },
+            QueryKind::Statement => Item::Statement {
+                schema: qe.schema().into_owned(),
+                query: query.into_owned(),
+                pos: self.boundary_here(),
+            },
+        };
+        Ok(item)
+    }
+
+    /// Updates the position bookkeeping for `ev` and maps it to an [`Item`].
+    fn map_event(&mut self, ev: Event) -> Result<Item> {
+        let header = ev.header();
+        let et = header.event_type_raw();
+
+        self.advance(&ev)?;
 
         let item = match et {
-            ty::ROTATE => {
-                let real = log_pos != 0 && !artificial;
-                let (file, pos) = rotate_target(&ev, !real)?;
-                if real {
-                    // Keep table maps of the file just finished, drop older ones.
-                    let g = self.generation;
-                    self.tables.retain(|_, (gen, _, _)| *gen >= g);
-                    self.generation += 1;
-                }
-                self.pos = Position { file, pos: pos.max(4) };
-                Item::Other
-            }
-            ty::TABLE_MAP => {
-                let tme: TableMapEvent<'_> = ev.read_event().context("parsing TABLE_MAP event")?;
-                let item = Item::TableMap {
-                    table_id: tme.table_id(),
-                    schema: tme.database_name().into_owned(),
-                    table: tme.table_name().into_owned(),
-                    columns: tme.columns_count(),
-                };
-                let twin = time2_twin(&ev, &tme);
-                self.tables.insert(
-                    tme.table_id(),
-                    (self.generation, tme.into_owned(), twin),
-                );
-                item
-            }
+            ty::ROTATE => self.on_rotate(&ev)?,
+            ty::TABLE_MAP => self.on_table_map(&ev)?,
             ty::WRITE_ROWS_V1
             | ty::UPDATE_ROWS_V1
             | ty::DELETE_ROWS_V1
@@ -1355,22 +1403,7 @@ impl Tracker {
                 (true, _) => Item::Commit { pos: self.boundary_here() }, // XA COMMIT … ONE PHASE
                 (false, xid) => Item::XaPrepare { xid, pos: self.boundary_here() },
             },
-            ty::QUERY => {
-                let qe: QueryEvent<'_> = ev.read_event().context("parsing QUERY event")?;
-                let query = qe.query();
-                match classify_query(&query) {
-                    QueryKind::InTxn => Item::Other,
-                    QueryKind::TxnEnd => Item::Commit { pos: self.boundary_here() },
-                    QueryKind::XaStart(xid) => Item::XaStart { xid },
-                    QueryKind::XaPrepare(xid) => Item::XaPrepare { xid, pos: self.boundary_here() },
-                    QueryKind::XaEnd(xid, commit) => Item::XaEnd { xid, commit, pos: self.boundary_here() },
-                    QueryKind::Statement => Item::Statement {
-                        schema: qe.schema().into_owned(),
-                        query: query.into_owned(),
-                        pos: self.boundary_here(),
-                    },
-                }
-            }
+            ty::QUERY => self.on_query(&ev)?,
             ty::GTID | ty::GTID_TAGGED => {
                 let ge: GtidEvent = ev.read_event().context("parsing GTID event")?;
                 Item::Gtid { gtid: mysql_gtid(&ge) }
