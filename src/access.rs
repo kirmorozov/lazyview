@@ -1,10 +1,16 @@
 //! The analyzer's public, per-source-table output; plain data; the copy set.
 //! One projection per view definition ([`AccessPlan::of`]).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
-use crate::analyze::{definition_hash, int_sql, quote_ident, ConstFilter, Edge, Mode, ViewPlan};
-use crate::catalog::{FkAction, TableRef};
+use sqlparser::ast::{BinaryOperator, Expr, SetExpr};
+
+use crate::analyze::{
+    definition_hash, int_sql, is_create_statement, parse_definition, parse_select, quote_ident,
+    referenced_tables, ConstFilter, Edge, Mode, ParsedDef, ViewPlan,
+};
+use crate::catalog::{FkAction, TableInfo, TableRef};
 use crate::datum::Datum;
 
 /// The view's unit, by expression.
@@ -141,6 +147,146 @@ pub struct AccessPlan {
     pub cascades: Vec<CascadeAccess>,
     /// `definition_hash` of the EXPLAIN text without its header: 16 hex.
     pub fingerprint: String,
+}
+
+/// What the caller calls the target id: the view's unit, or output columns of the SELECT.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IdSpec<'a> {
+    Unit,
+    /// The named output columns; with `keys_marker`, the WHERE conjunct `<expr> IN (<marker>)` is
+    /// removed before planning and `<expr>` must be an id column.
+    Outputs {
+        names: &'a [&'a str],
+        keys_marker: Option<&'a str>,
+    },
+}
+
+/// A planned statement: the comprehensive plan and its access plan.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    pub plan: ViewPlan,
+    pub access: AccessPlan,
+}
+
+/// `sql` (a bare SELECT, or a CREATE VIEW) as a definition with `id`'s outputs, and the expression of
+/// the removed keys-marker conjunct.
+fn parsed(sql: &str, id: IdSpec<'_>) -> anyhow::Result<(ParsedDef, Option<Expr>)> {
+    let mut def = if is_create_statement(sql) {
+        parse_definition(sql)?
+    } else {
+        parse_select(sql, "select")?
+    };
+    let IdSpec::Outputs { names, keys_marker } = id else {
+        return Ok((def, None));
+    };
+    def.id_outputs = names.iter().map(|s| s.to_string()).collect();
+    let Some(m) = keys_marker else {
+        return Ok((def, None));
+    };
+    let SetExpr::Select(sel) = &mut *def.query.body else {
+        anyhow::bail!("the keys marker needs a plain SELECT");
+    };
+    // The WHERE's top-level `AND` conjuncts, left to right.
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    let mut pending: Vec<Expr> = sel.selection.take().into_iter().collect();
+    while let Some(e) = pending.pop() {
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                pending.push(*right);
+                pending.push(*left);
+            }
+            other => conjuncts.push(other),
+        }
+    }
+    let at = conjuncts.iter().position(|c| {
+        matches!(c, Expr::InList { list, negated: false, .. }
+            if list.len() == 1 && list[0].to_string() == m)
+    });
+    let Some(at) = at else {
+        anyhow::bail!("keys marker `{m}` not found as `<expr> IN ({m})` in the WHERE");
+    };
+    let marker = conjuncts.remove(at);
+    // The checked expression is the marker's left side, `<expr>` of `<expr> IN (<m>)`.
+    let Expr::InList { expr, .. } = marker else {
+        anyhow::bail!("keys marker `{m}` not found as `<expr> IN ({m})` in the WHERE");
+    };
+    let marker = *expr;
+    sel.selection = conjuncts.into_iter().reduce(|acc, e| Expr::BinaryOp {
+        left: Box::new(acc),
+        op: BinaryOperator::And,
+        right: Box::new(e),
+    });
+    def.query_sql = def.query.to_string();
+    Ok((def, Some(marker)))
+}
+
+/// Whether the marker expression `e` is a column equal to an id part on every row of `p`: its
+/// alias's direct unit or partial columns hold it (names compared as identifiers).
+fn marks_the_id(p: &ViewPlan, e: &Expr) -> bool {
+    let (alias, col) = match e {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            (Some(parts[0].value.clone()), parts[1].value.clone())
+        }
+        Expr::Identifier(i) => (None, i.value.clone()),
+        _ => return false,
+    };
+    let mut found: Option<(usize, usize)> = None;
+    for (ai, a) in p.aliases.iter().enumerate() {
+        if alias
+            .as_ref()
+            .is_some_and(|al| !al.eq_ignore_ascii_case(&a.name))
+        {
+            continue;
+        }
+        for (c, cd) in a.table.columns.iter().enumerate() {
+            if !cd.name.eq_ignore_ascii_case(&col) {
+                continue;
+            }
+            if found.is_some() {
+                return false;
+            }
+            found = Some((ai, c));
+        }
+    }
+    let Some((ai, c)) = found else { return false };
+    p.aliases[ai]
+        .direct_unit
+        .as_ref()
+        .is_some_and(|u| u.contains(&c))
+        || p.partial_of(ai).is_some_and(|(_, cols)| cols.contains(&c))
+}
+
+/// Plans `sql` (a bare SELECT or a CREATE VIEW) with the target id `id`; `tables` must hold every
+/// table [`access_tables`] lists. Every failure is an `Err`.
+pub fn plan_access(
+    sql: &str,
+    id: IdSpec<'_>,
+    default_schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> anyhow::Result<Planned> {
+    let (def, marker) = parsed(sql, id)?;
+    let plan = crate::analyzer::plan(&def, default_schema, tables)?;
+    let access = AccessPlan::of(&plan);
+    let bad = marker
+        .as_ref()
+        .filter(|e| !matches!(plan.mode, Mode::Full(_)) && !marks_the_id(&plan, e));
+    if let Some(e) = bad {
+        anyhow::bail!("the keys marker filters `{e}`, which is not an id column");
+    }
+    Ok(Planned { plan, access })
+}
+
+/// The tables `plan_access` needs metadata for.
+pub fn access_tables(
+    sql: &str,
+    id: IdSpec<'_>,
+    default_schema: &str,
+) -> anyhow::Result<Vec<TableRef>> {
+    Ok(referenced_tables(&parsed(sql, id)?.0.query, default_schema))
 }
 
 /// One occurrence per source-table use of the view.
@@ -1498,5 +1644,148 @@ mod tests {
             AccessPlan::fingerprint_of(&ap.to_string()),
             Some(ap.fingerprint.as_str())
         );
+    }
+
+    /// A chosen output column is the id; the join's constant filter stays on the occurrence.
+    #[test]
+    fn plan_access_bare_select_outputs() {
+        let p = plan_access(
+            "SELECT i.id AS _key, v.val FROM items i JOIN item_values v ON v.item_id = i.id \
+             AND v.key_id = 99",
+            IdSpec::Outputs {
+                names: &["_key"],
+                keys_marker: None,
+            },
+            "db",
+            &catalog(),
+        )
+        .unwrap();
+        assert!(
+            matches!(p.access.route, Route::Dedup),
+            "{:?}",
+            p.access.route
+        );
+        assert_eq!(p.access.id.parts[0].output, Some(0));
+        let v = p
+            .access
+            .occurrences
+            .iter()
+            .find(|o| o.alias == "v")
+            .unwrap();
+        assert!(matches!(v.path, Path::Direct { .. }), "{:?}", v.path);
+        assert_eq!(v.filters.len(), 1);
+        assert_eq!(v.filters[0].col, 1, "key_id");
+        assert_eq!(v.filters[0].values, vec![Datum::Int(99)]);
+    }
+
+    /// The marker conjunct is gone before planning: the plan is the marker-less one's.
+    #[test]
+    fn keys_marker_is_removed() {
+        let base =
+            "SELECT i.id AS _key, v.val FROM items i JOIN item_values v ON v.item_id = i.id \
+                    AND v.key_id = 99";
+        let id = |m: Option<&'static str>| IdSpec::Outputs {
+            names: &["_key"],
+            keys_marker: m,
+        };
+        let plain = plan_access(base, id(None), "db", &catalog()).unwrap();
+        let with = plan_access(
+            &format!("{base} WHERE i.id IN (:keys)"),
+            id(Some(":keys")),
+            "db",
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(with.plan.where_sql, None);
+        let body = |a: &AccessPlan| {
+            a.to_string()
+                .lines()
+                .skip(1)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(body(&with.access), body(&plain.access));
+    }
+
+    /// A column equal to the id on every row may carry the marker.
+    #[test]
+    fn keys_marker_on_an_equal_column() {
+        let p = plan_access(
+            "SELECT i.id AS _key, v.val FROM items i JOIN item_values v ON v.item_id = i.id \
+             AND v.key_id = 99 WHERE v.item_id IN (:keys)",
+            IdSpec::Outputs {
+                names: &["_key"],
+                keys_marker: Some(":keys"),
+            },
+            "db",
+            &catalog(),
+        );
+        assert!(p.is_ok(), "{:?}", p.err());
+    }
+
+    /// A column that is not an id column is refused; a missing marker is refused too.
+    #[test]
+    fn keys_marker_on_another_column_is_refused() {
+        let e = plan_access(
+            "SELECT i.id AS _key, v.val FROM items i JOIN item_values v ON v.item_id = i.id \
+             AND v.key_id = 99 WHERE i.kind_id IN (:keys)",
+            IdSpec::Outputs {
+                names: &["_key"],
+                keys_marker: Some(":keys"),
+            },
+            "db",
+            &catalog(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("not an id column"), "{e}");
+        let e = plan_access(
+            "SELECT i.id AS _key, v.val FROM items i JOIN item_values v ON v.item_id = i.id",
+            IdSpec::Outputs {
+                names: &["_key"],
+                keys_marker: Some(":keys"),
+            },
+            "db",
+            &catalog(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("not found"), "{e}");
+    }
+
+    /// The tables to load are the ones the FROM clause uses.
+    #[test]
+    fn access_tables_lists_what_to_load() {
+        let t = access_tables(
+            "SELECT i.id AS _key, k.name FROM items i JOIN kinds k ON k.id = i.kind_id",
+            IdSpec::Outputs {
+                names: &["_key"],
+                keys_marker: None,
+            },
+            "db",
+        )
+        .unwrap();
+        assert_eq!(
+            t,
+            vec![
+                ("db".to_string(), "items".to_string()),
+                ("db".to_string(), "kinds".to_string())
+            ]
+        );
+    }
+
+    /// A `CREATE VIEW` with `IdSpec::Unit` plans exactly as `AccessPlan::of` does.
+    #[test]
+    fn create_view_unit_matches_of() {
+        let p = plan_access(
+            "CREATE VIEW v AS SELECT i.id FROM items i",
+            IdSpec::Unit,
+            "db",
+            &catalog(),
+        )
+        .unwrap();
+        let want = AccessPlan::of(&plan("SELECT i.id FROM items i"));
+        assert_eq!(p.access, want);
+        assert_eq!(p.access.fingerprint, want.fingerprint);
     }
 }
