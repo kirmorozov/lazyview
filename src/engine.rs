@@ -5311,18 +5311,28 @@ impl Engine {
                     a.table.name
                 );
             }
+            // A bound string, without the `COLLATE` it carries when the view's own definition has
+            // one ([`without_collate`]): a `COLLATE` clause is EXPLICIT, so the view's own meets
+            // the parameter's in an error ("Illegal mix of collations", 1267). Without it the
+            // view's `COLLATE` decides, exactly as it does in the definition. Losing the
+            // collation costs nothing here: the lookup only says which units MAY be affected, and
+            // a charset's default collation is its coarsest, so it can over-match (a few units
+            // refreshed that the changed row cannot move) but never miss one; each unit it finds
+            // is then refreshed by reading the real rows under the real collations.
+            let bound: Vec<&str> = if plan.has_explicit_collate {
+                cols.iter().map(|c| without_collate(&c.param)).collect()
+            } else {
+                cols.iter().map(|c| c.param.as_str()).collect()
+            };
             subs.push(Part {
                 alias,
                 first: cols
                     .iter()
-                    .map(|c| format!("{} AS {}", c.param, analyze::quote_ident(&c.name)))
+                    .zip(&bound)
+                    .map(|(c, p)| format!("{p} AS {}", analyze::quote_ident(&c.name)))
                     .collect::<Vec<_>>()
                     .join(", "),
-                rest: cols
-                    .iter()
-                    .map(|c| c.param.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                rest: bound.join(", "),
                 keys: images.iter().collect(),
                 per: (MAX_FILTER_PARAMS / (parts.len() * cols.len()))
                     .clamp(1, self.cfg.query_chunk),
@@ -5535,6 +5545,20 @@ async fn run_pending(sup: &Supervisor, p: &mut PendingRefresh) -> Result<supervi
     match p.job.take() {
         Some(job) if !p.idle => sup.run(job, p.units.as_ref(), &p.partial).await,
         _ => Ok(supervisor::Outcome::default()),
+    }
+}
+
+/// A bound string param without its trailing ` COLLATE <co>`: only for a param of the shape
+/// `CONVERT(CAST(? AS BINARY) USING <cs>) COLLATE <co>` (a string column, [`crate::catalog`]),
+/// which is the one that carries a collation of its own; a param that has none, and one of any
+/// other shape, is returned as it is. See the lookup that uses it.
+fn without_collate(param: &str) -> &str {
+    match param
+        .strip_prefix("CONVERT(")
+        .and_then(|_| param.rfind(" COLLATE "))
+    {
+        Some(i) => &param[..i],
+        None => param,
     }
 }
 
@@ -5871,6 +5895,29 @@ async fn build_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bound string loses its `COLLATE`; a param that has none, and a param that is not a bound
+    /// string, come back as they were (the lookup binds strings without a collation only where the
+    /// view definition has one of its own).
+    #[test]
+    fn a_lookup_param_loses_only_its_collate() {
+        assert_eq!(
+            without_collate("CONVERT(CAST(? AS BINARY) USING utf8mb4) COLLATE utf8mb4_bin"),
+            "CONVERT(CAST(? AS BINARY) USING utf8mb4)",
+            "the collation of the view definition decides"
+        );
+        assert_eq!(
+            without_collate("CONVERT(CAST(? AS BINARY) USING utf8mb4)"),
+            "CONVERT(CAST(? AS BINARY) USING utf8mb4)",
+            "a param without one is as it was"
+        );
+        assert_eq!(without_collate("?"), "?");
+        assert_eq!(
+            without_collate("CAST(? AS DECIMAL(10,2)) COLLATE utf8mb4_bin"),
+            "CAST(? AS DECIMAL(10,2)) COLLATE utf8mb4_bin",
+            "not a bound string: unchanged"
+        );
+    }
 
     /// The drain queue keeps its byte total and the file of its oldest events in step with
     /// pushes and pops, stops at its bounds and at the end of the stream, and gives back its

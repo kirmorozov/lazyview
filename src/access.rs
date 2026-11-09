@@ -1168,6 +1168,7 @@ mod tests {
                 },
             ],
             unit_refs: vec![vec![(0, 0)], vec![(2, 0)]],
+            has_explicit_collate: false,
         }
     }
 
@@ -1243,6 +1244,7 @@ mod tests {
             presence: vec![],
             edges,
             unit_refs,
+            has_explicit_collate: false,
         }
     }
 

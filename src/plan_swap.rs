@@ -87,6 +87,8 @@ pub fn same_reads(old: &ViewPlan, new: &ViewPlan) -> Result<(), String> {
         // Derived from the FROM / WHERE / units this function already compares.
         edges: _,
         unit_refs: _,
+        // Derived from the definition, whose hash is compared above.
+        has_explicit_collate: _,
     } = old;
     eq("schema", schema, &new.schema)?;
     eq("name", name, &new.name)?;

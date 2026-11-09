@@ -1087,6 +1087,12 @@ pub struct ViewPlan {
     pub edges: Vec<Edge>,
     /// Per reduced unit expression: the alias columns it reads.
     pub unit_refs: Vec<Vec<(usize, usize)>>,
+    /// Whether the definition spells a `COLLATE` of its own anywhere ([`has_collate`], the
+    /// statement as written and as the lookups see it). The lookup of an incremental view then
+    /// binds its string parameters without one: a `COLLATE` clause is EXPLICIT, and the view's own
+    /// would meet the parameter's in an error ("Illegal mix of collations", 1267). See the lookup
+    /// in `engine`.
+    pub has_explicit_collate: bool,
 }
 
 impl ViewPlan {
@@ -2462,6 +2468,22 @@ fn qident(id: &str) -> Ident {
     Ident::with_quote('`', id)
 }
 
+/// Whether anything in `t` carries a `COLLATE` of its own: a `COLLATE` clause anywhere in the
+/// definition (projection, WHERE, joins, GROUP BY, HAVING, ORDER BY, subqueries) makes the server
+/// compare with an EXPLICIT collation, which an equally EXPLICIT parameter collation cannot meet.
+fn has_collate(t: &impl Visit) -> bool {
+    let mut found = false;
+    let mut find = |e: &Expr| {
+        if matches!(e, Expr::Collate { .. }) {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    };
+    let _ = visit_expressions(t, &mut find);
+    found
+}
+
 /// Plans a definition: the query analyzer resolves CTEs, derived tables and subqueries and
 /// normalizes them into flat blocks it plans with [`plan_block`] (see `crate::analyzer`).
 /// `tables` must contain metadata for every table [`referenced_tables`] lists.
@@ -2508,6 +2530,9 @@ pub fn plan_block(
         }
     }
     let output_names = (!def.columns.is_empty()).then(|| def.columns.clone());
+    // The definition as written; the incremental plans below add what the inlined VIRTUAL columns
+    // carry. Never a reason to reject, only to bind string parameters the other way.
+    let has_explicit_collate = has_collate(&def.query);
     // Full rebuilds run the statement exactly as written (ORDER BY matters with LIMIT).
     let full_select = full_select_sql(def, default_schema, tables)?;
     let full_with = |reason: &str, watched: Vec<TableRef>, columns| ViewPlan {
@@ -2545,6 +2570,7 @@ pub fn plan_block(
         output_names: output_names.clone(),
         edges: Vec::new(),
         unit_refs: Vec::new(),
+        has_explicit_collate,
     };
     let full = |reason: &str| {
         let columns = read_columns(&def.query, &all_tables, tables);
@@ -3511,6 +3537,11 @@ pub fn plan_block(
                 .join(", ")
         ))
     };
+    // The statement as the lookups see it: a VIRTUAL column's inlined form carries a `COLLATE` of
+    // its own too, so this only adds to what the definition as written already had.
+    let has_explicit_collate = has_explicit_collate
+        || has_collate(&*select)
+        || order_usage.as_ref().is_some_and(has_collate);
     Ok(ViewPlan {
         schema,
         name: def.name.clone(),
@@ -3566,6 +3597,7 @@ pub fn plan_block(
         output_names,
         edges,
         unit_refs: unit_refs_cols,
+        has_explicit_collate,
     })
 }
 
@@ -4793,6 +4825,39 @@ mod tests {
     fn p(sql: &str) -> ViewPlan {
         let d = parse_definition(sql).unwrap();
         plan_block(&d, "db", &catalog()).unwrap()
+    }
+
+    /// The flag that makes a lookup bind its strings without a `COLLATE` (see `engine`): the
+    /// definition's own `COLLATE`, wherever it sits.
+    #[test]
+    fn a_definition_with_an_explicit_collate_is_marked() {
+        let cat: HashMap<_, _> = [
+            table("c", &[("id", "int"), ("name", "varchar")], &[0]),
+            table("s_bin", &[("code", "varchar")], &[0]),
+        ]
+        .into_iter()
+        .collect();
+        let marked = |sql: &str| {
+            plan_block(
+                &parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap(),
+                "db",
+                &cat,
+            )
+            .unwrap()
+            .has_explicit_collate
+        };
+        assert!(
+            marked("SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)"),
+            "a COLLATE of its own in the WHERE"
+        );
+        assert!(
+            !marked("SELECT c.id FROM c WHERE c.name IN (SELECT b.code FROM s_bin b)"),
+            "the same view without it"
+        );
+        assert!(
+            marked("SELECT c.id FROM c ORDER BY c.name COLLATE utf8mb4_general_ci"),
+            "the ORDER BY counts as much as the WHERE"
+        );
     }
 
     /// Constant filters per FROM alias: `col = lit`, `lit = col`, `col <=> lit` and IN lists of
