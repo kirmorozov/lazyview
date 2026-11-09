@@ -23,7 +23,7 @@
 # current digests for a manual refresh.
 
 # ---- toolchain: identical for every target platform (built once, shared) -----
-FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-bookworm@sha256:24707e70a4f1e23d9a7b25202ec43126d28a52294b96aad5c670df1fd1f1d400 AS toolchain
+FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS toolchain
 
 ARG ZIG_VERSION=0.17.0
 ARG CARGO_ZIGBUILD_VERSION=0.23.4
