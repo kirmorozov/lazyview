@@ -10,7 +10,7 @@ use crate::analyze::{
     definition_hash, int_sql, is_create_statement, parse_definition, parse_select, quote_ident,
     referenced_tables, ConstFilter, Edge, Mode, ParsedDef, ViewPlan,
 };
-use crate::catalog::{Column, FkAction, TableInfo, TableRef};
+use crate::catalog::{ColKind, Column, FkAction, TableInfo, TableRef};
 use crate::datum::Datum;
 
 /// The view's unit, by expression.
@@ -89,7 +89,9 @@ pub enum Path {
 pub struct Hop {
     pub link_cols: Vec<usize>,
     pub partner: Vec<String>,
-    /// The partner columns as (alias, column) ordinals, in `link_cols` order.
+    /// The partner columns as (alias, column) ordinals, in `link_cols` order. The executor
+    /// appends `AND (<partner>) IN (<link values>)`, single- or multi-column, built and
+    /// checked against the server rules in 6R/6T.
     pub partner_cols: Vec<(usize, usize)>,
     pub positions: Vec<usize>,
     pub aliases: Vec<usize>,
@@ -575,7 +577,8 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
 
 /// Whether a link column and its partner decode to equal datums for equal SQL values (the hop
 /// cache keys answers by the partner's query values and looks them up by the link's binlog
-/// values): both integer columns, or the same data type.
+/// values): the same decoded kind (the binlog decoder's [`ColKind`], `unsigned` included),
+/// never JSON, the BLOB family or the spatial / opaque types.
 fn same_link_type(a: &Column, b: &Column) -> bool {
     const INTS: [&str; 6] = [
         "tinyint",
@@ -585,7 +588,22 @@ fn same_link_type(a: &Column, b: &Column) -> bool {
         "integer",
         "bigint",
     ];
-    let int = |c: &Column| INTS.iter().any(|t| c.data_type.eq_ignore_ascii_case(t));
+    // The decoded kind decides: a signed and an unsigned integer are different kinds, so an
+    // `int` vs `int unsigned` pair is not one type class.
+    if a.kind != b.kind {
+        return false;
+    }
+    // JSON, BLOB-family and spatial / opaque columns never key the hop cache: their binlog and
+    // query representations differ (or cannot be bound back at all), so such a link keeps the
+    // viewplan route and the JSON key-part rule cannot arise.
+    if matches!(a.kind, ColKind::Json | ColKind::Binary | ColKind::Opaque) {
+        return false;
+    }
+    let int = |c: &Column| match &c.kind {
+        ColKind::Plain => INTS.iter().any(|t| c.data_type.eq_ignore_ascii_case(t)),
+        ColKind::Unsigned(_) => true,
+        _ => false,
+    };
     (int(a) && int(b)) || a.data_type.eq_ignore_ascii_case(&b.data_type)
 }
 
@@ -1289,8 +1307,8 @@ mod tests {
     #[test]
     fn link_types() {
         // The hop cache keys answers by the partner's query values and looks them up by the
-        // link's binlog values: the pair must decode equal datums, i.e. both integers or the
-        // same data type.
+        // link's binlog values: the pair must decode equal datums, i.e. the same decoded kind
+        // (unsigned included) and both integers or the same data type.
         assert!(same_link_type(
             &Column::simple("a", "int"),
             &Column::simple("b", "bigint")
@@ -1306,6 +1324,23 @@ mod tests {
         assert!(!same_link_type(
             &Column::simple("a", "int"),
             &Column::simple("b", "varchar")
+        ));
+        // The binlog decodes a signed and an unsigned integer into different kinds.
+        let unsigned = |n: &str| Column::new(n, "int", "int(11) unsigned", None, None, None, false);
+        assert!(!same_link_type(&Column::simple("a", "int"), &unsigned("b")));
+        assert!(same_link_type(&unsigned("a"), &unsigned("b")));
+        // JSON, BLOB-family and spatial columns never key the hop cache.
+        assert!(!same_link_type(
+            &Column::simple("a", "json"),
+            &Column::simple("b", "json")
+        ));
+        assert!(!same_link_type(
+            &Column::simple("a", "blob"),
+            &Column::simple("b", "blob")
+        ));
+        assert!(!same_link_type(
+            &Column::simple("a", "point"),
+            &Column::simple("b", "point")
         ));
     }
 
