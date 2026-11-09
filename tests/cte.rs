@@ -11,6 +11,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use common::workload::{names, run_batches, setup_ecommerce, Gen, Sizes, Workload};
@@ -701,6 +702,152 @@ async fn start_checked(
         bail!("engine strategies differ:{bad}");
     }
     Ok(eng)
+}
+
+// ---------------------------------------------------------------------------- one driver for all
+//
+// Every suite below is the same run over its own tables, cases and steps, so the run exists once:
+// [`run_suite`] with a [`Suite`] entry.
+
+/// One step of a suite: a label for the failure context, then the statements to run before the
+/// next oracle check.
+type Steps = Vec<(String, Vec<String>)>;
+
+/// The view cases of a suite. [`prepare`] checks every case's strategy against the analyzer; the
+/// suites that also check their plans against the server's catalog carry a route with each case.
+enum Cases {
+    /// the strategies are the whole plan check: no extra analyzer pass.
+    Plain(Vec<Case>),
+    /// each case also carries the route `ViewPlan::tracing` must report.
+    Traced(Vec<(Case, &'static str)>),
+}
+
+impl Cases {
+    /// Each case with its expected route, `None` where no route is checked.
+    fn with_routes(&self) -> Vec<(&Case, Option<&'static str>)> {
+        match self {
+            Cases::Plain(cs) => cs.iter().map(|c| (c, None)).collect(),
+            Cases::Traced(cs) => cs.iter().map(|(c, route)| (c, Some(*route))).collect(),
+        }
+    }
+
+    /// The cases to build views and oracles from.
+    fn into_cases(self) -> Vec<Case> {
+        match self {
+            Cases::Plain(cs) => cs,
+            Cases::Traced(cs) => cs.into_iter().map(|(c, _)| c).collect(),
+        }
+    }
+}
+
+/// The cases of a suite, for the server family of the run.
+type CasesFn = fn(bool) -> Cases;
+/// The steps of a suite.
+type StepsFn = fn() -> Steps;
+/// The complaint about a case whose plan is not what the suite expects, `None` when it is.
+type PlanCheck = fn(&Db, &Case, &ViewPlan) -> Option<String>;
+
+/// The assertions a suite makes on each case's plan before the engine starts, beyond the strategy
+/// check [`prepare`] does for every suite.
+struct Plans {
+    /// names these checks in the failure message.
+    what: &'static str,
+    check: PlanCheck,
+}
+
+/// A cte suite: everything [`run_suite`] needs besides the schema label and the batch window.
+struct Suite<'a> {
+    /// the tag of the schema: `cte_<tag>_<label>`.
+    tag: &'a str,
+    /// creates and seeds the suite's tables.
+    ddl: &'a [&'a str],
+    cases: CasesFn,
+    steps: StepsFn,
+    /// the plan assertions of [`Plans`]; `None` = the strategies are the whole plan check.
+    plans: Option<Plans>,
+    /// when set: building every case's plan must finish inside this budget.
+    plan_budget: Option<Duration>,
+}
+
+/// The steps of a suite from literal `(label, statement)` pairs, one statement per step.
+fn steps(src: &[(&str, &str)]) -> Steps {
+    src.iter()
+        .map(|(what, stmt)| (what.to_string(), vec![stmt.to_string()]))
+        .collect()
+}
+
+/// The steps of a suite from literal `(label, statements)` pairs: a step runs all of its
+/// statements before the next check.
+fn step_groups(src: &[(&str, &[&str])]) -> Steps {
+    src.iter()
+        .map(|(what, stmts)| {
+            (
+                what.to_string(),
+                stmts.iter().map(|stmt| stmt.to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+/// The driver every cte suite shares: create and seed the tables, check the plans the suite asks
+/// for, start the engine over its cases with the batch window `window_ms`, and verify every view
+/// against its oracle after each step. `label` names the schema and the log lines.
+async fn run_suite(ctx: &Ctx, s: &Suite<'_>, label: &str, window_ms: &str) -> Result<()> {
+    let db = ctx.new_db(&format!("cte_{}_{label}", s.tag)).await?;
+    let mut c = db.conn().await?;
+    for stmt in s.ddl {
+        exec(&mut c, stmt).await?;
+    }
+    let mariadb = ctx.server().is_mariadb();
+    let cases = (s.cases)(mariadb);
+    if let Some(plans) = &s.plans {
+        let mut bad = String::new();
+        for (case, route) in cases.with_routes() {
+            let def = format!("CREATE VIEW {} AS {}", case.name, case.select);
+            let plan = analyzer_plan(&db, mariadb, &def).await?;
+            let reported = plan.tracing();
+            if let Some(want) = route.filter(|want| reported != *want) {
+                bad.push_str(&format!(
+                    "\n  {}: routes {}, expected {want}",
+                    case.name, reported
+                ));
+            }
+            if let Some(diff) = (plans.check)(&db, case, &plan) {
+                bad.push_str(&diff);
+            }
+        }
+        if !bad.is_empty() {
+            bail!("{} differ:{bad}", plans.what);
+        }
+    }
+    let started = Instant::now();
+    let (specs, expect) = prepare(&db, mariadb, cases.into_cases()).await?;
+    if let Some(budget) = s.plan_budget {
+        anyhow::ensure!(
+            started.elapsed() < budget,
+            "planning took {:?}",
+            started.elapsed()
+        );
+    }
+    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        &format!("{label}: initial build"),
+    )
+    .await?;
+    for (what, stmts) in (s.steps)() {
+        for stmt in stmts {
+            exec(&mut c, &stmt).await.with_context(|| what.clone())?;
+        }
+        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
+    }
+    assert_ready(&mut c, &names(&specs)).await?;
+    eng.stop().await?;
+    c.disconnect().await.ok();
+    Ok(())
 }
 
 async fn run(ctx: &Ctx, label: &str, seed: u64, window_ms: &str) -> Result<()> {
@@ -1537,8 +1684,8 @@ fn order_cases() -> Vec<Case> {
 
 /// UPDATE-only mutations: nothing is inserted or deleted, so only the read-column filter
 /// decides whether the view is recomputed.
-fn order_steps() -> Vec<(&'static str, &'static str)> {
-    vec![
+fn order_steps() -> Steps {
+    steps(&[
         (
             "ORDER BY column raised",
             "UPDATE l_orders SET total = 100 WHERE id = 4",
@@ -1567,42 +1714,25 @@ fn order_steps() -> Vec<(&'static str, &'static str)> {
             "ORDER BY column of several rows",
             "UPDATE l_orders SET total = total + 50 WHERE id IN (5, 6)",
         ),
-    ]
+    ])
 }
 
-async fn run_order(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
-    let db = ctx.new_db(&format!("cte_order_{label}")).await?;
-    let mut c = db.conn().await?;
-    for s in ORDER_DDL {
-        exec(&mut c, s).await?;
-    }
-    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), order_cases()).await?;
-    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
-    verify(
-        ctx,
-        &mut eng,
-        &db,
-        &specs,
-        &format!("{label}: initial build"),
-    )
-    .await?;
-    for (what, stmt) in order_steps() {
-        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
-        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
-    }
-    assert_ready(&mut c, &names(&specs)).await?;
-    eng.stop().await?;
-    c.disconnect().await.ok();
-    Ok(())
-}
+const SUITE_ORDER: Suite<'static> = Suite {
+    tag: "order",
+    ddl: ORDER_DDL,
+    cases: |_| Cases::Plain(order_cases()),
+    steps: order_steps,
+    plans: None,
+    plan_budget: None,
+};
 
 /// L1: an UPDATE of a column that appears only in ORDER BY (plain, expression, aggregate input,
 /// OFFSET, joined alias) or in a window's PARTITION BY / ORDER BY reaches the recompute.
 #[test]
 fn cte_order_columns_match_their_oracles() {
     scenario("cte_order", |ctx| async move {
-        run_order(&ctx, "w0", "0").await?;
-        run_order(&ctx, "w50", "50").await?;
+        run_suite(&ctx, &SUITE_ORDER, "w0", "0").await?;
+        run_suite(&ctx, &SUITE_ORDER, "w50", "50").await?;
         Ok(())
     });
 }
@@ -1661,8 +1791,8 @@ fn schema_cases() -> Vec<(Case, &'static str)> {
     ]
 }
 
-fn schema_steps() -> Vec<(&'static str, &'static str)> {
-    vec![
+fn schema_steps() -> Steps {
+    steps(&[
         (
             "base column of a generated column",
             "UPDATE sk_items SET a = 11 WHERE code = 'x1'",
@@ -1696,77 +1826,51 @@ fn schema_steps() -> Vec<(&'static str, &'static str)> {
             "NOT IN key gone",
             "UPDATE sk_orders SET qty = 50 WHERE id = 1",
         ),
-    ]
+    ])
 }
 
-async fn run_schema(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
-    let db = ctx.new_db(&format!("cte_schema_{label}")).await?;
-    let mut c = db.conn().await?;
-    for s in SCHEMA_DDL {
-        exec(&mut c, s).await?;
-    }
-    let mariadb = ctx.server().is_mariadb();
-    let mut bad = String::new();
-    let mut plain = Vec::new();
-    for (case, tracing) in schema_cases() {
-        let def = format!("CREATE VIEW {} AS {}", case.name, case.select);
-        let plan = analyzer_plan(&db, mariadb, &def).await?;
-        if plan.tracing() != *tracing {
-            bad.push_str(&format!(
-                "\n  {}: routes {}, expected {tracing}",
-                case.name,
-                plan.tracing()
-            ));
-        }
-        if case.name == "sk_flat" && !same_texts(&db, &plan.unit_exprs, &["`sk_items`.`code`"]) {
-            bad.push_str(&format!("\n  sk_flat: units {:?}", plan.unit_exprs));
-        }
-        if case.name == "sk_distinct" && !same_texts(&db, &plan.unit_exprs, &["code"]) {
-            bad.push_str(&format!("\n  sk_distinct: units {:?}", plan.unit_exprs));
-        }
-        if case.name == "sk_not_in"
-            && !plan
+/// The schema suite's assertions on a case's plan: the units a PK-less table is identified by
+/// (its UNIQUE NOT NULL keys) and the NULL-aware form of NOT IN. The complaint for a case whose
+/// plan differs, `None` when the plan is right.
+fn schema_plan_check(db: &Db, case: &Case, plan: &ViewPlan) -> Option<String> {
+    let units = |want: &[&str]| {
+        (!same_texts(db, &plan.unit_exprs, want))
+            .then(|| format!("\n  {}: units {:?}", case.name, plan.unit_exprs))
+    };
+    match case.name {
+        "sk_flat" => units(&["`sk_items`.`code`"]),
+        "sk_distinct" => units(&["code"]),
+        "sk_distinct_ab" => units(&["a", "b"]),
+        "sk_not_in" => {
+            let rewritten = plan
                 .where_sql
                 .as_deref()
-                .is_some_and(|w| w.contains("NOT EXISTS") && !w.contains("IS NULL"))
-        {
-            bad.push_str(&format!("\n  sk_not_in: WHERE {:?}", plan.where_sql));
+                .is_some_and(|w| w.contains("NOT EXISTS") && !w.contains("IS NULL"));
+            (!rewritten).then(|| format!("\n  {}: WHERE {:?}", case.name, plan.where_sql))
         }
-        if case.name == "sk_distinct_ab" && !same_texts(&db, &plan.unit_exprs, &["a", "b"]) {
-            bad.push_str(&format!("\n  sk_distinct_ab: units {:?}", plan.unit_exprs));
-        }
-        plain.push(case);
+        _ => None,
     }
-    if !bad.is_empty() {
-        bail!("schema plans differ:{bad}");
-    }
-    let (specs, expect) = prepare(&db, mariadb, plain).await?;
-    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
-    verify(
-        ctx,
-        &mut eng,
-        &db,
-        &specs,
-        &format!("{label}: initial build"),
-    )
-    .await?;
-    for (what, stmt) in schema_steps() {
-        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
-        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
-    }
-    assert_ready(&mut c, &names(&specs)).await?;
-    eng.stop().await?;
-    c.disconnect().await.ok();
-    Ok(())
 }
+
+const SUITE_SCHEMA: Suite<'static> = Suite {
+    tag: "schema",
+    ddl: SCHEMA_DDL,
+    cases: |_| Cases::Traced(schema_cases()),
+    steps: schema_steps,
+    plans: Some(Plans {
+        what: "schema plans",
+        check: schema_plan_check,
+    }),
+    plan_budget: None,
+};
 
 /// Server schema: UNIQUE NOT NULL keys identify rows of PK-less tables (units, lineage, DISTINCT
 /// reduction); generated columns follow their base columns (VIRTUAL ones have no binlog value).
 #[test]
 fn cte_schema_keys_match_their_oracles() {
     scenario("cte_schema", |ctx| async move {
-        run_schema(&ctx, "w0", "0").await?;
-        run_schema(&ctx, "w50", "50").await?;
+        run_suite(&ctx, &SUITE_SCHEMA, "w0", "0").await?;
+        run_suite(&ctx, &SUITE_SCHEMA, "w50", "50").await?;
         Ok(())
     });
 }
@@ -1918,8 +2022,8 @@ fn virtual_cases() -> Vec<Case> {
     ]
 }
 
-fn virtual_steps() -> Vec<(&'static str, &'static str)> {
-    vec![
+fn virtual_steps() -> Steps {
+    steps(&[
         ("base column of gi / gchain / gsum", "UPDATE g1 SET a = 3 WHERE id = 1"),
         ("collation-only change of gbin", "UPDATE g1 SET name = 'ANN' WHERE id = 2"),
         ("datetime of gdate", "UPDATE g1 SET dt = '2026-01-01 12:00:00' WHERE id = 3"),
@@ -1934,42 +2038,25 @@ fn virtual_steps() -> Vec<(&'static str, &'static str)> {
         ("fraction of gdate6", "UPDATE g1 SET dt6 = '2026-01-01 00:00:00.400000' WHERE id = 1"),
         ("JSON of jname", "UPDATE g1 SET doc = '{\"name\": \"y\"}' WHERE id = 5"),
         ("outer row", "UPDATE r SET w = 3 WHERE id = 10"),
-    ]
+    ])
 }
 
-async fn run_virtual(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
-    let db = ctx.new_db(&format!("cte_virtual_{label}")).await?;
-    let mut c = db.conn().await?;
-    for s in VIRTUAL_DDL {
-        exec(&mut c, s).await?;
-    }
-    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), virtual_cases()).await?;
-    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
-    verify(
-        ctx,
-        &mut eng,
-        &db,
-        &specs,
-        &format!("{label}: initial build"),
-    )
-    .await?;
-    for (what, stmt) in virtual_steps() {
-        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
-        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
-    }
-    assert_ready(&mut c, &names(&specs)).await?;
-    eng.stop().await?;
-    c.disconnect().await.ok();
-    Ok(())
-}
+const SUITE_VIRTUAL: Suite<'static> = Suite {
+    tag: "virtual",
+    ddl: VIRTUAL_DDL,
+    cases: |_| Cases::Plain(virtual_cases()),
+    steps: virtual_steps,
+    plans: None,
+    plan_budget: None,
+};
 
 /// B1 / B2 / B3: VIRTUAL generated columns are inlined with their declared type and collation
 /// (nested ones, window partitions and subqueries included), from the initial build on.
 #[test]
 fn cte_virtual_columns_match_their_oracles() {
     scenario("cte_virtual", |ctx| async move {
-        run_virtual(&ctx, "w0", "0").await?;
-        run_virtual(&ctx, "w50", "50").await?;
+        run_suite(&ctx, &SUITE_VIRTUAL, "w0", "0").await?;
+        run_suite(&ctx, &SUITE_VIRTUAL, "w50", "50").await?;
         Ok(())
     });
 }
@@ -2024,8 +2111,8 @@ fn virtual_int_cases() -> Vec<Case> {
     ]
 }
 
-fn virtual_int_steps() -> Vec<(&'static str, &'static str)> {
-    vec![
+fn virtual_int_steps() -> Steps {
+    steps(&[
         (
             "u to 2^63 - 1",
             "UPDATE vu SET u = 9223372036854775807 WHERE id = 3",
@@ -2044,48 +2131,25 @@ fn virtual_int_steps() -> Vec<(&'static str, &'static str)> {
         ("both deleted", "DELETE FROM vd WHERE id IN (4, 5)"),
         ("double 7.25", "INSERT INTO vd (id, dbl) VALUES (6, 7.25)"),
         ("nested base column", "UPDATE vg SET a = 7 WHERE id = 1"),
-    ]
+    ])
 }
 
-async fn run_virtual_int(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
-    let db = ctx.new_db(&format!("cte_vint_{label}")).await?;
-    let mut c = db.conn().await?;
-    for s in VIRTUAL_INT_DDL {
-        exec(&mut c, s).await?;
-    }
-    let started = std::time::Instant::now();
-    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), virtual_int_cases()).await?;
-    anyhow::ensure!(
-        started.elapsed() < std::time::Duration::from_secs(10),
-        "planning took {:?}",
-        started.elapsed()
-    );
-    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
-    verify(
-        ctx,
-        &mut eng,
-        &db,
-        &specs,
-        &format!("{label}: initial build"),
-    )
-    .await?;
-    for (what, stmt) in virtual_int_steps() {
-        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
-        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
-    }
-    assert_ready(&mut c, &names(&specs)).await?;
-    eng.stop().await?;
-    c.disconnect().await.ok();
-    Ok(())
-}
+const SUITE_VINT: Suite<'static> = Suite {
+    tag: "vint",
+    ddl: VIRTUAL_INT_DDL,
+    cases: |_| Cases::Plain(virtual_int_cases()),
+    steps: virtual_int_steps,
+    plans: None,
+    plan_budget: Some(Duration::from_secs(10)),
+};
 
 /// F1 / F2 / F4: integer VIRTUAL columns over unsigned values >= 2^63 and out-of-range DOUBLE
 /// function results clip like the column; a nested fan-out past the budget is Full, quickly.
 #[test]
 fn cte_virtual_integers_match_their_oracles() {
     scenario("cte_vint", |ctx| async move {
-        run_virtual_int(&ctx, "w0", "0").await?;
-        run_virtual_int(&ctx, "w50", "50").await?;
+        run_suite(&ctx, &SUITE_VINT, "w0", "0").await?;
+        run_suite(&ctx, &SUITE_VINT, "w50", "50").await?;
         Ok(())
     });
 }
@@ -2191,8 +2255,8 @@ fn capture_cases() -> Vec<Case> {
     out
 }
 
-fn capture_steps() -> Vec<(&'static str, &'static str)> {
-    vec![
+fn capture_steps() -> Steps {
+    steps(&[
         (
             "payment over the threshold",
             "UPDATE payments SET amount = 401 WHERE id = 310",
@@ -2214,42 +2278,25 @@ fn capture_steps() -> Vec<(&'static str, &'static str)> {
             "referrer changed",
             "UPDATE customers SET ref = 3 WHERE id = 2",
         ),
-    ]
+    ])
 }
 
-async fn run_capture(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
-    let db = ctx.new_db(&format!("cte_capture_{label}")).await?;
-    let mut c = db.conn().await?;
-    for s in CAPTURE_DDL {
-        exec(&mut c, s).await?;
-    }
-    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), capture_cases()).await?;
-    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
-    verify(
-        ctx,
-        &mut eng,
-        &db,
-        &specs,
-        &format!("{label}: initial build"),
-    )
-    .await?;
-    for (what, stmt) in capture_steps() {
-        exec(&mut c, stmt).await.with_context(|| what.to_string())?;
-        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
-    }
-    assert_ready(&mut c, &names(&specs)).await?;
-    eng.stop().await?;
-    c.disconnect().await.ok();
-    Ok(())
-}
+const SUITE_CAPTURE: Suite<'static> = Suite {
+    tag: "capture",
+    ddl: CAPTURE_DDL,
+    cases: |_| Cases::Plain(capture_cases()),
+    steps: capture_steps,
+    plans: None,
+    plan_budget: None,
+};
 
 /// F3: correlated subqueries over a merged derived table / CTE keep their meaning whatever the
 /// aliases (the reviewer's colliding ones, a control, seeded random renamings).
 #[test]
 fn cte_semi_joins_never_capture_aliases() {
     scenario("cte_capture", |ctx| async move {
-        run_capture(&ctx, "w0", "0").await?;
-        run_capture(&ctx, "w50", "50").await?;
+        run_suite(&ctx, &SUITE_CAPTURE, "w0", "0").await?;
+        run_suite(&ctx, &SUITE_CAPTURE, "w50", "50").await?;
         Ok(())
     });
 }
@@ -2307,62 +2354,45 @@ fn not_in_cases() -> Vec<Case> {
 
 /// The subqueries flip between empty and non-empty five times, then a NULL key enters and
 /// leaves.
-fn not_in_steps() -> Vec<(String, &'static str)> {
+fn not_in_steps() -> Steps {
     let mut out = Vec::new();
     for round in 1..=5 {
         out.push((
             format!("round {round}: orders empty"),
-            "UPDATE orders SET total = 1 WHERE id = 20",
+            vec!["UPDATE orders SET total = 1 WHERE id = 20".to_string()],
         ));
         out.push((
             format!("round {round}: payments empty"),
-            "UPDATE payments SET amount = 1 WHERE id = 200",
+            vec!["UPDATE payments SET amount = 1 WHERE id = 200".to_string()],
         ));
         out.push((
             format!("round {round}: orders non-empty"),
-            "UPDATE orders SET total = 401 WHERE id = 20",
+            vec!["UPDATE orders SET total = 401 WHERE id = 20".to_string()],
         ));
         out.push((
             format!("round {round}: payments non-empty"),
-            "UPDATE payments SET amount = 450 WHERE id = 200",
+            vec!["UPDATE payments SET amount = 450 WHERE id = 200".to_string()],
         ));
     }
     out.push((
         "a NULL key enters".into(),
-        "INSERT INTO orders VALUES (21, NULL, 500)",
+        vec!["INSERT INTO orders VALUES (21, NULL, 500)".to_string()],
     ));
     out.push((
         "the NULL key leaves".into(),
-        "DELETE FROM orders WHERE id = 21",
+        vec!["DELETE FROM orders WHERE id = 21".to_string()],
     ));
     out
 }
 
-async fn run_not_in(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
-    let db = ctx.new_db(&format!("cte_nin_{label}")).await?;
-    let mut c = db.conn().await?;
-    for s in NOT_IN_DDL {
-        exec(&mut c, s).await?;
-    }
-    let (specs, expect) = prepare(&db, ctx.server().is_mariadb(), not_in_cases()).await?;
-    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
-    verify(
-        ctx,
-        &mut eng,
-        &db,
-        &specs,
-        &format!("{label}: initial build"),
-    )
-    .await?;
-    for (what, stmt) in not_in_steps() {
-        exec(&mut c, stmt).await.with_context(|| what.clone())?;
-        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
-    }
-    assert_ready(&mut c, &names(&specs)).await?;
-    eng.stop().await?;
-    c.disconnect().await.ok();
-    Ok(())
-}
+const SUITE_NOT_IN: Suite<'static> = Suite {
+    tag: "nin",
+    ddl: NOT_IN_DDL,
+    cases: |_| Cases::Plain(not_in_cases()),
+    steps: not_in_steps,
+    plans: None,
+    plan_budget: None,
+};
 
 /// Whether the server re-uses a stale NOT IN result in a re-executed prepared statement (the
 /// MariaDB bug F5 works around), for the log: lazyview must be right either way.
@@ -2403,8 +2433,8 @@ async fn not_in_canary(ctx: &Ctx) -> Result<()> {
 fn cte_not_in_survives_reexecution() {
     scenario("cte_nin", |ctx| async move {
         not_in_canary(&ctx).await?;
-        run_not_in(&ctx, "w0", "0").await?;
-        run_not_in(&ctx, "w50", "50").await?;
+        run_suite(&ctx, &SUITE_NOT_IN, "w0", "0").await?;
+        run_suite(&ctx, &SUITE_NOT_IN, "w50", "50").await?;
         Ok(())
     });
 }
@@ -2704,51 +2734,22 @@ const KEY_EXACT_STEPS: &[(&str, &[&str])] = &[
     ),
 ];
 
-async fn run_key_exact(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
-    let db = ctx.new_db(&format!("cte_keyx_{label}")).await?;
-    let mut c = db.conn().await?;
-    for s in KEY_EXACT_DDL {
-        exec(&mut c, s).await?;
-    }
-    let mariadb = ctx.server().is_mariadb();
-    let mut bad = String::new();
-    let mut plain = Vec::new();
-    for (case, tracing) in key_exact_cases() {
-        let def = format!("CREATE VIEW {} AS {}", case.name, case.select);
-        let plan = analyzer_plan(&db, mariadb, &def).await?;
-        if plan.tracing() != tracing {
-            bad.push_str(&format!(
-                "\n  {}: routes {}, expected {tracing}",
-                case.name,
-                plan.tracing()
-            ));
-        }
-        plain.push(case);
-    }
-    if !bad.is_empty() {
-        bail!("key-exact plans differ:{bad}");
-    }
-    let (specs, expect) = prepare(&db, mariadb, plain).await?;
-    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
-    verify(
-        ctx,
-        &mut eng,
-        &db,
-        &specs,
-        &format!("{label}: initial build"),
-    )
-    .await?;
-    for (what, stmts) in KEY_EXACT_STEPS {
-        for s in *stmts {
-            exec(&mut c, s).await.with_context(|| what.to_string())?;
-        }
-        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
-    }
-    assert_ready(&mut c, &names(&specs)).await?;
-    eng.stop().await?;
-    c.disconnect().await.ok();
-    Ok(())
+fn key_exact_steps() -> Steps {
+    step_groups(KEY_EXACT_STEPS)
 }
+
+const SUITE_KEY_EXACT: Suite<'static> = Suite {
+    tag: "keyx",
+    ddl: KEY_EXACT_DDL,
+    cases: |_| Cases::Traced(key_exact_cases()),
+    steps: key_exact_steps,
+    plans: Some(Plans {
+        what: "key-exact plans",
+        // the routes are the whole check here, and `run_suite` compares them.
+        check: |_, _, _| None,
+    }),
+    plan_budget: None,
+};
 
 /// G1 / G4: semi-joins over string keys compared with numbers or under a weaker COLLATE, and
 /// over TIMESTAMP keys or against TIMESTAMP columns, stay semi-joins (no repeated outer rows);
@@ -2756,8 +2757,8 @@ async fn run_key_exact(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
 #[test]
 fn cte_key_exact_semi_joins_match_their_oracles() {
     scenario("cte_keyx", |ctx| async move {
-        run_key_exact(&ctx, "w0", "0").await?;
-        run_key_exact(&ctx, "w50", "50").await?;
+        run_suite(&ctx, &SUITE_KEY_EXACT, "w0", "0").await?;
+        run_suite(&ctx, &SUITE_KEY_EXACT, "w50", "50").await?;
         Ok(())
     });
 }
@@ -3041,34 +3042,18 @@ async fn json_row_in_canary(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-async fn run_json_keys(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
-    let db = ctx.new_db(&format!("cte_jkey_{label}")).await?;
-    let mut c = db.conn().await?;
-    for s in JSON_KEY_DDL {
-        exec(&mut c, s).await?;
-    }
-    let mariadb = ctx.server().is_mariadb();
-    let (specs, expect) = prepare(&db, mariadb, json_key_cases(mariadb)).await?;
-    let mut eng = start_checked(ctx, &db, &specs, &expect, window_ms).await?;
-    verify(
-        ctx,
-        &mut eng,
-        &db,
-        &specs,
-        &format!("{label}: initial build"),
-    )
-    .await?;
-    for (what, stmts) in JSON_KEY_STEPS {
-        for s in *stmts {
-            exec(&mut c, s).await.with_context(|| what.to_string())?;
-        }
-        verify(ctx, &mut eng, &db, &specs, &format!("{label}: {what}")).await?;
-    }
-    assert_ready(&mut c, &names(&specs)).await?;
-    eng.stop().await?;
-    c.disconnect().await.ok();
-    Ok(())
+fn json_key_steps() -> Steps {
+    step_groups(JSON_KEY_STEPS)
 }
+
+const SUITE_JSON_KEYS: Suite<'static> = Suite {
+    tag: "jkey",
+    ddl: JSON_KEY_DDL,
+    cases: |mariadb| Cases::Plain(json_key_cases(mariadb)),
+    steps: json_key_steps,
+    plans: None,
+    plan_budget: None,
+};
 
 /// G5: JSON group keys stay equal to their oracles; a JSON column in a composite key is Full on
 /// the MySQL family (its refresh filter would compare JSON by representation).
@@ -3076,8 +3061,8 @@ async fn run_json_keys(ctx: &Ctx, label: &str, window_ms: &str) -> Result<()> {
 fn cte_json_group_keys_match_their_oracles() {
     scenario("cte_jkey", |ctx| async move {
         json_row_in_canary(&ctx).await?;
-        run_json_keys(&ctx, "w0", "0").await?;
-        run_json_keys(&ctx, "w50", "50").await?;
+        run_suite(&ctx, &SUITE_JSON_KEYS, "w0", "0").await?;
+        run_suite(&ctx, &SUITE_JSON_KEYS, "w50", "50").await?;
         Ok(())
     });
 }
