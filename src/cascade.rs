@@ -23,7 +23,7 @@ use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
 use mysql_async::Value;
 
-use crate::analyze::{quote_ident, CascadeRoute};
+use crate::analyze::{int_sql, quote_ident, CascadeRoute};
 use crate::binlog::Position;
 use crate::catalog::{ColKind, Column};
 use crate::datum::{Datum, Key};
@@ -153,7 +153,7 @@ pub fn seed_sql(c: &CascadeRoute) -> Option<String> {
                 let all: Vec<String> = fs
                     .iter()
                     .map(|f| {
-                        let vals: Vec<String> = f.values.iter().map(int_literal).collect();
+                        let vals: Vec<String> = f.values.iter().map(int_sql).collect();
                         format!(
                             "{} IN ({})",
                             quote_ident(&t.columns[f.col].name),
@@ -207,14 +207,6 @@ pub fn seed_row(c: &CascadeRoute, vals: Vec<Value>) -> (Key, KeptRow) {
             complete: true,
         },
     )
-}
-
-fn int_literal(d: &Datum) -> String {
-    match d {
-        Datum::Int(i) => i.to_string(),
-        Datum::UInt(u) => u.to_string(),
-        other => unreachable!("non-integer filter value {other:?}"),
-    }
 }
 
 /// One cached cascade route: the kept child rows, by child key and by FK value.

@@ -579,15 +579,17 @@ fn parse_sql<T>(sql: &str, f: impl FnOnce(&mut Parser) -> Result<T, ParserError>
 }
 
 /// The name a (raw-tokenized) identifier stands for: a doubled quote character inside a quoted
-/// identifier is one character of the name.
-fn unquote(value: &str, quote: Option<char>) -> String {
+/// identifier is one character of the name. The owner of both readings of a name, shared with
+/// `crate::analyzer` (see [`ident_name`]).
+pub(crate) fn unquote(value: &str, quote: Option<char>) -> String {
     match quote {
         Some(q) => value.replace(&format!("{q}{q}"), &q.to_string()),
         None => value.to_string(),
     }
 }
 
-fn ident_name(i: &Ident) -> String {
+/// The name an identifier of a parsed AST stands for.
+pub(crate) fn ident_name(i: &Ident) -> String {
     unquote(&i.value, i.quote_style)
 }
 
@@ -2460,12 +2462,11 @@ fn chosen_id(
     Ok(chosen)
 }
 
-fn quote(id: &str) -> String {
-    format!("`{}`", id.replace('`', "``"))
-}
-
-fn qident(id: &str) -> Ident {
-    Ident::with_quote('`', id)
+/// A backtick-quoted identifier for the AST. The stored value keeps the doubled backticks a name
+/// needs inside quotes, exactly as the tokenizer leaves them, so a generated identifier and a
+/// parsed one of the same name hold the same value (see [`unquote`], [`expr_key`]).
+pub(crate) fn qident(id: &str) -> Ident {
+    Ident::with_quote('`', id.replace('`', "``"))
 }
 
 /// Whether anything in `t` carries a `COLLATE` of its own: a `COLLATE` clause anywhere in the
@@ -4306,7 +4307,7 @@ fn full_select_sql(
             );
         }
     }
-    let names: Vec<String> = def.columns.iter().map(|c| quote(c)).collect();
+    let names: Vec<String> = def.columns.iter().map(|c| quote_ident(c)).collect();
     Ok(format!(
         "WITH `_lv_cols` ({}) AS ({}) SELECT * FROM `_lv_cols`",
         names.join(", "),
@@ -4665,7 +4666,9 @@ fn read_columns(
         .collect()
 }
 
-fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+/// The `JoinConstraint` of a join operator, `None` for the operators that carry none. One owner,
+/// also read by `crate::analyzer` (its `ast` module re-exports it).
+pub(crate) fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
     match op {
         JoinOperator::Join(c)
         | JoinOperator::Inner(c)
@@ -4743,8 +4746,9 @@ fn substitute_factor(
     }
 }
 
+/// A backtick-quoted identifier: the name `` a`b `` renders as `` `a``b` ``.
 pub fn quote_ident(id: &str) -> String {
-    quote(id)
+    format!("`{}`", id.replace('`', "``"))
 }
 
 #[cfg(test)]

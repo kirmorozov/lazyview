@@ -12,6 +12,10 @@ use sqlparser::tokenizer::{Token, Whitespace};
 
 use super::source::tokenize;
 
+/// The name of an identifier has one owner, `crate::analyze` (it reads the same names off the raw
+/// tokens); re-exported here for the analyzer's passes.
+pub(crate) use crate::analyze::ident_name;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum NameKind {
     /// Given with `AS`.
@@ -42,14 +46,6 @@ impl Name {
 
     pub(crate) fn generated(&self) -> bool {
         matches!(self.kind, NameKind::Generated { .. })
-    }
-}
-
-/// The name a raw-tokenized identifier stands for (doubled quote characters are one character).
-pub(crate) fn ident_name(i: &Ident) -> String {
-    match i.quote_style {
-        Some(q) => i.value.replace(&format!("{q}{q}"), &q.to_string()),
-        None => i.value.clone(),
     }
 }
 

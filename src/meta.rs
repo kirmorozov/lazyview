@@ -198,7 +198,7 @@ impl DefRow {
             .trim_start();
         match &self.name {
             Some(n) if !crate::analyze::is_create_statement(d) => {
-                format!("CREATE VIEW `{}` AS {d}", n.replace('`', "``"))
+                format!("CREATE VIEW {} AS {d}", crate::analyze::quote_ident(n))
             }
             _ => d.to_string(),
         }

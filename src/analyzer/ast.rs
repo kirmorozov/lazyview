@@ -12,10 +12,9 @@ use super::ir::Pos;
 use super::names::ident_name;
 use crate::catalog::TableRef;
 
-/// A backtick-quoted identifier.
-pub(crate) fn qident(id: &str) -> Ident {
-    Ident::with_quote('`', id.replace('`', "``"))
-}
+/// The shared quoting and join-constraint helpers: one owner in `crate::analyze`, the module the
+/// analyzer already leans on for `Mode`, `ParsedDef` and `ViewPlan`.
+pub(crate) use crate::analyze::{join_constraint, qident};
 
 /// `` `alias`.col `` (the column identifier kept as written).
 pub(crate) fn qcol(alias: &str, col: &Ident) -> Expr {
@@ -124,28 +123,6 @@ pub(crate) fn factor_alias(f: &TableFactor) -> Option<&TableAlias> {
         TableFactor::Table { alias, .. }
         | TableFactor::Derived { alias, .. }
         | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
-        _ => None,
-    }
-}
-
-pub(crate) fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
-    match op {
-        JoinOperator::Join(c)
-        | JoinOperator::Inner(c)
-        | JoinOperator::Left(c)
-        | JoinOperator::LeftOuter(c)
-        | JoinOperator::Right(c)
-        | JoinOperator::RightOuter(c)
-        | JoinOperator::FullOuter(c)
-        | JoinOperator::CrossJoin(c)
-        | JoinOperator::Semi(c)
-        | JoinOperator::LeftSemi(c)
-        | JoinOperator::RightSemi(c)
-        | JoinOperator::Anti(c)
-        | JoinOperator::LeftAnti(c)
-        | JoinOperator::RightAnti(c)
-        | JoinOperator::StraightJoin(c)
-        | JoinOperator::AsOf { constraint: c, .. } => Some(c),
         _ => None,
     }
 }
