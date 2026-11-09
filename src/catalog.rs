@@ -340,6 +340,39 @@ pub async fn load_table(
     mariadb: bool,
     default_collations: &mut HashMap<String, Option<String>>,
 ) -> Result<Option<TableInfo>> {
+    let Some(columns) = load_columns(conn, schema, name, mariadb, default_collations).await? else {
+        return Ok(None);
+    };
+    let pk_names = load_pk(conn, schema, name).await?;
+    let unique_keys = load_unique_keys(conn, schema, name, &columns).await?;
+    let pk = pk_names
+        .iter()
+        .filter_map(|n| columns.iter().position(|c| &c.name == n))
+        .collect();
+    let cascades = load_foreign_keys(conn, schema, name, &columns).await?;
+    let (is_view, view_bases) = load_view_bases(conn, schema, name).await?;
+    Ok(Some(TableInfo {
+        schema: schema.to_string(),
+        name: name.to_string(),
+        columns,
+        pk,
+        unique_keys,
+        cascades,
+        is_view,
+        view_bases,
+    }))
+}
+
+/// Columns from `information_schema.COLUMNS` in `ORDINAL_POSITION` order
+/// (`None`: the table does not exist), remembering each charset's collation of
+/// `CONVERT(... USING charset)` in `default_collations`.
+async fn load_columns(
+    conn: &mut Conn,
+    schema: &str,
+    name: &str,
+    mariadb: bool,
+    default_collations: &mut HashMap<String, Option<String>>,
+) -> Result<Option<Vec<Column>>> {
     type ColRow = (
         String,
         String,
@@ -363,13 +396,6 @@ pub async fn load_table(
     if rows.is_empty() {
         return Ok(None);
     }
-    let pk_names: Vec<String> = conn
-        .exec(
-            "SELECT CAST(COLUMN_NAME AS CHAR) FROM information_schema.KEY_COLUMN_USAGE \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION",
-            (schema, name),
-        )
-        .await?;
     for (_, _, _, cs, ..) in &rows {
         if let Some(cs) = cs.as_deref().map(str::to_ascii_lowercase) {
             if let Entry::Vacant(e) = default_collations.entry(cs) {
@@ -424,6 +450,28 @@ pub async fn load_table(
             g.deps = generated_deps(&g.expr, &names);
         }
     }
+    Ok(Some(columns))
+}
+
+/// PRIMARY key column names in `ORDINAL_POSITION` order.
+async fn load_pk(conn: &mut Conn, schema: &str, name: &str) -> Result<Vec<String>> {
+    let pk_names: Vec<String> = conn
+        .exec(
+            "SELECT CAST(COLUMN_NAME AS CHAR) FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION",
+            (schema, name),
+        )
+        .await?;
+    Ok(pk_names)
+}
+
+/// Other keys that identify a row, from `information_schema.STATISTICS`.
+async fn load_unique_keys(
+    conn: &mut Conn,
+    schema: &str,
+    name: &str,
+    columns: &[Column],
+) -> Result<Vec<Vec<usize>>> {
     type KeyRow = (String, u64, Option<String>, Option<u64>, String);
     let key_rows: Vec<KeyRow> = conn
         .exec(
@@ -435,11 +483,17 @@ pub async fn load_table(
             (schema, name),
         )
         .await?;
-    let unique_keys = unique_keys_from(&key_rows, &columns);
-    let pk = pk_names
-        .iter()
-        .filter_map(|n| columns.iter().position(|c| &c.name == n))
-        .collect();
+    Ok(unique_keys_from(&key_rows, columns))
+}
+
+/// Foreign keys of this (child) table that change child rows, grouped by constraint name from
+/// `information_schema.KEY_COLUMN_USAGE` joined with `REFERENTIAL_CONSTRAINTS`.
+async fn load_foreign_keys(
+    conn: &mut Conn,
+    schema: &str,
+    name: &str,
+    columns: &[Column],
+) -> Result<Vec<ForeignKey>> {
     let fk_rows: Vec<(String, String, String, String, String, String, String)> = conn
         .exec(
             "SELECT CAST(k.CONSTRAINT_NAME AS CHAR), CAST(k.COLUMN_NAME AS CHAR), CAST(k.REFERENCED_TABLE_SCHEMA AS CHAR), \
@@ -476,8 +530,17 @@ pub async fn load_table(
         fk.child_cols.push(ci);
         fk.parent_cols.push(pc);
     }
-    // Views: their base tables come from the stored definition (VIEW_TABLE_USAGE is missing on
-    // MariaDB and MySQL < 8.0.13, so parse VIEWS.VIEW_DEFINITION instead).
+    Ok(cascades)
+}
+
+/// Whether the table is a SQL VIEW and its base tables. They come from the stored definition
+/// (VIEW_TABLE_USAGE is missing on MariaDB and MySQL < 8.0.13, so parse VIEWS.VIEW_DEFINITION
+/// instead).
+async fn load_view_bases(
+    conn: &mut Conn,
+    schema: &str,
+    name: &str,
+) -> Result<(bool, Vec<TableRef>)> {
     let view_def: Option<Option<String>> = conn
         .exec_first(
             "SELECT CAST(VIEW_DEFINITION AS CHAR) FROM information_schema.VIEWS \
@@ -485,7 +548,7 @@ pub async fn load_table(
             (schema, name),
         )
         .await?;
-    let (is_view, view_bases) = match view_def {
+    Ok(match view_def {
         Some(def) => (
             true,
             def.as_deref()
@@ -493,17 +556,7 @@ pub async fn load_table(
                 .unwrap_or_default(),
         ),
         None => (false, Vec::new()),
-    };
-    Ok(Some(TableInfo {
-        schema: schema.to_string(),
-        name: name.to_string(),
-        columns,
-        pk,
-        unique_keys,
-        cascades,
-        is_view,
-        view_bases,
-    }))
+    })
 }
 
 /// UNIQUE keys usable as row keys: whole columns only (no prefix `SUB_PART`, no functional
