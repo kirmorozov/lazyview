@@ -875,6 +875,135 @@ fn simple_aggregate(inner: &Block) -> bool {
         && group_exprs(&inner.select).is_some()
 }
 
+/// Whether an expression reads an aggregate output of the derived item at index `d`.
+fn pull_up_refs_agg(e: &Expr, r: &Resolver, d: usize, out_agg: &[bool]) -> bool {
+    let mut agg = false;
+    let _ = visit_expressions(e, |x: &Expr| {
+        if let Res::Col(i, c) = r.resolve(x) {
+            agg |= i == d && out_agg[c];
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    agg
+}
+
+/// Key preservation, to a fixpoint: a table is bound when each of its primary-key columns
+/// equals a group key of the derived item or a column of a bound table ([`same_key_type`]).
+fn pull_up_bound(
+    items: &[Item],
+    conds: &[Expr],
+    r: &Resolver,
+    d: usize,
+    out_key: &[bool],
+    out_agg: &[bool],
+    out_col: &[Option<crate::catalog::Column>],
+) -> HashSet<usize> {
+    let mut bound: HashSet<usize> = [d].into_iter().collect();
+    loop {
+        let mut grew = false;
+        for (ti, it) in items.iter().enumerate() {
+            let Some(t) = it.table() else { continue };
+            if bound.contains(&ti) {
+                continue;
+            }
+            let covered = t.keys().any(|key| {
+                key.iter().all(|&pc| {
+                    conds
+                        .iter()
+                        .filter(|c| !pull_up_refs_agg(c, r, d, out_agg))
+                        .any(|c| {
+                            let Expr::BinaryOp {
+                                left,
+                                op: BinaryOperator::Eq,
+                                right,
+                            } = c
+                            else {
+                                return false;
+                            };
+                            [(left, right), (right, left)].iter().any(|(a, z)| {
+                                if r.resolve(a) != Res::Col(ti, pc) {
+                                    return false;
+                                }
+                                let other = match r.resolve(z) {
+                                    Res::Col(i, c) if i == d && out_key[c] => out_col[c].clone(),
+                                    Res::Col(i, c) if i != ti && bound.contains(&i) => {
+                                        items[i].table().map(|t| t.columns[c].clone())
+                                    }
+                                    _ => None,
+                                };
+                                other.is_some_and(|o| same_key_type(&o, &t.columns[pc]))
+                            })
+                        })
+                })
+            });
+            if covered {
+                bound.insert(ti);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    bound
+}
+
+/// Conditions on aggregates move to HAVING; the other tables' columns used after
+/// aggregation join the GROUP BY (they are constant within a group).
+fn pull_up_having(b: &mut Block, r: &Resolver, d: usize, out_agg: &[bool]) {
+    let mut having = Vec::new();
+    let keep = |e: Expr, having: &mut Vec<Expr>| -> Option<Expr> {
+        if pull_up_refs_agg(&e, r, d, out_agg) {
+            having.push(e);
+            None
+        } else {
+            Some(e)
+        }
+    };
+    let w: Vec<Expr> = b
+        .select
+        .selection
+        .take()
+        .into_iter()
+        .flat_map(|e| conjuncts(&e))
+        .filter_map(|c| keep(c, &mut having))
+        .collect();
+    b.select.selection = and_all(w);
+    for twj in &mut b.select.from {
+        for j in &mut twj.joins {
+            if let Some(c) = join_constraint_mut(&mut j.join_operator) {
+                if let JoinConstraint::On(e) = c {
+                    let kept: Vec<Expr> = conjuncts(e)
+                        .into_iter()
+                        .filter_map(|c| keep(c, &mut having))
+                        .collect();
+                    *c = and_all(kept)
+                        .map(JoinConstraint::On)
+                        .unwrap_or(JoinConstraint::None);
+                }
+            }
+        }
+    }
+    let mut extra_keys: Vec<Expr> = Vec::new();
+    let mut seen = HashSet::new();
+    for e in b.outputs.iter().map(|o| &o.expr).chain(having.iter()) {
+        let _ = visit_expressions(e, |x: &Expr| {
+            if let Res::Col(i, c) = r.resolve(x) {
+                if i != d {
+                    let it = &b.items[i];
+                    let col = qcol(&it.alias, &qident(&it.table().unwrap().columns[c].name));
+                    if seen.insert(col.to_string()) {
+                        extra_keys.push(col);
+                    }
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+    b.select.having = and_all(having);
+    b.select.group_by = GroupByExpr::Expressions(extra_keys, vec![]);
+}
+
 /// Aggregation pulled up through key-preserving inner joins (Yan & Larson's "eager/lazy
 /// aggregation"): `SELECT … FROM t JOIN c ON c.pk = t.g` with `t = SELECT g, agg(x) … GROUP BY g`
 /// becomes one grouped block over `t`'s tables joined to `c`, grouped by `g` and the columns of
@@ -970,118 +1099,11 @@ fn pull_up(b: &mut Block) -> Result<()> {
             }
         }
     }
-    let refs_agg = |e: &Expr| {
-        let mut agg = false;
-        let _ = visit_expressions(e, |x: &Expr| {
-            if let Res::Col(i, c) = r.resolve(x) {
-                agg |= i == d && out_agg[c];
-            }
-            ControlFlow::<()>::Continue(())
-        });
-        agg
-    };
-    // Key preservation, to a fixpoint: a table is bound when each of its primary-key columns
-    // equals a group key of the derived item or a column of a bound table ([`same_key_type`]).
-    let mut bound: HashSet<usize> = [d].into_iter().collect();
-    loop {
-        let mut grew = false;
-        for (ti, it) in b.items.iter().enumerate() {
-            let Some(t) = it.table() else { continue };
-            if bound.contains(&ti) {
-                continue;
-            }
-            let covered = t.keys().any(|key| {
-                key.iter().all(|&pc| {
-                    conds.iter().filter(|c| !refs_agg(c)).any(|c| {
-                        let Expr::BinaryOp {
-                            left,
-                            op: BinaryOperator::Eq,
-                            right,
-                        } = c
-                        else {
-                            return false;
-                        };
-                        [(left, right), (right, left)].iter().any(|(a, z)| {
-                            if r.resolve(a) != Res::Col(ti, pc) {
-                                return false;
-                            }
-                            let other = match r.resolve(z) {
-                                Res::Col(i, c) if i == d && out_key[c] => out_col[c].clone(),
-                                Res::Col(i, c) if i != ti && bound.contains(&i) => {
-                                    b.items[i].table().map(|t| t.columns[c].clone())
-                                }
-                                _ => None,
-                            };
-                            other.is_some_and(|o| same_key_type(&o, &t.columns[pc]))
-                        })
-                    })
-                })
-            });
-            if covered {
-                bound.insert(ti);
-                grew = true;
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
+    let bound = pull_up_bound(&b.items, &conds, &r, d, &out_key, &out_agg, &out_col);
     if bound.len() != b.items.len() {
         return Ok(());
     }
-    // Conditions on aggregates move to HAVING; the other tables' columns used after
-    // aggregation join the GROUP BY (they are constant within a group).
-    let mut having = Vec::new();
-    let keep = |e: Expr, having: &mut Vec<Expr>| -> Option<Expr> {
-        if refs_agg(&e) {
-            having.push(e);
-            None
-        } else {
-            Some(e)
-        }
-    };
-    let w: Vec<Expr> = b
-        .select
-        .selection
-        .take()
-        .into_iter()
-        .flat_map(|e| conjuncts(&e))
-        .filter_map(|c| keep(c, &mut having))
-        .collect();
-    b.select.selection = and_all(w);
-    for twj in &mut b.select.from {
-        for j in &mut twj.joins {
-            if let Some(c) = join_constraint_mut(&mut j.join_operator) {
-                if let JoinConstraint::On(e) = c {
-                    let kept: Vec<Expr> = conjuncts(e)
-                        .into_iter()
-                        .filter_map(|c| keep(c, &mut having))
-                        .collect();
-                    *c = and_all(kept)
-                        .map(JoinConstraint::On)
-                        .unwrap_or(JoinConstraint::None);
-                }
-            }
-        }
-    }
-    let mut extra_keys: Vec<Expr> = Vec::new();
-    let mut seen = HashSet::new();
-    for e in b.outputs.iter().map(|o| &o.expr).chain(having.iter()) {
-        let _ = visit_expressions(e, |x: &Expr| {
-            if let Res::Col(i, c) = r.resolve(x) {
-                if i != d {
-                    let it = &b.items[i];
-                    let col = qcol(&it.alias, &qident(&it.table().unwrap().columns[c].name));
-                    if seen.insert(col.to_string()) {
-                        extra_keys.push(col);
-                    }
-                }
-            }
-            ControlFlow::<()>::Continue(())
-        });
-    }
-    b.select.having = and_all(having);
-    b.select.group_by = GroupByExpr::Expressions(extra_keys, vec![]);
+    pull_up_having(b, &r, d, &out_agg);
     let mut rest = merge_picks(b, &[d])?;
     let inner = rest.pop().unwrap();
     let mut keys = group_exprs(&inner.select).cloned().unwrap_or_default();
@@ -1248,6 +1270,61 @@ fn scalars(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
 /// else why it stays a subquery, where that has a precise reason.
 type ScalarJoin = std::result::Result<(Expr, Join, Item), Option<String>>;
 
+/// Inner, outer or unknown identifiers of an expression: the inner column indexes, the number
+/// of outer columns it reads, and whether anything resolves in neither scope.
+fn scalar_scan(e: &Expr, inner: &Resolver, outer: &Resolver) -> (Vec<usize>, usize, bool) {
+    let (mut inner_refs, mut outer_refs, mut unknown) = (Vec::new(), 0usize, false);
+    let _ = visit_expressions(e, |x: &Expr| {
+        if matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            match inner.resolve(x) {
+                Res::Col(_, c) => inner_refs.push(c),
+                Res::Ambiguous(_) => unknown = true,
+                Res::Unknown => match outer.resolve(x) {
+                    Res::Col(..) => outer_refs += 1,
+                    _ => unknown = true,
+                },
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    (inner_refs, outer_refs, unknown)
+}
+
+/// Each outer row matches at most one row: a whole key (the PK or a UNIQUE NOT NULL key) is
+/// bound to outer columns that compare like it (G1); `None` when no key is bound or a condition
+/// reads something neither scope resolves.
+fn scalar_bound_key(
+    inner: &Resolver,
+    outer: &Resolver,
+    info: &crate::catalog::TableInfo,
+    conds: &[Expr],
+) -> Option<Vec<usize>> {
+    let mut bound = HashSet::new();
+    for c in conds {
+        if scalar_scan(c, inner, outer).2 {
+            return None;
+        }
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = c
+        {
+            for (a, z) in [(left, right), (right, left)] {
+                if let Res::Col(_, col) = inner.resolve(a) {
+                    let (zi, zo, _) = scalar_scan(z, inner, outer);
+                    if zi.is_empty() && zo > 0 && key_exact(&info.columns[col], outer, z) {
+                        bound.insert(col);
+                    }
+                }
+            }
+        }
+    }
+    info.keys()
+        .find(|k| k.iter().all(|c| bound.contains(c)))
+        .map(<[usize]>::to_vec)
+}
+
 fn scalar(
     bld: &Builder,
     outer: &Resolver,
@@ -1299,56 +1376,11 @@ fn scalar(
         return Ok(Err(None));
     }
     let inner = Resolver::new(&sb);
-    // Inner, outer or unknown identifiers of an expression.
-    let scan = |e: &Expr| {
-        let (mut inner_refs, mut outer_refs, mut unknown) = (Vec::new(), 0, false);
-        let _ = visit_expressions(e, |x: &Expr| {
-            if matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-                match inner.resolve(x) {
-                    Res::Col(_, c) => inner_refs.push(c),
-                    Res::Ambiguous(_) => unknown = true,
-                    Res::Unknown => match outer.resolve(x) {
-                        Res::Col(..) => outer_refs += 1,
-                        _ => unknown = true,
-                    },
-                }
-            }
-            ControlFlow::<()>::Continue(())
-        });
-        (inner_refs, outer_refs, unknown)
-    };
     let conds: Vec<Expr> = sb.select.selection.iter().flat_map(conjuncts).collect();
-    let mut bound = HashSet::new();
-    for c in &conds {
-        if scan(c).2 {
-            return Ok(Err(None));
-        }
-        if let Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } = c
-        {
-            for (a, z) in [(left, right), (right, left)] {
-                if let Res::Col(_, col) = inner.resolve(a) {
-                    let (zi, zo, _) = scan(z);
-                    if zi.is_empty() && zo > 0 && key_exact(&info.columns[col], outer, z) {
-                        bound.insert(col);
-                    }
-                }
-            }
-        }
-    }
-    // Each outer row matches at most one row: a whole key (the PK or a UNIQUE NOT NULL key) is
-    // bound to outer columns that compare like it (G1).
-    let Some(key) = info
-        .keys()
-        .find(|k| k.iter().all(|c| bound.contains(c)))
-        .map(<[usize]>::to_vec)
-    else {
+    let Some(key) = scalar_bound_key(&inner, outer, &info, &conds) else {
         return Ok(Err(None));
     };
-    if scan(&sb.outputs[0].expr).2 {
+    if scalar_scan(&sb.outputs[0].expr, &inner, outer).2 {
         return Ok(Err(None));
     }
     let mut alias = sb.items[0].alias.clone();
@@ -1376,7 +1408,7 @@ fn scalar(
     // The value is NULL for an outer row without a match only if it propagates NULL from a
     // column of the subquery's own table; a value over outer columns alone (or constants)
     // keeps its value through the NULL-extended row and needs the guard (A6).
-    let reads_inner = !scan(&sb.outputs[0].expr).0.is_empty();
+    let reads_inner = !scalar_scan(&sb.outputs[0].expr, &inner, outer).0.is_empty();
     let value = localize(sb.outputs[0].expr.clone());
     let value = if reads_inner && null_propagating(&value) {
         value
@@ -1600,23 +1632,38 @@ fn inner_join_conditions(kind: &str, sb: &Block) -> std::result::Result<Vec<Expr
     Ok(on)
 }
 
-/// A semi-join for conjunct `c`, with the marker that replaces it. A subquery that stays one
-/// leaves its reason in `blockers`.
-fn semi(
+/// The semi-join candidate as recognised by [`semi_shape`].
+struct SemiShape<'a> {
+    /// The left-hand side of an `IN` subquery; `None` for `EXISTS`.
+    lhs: Option<&'a Expr>,
+    /// The shape's name for blocker texts.
+    kind: &'static str,
+    negated: bool,
+    not_in: bool,
+    /// The subquery's block: plain tables, no aggregate, no window, no LIMIT, no subquery.
+    sb: Block,
+    /// `sb` reads several tables joined by inner joins.
+    several: bool,
+    /// The inner joins' ON conditions, WHERE conjuncts of the semi-join.
+    on: Vec<Expr>,
+}
+
+/// Match the condition as an `[NOT] EXISTS` or `[NOT] IN` subquery, resolve its body to a
+/// simple block and take its inner-join conditions; `None` when it cannot become a semi-join
+/// (`blockers` then holds why).
+fn semi_shape<'a>(
     bld: &Builder,
-    outer: &Resolver,
-    outer_not_null: &dyn Fn(&Expr) -> bool,
-    c: &Expr,
-    scope: &Scope,
+    c: &'a Expr,
+    scope: &Scope<'a>,
     blockers: &mut Vec<String>,
-) -> Result<Option<(Semi, Expr)>> {
+) -> Result<Option<SemiShape<'a>>> {
     let (lhs, subquery, negated) = match c {
         Expr::Exists { subquery, negated } => (None, subquery, *negated),
         Expr::InSubquery {
             expr,
             subquery,
             negated,
-        } => (Some(expr), subquery, *negated),
+        } => (Some(&**expr), subquery, *negated),
         _ => return Ok(None),
     };
     let kind = match (lhs.is_some(), negated) {
@@ -1625,8 +1672,8 @@ fn semi(
         (false, false) => "EXISTS subquery",
         (false, true) => "NOT EXISTS subquery",
     };
-    let mut not_in = lhs.is_some() && negated;
-    if not_in && matches!(lhs.map(|e| &**e), Some(Expr::Tuple(_))) {
+    let not_in = lhs.is_some() && negated;
+    if not_in && matches!(lhs, Some(Expr::Tuple(_))) {
         blockers.push("NOT IN over a row constructor".into());
         return Ok(None);
     }
@@ -1656,31 +1703,36 @@ fn semi(
         let r = Resolver::new(&sb);
         using_to_on(&mut sb, &r);
     }
-    let mut on = match inner_join_conditions(kind, &sb) {
+    let on = match inner_join_conditions(kind, &sb) {
         Ok(on) => on,
         Err(why) => {
             blockers.push(why);
             return Ok(None);
         }
     };
-    let mut tables: Vec<SemiTable> = sb
-        .items
-        .iter()
-        .map(|it| match &it.source {
-            Source::Table(t, info) => SemiTable {
-                table: t.clone(),
-                info: info.clone(),
-                alias: it.alias.clone(),
-                referenced: vec![false; info.columns.len()],
-            },
-            Source::Derived(_) => unreachable!(),
-        })
-        .collect();
-    let inner = Resolver::new(&sb);
-    let mut where_ = sb.select.selection.take();
-    let mut proj: Vec<Expr> = sb.outputs.iter().map(|o| o.expr.clone()).collect();
-    // VIRTUAL generated columns of the subquery's tables have no value in the row images its
-    // lookups substitute: their expressions, converted to their types, stand in (B2).
+    Ok(Some(SemiShape {
+        lhs,
+        kind,
+        negated,
+        not_in,
+        sb,
+        several,
+        on,
+    }))
+}
+
+/// VIRTUAL generated columns of the subquery's tables have no value in the row images its
+/// lookups substitute: their expressions, converted to their types, stand in (B2). False when
+/// one cannot be expanded (`blockers` then holds why).
+fn semi_expand_virtual(
+    kind: &str,
+    inner: &Resolver,
+    tables: &[SemiTable],
+    on: &mut [Expr],
+    where_: &mut Option<Expr>,
+    proj: &mut [Expr],
+    blockers: &mut Vec<String>,
+) -> bool {
     let mut virtual_failed = None;
     for e in on
         .iter_mut()
@@ -1706,13 +1758,28 @@ fn semi(
             ControlFlow::<()>::Continue(())
         });
     }
-    if let Some(why) = virtual_failed {
-        blockers.push(format!("{kind} reading {why}"));
-        return Ok(None);
+    match virtual_failed {
+        Some(why) => {
+            blockers.push(format!("{kind} reading {why}"));
+            false
+        }
+        None => true,
     }
-    // Inner columns are qualified with their alias, outer references become placeholders.
+}
+
+/// Inner columns are qualified with their alias, outer references become placeholders; false
+/// when a reference is ambiguous or belongs to neither scope. On success each table's
+/// `referenced` flags record the columns the subquery reads.
+fn semi_localize(
+    inner: &Resolver,
+    outer: &Resolver,
+    tables: &mut [SemiTable],
+    on: &mut [Expr],
+    where_: &mut Option<Expr>,
+    proj: &mut [Expr],
+    outer_exprs: &mut Vec<Expr>,
+) -> bool {
     let aliases: Vec<String> = tables.iter().map(|t| t.alias.clone()).collect();
-    let mut outer_exprs: Vec<Expr> = Vec::new();
     let mut ok = true;
     let mut referenced: Vec<Vec<bool>> = tables.iter().map(|t| t.referenced.clone()).collect();
     let mut localize =
@@ -1744,26 +1811,50 @@ fn semi(
                 ControlFlow::<()>::Continue(())
             });
         };
-    for e in &mut on {
-        localize(e, &mut outer_exprs, &mut referenced);
+    for e in on {
+        localize(e, outer_exprs, &mut referenced);
     }
-    if let Some(w) = &mut where_ {
-        localize(w, &mut outer_exprs, &mut referenced);
+    if let Some(w) = where_ {
+        localize(w, outer_exprs, &mut referenced);
     }
-    for p in &mut proj {
-        localize(p, &mut outer_exprs, &mut referenced);
+    for p in proj {
+        localize(p, outer_exprs, &mut referenced);
     }
     if !ok {
-        return Ok(None);
+        return false;
     }
     for (t, r) in tables.iter_mut().zip(referenced) {
         t.referenced = r;
     }
+    true
+}
+
+/// The `IN` list's contribution: its parts become outer-expression placeholders (appended to
+/// `outer_exprs`) and yield the correlation and the join and lookup conditions built from the
+/// projections; `not_in` flips when the comparison is safely its EXISTS form. `None` when the
+/// list and the projections differ in length.
+fn semi_lhs_conditions(
+    inner: &Resolver,
+    tables: &[SemiTable],
+    outer_not_null: &dyn Fn(&Expr) -> bool,
+    lhs: Option<&Expr>,
+    proj: &[Expr],
+    not_in: &mut bool,
+    outer_exprs: &mut Vec<Expr>,
+) -> Result<
+    Option<(
+        Vec<(usize, usize, usize)>,
+        Vec<Expr>,
+        Vec<Expr>,
+        Vec<Expr>,
+        bool,
+    )>,
+> {
     let mut correlation = Vec::new();
     let mut join_conditions = Vec::new();
     let mut lookup_conditions = Vec::new();
     let lhs_parts: Vec<Expr> = match lhs {
-        Some(e) => match &**e {
+        Some(e) => match e {
             Expr::Tuple(es) => es.clone(),
             other => vec![other.clone()],
         },
@@ -1782,13 +1873,13 @@ fn semi(
         Res::Col(t, c) => !tables[t].info.columns[c].nullable,
         _ => false,
     };
-    let exists_form = not_in
+    let exists_form = *not_in
         && lhs_parts.len() == 1
         && proj.len() == 1
         && outer_not_null(&lhs_parts[0])
         && not_null_key(&proj[0]);
     if exists_form {
-        not_in = false;
+        *not_in = false;
     }
     if lhs.is_some() {
         if proj.len() != lhs_ph.len() {
@@ -1804,7 +1895,7 @@ fn semi(
                 op: BinaryOperator::Eq,
                 right: Box::new(ph.clone()),
             };
-            lookup_conditions.push(if not_in {
+            lookup_conditions.push(if *not_in {
                 // `x NOT IN K` also changes for every x when a NULL enters or leaves K, and for
                 // a NULL x whenever K becomes empty or not.
                 parse_expr(&format!("({eq} OR {ph} IS NULL OR {p} IS NULL)"))?
@@ -1814,6 +1905,89 @@ fn semi(
             join_conditions.push(eq);
         }
     }
+    Ok(Some((
+        correlation,
+        join_conditions,
+        lookup_conditions,
+        lhs_ph,
+        exists_form,
+    )))
+}
+
+/// A semi-join for conjunct `c`, with the marker that replaces it. A subquery that stays one
+/// leaves its reason in `blockers`.
+fn semi(
+    bld: &Builder,
+    outer: &Resolver,
+    outer_not_null: &dyn Fn(&Expr) -> bool,
+    c: &Expr,
+    scope: &Scope,
+    blockers: &mut Vec<String>,
+) -> Result<Option<(Semi, Expr)>> {
+    let Some(shape) = semi_shape(bld, c, scope, blockers)? else {
+        return Ok(None);
+    };
+    let SemiShape {
+        lhs,
+        kind,
+        negated,
+        mut not_in,
+        mut sb,
+        several,
+        mut on,
+    } = shape;
+    let mut tables: Vec<SemiTable> = sb
+        .items
+        .iter()
+        .map(|it| match &it.source {
+            Source::Table(t, info) => SemiTable {
+                table: t.clone(),
+                info: info.clone(),
+                alias: it.alias.clone(),
+                referenced: vec![false; info.columns.len()],
+            },
+            Source::Derived(_) => unreachable!(),
+        })
+        .collect();
+    let inner = Resolver::new(&sb);
+    let mut where_ = sb.select.selection.take();
+    let mut proj: Vec<Expr> = sb.outputs.iter().map(|o| o.expr.clone()).collect();
+    if !semi_expand_virtual(
+        kind,
+        &inner,
+        &tables,
+        &mut on,
+        &mut where_,
+        &mut proj,
+        blockers,
+    ) {
+        return Ok(None);
+    }
+    let mut outer_exprs: Vec<Expr> = Vec::new();
+    if !semi_localize(
+        &inner,
+        outer,
+        &mut tables,
+        &mut on,
+        &mut where_,
+        &mut proj,
+        &mut outer_exprs,
+    ) {
+        return Ok(None);
+    }
+    let Some((mut correlation, mut join_conditions, mut lookup_conditions, lhs_ph, exists_form)) =
+        semi_lhs_conditions(
+            &inner,
+            &tables,
+            outer_not_null,
+            lhs,
+            &proj,
+            &mut not_in,
+            &mut outer_exprs,
+        )?
+    else {
+        return Ok(None);
+    };
     let conds: Vec<Expr> = on
         .iter()
         .flat_map(conjuncts)
