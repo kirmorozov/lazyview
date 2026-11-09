@@ -10,5 +10,6 @@ pub mod lane;
 pub mod stage;
 
 pub use buffer::IdSet;
+pub use buffer::{Fact, Facts};
 pub use key::{HopId, Item, Key, NoItem, NoJob, Op, SpaceId, Spaces};
 pub use lane::{JobId, Schedule};

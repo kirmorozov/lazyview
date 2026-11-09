@@ -17,7 +17,7 @@ use std::hash::Hash;
 use crate::datum::{Datum, Key as Tuple};
 use crate::intset::{self, IntSet};
 
-use super::key::{Item, Key, SpaceId};
+use super::key::{Item, Key, Op, SpaceId};
 
 /// A hash set of tuple ids (std `HashSet`, foldhash hasher).
 pub type TupleSet = HashSet<Tuple, foldhash::fast::RandomState>;
@@ -118,12 +118,85 @@ impl IdSet {
     }
 }
 
+/// The merged facts of one id for its window (keymap §4.1): the op its first and last actions give,
+/// and whether a cascade reached it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fact {
+    pub op: Op,
+    pub cascaded: bool,
+}
+
+/// The facts of one space: ids whose first action in the window inserted, ids whose last action
+/// deleted, ids a cascade reached.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Facts {
+    first_insert: IdSet,
+    last_delete: IdSet,
+    cascaded: IdSet,
+}
+
+impl Facts {
+    /// One action `op` on `k`; `new`: `k` was not pending before it.
+    pub fn note(&mut self, k: &Key, op: Op, cascaded: bool, new: bool) {
+        if new && op == Op::Insert {
+            self.first_insert.insert(k.clone());
+        }
+        if op == Op::Delete {
+            self.last_delete.insert(k.clone());
+        } else {
+            self.last_delete.remove(k);
+        }
+        if cascaded {
+            self.cascaded.insert(k.clone());
+        }
+    }
+
+    /// The merged fact of `k`, removing its entries: last action a delete → `Delete`, else first
+    /// action an insert → `Insert`, else `Update`.
+    pub fn take(&mut self, k: &Key) -> Fact {
+        let deleted = self.last_delete.remove(k);
+        let inserted = self.first_insert.remove(k);
+        Fact {
+            op: if deleted {
+                Op::Delete
+            } else if inserted {
+                Op::Insert
+            } else {
+                Op::Update
+            },
+            cascaded: self.cascaded.remove(k),
+        }
+    }
+
+    /// Retried id `k` back with fact `f`; `pending`: it was marked again meanwhile (its newer last
+    /// action stays; the older first action is `f`'s).
+    pub fn retry(&mut self, k: &Key, f: Fact, pending: bool) {
+        if !pending {
+            self.note(k, f.op, f.cascaded, true);
+        } else {
+            if f.op == Op::Insert {
+                self.first_insert.insert(k.clone());
+            }
+            if f.cascaded {
+                self.cascaded.insert(k.clone());
+            }
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.first_insert.bytes() + self.last_delete.bytes() + self.cascaded.bytes()
+    }
+}
+
 /// A chunk taken from the generation in flight.
 #[derive(Debug)]
 pub struct Taken<P, U> {
     /// The spaces with ids in the chunk, in space order.
     pub ids: Vec<(SpaceId, IdSet)>,
     pub items: Vec<Item<U>>,
+    /// The merged facts of the taken ids, one per (space, id) of `ids`; `None`: the target's
+    /// facts flag is off (decision 3, off for lazyview).
+    pub facts: Option<Vec<(SpaceId, Key, Fact)>>,
     /// The replay position of the generation's oldest release (lazyview pins lagging targets there).
     pub origin: P,
     /// The generation's newest release: the caller fences on it.
@@ -133,6 +206,7 @@ pub struct Taken<P, U> {
 #[derive(Debug)]
 struct Generation<P, U> {
     sets: Vec<IdSet>,
+    facts: Option<Vec<Facts>>,
     items: Vec<Item<U>>,
     origin: P,
     high: P,
@@ -144,6 +218,7 @@ struct Generation<P, U> {
 #[derive(Debug)]
 pub struct Buffer<P, U> {
     pending: Vec<IdSet>,
+    facts: Option<Vec<Facts>>,
     items: HashSet<Item<U>, foldhash::fast::RandomState>,
     origin: Option<P>,
     high: Option<P>,
@@ -151,10 +226,11 @@ pub struct Buffer<P, U> {
 }
 
 impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
-    /// An empty buffer of `spaces` key spaces.
-    pub fn new(spaces: usize) -> Self {
+    /// An empty buffer of `spaces` key spaces; `facts`: keep the merged facts per id (keymap §4.1).
+    pub fn new(spaces: usize, facts: bool) -> Self {
         Self {
             pending: vec![IdSet::default(); spaces],
+            facts: facts.then(|| vec![Facts::default(); spaces]),
             items: HashSet::default(),
             origin: None,
             high: None,
@@ -186,6 +262,14 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
             self.origin = Some(origin.clone());
         }
         r
+    }
+
+    /// One action `op` on id `k` of space `s` in the pending window; `new`: `k` was not pending
+    /// before it. No-op when the target's facts flag is off.
+    pub fn note(&mut self, s: SpaceId, k: &Key, op: Op, cascaded: bool, new: bool) {
+        if let Some(f) = self.facts.as_mut() {
+            f[s.index()].note(k, op, cascaded, new);
+        }
     }
 
     /// A deferred item; `true`: it was not pending.
@@ -222,6 +306,10 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
         let high = self.high.take().unwrap_or_else(|| origin.clone());
         self.flight = Some(Generation {
             sets: std::mem::replace(&mut self.pending, vec![IdSet::default(); n]),
+            facts: self
+                .facts
+                .as_mut()
+                .map(|f| std::mem::replace(f, vec![Facts::default(); n])),
             items: self.items.drain().collect(),
             origin,
             high,
@@ -252,10 +340,24 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
         if out.is_empty() && taken_items.is_empty() {
             return None;
         }
+        let facts = match g.facts.as_mut() {
+            Some(gf) => {
+                let mut v = Vec::new();
+                for (s, set) in out.iter() {
+                    for key in set.to_keys() {
+                        let f = gf[s.index()].take(&key);
+                        v.push((*s, key, f));
+                    }
+                }
+                Some(v)
+            }
+            None => None,
+        };
         g.out += 1;
         Some(Taken {
             ids: out,
             items: taken_items,
+            facts,
             origin: g.origin.clone(),
             high: g.high.clone(),
         })
@@ -293,6 +395,18 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
         };
         if ends {
             self.flight = None;
+        }
+    }
+
+    /// Facts of retried ids going back with them; call this **before** [`Buffer::done`] puts the
+    /// same ids back (else every id looks pending). A fact of an id marked again meanwhile keeps
+    /// its newer last action; its older first action is the fact's.
+    pub fn retry_facts(&mut self, back: Vec<(SpaceId, Key, Fact)>) {
+        if let Some(f) = self.facts.as_mut() {
+            for (s, k, fact) in back {
+                let pending = self.pending[s.index()].contains(&k);
+                f[s.index()].retry(&k, fact, pending);
+            }
         }
     }
 
@@ -350,7 +464,8 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
             items.extend(g.items);
         }
         let sets = std::mem::take(&mut self.pending);
-        *self = Self::new(n);
+        let facts = self.facts.is_some();
+        *self = Self::new(n, facts);
         (sets, items)
     }
 }
@@ -364,7 +479,7 @@ mod tests {
     #[test]
     fn marks_dedup_and_pin_the_first_origin() {
         let s = SpaceId::FULL;
-        let mut b = Buffer::<u64, NoItem>::new(1);
+        let mut b = Buffer::<u64, NoItem>::new(1, false);
         assert!(b.mark_int(s, 5, &10));
         assert!(!b.mark_int(s, 5, &11));
         assert!(b.mark_int(s, 7, &12));
@@ -374,7 +489,7 @@ mod tests {
     #[test]
     fn begin_swaps_and_new_marks_wait() {
         let s = SpaceId::FULL;
-        let mut b = Buffer::<u64, NoItem>::new(1);
+        let mut b = Buffer::<u64, NoItem>::new(1, false);
         for v in 1..=3u64 {
             assert!(b.mark_int(s, v, &10));
         }
@@ -388,7 +503,7 @@ mod tests {
     #[test]
     fn take_is_bounded_ascending_and_complete() {
         let s = SpaceId::FULL;
-        let mut b = Buffer::<u64, NoItem>::new(1);
+        let mut b = Buffer::<u64, NoItem>::new(1, false);
         for v in 0..10_000u64 {
             assert!(b.mark_int(s, v, &1));
         }
@@ -433,7 +548,7 @@ mod tests {
     #[test]
     fn retry_keeps_the_generation_origin() {
         let s = SpaceId::FULL;
-        let mut b = Buffer::<u64, NoItem>::new(1);
+        let mut b = Buffer::<u64, NoItem>::new(1, false);
         assert!(b.mark_int(s, 1, &10));
         assert!(b.begin());
         let c1 = b.take(100, 0).unwrap();
@@ -461,7 +576,7 @@ mod tests {
     #[test]
     fn generation_unpins_after_every_chunk() {
         let s = SpaceId::FULL;
-        let mut b = Buffer::<u64, NoItem>::new(1);
+        let mut b = Buffer::<u64, NoItem>::new(1, false);
         for v in 1..=4u64 {
             assert!(b.mark_int(s, v, &7));
         }
@@ -483,7 +598,7 @@ mod tests {
 
     #[test]
     fn items_dedup_and_take_bounded() {
-        let mut b = Buffer::<u64, NoItem>::new(1);
+        let mut b = Buffer::<u64, NoItem>::new(1, false);
         let first = Item::<NoItem>::Hop {
             hop: HopId(0),
             link: Box::new([Datum::Int(0)]),
@@ -521,7 +636,7 @@ mod tests {
     #[test]
     fn drain_returns_everything() {
         let s = SpaceId::FULL;
-        let mut b = Buffer::<u64, NoItem>::new(1);
+        let mut b = Buffer::<u64, NoItem>::new(1, false);
         for v in 1..=5u64 {
             assert!(b.mark_int(s, v, &10));
         }
@@ -539,5 +654,172 @@ mod tests {
         assert_eq!(b.pinned(), None, "the drained buffer pins nothing");
         assert!(!b.in_flight());
         assert_eq!(b.pending_len(), 0);
+    }
+
+    /// The merged fact of one id (7): actions in binlog order, `new` = the id was not pending
+    /// before the action (the merge table of keymap §4.1).
+    fn merge_of(actions: &[(Op, bool)]) -> Fact {
+        let s = SpaceId::FULL;
+        let mut b = Buffer::<u64, NoItem>::new(1, true);
+        for (op, cascaded) in actions {
+            let new = b.mark_int(s, 7, &10);
+            b.note(s, &Key::Int(7), *op, *cascaded, new);
+        }
+        assert!(b.begin());
+        let t = b.take(100, 0).unwrap();
+        t.facts.unwrap()[0].2
+    }
+
+    #[test]
+    fn facts_insert_then_updates_merge_to_insert() {
+        assert_eq!(
+            merge_of(&[
+                (Op::Insert, false),
+                (Op::Update, false),
+                (Op::Update, false)
+            ]),
+            Fact {
+                op: Op::Insert,
+                cascaded: false,
+            }
+        );
+    }
+
+    #[test]
+    fn facts_updates_only_merge_to_update() {
+        assert_eq!(
+            merge_of(&[(Op::Update, false), (Op::Update, false)]),
+            Fact {
+                op: Op::Update,
+                cascaded: false,
+            }
+        );
+    }
+
+    #[test]
+    fn facts_delete_then_insert_merges_to_update() {
+        assert_eq!(
+            merge_of(&[(Op::Delete, false), (Op::Insert, false)]),
+            Fact {
+                op: Op::Update,
+                cascaded: false,
+            }
+        );
+    }
+
+    #[test]
+    fn facts_insert_then_delete_merges_to_delete() {
+        assert_eq!(
+            merge_of(&[(Op::Insert, false), (Op::Delete, false)]),
+            Fact {
+                op: Op::Delete,
+                cascaded: false,
+            }
+        );
+    }
+
+    #[test]
+    fn facts_cascaded_delete_reports_cascaded() {
+        assert_eq!(
+            merge_of(&[(Op::Delete, true)]),
+            Fact {
+                op: Op::Delete,
+                cascaded: true,
+            }
+        );
+    }
+
+    #[test]
+    fn facts_key_move_gives_old_delete_and_new_insert() {
+        let s = SpaceId::FULL;
+        let mut b = Buffer::<u64, NoItem>::new(1, true);
+        let (a, n) = (Key::Int(1), Key::Int(2));
+        assert!(b.mark_int(s, 1, &10));
+        b.note(s, &a, Op::Delete, false, true);
+        assert!(b.mark_int(s, 2, &11));
+        b.note(s, &n, Op::Insert, false, true);
+        assert!(b.begin());
+        let t = b.take(100, 0).unwrap();
+        assert_eq!(
+            t.facts.unwrap(),
+            vec![
+                (
+                    s,
+                    a.clone(),
+                    Fact {
+                        op: Op::Delete,
+                        cascaded: false,
+                    }
+                ),
+                (
+                    s,
+                    n.clone(),
+                    Fact {
+                        op: Op::Insert,
+                        cascaded: false,
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn facts_delete_and_reinsert_in_one_window_merge_to_update() {
+        assert_eq!(
+            merge_of(&[
+                (Op::Delete, false),
+                (Op::Insert, false),
+                (Op::Insert, false)
+            ]),
+            Fact {
+                op: Op::Update,
+                cascaded: false,
+            }
+        );
+    }
+
+    #[test]
+    fn retry_facts_of_an_insert_keeps_insert_when_marked_again() {
+        let s = SpaceId::FULL;
+        let mut b = Buffer::<u64, NoItem>::new(1, true);
+        assert!(b.mark_int(s, 7, &10));
+        b.note(s, &Key::Int(7), Op::Insert, false, true);
+        assert!(b.begin());
+        let c = b.take(100, 0).unwrap();
+        let taken_facts = c.facts.unwrap();
+        assert_eq!(
+            taken_facts[0].2,
+            Fact {
+                op: Op::Insert,
+                cascaded: false,
+            }
+        );
+        // the id is updated again while the chunk is in flight; its fact goes back before `done`
+        assert!(b.mark_int(s, 7, &20));
+        b.note(s, &Key::Int(7), Op::Update, false, true);
+        b.retry_facts(taken_facts);
+        b.done(c.ids, vec![]);
+        assert!(b.begin());
+        let c2 = b.take(100, 0).unwrap();
+        assert_eq!(
+            c2.facts.unwrap()[0].2,
+            Fact {
+                op: Op::Insert,
+                cascaded: false,
+            },
+            "the older first action is the retried fact's"
+        );
+        b.done(vec![], vec![]);
+    }
+
+    #[test]
+    fn facts_off_take_carries_no_facts() {
+        let s = SpaceId::FULL;
+        let mut b = Buffer::<u64, NoItem>::new(1, false);
+        assert!(b.mark_int(s, 7, &10));
+        b.note(s, &Key::Int(7), Op::Insert, false, true);
+        assert!(b.begin());
+        let c = b.take(100, 0).unwrap();
+        assert!(c.facts.is_none(), "facts off: nothing below the flag runs");
     }
 }
