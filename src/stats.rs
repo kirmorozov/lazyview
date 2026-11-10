@@ -284,42 +284,127 @@ impl ViewStats {
     }
 }
 
-/// The statistics of one view at one point in time (see the module documentation).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ViewSnapshot {
-    pub mode: String,
-    pub source_rows: u64,
-    pub source_rows_skipped: u64,
-    /// Target ids marked, before deduplication.
-    pub ids_marked: u64,
-    /// Of those, already pending (absorbed by deduplication).
-    pub ids_absorbed: u64,
-    pub ids_pending: u64,
-    pub images_marked: u64,
-    pub images_absorbed: u64,
-    /// Kept child rows replayed for a parent change (the in-memory cascade cache).
-    pub cascade_rows: u64,
-    /// Parent changes replayed from before the startup seed (a cache gap).
-    pub cascade_gaps: u64,
-    /// Rows kept in the live version's in-memory cascade cache.
-    pub cascade_cached_rows: u64,
-    /// Target ids refreshed, after deduplication (each id once per flush).
-    pub entities_updated: u64,
-    pub rows_inserted: u64,
-    pub rows_updated: u64,
-    pub rows_deleted: u64,
-    pub rows_unchanged: u64,
-    pub whole_view_refreshes: u64,
-    /// Reason and unix time of the last whole-view refresh.
-    pub last_whole_view_refresh: Option<(String, u64)>,
-    /// First builds (no live version yet).
-    pub builds: u64,
-    pub source_queries: u64,
-    pub lookup_queries: u64,
-    /// Refreshes of the view (flushes that refreshed it).
-    pub flushes: u64,
-    pub last_flush_unix: u64,
+/// The one field list of [`ViewSnapshot`]: each entry is `name: Type, json "key"`, with
+/// `object ("k1", "k2")` for a field whose JSON value is an object of two keys and
+/// `series ("name", "help", counter)` for its `/metrics` series. The struct, `to_json`
+/// and `series` all expand from this list (the 23 names used to be kept in it by hand
+/// three times). $cb is the callback macro; $s is the snapshot receiver, or `()` for the
+/// struct itself (macro hygiene: `self` only reaches the callback as a fragment).
+macro_rules! view_snapshot_fields {
+    ($cb:ident, $s:expr) => {
+        $cb! {
+            $s;
+            mode: String, json "mode";
+            source_rows: u64, json "source_rows",
+                series ("source_rows", "Binlog row changes fed to the view.", true);
+            source_rows_skipped: u64, json "source_rows_skipped",
+                series ("source_rows_skipped", "Of those, skipped as irrelevant.", true);
+            /// Target ids marked, before deduplication.
+            ids_marked: u64, json "ids_marked",
+                series ("ids_marked", "Target ids marked for a refresh, before deduplication.", true);
+            /// Of those, already pending (absorbed by deduplication).
+            ids_absorbed: u64, json "ids_absorbed",
+                series ("ids_absorbed", "Marks of an id already pending (absorbed by deduplication).", true);
+            ids_pending: u64, json "ids_pending",
+                series ("ids_pending", "Ids buffered and not refreshed yet.", false);
+            images_marked: u64, json "images_marked",
+                series ("images_marked", "Row images buffered for a lookup of their target ids.", true);
+            images_absorbed: u64, json "images_absorbed",
+                series ("images_absorbed", "Of those, already buffered.", true);
+            /// Kept child rows replayed for a parent change (the in-memory cascade cache).
+            cascade_rows: u64, json "cascade_rows",
+                series ("cascade_rows", "Kept child rows replayed for a parent change.", true);
+            /// Parent changes replayed from before the startup seed (a cache gap).
+            cascade_gaps: u64, json "cascade_gaps",
+                series ("cascade_gaps", "Parent changes replayed from before the startup seed.", true);
+            /// Rows kept in the live version's in-memory cascade cache.
+            cascade_cached_rows: u64, json "cascade_cached_rows",
+                series ("cascade_cached_rows", "Rows kept in the live version's in-memory cascade cache.", false);
+            /// Target ids refreshed, after deduplication (each id once per flush).
+            entities_updated: u64, json "entities_updated",
+                series ("entities_updated", "Target ids refreshed after deduplication, summed over flushes.", true);
+            rows_inserted: u64, json "rows_inserted",
+                series ("rows_inserted", "View rows inserted.", true);
+            rows_updated: u64, json "rows_updated",
+                series ("rows_updated", "View rows replaced in place.", true);
+            rows_deleted: u64, json "rows_deleted",
+                series ("rows_deleted", "View rows deleted.", true);
+            rows_unchanged: u64, json "rows_unchanged",
+                series ("rows_unchanged", "View rows compared and found unchanged.", true);
+            whole_view_refreshes: u64, json "whole_view_refreshes",
+                series ("whole_view_refreshes", "Rebuilds of the whole view that replaced a live version.", true);
+            /// Reason and unix time of the last whole-view refresh.
+            last_whole_view_refresh: Option<(String, u64)>, json "last_whole_view_refresh",
+                object ("reason", "unix");
+            /// First builds (no live version yet).
+            builds: u64, json "builds",
+                series ("builds", "First builds of the view.", true);
+            source_queries: u64, json "source_queries",
+                series ("source_queries", "Source reads of the view's refreshes.", true);
+            lookup_queries: u64, json "lookup_queries",
+                series ("lookup_queries", "Lookup queries of the view's refreshes.", true);
+            /// Refreshes of the view (flushes that refreshed it).
+            flushes: u64, json "flushes",
+                series ("flushes", "Refreshes of the view.", true);
+            last_flush_unix: u64, json "last_flush_unix",
+                series ("last_flush_timestamp_seconds", "Unix time of the view's last refresh.", false);
+        }
+    };
 }
+
+/// The [`ViewSnapshot`] struct itself: one field per entry of [`view_snapshot_fields`].
+macro_rules! view_snapshot_as_struct {
+    ($_d:expr ; $( $(#[$doc:meta])* $name:ident : $ty:ty, json $key:literal
+        $(, object ($k1:literal, $k2:literal))?
+        $(, series ($sn:literal, $help:literal, $counter:literal))? ;)*) => {
+        /// The statistics of one view at one point in time (see the module documentation).
+        #[derive(Debug, Default, Clone, PartialEq, Eq)]
+        pub struct ViewSnapshot {
+            $( $(#[$doc])* pub $name: $ty, )*
+        }
+    };
+}
+
+/// The JSON value of one entry: the field itself, or an object of the two given keys.
+macro_rules! view_snapshot_json_value {
+    ($s:expr, $name:ident, object ($k1:literal, $k2:literal)) => {
+        match &$s.$name {
+            Some((a, b)) => json!({ $k1: a, $k2: b }),
+            None => Value::Null,
+        }
+    };
+    ($s:expr, $name:ident) => {
+        json!($s.$name)
+    };
+}
+
+/// The `/stats` document of one view: every field plus the derived `balanced`.
+macro_rules! view_snapshot_as_json {
+    ($s:expr ; $( $(#[$doc:meta])* $name:ident : $ty:ty, json $key:literal
+        $(, object ($k1:literal, $k2:literal))?
+        $(, series ($sn:literal, $help:literal, $counter:literal))? ;)*) => {{
+        let mut map = serde_json::Map::new();
+        $(
+            map.insert(
+                $key.to_string(),
+                view_snapshot_json_value!($s, $name $(, object ($k1, $k2))?),
+            );
+        )*
+        map.insert("balanced".to_string(), json!($s.balanced()));
+        Value::Object(map)
+    }};
+}
+
+/// The `/metrics` series of one view: every field that carries a `series` clause.
+macro_rules! view_snapshot_as_series {
+    ($s:expr ; $( $(#[$doc:meta])* $name:ident : $ty:ty, json $key:literal
+        $(, object ($k1:literal, $k2:literal))?
+        $(, series ($sn:literal, $help:literal, $counter:literal))? ;)*) => {
+        vec![ $( $( ($sn, $help, $counter, $s.$name), )? )* ]
+    };
+}
+
+view_snapshot_fields!(view_snapshot_as_struct, ());
 
 impl ViewSnapshot {
     /// `ids_marked = ids_absorbed + entities_updated + ids_pending` (holds while no whole-view
@@ -329,157 +414,12 @@ impl ViewSnapshot {
     }
 
     pub fn to_json(&self) -> Value {
-        json!({
-            "mode": self.mode,
-            "source_rows": self.source_rows,
-            "source_rows_skipped": self.source_rows_skipped,
-            "ids_marked": self.ids_marked,
-            "ids_absorbed": self.ids_absorbed,
-            "ids_pending": self.ids_pending,
-            "images_marked": self.images_marked,
-            "images_absorbed": self.images_absorbed,
-            "cascade_rows": self.cascade_rows,
-            "cascade_gaps": self.cascade_gaps,
-            "cascade_cached_rows": self.cascade_cached_rows,
-            "entities_updated": self.entities_updated,
-            "rows_inserted": self.rows_inserted,
-            "rows_updated": self.rows_updated,
-            "rows_deleted": self.rows_deleted,
-            "rows_unchanged": self.rows_unchanged,
-            "whole_view_refreshes": self.whole_view_refreshes,
-            "last_whole_view_refresh": self.last_whole_view_refresh.as_ref().map(|(why, at)| json!({
-                "reason": why,
-                "unix": at,
-            })),
-            "builds": self.builds,
-            "source_queries": self.source_queries,
-            "lookup_queries": self.lookup_queries,
-            "flushes": self.flushes,
-            "last_flush_unix": self.last_flush_unix,
-            "balanced": self.balanced(),
-        })
+        view_snapshot_fields!(view_snapshot_as_json, self)
     }
 
     /// `(name, help, counter)` and value of each `/metrics` series.
-    fn series(&self) -> [(&'static str, &'static str, bool, u64); 21] {
-        [
-            (
-                "source_rows",
-                "Binlog row changes fed to the view.",
-                true,
-                self.source_rows,
-            ),
-            (
-                "source_rows_skipped",
-                "Of those, skipped as irrelevant.",
-                true,
-                self.source_rows_skipped,
-            ),
-            (
-                "ids_marked",
-                "Target ids marked for a refresh, before deduplication.",
-                true,
-                self.ids_marked,
-            ),
-            (
-                "ids_absorbed",
-                "Marks of an id already pending (absorbed by deduplication).",
-                true,
-                self.ids_absorbed,
-            ),
-            (
-                "ids_pending",
-                "Ids buffered and not refreshed yet.",
-                false,
-                self.ids_pending,
-            ),
-            (
-                "images_marked",
-                "Row images buffered for a lookup of their target ids.",
-                true,
-                self.images_marked,
-            ),
-            (
-                "images_absorbed",
-                "Of those, already buffered.",
-                true,
-                self.images_absorbed,
-            ),
-            (
-                "cascade_rows",
-                "Kept child rows replayed for a parent change.",
-                true,
-                self.cascade_rows,
-            ),
-            (
-                "cascade_gaps",
-                "Parent changes replayed from before the startup seed.",
-                true,
-                self.cascade_gaps,
-            ),
-            (
-                "cascade_cached_rows",
-                "Rows kept in the live version's in-memory cascade cache.",
-                false,
-                self.cascade_cached_rows,
-            ),
-            (
-                "entities_updated",
-                "Target ids refreshed after deduplication, summed over flushes.",
-                true,
-                self.entities_updated,
-            ),
-            (
-                "rows_inserted",
-                "View rows inserted.",
-                true,
-                self.rows_inserted,
-            ),
-            (
-                "rows_updated",
-                "View rows replaced in place.",
-                true,
-                self.rows_updated,
-            ),
-            (
-                "rows_deleted",
-                "View rows deleted.",
-                true,
-                self.rows_deleted,
-            ),
-            (
-                "rows_unchanged",
-                "View rows compared and found unchanged.",
-                true,
-                self.rows_unchanged,
-            ),
-            (
-                "whole_view_refreshes",
-                "Rebuilds of the whole view that replaced a live version.",
-                true,
-                self.whole_view_refreshes,
-            ),
-            ("builds", "First builds of the view.", true, self.builds),
-            (
-                "source_queries",
-                "Source reads of the view's refreshes.",
-                true,
-                self.source_queries,
-            ),
-            (
-                "lookup_queries",
-                "Lookup queries of the view's refreshes.",
-                true,
-                self.lookup_queries,
-            ),
-            ("flushes", "Refreshes of the view.", true, self.flushes),
-            (
-                "last_flush_timestamp_seconds",
-                "Unix time of the view's last refresh.",
-                false,
-                self.last_flush_unix,
-            ),
-        ]
+    fn series(&self) -> Vec<(&'static str, &'static str, bool, u64)> {
+        view_snapshot_fields!(view_snapshot_as_series, self)
     }
 }
 
