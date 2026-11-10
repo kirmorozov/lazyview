@@ -3681,6 +3681,91 @@ const ENTITIES: &[&str] = &[
     "INSERT INTO entities VALUES (10, 1, 'new'), (11, 1, 'paid'), (12, 2, 'new'), (13, 3, 'paid')",
 ];
 
+/// A view defined while an XA transaction was prepared was rebuilt at its `XA COMMIT`: lazyview
+/// kept the transaction's rows only for the tables a view already read, so the change was not
+/// traceable (owner rule: an incremental view never falls back to a rebuild). Those rows are
+/// kept now and the view is fed from them, whether it is live already or still building
+/// (`LAZYVIEW_TEST_BUILD_DELAY` holds the second build past the commit).
+#[test]
+fn reg_xa_view_defined_while_prepared() {
+    scenario("reg_xa_def", |ctx| async move {
+        let mut ddl: Vec<&str> = ENTITIES.to_vec();
+        ddl.push("CREATE TABLE items (id INT PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)");
+        ddl.push("INSERT INTO items VALUES (1, 1, 1), (2, 1, 2)");
+        let mut specs = vec![ViewSpec::new(
+            "r_entities",
+            Kind::Incremental,
+            "SELECT id, grp, status FROM entities",
+        )];
+        let ov = [("LAZYVIEW_TEST_BUILD_DELAY", "/*xa_build*/:20000")];
+        let (db, mut eng) = setup(&ctx, "reg_xa_def", &ddl, &specs, &ov).await?;
+        let mut c = db.conn().await?;
+        let mut xc = db.conn().await?;
+        let before = eng.snapshot();
+        // `items` is read by no view: these are the rows origin/main drops.
+        exec_all(
+            &mut xc,
+            &[
+                "XA START 'r1'",
+                "INSERT INTO items VALUES (3, 2, 30), (4, 2, 40)",
+                "UPDATE items SET val = val + 100 WHERE id = 1",
+                "XA END 'r1'",
+                "XA PREPARE 'r1'",
+            ],
+        )
+        .await?;
+        // (a) defined and built while the transaction is prepared: no prepared row may show,
+        // and at the commit all of them must, without a rebuild.
+        let v1 = ViewSpec::new(
+            "r_items",
+            Kind::Incremental,
+            "SELECT id, grp, val FROM items",
+        );
+        add_definition(&mut c, &v1.definition, None).await?;
+        wait_ready(
+            &mut c,
+            &mut eng,
+            &names(std::slice::from_ref(&v1)),
+            t_ready(),
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            std::slice::from_ref(&v1),
+            "prepared rows invisible",
+        )
+        .await?;
+        // (b) defined while it is prepared and still building when it commits.
+        let v2 = ViewSpec::new(
+            "r_items_sum",
+            Kind::Incremental,
+            "SELECT grp, SUM(val) AS s FROM items /*xa_build*/ GROUP BY grp",
+        );
+        add_definition(&mut c, &v2.definition, None).await?;
+        wait_state(
+            &mut c,
+            &mut eng,
+            "r_items_sum",
+            "building",
+            Duration::from_secs(10),
+        )
+        .await?;
+        exec(&mut xc, "XA COMMIT 'r1'").await?;
+        specs.extend([v1, v2]);
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the XA COMMIT").await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 2,
+            "both views must be fed from the staged rows, not rebuilt: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
 /// A view's own table dropped by hand stayed `ready` while every refresh failed with 1146, until
 /// `rebuild = 1`. lazyview sees the DROP in the binlog (it never drops a live view's table) and
 /// rebuilds the view online, which creates the table again.

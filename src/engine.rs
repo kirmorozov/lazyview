@@ -468,6 +468,9 @@ struct XaTxn {
     /// Position before it (replaying from there re-reads its rows).
     start: Position,
     rows: Vec<XaRow>,
+    /// Estimated memory of `rows` (`KEY_BYTES` per row, see `buffer_bytes`). The rows of
+    /// tables no view read are kept only while this stays under [`XA_HOLD_BYTES`].
+    bytes: usize,
     /// Tables with rows that were not kept (no view read them at the time).
     other_tables: HashSet<TableRef>,
     prepared_at: Instant,
@@ -670,6 +673,12 @@ const DRAIN_KEEP_SLOTS: usize = 1024;
 /// builds (`Engine::hold_for_builds`) instead of dropping changes. The roadmap's buffer bound
 /// (8 × [`DRAIN_MAX_BYTES`], 256 MiB), a constant.
 const BUILD_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
+
+/// Byte budget of the rows one prepared XA transaction keeps for tables no view read: past it
+/// they are dropped and only a view that was defined while the transaction was prepared and
+/// reads such a table is rebuilt (the rows of a table a view does read are always kept: they
+/// are the transaction's own changes and dropping them would cost every live view a rebuild).
+const XA_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
 /// Estimated memory of one buffered integer id, and of any other key, row image or mark (hash
 /// slot, boxed datums and a short value; wide images count low).
 const INT_KEY_BYTES: usize = 16;
@@ -3041,10 +3050,26 @@ impl Engine {
                     }
                     return Ok(());
                 }
+                let own =
+                    key.0 == self.schema && (key.1 == meta::STATUS || key.1 == fence::table());
+                let keep_unrouted = !own
+                    && self
+                        .xa_current
+                        .as_ref()
+                        .is_some_and(|(_, xa)| xa.bytes <= XA_HOLD_BYTES);
                 let Some(route) = route else {
-                    // No view reads it now; one defined before the XA COMMIT may.
+                    // No view reads it now; one defined while this transaction is prepared may.
+                    // Keep its rows so `xa_committed` can feed that view instead of rebuilding it
+                    // (owner rule), up to one prepared transaction's budget of kept rows.
                     if let Some((_, xa)) = self.xa_current.as_mut() {
-                        xa.other_tables.insert(key);
+                        if keep_unrouted {
+                            let rows = reader.rows(table_id, &event)?;
+                            xa.bytes += rows.len() * KEY_BYTES;
+                            xa.rows
+                                .extend(rows.into_iter().map(|(b, a)| (key.clone(), b, a)));
+                        } else {
+                            xa.other_tables.insert(key);
+                        }
                     }
                     return Ok(());
                 };
@@ -3069,6 +3094,7 @@ impl Engine {
                     XaTxn {
                         start: self.boundary.clone(),
                         rows: Vec::new(),
+                        bytes: 0,
                         other_tables: HashSet::new(),
                         prepared_at: Instant::now(),
                         unpinned: false,
@@ -3089,7 +3115,7 @@ impl Engine {
             Item::XaEnd { xid, commit, pos } => {
                 let before = self.end_txn(pos);
                 match self.xa_pending.remove(&xid) {
-                    Some(xa) if commit => self.xa_committed(xa),
+                    Some(xa) if commit => self.xa_committed(&xid, xa),
                     Some(_) => {}
                     None if commit => {
                         // Prepared before the position we resumed from (positions are never
@@ -3172,7 +3198,7 @@ impl Engine {
     }
 
     /// XA COMMIT of a transaction read in this run: its rows become visible now.
-    fn xa_committed(&mut self, xa: XaTxn) {
+    fn xa_committed(&mut self, xid: &str, xa: XaTxn) {
         let mut by_table: Vec<(TableRef, Vec<(Option<BinlogRow>, Option<BinlogRow>)>)> = Vec::new();
         for (t, b, a) in xa.rows {
             match by_table.last_mut() {
@@ -3186,7 +3212,8 @@ impl Engine {
                 self.feed_rows(&route, &rows, &xa.start);
             }
         }
-        // Views defined while it was prepared read tables whose rows were not kept.
+        // Only the tables whose rows were dropped (past `XA_HOLD_BYTES`) still cost a view a
+        // rebuild: say so, it is the one case this run could not trace the change.
         if xa.other_tables.is_empty() {
             return;
         }
@@ -3207,6 +3234,7 @@ impl Engine {
                             .contains(&(c.parent.schema.clone(), c.parent.name.clone()))
                     });
                 if reads {
+                    warn!(view = %s.name, xid, "a view defined while this XA transaction was prepared reads a table whose rows were dropped; rebuilding it");
                     d.rebuild = true;
                     d.all = true;
                     since.get_or_insert_with(|| xa.start.clone());
@@ -5980,6 +6008,7 @@ mod tests {
         d.marks.push((0, Datum::Int(1)));
         assert_eq!(buffer_bytes(&d), 3 * INT_KEY_BYTES + 3 * KEY_BYTES);
         assert_eq!(BUILD_HOLD_BYTES, 256 << 20);
+        assert_eq!(XA_HOLD_BYTES, 256 << 20);
     }
 
     fn server(code: u16) -> anyhow::Error {
