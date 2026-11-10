@@ -15,8 +15,10 @@ use crate::accumulate::{UnitChunk, UnitKind};
 use crate::analyze::{quote_ident as q, Mode, ViewPlan};
 use crate::datum::{Datum, Key};
 use crate::metrics::Metrics;
+use crate::target::Kind;
 
-/// Maximum placeholders per statement (server limit is 65535).
+/// Maximum placeholders per statement (server limit is 65535). `Kind::Postgres` has a hard
+/// ceiling of 65535; this cap is below it for both families.
 const MAX_PARAMS: usize = 60_000;
 /// InnoDB's limit on the length of an index key, in bytes.
 const MAX_KEY_BYTES: u64 = 3072;
@@ -1145,11 +1147,15 @@ pub struct WriteOpts {
     /// `max_allowed_packet`). A larger row goes alone.
     pub batch_bytes: usize,
     pub upsert: Upsert,
+    /// The target family this connection speaks (statement shapes, caps). Set once when the
+    /// connection is made and carried by every write (see [`crate::target::Kind`]).
+    pub kind: crate::target::Kind,
 }
 
 impl WriteOpts {
     /// For a server reporting `version` (`@@version`) and `max_packet` (`@@max_allowed_packet`).
     pub fn for_server(
+        kind: crate::target::Kind,
         version: &str,
         max_packet: u64,
         batch_rows: usize,
@@ -1171,6 +1177,7 @@ impl WriteOpts {
             batch_rows: batch_rows.max(1),
             batch_bytes: batch_bytes.min(cap).max(1024),
             upsert,
+            kind,
         }
     }
 }
@@ -1178,6 +1185,7 @@ impl WriteOpts {
 /// [`WriteOpts`] for the server `conn` is connected to.
 pub async fn write_opts(
     conn: &mut Conn,
+    kind: Kind,
     batch_rows: usize,
     batch_bytes: usize,
 ) -> Result<WriteOpts> {
@@ -1186,6 +1194,7 @@ pub async fn write_opts(
         .await?
         .context("reading @@version and @@max_allowed_packet")?;
     Ok(WriteOpts::for_server(
+        kind,
         &version,
         packet,
         batch_rows,
@@ -2294,7 +2303,9 @@ mod tests {
 
     #[test]
     fn upsert_syntax_and_packet_limits() {
-        let w = |v: &str, p: u64| WriteOpts::for_server(v, p, 500, DEFAULT_WRITE_BATCH_BYTES);
+        let w = |v: &str, p: u64| {
+            WriteOpts::for_server(Kind::Mysql, v, p, 500, DEFAULT_WRITE_BATCH_BYTES)
+        };
         assert_eq!(w("8.4.11", 64 << 20).upsert, Upsert::RowAlias);
         assert_eq!(w("26.7.0", 64 << 20).upsert, Upsert::RowAlias);
         assert_eq!(w("8.0.19", 64 << 20).upsert, Upsert::RowAlias);

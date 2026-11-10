@@ -122,6 +122,8 @@ fn backoff(attempt: u32) -> Duration {
 pub struct Endpoint {
     /// `source` or the target's name.
     pub name: String,
+    /// The target family this endpoint's connections speak (statement shapes, caps).
+    pub kind: crate::target::Kind,
     opts: Opts,
     pool: Pool,
     permits: Arc<Semaphore>,
@@ -152,6 +154,7 @@ impl Endpoint {
     pub fn new(
         kind: &str,
         name: &str,
+        target_kind: crate::target::Kind,
         opts: &Opts,
         max: usize,
         sql_mode: &str,
@@ -176,6 +179,7 @@ impl Endpoint {
         metrics.register_pool(gauges.clone());
         Arc::new(Endpoint {
             name: name.to_string(),
+            kind: target_kind,
             opts: opts.clone(),
             pool,
             permits: Arc::new(Semaphore::new(max)),
@@ -337,6 +341,7 @@ impl Budget {
 /// One target of a [`Job`].
 pub struct TargetJob {
     pub name: String,
+    pub kind: crate::target::Kind,
     pub schema: String,
     pub write: WriteOpts,
     pub endpoint: Arc<Endpoint>,
@@ -412,6 +417,7 @@ impl Supervisor {
         let read = Endpoint::new(
             "read",
             "source",
+            crate::target::Kind::Mysql,
             src_opts,
             cfg.max_source,
             src_sql_mode,
@@ -437,6 +443,7 @@ impl Supervisor {
     pub fn write_endpoint(
         &mut self,
         name: &str,
+        kind: crate::target::Kind,
         opts: &Opts,
         sql_mode: &str,
         lock_wait_s: u64,
@@ -446,7 +453,16 @@ impl Supervisor {
         self.write
             .entry(name.to_string())
             .or_insert_with(|| {
-                Endpoint::new("write", name, opts, max, sql_mode, lock_wait_s, &metrics)
+                Endpoint::new(
+                    "write",
+                    name,
+                    kind,
+                    opts,
+                    max,
+                    sql_mode,
+                    lock_wait_s,
+                    &metrics,
+                )
             })
             .clone()
     }

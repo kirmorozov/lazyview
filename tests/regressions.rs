@@ -2251,7 +2251,13 @@ fn reg_json_unit_filters_match_json_equal_groups() {
             l_j.unit_kinds()
         );
         let metrics = Metrics::default();
-        let w = mv::write_opts(&mut c, 1000, mv::DEFAULT_WRITE_BATCH_BYTES).await?;
+        let w = mv::write_opts(
+            &mut c,
+            lazyview::target::Kind::Mysql,
+            1000,
+            mv::DEFAULT_WRITE_BATCH_BYTES,
+        )
+        .await?;
         let j = |s: &str| Datum::Bytes(s.as_bytes().to_vec());
         let sel_j = "SELECT doc, COUNT(*) AS n FROM jt WHERE {F} GROUP BY doc";
         let orc_j = "SELECT doc, COUNT(*) AS n FROM jt GROUP BY doc";
@@ -2475,7 +2481,13 @@ fn reg_json_unit_delete_with_epoch_timestamps() {
         let orc = "SELECT doc, MAX(ts) AS mx, COUNT(*) AS n FROM jt GROUP BY doc";
         let on = "o.doc <=> m.doc AND o.mx <=> m.mx";
         let metrics = Metrics::default();
-        let w = mv::write_opts(&mut c, 1000, mv::DEFAULT_WRITE_BATCH_BYTES).await?;
+        let w = mv::write_opts(
+            &mut c,
+            lazyview::target::Kind::Mysql,
+            1000,
+            mv::DEFAULT_WRITE_BATCH_BYTES,
+        )
+        .await?;
         let r = rows(&mut c, &l, sel, &["doc"], None).await?;
         mv::apply(
             &mut c,

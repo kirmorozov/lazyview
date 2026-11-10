@@ -34,6 +34,7 @@ use crate::metrics::Metrics;
 use crate::mv::{self, BuildTarget, Layout};
 use crate::plan_swap;
 use crate::supervisor::{self, Supervisor};
+use crate::target;
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
 
@@ -283,6 +284,8 @@ async fn connect_wait(
 }
 
 struct Target {
+    /// The target family, from the DSN's scheme.
+    kind: target::Kind,
     opts: Opts,
     schema: String,
     conn: Option<Conn>,
@@ -864,6 +867,7 @@ impl Engine {
         targets.insert(
             SOURCE_TARGET.to_string(),
             Target {
+                kind: target::Kind::Mysql,
                 opts: src_opts.clone(),
                 schema: schema.clone(),
                 conn: None,
@@ -874,11 +878,13 @@ impl Engine {
             },
         );
         for (name, dsn) in &cfg.targets {
+            let kind = target::Kind::from_dsn(dsn)?;
             let opts = binlog::replica_opts(dsn)?;
             let ts = schema_of(&opts, &format!("target {name}"))?;
             targets.insert(
                 name.clone(),
                 Target {
+                    kind,
                     opts,
                     schema: ts,
                     conn: None,
@@ -2021,7 +2027,7 @@ impl Engine {
             let (rows, bytes) = (self.cfg.write_batch_rows, self.cfg.write_batch_bytes);
             let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, async {
                 let mut c = connect(&target.opts, self.cfg.lock_wait_s).await?;
-                let w = mv::write_opts(&mut c, rows, bytes).await?;
+                let w = mv::write_opts(&mut c, target.kind, rows, bytes).await?;
                 let mode = session_sql_mode(&mut c).await?;
                 Ok::<_, anyhow::Error>((c, w, mode))
             })
@@ -2198,6 +2204,7 @@ impl Engine {
                 BuildSpec {
                     target: t.clone(),
                     opts: self.targets[t].opts.clone(),
+                    kind: self.targets[t].kind,
                     schema: self.targets[t].schema.clone(),
                     marker: mv::marker(&name, def_id),
                     check_side: !routine
@@ -4983,9 +4990,10 @@ impl Engine {
                 .sup
                 .as_mut()
                 .expect("supervised refresh")
-                .write_endpoint(t, &opts, &mode, self.cfg.lock_wait_s);
+                .write_endpoint(t, target.kind, &opts, &mode, self.cfg.lock_wait_s);
             jobs.push(supervisor::TargetJob {
                 name: t.clone(),
+                kind: target.kind,
                 schema,
                 write,
                 endpoint,
@@ -5616,6 +5624,7 @@ const LAG_MAX_FAILURES: u32 = 5;
 struct BuildSpec {
     target: String,
     opts: Opts,
+    kind: target::Kind,
     schema: String,
     /// Ownership marker (table comment) of this view's tables: a table carrying it is ours
     /// even without a state row (a crash between the swap and the state update).
@@ -5748,7 +5757,7 @@ async fn prepare_target(
         Ok(r) => r.with_context(|| format!("connecting to target {t}"))?,
         Err(_) => bail!("connecting to target {t}: timed out"),
     };
-    let w = mv::write_opts(&mut c, batch_rows, batch_bytes)
+    let w = mv::write_opts(&mut c, spec.kind, batch_rows, batch_bytes)
         .await
         .with_context(|| format!("target {t}"))?;
     let ours = |m: Option<String>| m.as_deref() == Some(spec.marker.as_str());

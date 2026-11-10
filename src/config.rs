@@ -171,7 +171,7 @@ impl Config {
     }
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
-        let dsn = connection(&get, "LAZYVIEW")?.ok_or_else(|| {
+        let dsn = connection(&get, "LAZYVIEW", false)?.ok_or_else(|| {
             anyhow!("no database configured: set LAZYVIEW_HOST, LAZYVIEW_USER, LAZYVIEW_PASSWORD, LAZYVIEW_DATABASE (or LAZYVIEW_DSN=mysql://user:pass@host:3306/db)")
         })?;
         let instance_id = get("LAZYVIEW_INSTANCE_ID").unwrap_or_else(|| "default".into());
@@ -243,7 +243,7 @@ impl Config {
                     "LAZYVIEW_TARGET_{}",
                     name.to_ascii_uppercase().replace('-', "_")
                 );
-                let dsn = connection(&get, &prefix)?
+                let dsn = connection(&get, &prefix, true)?
                     .ok_or_else(|| anyhow!("target {name}: set {prefix}_HOST/_USER/_PASSWORD/_DATABASE or {prefix}_DSN"))?;
                 targets.insert(name.to_string(), dsn);
             }
@@ -337,7 +337,11 @@ impl Config {
 
 /// `<PREFIX>_DSN`, or a DSN assembled from `<PREFIX>_HOST`, `_PORT`, `_USER`, `_PASSWORD`,
 /// `_DATABASE` (values used verbatim: no URL encoding needed by the user).
-fn connection(get: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Option<String>> {
+fn connection(
+    get: &impl Fn(&str) -> Option<String>,
+    prefix: &str,
+    allow_pg: bool,
+) -> Result<Option<String>> {
     let part = |k: &str| get(&format!("{prefix}_{k}")).filter(|v| !v.is_empty());
     let ca = part("TLS_CA").or_else(|| get("LAZYVIEW_TLS_CA").filter(|v| !v.is_empty()));
     // A CA file without an explicit mode means full verification (certificate + host name).
@@ -351,7 +355,7 @@ fn connection(get: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Opt
         None => assemble(&part, prefix)?,
     };
     dsn.map(|d| {
-        let mut d = finish_dsn(&d, tls.as_deref(), prefix)?;
+        let mut d = finish_dsn(&d, tls.as_deref(), prefix, allow_pg)?;
         if let Some(ca) = &ca {
             d.push(if d.contains('?') { '&' } else { '?' });
             d.push_str("tls_ca=");
@@ -362,8 +366,17 @@ fn connection(get: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Opt
     .transpose()
 }
 
-/// Accepts `mariadb://` as an alias and appends TLS parameters for `<PREFIX>_TLS`.
-fn finish_dsn(dsn: &str, tls: Option<&str>, prefix: &str) -> Result<String> {
+/// Accepts `mariadb://` as an alias and appends TLS parameters for `<PREFIX>_TLS`. With
+/// `allow_pg` a `postgres://` / `postgresql://` DSN is a target's: the MySQL rewrites below
+/// skip it and [`finish_pg_dsn`] maps the TLS modes instead.
+fn finish_dsn(dsn: &str, tls: Option<&str>, prefix: &str, allow_pg: bool) -> Result<String> {
+    // The mariadb:// rewrite and the TLS parameter block below are MySQL-only: a PG DSN
+    // (targets only) goes to finish_pg_dsn. The Kind::from_dsn gate rejects it until
+    // src/target/postgres.rs lands, so that call is unreachable in this PR.
+    if allow_pg && dsn.starts_with("postgres") {
+        crate::target::Kind::from_dsn(dsn)?;
+        return finish_pg_dsn(dsn, tls, prefix);
+    }
     let mut d = match dsn.strip_prefix("mariadb://") {
         Some(rest) => format!("mysql://{rest}"),
         None => dsn.to_string(),
@@ -389,6 +402,33 @@ fn finish_dsn(dsn: &str, tls: Option<&str>, prefix: &str) -> Result<String> {
     if let Some(p) = params {
         d.push(if d.contains('?') { '&' } else { '?' });
         d.push_str(p);
+    }
+    Ok(d)
+}
+
+/// Maps `<PREFIX>_TLS` onto `sslmode` for a `postgres://` target DSN (D11). Unreachable in
+/// this PR (`Kind::from_dsn` still rejects a PostgreSQL target); it lands with the seam so
+/// the family mapping is reviewed with it, and T1 completes the `TLS_CA` → `sslrootcert`
+/// handling when `src/target/postgres.rs` arrives.
+fn finish_pg_dsn(dsn: &str, tls: Option<&str>, prefix: &str) -> Result<String> {
+    let mut d = dsn.to_string();
+    let sslmode = match tls.map(|t| t.trim().to_ascii_lowercase()) {
+        None => None,
+        Some(t) => match t.as_str() {
+            "disabled" | "off" | "false" => Some("disable"),
+            "required" | "require" | "on" | "true" => Some("require"),
+            // tokio-postgres has no verify-ca (certificate without the host-name check).
+            "verify-ca" | "verify_ca" => bail!(
+                "{prefix}_TLS verify-ca is not supported for a PostgreSQL target (use verify-full)"
+            ),
+            "verify-full" | "verify_identity" | "verify-identity" => Some("verify-full"),
+            other => bail!("{prefix}_TLS must be disabled|required|verify-full, got {other}"),
+        },
+    };
+    if let Some(m) = sslmode {
+        d.push(if d.contains('?') { '&' } else { '?' });
+        d.push_str("sslmode=");
+        d.push_str(m);
     }
     Ok(d)
 }
@@ -538,6 +578,18 @@ mod tests {
         assert_eq!(
             c.targets.get("re-port").map(String::as_str),
             Some("mysql://b")
+        );
+        // A PostgreSQL target DSN is rejected until src/target/postgres.rs lands (T1):
+        // accepted into c.targets only then, not before.
+        let e = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_TARGETS", "b"),
+            ("LAZYVIEW_TARGET_B_DSN", "postgres://lv:lv@h:5432/lvtest"),
+        ])
+        .expect_err("a PostgreSQL target DSN must not be accepted yet");
+        assert!(
+            e.to_string().contains("not supported yet"),
+            "unexpected error: {e}"
         );
         assert!(cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_TARGETS", "nope")]).is_err());
         let c = cfg(&[
