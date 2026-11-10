@@ -22,7 +22,8 @@ docker run -d --name lazyview --restart unless-stopped \
   `docker exec lazyview /lazyview healthcheck`, the HTTP endpoints, the logs and the
   [database tables](#status-from-the-database).
 * Image tags: releases are `X.Y.Z`, `X.Y` and `latest` (for 0.x there is no bare `X` tag), `edge`
-  is the nightly build of `main` and may be unstable, `sha-<commit>` is every published build.
+  is built from every push to `main` and may be unstable (use a release for production),
+  `sha-<commit>` is every published build.
   Details: [development](development.md#image).
 
 As a Compose service for an existing database:

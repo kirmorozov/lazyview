@@ -43,10 +43,10 @@ kubectl -n lazyview get pods        # with 2 replicas, both READY 1/1: one activ
 kubectl -n lazyview logs -l app.kubernetes.io/name=lazyview --prefix | grep -E 'standing by|took over|streaming'
 ```
 
-* The base uses `ghcr.io/kirmorozov/lazyview:edge`, the nightly build of `main`; it may be
-  unstable, so prefer pinning a release (`newTag: 0.1.0`, the first one), an exact build
-  (`newTag: sha-1234567`) or a digest with `images:` in the overlay. `newName:` switches to your
-  own registry.
+* The base uses `ghcr.io/kirmorozov/lazyview:edge`, built from every push to `main`; it may be
+  unstable, so use a release for production — pin one (`newTag: 0.1.0`, the first one), an exact
+  build (`newTag: sha-1234567`) or a digest with `images:` in the overlay. `newName:` switches to
+  your own registry.
 * With `components/network-policy`, set the namespace your Prometheus runs in (the example overlay
   shows the patch), or scraping stops.
 * The Secret may hold `LAZYVIEW_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `_DATABASE` or `LAZYVIEW_DSN`

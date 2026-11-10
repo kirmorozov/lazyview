@@ -32,8 +32,8 @@ docker run -d --name lazyview --restart unless-stopped \
   ghcr.io/kirmorozov/lazyview:0.1.0
 ```
 
-Releases are tagged `X.Y.Z`, `X.Y` and `latest`; `edge` is the nightly build of `main` and may be
-unstable — for trying what is coming, not for production. To try it with a bundled MySQL 8.4, run
+Releases are tagged `X.Y.Z`, `X.Y` and `latest`; `edge` is built from every push to `main` and may
+be unstable — for trying what is coming, not for production. To try it with a bundled MySQL 8.4, run
 `docker compose -f docker-compose.example.yml up -d --build --wait` from a checkout, or set
 `LAZYVIEW_IMAGE=ghcr.io/kirmorozov/lazyview:0.1.0` to use the published image (see the header of
 [docker-compose.example.yml](docker-compose.example.yml)). Kubernetes: [docs/kubernetes.md](docs/kubernetes.md).
