@@ -835,6 +835,13 @@ fn permissive_sql_mode(mode: &str) -> String {
 /// Derives the materialized layout by creating a temporary view on the source and reading its
 /// column types from `information_schema`.
 pub async fn probe(src: &mut Conn, src_schema: &str, plan: &ViewPlan) -> Result<Layout> {
+    let cols = probe_columns(src, src_schema, plan).await?;
+    layout_from(plan, cols)
+}
+
+/// The server round trip of [`probe`]: create the temporary probe view, read its columns back
+/// from `information_schema`, drop the view.
+async fn probe_columns(src: &mut Conn, src_schema: &str, plan: &ViewPlan) -> Result<Vec<MvCol>> {
     let hidden: Vec<usize> = (0..plan.unit_exprs.len())
         .filter(|&u| plan.unit_in_projection[u].is_none())
         .collect();
@@ -875,6 +882,15 @@ pub async fn probe(src: &mut Conn, src_schema: &str, plan: &ViewPlan) -> Result<
                 nullable: nullable.eq_ignore_ascii_case("YES"),
             },
         )
+        .collect();
+    Ok(cols)
+}
+
+/// The pure layout computation of [`probe`]: derive the [`Layout`] from the columns
+/// [`probe_columns`] read back, unit-testable without a server.
+fn layout_from(plan: &ViewPlan, cols: Vec<MvCol>) -> Result<Layout> {
+    let hidden: Vec<usize> = (0..plan.unit_exprs.len())
+        .filter(|&u| plan.unit_in_projection[u].is_none())
         .collect();
     // Projection, hidden unit columns, then lineage columns (incremental plans).
     let n_visible = match plan.mode {
