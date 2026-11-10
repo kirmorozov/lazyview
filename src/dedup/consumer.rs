@@ -297,7 +297,8 @@ fn ids<U, S: Sink<U>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dedup::testkit::{plan, row, row_typed, Cell, Rec};
+    use crate::catalog::{FkAction, ForeignKey};
+    use crate::dedup::testkit::{catalog, plan, plan_in, row, row_typed, Cell, Rec};
 
     fn table_ref(name: &str) -> TableRef {
         ("db".into(), name.into())
@@ -334,6 +335,15 @@ mod tests {
             })
             .collect();
         (C { c, hops }, aps)
+    }
+
+    /// The compiled path of the occurrence the definition aliases `alias`.
+    fn path<'a>(ap: &'a AccessPlan, alias: &str) -> &'a Path {
+        &ap.occurrences
+            .iter()
+            .find(|o| o.alias == alias)
+            .unwrap_or_else(|| panic!("no occurrence aliased `{alias}`"))
+            .path
     }
 
     const DIRECT: &str = "SELECT i.id, i.kind_id FROM items i";
@@ -449,6 +459,46 @@ mod tests {
     }
 
     #[test]
+    fn a_row_comes_back_to_the_filters_and_another_leaves_them() {
+        // The two rows that cross the occurrence's filters: only the image that passes them is
+        // the occurrence's row, so the side that fails them contributes no id - the arriving row
+        // has no before-image left to compare with, so it is new to the occurrence, not kept.
+        let (mut x, _) = compile(FILTERED);
+        let s =
+            x.c.source(&table_ref("item_values"), Some(5))
+                .expect("watched");
+        let mut rec = Rec::default();
+        // Re-entry: key_id 98 (not the filters' row) becomes key_id 99 (it is).
+        x.c.row(
+            &s,
+            Some(&row(&[Some(5), Some(98), Some(0), Some(1), Some(0)])),
+            Some(&row(&[Some(5), Some(99), Some(0), Some(1), Some(0)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(rec.rows, vec![(0, false)], "the after-image is the row");
+        assert_eq!(
+            rec.ints(0, SpaceId::FULL),
+            vec![(5, Op::Insert)],
+            "the id is new to the occurrence, not kept: {rec:?}"
+        );
+        // The reverse: key_id 99 becomes 98, so only the before-image is the row and its id is gone.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(5), Some(99), Some(0), Some(1), Some(0)])),
+            Some(&row(&[Some(5), Some(98), Some(0), Some(1), Some(0)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.ints(0, SpaceId::FULL),
+            vec![(5, Op::Insert), (5, Op::Delete)],
+            "{rec:?}"
+        );
+        assert_eq!(rec.rows, vec![(0, false), (0, false)]);
+    }
+
+    #[test]
     fn partial_ids_go_to_their_space() {
         let p = plan(
             "SELECT l.parent_id, i.id, MAX(v.val) AS v FROM item_links l JOIN items i ON i.id \
@@ -477,6 +527,68 @@ mod tests {
         );
         assert_eq!(rec.ints(0, SpaceId::partial(set)), vec![(4, Op::Insert)]);
         assert!(rec.ints(0, SpaceId::FULL).is_empty(), "{rec:?}");
+    }
+
+    /// The composite id of one table plus a column that table also reads.
+    const TUPLE_AND_A_COLUMN: &str = "SELECT v.item_id, v.key_id, MAX(v.val) AS m FROM \
+                                       item_values v GROUP BY v.item_id, v.key_id";
+
+    #[test]
+    fn a_tuple_id_that_keeps_its_parts_is_marked_once() {
+        // The occurrence's id is two of its table's columns and it reads a third: an UPDATE of
+        // that column alone is the tuple path's `same` branch, which no other test reaches (the
+        // composite fixture below changes an id column, so its `same` is never true).
+        let (mut x, ap) = compile(TUPLE_AND_A_COLUMN);
+        assert!(
+            matches!(&ap.occurrences[0].path, Path::Direct { cols } if cols == &[0, 1]),
+            "{:?}",
+            ap.occurrences[0].path
+        );
+        let s =
+            x.c.source(&table_ref("item_values"), Some(5))
+                .expect("watched");
+        let mut rec = Rec::default();
+        // Insert [5, 99, 0, 1, 0]: a new tuple.
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(5), Some(99), Some(0), Some(1), Some(0)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        // Update `val` only: both id columns stay, so the tuple is marked once, as an update.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(5), Some(99), Some(0), Some(1), Some(0)])),
+            Some(&row(&[Some(5), Some(99), Some(0), Some(2), Some(0)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        let id = vec![Datum::Int(5), Datum::Int(99)];
+        assert_eq!(
+            rec.tuples(0, SpaceId::FULL),
+            vec![(id.clone(), Op::Insert), (id.clone(), Op::Update)],
+            "an id that stays is not a delete plus an insert: {rec:?}"
+        );
+        assert!(rec.ints(0, SpaceId::FULL).is_empty(), "{rec:?}");
+        // An update that does move an id column still marks the old tuple gone and the new one in.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(5), Some(99), Some(0), Some(2), Some(0)])),
+            Some(&row(&[Some(6), Some(99), Some(0), Some(2), Some(0)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.tuples(0, SpaceId::FULL),
+            vec![
+                (id.clone(), Op::Insert),
+                (id.clone(), Op::Update),
+                (id, Op::Delete),
+                (vec![Datum::Int(6), Datum::Int(99)], Op::Insert),
+            ],
+            "{rec:?}"
+        );
     }
 
     #[test]
@@ -736,6 +848,178 @@ mod tests {
             !x.c.watched(&table_ref("item_values")),
             "no occurrence of item_values is left"
         );
+    }
+
+    /// Every table `ap` can make the consumer watch: its occurrences and both sides of its cascades.
+    fn plan_tables(ap: &AccessPlan) -> Vec<TableRef> {
+        let mut v: Vec<TableRef> = ap.occurrences.iter().map(|o| o.table.clone()).collect();
+        for c in &ap.cascades {
+            v.push(c.parent.clone());
+            v.push(c.child.clone());
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// [`catalog`] with a cascading FK onto `item_values` whose parent columns give every unit
+    /// value, which is the analyzer's `Via::Direct`.
+    fn cascading_catalog() -> HashMap<TableRef, Arc<TableInfo>> {
+        let mut cat = catalog();
+        let mut t = (*cat[&table_ref("item_values")]).clone();
+        t.cascades = vec![ForeignKey {
+            parent: table_ref("item_links"),
+            child_cols: vec![0, 1],
+            parent_cols: vec!["child_id".into(), "parent_id".into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        }];
+        cat.insert(table_ref("item_values"), Arc::new(t));
+        cat
+    }
+
+    /// `add` compiles everything before it inserts anything, so each refusal leaves every table of
+    /// the plan unwatched. (The hop refusal, the fourth, is `hop_plans_are_refused_until_6j`.)
+    #[test]
+    fn a_refusal_watches_no_table_of_the_plan() {
+        let mut c = Consumer::default();
+        let mut hops = Hops::new(1000);
+
+        // A route the consumer does not take: the analyzer's Recompute route, over two tables, so
+        // an occurrence compiled before the refusal would show.
+        let p = plan("SELECT MAX(v.val) AS m FROM items i JOIN item_values v ON v.item_id = i.id");
+        let ap = AccessPlan::of(&p);
+        assert!(matches!(ap.route, Route::Recompute), "{ap}");
+        let spaces = Spaces::of(p.unit_exprs.len(), &p.partial.sets);
+        assert!(
+            c.add(0, 0, &p, &ap, &spaces, &mut hops)
+                .unwrap_err()
+                .starts_with("route recompute"),
+            "the route is the reason"
+        );
+        for t in plan_tables(&ap) {
+            assert!(!c.watched(&t), "the route refusal watched {t:?}");
+        }
+
+        // A path the consumer does not take, on a plan whose route is Dedup: the analyzer gives
+        // `Whole` only with the Full and Recompute routes, so the second occurrence carries it
+        // here. The first one compiled, so a half-watch would leave `items` watched.
+        let p = plan(FILTERED);
+        let mut ap = AccessPlan::of(&p);
+        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+        assert_eq!(ap.occurrences.len(), 2, "items and item_values");
+        ap.occurrences[1].path = Path::Whole;
+        let spaces = Spaces::of(p.unit_exprs.len(), &p.partial.sets);
+        let err = c.add(1, 0, &p, &ap, &spaces, &mut hops).unwrap_err();
+        assert_eq!(err, "`v`: Whole");
+        for t in plan_tables(&ap) {
+            assert!(!c.watched(&t), "the path refusal watched {t:?}");
+        }
+
+        // A cascade whose via is not Traced, on a plan the route still lets through: the analyzer's
+        // own `Via::Direct`. Its parent is a table no occurrence reads, so the refusal must not
+        // have left the child watched either.
+        let p = plan_in(TUPLE_AND_A_COLUMN, &cascading_catalog());
+        let ap = AccessPlan::of(&p);
+        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+        assert!(
+            matches!(ap.cascades[0].via, Via::Direct { .. }),
+            "{:?}",
+            ap.cascades
+        );
+        let spaces = Spaces::of(p.unit_exprs.len(), &p.partial.sets);
+        let err = c.add(2, 0, &p, &ap, &spaces, &mut hops).unwrap_err();
+        assert!(err.contains("6K / 6L"), "{err}");
+        for t in plan_tables(&ap) {
+            assert!(!c.watched(&t), "the cascade refusal watched {t:?}");
+        }
+    }
+
+    /// The same `item_values` twice, giving the two parts of the unit in different columns: `v1`
+    /// the second part through its `item_id`, `v2` the first through its `key_id`.
+    const TWO_PARTIALS: &str = "SELECT l.parent_id, i.id, MAX(v1.val) AS a, MAX(v2.val) AS b \
+                                FROM item_links l JOIN items i ON i.id = l.child_id JOIN \
+                                item_values v1 ON v1.item_id = i.id AND v1.key_id = 7 JOIN \
+                                item_values v2 ON v2.key_id = l.parent_id GROUP BY l.parent_id, \
+                                i.id";
+
+    #[test]
+    fn two_partial_sets_keep_their_ids_apart() {
+        let p = plan(TWO_PARTIALS);
+        let ap = AccessPlan::of(&p);
+        let partial = |alias: &str| match path(&ap, alias) {
+            Path::Partial {
+                set,
+                positions,
+                cols,
+            } => (*set, positions.clone(), cols.clone()),
+            other => panic!("`{alias}` is not a partial path: {other:?}"),
+        };
+        // One consumer, two partial occurrences of one table, each under its own unit positions.
+        let (set1, pos1, cols1) = partial("v1");
+        let (set2, pos2, cols2) = partial("v2");
+        assert_eq!((pos1.as_slice(), cols1.as_slice()), (&[1][..], &[0][..]));
+        assert_eq!((pos2.as_slice(), cols2.as_slice()), (&[0][..], &[1][..]));
+        let (sp1, sp2) = (SpaceId::partial(set1), SpaceId::partial(set2));
+        assert_ne!(sp1, sp2, "different positions, different spaces");
+        assert_ne!(sp1, SpaceId::FULL);
+        assert_ne!(sp2, SpaceId::FULL);
+
+        let mut c = Consumer::default();
+        let mut hops = Hops::new(1000);
+        c.add(
+            0,
+            0,
+            &p,
+            &ap,
+            &Spaces::of(p.unit_exprs.len(), &p.partial.sets),
+            &mut hops,
+        )
+        .unwrap();
+        let s = c
+            .source(&table_ref("item_values"), Some(5))
+            .expect("watched");
+        // One row change of the shared table: each occurrence projects its own columns, into its
+        // own space, and neither sees the other's id.
+        let mut rec = Rec::default();
+        c.row(
+            &s,
+            None,
+            Some(&row(&[Some(4), Some(7), Some(0), Some(9), Some(0)])),
+            &mut hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.rows,
+            vec![(0, false), (0, false)],
+            "both occurrences took the row"
+        );
+        assert_eq!(rec.ints(0, sp1), vec![(4, Op::Insert)], "v1: its item_id");
+        assert_eq!(rec.ints(0, sp2), vec![(7, Op::Insert)], "v2: its key_id");
+        assert!(
+            rec.tuples(0, sp1).is_empty() && rec.tuples(0, sp2).is_empty(),
+            "{rec:?}"
+        );
+        assert!(rec.ints(0, SpaceId::FULL).is_empty(), "{rec:?}");
+
+        // A target whose spaces hold no partial set: the compile refuses, and it refuses the whole
+        // plan, not the occurrence it was on.
+        let mut c = Consumer::default();
+        let mut hops = Hops::new(1000);
+        let err = c
+            .add(
+                0,
+                0,
+                &p,
+                &ap,
+                &Spaces::of(p.unit_exprs.len(), &[]),
+                &mut hops,
+            )
+            .unwrap_err();
+        assert!(err.contains("no space for"), "{err}");
+        for t in plan_tables(&ap) {
+            assert!(!c.watched(&t), "the space refusal watched {t:?}");
+        }
     }
 
     #[test]
