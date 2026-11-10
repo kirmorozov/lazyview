@@ -3148,6 +3148,9 @@ impl Engine {
                     self.after_boundary();
                 }
             }
+            Item::Incident { pos } => {
+                warn!(at = %pos, "INCIDENT event in the binlog: the source reports possibly lost changes");
+            }
             Item::Other => {}
         }
         Ok(())

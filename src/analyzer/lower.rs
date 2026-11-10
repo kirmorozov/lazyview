@@ -92,11 +92,11 @@ pub(crate) fn plan_block(
     };
     let mut plan = match analyze::plan_block(&flat, schema, tables) {
         Ok(p) => p,
+        // The caller turns this into a Full plan whose reason the engine reports.
         Err(e) => {
-            tracing::warn!(view = %def.name, "analyzer: the merged form does not plan: {e:#}");
             return Ok(Err(Refused::Reason(format!(
                 "internal analyzer error: {e}"
-            ))));
+            ))))
         }
     };
     // A Full plan watches what the statement as written reads (semi-join subqueries included).

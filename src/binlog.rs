@@ -658,6 +658,13 @@ pub enum Item {
     Gtid {
         gtid: String,
     },
+    /// The source reports possibly lost changes (an `INCIDENT` event: it could not log the rows
+    /// of a statement, e.g. an unsafe statement written in row format). The copy set only reads
+    /// it; the caller logs it. `pos` is the position right after the event, not a boundary: the
+    /// transaction continues.
+    Incident {
+        pos: Position,
+    },
     Heartbeat,
     Other,
 }
@@ -1006,9 +1013,13 @@ impl Time2Twin {
 }
 
 /// The twin (see [`Time2Twin`]) of `tme` from event `ev`, if the table has TIME2 columns with 1
-/// or 2 fractional digits.
-fn time2_twin(ev: &Event, tme: &TableMapEvent<'_>) -> Option<Time2Twin> {
-    let n = usize::try_from(tme.columns_count()).ok()?;
+/// or 2 fractional digits. A table that has them but whose event body does not line up with the
+/// parsed layout is an error rather than a missing twin: reading it without one misreads negative
+/// values with a fraction, silently.
+fn time2_twin(ev: &Event, tme: &TableMapEvent<'_>) -> Result<Option<Time2Twin>> {
+    let Ok(n) = usize::try_from(tme.columns_count()) else {
+        return Ok(None);
+    };
     let cols: Vec<usize> = (0..n)
         .filter(|&i| {
             matches!(
@@ -1018,16 +1029,16 @@ fn time2_twin(ev: &Event, tme: &TableMapEvent<'_>) -> Option<Time2Twin> {
         })
         .collect();
     if cols.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let twin = time2_twin_body(ev, tme, &cols);
-    if twin.is_none() {
-        tracing::warn!(
-            table = %tme_name(tme),
-            "cannot build the TIME(1)/TIME(2) decode twin; negative values with a fraction may be misread"
+    let Some(twin) = time2_twin_body(ev, tme, &cols) else {
+        bail!(
+            "cannot build the TIME(1)/TIME(2) decode twin of {}; negative values with a fraction \
+             would be misread",
+            tme_name(tme)
         );
-    }
-    Some(Time2Twin { tme: twin?, cols })
+    };
+    Ok(Some(Time2Twin { tme: twin, cols }))
 }
 
 fn time2_twin_body(
@@ -1340,7 +1351,7 @@ impl Tracker {
             table: tme.table_name().into_owned(),
             columns: tme.columns_count(),
         };
-        let twin = time2_twin(ev, &tme);
+        let twin = time2_twin(ev, &tme)?;
         self.tables
             .insert(tme.table_id(), (self.generation, tme.into_owned(), twin));
         Ok(item)
@@ -1432,10 +1443,9 @@ impl Tracker {
                  set log_bin_compress=OFF on the server (events already written compressed cannot be read)",
                 self.pos
             ),
-            ty::INCIDENT => {
-                tracing::warn!(at = %self.pos, "INCIDENT event in the binlog: the source reports possibly lost changes");
-                Item::Other
-            }
+            ty::INCIDENT => Item::Incident {
+                pos: self.pos.clone(),
+            },
             // FORMAT_DESCRIPTION, PREVIOUS_GTIDS, ANONYMOUS_GTID, ROWS_QUERY, INTVAR, RAND,
             // USER_VAR, STOP, IGNORABLE, TRANSACTION_CONTEXT, VIEW_CHANGE, MariaDB ANNOTATE_ROWS
             // (160), BINLOG_CHECKPOINT (161), GTID_LIST (163), START_ENCRYPTION (164), …
@@ -2244,12 +2254,21 @@ mod tests {
             let err = t.map_event(ev(et, 100, &[0; 8])).unwrap_err();
             assert!(err.to_string().contains("log_bin_compress"), "{err}");
         }
-        for et in [160u8, 161, 163, 164, ty::INCIDENT] {
+        for et in [160u8, 161, 163, 164] {
             assert!(
                 matches!(t.map_event(ev(et, 0, &[0; 4])).unwrap(), Item::Other),
                 "type {et}"
             );
         }
+        // INCIDENT reaches the caller as its own item: the copy set logs nothing.
+        let et = ty::INCIDENT;
+        assert!(
+            matches!(
+                t.map_event(ev(et, 0, &[0; 4])).unwrap(),
+                Item::Incident { .. }
+            ),
+            "type {et}"
+        );
         // Dummy rows event (table id 0x00ffffff, end of statement) is not a Rows item.
         assert!(matches!(
             t.map_event(write_rows(0, DUMMY_TABLE_ID, 0)).unwrap(),

@@ -318,6 +318,7 @@ async fn collect(
                 }
             }
             Item::Heartbeat => seen.heartbeats += 1,
+            Item::Incident { .. } => {}
             Item::Other => {}
         }
     }
