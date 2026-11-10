@@ -1,24 +1,10 @@
 //! Integration-test harness for lazyview.
 //!
-//! * Servers come from `LAZYVIEW_TEST_DSNS` (`name=mysql://...,name2=mysql://...`, e.g. the output
-//!   of `scripts/test-servers.sh dsns`). If unset every scenario passes with a printed note.
-//!   Multi-server scenarios ([`scenario_multi`]) skip visibly with too few servers, or fail when
-//!   `CI` is set or `LAZYVIEW_TEST_REQUIRE_MULTI=1` (`=0` allows the skip in CI too).
-//! * Every scenario runs against every listed flavor (in parallel, one tokio task per flavor);
-//!   each run works in its own fresh schemas (`lvt_<tag>_<random>`), dropped on success and kept
-//!   on failure for debugging.
-//! * Engines run in-process, each on its own dedicated tokio runtime/thread so that a "crash"
-//!   (dropping the runtime) really kills every task the engine spawned. Engine logs go to
-//!   `tmp/out/test-logs/<schema>/engine-<n>.log` (kept on failure).
-//! * Seeds: `LAZYVIEW_TEST_SEED` (default: random, printed on failure). Size: `LAZYVIEW_TEST_SCALE`
-//!   (float, default 1). Per-run timeout: `LAZYVIEW_TEST_TIMEOUT_S` (default 900 × scale).
-//! * `LAZYVIEW_TEST_ENGINE_USER=user:password` runs every engine as that account instead of the
-//!   admin account of the DSN (setup and oracle queries stay on the admin account). CI sets it to
-//!   `lvdoc:doc`, the account `docker/initdb` creates with exactly the grants of
-//!   docs/server-setup.md, so every suite proves the documented privileges are enough.
-//! * Engine log filter: `LAZYVIEW_TEST_LOG` (falls back to `RUST_LOG`, default `lazyview=debug,warn`).
-//! * The monkey-wrench rename test: `LAZYVIEW_TEST_RENAME=<seed>` runs every scenario twice, as
-//!   written and with every name renamed (see [`rename`] and [`compare_renamed`]).
+//! The harness is configured entirely by environment variables: the server list
+//! (`LAZYVIEW_TEST_DSNS`; unset means every scenario passes with a printed note), seeds and
+//! scale, the per-run timeout, the engine account and log filter, and the opt-in switches for
+//! the special suites. All of them are documented in one place, `docs/development.md`
+//! ("Tests"); this header deliberately does not repeat that list — keep additions there.
 
 #![allow(dead_code, unused_imports)]
 

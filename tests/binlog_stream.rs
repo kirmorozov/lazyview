@@ -1,9 +1,11 @@
 //! Integration tests for `lazyview::binlog` against real servers.
 //!
-//! Servers come from `LAZYVIEW_TEST_DSNS` (`name=dsn,name=dsn`, e.g. the output of
-//! `scripts/test-servers.sh dsns`); when it is unset the tests print a notice and pass.
+//! Servers come from `LAZYVIEW_TEST_DSNS` through `common::servers()` (see
+//! `docs/development.md`); when it is unset the tests print a notice and pass.
 //! Every server is tested concurrently; each run uses fresh schemas and replica server ids, and
 //! only items of its own schema are asserted (other sessions may write concurrently).
+
+mod common;
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -22,20 +24,16 @@ use mysql_async::{Conn, Opts, Row, Value};
 // harness
 
 fn targets(test: &str) -> Vec<(String, String)> {
-    let Ok(v) = std::env::var("LAZYVIEW_TEST_DSNS") else {
-        println!("{test}: LAZYVIEW_TEST_DSNS not set, skipping");
-        return vec![];
-    };
-    v.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let (name, dsn) = s
-                .split_once('=')
-                .expect("LAZYVIEW_TEST_DSNS entries are name=dsn");
-            (name.to_string(), dsn.to_string())
-        })
-        .collect()
+    match common::servers() {
+        Some(servers) => servers
+            .into_iter()
+            .map(|s| (s.flavor, s.base_dsn))
+            .collect(),
+        None => {
+            println!("{test}: LAZYVIEW_TEST_DSNS not set, skipping");
+            vec![]
+        }
+    }
 }
 
 /// Runs `f` against every configured server concurrently and fails listing every failure.

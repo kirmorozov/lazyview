@@ -533,12 +533,7 @@ fn upstream_of(dsn: &str) -> Result<SocketAddr> {
 /// Database outage longer than the liveness stall window: liveness keeps passing (the engine
 /// keeps beating while it reconnects), readiness fails once the binlog has been disconnected for
 /// longer than the grace period and recovers after the database is back.
-///
-/// Ignored until the engine (a) beats in the binlog reconnect loop and bounds each connect
-/// attempt, and (b) re-opens its source/metadata connections after an outage instead of exiting
-/// with "connection closed": `cargo test --test health -- --ignored`.
 #[test]
-#[ignore = "needs engine support: heartbeat in the binlog reconnect loop, reconnecting stale connections"]
 fn health_database_outage() {
     init_env();
     scenario("health_outage", |ctx| async move {
