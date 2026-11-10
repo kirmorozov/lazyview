@@ -906,3 +906,388 @@ mod tests {
         );
     }
 }
+
+/// Shared fixtures for the planner tests, so the same catalog is not pasted once per module:
+/// `table` and `typed` build one table, `catalog` is what the block planner's own tests
+/// plan against, `wide_catalog` adds the columns a plan has to see by type (typed, opaque,
+/// generated) and the view, `linked_catalog` is the small star schema `access` plans its
+/// routes over, and `VIEW_CORPUS` holds the view statements both planners are checked against.
+#[cfg(test)]
+pub(crate) mod test_catalog {
+    use super::{Column, TableInfo, TableRef};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// A table of hand-built columns, keyed by its `(schema, name)` reference.
+    pub(crate) fn typed(name: &str, cols: Vec<Column>, pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
+        let t = TableInfo {
+            schema: "db".into(),
+            name: name.into(),
+            columns: cols,
+            pk: pk.to_vec(),
+            unique_keys: vec![],
+            cascades: vec![],
+            is_view: false,
+            view_bases: vec![],
+        };
+        (("db".into(), name.into()), Arc::new(t))
+    }
+
+    /// A table of `(name, data type)` columns; use `typed` where the type itself matters.
+    pub(crate) fn table(
+        name: &str,
+        cols: &[(&str, &str)],
+        pk: &[usize],
+    ) -> (TableRef, Arc<TableInfo>) {
+        typed(
+            name,
+            cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
+            pk,
+        )
+    }
+
+    /// The tables the block planner's tests plan against.
+    pub(crate) fn catalog() -> HashMap<TableRef, Arc<TableInfo>> {
+        [
+            table(
+                "orders",
+                &[
+                    ("id", "int"),
+                    ("customer_id", "int"),
+                    ("status", "varchar"),
+                    ("total", "decimal"),
+                    ("note", "text"),
+                ],
+                &[0],
+            ),
+            table(
+                "customers",
+                &[("id", "int"), ("name", "varchar"), ("region_id", "int")],
+                &[0],
+            ),
+            table("regions", &[("id", "int"), ("name", "varchar")], &[0]),
+            table(
+                "order_items",
+                &[
+                    ("order_id", "int"),
+                    ("line", "int"),
+                    ("qty", "int"),
+                    ("price", "decimal"),
+                ],
+                &[0, 1],
+            ),
+            table("logs", &[("msg", "varchar")], &[]),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// `catalog` plus the tables whose columns only a typed catalog can describe (opaque
+    /// types, a collated `varchar`, JSON and BIT), a name with a backtick in it, and a view over
+    /// `orders`: the union of what the analyzer's tests need.
+    pub(crate) fn wide_catalog() -> HashMap<TableRef, Arc<TableInfo>> {
+        let opaque = |n: &str, ty: &str| Column::new(n, ty, ty, None, None, Some(16), true);
+        let mut cat: HashMap<TableRef, Arc<TableInfo>> = [
+            typed(
+                "codes",
+                vec![
+                    Column::simple("code", "varchar"),
+                    Column::simple("v", "int"),
+                ],
+                &[0],
+            ),
+            typed(
+                "refs",
+                vec![
+                    Column::simple("id", "int"),
+                    Column::new(
+                        "code",
+                        "varchar",
+                        "varchar(9)",
+                        Some("latin1"),
+                        Some("latin1_swedish_ci"),
+                        Some(9),
+                        false,
+                    ),
+                    Column::simple("code_int", "int"),
+                ],
+                &[0],
+            ),
+            typed(
+                "docs",
+                vec![
+                    Column::simple("id", "int"),
+                    Column::new("doc", "json", "json", None, None, None, false),
+                    Column::new("flags", "bit", "bit(8)", None, None, None, false),
+                ],
+                &[0],
+            ),
+            typed(
+                "devices",
+                vec![
+                    opaque("id", "uuid"),
+                    opaque("ip", "inet6"),
+                    Column::simple("name", "varchar"),
+                    opaque("pos", "point"),
+                ],
+                &[0],
+            ),
+            typed(
+                "hits",
+                vec![
+                    Column::simple("n", "int"),
+                    opaque("ip", "inet6"),
+                    opaque("v4", "inet4"),
+                ],
+                &[0],
+            ),
+            table("we`ird", &[("i`d", "int"), ("v", "int")], &[0]),
+        ]
+        .into_iter()
+        .collect();
+        cat.extend(catalog());
+        let mut paid = (*cat[&("db".to_string(), "orders".to_string())]).clone();
+        paid.name = "paid_orders".into();
+        paid.pk.clear();
+        paid.is_view = true;
+        paid.view_bases = vec![("db".into(), "orders".into())];
+        cat.insert(("db".into(), "paid_orders".into()), Arc::new(paid));
+        cat
+    }
+
+    /// The star schema `access` derives its routes from.
+    pub(crate) fn linked_catalog() -> HashMap<TableRef, Arc<TableInfo>> {
+        [
+            table(
+                "items",
+                &[("id", "int"), ("kind_id", "int"), ("owner_id", "int")],
+                &[0],
+            ),
+            table("kinds", &[("id", "int"), ("name", "varchar")], &[0]),
+            table(
+                "item_values",
+                &[("item_id", "int"), ("key_id", "int"), ("val", "int")],
+                &[0, 1],
+            ),
+            table("owners", &[("id", "int"), ("name", "varchar")], &[0]),
+            table(
+                "item_links",
+                &[("child_id", "int"), ("parent_id", "int")],
+                &[0, 1],
+            ),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// The view statements of the planner tests, planned identically by both planners except for
+    /// what the analyzer's differential test lists as improved. Both test modules iterate it, so
+    /// a statement that moves stays in the corpus instead of silently leaving it.
+    pub(crate) const VIEW_CORPUS: &[&str] = &[
+    "CREATE VIEW v AS {sql}",
+    "CREATE OR REPLACE ALGORITHM=MERGE DEFINER=`root`@`%` SQL SECURITY INVOKER VIEW `db`.`v1` (a, b) AS SELECT id, status FROM orders WITH CASCADED CHECK OPTION;",
+    "CREATE VIEW `v` AS ",
+    "CREATE VIEW `lz_insert` AS INSERT INTO orders VALUES (9,'z',1)",
+    "CREATE VIEW `v` AS UPDATE orders SET a = 1",
+    "CREATE VIEW `v` AS DELETE FROM orders",
+    "CREATE VIEW `v` AS CREATE TABLE t (a INT)",
+    "CREATE VIEW `v` AS DROP TABLE orders",
+    "CREATE VIEW `v` AS SELECT id FROM orders; SELECT id FROM orders",
+    "CREATE VIEW `v` AS SELECT 1 FROM t; SELECT 2 FROM t;\n SELECT 3 FROM t;",
+    "CREATE VIEW v AS SELECT id, @@session.sql_mode AS m FROM t",
+    "CREATE VIEW v AS SELECT id, @x AS x FROM t",
+    "CREATE VIEW v AS SELECT id FROM t LIMIT 2 ROWS EXAMINED 100",
+    "CREATE VIEW v AS\\r\nSELECT id\\r\nFROM t\\r\nWHERE id > 1;\\r\n",
+    "CREATE VIEW v AS SELECT id FROM t;;",
+    "CREATE VIEW v AS SELECT id, 'a;b' AS s FROM t -- trailing; comment",
+    "CREATE VIEW v AS SELECT `@x` FROM t",
+    "CREATE VIEW v AS SELECT 1 garbage garbage",
+    "CREATE VIEW v AS SELECT DISTINCT status FROM orders",
+    "CREATE VIEW v AS SELECT c.name FROM customers c JOIN regions USING (id) WHERE c.id IN (SELECT customer_id FROM orders WHERE total > 5) ORDER BY region_id LIMIT 3",
+    "CREATE VIEW v AS SELECT DISTINCT * FROM orders",
+    "CREATE VIEW v AS SELECT DISTINCT o.* FROM orders o",
+    "CREATE VIEW v AS SELECT DISTINCT id FROM orders NATURAL JOIN order_items",
+    "CREATE VIEW v AS SELECT id FROM orders UNION SELECT * FROM (SELECT id FROM regions) x",
+    "CREATE VIEW v AS SELECT o.id, c.name, r.name AS region FROM orders o JOIN customers c ON c.id = o.customer_id LEFT JOIN regions r ON r.id = c.region_id",
+    "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.customer_id",
+    "CREATE VIEW v AS SELECT o.id, l.msg FROM orders o JOIN logs l ON l.msg = o.status",
+    "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.id",
+    "CREATE VIEW v AS SELECT c.name, COUNT(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.name",
+    "CREATE VIEW v AS SELECT id, status FROM orders",
+    "CREATE VIEW v AS SELECT o.id, c.name, r.name AS region FROM orders o JOIN customers c ON c.id = o.customer_id LEFT JOIN regions r ON r.id = c.region_id",
+    "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.customer_id",
+    "CREATE VIEW v AS SELECT id, status FROM orders",
+    "CREATE VIEW v AS SELECT o.id, i.qty FROM orders o JOIN order_items i ON i.order_id = o.id",
+    "CREATE VIEW v AS SELECT o.id, l.msg FROM orders o JOIN logs l ON l.msg = o.status",
+    "CREATE VIEW v AS SELECT c.name, COUNT(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.name",
+    "CREATE VIEW v AS SELECT COUNT(*) AS n FROM orders",
+    "CREATE VIEW v AS SELECT msg FROM logs",
+    "CREATE VIEW v AS SELECT k.par_id, k.seq, p.label, g.name FROM kids k JOIN pars p ON p.id = k.par_id LEFT JOIN grps g ON g.id = p.grp_id",
+    "CREATE VIEW v AS SELECT par_id, seq, qty FROM kids",
+    "CREATE VIEW v AS SELECT k.par_id, k.seq, p.label FROM kids k JOIN pars p ON p.grp_id = k.qty",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON k.par_id = p.id WHERE k.qty > 1",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON (p.id = k.par_id)",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id AND p.active = 1",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id AND k.qty > 1",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id AND p.id > 1",
+    "CREATE VIEW v AS SELECT o.id, k.qty, p.name FROM ords o LEFT JOIN kids k ON k.id = o.kid_id LEFT JOIN pars p ON p.id = k.par_id AND p.active = 1",
+    "CREATE VIEW v AS SELECT o.id, k.qty, p.name FROM ords o LEFT JOIN kids k ON k.id = o.kid_id LEFT JOIN pars p ON p.id = k.par_id",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k JOIN pars p ON p.id = k.par_id AND p.active = 1",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k, pars p WHERE p.id = k.par_id AND p.active = 1",
+    "CREATE VIEW v AS SELECT p.id, p.name, k.qty FROM pars p LEFT JOIN kids k ON k.par_id = p.id AND k.qty > 2",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k JOIN ords o ON o.kid_id = k.id LEFT JOIN pars p ON p.id = o.id",
+    "CREATE VIEW v AS SELECT k.id, p.name, q.name AS other FROM kids k LEFT JOIN pars p ON p.id = k.par_id LEFT JOIN pars q ON q.id = k.qty",
+    "CREATE VIEW v AS SELECT k.id, p.name, g.name AS grp FROM kids k JOIN pars p ON p.id = k.par_id LEFT JOIN grps g ON g.id = p.grp_id",
+    "CREATE VIEW v AS SELECT k.id, p.name, g.name AS grp FROM kids k LEFT JOIN pars p ON p.id = k.par_id AND p.active = 1 LEFT JOIN grps g ON g.id = p.grp_id",
+    "CREATE VIEW v AS SELECT p.id, p.name, g.name AS grp FROM pars p LEFT JOIN grps g ON g.id = p.grp_id AND g.name <> ''",
+    "CREATE VIEW v AS SELECT c.id, c.name, p.name AS parent FROM nodes c JOIN nodes p ON p.id = c.parent_id",
+    "CREATE VIEW v AS SELECT k.par_id, COUNT(*) AS n FROM kids k JOIN gkids g ON g.kid_id = k.id AND g.v > 0 GROUP BY k.par_id",
+    "CREATE VIEW v AS SELECT k.par_id, COUNT(*) AS n FROM kids k JOIN gkids g ON g.v = k.qty GROUP BY k.par_id",
+    "CREATE VIEW v AS SELECT n.parent_id, COUNT(*) AS n FROM nodes n GROUP BY n.parent_id",
+    "CREATE VIEW v AS SELECT a.id, b.id AS b FROM ma a JOIN mb b ON b.id = a.b_id AND a.id = b.a_id",
+    "CREATE VIEW v AS SELECT k.id, k.qty, p.name FROM kids k LEFT JOIN pars p ON p.id = k.par_id WHERE p.id IS NULL OR p.active = 1",
+    "CREATE VIEW v AS SELECT (a > 1) || 1 AS v FROM t",
+    "CREATE VIEW v AS SELECT a OR 1 AS v FROM t",
+    "CREATE VIEW v AS SELECT * FROM t_a JOIN t_b USING (k)",
+    "CREATE VIEW v AS SELECT * FROM t_a LEFT JOIN t_b USING (k)",
+    "CREATE VIEW v AS SELECT * FROM t_a NATURAL JOIN t_b",
+    "CREATE VIEW v AS SELECT * FROM t_a RIGHT JOIN t_b USING (k)",
+    "CREATE VIEW v AS SELECT * FROM t_a JOIN t_b USING (k) JOIN t_c USING (y)",
+    "CREATE VIEW v AS SELECT t_a.x AS ax, * FROM t_a JOIN t_b USING (k)",
+    "CREATE VIEW v AS SELECT * FROM t_a JOIN t_b USING (k)",
+    "CREATE VIEW v AS SELECT * FROM t_a JOIN (SELECT k, y FROM t_b) d USING (k)",
+    "CREATE VIEW v AS SELECT t_a.*, y FROM t_a JOIN t_b USING (k)",
+    "CREATE VIEW v AS SELECT k, x, y FROM t_a LEFT JOIN t_b USING (k)",
+    "CREATE VIEW v AS SELECT id FROM orders ORDER BY total DESC LIMIT 2",
+    "CREATE VIEW v AS SELECT id FROM orders ORDER BY total * 2 DESC LIMIT 2",
+    "CREATE VIEW v AS SELECT id FROM orders ORDER BY -total LIMIT 2",
+    "CREATE VIEW v AS SELECT id FROM orders ORDER BY ABS(total) DESC, id LIMIT 2",
+    "CREATE VIEW v AS SELECT id FROM orders ORDER BY total DESC LIMIT 1 OFFSET 1",
+    "CREATE VIEW v AS SELECT customer_id FROM orders GROUP BY customer_id ORDER BY SUM(total) DESC LIMIT 2",
+    "CREATE VIEW v AS SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id ORDER BY c.name DESC, o.id LIMIT 2",
+    "CREATE VIEW v AS SELECT id, total * 2 AS t FROM orders ORDER BY t DESC LIMIT 2",
+    "CREATE VIEW v AS SELECT id, status FROM orders ORDER BY 2 DESC LIMIT 2",
+    "CREATE VIEW v AS SELECT id, SUM(total) OVER (PARTITION BY customer_id ORDER BY status) AS s FROM orders",
+    "CREATE VIEW v AS SELECT id, customer_id, ROW_NUMBER() OVER w AS rn, SUM(total) OVER w AS run FROM orders WINDOW w AS (PARTITION BY customer_id ORDER BY id)",
+    "CREATE VIEW v AS SELECT id, SUM(total) OVER (w ORDER BY id) AS run FROM orders WINDOW w AS (PARTITION BY customer_id)",
+    "CREATE VIEW v AS SELECT id, ROW_NUMBER() OVER w AS rn FROM orders WINDOW w AS (ORDER BY id)",
+    "CREATE VIEW v AS SELECT id, status FROM orders",
+    "CREATE VIEW v AS SELECT a.k, c.k FROM t_a a JOIN t_c c ON c.k = a.k",
+    "CREATE VIEW v AS SELECT a.k, c.z AS K FROM t_a a JOIN t_c c ON c.k = a.k",
+    "CREATE VIEW v AS SELECT * FROM t_a a JOIN t_c c ON c.k = a.k",
+    "CREATE VIEW v AS SELECT a.k, c.k AS ck FROM t_a a JOIN t_c c ON c.k = a.k",
+    "CREATE VIEW v (k1, k2) AS SELECT a.k, c.k FROM t_a a JOIN t_c c ON c.k = a.k",
+    "CREATE VIEW v AS SELECT * FROM t_a JOIN t_c USING (k, x)",
+    "CREATE VIEW v AS SELECT note, a FROM skus",
+    "CREATE VIEW v AS SELECT o.id, s.note FROM orders o JOIN skus s ON s.code = o.status",
+    "CREATE VIEW v AS SELECT DISTINCT code, note, s FROM skus",
+    "CREATE VIEW v AS SELECT DISTINCT a, b, note FROM skus",
+    "CREATE VIEW v AS SELECT g, s FROM skus WHERE g > 1",
+    "CREATE VIEW v AS SELECT DISTINCT g FROM skus",
+    "CREATE VIEW v AS SELECT g, s FROM skus",
+    "CREATE VIEW v AS SELECT g FROM skus",
+    "CREATE VIEW v AS SELECT o.id, c.name, r.name AS region FROM orders o JOIN customers c ON c.id = o.customer_id LEFT JOIN regions r ON r.id = c.region_id",
+    "CREATE VIEW v AS SELECT id, status FROM orders WHERE total > 10",
+    "CREATE VIEW v AS SELECT o.id, c.name, r.name AS region, i.qty FROM orders o JOIN customers c ON c.id = o.customer_id LEFT JOIN regions r ON r.id = c.region_id LEFT JOIN order_items i ON i.order_id = o.id",
+    "CREATE VIEW v AS SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id",
+    "CREATE VIEW v AS SELECT o.id, c.name FROM orders o JOIN customers c ON c.id IN (o.customer_id)",
+    "CREATE VIEW v AS SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id IN (c.id)",
+    "CREATE VIEW v AS SELECT o.id, c.name FROM orders o, customers c WHERE c.id IN (o.customer_id)",
+    "CREATE VIEW v AS SELECT o.id, c.name, COUNT(*) n FROM orders o JOIN customers c ON c.id IN (o.customer_id) GROUP BY o.id, c.name",
+    "CREATE VIEW q AS {sql}",
+    "CREATE VIEW x AS SELECT 1",
+    "CREATE VIEW v (k, idcol) AS SELECT o.customer_id, o.id FROM orders o",
+    "CREATE VIEW v AS SELECT id FROM {name}",
+    "CREATE VIEW v AS SELECT o.id FROM orders o",
+    "CREATE VIEW v AS SELECT o.customer_id AS cust, COUNT(*) n, SUM(i.qty * i.price) amt FROM orders o JOIN order_items i ON i.order_id = o.id GROUP BY cust HAVING n > 1",
+    "CREATE VIEW v AS SELECT c.id, c.name, COUNT(*) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.id, c.name",
+    "CREATE VIEW v AS SELECT DATE(o.note) d, COUNT(*) FROM orders o GROUP BY 1",
+    "CREATE VIEW v AS SELECT COUNT(*) FROM orders",
+    "CREATE VIEW v AS SELECT DISTINCT status FROM orders",
+    "CREATE VIEW v AS SELECT id FROM orders LIMIT 5",
+    "CREATE VIEW v AS SELECT id FROM orders UNION SELECT id FROM customers",
+    "CREATE VIEW v AS SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers)",
+    "CREATE VIEW v AS SELECT id, NOW() FROM orders",
+    "CREATE VIEW v AS SELECT o.id FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id",
+    "CREATE VIEW v AS SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers)",
+    "CREATE VIEW v (a, b, c) AS SELECT r.*, 1 FROM regions r",
+    "CREATE VIEW v (a) AS SELECT id, name FROM regions",
+    "CREATE VIEW v AS SELECT * FROM nope",
+    "CREATE VIEW v AS SELECT bogus FROM orders",
+    "CREATE VIEW v AS SELECT i.order_id, i.line, o.status FROM order_items i JOIN orders o ON o.id = i.order_id",
+    "CREATE VIEW v AS SELECT o.id, o.status FROM orders o JOIN customers c ON c.id = o.customer_id",
+    "CREATE VIEW v AS SELECT r.id, c.name FROM regions r JOIN customers c ON c.region_id = r.id",
+    "CREATE VIEW v (cust, cnt) AS SELECT customer_id, COUNT(*) n FROM orders GROUP BY customer_id HAVING n > 1",
+    "CREATE VIEW v AS SELECT id FROM orders ORDER BY total DESC LIMIT 3",
+    "CREATE VIEW v AS SELECT id FROM orders LIMIT 3",
+    "CREATE VIEW v AS SELECT id FROM orders ORDER BY total",
+    "CREATE VIEW v AS WITH big AS (SELECT id FROM orders WHERE total > 5) SELECT id FROM big",
+    "CREATE VIEW v AS SELECT id, customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) AS rn, SUM(total) OVER w AS run FROM orders WINDOW w AS (PARTITION BY customer_id, status ORDER BY id)",
+    "CREATE VIEW v AS SELECT id, RANK() OVER (ORDER BY total DESC) AS r FROM orders",
+    "CREATE VIEW v AS SELECT customer_id, SUM(total), RANK() OVER (ORDER BY SUM(total)) FROM orders GROUP BY customer_id",
+    "CREATE VIEW v AS SELECT id, ROW_NUMBER() OVER (PARTITION BY id, status ORDER BY id) AS rn FROM orders",
+    "CREATE VIEW v AS SELECT o.id, ROW_NUMBER() OVER (PARTITION BY o.id, c.name ORDER BY o.id) AS rn FROM orders o JOIN customers c ON c.id = o.customer_id",
+    "CREATE VIEW v AS SELECT msg, LENGTH(msg) AS n FROM logs WHERE msg <> ''",
+    "CREATE VIEW v AS SELECT i.order_id, COUNT(*) FROM orders o LEFT JOIN order_items i ON i.order_id = o.id GROUP BY i.order_id",
+    "CREATE VIEW v AS SELECT COALESCE(c.name, '?') n, COUNT(*) FROM orders o LEFT JOIN customers c ON c.id = o.customer_id GROUP BY n",
+    "CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.id IS NULL AND o.total > 0",
+    "CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE IFNULL(c.name, 'x') = 'x'",
+    "CREATE VIEW v AS SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.name = 'a' OR o.total > 1",
+    "CREATE VIEW v AS SELECT o.id, c.name, COUNT(*) FROM orders o LEFT JOIN customers c ON c.id = o.customer_id GROUP BY o.id, c.name",
+    "CREATE VIEW v AS SELECT o.id, c.name FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.name LIKE 'a%' AND UPPER(c.name) <> 'B' AND c.region_id IN (1, 2)",
+    "CREATE VIEW v AS SELECT o.id, COUNT(i.line) n FROM orders o LEFT JOIN order_items i ON i.order_id = o.id GROUP BY o.id HAVING COUNT(i.line) = 0",
+    "CREATE VIEW v AS SELECT c.code, r.id FROM codes c JOIN refs r ON r.code_int = c.code",
+    "CREATE VIEW v AS SELECT c.code, r.id FROM codes c JOIN refs r ON r.code = c.code",
+    "CREATE VIEW v AS SELECT c.code, r.id FROM codes c JOIN refs r ON r.code_int = c.v",
+    "CREATE VIEW v AS SELECT id FROM orders WHERE MATCH(note) AGAINST ('x')",
+    "CREATE VIEW v AS SELECT o.id, c.name FROM orders o CROSS JOIN regions c",
+    "CREATE VIEW v AS SELECT o.id, r.name FROM orders o JOIN regions r",
+    "CREATE VIEW v AS SELECT doc, COUNT(*) FROM docs GROUP BY doc",
+    "CREATE VIEW v AS SELECT JSON_EXTRACT(doc, '$.a') k, COUNT(*) FROM docs GROUP BY k",
+    "CREATE VIEW v AS SELECT doc->'$.a' k, COUNT(*) FROM docs GROUP BY k",
+    "CREATE VIEW v AS SELECT doc->>'$.a' k, COUNT(*) FROM docs GROUP BY k",
+    "CREATE VIEW v AS SELECT flags, COUNT(*) FROM docs GROUP BY flags",
+    "CREATE VIEW v AS SELECT p.id, c.name FROM paid_orders p JOIN customers c ON c.id = p.customer_id",
+    "CREATE VIEW x__lv_new AS SELECT id FROM orders",
+    "CREATE VIEW x__LV_OLD AS SELECT id FROM orders",
+    "CREATE VIEW _lv_probe AS SELECT id FROM orders",
+    "CREATE VIEW _lazyview_state AS SELECT id FROM orders",
+    "CREATE VIEW v AS SELECT name FROM _lazyview_state",
+    "CREATE VIEW v AS SELECT id, my_fn(total), app.calc(id) FROM orders WHERE UPPER(status) = 'X'",
+    "CREATE VIEW v AS SELECT id, status FROM orders WHERE status = 'a\\'b' OR status LIKE 'x\\_y' OR note = '\\\\n'",
+    "CREATE VIEW v AS SELECT CONCAT(status, '\\\\n') k, COUNT(*) FROM orders GROUP BY k",
+    "CREATE VIEW v AS\n  SELECT DISTINCT CONCAT(status, '\\\\n')  FROM orders WHERE note = 'it''s' -- tail\n WITH CHECK OPTION;",
+    "CREATE VIEW `v``1` (`a``b`, c) AS SELECT `i``d`, w.v FROM `we``ird` w WHERE w.`i``d` > 1",
+    "CREATE VIEW v AS SELECT id, name FROM devices",
+    "CREATE VIEW v AS SELECT ip, COUNT(*) FROM hits GROUP BY ip",
+    "CREATE VIEW v AS SELECT h.n, d.name FROM hits h JOIN devices d ON d.ip = h.ip",
+    "CREATE VIEW v AS SELECT n FROM hits WHERE v4 > '10.0.0.0'",
+    "CREATE VIEW v AS SELECT n, ip, v4 FROM hits",
+    "CREATE VIEW v AS SELECT COUNT(*) FROM hits WHERE ip IS NOT NULL",
+    "CREATE VIEW v AS SELECT db.orders.id, db.customers.name, db.orders.total + 1 FROM db.orders JOIN db.customers ON db.customers.id = db.orders.customer_id WHERE db.customers.name <> 'x' AND db.orders.total > 0",
+    "CREATE VIEW v AS SELECT db.orders.customer_id c, COUNT(*) FROM orders GROUP BY db.orders.customer_id",
+    "CREATE VIEW v (st) AS SELECT DISTINCT status FROM orders",
+    "CREATE VIEW v (x, y) AS SELECT id, status AS s FROM orders UNION ALL SELECT id, name FROM customers ORDER BY s LIMIT 2",
+    "CREATE VIEW v (a, b) AS SELECT DISTINCT * FROM regions",
+    "CREATE VIEW v (a, b, c) AS SELECT DISTINCT r.*, c.id FROM regions r JOIN customers c ON c.region_id = r.id",
+    "CREATE VIEW v (a) AS SELECT * FROM (SELECT id, name FROM regions) d",
+    "CREATE VIEW v (a, b, c, d) AS SELECT DISTINCT * FROM regions JOIN customers USING (id)",
+    "CREATE VIEW v (a) AS SELECT DISTINCT id, status FROM orders",
+    "CREATE VIEW v (a) AS SELECT * FROM regions UNION SELECT id, name FROM customers",
+    "CREATE VIEW v (a, b, c) AS SELECT DISTINCT * FROM regions",
+    "CREATE VIEW v (a, b) AS SELECT id, name FROM regions",
+    "CREATE VIEW v AS SELECT id, CONCAT(status,'-',note), CASE WHEN total > 1 THEN 'y' ELSE 'n' END, id+customer_id, IF(total>1,'y','n'), `status`, o.note, (total), 'it''s', total AS t, total /* c */ + 1, total\n  + 2, CONCAT(note, 'é—x'), CONCAT(status, '-', note, '-', status, '-', note, '-', status, '-', note, '-', status) FROM orders o",
+    "CREATE VIEW v AS SELECT SQL_NO_CACHE customer_id, COUNT( * ), count(*), SUM(total*2) FROM orders GROUP BY customer_id",
+    "CREATE VIEW v AS SELECT r.*, LENGTH( name ) FROM regions r",
+    "CREATE VIEW v AS SELECT DISTINCT  COUNT( * ) , 'a' 'b' FROM orders",
+    "CREATE VIEW v AS SELECT id /*! , 1 */ FROM items",
+    "CREATE VIEW v AS SELECT id FROM items /*!50100 WHERE 1 */",
+    "CREATE VIEW v AS SELECT id FROM items /*M! WHERE 1 */",
+    "CREATE VIEW v AS SELECT id FROM items /*m!100500 WHERE 1 */",
+    "CREATE VIEW v AS SELECT id FROM items WHERE note = '/*!x*/'",
+    "CREATE VIEW v AS SELECT id /* a note */ FROM items",
+    "CREATE VIEW v AS SELECT id FROM items -- a note",
+    "CREATE VIEW v AS SELECT /*+ MAX_EXECUTION_TIME(1000) */ id FROM items",
+    ];
+}

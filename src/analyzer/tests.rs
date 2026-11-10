@@ -1,4 +1,4 @@
-//! Analyzer tests: differential against the block planner on its own test corpus, metamorphic
+//! Analyzer tests: differential against the block planner on the shared view corpus, metamorphic
 //! CTE-vs-inline checks, and one test per taxonomy class (strategy and exact reason).
 
 use std::collections::HashMap;
@@ -6,131 +6,12 @@ use std::sync::Arc;
 
 use super::plan as analyzer_plan;
 use crate::analyze::{self, parse_definition, Mode, ViewPlan};
+use crate::catalog::test_catalog::{table, typed, wide_catalog, VIEW_CORPUS};
 use crate::catalog::{Column, TableInfo, TableRef};
-
-fn typed(name: &str, cols: Vec<Column>, pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
-    let t = TableInfo {
-        schema: "db".into(),
-        name: name.into(),
-        columns: cols,
-        pk: pk.to_vec(),
-        unique_keys: vec![],
-        cascades: vec![],
-        is_view: false,
-        view_bases: vec![],
-    };
-    (("db".into(), name.into()), Arc::new(t))
-}
-
-fn table(name: &str, cols: &[(&str, &str)], pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
-    typed(
-        name,
-        cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
-        pk,
-    )
-}
-
-/// The union of the catalogs of `analyze.rs`'s tests.
-fn catalog() -> HashMap<TableRef, Arc<TableInfo>> {
-    let opaque = |n: &str, ty: &str| Column::new(n, ty, ty, None, None, Some(16), true);
-    let mut cat: HashMap<TableRef, Arc<TableInfo>> = [
-        table(
-            "orders",
-            &[
-                ("id", "int"),
-                ("customer_id", "int"),
-                ("status", "varchar"),
-                ("total", "decimal"),
-                ("note", "text"),
-            ],
-            &[0],
-        ),
-        table(
-            "customers",
-            &[("id", "int"), ("name", "varchar"), ("region_id", "int")],
-            &[0],
-        ),
-        table("regions", &[("id", "int"), ("name", "varchar")], &[0]),
-        table(
-            "order_items",
-            &[
-                ("order_id", "int"),
-                ("line", "int"),
-                ("qty", "int"),
-                ("price", "decimal"),
-            ],
-            &[0, 1],
-        ),
-        table("logs", &[("msg", "varchar")], &[]),
-        typed(
-            "codes",
-            vec![
-                Column::simple("code", "varchar"),
-                Column::simple("v", "int"),
-            ],
-            &[0],
-        ),
-        typed(
-            "refs",
-            vec![
-                Column::simple("id", "int"),
-                Column::new(
-                    "code",
-                    "varchar",
-                    "varchar(9)",
-                    Some("latin1"),
-                    Some("latin1_swedish_ci"),
-                    Some(9),
-                    false,
-                ),
-                Column::simple("code_int", "int"),
-            ],
-            &[0],
-        ),
-        typed(
-            "docs",
-            vec![
-                Column::simple("id", "int"),
-                Column::new("doc", "json", "json", None, None, None, false),
-                Column::new("flags", "bit", "bit(8)", None, None, None, false),
-            ],
-            &[0],
-        ),
-        typed(
-            "devices",
-            vec![
-                opaque("id", "uuid"),
-                opaque("ip", "inet6"),
-                Column::simple("name", "varchar"),
-                opaque("pos", "point"),
-            ],
-            &[0],
-        ),
-        typed(
-            "hits",
-            vec![
-                Column::simple("n", "int"),
-                opaque("ip", "inet6"),
-                opaque("v4", "inet4"),
-            ],
-            &[0],
-        ),
-        table("we`ird", &[("i`d", "int"), ("v", "int")], &[0]),
-    ]
-    .into_iter()
-    .collect();
-    let mut paid = (*cat[&("db".to_string(), "orders".to_string())]).clone();
-    paid.name = "paid_orders".into();
-    paid.pk.clear();
-    paid.is_view = true;
-    paid.view_bases = vec![("db".into(), "orders".into())];
-    cat.insert(("db".into(), "paid_orders".into()), Arc::new(paid));
-    cat
-}
 
 fn p(sql: &str) -> ViewPlan {
     let d = parse_definition(sql).unwrap();
-    analyzer_plan(&d, "db", &catalog()).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    analyzer_plan(&d, "db", &wide_catalog()).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
 }
 
 fn reason(sql: &str) -> String {
@@ -138,88 +19,6 @@ fn reason(sql: &str) -> String {
         Mode::Full(r) => r,
         m => panic!("{sql}: expected Full, got {m:?}"),
     }
-}
-
-/// Every string literal of `analyze.rs`'s tests that holds a `CREATE VIEW` statement.
-fn corpus() -> Vec<String> {
-    let src = include_str!("../analyze.rs");
-    let src = &src[src.find("#[cfg(test)]").expect("analyze.rs has tests")..];
-    let b = src.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if b[i] == b'\'' {
-            // A char literal ('x', '\'', '`') or a lifetime: skip it.
-            let end = src[i + 1..].find('\'').map(|e| i + 1 + e);
-            i = match end {
-                Some(e) if e - i <= 3 || src[i + 1..e].starts_with('\\') => e + 1,
-                _ => i + 1,
-            };
-            continue;
-        }
-        let raw = b[i] == b'r' && matches!(b.get(i + 1), Some(b'"' | b'#'));
-        if raw {
-            let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
-            let start = i + 2 + hashes;
-            let close = format!("\"{}", "#".repeat(hashes));
-            let end = start + src[start..].find(&close).expect("raw string ends");
-            out.push(src[start..end].to_string());
-            i = end + close.len();
-            continue;
-        }
-        if b[i] == b'"' {
-            let mut s = String::new();
-            let mut j = i + 1;
-            let chars: Vec<char> = src[j..].chars().take(4000).collect();
-            let mut k = 0;
-            while k < chars.len() {
-                let c = chars[k];
-                if c == '"' {
-                    break;
-                }
-                if c == '\\' {
-                    k += 1;
-                    match chars[k] {
-                        'n' => s.push('\n'),
-                        't' => s.push('\t'),
-                        '\\' => s.push('\\'),
-                        '"' => s.push('"'),
-                        '\'' => s.push('\''),
-                        '0' => s.push('\0'),
-                        '\n' => {
-                            while chars.get(k + 1).is_some_and(|c| c.is_whitespace()) {
-                                k += 1;
-                            }
-                        }
-                        other => {
-                            s.push('\\');
-                            s.push(other);
-                        }
-                    }
-                } else {
-                    s.push(c);
-                }
-                k += 1;
-            }
-            j += chars[..k].iter().map(|c| c.len_utf8()).sum::<usize>();
-            out.push(s);
-            i = j + 1;
-            continue;
-        }
-        i += 1;
-    }
-    let mut v: Vec<String> = out
-        .into_iter()
-        .filter(|s| s.trim_start().starts_with("CREATE") && s.contains("VIEW"))
-        .collect();
-    v.dedup();
-    v
 }
 
 /// Statements the analyzer plans differently from the block planner, with the expected new
@@ -242,7 +41,7 @@ fn cte_chain(n: usize) -> String {
 /// within the budget the copies are inlined and planned.
 #[test]
 fn cte_inlining_is_bounded() {
-    let cat = catalog();
+    let cat = wide_catalog();
     let plan = |n: usize| {
         let d = parse_definition(&cte_chain(n)).unwrap();
         let t = std::time::Instant::now();
@@ -302,7 +101,7 @@ fn virtual_columns_convert_to_their_declared_type() {
     };
     let mut gbin = col("gbin", "varchar", "varchar(20)");
     gbin.collation = Some("utf8mb4_bin".into());
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     for (k, t) in [
         typed(
             "g1",
@@ -447,7 +246,7 @@ fn virtual_integers_clip_and_nesting_is_bounded() {
             vec![k + 1],
         ));
     }
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     for (k, t) in [
         typed(
             "vu",
@@ -646,7 +445,7 @@ fn not_in_is_rendered_as_not_exists() {
 /// all-units NULL trace); a UNIQUE NOT NULL key makes a semi-join an inner join like the PK.
 #[test]
 fn not_null_columns_and_unique_keys_in_semi_joins() {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let set = |cat: &mut HashMap<TableRef, Arc<TableInfo>>, t: &str, f: &dyn Fn(&mut TableInfo)| {
         let k = ("db".to_string(), t.to_string());
         let mut info = (*cat[&k]).clone();
@@ -722,7 +521,7 @@ fn not_null_columns_and_unique_keys_in_semi_joins() {
 /// a column of the key's own collation, joins.
 #[test]
 fn semi_joins_need_key_exact_equalities() {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let int = |n: &str| {
         let mut c = Column::simple(n, "int");
         c.nullable = false;
@@ -847,7 +646,7 @@ fn semi_joins_need_key_exact_equalities() {
 /// list and in WHERE, and outer columns one and two joins away.
 #[test]
 fn key_exact_formulations() {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let int = |n: &str, ty: &str| {
         let mut c = Column::new(n, ty, ty, None, None, None, false);
         c.nullable = false;
@@ -1062,7 +861,7 @@ fn key_exact_formulations() {
 /// against their own type still do.
 #[test]
 fn timestamp_keys_are_not_key_exact() {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let col = |n: &str, ty: &str| {
         let mut c = Column::new(n, ty, ty, None, None, None, false);
         c.nullable = false;
@@ -1200,7 +999,7 @@ fn timestamp_keys_are_not_key_exact() {
 /// CTEs and derived tables with renamed columns, joins in every placement, and 1-3 hops.
 #[test]
 fn json_columns_in_composite_units() {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let col = |n: &str, ty: &str| Column::new(n, ty, ty, None, None, None, false);
     let mut long = Column::new(
         "doc",
@@ -1400,7 +1199,7 @@ fn json_columns_in_composite_units() {
 /// reads the same tables and column count; a different reading is an error naming it.
 #[test]
 fn validate_against_the_canonical_definition() {
-    let cat = catalog();
+    let cat = wide_catalog();
     let check = |sql: &str, canonical: &str| {
         let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
         super::validate(&d, canonical, "db", &cat)
@@ -1495,7 +1294,7 @@ fn inlining_budget_is_per_join_block() {
     };
     let go = |sql: &str, opts: &super::Options| {
         let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
-        super::analyze(&d, "db", &catalog(), opts).unwrap()
+        super::analyze(&d, "db", &wide_catalog(), opts).unwrap()
     };
     let union = |n: usize, branch: &str| vec![branch; n].join(" UNION ALL ");
     // 33 one-table branches, no WITH: 33 branch plans (without branch plans: the construct,
@@ -1635,7 +1434,7 @@ fn order_by_through_merges_and_subqueries() {
 /// parenthesized join that is not a chain of inner joins names the construct.
 #[test]
 fn newlines_in_literals_and_nested_outer_joins() {
-    let cat = catalog();
+    let cat = wide_catalog();
     let d = parse_definition(
         "CREATE VIEW v AS SELECT o.id FROM orders o WHERE o.note <> 'a\nb' \
          AND EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.qty > 2)",
@@ -1666,7 +1465,7 @@ fn newlines_in_literals_and_nested_outer_joins() {
 /// propagating NULL from the subquery's own column is not.
 #[test]
 fn outer_only_scalar_values_are_guarded() {
-    let cat = catalog();
+    let cat = wide_catalog();
     let select = |sql: &str| {
         let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
         let p = crate::analyzer::plan(&d, "db", &cat).unwrap();
@@ -1772,16 +1571,15 @@ fn improvements() -> Vec<(&'static str, Result<Mode, &'static str>)> {
 /// the listed improvements (never an incremental plan made worse).
 #[test]
 fn differential_against_the_block_planner() {
-    let cat = catalog();
-    let corpus = corpus();
+    let cat = wide_catalog();
     assert!(
-        corpus.len() > 60,
-        "corpus extraction found only {}",
-        corpus.len()
+        VIEW_CORPUS.len() > 60,
+        "the view corpus holds only {}",
+        VIEW_CORPUS.len()
     );
     let improved = improvements();
     let mut report = String::new();
-    for sql in &corpus {
+    for sql in VIEW_CORPUS {
         let Ok(d) = parse_definition(sql) else {
             continue;
         };
@@ -2153,7 +1951,7 @@ fn internal_table(
 fn internal_views_for_aggregates_joined_on_non_keys() {
     let sql = "WITH t AS (SELECT customer_id, SUM(total) AS s FROM orders GROUP BY customer_id) \
                SELECT c.id, t.s FROM customers c JOIN t ON t.customer_id = c.region_id";
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
         panic!("expected an internal view")
     };
@@ -2219,7 +2017,7 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
 /// units); otherwise the view is Full (cascaded child rows have no binlog rows).
 #[test]
 fn semi_joins_over_cascading_children() {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let key = ("db".to_string(), "order_items".to_string());
     let mut items = (*cat[&key]).clone();
     items.cascades = vec![crate::catalog::ForeignKey {
@@ -2398,7 +2196,7 @@ fn semi_joins_over_joined_subqueries() {
         assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
     }
     // A cascading child among the subquery's tables (no binlog rows for cascaded changes).
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let key = ("db".to_string(), "order_items".to_string());
     let mut items = (*cat[&key]).clone();
     items.cascades = vec![crate::catalog::ForeignKey {
@@ -2427,7 +2225,7 @@ fn semi_joins_over_joined_subqueries() {
 /// Window and top-N CTEs are isolated too: the parent filters or joins their table.
 #[test]
 fn internal_views_for_windows_and_top_n() {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let win = "WITH t AS (SELECT id, customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) AS rn \
                FROM orders) SELECT id, customer_id FROM t WHERE rn = 1";
     let super::Outcome::NeedsInternal(ivs) = outcome(win, &cat) else {
@@ -2471,7 +2269,7 @@ fn internal_views_for_windows_and_top_n() {
 /// of a LEFT JOIN, aggregate a tuple-lineage view of their join.
 #[test]
 fn tuple_lineage_views_for_untraceable_groups() {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let sql = "SELECT c.region_id, SUM(i.qty) AS units, COUNT(*) AS n FROM order_items i \
                JOIN orders o ON o.id = i.order_id JOIN customers c ON c.id = o.customer_id GROUP BY c.region_id";
     let today = p(&format!("CREATE VIEW v AS {sql}"));
@@ -2520,7 +2318,7 @@ fn tuple_lineage_views_for_untraceable_groups() {
     let sql =
         "SELECT c.region_id, COUNT(*) AS n FROM orders o LEFT JOIN customers c ON c.id = o.customer_id \
                WHERE o.status <> 'x' AND c.name <> 'y' GROUP BY c.region_id";
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
         panic!("expected the tuple-lineage view")
     };
@@ -2624,7 +2422,7 @@ fn union_all_branch_plans() {
     };
     let go = |sql: &str| {
         let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
-        super::analyze(&d, "db", &catalog(), &opts).unwrap()
+        super::analyze(&d, "db", &wide_catalog(), &opts).unwrap()
     };
     let super::Outcome::Branches(b) = go(
         "WITH paid AS (SELECT id, customer_id FROM orders WHERE status = 'paid') \
@@ -2658,7 +2456,9 @@ fn union_all_branch_plans() {
 fn analyzer_errors_mirror_the_server() {
     let err = |sql: &str| {
         let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
-        analyzer_plan(&d, "db", &catalog()).unwrap_err().to_string()
+        analyzer_plan(&d, "db", &wide_catalog())
+            .unwrap_err()
+            .to_string()
     };
     assert_eq!(
         err("WITH t (a) AS (SELECT id, total FROM orders) SELECT a FROM t"),
@@ -2709,7 +2509,7 @@ fn show_plans() {
             continue;
         }
         let d = parse_definition(sql).unwrap();
-        match analyzer_plan(&d, "db", &catalog()) {
+        match analyzer_plan(&d, "db", &wide_catalog()) {
             Ok(v) => {
                 println!(
                     "== {sql}\n mode {:?}\n select: {}",
@@ -2772,7 +2572,7 @@ fn semi_join_views_are_identified_by_their_from_tables() {
 /// key (NOT NULL / nullable column).
 fn formulation_catalog() -> HashMap<TableRef, Arc<TableInfo>> {
     use crate::catalog::{FkAction, ForeignKey};
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let col = |n: &str, nullable: bool| {
         let mut c = Column::new(n, "int", "int", None, None, None, false);
         c.nullable = nullable;

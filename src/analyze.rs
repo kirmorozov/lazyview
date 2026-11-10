@@ -4754,35 +4754,8 @@ pub fn quote_ident(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::test_catalog::{catalog, table, typed, VIEW_CORPUS};
     use crate::catalog::Column;
-
-    fn table(name: &str, cols: &[(&str, &str)], pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
-        let t = TableInfo {
-            schema: "db".into(),
-            name: name.into(),
-            columns: cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
-            pk: pk.to_vec(),
-            unique_keys: vec![],
-            cascades: vec![],
-            is_view: false,
-            view_bases: vec![],
-        };
-        (("db".into(), name.into()), Arc::new(t))
-    }
-
-    fn typed(name: &str, cols: Vec<Column>, pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
-        let t = TableInfo {
-            schema: "db".into(),
-            name: name.into(),
-            columns: cols,
-            pk: pk.to_vec(),
-            unique_keys: vec![],
-            cascades: vec![],
-            is_view: false,
-            view_bases: vec![],
-        };
-        (("db".into(), name.into()), Arc::new(t))
-    }
 
     fn full_reason(sql: &str) -> String {
         match p(sql).mode {
@@ -4791,44 +4764,26 @@ mod tests {
         }
     }
 
-    fn catalog() -> HashMap<TableRef, Arc<TableInfo>> {
-        [
-            table(
-                "orders",
-                &[
-                    ("id", "int"),
-                    ("customer_id", "int"),
-                    ("status", "varchar"),
-                    ("total", "decimal"),
-                    ("note", "text"),
-                ],
-                &[0],
-            ),
-            table(
-                "customers",
-                &[("id", "int"), ("name", "varchar"), ("region_id", "int")],
-                &[0],
-            ),
-            table("regions", &[("id", "int"), ("name", "varchar")], &[0]),
-            table(
-                "order_items",
-                &[
-                    ("order_id", "int"),
-                    ("line", "int"),
-                    ("qty", "int"),
-                    ("price", "decimal"),
-                ],
-                &[0, 1],
-            ),
-            table("logs", &[("msg", "varchar")], &[]),
-        ]
-        .into_iter()
-        .collect()
-    }
-
     fn p(sql: &str) -> ViewPlan {
         let d = parse_definition(sql).unwrap();
         plan_block(&d, "db", &catalog()).unwrap()
+    }
+
+    /// The shared corpus is these tests' own statements, so they are checked here too: the
+    /// analyzer's differential test compares its plans against the block planner's, and a
+    /// statement that stopped reaching this planner would otherwise go unnoticed. Refusing one
+    /// is an outcome (some name tables this catalog has no entry for); panicking is not.
+    #[test]
+    fn every_statement_of_the_shared_corpus_is_planned() {
+        let cat = catalog();
+        for sql in VIEW_CORPUS {
+            let Ok(d) = parse_definition(sql) else {
+                continue;
+            };
+            if let Err(e) = plan_block(&d, "db", &cat) {
+                assert!(!e.to_string().is_empty(), "{sql}: refused without a reason");
+            }
+        }
     }
 
     /// The flag that makes a lookup bind its strings without a `COLLATE` (see `engine`): the

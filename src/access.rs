@@ -906,51 +906,13 @@ impl std::fmt::Display for AccessPlan {
 mod tests {
     use super::*;
     use crate::analyze::{parse_definition, plan_block};
-    use crate::catalog::{Column, TableInfo};
-    use std::collections::HashMap;
+    use crate::catalog::test_catalog::linked_catalog;
+    use crate::catalog::Column;
     use std::sync::Arc;
-
-    fn table(name: &str, cols: &[(&str, &str)], pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
-        let t = TableInfo {
-            schema: "db".into(),
-            name: name.into(),
-            columns: cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
-            pk: pk.to_vec(),
-            unique_keys: vec![],
-            cascades: vec![],
-            is_view: false,
-            view_bases: vec![],
-        };
-        (("db".into(), name.into()), Arc::new(t))
-    }
-
-    fn catalog() -> HashMap<TableRef, Arc<TableInfo>> {
-        [
-            table(
-                "items",
-                &[("id", "int"), ("kind_id", "int"), ("owner_id", "int")],
-                &[0],
-            ),
-            table("kinds", &[("id", "int"), ("name", "varchar")], &[0]),
-            table(
-                "item_values",
-                &[("item_id", "int"), ("key_id", "int"), ("val", "int")],
-                &[0, 1],
-            ),
-            table("owners", &[("id", "int"), ("name", "varchar")], &[0]),
-            table(
-                "item_links",
-                &[("child_id", "int"), ("parent_id", "int")],
-                &[0, 1],
-            ),
-        ]
-        .into_iter()
-        .collect()
-    }
 
     fn plan(sql: &str) -> ViewPlan {
         let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
-        plan_block(&d, "db", &catalog()).unwrap()
+        plan_block(&d, "db", &linked_catalog()).unwrap()
     }
 
     #[test]
@@ -1181,7 +1143,7 @@ mod tests {
                 lookup_where: false,
             }
         };
-        let cat = catalog();
+        let cat = linked_catalog();
         let i = cat[&("db".into(), "items".into())].clone();
         let l = cat[&("db".into(), "item_links".into())].clone();
         let o = cat[&("db".into(), "owners".into())].clone();
@@ -1405,7 +1367,7 @@ mod tests {
     fn search_keeps_two_links_on_one_id_column() {
         // Both edges sit on `l.child_id` (col 0) with different partners: the link dedup must
         // keep both; only a true duplicate of the pair would be dropped.
-        let c = catalog();
+        let c = linked_catalog();
         let pick = |t: &str| c[&("db".into(), t.into())].clone();
         let p = three_alias_plan(
             pick("items"),
@@ -1435,7 +1397,7 @@ mod tests {
     fn search_rejects_a_chain_that_covers_no_id_part() {
         // `l` reaches `i` (one link), but every id part also reads the unreachable `o`:
         // no position survives, so the chain cannot stand for the id.
-        let c = catalog();
+        let c = linked_catalog();
         let pick = |t: &str| c[&("db".into(), t.into())].clone();
         let p = three_alias_plan(
             pick("items"),
@@ -1458,7 +1420,7 @@ mod tests {
     fn hop_rejects_a_link_compared_by_collation() {
         // `o.ts` (timestamp) is not an exact key: a link whose one side is inexact must fail
         // even when the other side is exact.
-        let c = catalog();
+        let c = linked_catalog();
         let pick = |t: &str| c[&("db".into(), t.into())].clone();
         let o = Arc::new(TableInfo {
             schema: "db".into(),
@@ -1514,7 +1476,7 @@ mod tests {
             "CREATE VIEW v AS SELECT i.id FROM items i WHERE i.id NOT IN (SELECT id FROM kinds k)",
         )
         .unwrap();
-        let v = crate::analyze::plan(&d, "db", &catalog()).unwrap();
+        let v = crate::analyze::plan(&d, "db", &linked_catalog()).unwrap();
         let ap = AccessPlan::of(&v);
         let semi = ap
             .occurrences
@@ -1701,7 +1663,7 @@ mod tests {
     #[test]
     fn explain_pins_cascade_traced_directly() {
         use crate::catalog::{FkAction, ForeignKey};
-        let cat = catalog();
+        let cat = linked_catalog();
         let mut i = (*cat[&("db".into(), "item_values".into())]).clone();
         let fk = |parent: &str, cols: Vec<usize>, pcols: &[&str]| ForeignKey {
             parent: ("db".into(), parent.into()),
@@ -1747,7 +1709,7 @@ mod tests {
     #[test]
     fn explain_pins_traced_cascade() {
         use crate::catalog::{FkAction, ForeignKey};
-        let cat = catalog();
+        let cat = linked_catalog();
         let mut i = (*cat[&("db".into(), "items".into())]).clone();
         i.cascades = vec![ForeignKey {
             parent: ("db".into(), "kinds".into()),
@@ -1812,7 +1774,7 @@ mod tests {
                 keys_marker: None,
             },
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap();
         assert!(
@@ -1843,12 +1805,12 @@ mod tests {
             names: &["_key"],
             keys_marker: m,
         };
-        let plain = plan_access(base, id(None), "db", &catalog()).unwrap();
+        let plain = plan_access(base, id(None), "db", &linked_catalog()).unwrap();
         let with = plan_access(
             &format!("{base} WHERE i.id IN (:keys)"),
             id(Some(":keys")),
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap();
         assert_eq!(with.plan.where_sql, None);
@@ -1873,7 +1835,7 @@ mod tests {
                 keys_marker: Some(":keys"),
             },
             "db",
-            &catalog(),
+            &linked_catalog(),
         );
         assert!(p.is_ok(), "{:?}", p.err());
     }
@@ -1889,7 +1851,7 @@ mod tests {
                 keys_marker: Some(":keys"),
             },
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap_err()
         .to_string();
@@ -1901,7 +1863,7 @@ mod tests {
                 keys_marker: Some(":keys"),
             },
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap_err()
         .to_string();
@@ -1936,7 +1898,7 @@ mod tests {
             "CREATE VIEW v AS SELECT i.id FROM items i",
             IdSpec::Unit,
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap();
         let want = AccessPlan::of(&plan("SELECT i.id FROM items i"));

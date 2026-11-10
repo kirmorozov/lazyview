@@ -15,9 +15,9 @@ mod monkey;
 
 use monkey::{ident_sql, map_words, needs_quote, Names, Quote, Role};
 
-use super::{catalog, corpus};
 use crate::analyze::{parse_definition, Mode, ViewPlan};
 use crate::analyzer::plan as analyzer_plan;
+use crate::catalog::test_catalog::{wide_catalog, VIEW_CORPUS};
 use crate::catalog::{Column, FkAction, ForeignKey, Generated, TableInfo, TableRef};
 
 type Catalog = HashMap<TableRef, Arc<TableInfo>>;
@@ -67,7 +67,7 @@ const FINDINGS: &[(&str, &str, bool)] = &[
 
 /// The catalog with cascading foreign keys (cascade routes are planned from them).
 fn cascading() -> Catalog {
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let fk = |child: &str, col: usize, parent: &str, on_delete| {
         let k = ("db".to_string(), child.to_string());
         let mut t = (*cat[&k]).clone();
@@ -97,7 +97,7 @@ fn generated() -> Catalog {
         });
         c
     };
-    let mut cat = catalog();
+    let mut cat = wide_catalog();
     let t = TableInfo {
         schema: "db".into(),
         name: "g1".into(),
@@ -527,10 +527,10 @@ fn analyzer_corpus() -> Vec<String> {
 }
 
 fn cases() -> Vec<(&'static str, Catalog, Vec<String>)> {
-    let corpus = corpus();
+    let corpus: Vec<String> = VIEW_CORPUS.iter().map(|s| s.to_string()).collect();
     vec![
-        ("base", catalog(), corpus.clone()),
-        ("analyzer", catalog(), analyzer_corpus()),
+        ("base", wide_catalog(), corpus.clone()),
+        ("analyzer", wide_catalog(), analyzer_corpus()),
         ("cascading", cascading(), corpus),
         (
             "generated",
