@@ -61,6 +61,10 @@ counters!(
     full_rebuilds,
     // Targets brought up to date from the changes kept for them (`retry_lag`).
     target_catchups,
+    // Crossings of the byte budget of the changes kept for targets that are behind: reported
+    // (a warn naming the view, the target and the estimate), never acted on — a target that
+    // is down keeps its keys until it catches up (see `Engine::lag_over_budget`).
+    lag_over_budget,
     // Failed refresh attempts of live views (each retried with backoff, never a rebuild).
     refresh_errors,
     definition_reloads,

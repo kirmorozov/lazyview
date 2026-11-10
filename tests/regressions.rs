@@ -3929,7 +3929,10 @@ fn reg_failing_refresh_retries_without_rebuild() {
 /// rebuild for a change it can trace). It keeps them now and catches up when it answers. The
 /// target refuses writes through a `BEFORE INSERT` trigger on the view's own table (1644 is
 /// neither an overload nor a connection error), so the sources are read and the changes traced
-/// the whole time; the engine runs unsupervised, as the failure is not congestion.
+/// the whole time; the engine runs unsupervised, as the failure is not congestion. The budget
+/// of the kept changes is set to one byte, so the target is also past it while it is down:
+/// passing the budget only warns and counts (`lag_over_budget`), nothing is dropped and the
+/// target is still not rebuilt.
 #[test]
 fn reg_down_target_keeps_its_keys() {
     scenario("reg_target_keys", |ctx| async move {
@@ -3938,7 +3941,10 @@ fn reg_down_target_keeps_its_keys() {
             Kind::Incremental,
             "SELECT id, grp, status FROM entities",
         )];
-        let ov = [("LAZYVIEW_SUPERVISOR", "off")];
+        let ov = [
+            ("LAZYVIEW_SUPERVISOR", "off"),
+            ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "1"),
+        ];
         let (db, mut eng) = setup(&ctx, "reg_target_keys", ENTITIES, &specs, &ov).await?;
         let mut c = db.conn().await?;
         let mut block = db.conn().await?;
@@ -3978,8 +3984,9 @@ fn reg_down_target_keeps_its_keys() {
         verify(&ctx, &mut eng, &db, &specs, "after the target answered").await?;
         let d = eng.snapshot().since(&before);
         ensure!(
-            d.full_rebuilds == 0 && d.target_catchups >= 1,
-            "the target must catch up from the changes kept for it, never be rebuilt: {}",
+            d.full_rebuilds == 0 && d.target_catchups >= 1 && d.lag_over_budget == 1,
+            "the target must catch up from the changes kept for it, past the budget and never \
+             rebuilt (the budget pass warns and counts once): {}",
             fmt_snapshot(&d)
         );
         eng.stop().await

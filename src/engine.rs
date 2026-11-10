@@ -360,9 +360,26 @@ struct Lag {
     failures: u32,
     retry_at: Instant,
     /// Reported down (`Down`): excluded from the refresh's targets and retried here, with its
-    /// keys kept. A down target's `since` needs no binlog replay (its changes are applied by
-    /// re-reading the sources by key), so it does not hold the saved position back.
+    /// keys kept. Its kept keys live only in memory, so the saved position waits for its
+    /// `since` (`pending_floor`) and a restart replays the outage rather than losing them.
     down: bool,
+}
+
+/// Lowers `floor` to `p` when that is a known position older than it.
+fn lower_pos(floor: &mut Position, p: Option<&Position>) {
+    if let Some(p) = p.filter(|p| !p.file.is_empty() && **p < *floor) {
+        *floor = p.clone();
+    }
+}
+
+/// Lowers `floor` to the oldest `since` among the changes kept for targets that are behind,
+/// a target reported down included. The kept keys live only in memory, so the saved position
+/// waits for them and a restart replays the outage from the binlog, rebuilding the same key
+/// sets, instead of leaving that target silently stale.
+fn lag_floor(floor: &mut Position, lag: &BTreeMap<String, Lag>) {
+    for g in lag.values() {
+        lower_pos(floor, Some(&g.since));
+    }
 }
 
 /// A target the view could not be built on (unreachable, refused): retried by a partial build,
@@ -640,6 +657,10 @@ struct Engine {
     build_slots: Arc<tokio::sync::Semaphore>,
     leader: coord::Leadership,
     ready_logged: bool,
+    /// The warn for the changes kept for targets that are behind passing their budget was
+    /// emitted: one warn and one count per crossing of `LAG_HOLD_BYTES`, not per housekeeping
+    /// tick (re-armed when the estimate falls back within the budget).
+    lag_budget_warned: bool,
     /// Live views refreshed since `refreshed_at` was last bumped.
     refreshed: HashSet<String>,
     last_touch: Instant,
@@ -686,12 +707,13 @@ const BUILD_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
 const XA_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
 
 /// Byte budget of the changes kept for targets that are behind (their unit keys, all views and
-/// targets together). A target that is down has nothing that drains them while it is
-/// unreachable, so the reader cannot wait for it — and nothing is dropped or rebuilt past it
-/// either: the keys are sets, bounded by the distinct ids the view's units can hold, so a down
-/// target keeps them until it catches up. Past this budget the engine only reports (a
-/// rate-limited warn naming the view and target, and `metrics::over_budget_lag`); the saved
-/// position waits for the kept keys (`Engine::pending_floor`), so a restart replays the outage.
+/// targets together; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). A target that is down has nothing
+/// that drains them while it is unreachable, so the reader cannot wait for it — and nothing is
+/// dropped or rebuilt past it either: the keys are sets, bounded by the distinct ids the view
+/// can have, so a down target keeps them until it catches up. Past this budget the engine only
+/// reports (a warn per crossing naming the view, the target and the estimate, and the
+/// `lag_over_budget` counter); the saved position waits for the kept keys
+/// (`Engine::pending_floor`), so a restart replays the outage instead of losing them.
 const LAG_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
 /// Estimated memory of one buffered integer id, and of any other key, row image or mark (hash
 /// slot, boxed datums and a short value; wide images count low).
@@ -1002,6 +1024,7 @@ impl Engine {
             build_slots: Arc::new(tokio::sync::Semaphore::new(cfg_build_concurrency)),
             leader,
             ready_logged: false,
+            lag_budget_warned: false,
             refreshed: HashSet::new(),
             last_touch: Instant::now(),
             last_stats: (Instant::now(), Default::default()),
@@ -3319,9 +3342,13 @@ impl Engine {
                 self.meta_failed(e, "checking the leadership lock").await?;
             }
         }
-        // The changes kept for targets that are behind are bounded; see `drop_oldest_lag_keys`.
-        if let Some(held) = self.lag_over_budget() {
-            self.drop_oldest_lag_keys(held).await;
+        // The changes kept for targets that are behind are bounded: past the budget the engine
+        // only reports (`lag_over_budget`) — nothing is dropped and nothing is rebuilt, the
+        // saved position waits for the kept keys instead (`pending_floor`).
+        match self.lag_over_budget() {
+            Some(held) if !self.lag_budget_warned => self.report_lag_over_budget(held),
+            Some(_) => {}
+            None => self.lag_budget_warned = false,
         }
         Ok(())
     }
@@ -3398,26 +3425,21 @@ impl Engine {
 
     /// Oldest replay position of a change not yet applied to a maintained table: a restart from
     /// here re-reads everything still pending. Views in error do not hold it back (they are
-    /// rebuilt after a restart), neither do lagging targets once they are reported down. With
-    /// `held`, also the oldest change whose images are remembered for later lookups (applied,
-    /// but a restart must read them again to have them; see [`Lookback`]).
+    /// rebuilt after a restart). A target that is behind does, whether or not it was reported
+    /// down: the keys kept for it live only in memory, so the saved position waits for them and
+    /// a restart replays the outage into them (see [`lag_floor`]). With `held`, also the oldest
+    /// change whose images are remembered for later lookups (applied, but a restart must read
+    /// them again to have them; see [`Lookback`]).
     fn pending_floor(&self, held: bool) -> Position {
         let mut floor = self.boundary.clone();
-        let mut lower = |p: Option<&Position>| {
-            if let Some(p) = p.filter(|p| !p.file.is_empty() && **p < floor) {
-                floor = p.clone();
-            }
-        };
         for s in self.slots.iter().filter(|s| s.error.is_none()) {
-            lower(s.stale_since.as_ref());
+            lower_pos(&mut floor, s.stale_since.as_ref());
             if let Some(l) = s.live.as_ref().filter(|l| !l.frozen) {
-                lower(l.since.as_ref());
+                lower_pos(&mut floor, l.since.as_ref());
                 if held {
-                    lower(l.recent.floor());
+                    lower_pos(&mut floor, l.recent.floor());
                 }
-                for lag in l.lag.values().filter(|g| !g.down) {
-                    lower(Some(&lag.since));
-                }
+                lag_floor(&mut floor, &l.lag);
             }
         }
         floor
@@ -3685,9 +3707,12 @@ impl Engine {
     }
 
     /// The estimated bytes kept for targets that are behind, when they exceed their budget
-    /// ([`LAG_HOLD_BYTES`]). One pass over the slots; called from `housekeeping`, never per
-    /// event and never per flush.
+    /// ([`LAG_HOLD_BYTES`]; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). One pass over the slots;
+    /// called from `housekeeping`, never per event and never per flush. The budget is a
+    /// reporting threshold only: passing it drops nothing and rebuilds nothing (see
+    /// [`Self::report_lag_over_budget`]).
     fn lag_over_budget(&self) -> Option<usize> {
+        let budget = self.cfg.test_lag_hold_bytes.unwrap_or(LAG_HOLD_BYTES);
         let held: usize = self
             .slots
             .iter()
@@ -3695,42 +3720,35 @@ impl Engine {
             .flat_map(|l| l.lag.values())
             .map(|g| units_bytes(&g.units, &g.partial))
             .sum();
-        (held > LAG_HOLD_BYTES).then_some(held)
+        (held > budget).then_some(held)
     }
 
-    /// The budget of the changes kept for targets that are behind was reached: drops the keys of
-    /// the target that has been behind longest **and is reported down** (a target that is merely
-    /// lagging catches up on its next success, so its keys are never dropped) and reports it
-    /// down, so `retry_down` rebuilds it there. One target per housekeeping tick.
-    async fn drop_oldest_lag_keys(&mut self, held: usize) {
-        let mut best: Option<(usize, String, Position)> = None;
-        for (i, s) in self.slots.iter().enumerate() {
+    /// The budget of the changes kept for targets that are behind was passed: report only, take
+    /// no action. A target that is down has nothing draining its keys while it is unreachable,
+    /// but they are sets, bounded by the distinct ids the view can have, so it keeps them until
+    /// it catches up; the saved position waits for them ([`lag_floor`]), so a restart replays
+    /// the outage instead of losing the changes silently. Names the target that has been behind
+    /// longest: it is the one keeping keys the longest, usually the unreachable one. Called
+    /// once per crossing (the `lag_budget_warned` latch), not per housekeeping tick.
+    fn report_lag_over_budget(&mut self, held: usize) {
+        self.lag_budget_warned = true;
+        Metrics::add(&self.metrics.lag_over_budget, 1);
+        let budget = self.cfg.test_lag_hold_bytes.unwrap_or(LAG_HOLD_BYTES);
+        let mut best: Option<(String, String)> = None;
+        let mut oldest: Option<Position> = None;
+        for s in self.slots.iter() {
             let Some(l) = s.live.as_ref() else { continue };
-            for (t, g) in l.lag.iter().filter(|(_, g)| g.down) {
-                if best.as_ref().is_none_or(|(_, _, p)| g.since < *p) {
-                    best = Some((i, t.clone(), g.since.clone()));
+            for (t, g) in &l.lag {
+                if oldest.as_ref().is_none_or(|p| g.since < *p) {
+                    oldest = Some(g.since.clone());
+                    best = Some((l.name.clone(), t.clone()));
                 }
             }
         }
-        let Some((i, t, since)) = best else {
-            return;
-        };
-        let (name, plan) = {
-            let l = self.slots[i].live.as_ref().expect("found above");
-            (l.name.clone(), l.plan.clone())
-        };
-        warn!(view = %name, target = %t, buffered_mib = held >> 20, "the changes kept for this target exceed their budget; it is rebuilt when it answers");
-        if let Some(l) = self.slots[i].live.as_mut() {
-            l.lag.remove(&t);
-            l.targets.retain(|x| *x != t);
+        if let Some((view, target)) = best {
+            warn!(view = %view, target = %target, buffered_mib = held >> 20,
+                "the changes kept for this target exceed their {budget} byte budget; they are kept until it catches up, and the saved position waits for them");
         }
-        let e = anyhow!(
-            "its buffered changes exceeded their {} byte budget",
-            LAG_HOLD_BYTES
-        );
-        self.target_down(i, &name, &t, Some(&plan), &e).await;
-        debug!(view = %name, target = %t, since = %since, "dropped the changes kept for this target");
-        self.rebuild_routes();
     }
 
     fn key_count(&self) -> usize {
@@ -6108,6 +6126,49 @@ mod tests {
         assert_eq!(BUILD_HOLD_BYTES, 256 << 20);
         assert_eq!(XA_HOLD_BYTES, 256 << 20);
         assert_eq!(LAG_HOLD_BYTES, 256 << 20);
+    }
+
+    fn lag(since: (&str, u64), down: bool) -> Lag {
+        Lag {
+            units: UnitSet::default(),
+            partial: Vec::new(),
+            all: false,
+            since: Position {
+                file: since.0.to_string(),
+                pos: since.1,
+            },
+            failures: 0,
+            retry_at: Instant::now(),
+            down,
+        }
+    }
+
+    /// The saved position waits for a lagging target reported down (`pending_floor` keeps
+    /// every `lag_floor` entry): its kept keys live only in memory, so a restart must replay
+    /// the outage into them instead of leaving the target silently stale.
+    #[test]
+    fn the_saved_position_waits_for_a_down_target() {
+        let mut floor = Position {
+            file: "binlog.000009".to_string(),
+            pos: 500,
+        };
+        let lag: BTreeMap<String, Lag> = [
+            ("t2", lag(("binlog.000003", 42), false)),
+            ("t1", lag(("binlog.000002", 7), true)),
+        ]
+        .into_iter()
+        .map(|(t, g)| (t.to_string(), g))
+        .collect();
+        assert!(lag["t1"].down);
+        lag_floor(&mut floor, &lag);
+        assert_eq!(
+            floor,
+            Position {
+                file: "binlog.000002".to_string(),
+                pos: 7
+            },
+            "the down target's `since` holds the saved position back"
+        );
     }
 
     fn server(code: u16) -> anyhow::Error {
