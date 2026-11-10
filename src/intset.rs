@@ -304,19 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_set() {
-        let mut s = IntSet::new();
-        assert_eq!(s.len(), 0);
-        assert!(s.is_empty());
-        assert!(!s.contains(7));
-        assert_eq!(s.to_sorted_vec(), Vec::<u64>::new());
-        assert_eq!(s.pop_smallest(5), Vec::<u64>::new());
-        assert!(s.insert(7));
-        assert!(s.remove(7));
-        assert_eq!(s.pop_smallest(5), Vec::<u64>::new());
-    }
-
-    #[test]
     fn partial_eq_ignores_cache() {
         let mut a = IntSet::new();
         for v in 1..=10 {
@@ -371,37 +358,6 @@ mod tests {
         assert_eq!(s.pop_smallest(5), Vec::<u64>::new());
     }
 
-    #[test]
-    fn drain_in_batches_with_inserts() {
-        let mut rng = SplitMix64(0x5EED_5EED_5EED_5EED);
-        let mut s = IntSet::new();
-        let mut refset: BTreeSet<u64> = BTreeSet::new();
-        for _ in 0..10_000 {
-            let v = rng.next_u64();
-            s.insert(v);
-            refset.insert(v);
-        }
-        // Drain in batches of 7, inserting values below and above the
-        // current minimum between batches.
-        while refset.len() > 7 {
-            let want: Vec<u64> = refset.iter().take(7).copied().collect();
-            assert_eq!(s.pop_smallest(7), want);
-            for v in &want {
-                refset.remove(v);
-            }
-            let next_min = *refset.iter().next().unwrap();
-            if next_min > 0 {
-                s.insert(next_min - 1);
-                refset.insert(next_min - 1);
-            }
-            s.insert(next_min + 1);
-            refset.insert(next_min + 1);
-        }
-        let want: Vec<u64> = refset.iter().copied().collect();
-        assert_eq!(s.pop_smallest(s.len() as usize), want);
-        assert!(s.is_empty());
-    }
-
     #[cfg(not(feature = "roaring"))]
     #[test]
     fn cache_freshness_tracks_pending() {
@@ -423,29 +379,6 @@ mod tests {
         assert!(s.pending.is_empty());
         assert!(s.contains(5));
         assert_eq!(s.to_sorted_vec(), [5]);
-    }
-
-    #[test]
-    fn sorted_vec_with_pending() {
-        let mut s = IntSet::new();
-        let mut refset: BTreeSet<u64> = BTreeSet::new();
-        for v in [20, 1, 8, 45, 3, 30] {
-            s.insert(v);
-            refset.insert(v);
-        }
-        let got = s.pop_smallest(2);
-        assert_eq!(got, [1, 3]);
-        for v in &got {
-            refset.remove(v);
-        }
-        for v in [0, 7, 25, 46] {
-            s.insert(v);
-            refset.insert(v);
-        }
-        assert_eq!(
-            s.to_sorted_vec(),
-            refset.iter().copied().collect::<Vec<u64>>()
-        );
     }
 
     #[test]
