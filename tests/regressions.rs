@@ -3924,6 +3924,68 @@ fn reg_failing_refresh_retries_without_rebuild() {
     });
 }
 
+/// A target that failed five writes was reported down and then *rebuilt*, although lazyview
+/// still knew exactly which units it owed (owner rule: an incremental view never falls back to a
+/// rebuild for a change it can trace). It keeps them now and catches up when it answers. The
+/// target refuses writes through a `BEFORE INSERT` trigger on the view's own table (1644 is
+/// neither an overload nor a connection error), so the sources are read and the changes traced
+/// the whole time; the engine runs unsupervised, as the failure is not congestion.
+#[test]
+fn reg_down_target_keeps_its_keys() {
+    scenario("reg_target_keys", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_entities",
+            Kind::Incremental,
+            "SELECT id, grp, status FROM entities",
+        )];
+        let ov = [("LAZYVIEW_SUPERVISOR", "off")];
+        let (db, mut eng) = setup(&ctx, "reg_target_keys", ENTITIES, &specs, &ov).await?;
+        let mut c = db.conn().await?;
+        let mut block = db.conn().await?;
+        let before = eng.snapshot();
+        exec(
+            &mut block,
+            "CREATE TRIGGER lv_block BEFORE INSERT ON r_entities FOR EACH ROW \
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'lazyview test: the target refuses writes'",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "INSERT INTO entities VALUES (20, 4, 'held'), (21, 4, 'held')",
+        )
+        .await?;
+        // Five failed retries (1 s doubling, 30 s cap) report the target down.
+        let t = std::time::Instant::now();
+        loop {
+            eng.check_alive()?;
+            let rows = view_state(&mut c, "r_entities").await?;
+            if rows.iter().any(|r| r.state == "error") {
+                break;
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(150),
+                "the target was never reported down: {rows:?}; {}",
+                fmt_snapshot(&eng.snapshot().since(&before))
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // Changes while it is down are kept with the ones it already owes.
+        exec(&mut c, "INSERT INTO entities VALUES (22, 5, 'more')").await?;
+        exec(&mut block, "DROP TRIGGER lv_block").await?;
+        // The target is retried at the capped backoff (up to 30 s), so its `error` row outlives
+        // `wait_ready`'s 5 s grace: tolerate it here, the assertions below still require `ready`.
+        wait_ready_tolerant(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "after the target answered").await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0 && d.target_catchups >= 1,
+            "the target must catch up from the changes kept for it, never be rebuilt: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await
+    });
+}
+
 /// Writes to `entities` (unless `links_only`) and `links` until `stop`: inserts into both,
 /// flips the status of existing entities. Ids come from `seq`.
 async fn churn(

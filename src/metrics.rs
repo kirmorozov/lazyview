@@ -59,6 +59,8 @@ counters!(
     mv_rows_upserted,
     mv_rows_deleted,
     full_rebuilds,
+    // Targets brought up to date from the changes kept for them (`retry_lag`).
+    target_catchups,
     // Failed refresh attempts of live views (each retried with backoff, never a rebuild).
     refresh_errors,
     definition_reloads,
