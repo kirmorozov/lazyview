@@ -297,7 +297,7 @@ fn ids<U, S: Sink<U>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dedup::testkit::{plan, row, Rec};
+    use crate::dedup::testkit::{plan, row, row_typed, Cell, Rec};
 
     fn table_ref(name: &str) -> TableRef {
         ("db".into(), name.into())
@@ -317,6 +317,23 @@ mod tests {
         let mut hops = Hops::new(1000);
         c.add(0, 0, &p, &ap, &spaces, &mut hops).unwrap();
         (C { c, hops }, ap)
+    }
+
+    /// Compiles every `(target, sql)` into one consumer, in the given order.
+    fn compile_all(plans: &[(usize, &str)]) -> (C, Vec<AccessPlan>) {
+        let mut c = Consumer::default();
+        let mut hops = Hops::new(1000);
+        let aps = plans
+            .iter()
+            .map(|(t, sql)| {
+                let p = plan(sql);
+                let ap = AccessPlan::of(&p);
+                let spaces = Spaces::of(p.unit_exprs.len(), &p.partial.sets);
+                c.add(*t, 0, &p, &ap, &spaces, &mut hops).unwrap();
+                ap
+            })
+            .collect();
+        (C { c, hops }, aps)
     }
 
     const DIRECT: &str = "SELECT i.id, i.kind_id FROM items i";
@@ -463,6 +480,130 @@ mod tests {
     }
 
     #[test]
+    fn composite_ids_are_tuples() {
+        // The view id is two columns: every id reaches the sink's tuple hook.
+        let (mut x, _) = compile("SELECT l.child_id, l.parent_id FROM item_links l");
+        let s =
+            x.c.source(&table_ref("item_links"), Some(2))
+                .expect("watched");
+        let mut rec = Rec::default();
+        // Insert [3, 4].
+        x.c.row(
+            &s,
+            None,
+            Some(&row_typed(&[Cell::Int(3), Cell::Int(4)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(rec.ints(0, SpaceId::FULL).is_empty(), "{rec:?}");
+        assert_eq!(
+            rec.tuples(0, SpaceId::FULL),
+            vec![(vec![Datum::Int(3), Datum::Int(4)], Op::Insert)]
+        );
+        // Update [3, 4] to [3, 5]: the old tuple goes, the new one comes.
+        x.c.row(
+            &s,
+            Some(&row_typed(&[Cell::Int(3), Cell::Int(4)])),
+            Some(&row_typed(&[Cell::Int(3), Cell::Int(5)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        // Delete [3, 5].
+        x.c.row(
+            &s,
+            Some(&row_typed(&[Cell::Int(3), Cell::Int(5)])),
+            None,
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.tuples(0, SpaceId::FULL),
+            vec![
+                (vec![Datum::Int(3), Datum::Int(4)], Op::Insert),
+                (vec![Datum::Int(3), Datum::Int(4)], Op::Delete),
+                (vec![Datum::Int(3), Datum::Int(5)], Op::Insert),
+                (vec![Datum::Int(3), Datum::Int(5)], Op::Delete),
+            ]
+        );
+        assert!(rec.ints(0, SpaceId::FULL).is_empty(), "{rec:?}");
+    }
+
+    #[test]
+    fn a_string_id_is_a_tuple() {
+        // One id column, not an integer: still a tuple, never an int.
+        let (mut x, _) = compile("SELECT s.slug, s.kind_id FROM slugs s");
+        let s = x.c.source(&table_ref("slugs"), Some(2)).expect("watched");
+        let mut rec = Rec::default();
+        x.c.row(
+            &s,
+            None,
+            Some(&row_typed(&[Cell::Text("abc"), Cell::Int(7)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(rec.ints(0, SpaceId::FULL).is_empty(), "{rec:?}");
+        assert_eq!(
+            rec.tuples(0, SpaceId::FULL),
+            vec![(vec![Datum::Bytes(b"abc".to_vec())], Op::Insert)]
+        );
+    }
+
+    #[test]
+    fn an_unsigned_id_above_i64_max_is_a_tuple() {
+        // The split is on the decoded Datum: an UNSIGNED BIGINT above i64::MAX decodes to
+        // Datum::UInt, so the sink's tuple hook fires; one that fits an i64 stays the int hook.
+        const OVER: u64 = 1 << 63;
+        let (mut x, _) = compile("SELECT c.id, c.kind_id FROM counters c");
+        let s =
+            x.c.source(&table_ref("counters"), Some(2))
+                .expect("watched");
+        let mut rec = Rec::default();
+        x.c.row(
+            &s,
+            None,
+            Some(&row_typed(&[Cell::UInt(OVER), Cell::Int(7)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(rec.ints(0, SpaceId::FULL).is_empty(), "{rec:?}");
+        assert_eq!(
+            rec.tuples(0, SpaceId::FULL),
+            vec![(vec![Datum::UInt(OVER)], Op::Insert)]
+        );
+        x.c.row(
+            &s,
+            None,
+            Some(&row_typed(&[Cell::UInt(5), Cell::Int(7)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(rec.ints(0, SpaceId::FULL), vec![(5, Op::Insert)]);
+        assert_eq!(
+            rec.tuples(0, SpaceId::FULL),
+            vec![(vec![Datum::UInt(OVER)], Op::Insert)],
+            "the above-i64::MAX id is still the only tuple"
+        );
+    }
+
+    #[test]
+    fn a_smallint_id_stays_the_int_hook() {
+        // A narrower signed type is still one Datum::Int: the int hook, with its value. A
+        // negative value catches a decode that mistook it for unsigned (65533 then).
+        let (mut x, _) = compile("SELECT t.code, t.kind_id FROM tags t");
+        let s = x.c.source(&table_ref("tags"), Some(2)).expect("watched");
+        let mut rec = Rec::default();
+        x.c.row(
+            &s,
+            None,
+            Some(&row_typed(&[Cell::Int(-3), Cell::Int(7)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(rec.ints(0, SpaceId::FULL), vec![(-3, Op::Insert)]);
+        assert!(rec.tuples(0, SpaceId::FULL).is_empty(), "{rec:?}");
+    }
+
+    #[test]
     fn shape_mismatch_skips_the_occurrence() {
         let (mut x, _) = compile(DIRECT);
         let s = x.c.source(&table_ref("items"), Some(4)).expect("watched");
@@ -521,6 +662,80 @@ mod tests {
             );
         }
         assert!(rec.rows.is_empty() && rec.ids.is_empty(), "{rec:?}");
+    }
+
+    #[test]
+    fn two_targets_share_a_source_table() {
+        const KEY_98: &str =
+            "SELECT i.id, v.val FROM items i JOIN item_values v ON v.item_id = i.id \
+                            AND v.key_id = 98 AND v.scope_id = 0";
+        // Target 1 first, then 0, then 1 again: its skipped targets come out unsorted with a
+        // duplicate.
+        let (mut x, _aps) = compile_all(&[(1, FILTERED), (0, DIRECT), (1, KEY_98)]);
+        let items = table_ref("items");
+        assert!(x.c.watched(&items), "both targets watch items");
+        assert!(
+            x.c.watched(&table_ref("item_values")),
+            "target 1's joined table is watched too"
+        );
+        // One row change: both targets' occurrences of items see it, in occurrence order.
+        let s = x.c.source(&items, Some(3)).expect("watched");
+        let mut rec = Rec::default();
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(1), Some(7), Some(0)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(rec.rows, vec![(1, false), (0, false), (1, false)]);
+        assert_eq!(rec.ints(0, SpaceId::FULL), vec![(1, Op::Insert)]);
+        assert_eq!(
+            rec.ints(1, SpaceId::FULL),
+            vec![(1, Op::Insert), (1, Op::Insert)]
+        );
+        // A TABLE_MAP of another shape: occurrences 1, 0 and 1 are all skipped, and the skip
+        // entries come out ascending, once each.
+        let s = x.c.source(&items, Some(4)).expect("watched");
+        assert_eq!(x.c.mismatched(&s), vec![0, 1]);
+        let mut rec = Rec::default();
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(1), Some(7), Some(0), Some(0)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(rec.rows.is_empty() && rec.ids.is_empty(), "{rec:?}");
+        // remove(0) keeps every occurrence of target 1.
+        x.c.remove(0);
+        assert!(x.c.watched(&items), "target 1 still watches items");
+        assert!(
+            x.c.watched(&table_ref("item_values")),
+            "target 1 still watches item_values"
+        );
+        let s = x.c.source(&items, Some(3)).expect("watched");
+        let mut rec = Rec::default();
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(2), Some(7), Some(0)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(rec.rows, vec![(1, false), (1, false)]);
+        assert!(rec.ints(0, SpaceId::FULL).is_empty(), "{rec:?}");
+        assert_eq!(
+            rec.ints(1, SpaceId::FULL),
+            vec![(2, Op::Insert), (2, Op::Insert)]
+        );
+        // Only when the last target goes does the table stop being watched.
+        x.c.remove(1);
+        assert!(!x.c.watched(&items), "no occurrence of items is left");
+        assert!(
+            !x.c.watched(&table_ref("item_values")),
+            "no occurrence of item_values is left"
+        );
     }
 
     #[test]
