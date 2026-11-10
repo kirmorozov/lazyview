@@ -11,6 +11,7 @@ use crate::cascade;
 pub use crate::cascade::{kept_image, KeptRow};
 use crate::catalog::FkAction;
 use crate::datum::{Datum, Key};
+use crate::dedup::consumer::changed;
 use crate::intset::{self, IntSet};
 use crate::metrics::unix_now;
 use crate::stats::Tally;
@@ -453,13 +454,6 @@ pub enum Fed {
 
 fn value_at(row: &BinlogRow, c: usize) -> Option<&BinlogValue<'_>> {
     row.as_ref(c)
-}
-
-fn changed(before: &BinlogRow, after: &BinlogRow, mask: &[bool]) -> bool {
-    mask.iter().enumerate().any(|(c, &m)| {
-        m && (value_at(before, c) != value_at(after, c)
-            || matches!(value_at(after, c), Some(BinlogValue::JsonDiff(_))))
-    })
 }
 
 fn project(row: &BinlogRow, a: &AliasPlan, cols: &[usize]) -> Key {

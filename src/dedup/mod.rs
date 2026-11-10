@@ -4,12 +4,17 @@
 //! catalog, cascade, datum and intset. No logging, no environment, no IO, no tokio.
 
 pub mod buffer;
+pub mod consumer;
 pub mod hop;
 pub mod key;
 pub mod lane;
 pub mod stage;
 
+#[cfg(test)]
+pub(crate) mod testkit;
+
 pub use buffer::IdSet;
 pub use buffer::{Fact, Facts};
+pub use consumer::{Sink, Source};
 pub use key::{HopId, Item, Key, NoItem, NoJob, Op, SpaceId, Spaces};
 pub use lane::{JobId, Schedule};
