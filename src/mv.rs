@@ -30,8 +30,6 @@ const TEXT_PREFIX: u64 = 255;
 pub const MARKER_PREFIX: &str = "lazyview:v1 ";
 /// Name of the unique index over the row identity (see [`Layout::row_key`]).
 const ROW_INDEX: &str = "_lv_row";
-/// Row alias of upserts (`INSERT ... AS <alias> ON DUPLICATE KEY UPDATE`).
-const ROW_ALIAS: &str = "_lv_new";
 /// Estimated bytes per write statement unless configured (`LAZYVIEW_WRITE_BATCH_BYTES`).
 pub const DEFAULT_WRITE_BATCH_BYTES: usize = 4 << 20;
 
@@ -1242,51 +1240,6 @@ fn batches<T>(
     out
 }
 
-/// A multi-row INSERT of `n` rows; with `upsert`, rows whose key exists replace that row.
-fn insert_sql(
-    schema: &str,
-    table: &str,
-    layout: &Layout,
-    n: usize,
-    upsert: Option<Upsert>,
-) -> String {
-    let tuple = format!("({})", vec!["?"; layout.cols.len()].join(","));
-    let mut sql = format!(
-        "INSERT INTO {}.{} ({}) VALUES {}",
-        q(schema),
-        q(table),
-        layout.col_list(),
-        vec![tuple.as_str(); n].join(",")
-    );
-    // Every column is set, the key columns too: a collation-equal key takes the new bytes.
-    let set = |value: &dyn Fn(&str) -> String| {
-        layout
-            .cols
-            .iter()
-            .map(|c| format!("{} = {}", q(&c.name), value(&q(&c.name))))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    match upsert {
-        None => {}
-        Some(Upsert::RowAlias) => {
-            // (The row alias must differ from the table name.)
-            let alias = if table.eq_ignore_ascii_case(ROW_ALIAS) {
-                q(&format!("{ROW_ALIAS}_"))
-            } else {
-                q(ROW_ALIAS)
-            };
-            let updates = set(&|c| format!("{alias}.{c}"));
-            sql.push_str(&format!(" AS {alias} ON DUPLICATE KEY UPDATE {updates}"));
-        }
-        Some(Upsert::Values) => {
-            let updates = set(&|c| format!("VALUES({c})"));
-            sql.push_str(&format!(" ON DUPLICATE KEY UPDATE {updates}"));
-        }
-    }
-    sql
-}
-
 /// Multi-row parameterized INSERTs (upserts with `upsert`, see [`Layout::row_key`]), at most
 /// `w.batch_rows` rows and about `w.batch_bytes` bytes each.
 #[allow(clippy::too_many_arguments)]
@@ -1304,12 +1257,14 @@ pub async fn insert_rows<C: Queryable>(
     let text = 3 + 2 * layout.cols.len();
     let row_bytes = |r: &Vec<Value>| text + r.iter().map(value_bytes).sum::<usize>();
     for chunk in batches(rows, per, w.batch_bytes, row_bytes) {
-        let sql = insert_sql(
+        let sql = crate::target::insert_sql(
+            w.kind,
             schema,
             table,
             layout,
             chunk.len(),
             upsert.then_some(w.upsert),
+            upsert.then(|| layout.row_key()).flatten(),
         );
         let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
         conn.exec_drop(sql, params).await?;
@@ -2338,21 +2293,30 @@ mod tests {
             true,
         );
         assert_eq!(
-            insert_sql("s", "t", &l, 2, None),
+            crate::target::insert_sql(Kind::Mysql, "s", "t", &l, 2, None, None),
             "INSERT INTO `s`.`t` (`g`, `n`) VALUES (?,?),(?,?)"
         );
         assert_eq!(
-            insert_sql("s", "t", &l, 1, Some(Upsert::RowAlias)),
+            crate::target::insert_sql(Kind::Mysql, "s", "t", &l, 1, Some(Upsert::RowAlias), None),
             "INSERT INTO `s`.`t` (`g`, `n`) VALUES (?,?) AS `_lv_new` \
              ON DUPLICATE KEY UPDATE `g` = `_lv_new`.`g`, `n` = `_lv_new`.`n`"
         );
         assert_eq!(
-            insert_sql("s", "t", &l, 1, Some(Upsert::Values)),
+            crate::target::insert_sql(Kind::Mysql, "s", "t", &l, 1, Some(Upsert::Values), None),
             "INSERT INTO `s`.`t` (`g`, `n`) VALUES (?,?) \
              ON DUPLICATE KEY UPDATE `g` = VALUES(`g`), `n` = VALUES(`n`)"
         );
         assert!(
-            insert_sql("s", "_LV_NEW", &l, 1, Some(Upsert::RowAlias)).contains("AS `_lv_new_`"),
+            crate::target::insert_sql(
+                Kind::Mysql,
+                "s",
+                "_LV_NEW",
+                &l,
+                1,
+                Some(Upsert::RowAlias),
+                None
+            )
+            .contains("AS `_lv_new_`"),
             "the row alias differs from the table name"
         );
     }

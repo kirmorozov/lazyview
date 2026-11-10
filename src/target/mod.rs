@@ -5,7 +5,10 @@
 
 use anyhow::{bail, Result};
 
+use crate::mv::{Layout, Upsert};
+
 pub mod mysql;
+pub mod postgres;
 
 /// The family of one target instance. A source is always MySQL-family (`crate::config::Flavor`
 /// is the source's product; this is the target's).
@@ -37,5 +40,23 @@ impl Kind {
                 "invalid target DSN: scheme `{scheme}` is not mysql://, mariadb:// or postgres://"
             ),
         }
+    }
+}
+
+/// The multi-row INSERT of `n` rows into `table`, upserting by the row key with `upsert`.
+/// One dispatch per statement (never per row): the family's own function renders it.
+pub(crate) fn insert_sql(
+    kind: Kind,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    n: usize,
+    upsert: Option<Upsert>,
+    key: Option<&[usize]>,
+) -> String {
+    match kind {
+        // key is unused: MySQL's forms conflict against any unique key.
+        Kind::Mysql => mysql::insert_sql(schema, table, layout, n, upsert),
+        Kind::Postgres => postgres::insert_sql(schema, table, layout, n, key),
     }
 }
