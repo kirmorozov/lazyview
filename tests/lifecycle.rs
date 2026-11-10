@@ -386,6 +386,8 @@ fn lifecycle_drop_removed_false_keeps_table() {
         .await?;
         let mut sc = db.conn().await?;
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // Keep the fixed sleep: "nothing happened" is the assertion — the MV table must
+        // still exist after the engine has had time to (wrongly) drop it.
         tokio::time::sleep(Duration::from_secs(2)).await;
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
         ensure!(

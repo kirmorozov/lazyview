@@ -331,6 +331,8 @@ fn health_probe_transitions() {
             status(&a_addr, "/readyz").await? == 200,
             "active stays ready while a standby waits"
         );
+        // Keep the fixed sleep: the assertion is that nothing happens while the standby
+        // idles — only a fixed stretch of time shows whether the watchdog kills it.
         tokio::time::sleep(Duration::from_secs(3)).await;
         b.check_alive()?;
         assert_alive(&b_addr, "after waiting in standby").await?;

@@ -305,6 +305,8 @@ fn exclusive_killed_connections_are_not_fatal() {
                 &format!("INSERT INTO entities VALUES ({}, 5, 'new')", 200 + round),
             )
             .await?;
+            // Keep the fixed sleep: nothing must happen in this window — the engine must
+            // not exit after its sessions were killed; verify() below polls the recovery.
             tokio::time::sleep(Duration::from_secs(2)).await;
             eng.check_alive()
                 .with_context(|| format!("kill {round}: lazyview exited"))?;

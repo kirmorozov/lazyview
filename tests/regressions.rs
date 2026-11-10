@@ -1123,6 +1123,8 @@ fn reg_failed_full_rebuild_backs_off() {
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
         let before = eng.snapshot();
         exec_all(&mut c, &["UPDATE products SET sku = 'zz' WHERE id = 1"]).await?;
+        // Keep the fixed sleep: the assertion is that nothing (more) happens in this window —
+        // the retries must stay within the backoff rate, which only a fixed stretch of time shows.
         tokio::time::sleep(Duration::from_secs(4)).await;
         let d = eng.snapshot().since(&before);
         ensure!(
@@ -1365,9 +1367,33 @@ fn reg_crash_with_stale_full_view() {
         )
         .await?;
         let mut c = db.conn().await?;
+        // The crash must land after the update was consumed (incremental refresh) and the
+        // 50 ms save loop saved its position: poll for both instead of sleeping 2 s.
+        let saved: (String, String) = typed_first(
+            &mut c,
+            "SELECT CAST(binlog_file AS CHAR), CAST(binlog_pos AS CHAR) FROM _lazyview_status",
+        )
+        .await?
+        .context("no saved position")?;
         exec_all(&mut c, &["UPDATE orders SET status = 'void' WHERE id = 10"]).await?;
-        // Long enough for several position saves (and the incremental refresh).
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Poll for the save instead of sleeping 2 s. The save can only move once the update
+        // is consumed (the floor pins it to the update's start: the stale full view holds
+        // everything beyond back), so this covers the refresh too — no wait_caught_up here,
+        // the stale full view would hold `applied()` back for its whole 600 s cadence.
+        wait_until("the update's position saved to _lazyview_status", t_ready(), || {
+            let dsn = db.dsn.clone();
+            let saved = saved.clone();
+            async move {
+                let mut pc = connect(&dsn).await?;
+                let cur: Option<(String, String)> = typed_first(
+                    &mut pc,
+                    "SELECT CAST(binlog_file AS CHAR), CAST(binlog_pos AS CHAR) FROM _lazyview_status",
+                )
+                .await?;
+                Ok(cur != Some(saved))
+            }
+        })
+        .await?;
         eng.crash().await?;
         let mut eng = ctx.start_engine(&db, &[])?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
@@ -1548,6 +1574,8 @@ fn reg_held_back_position_does_not_spin() {
         exec_all(&mut c, &["UPDATE orders SET status = 'void' WHERE id = 10"]).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let before = eng.snapshot();
+        // Keep the fixed sleep: "nothing happens" is the assertion — no spinning (flushes
+        // stay below 200) within this 2 s window; a poll has no value to wait for.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let d = eng.snapshot().since(&before);
         ensure!(
@@ -3268,6 +3296,8 @@ fn reg_slow_planning_is_bounded() {
         exec(&mut c, "ALTER TABLE orders ADD COLUMN extra INT NULL").await?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
         verify(&ctx, &mut eng, &db, &specs, "after ALTER").await?;
+        // Keep the fixed sleep: nothing must happen in this window — a re-plan of the timed-out
+        // view would add a second timeout, and there is no value to poll for.
         tokio::time::sleep(Duration::from_secs(3)).await;
         let n = eng.snapshot().plans_timed_out;
         ensure!(n == 1, "planned again after timing out: {n} timeouts");

@@ -1011,7 +1011,21 @@ pub async fn verify_targets(
             Ok(())
         }
         Err(first) => {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // Poll the oracle comparison for up to 3 s instead of sleeping a fixed 3 s:
+            // a late-converging oracle settles as soon as it matches.
+            let _ = wait_until(
+                "the oracle to match after the first mismatch",
+                Duration::from_secs(3),
+                || {
+                    let (src, targets, specs) = (src, targets, specs);
+                    async move {
+                        Ok(oracle::check_views_targets(src, targets, specs)
+                            .await
+                            .is_ok())
+                    }
+                },
+            )
+            .await;
             engine.wait_caught_up(&mut sc, t_catchup()).await.ok();
             let again = oracle::check_views_targets(src, targets, specs).await;
             let verdict = match &again {
