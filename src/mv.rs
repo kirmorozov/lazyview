@@ -614,6 +614,9 @@ pub enum Upsert {
     RowAlias,
     /// `... ON DUPLICATE KEY UPDATE c = VALUES(c)` (MariaDB, which has no row alias; older MySQL).
     Values,
+    /// `INSERT ... ON CONFLICT (<row key>) DO UPDATE SET ...` (PostgreSQL; rendered by
+    /// `src/target/postgres.rs`, PR T4).
+    OnConflict,
 }
 
 /// Statement limits and upsert syntax of the writes to one server.

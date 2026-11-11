@@ -15,6 +15,20 @@ path = "src/main.rs"
 
 [dependencies]
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "binlog"] }
+# PostgreSQL targets (src/target/postgres.rs). rustls, not OpenSSL: the musl binaries of
+# `make cross` (Makefile:23,68-73) build `ring` already for mysql_async (Cargo.lock:
+# rustls 0.23.46, ring 0.17.14), so this adds no new C toolchain dependency; postgres-openssl
+# is deliberately not used. No `with-*` type features: values cross as PG text (see
+# src/target/postgres.rs), so chrono / serde_json / uuid are not needed.
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring", "webpki-roots"] }
+# The rustls already in Cargo.lock, named so `PgConn::connect` can build its `ClientConfig`
+# explicitly with the ring provider (the crate's `with_webpki_roots()` would use the
+# process-default provider); `webpki-roots` are its default roots and `rustls-pemfile` reads
+# an `sslrootcert` file (D11).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "1.0"
 sqlparser = { version = "0.63", features = ["visitor"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "net", "io-util"] }
 futures-util = "0.3"

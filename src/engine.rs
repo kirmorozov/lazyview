@@ -244,7 +244,7 @@ async fn connect_wait(
     loop {
         // A source connection: a source is always MySQL-family (`postgres://` is rejected for
         // `LAZYVIEW_DSN` in `crate::config`).
-        match connect(opts, target::Kind::Mysql, lock_wait_s).await {
+        match connect_source(opts, lock_wait_s).await {
             Ok(c) => {
                 if waited {
                     info!(
@@ -288,9 +288,9 @@ async fn connect_wait(
 struct Target {
     /// The target family, from the DSN's scheme.
     kind: target::Kind,
-    opts: Opts,
+    opts: target::Opts,
     schema: String,
-    conn: Option<Conn>,
+    conn: Option<target::Conn>,
     /// Statement limits and upsert syntax of this server (read with the connection).
     write: Option<mv::WriteOpts>,
     /// Session sql_mode of the connection (the supervisor's pooled connections set it too).
@@ -678,7 +678,7 @@ struct Engine {
 
 /// One connection attempt (TCP, TLS and handshake) is bounded well inside the liveness window:
 /// an unreachable host would otherwise hold the loop for the OS's SYN retries (~130 s).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Binlog dump connections: connect, register as a replica and request the stream.
 const BINLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -793,7 +793,18 @@ impl Drained {
 
 /// Opens a connection with the service's session settings of the target family `kind` (at most
 /// `lock_wait_s` for a table lock, see [`target::init_session`]).
-async fn connect(opts: &Opts, kind: target::Kind, lock_wait_s: u64) -> Result<Conn> {
+async fn connect_target(
+    opts: &target::Opts,
+    kind: target::Kind,
+    lock_wait_s: u64,
+) -> Result<target::Conn> {
+    // One dispatch per connection: the family is chosen there, once.
+    kind.connect(opts, lock_wait_s).await
+}
+
+/// Opens a *source* connection (always MySQL-family, §0.2) with the service's
+/// session settings of the MySQL target family.
+async fn connect_source(opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
     let mut c = match tokio::time::timeout(CONNECT_TIMEOUT, Conn::new(opts.clone())).await {
         Ok(r) => r?,
         Err(_) => bail!(
@@ -802,7 +813,7 @@ async fn connect(opts: &Opts, kind: target::Kind, lock_wait_s: u64) -> Result<Co
             opts.tcp_port()
         ),
     };
-    target::init_session(&mut c, kind, lock_wait_s).await?;
+    target::init_session(&mut c, target::Kind::Mysql, lock_wait_s).await?;
     Ok(c)
 }
 
@@ -913,7 +924,7 @@ impl Engine {
             SOURCE_TARGET.to_string(),
             Target {
                 kind: target::Kind::Mysql,
-                opts: src_opts.clone(),
+                opts: target::Opts::Mysql(src_opts.clone()),
                 schema: schema.clone(),
                 conn: None,
                 write: None,
@@ -923,9 +934,8 @@ impl Engine {
             },
         );
         for (name, dsn) in &cfg.targets {
-            let kind = target::Kind::from_dsn(dsn)?;
-            let opts = target::mysql::opts(dsn)?;
-            let ts = target::mysql::schema_of(&opts, &format!("target {name}"))?;
+            let (kind, opts) = target::opts(dsn)?;
+            let ts = target::schema_of(&opts, &format!("target {name}"))?;
             targets.insert(
                 name.clone(),
                 Target {
@@ -1635,7 +1645,7 @@ impl Engine {
 
     /// Re-establishes the source-read connection after a connection-class error.
     async fn heal_src(&mut self) {
-        match connect(&self.src_opts, target::Kind::Mysql, self.cfg.lock_wait_s).await {
+        match connect_source(&self.src_opts, self.cfg.lock_wait_s).await {
             Ok(c) => {
                 self.src = c;
                 // The new connection probes the commit order again (and re-creates a dropped
@@ -1654,7 +1664,7 @@ impl Engine {
     /// another instance took over meanwhile this one stops (`Err`). `Ok(false)`: still
     /// unreachable, try again later.
     async fn heal_meta(&mut self) -> Result<bool> {
-        let conn = connect(&self.src_opts, target::Kind::Mysql, self.cfg.lock_wait_s).await;
+        let conn = connect_source(&self.src_opts, self.cfg.lock_wait_s).await;
         self.metrics.beat();
         let mut conn = match conn {
             Ok(c) => c,
@@ -2070,7 +2080,7 @@ impl Engine {
 
     /// The write connection of target `t`, (re)connecting if needed. After a failed attempt the
     /// target fails fast until its backoff expires.
-    async fn target_conn(&mut self, t: &str) -> Result<&mut Conn> {
+    async fn target_conn(&mut self, t: &str) -> Result<&mut target::Conn> {
         let metrics = self.metrics.clone();
         let target = self
             .targets
@@ -2085,9 +2095,17 @@ impl Engine {
             }
             let (rows, bytes) = (self.cfg.write_batch_rows, self.cfg.write_batch_bytes);
             let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, async {
-                let mut c = connect(&target.opts, target.kind, self.cfg.lock_wait_s).await?;
-                let w = mv::write_opts(&mut c, target.kind, rows, bytes).await?;
-                let mode = session_sql_mode(&mut c).await?;
+                let mut c = connect_target(&target.opts, target.kind, self.cfg.lock_wait_s).await?;
+                let w = match &mut c {
+                    target::Conn::Mysql(c) => mv::write_opts(c, target.kind, rows, bytes).await?,
+                    target::Conn::Postgres(c) => c.write_opts(target.kind, rows, bytes).await?,
+                };
+                let mode = match &mut c {
+                    target::Conn::Mysql(c) => session_sql_mode(c).await?,
+                    // A PostgreSQL session has no sql_mode (its five SET statements are
+                    // `target::postgres::session_setup`).
+                    target::Conn::Postgres(_) => String::new(),
+                };
                 Ok::<_, anyhow::Error>((c, w, mode))
             })
             .await
@@ -2143,9 +2161,9 @@ impl Engine {
             // Columns as the layout's, and the unique index rows are upserted by (tables
             // built before upserts lack `_lv_row`: rebuilt once).
             let fits = match self.target_conn(&t).await {
-                Ok(conn) => match mv::table_columns(conn, kind, &ts, &name).await {
+                Ok(conn) => match mv::table_columns(conn.mysql()?, kind, &ts, &name).await {
                     Ok(c) if mv::layout_matches(kind, &layout, &c) => {
-                        mv::has_row_index(conn, kind, &ts, &name, &layout)
+                        mv::has_row_index(conn.mysql()?, kind, &ts, &name, &layout)
                             .await
                             .unwrap_or(false)
                     }
@@ -2213,7 +2231,9 @@ impl Engine {
         let ts = self.targets[t].schema.clone();
         let kind = self.targets[t].kind;
         if let Ok(c) = self.target_conn(t).await {
-            let _ = mv::drop_table(c, kind, &ts, &mv::shadow_name(name)).await;
+            if let Ok(c) = c.mysql() {
+                let _ = mv::drop_table(c, kind, &ts, &mv::shadow_name(name)).await;
+            }
         }
     }
 
@@ -2518,8 +2538,10 @@ impl Engine {
                 let (ts, kind) = (t.schema.clone(), t.kind);
                 match self.target_conn(target).await {
                     Ok(c) => {
-                        if let Err(e) = mv::drop_table(c, kind, &ts, name).await {
-                            warn!("dropping {name}@{target}: {e:#}");
+                        if let Ok(c) = c.mysql() {
+                            if let Err(e) = mv::drop_table(c, kind, &ts, name).await {
+                                warn!("dropping {name}@{target}: {e:#}");
+                            }
                         }
                     }
                     Err(e) => warn!("dropping {name}@{target}: {e:#}"),
@@ -4497,10 +4519,14 @@ impl Engine {
             }
             let timeout = self.cfg.target_timeout;
             let r = match self.target_conn(&t).await {
-                Ok(c) => match tokio::time::timeout(timeout, mv::swap(c, kind, &ts, &n.name)).await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow!("timed out after {timeout:?}")),
+                Ok(c) => match c.mysql() {
+                    Err(e) => Err(e),
+                    Ok(c) => {
+                        match tokio::time::timeout(timeout, mv::swap(c, kind, &ts, &n.name)).await {
+                            Ok(r) => r,
+                            Err(_) => Err(anyhow!("timed out after {timeout:?}")),
+                        }
+                    }
                 },
                 Err(e) => Err(e),
             };
@@ -5148,6 +5174,15 @@ impl Engine {
                 ));
                 continue;
             };
+            if target.kind == target::Kind::Postgres {
+                // The connect level is wired (PR T1); the writes land with T4 and the
+                // write pool (which would build a MySQL pool from these opts) with T5.
+                p.failed.push((
+                    t.clone(),
+                    anyhow!("PostgreSQL targets cannot be written yet (PRs T2-T5)"),
+                ));
+                continue;
+            }
             let (opts, schema) = (target.opts.clone(), target.schema.clone());
             let endpoint = self
                 .sup
@@ -5246,7 +5281,7 @@ impl Engine {
         };
         let r = match tokio::time::timeout(
             timeout,
-            mv::apply(c, &ts, table, layout, chunk, rows, &w, &metrics),
+            mv::apply(c.mysql()?, &ts, table, layout, chunk, rows, &w, &metrics),
         )
         .await
         {
@@ -5431,7 +5466,9 @@ impl Engine {
             let timeout = self.cfg.target_timeout;
             let r = match self.target_conn(t).await {
                 Ok(c) => {
-                    match tokio::time::timeout(timeout, c.exec(sql(&ts), params.clone())).await {
+                    match tokio::time::timeout(timeout, c.mysql()?.exec(sql(&ts), params.clone()))
+                        .await
+                    {
                         Ok(r) => r.map_err(anyhow::Error::from),
                         Err(_) => Err(anyhow!("timed out after {timeout:?}")),
                     }
@@ -5786,7 +5823,7 @@ const LAG_MAX_FAILURES: u32 = 5;
 /// One target of a build, with the ownership checks it needs there.
 struct BuildSpec {
     target: String,
-    opts: Opts,
+    opts: target::Opts,
     kind: target::Kind,
     schema: String,
     /// Ownership marker (table comment) of this view's tables: a table carrying it is ours
@@ -5831,7 +5868,7 @@ fn first_keyword(query: &str) -> &str {
 /// under the view's name. A target where that fails is left to the engine, which checks again
 /// and retries it as for any build.
 async fn swap_task(
-    targets: Vec<(String, Opts, String, target::Kind, Option<String>)>,
+    targets: Vec<(String, target::Opts, String, target::Kind, Option<String>)>,
     name: String,
     layout: Layout,
     tx: mpsc::UnboundedSender<BuildDone>,
@@ -5842,7 +5879,7 @@ async fn swap_task(
         let r = async {
             let mut c = match tokio::time::timeout(
                 TARGET_CONNECT_TIMEOUT * 3,
-                connect(&opts, kind, crate::config::DEFAULT_LOCK_WAIT_S),
+                connect_target(&opts, kind, crate::config::DEFAULT_LOCK_WAIT_S),
             )
             .await
             {
@@ -5858,7 +5895,7 @@ async fn swap_task(
             // A reader holding the old table's metadata lock: wait for it a while.
             let mut attempts = 0;
             let r = loop {
-                match mv::swap(&mut c, kind, &schema, &name).await {
+                match mv::swap(c.mysql()?, kind, &schema, &name).await {
                     Err(e) if server_code(&e) == Some(1205) && attempts < 12 => {
                         attempts += 1;
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -5890,12 +5927,16 @@ async fn swap_task(
 /// Whether a table `name` exists that lazyview did not create for this view (`marker`, see
 /// [`mv::marker`]): a swap must never replace it.
 async fn foreign_table(
-    c: &mut Conn,
+    c: &mut target::Conn,
     kind: target::Kind,
     schema: &str,
     name: &str,
     marker: &str,
 ) -> bool {
+    let Ok(c) = c.mysql() else {
+        // A PostgreSQL target is never built before T3 (see `prepare_target`).
+        return false;
+    };
     mv::table_kind(c, kind, schema, name)
         .await
         .ok()
@@ -5915,35 +5956,39 @@ async fn prepare_target(
     name: &str,
     layout: &Layout,
     (batch_rows, batch_bytes): (usize, usize),
-) -> Result<(Conn, mv::WriteOpts)> {
+) -> Result<(target::Conn, mv::WriteOpts)> {
     let (t, ts) = (&spec.target, &spec.schema);
+    if spec.kind == target::Kind::Postgres {
+        // Its DDL, swap and writes land in T3/T4: refuse before connecting.
+        bail!("PostgreSQL targets cannot be built yet (PRs T2-T5)");
+    }
     let mut c = match tokio::time::timeout(
         TARGET_CONNECT_TIMEOUT * 3,
-        connect(&spec.opts, spec.kind, crate::config::DEFAULT_LOCK_WAIT_S),
+        connect_target(&spec.opts, spec.kind, crate::config::DEFAULT_LOCK_WAIT_S),
     )
     .await
     {
         Ok(r) => r.with_context(|| format!("connecting to target {t}"))?,
         Err(_) => bail!("connecting to target {t}: timed out"),
     };
-    let w = mv::write_opts(&mut c, spec.kind, batch_rows, batch_bytes)
+    let w = mv::write_opts(c.mysql()?, spec.kind, batch_rows, batch_bytes)
         .await
         .with_context(|| format!("target {t}"))?;
     let ours = |m: Option<String>| m.as_deref() == Some(spec.marker.as_str());
     if spec.check_side {
         for side in [mv::shadow_name(name), mv::old_name(name)] {
-            if mv::table_kind(&mut c, spec.kind, ts, &side)
+            if mv::table_kind(c.mysql()?, spec.kind, ts, &side)
                 .await?
                 .is_some()
-                && !ours(mv::table_marker(&mut c, spec.kind, ts, &side).await?)
+                && !ours(mv::table_marker(c.mysql()?, spec.kind, ts, &side).await?)
             {
                 bail!("refusing to build `{name}`: table `{ts}`.`{side}` on target {t} exists and was not created by lazyview for this view");
             }
         }
     }
     if spec.check_table {
-        if let Some(k) = mv::table_kind(&mut c, spec.kind, ts, name).await? {
-            if !ours(mv::table_marker(&mut c, spec.kind, ts, name).await?) {
+        if let Some(k) = mv::table_kind(c.mysql()?, spec.kind, ts, name).await? {
+            if !ours(mv::table_marker(c.mysql()?, spec.kind, ts, name).await?) {
                 bail!(
                     "refusing to replace existing {} `{ts}`.`{name}` on target {t} that lazyview does not manage",
                     k.to_lowercase()
@@ -5951,7 +5996,7 @@ async fn prepare_target(
             }
         }
     }
-    mv::create_shadow_marked(&mut c, spec.kind, ts, name, layout, &spec.marker)
+    mv::create_shadow_marked(c.mysql()?, spec.kind, ts, name, layout, &spec.marker)
         .await
         .with_context(|| format!("creating the shadow table on target {t}"))?;
     Ok((c, w))
@@ -6000,7 +6045,7 @@ async fn build_task(
         if let Some(d) = test_delay {
             tokio::time::sleep(d).await;
         }
-        let mut src = connect(&src_opts, target::Kind::Mysql, lock_wait_s).await?;
+        let mut src = connect_source(&src_opts, lock_wait_s).await?;
         let layout = mv::probe(&mut src, &src_schema, &plan).await?;
         // The cascade cache is read on the source before the table is filled, so that no
         // cascade falls between the two reads: the binlog this version replays holds the rest.
@@ -6015,14 +6060,14 @@ async fn build_task(
             }
         }
         if !conns.is_empty() {
-            let mut bt: Vec<BuildTarget> = conns
-                .iter_mut()
-                .map(|(c, s, w)| BuildTarget {
-                    conn: c,
+            let mut bt: Vec<BuildTarget> = Vec::new();
+            for (c, s, w) in conns.iter_mut() {
+                bt.push(BuildTarget {
+                    conn: c.mysql()?,
                     schema: s.clone(),
                     write: *w,
-                })
-                .collect();
+                });
+            }
             let n = mv::fill(&mut src, &plan, &layout, &mut bt, &name, batch.0, &metrics).await?;
             debug!(view = %name, rows = n, "build finished");
         }
@@ -6041,7 +6086,7 @@ async fn build_task(
                 debug!(view = %name, target = %spec.target, "swap left to the engine: a table appeared during the build");
                 continue;
             }
-            match mv::swap(c, spec.kind, ts, &name).await {
+            match mv::swap(c.mysql()?, spec.kind, ts, &name).await {
                 Ok(()) => swapped.push(spec.target.clone()),
                 Err(e) => {
                     debug!(view = %name, target = %spec.target, "swap left to the engine: {e:#}")

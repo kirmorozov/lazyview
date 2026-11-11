@@ -361,11 +361,14 @@ fn connection(
         None => assemble(&part, prefix)?,
     };
     dsn.map(|d| {
-        let mut d = finish_dsn(&d, tls.as_deref(), prefix, allow_pg)?;
+        let mut d = finish_dsn(&d, tls.as_deref(), prefix, allow_pg, ca.as_deref())?;
         if let Some(ca) = &ca {
-            d.push(if d.contains('?') { '&' } else { '?' });
-            d.push_str("tls_ca=");
-            d.push_str(&encode(ca));
+            // finish_pg_dsn mapped a PostgreSQL target's CA onto sslrootcert instead (D11).
+            if !d.starts_with("postgres") {
+                d.push(if d.contains('?') { '&' } else { '?' });
+                d.push_str("tls_ca=");
+                d.push_str(&encode(ca));
+            }
         }
         Ok(d)
     })
@@ -375,13 +378,18 @@ fn connection(
 /// Accepts `mariadb://` as an alias and appends TLS parameters for `<PREFIX>_TLS`. With
 /// `allow_pg` a `postgres://` / `postgresql://` DSN is a target's: the MySQL rewrites below
 /// skip it and [`finish_pg_dsn`] maps the TLS modes instead.
-fn finish_dsn(dsn: &str, tls: Option<&str>, prefix: &str, allow_pg: bool) -> Result<String> {
+fn finish_dsn(
+    dsn: &str,
+    tls: Option<&str>,
+    prefix: &str,
+    allow_pg: bool,
+    ca: Option<&str>,
+) -> Result<String> {
     // The mariadb:// rewrite and the TLS parameter block below are MySQL-only: a PG DSN
-    // (targets only) goes to finish_pg_dsn. The Kind::from_dsn gate rejects it until
-    // src/target/postgres.rs lands, so that call is unreachable in this PR.
+    // (targets only) goes to finish_pg_dsn, which maps the TLS modes and the CA file.
     if allow_pg && dsn.starts_with("postgres") {
         crate::target::Kind::from_dsn(dsn)?;
-        return finish_pg_dsn(dsn, tls, prefix);
+        return finish_pg_dsn(dsn, tls, prefix, ca);
     }
     let mut d = match dsn.strip_prefix("mariadb://") {
         Some(rest) => format!("mysql://{rest}"),
@@ -412,11 +420,10 @@ fn finish_dsn(dsn: &str, tls: Option<&str>, prefix: &str, allow_pg: bool) -> Res
     Ok(d)
 }
 
-/// Maps `<PREFIX>_TLS` onto `sslmode` for a `postgres://` target DSN (D11). Unreachable in
-/// this PR (`Kind::from_dsn` still rejects a PostgreSQL target); it lands with the seam so
-/// the family mapping is reviewed with it, and T1 completes the `TLS_CA` → `sslrootcert`
-/// handling when `src/target/postgres.rs` arrives.
-fn finish_pg_dsn(dsn: &str, tls: Option<&str>, prefix: &str) -> Result<String> {
+/// Maps `<PREFIX>_TLS` onto `sslmode` for a `postgres://` target DSN (D11) and appends
+/// `<PREFIX>_TLS_CA` as `sslrootcert` (`PgConn::connect` reads and strips it: tokio-postgres
+/// has no libpq).
+fn finish_pg_dsn(dsn: &str, tls: Option<&str>, prefix: &str, ca: Option<&str>) -> Result<String> {
     let mut d = dsn.to_string();
     let sslmode = match tls.map(|t| t.trim().to_ascii_lowercase()) {
         None => None,
@@ -435,6 +442,11 @@ fn finish_pg_dsn(dsn: &str, tls: Option<&str>, prefix: &str) -> Result<String> {
         d.push(if d.contains('?') { '&' } else { '?' });
         d.push_str("sslmode=");
         d.push_str(m);
+    }
+    if let Some(ca) = ca {
+        d.push(if d.contains('?') { '&' } else { '?' });
+        d.push_str("sslrootcert=");
+        d.push_str(&encode(ca));
     }
     Ok(d)
 }
@@ -556,6 +568,80 @@ mod tests {
     }
 
     #[test]
+    fn dsn_scheme_is_accepted_for_targets_only() {
+        // postgres:// and postgresql:// (libpq's own alias, D12) are target DSNs, verbatim.
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_TARGETS", "pg,pg2"),
+            ("LAZYVIEW_TARGET_PG_DSN", "postgres://a@b/d"),
+            ("LAZYVIEW_TARGET_PG2_DSN", "postgresql://a@b/d"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.targets.get("pg").map(String::as_str),
+            Some("postgres://a@b/d")
+        );
+        assert_eq!(
+            c.targets.get("pg2").map(String::as_str),
+            Some("postgresql://a@b/d")
+        );
+        // The source stays MySQL-family: a postgres:// LAZYVIEW_DSN still errors (the
+        // replica options are parsed with the MySQL URL parser, src/binlog.rs).
+        assert!(crate::binlog::replica_opts("postgres://a@b/d").is_err());
+    }
+
+    #[test]
+    fn pg_tls_modes_map_to_sslmode() {
+        let dsn = |tls: Option<&str>, ca: Option<&str>| {
+            let mut env: Vec<(&str, &str)> = vec![
+                ("LAZYVIEW_DSN", "x"),
+                ("LAZYVIEW_TARGETS", "b"),
+                ("LAZYVIEW_TARGET_B_DSN", "postgres://a@b/d"),
+            ];
+            if let Some(t) = tls {
+                env.push(("LAZYVIEW_TARGET_B_TLS", t));
+            }
+            if let Some(c) = ca {
+                env.push(("LAZYVIEW_TARGET_B_TLS_CA", c));
+            }
+            cfg(&env).unwrap().targets.get("b").cloned().unwrap()
+        };
+        assert!(dsn(Some("disabled"), None).ends_with("sslmode=disable"));
+        assert!(dsn(Some("required"), None).ends_with("sslmode=require"));
+        assert!(dsn(Some("verify-full"), None).ends_with("sslmode=verify-full"));
+        // A CA file without an explicit mode means full verification, and maps onto
+        // sslrootcert (D11); tokio-postgres has no verify-ca.
+        let with_ca = dsn(None, Some("/opt/certs/ca.pem"));
+        assert!(with_ca.contains("sslmode=verify-full"), "{with_ca}");
+        assert!(with_ca.contains("sslrootcert="), "{with_ca}");
+        let e = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_TARGETS", "b"),
+            ("LAZYVIEW_TARGET_B_DSN", "postgres://a@b/d"),
+            ("LAZYVIEW_TARGET_B_TLS", "verify-ca"),
+        ])
+        .expect_err("verify-ca must be rejected for a PostgreSQL target");
+        assert!(
+            e.to_string()
+                .contains("verify-ca is not supported for a PostgreSQL target"),
+            "unexpected error: {e}"
+        );
+        // The MySQL branch is untouched: a MySQL target DSN still gets tls_ca=.
+        let m = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_TARGETS", "b"),
+            ("LAZYVIEW_TARGET_B_DSN", "mysql://a@b/d"),
+            ("LAZYVIEW_TARGET_B_TLS_CA", "/opt/certs/ca.pem"),
+        ])
+        .unwrap()
+        .targets
+        .get("b")
+        .cloned()
+        .unwrap();
+        assert!(m.contains("tls_ca="), "{m}");
+    }
+
+    #[test]
     fn defaults_and_overrides() {
         assert!(cfg(&[]).is_err());
         let c = cfg(&[("LAZYVIEW_DSN", "mysql://a@b/c")]).unwrap();
@@ -591,17 +677,16 @@ mod tests {
             c.targets.get("re-port").map(String::as_str),
             Some("mysql://b")
         );
-        // A PostgreSQL target DSN is rejected until src/target/postgres.rs lands (T1):
-        // accepted into c.targets only then, not before.
-        let e = cfg(&[
+        // A PostgreSQL target DSN is kept verbatim (T1: src/target/postgres.rs landed).
+        let c = cfg(&[
             ("LAZYVIEW_DSN", "x"),
             ("LAZYVIEW_TARGETS", "b"),
             ("LAZYVIEW_TARGET_B_DSN", "postgres://lv:lv@h:5432/lvtest"),
         ])
-        .expect_err("a PostgreSQL target DSN must not be accepted yet");
-        assert!(
-            e.to_string().contains("not supported yet"),
-            "unexpected error: {e}"
+        .unwrap();
+        assert_eq!(
+            c.targets.get("b").map(String::as_str),
+            Some("postgres://lv:lv@h:5432/lvtest")
         );
         assert!(cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_TARGETS", "nope")]).is_err());
         let c = cfg(&[

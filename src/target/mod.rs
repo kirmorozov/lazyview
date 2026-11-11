@@ -1,10 +1,11 @@
-//! How lazyview talks to one target instance: the family discriminator and the facts a
-//! connection's statements are built from. Dispatched once per target connection: every
-//! target-facing function in `crate::mv` matches on [`Kind`] at its top and calls one
-//! function of the family's module. No trait objects, nothing on a per-row path.
+//! How lazyview talks to one target instance: the family discriminator, the connection and
+//! the options of one target, and the facts a connection's statements are built from.
+//! Dispatched once per target connection: every target-facing function in `crate::mv` matches
+//! on [`Kind`] at its top and calls one function of the family's module. No trait objects,
+//! nothing on a per-row path.
 
-use anyhow::{bail, Result};
-use mysql_async::{Conn, Opts, Value};
+use anyhow::{anyhow, bail, Result};
+use mysql_async::Value;
 
 use crate::accumulate::{UnitChunk, UnitKind};
 use crate::mv::{Layout, Upsert, WriteOpts};
@@ -34,13 +35,105 @@ impl Kind {
             .unwrap_or_default();
         match scheme.as_str() {
             "mysql" | "mariadb" => Ok(Kind::Mysql),
-            // Until src/target/postgres.rs lands, a PostgreSQL target cannot be reached.
-            "postgres" | "postgresql" => {
-                bail!("PostgreSQL targets are not supported yet (postgres:// DSN)")
-            }
+            // The connect level (DSN, connection, session, opts) is real
+            // (src/target/postgres.rs, PR T1); the statements land with T2-T5.
+            "postgres" | "postgresql" => Ok(Kind::Postgres),
             _ => bail!(
                 "invalid target DSN: scheme `{scheme}` is not mysql://, mariadb:// or postgres://"
             ),
+        }
+    }
+
+    /// Opens one target connection of this family: the driver connect plus the family's
+    /// session settings (`mysql::init_session` / `postgres::session_setup`, which the
+    /// PostgreSQL connect applies itself). One dispatch per connection.
+    pub(crate) async fn connect(&self, opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
+        match (self, opts) {
+            (Kind::Mysql, Opts::Mysql(o)) => {
+                let mut c = match tokio::time::timeout(
+                    crate::engine::CONNECT_TIMEOUT,
+                    mysql_async::Conn::new(o.clone()),
+                )
+                .await
+                {
+                    Ok(r) => r?,
+                    Err(_) => bail!(
+                        "connecting to {}:{}: timed out after {:?}",
+                        o.ip_or_hostname(),
+                        o.tcp_port(),
+                        crate::engine::CONNECT_TIMEOUT
+                    ),
+                };
+                mysql::init_session(&mut c, lock_wait_s).await?;
+                Ok(Conn::Mysql(c))
+            }
+            (Kind::Postgres, Opts::Postgres(d)) => {
+                postgres::PgConn::connect(d, lock_wait_s, crate::engine::CONNECT_TIMEOUT)
+                    .await
+                    .map(Conn::Postgres)
+            }
+            _ => bail!("internal: target family and parsed DSN disagree"),
+        }
+    }
+}
+
+/// A target connection. One variant per family: no trait object, no allocation, and the
+/// family is chosen here, once, not per statement below this point.
+pub enum Conn {
+    Mysql(mysql_async::Conn),
+    Postgres(crate::target::postgres::PgConn),
+}
+
+impl Conn {
+    /// The MySQL connection behind this one: the choke point of every statement path that is
+    /// still MySQL-only (the PostgreSQL arms land with T2-T5), so a PostgreSQL target fails
+    /// there with a clear error instead of reaching a stub.
+    pub(crate) fn mysql(&mut self) -> Result<&mut mysql_async::Conn> {
+        match self {
+            Conn::Mysql(c) => Ok(c),
+            Conn::Postgres(_) => Err(anyhow!(
+                "PostgreSQL targets land in PRs T2-T5 (the statements of src/target/postgres.rs)"
+            )),
+        }
+    }
+
+    /// Closes the connection (the PostgreSQL driver task ends with it).
+    pub(crate) async fn disconnect(self) -> Result<()> {
+        match self {
+            Conn::Mysql(c) => Ok(c.disconnect().await?),
+            Conn::Postgres(_) => Ok(()),
+        }
+    }
+}
+
+/// The parsed options of one target DSN (parsed once at startup, see [`opts`]).
+#[derive(Clone)]
+pub enum Opts {
+    Mysql(mysql_async::Opts),
+    /// The PostgreSQL DSN, verbatim: `tokio_postgres` parses it at connect time.
+    Postgres(String),
+}
+
+/// Parses a target DSN once: its family and options (`src/engine.rs`, at startup).
+pub fn opts(dsn: &str) -> Result<(Kind, Opts)> {
+    match Kind::from_dsn(dsn)? {
+        Kind::Mysql => Ok((Kind::Mysql, Opts::Mysql(mysql::opts(dsn)?))),
+        Kind::Postgres => Ok((Kind::Postgres, Opts::Postgres(dsn.to_string()))),
+    }
+}
+
+/// The schema a target DSN names (its path after the host), from its parsed options.
+pub(crate) fn schema_of(opts: &Opts, what: &str) -> Result<String> {
+    match opts {
+        Opts::Mysql(o) => mysql::schema_of(o, what),
+        Opts::Postgres(d) => {
+            let rest = d.split_once("://").map(|(_, r)| r).unwrap_or(d);
+            let path = rest.split_once('/').map(|(_, p)| p).unwrap_or("");
+            let schema = path.split(['?', '#']).next().unwrap_or("");
+            if schema.is_empty() {
+                bail!("{what} DSN must name a database (postgres://user:pass@host:port/<schema>)");
+            }
+            Ok(schema.to_string())
         }
     }
 }
@@ -143,7 +236,7 @@ pub(crate) fn create_table_sql(
 
 /// `BASE TABLE` / `VIEW` / None. One dispatch per metadata read.
 pub(crate) async fn table_kind(
-    conn: &mut Conn,
+    conn: &mut mysql_async::Conn,
     kind: Kind,
     schema: &str,
     name: &str,
@@ -156,7 +249,7 @@ pub(crate) async fn table_kind(
 
 /// Visible + invisible column names and types of an existing table.
 pub(crate) async fn table_columns(
-    conn: &mut Conn,
+    conn: &mut mysql_async::Conn,
     kind: Kind,
     schema: &str,
     name: &str,
@@ -177,7 +270,7 @@ pub(crate) fn layout_matches(kind: Kind, layout: &Layout, existing: &[(String, S
 
 /// Whether `table` has the unique index its rows are upserted by (see [`Layout::row_key`]).
 pub(crate) async fn has_row_index(
-    conn: &mut Conn,
+    conn: &mut mysql_async::Conn,
     kind: Kind,
     schema: &str,
     table: &str,
@@ -191,7 +284,7 @@ pub(crate) async fn has_row_index(
 
 /// The ownership marker (see [`marker`]) of an existing table, if its comment is one.
 pub(crate) async fn table_marker(
-    conn: &mut Conn,
+    conn: &mut mysql_async::Conn,
     kind: Kind,
     schema: &str,
     name: &str,
@@ -204,7 +297,7 @@ pub(crate) async fn table_marker(
 
 /// Creates the shadow table of `name` with the ownership marker as its comment.
 pub(crate) async fn create_shadow_marked(
-    conn: &mut Conn,
+    conn: &mut mysql_async::Conn,
     kind: Kind,
     schema: &str,
     name: &str,
@@ -218,7 +311,12 @@ pub(crate) async fn create_shadow_marked(
 }
 
 /// Atomically replaces `name` with its shadow table (or renames the shadow when `name` is new).
-pub(crate) async fn swap(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -> Result<()> {
+pub(crate) async fn swap(
+    conn: &mut mysql_async::Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+) -> Result<()> {
     match kind {
         Kind::Mysql => mysql::swap(conn, schema, name).await,
         Kind::Postgres => postgres::swap(conn, schema, name).await,
@@ -226,7 +324,7 @@ pub(crate) async fn swap(conn: &mut Conn, kind: Kind, schema: &str, name: &str) 
 }
 
 pub(crate) async fn drop_table(
-    conn: &mut Conn,
+    conn: &mut mysql_async::Conn,
     kind: Kind,
     schema: &str,
     name: &str,
@@ -247,8 +345,12 @@ pub(crate) fn session_setup(kind: Kind, sql_mode: &str, lock_wait_s: u64) -> Vec
 }
 
 /// Applies the family's session settings to a fresh direct connection. One dispatch per
-/// connection setup.
-pub(crate) async fn init_session(conn: &mut Conn, kind: Kind, lock_wait_s: u64) -> Result<()> {
+/// connection setup. (The PostgreSQL connection applies them inside its `connect`.)
+pub(crate) async fn init_session(
+    conn: &mut mysql_async::Conn,
+    kind: Kind,
+    lock_wait_s: u64,
+) -> Result<()> {
     match kind {
         Kind::Mysql => mysql::init_session(conn, lock_wait_s).await,
         Kind::Postgres => postgres::init_session(conn, lock_wait_s).await,
@@ -256,8 +358,9 @@ pub(crate) async fn init_session(conn: &mut Conn, kind: Kind, lock_wait_s: u64) 
 }
 
 /// [`WriteOpts`] of the server `conn` is connected to. One dispatch per connection setup.
+/// (The engine's PostgreSQL arm reads them from the [`postgres::PgConn`] directly.)
 pub(crate) async fn write_opts(
-    conn: &mut Conn,
+    conn: &mut mysql_async::Conn,
     kind: Kind,
     batch_rows: usize,
     batch_bytes: usize,
@@ -271,8 +374,9 @@ pub(crate) async fn write_opts(
 /// Kills write op `id` and waits until the server no longer lists it (the zombie fence). One
 /// dispatch per fence, never per row.
 pub(crate) async fn fence(kind: Kind, opts: &Opts, id: u32) -> Result<()> {
-    match kind {
-        Kind::Mysql => mysql::kill_and_wait(opts, id).await,
-        Kind::Postgres => postgres::fence(opts, id).await,
+    match (kind, opts) {
+        (Kind::Mysql, Opts::Mysql(o)) => mysql::kill_and_wait(o, id).await,
+        (Kind::Postgres, _) => postgres::fence(opts, id).await,
+        _ => bail!("internal: target family and parsed DSN disagree"),
     }
 }

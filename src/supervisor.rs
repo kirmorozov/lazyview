@@ -124,7 +124,7 @@ pub struct Endpoint {
     pub name: String,
     /// The target family this endpoint's connections speak (statement shapes, caps).
     pub kind: crate::target::Kind,
-    opts: Opts,
+    opts: crate::target::Opts,
     pool: Pool,
     permits: Arc<Semaphore>,
     pub max: usize,
@@ -156,7 +156,7 @@ impl Endpoint {
         metric_kind: &str,
         name: &str,
         kind: crate::target::Kind,
-        opts: &Opts,
+        opts: &crate::target::Opts,
         max: usize,
         sql_mode: &str,
         lock_wait_s: u64,
@@ -169,8 +169,13 @@ impl Endpoint {
             .with_inactive_connection_ttl(INACTIVE_TTL)
             .with_ttl_check_interval(Duration::from_secs(5));
         let setup = crate::target::session_setup(kind, sql_mode, lock_wait_s);
+        // The PostgreSQL write pool (its own dedicated backends, D10) is PR T5: the engine
+        // rejects a PostgreSQL target before pooling it (its writes are T4).
+        let crate::target::Opts::Mysql(o) = opts else {
+            unreachable!("PostgreSQL target pools land in PR T5")
+        };
         let pool = Pool::new(
-            OptsBuilder::from_opts(opts.clone())
+            OptsBuilder::from_opts(o.clone())
                 .pool_opts(pool_opts)
                 .setup(setup),
         );
@@ -382,7 +387,7 @@ impl Supervisor {
             "read",
             "source",
             crate::target::Kind::Mysql,
-            src_opts,
+            &crate::target::Opts::Mysql(src_opts.clone()),
             cfg.max_source,
             src_sql_mode,
             lock_wait_s,
@@ -408,7 +413,7 @@ impl Supervisor {
         &mut self,
         name: &str,
         kind: crate::target::Kind,
-        opts: &Opts,
+        opts: &crate::target::Opts,
         sql_mode: &str,
         lock_wait_s: u64,
     ) -> Arc<Endpoint> {

@@ -58,6 +58,10 @@ pub(crate) fn insert_sql(
             let updates = set(&|c| format!("VALUES({c})"));
             sql.push_str(&format!(" ON DUPLICATE KEY UPDATE {updates}"));
         }
+        // `ON CONFLICT` is PostgreSQL's (target/postgres.rs renders it, T4); a MySQL
+        // connection never carries these opts (they come from `PgConn::write_opts`).
+        #[allow(unreachable_patterns)]
+        _ => unreachable!("ON CONFLICT is the PostgreSQL family's"),
     }
     sql
 }
