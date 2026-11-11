@@ -2,7 +2,9 @@
 //! a stub until the PR that lands its real form (T1-T5); none is reachable before
 //! [`crate::target::Kind::from_dsn`] accepts a PostgreSQL scheme.
 
+use crate::accumulate::{UnitChunk, UnitKind};
 use crate::mv::Layout;
+use mysql_async::Value;
 
 /// `INSERT ... ON CONFLICT (row key) DO UPDATE` — PR T4 replaces this stub with the real
 /// statement. Unreachable today: a PostgreSQL target DSN is rejected at [`Kind::from_dsn`].
@@ -15,5 +17,18 @@ pub(crate) fn insert_sql(
     _n: usize,
     _key: Option<&[usize]>,
 ) -> String {
+    unreachable!("PostgreSQL targets are rejected by Kind::from_dsn")
+}
+
+/// The `$n` form of the unit filter — PR T4 replaces this stub (no `CAST(? AS JSON)`: a jsonb
+/// column compares to an untyped parameter by jsonb equality). Unreachable today: a PostgreSQL
+/// target DSN is rejected at [`Kind::from_dsn`].
+///
+/// [`Kind::from_dsn`]: crate::target::Kind::from_dsn
+pub(crate) fn unit_filter(
+    _chunk: &UnitChunk,
+    _cols: &[String],
+    _kinds: &[UnitKind],
+) -> (String, Vec<Value>) {
     unreachable!("PostgreSQL targets are rejected by Kind::from_dsn")
 }

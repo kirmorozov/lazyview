@@ -4,7 +4,9 @@
 //! function of the family's module. No trait objects, nothing on a per-row path.
 
 use anyhow::{bail, Result};
+use mysql_async::Value;
 
+use crate::accumulate::{UnitChunk, UnitKind};
 use crate::mv::{Layout, Upsert};
 
 pub mod mysql;
@@ -58,5 +60,19 @@ pub(crate) fn insert_sql(
         // key is unused: MySQL's forms conflict against any unique key.
         Kind::Mysql => mysql::insert_sql(schema, table, layout, n, upsert),
         Kind::Postgres => postgres::insert_sql(schema, table, layout, n, key),
+    }
+}
+
+/// `(predicate, parameters)` matching exactly `chunk`'s keys on `cols` (a DELETE's or a read's
+/// WHERE). Dispatched once per statement.
+pub(crate) fn unit_filter(
+    kind: Kind,
+    chunk: &UnitChunk,
+    cols: &[String],
+    kinds: &[UnitKind],
+) -> (String, Vec<Value>) {
+    match kind {
+        Kind::Mysql => mysql::unit_filter(chunk, cols, kinds),
+        Kind::Postgres => postgres::unit_filter(chunk, cols, kinds),
     }
 }

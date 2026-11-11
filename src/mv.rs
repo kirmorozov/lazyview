@@ -1285,6 +1285,7 @@ async fn delete_keys<C: Queryable>(
     table: &str,
     layout: &Layout,
     keys: &[Key],
+    kind: Kind,
     w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<()> {
@@ -1296,7 +1297,8 @@ async fn delete_keys<C: Queryable>(
     let per = MAX_PARAMS / cols.len().max(1);
     let key_bytes = |k: &Key| 4 + k.iter().map(datum_bytes).sum::<usize>();
     for piece in batches(keys, per, w.batch_bytes, key_bytes) {
-        let (f, p) = keys_chunk(piece.to_vec()).filter_typed(&cols, &kinds);
+        let chunk = keys_chunk(piece.to_vec());
+        let (f, p) = crate::target::unit_filter(kind, &chunk, &cols, &kinds);
         conn.exec_drop(
             format!("DELETE FROM {}.{} WHERE {f}", q(schema), q(table)),
             p,
@@ -1543,12 +1545,13 @@ pub async fn read_old(
     schema: &str,
     table: &str,
     layout: &Layout,
+    kind: Kind,
     chunk: Option<&UnitChunk>,
     metrics: &Metrics,
 ) -> Result<Vec<Vec<Value>>> {
     let unit_cols = layout.unit_cols();
     let (filter, params) = match chunk {
-        Some(c) => c.filter_typed(&unit_cols, &layout.unit_kinds()),
+        Some(c) => crate::target::unit_filter(kind, c, &unit_cols, &layout.unit_kinds()),
         None => ("TRUE".to_string(), Vec::new()),
     };
     let old: Vec<Row> = conn
@@ -1695,7 +1698,13 @@ pub async fn write_diff(
         conn.query_drop(format!("SET @lv_tz = @@SESSION.time_zone, {UTC_SESSION}"))
             .await?;
     }
-    let r = write_tx(conn, schema, table, layout, d, w, metrics).await;
+    // One dispatch per write (never per row): the transaction's open/commit stays with the
+    // family. PR T4 opens the PostgreSQL transaction inside its own arm; this PR's PostgreSQL
+    // arm is unreachable, as every PostgreSQL target DSN is rejected at `Kind::from_dsn`.
+    let r = match w.kind {
+        Kind::Mysql => write_tx_mysql(conn, schema, table, layout, d, w, metrics).await,
+        Kind::Postgres => unreachable!("PostgreSQL targets are rejected by Kind::from_dsn"),
+    };
     if utc {
         let restored = conn.query_drop("SET SESSION time_zone = @lv_tz").await;
         if r.is_ok() {
@@ -1705,8 +1714,9 @@ pub async fn write_diff(
     r
 }
 
-/// The transaction of [`write_diff`].
-async fn write_tx(
+/// The MySQL transaction of [`write_diff`] (the family's own arm; the PostgreSQL arm arrives
+/// with its transaction in PR T4).
+async fn write_tx_mysql(
     conn: &mut Conn,
     schema: &str,
     table: &str,
@@ -1728,8 +1738,13 @@ async fn write_tx(
         let del_filter = if layout.unit_pos.is_empty() {
             ("TRUE".to_string(), Vec::new())
         } else {
-            keys_chunk(d.changed.clone())
-                .filter_typed(&layout.unit_cols(), &layout.write_kinds(&layout.unit_pos))
+            let chunk = keys_chunk(d.changed.clone());
+            crate::target::unit_filter(
+                w.kind,
+                &chunk,
+                &layout.unit_cols(),
+                &layout.write_kinds(&layout.unit_pos),
+            )
         };
         tx.exec_drop(
             format!(
@@ -1744,7 +1759,17 @@ async fn write_tx(
         Metrics::add(&metrics.mv_queries, 1);
     }
     if !d.by_unit {
-        delete_keys(&mut tx, schema, table, layout, &d.delete_keys, w, metrics).await?;
+        delete_keys(
+            &mut tx,
+            schema,
+            table,
+            layout,
+            &d.delete_keys,
+            w.kind,
+            w,
+            metrics,
+        )
+        .await?;
     }
     Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
     insert_rows(
@@ -1769,7 +1794,8 @@ pub async fn apply(
     w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<Applied> {
-    let old = read_old(conn, schema, table, layout, chunk, metrics).await?;
+    // The callers pass the family explicitly until PR T4 supplies the target's own kind.
+    let old = read_old(conn, schema, table, layout, Kind::Mysql, chunk, metrics).await?;
     let new = prepare(layout, new_rows.to_vec());
     let d = diff(layout, old, &new)
         .with_context(|| format!("comparing the rows of `{schema}`.`{table}`"))?;

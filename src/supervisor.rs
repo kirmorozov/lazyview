@@ -740,6 +740,8 @@ async fn write_once(
             &target.schema,
             &job.table,
             &job.layout,
+            // The caller passes the family explicitly until PR T4 supplies the real one.
+            crate::target::Kind::Mysql,
             chunk.as_ref(),
             &run.metrics,
         )
