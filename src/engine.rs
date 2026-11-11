@@ -242,7 +242,9 @@ async fn connect_wait(
     let mut backoff = Duration::from_secs(1);
     let mut waited = false;
     loop {
-        match connect(opts, lock_wait_s).await {
+        // A source connection: a source is always MySQL-family (`postgres://` is rejected for
+        // `LAZYVIEW_DSN` in `crate::config`).
+        match connect(opts, target::Kind::Mysql, lock_wait_s).await {
             Ok(c) => {
                 if waited {
                     info!(
@@ -789,9 +791,9 @@ impl Drained {
     }
 }
 
-/// Opens a connection with the service's session settings (at most `lock_wait_s` for a table
-/// lock, see `mv::init_session`).
-async fn connect(opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
+/// Opens a connection with the service's session settings of the target family `kind` (at most
+/// `lock_wait_s` for a table lock, see [`target::init_session`]).
+async fn connect(opts: &Opts, kind: target::Kind, lock_wait_s: u64) -> Result<Conn> {
     let mut c = match tokio::time::timeout(CONNECT_TIMEOUT, Conn::new(opts.clone())).await {
         Ok(r) => r?,
         Err(_) => bail!(
@@ -800,7 +802,7 @@ async fn connect(opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
             opts.tcp_port()
         ),
     };
-    mv::init_session(&mut c, lock_wait_s).await?;
+    target::init_session(&mut c, kind, lock_wait_s).await?;
     Ok(c)
 }
 
@@ -821,12 +823,6 @@ async fn server_identity(conn: &mut Conn, flavor: Flavor) -> Result<String> {
     };
     let v: Option<Option<String>> = conn.query_first(sql).await?;
     Ok(v.flatten().unwrap_or_default())
-}
-
-fn schema_of(opts: &Opts, what: &str) -> Result<String> {
-    opts.db_name().map(str::to_string).ok_or_else(|| {
-        anyhow!("{what} DSN must name a database (mysql://user:pass@host:port/<schema>)")
-    })
 }
 
 /// Whether an UPDATE changed any column marked in `cols`. Images that are not full rows
@@ -866,7 +862,7 @@ impl Engine {
     ) -> Result<Option<(Engine, Option<Position>)>> {
         Metrics::set(&metrics.gauges.starting, 1);
         let src_opts = binlog::replica_opts(&cfg.dsn)?;
-        let schema = schema_of(&src_opts, "LAZYVIEW_DSN")?;
+        let schema = target::mysql::schema_of(&src_opts, "LAZYVIEW_DSN")?;
         let Some(mut src) = connect_wait(
             &src_opts,
             "source database",
@@ -928,8 +924,8 @@ impl Engine {
         );
         for (name, dsn) in &cfg.targets {
             let kind = target::Kind::from_dsn(dsn)?;
-            let opts = binlog::replica_opts(dsn)?;
-            let ts = schema_of(&opts, &format!("target {name}"))?;
+            let opts = target::mysql::opts(dsn)?;
+            let ts = target::mysql::schema_of(&opts, &format!("target {name}"))?;
             targets.insert(
                 name.clone(),
                 Target {
@@ -1639,7 +1635,7 @@ impl Engine {
 
     /// Re-establishes the source-read connection after a connection-class error.
     async fn heal_src(&mut self) {
-        match connect(&self.src_opts, self.cfg.lock_wait_s).await {
+        match connect(&self.src_opts, target::Kind::Mysql, self.cfg.lock_wait_s).await {
             Ok(c) => {
                 self.src = c;
                 // The new connection probes the commit order again (and re-creates a dropped
@@ -1658,7 +1654,7 @@ impl Engine {
     /// another instance took over meanwhile this one stops (`Err`). `Ok(false)`: still
     /// unreachable, try again later.
     async fn heal_meta(&mut self) -> Result<bool> {
-        let conn = connect(&self.src_opts, self.cfg.lock_wait_s).await;
+        let conn = connect(&self.src_opts, target::Kind::Mysql, self.cfg.lock_wait_s).await;
         self.metrics.beat();
         let mut conn = match conn {
             Ok(c) => c,
@@ -2089,7 +2085,7 @@ impl Engine {
             }
             let (rows, bytes) = (self.cfg.write_batch_rows, self.cfg.write_batch_bytes);
             let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, async {
-                let mut c = connect(&target.opts, self.cfg.lock_wait_s).await?;
+                let mut c = connect(&target.opts, target.kind, self.cfg.lock_wait_s).await?;
                 let w = mv::write_opts(&mut c, target.kind, rows, bytes).await?;
                 let mode = session_sql_mode(&mut c).await?;
                 Ok::<_, anyhow::Error>((c, w, mode))
@@ -5846,7 +5842,7 @@ async fn swap_task(
         let r = async {
             let mut c = match tokio::time::timeout(
                 TARGET_CONNECT_TIMEOUT * 3,
-                connect(&opts, crate::config::DEFAULT_LOCK_WAIT_S),
+                connect(&opts, kind, crate::config::DEFAULT_LOCK_WAIT_S),
             )
             .await
             {
@@ -5923,7 +5919,7 @@ async fn prepare_target(
     let (t, ts) = (&spec.target, &spec.schema);
     let mut c = match tokio::time::timeout(
         TARGET_CONNECT_TIMEOUT * 3,
-        connect(&spec.opts, crate::config::DEFAULT_LOCK_WAIT_S),
+        connect(&spec.opts, spec.kind, crate::config::DEFAULT_LOCK_WAIT_S),
     )
     .await
     {
@@ -6004,7 +6000,7 @@ async fn build_task(
         if let Some(d) = test_delay {
             tokio::time::sleep(d).await;
         }
-        let mut src = connect(&src_opts, lock_wait_s).await?;
+        let mut src = connect(&src_opts, target::Kind::Mysql, lock_wait_s).await?;
         let layout = mv::probe(&mut src, &src_schema, &plan).await?;
         // The cascade cache is read on the source before the table is filled, so that no
         // cascade falls between the two reads: the binlog this version replays holds the rest.

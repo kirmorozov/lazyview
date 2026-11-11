@@ -27,7 +27,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Value};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -51,10 +50,11 @@ pub const OFFLOAD_ROWS: usize = 4096;
 pub const OFFLOAD_DATUMS: usize = 65_536;
 /// Idle pooled connections close after this long.
 pub const INACTIVE_TTL: Duration = Duration::from_secs(30);
-/// How long a killed connection may take to leave the server's process list.
-const FENCE_WAIT: Duration = Duration::from_secs(5);
+/// How long a killed connection may take to leave the server's process list (the fence of
+/// `target::mysql::kill_and_wait`).
+pub(crate) const FENCE_WAIT: Duration = Duration::from_secs(5);
 /// Getting a pooled connection (connect + session setup when a new one is needed).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An op exceeded `LAZYVIEW_TARGET_TIMEOUT_MS` (an overload error).
 #[derive(Debug)]
@@ -148,13 +148,14 @@ impl Drop for Permit {
 
 impl Endpoint {
     /// A pool of at most `max` connections, created on demand with the service's session
-    /// settings (`sql_mode`: the permissive mode `mv::init_session` sets, see there; a table
+    /// settings (`sql_mode`: the permissive mode `target::init_session` sets, see there; a table
     /// lock wait of at most `lock_wait_s` s) and never
-    /// reset between uses, closing when idle for [`INACTIVE_TTL`].
+    /// reset between uses, closing when idle for [`INACTIVE_TTL`]. `metric_kind` is the pool's
+    /// gauge label (`read` / `write`); `kind` is the target family its connections speak.
     pub fn new(
-        kind: &str,
+        metric_kind: &str,
         name: &str,
-        target_kind: crate::target::Kind,
+        kind: crate::target::Kind,
         opts: &Opts,
         max: usize,
         sql_mode: &str,
@@ -167,19 +168,19 @@ impl Endpoint {
             .with_reset_connection(false)
             .with_inactive_connection_ttl(INACTIVE_TTL)
             .with_ttl_check_interval(Duration::from_secs(5));
-        let setup = Vec::from(mv::session_setup(sql_mode, lock_wait_s));
+        let setup = crate::target::session_setup(kind, sql_mode, lock_wait_s);
         let pool = Pool::new(
             OptsBuilder::from_opts(opts.clone())
                 .pool_opts(pool_opts)
                 .setup(setup),
         );
-        let gauges = Arc::new(PoolGauges::new(kind, name));
+        let gauges = Arc::new(PoolGauges::new(metric_kind, name));
         Metrics::set(&gauges.max, max as u64);
         Metrics::set_f64(&gauges.limit, max as f64);
         metrics.register_pool(gauges.clone());
         Arc::new(Endpoint {
             name: name.to_string(),
-            kind: target_kind,
+            kind,
             opts: opts.clone(),
             pool,
             permits: Arc::new(Semaphore::new(max)),
@@ -220,7 +221,7 @@ impl Endpoint {
     async fn fence(&self, id: u32, metrics: &Metrics) -> Result<()> {
         Metrics::add(&metrics.supervisor_zombie_kills, 1);
         let mut pending = self.zombies.lock().await;
-        let r = kill_and_wait(&self.opts, id).await;
+        let r = crate::target::fence(self.kind, &self.opts, id).await;
         if let Err(e) = &r {
             warn!(endpoint = %self.name, connection = id, "could not confirm that a timed-out write is gone: {e:#}; no writes to this target until it is");
             pending.push(id);
@@ -234,7 +235,7 @@ impl Endpoint {
         let mut err = None;
         let mut left = Vec::new();
         for &id in pending.iter() {
-            if let Err(e) = kill_and_wait(&self.opts, id).await {
+            if let Err(e) = crate::target::fence(self.kind, &self.opts, id).await {
                 left.push(id);
                 err.get_or_insert(e);
             }
@@ -251,43 +252,6 @@ impl Endpoint {
 
     pub async fn disconnect(&self) {
         let _ = self.pool.clone().disconnect().await;
-    }
-}
-
-/// `KILL CONNECTION id` on a fresh connection, then waits until `SHOW PROCESSLIST` (which lists
-/// the user's own threads without privileges) no longer has it.
-async fn kill_and_wait(opts: &Opts, id: u32) -> Result<()> {
-    let fut = async {
-        let mut c = Conn::new(opts.clone()).await?;
-        match c.query_drop(format!("KILL CONNECTION {id}")).await {
-            // 1094: unknown thread id (already gone).
-            Ok(()) | Err(mysql_async::Error::Server(_)) => {}
-            Err(e) => return Err(anyhow::Error::from(e)),
-        }
-        let deadline = tokio::time::Instant::now() + FENCE_WAIT;
-        loop {
-            let rows: Vec<mysql_async::Row> = c.query("SHOW PROCESSLIST").await?;
-            let listed = rows.iter().any(|r| {
-                r.get::<Option<u64>, _>(0)
-                    .flatten()
-                    .is_some_and(|x| x == u64::from(id))
-            });
-            if !listed {
-                let _ = c.disconnect().await;
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let _ = c.disconnect().await;
-                return Err(anyhow!(
-                    "connection {id} still listed {FENCE_WAIT:?} after KILL"
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    };
-    match tokio::time::timeout(FENCE_WAIT + CONNECT_TIMEOUT, fut).await {
-        Ok(r) => r,
-        Err(_) => Err(anyhow::Error::new(Timeout(FENCE_WAIT + CONNECT_TIMEOUT))),
     }
 }
 
@@ -403,7 +367,7 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// `None` for `LAZYVIEW_SUPERVISOR=off`. `src_sql_mode`: the session sql_mode of a source
-    /// connection set up by `mv::init_session`.
+    /// connection set up by `target::init_session`.
     pub fn new(
         cfg: &SupervisorConfig,
         src_opts: &Opts,

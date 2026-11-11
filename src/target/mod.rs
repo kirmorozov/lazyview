@@ -4,10 +4,10 @@
 //! function of the family's module. No trait objects, nothing on a per-row path.
 
 use anyhow::{bail, Result};
-use mysql_async::{Conn, Value};
+use mysql_async::{Conn, Opts, Value};
 
 use crate::accumulate::{UnitChunk, UnitKind};
-use crate::mv::{Layout, Upsert};
+use crate::mv::{Layout, Upsert, WriteOpts};
 
 pub mod mysql;
 pub mod postgres;
@@ -234,5 +234,45 @@ pub(crate) async fn drop_table(
     match kind {
         Kind::Mysql => mysql::drop_table(conn, schema, name).await,
         Kind::Postgres => postgres::drop_table(conn, schema, name).await,
+    }
+}
+
+/// The statements that give a new pooled connection the family's session settings. Dispatched
+/// once per pooled connection (never per statement).
+pub(crate) fn session_setup(kind: Kind, sql_mode: &str, lock_wait_s: u64) -> Vec<String> {
+    match kind {
+        Kind::Mysql => Vec::from(mysql::session_setup(sql_mode, lock_wait_s)),
+        Kind::Postgres => postgres::session_setup(lock_wait_s),
+    }
+}
+
+/// Applies the family's session settings to a fresh direct connection. One dispatch per
+/// connection setup.
+pub(crate) async fn init_session(conn: &mut Conn, kind: Kind, lock_wait_s: u64) -> Result<()> {
+    match kind {
+        Kind::Mysql => mysql::init_session(conn, lock_wait_s).await,
+        Kind::Postgres => postgres::init_session(conn, lock_wait_s).await,
+    }
+}
+
+/// [`WriteOpts`] of the server `conn` is connected to. One dispatch per connection setup.
+pub(crate) async fn write_opts(
+    conn: &mut Conn,
+    kind: Kind,
+    batch_rows: usize,
+    batch_bytes: usize,
+) -> Result<WriteOpts> {
+    match kind {
+        Kind::Mysql => mysql::write_opts(conn, kind, batch_rows, batch_bytes).await,
+        Kind::Postgres => postgres::write_opts(conn, kind, batch_rows, batch_bytes).await,
+    }
+}
+
+/// Kills write op `id` and waits until the server no longer lists it (the zombie fence). One
+/// dispatch per fence, never per row.
+pub(crate) async fn fence(kind: Kind, opts: &Opts, id: u32) -> Result<()> {
+    match kind {
+        Kind::Mysql => mysql::kill_and_wait(opts, id).await,
+        Kind::Postgres => postgres::fence(opts, id).await,
     }
 }

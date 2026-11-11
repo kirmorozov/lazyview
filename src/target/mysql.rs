@@ -2,15 +2,17 @@
 //! lands (PR S2 onward). Verbatim moves: the SQL strings are the ones `crate::mv` rendered.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Value};
+use mysql_async::{Conn, Opts, Value};
 
 use crate::accumulate::{UnitChunk, UnitKind};
 use crate::analyze::quote_ident as q;
-use crate::mv::{Layout, MvCol, Upsert, ROW_INDEX};
-use crate::target::{old_name, shadow_name, MARKER_PREFIX};
+use crate::mv::{Layout, MvCol, Upsert, WriteOpts, ROW_INDEX};
+use crate::supervisor::{Timeout, CONNECT_TIMEOUT, FENCE_WAIT};
+use crate::target::{old_name, shadow_name, Kind, MARKER_PREFIX};
 
 /// Row alias of upserts (`INSERT ... AS <alias> ON DUPLICATE KEY UPDATE`).
 const ROW_ALIAS: &str = "_lv_new";
@@ -590,4 +592,169 @@ pub(crate) async fn drop_table(conn: &mut Conn, schema: &str, name: &str) -> Res
     conn.query_drop(format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(name)))
         .await?;
     Ok(())
+}
+
+/// Session time zone in which TIMESTAMPs are written (see [`crate::mv::Layout::epoch_timestamps`]).
+pub(crate) const UTC_SESSION: &str = "SESSION time_zone = '+00:00'";
+
+/// Session settings for every connection the service opens: non-locking reads, an sql_mode
+/// in which values are stored as they were read (zero dates, no strict-mode rejections), and a
+/// bounded table-lock wait (`lock_wait_s`) so a session blocked by a `LOCK TABLES` fails with
+/// 1205 instead of waiting out the server default (a year).
+pub(crate) async fn init_session(conn: &mut Conn, lock_wait_s: u64) -> Result<()> {
+    let mode: Option<String> = conn
+        .query_first("SELECT CAST(@@SESSION.sql_mode AS CHAR)")
+        .await?;
+    let mode = mode.unwrap_or_default();
+    let permissive = permissive_sql_mode(&mode);
+    let [isolation, set_mode, lock_wait] = session_setup(&permissive, lock_wait_s);
+    conn.query_drop(isolation).await?;
+    if permissive != mode {
+        conn.query_drop(set_mode).await?;
+    }
+    conn.query_drop(lock_wait).await?;
+    Ok(())
+}
+
+/// The statements that give a connection the service's session settings with `sql_mode` (a mode
+/// [`permissive_sql_mode`] returned) and a table-lock wait of at most `lock_wait_s` seconds:
+/// [`init_session`] runs them on a direct connection, the supervisor's pools
+/// (src/supervisor.rs) on every new pooled connection.
+pub(crate) fn session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
+    [
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+        format!("SET SESSION sql_mode = '{}'", sql_mode.replace('\'', "")),
+        format!("SET SESSION lock_wait_timeout = {lock_wait_s}"),
+    ]
+}
+
+/// `mode` without the flags that reject values the source holds (strict mode, zero dates) and
+/// without the flags that change how SQL text is parsed (`ANSI_QUOTES`, `PIPES_AS_CONCAT`,
+/// `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES`, `IGNORE_SPACE`): lazyview parses definitions
+/// and writes its SQL in the default mode, so under `ANSI_QUOTES` a `"paid"` the analyzer
+/// traced as a string would be a column for the server. The combination modes (`ANSI`,
+/// `TRADITIONAL`, `ORACLE`, ...) imply some of them and go too: the server lists their member
+/// flags individually, so nothing else is lost.
+pub(crate) fn permissive_sql_mode(mode: &str) -> String {
+    mode.split(',')
+        .map(str::trim)
+        .filter(|m| {
+            !m.is_empty()
+                && m.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && !matches!(
+                    m.to_ascii_uppercase().as_str(),
+                    "STRICT_TRANS_TABLES"
+                        | "STRICT_ALL_TABLES"
+                        | "NO_ZERO_DATE"
+                        | "NO_ZERO_IN_DATE"
+                        | "ANSI_QUOTES"
+                        | "PIPES_AS_CONCAT"
+                        | "HIGH_NOT_PRECEDENCE"
+                        | "NO_BACKSLASH_ESCAPES"
+                        | "IGNORE_SPACE"
+                        | "TRADITIONAL"
+                        | "ANSI"
+                        | "DB2"
+                        | "MAXDB"
+                        | "MSSQL"
+                        | "ORACLE"
+                        | "POSTGRESQL"
+                        | "MYSQL323"
+                        | "MYSQL40"
+                )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// [`WriteOpts`] for the server `conn` is connected to.
+pub(crate) async fn write_opts(
+    conn: &mut Conn,
+    kind: Kind,
+    batch_rows: usize,
+    batch_bytes: usize,
+) -> Result<WriteOpts> {
+    let (version, packet): (String, u64) = conn
+        .query_first("SELECT CAST(@@version AS CHAR), @@max_allowed_packet")
+        .await?
+        .context("reading @@version and @@max_allowed_packet")?;
+    Ok(for_server(kind, &version, packet, batch_rows, batch_bytes))
+}
+
+/// For a server reporting `version` (`@@version`) and `max_packet` (`@@max_allowed_packet`).
+pub(crate) fn for_server(
+    kind: Kind,
+    version: &str,
+    max_packet: u64,
+    batch_rows: usize,
+    batch_bytes: usize,
+) -> WriteOpts {
+    let num: Vec<u32> = version
+        .split(|c: char| !c.is_ascii_digit())
+        .take(3)
+        .map(|p| p.parse().unwrap_or(0))
+        .collect();
+    let mysql_alias = num.len() == 3 && (num[0], num[1], num[2]) >= (8, 0, 19);
+    let upsert = if version.to_ascii_lowercase().contains("mariadb") || !mysql_alias {
+        Upsert::Values
+    } else {
+        Upsert::RowAlias
+    };
+    let cap = usize::try_from(max_packet / 2).unwrap_or(usize::MAX);
+    WriteOpts {
+        batch_rows: batch_rows.max(1),
+        batch_bytes: batch_bytes.min(cap).max(1024),
+        upsert,
+        kind,
+    }
+}
+
+/// `KILL CONNECTION id` on a fresh connection, then waits until `SHOW PROCESSLIST` (which lists
+/// the user's own threads without privileges) no longer has it.
+pub(crate) async fn kill_and_wait(opts: &Opts, id: u32) -> Result<()> {
+    let fut = async {
+        let mut c = Conn::new(opts.clone()).await?;
+        match c.query_drop(format!("KILL CONNECTION {id}")).await {
+            // 1094: unknown thread id (already gone).
+            Ok(()) | Err(mysql_async::Error::Server(_)) => {}
+            Err(e) => return Err(anyhow::Error::from(e)),
+        }
+        let deadline = tokio::time::Instant::now() + FENCE_WAIT;
+        loop {
+            let rows: Vec<mysql_async::Row> = c.query("SHOW PROCESSLIST").await?;
+            let listed = rows.iter().any(|r| {
+                r.get::<Option<u64>, _>(0)
+                    .flatten()
+                    .is_some_and(|x| x == u64::from(id))
+            });
+            if !listed {
+                let _ = c.disconnect().await;
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = c.disconnect().await;
+                return Err(anyhow!(
+                    "connection {id} still listed {FENCE_WAIT:?} after KILL"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    match tokio::time::timeout(FENCE_WAIT + CONNECT_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::Error::new(Timeout(FENCE_WAIT + CONNECT_TIMEOUT))),
+    }
+}
+
+/// The connection options of a MySQL-family target DSN. The source-side parser stays in
+/// [`crate::binlog`]: a target DSN is not a replica DSN.
+pub(crate) fn opts(dsn: &str) -> Result<Opts> {
+    crate::binlog::replica_opts(dsn)
+}
+
+/// The schema a target DSN names (its path).
+pub(crate) fn schema_of(opts: &Opts, what: &str) -> Result<String> {
+    opts.db_name().map(str::to_string).ok_or_else(|| {
+        anyhow!("{what} DSN must name a database (mysql://user:pass@host:port/<schema>)")
+    })
 }

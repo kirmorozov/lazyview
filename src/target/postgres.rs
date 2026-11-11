@@ -3,10 +3,10 @@
 //! [`crate::target::Kind::from_dsn`] accepts a PostgreSQL scheme.
 
 use anyhow::Result;
-use mysql_async::{Conn, Value};
+use mysql_async::{Conn, Opts, Value};
 
 use crate::accumulate::{UnitChunk, UnitKind};
-use crate::mv::Layout;
+use crate::mv::{Layout, WriteOpts};
 
 /// `INSERT ... ON CONFLICT (row key) DO UPDATE` — PR T4 replaces this stub with the real
 /// statement. Unreachable today: a PostgreSQL target DSN is rejected at [`Kind::from_dsn`].
@@ -107,5 +107,34 @@ pub(crate) async fn swap(_conn: &mut Conn, _schema: &str, _name: &str) -> Result
 
 /// `DROP TABLE IF EXISTS` — PR T4. Unreachable today.
 pub(crate) async fn drop_table(_conn: &mut Conn, _schema: &str, _name: &str) -> Result<()> {
+    unreachable!("PostgreSQL targets are rejected by Kind::from_dsn")
+}
+
+/// The five `SET` statements of a PostgreSQL session — PR T1.4 lands them (`TimeZone='UTC'`,
+/// `DateStyle='ISO'`, `bytea_output='hex'`, `extra_float_digits=1`, `lock_timeout`).
+/// Unreachable today.
+pub(crate) fn session_setup(_lock_wait_s: u64) -> Vec<String> {
+    unreachable!("PostgreSQL targets are rejected by Kind::from_dsn")
+}
+
+/// Applies [`session_setup`] to a fresh connection — PR T1.2. Unreachable today.
+pub(crate) async fn init_session(_conn: &mut Conn, _lock_wait_s: u64) -> Result<()> {
+    unreachable!("PostgreSQL targets are rejected by Kind::from_dsn")
+}
+
+/// `WriteOpts` from `server_version_num` (no packet cap, `Upsert::OnConflict`) — PR T1.5.
+/// Unreachable today.
+pub(crate) async fn write_opts(
+    _conn: &mut Conn,
+    _kind: crate::target::Kind,
+    _batch_rows: usize,
+    _batch_bytes: usize,
+) -> Result<WriteOpts> {
+    unreachable!("PostgreSQL targets are rejected by Kind::from_dsn")
+}
+
+/// `SELECT pg_terminate_backend($1)` on a fresh connection and the `pg_stat_activity` poll —
+/// PR T5.2 lands it. Unreachable today.
+pub(crate) async fn fence(_opts: &Opts, _id: u32) -> Result<()> {
     unreachable!("PostgreSQL targets are rejected by Kind::from_dsn")
 }

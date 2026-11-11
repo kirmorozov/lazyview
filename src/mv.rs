@@ -374,74 +374,22 @@ pub async fn table_marker(
     crate::target::table_marker(conn, kind, schema, name).await
 }
 
-/// Session settings for every connection the service opens: non-locking reads, an sql_mode
-/// in which values are stored as they were read (zero dates, no strict-mode rejections), and a
-/// bounded table-lock wait (`lock_wait_s`) so a session blocked by a `LOCK TABLES` fails with
-/// 1205 instead of waiting out the server default (a year).
+/// Session settings for every connection the service opens (the target module renders them:
+/// [`crate::target::mysql::init_session`]).
 pub async fn init_session(conn: &mut Conn, lock_wait_s: u64) -> Result<()> {
-    let mode: Option<String> = conn
-        .query_first("SELECT CAST(@@SESSION.sql_mode AS CHAR)")
-        .await?;
-    let mode = mode.unwrap_or_default();
-    let permissive = permissive_sql_mode(&mode);
-    let [isolation, set_mode, lock_wait] = session_setup(&permissive, lock_wait_s);
-    conn.query_drop(isolation).await?;
-    if permissive != mode {
-        conn.query_drop(set_mode).await?;
-    }
-    conn.query_drop(lock_wait).await?;
-    Ok(())
+    crate::target::mysql::init_session(conn, lock_wait_s).await
 }
 
-/// The statements that give a connection the service's session settings with `sql_mode` (a mode
-/// `permissive_sql_mode` returned) and a table-lock wait of at most `lock_wait_s` seconds:
-/// [`init_session`] runs them on a direct connection, the supervisor's pools (src/supervisor.rs)
-/// on every new pooled connection.
+/// The statements that give a MySQL-family connection the service's session settings (see
+/// [`crate::target::mysql::session_setup`]).
 pub fn session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
-    [
-        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
-        format!("SET SESSION sql_mode = '{}'", sql_mode.replace('\'', "")),
-        format!("SET SESSION lock_wait_timeout = {lock_wait_s}"),
-    ]
+    crate::target::mysql::session_setup(sql_mode, lock_wait_s)
 }
 
-/// `mode` without the flags that reject values the source holds (strict mode, zero dates) and
-/// without the flags that change how SQL text is parsed (`ANSI_QUOTES`, `PIPES_AS_CONCAT`,
-/// `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES`, `IGNORE_SPACE`): lazyview parses definitions
-/// and writes its SQL in the default mode, so under `ANSI_QUOTES` a `"paid"` the analyzer
-/// traced as a string would be a column for the server. The combination modes (`ANSI`,
-/// `TRADITIONAL`, `ORACLE`, ...) imply some of them and go too: the server lists their member
-/// flags individually, so nothing else is lost.
-fn permissive_sql_mode(mode: &str) -> String {
-    mode.split(',')
-        .map(str::trim)
-        .filter(|m| {
-            !m.is_empty()
-                && m.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
-                && !matches!(
-                    m.to_ascii_uppercase().as_str(),
-                    "STRICT_TRANS_TABLES"
-                        | "STRICT_ALL_TABLES"
-                        | "NO_ZERO_DATE"
-                        | "NO_ZERO_IN_DATE"
-                        | "ANSI_QUOTES"
-                        | "PIPES_AS_CONCAT"
-                        | "HIGH_NOT_PRECEDENCE"
-                        | "NO_BACKSLASH_ESCAPES"
-                        | "IGNORE_SPACE"
-                        | "TRADITIONAL"
-                        | "ANSI"
-                        | "DB2"
-                        | "MAXDB"
-                        | "MSSQL"
-                        | "ORACLE"
-                        | "POSTGRESQL"
-                        | "MYSQL323"
-                        | "MYSQL40"
-                )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+/// `mode` without the flags that reject values the source holds and the flags that change how
+/// SQL text is parsed (see [`crate::target::mysql::permissive_sql_mode`]).
+pub fn permissive_sql_mode(mode: &str) -> String {
+    crate::target::mysql::permissive_sql_mode(mode)
 }
 
 /// Derives the materialized layout by creating a temporary view on the source and reading its
@@ -652,7 +600,7 @@ pub async fn drop_table(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -
 }
 
 /// Session time zone in which TIMESTAMPs are written (see [`Layout::epoch_timestamps`]).
-const UTC_SESSION: &str = "SESSION time_zone = '+00:00'";
+pub(crate) use crate::target::mysql::UTC_SESSION;
 
 fn rows_per_insert(layout: &Layout, batch_rows: usize) -> usize {
     (MAX_PARAMS / layout.cols.len().max(1)).clamp(1, batch_rows.max(1))
@@ -683,7 +631,9 @@ pub struct WriteOpts {
 }
 
 impl WriteOpts {
-    /// For a server reporting `version` (`@@version`) and `max_packet` (`@@max_allowed_packet`).
+    /// For a server reporting `version` (`@@version`) and `max_packet`
+    /// (`@@max_allowed_packet`); the target module decides the upsert form (see
+    /// [`crate::target::mysql::for_server`]).
     pub fn for_server(
         kind: crate::target::Kind,
         version: &str,
@@ -691,24 +641,7 @@ impl WriteOpts {
         batch_rows: usize,
         batch_bytes: usize,
     ) -> WriteOpts {
-        let num: Vec<u32> = version
-            .split(|c: char| !c.is_ascii_digit())
-            .take(3)
-            .map(|p| p.parse().unwrap_or(0))
-            .collect();
-        let mysql_alias = num.len() == 3 && (num[0], num[1], num[2]) >= (8, 0, 19);
-        let upsert = if version.to_ascii_lowercase().contains("mariadb") || !mysql_alias {
-            Upsert::Values
-        } else {
-            Upsert::RowAlias
-        };
-        let cap = usize::try_from(max_packet / 2).unwrap_or(usize::MAX);
-        WriteOpts {
-            batch_rows: batch_rows.max(1),
-            batch_bytes: batch_bytes.min(cap).max(1024),
-            upsert,
-            kind,
-        }
+        crate::target::mysql::for_server(kind, version, max_packet, batch_rows, batch_bytes)
     }
 }
 
@@ -719,17 +652,7 @@ pub async fn write_opts(
     batch_rows: usize,
     batch_bytes: usize,
 ) -> Result<WriteOpts> {
-    let (version, packet): (String, u64) = conn
-        .query_first("SELECT CAST(@@version AS CHAR), @@max_allowed_packet")
-        .await?
-        .context("reading @@version and @@max_allowed_packet")?;
-    Ok(WriteOpts::for_server(
-        kind,
-        &version,
-        packet,
-        batch_rows,
-        batch_bytes,
-    ))
+    crate::target::write_opts(conn, kind, batch_rows, batch_bytes).await
 }
 
 /// Estimated bytes a value takes in a statement.
