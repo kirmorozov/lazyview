@@ -10,6 +10,7 @@ use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::Value;
 
 use crate::analyze::{parse_definition, ViewPlan};
+use crate::cascade::Cache;
 use crate::catalog::{Column, FkAction, ForeignKey, TableInfo, TableRef};
 use crate::datum::{Datum, Key as Tuple};
 use crate::intset;
@@ -188,6 +189,8 @@ pub(crate) struct Rec {
     pub items: Vec<(usize, Item<NoItem>)>,
     pub notes: Vec<(usize, Note)>,
     pub hops: Vec<(usize, bool)>,
+    /// The cascade cache of `(target, plan)`, as the core owns it (default on first use).
+    pub caches: HashMap<(usize, usize), Cache>,
 }
 
 impl Rec {
@@ -243,5 +246,9 @@ impl Sink<NoItem> for Rec {
     }
     fn hop(&mut self, t: usize, hit: bool) {
         self.hops.push((t, hit));
+    }
+
+    fn cache(&mut self, t: usize, pi: usize) -> &mut Cache {
+        self.caches.entry((t, pi)).or_default()
     }
 }

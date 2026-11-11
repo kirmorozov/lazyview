@@ -18,6 +18,7 @@ use mysql_async::binlog::value::BinlogValue;
 
 use crate::access::{AccessPlan, Path, Route, Via};
 use crate::analyze::{CascadeRoute, ConstFilter, ViewPlan};
+use crate::cascade;
 use crate::catalog::{FkAction, TableInfo, TableRef};
 use crate::datum::{Datum, Key as Tuple};
 use crate::intset;
@@ -56,6 +57,8 @@ pub trait Sink<U> {
     fn note(&mut self, t: usize, n: Note);
     /// A hop lookup of target `t`: a hit or a miss.
     fn hop(&mut self, t: usize, hit: bool);
+    /// The cascade cache of plan `pi` of target `t`.
+    fn cache(&mut self, t: usize, pi: usize) -> &mut crate::cascade::Cache;
 }
 
 /// Something a row showed that is not an id: counts, and changes whose ids are unknown.
@@ -63,16 +66,38 @@ pub trait Sink<U> {
 pub enum Note {
     /// A cascade parent's image lacks columns: the ids its cascade changes are unknown.
     ShortParentImage,
+    /// A kept child row lacks a stored column: the ids its cascade changes are unknown.
+    IncompleteKeptRow,
+    /// The cascade cache missed binlog events: the kept rows under the parent's key may be stale.
+    CascadeGap,
+    /// `n` kept child rows were replayed for a parent change.
+    CascadeRows(u64),
+    /// A parent or child change was logged while the cache seeds: the caller must hold the
+    /// position until `install`.
+    Logged,
 }
 
 /// One cascade whose parent is the table, compiled.
 #[derive(Debug, Clone)]
 struct Cas {
     target: usize,
+    pi: usize,
     plan: Arc<ViewPlan>,
     ci: usize,
     /// The space of each partial set of the plan.
     sets: Vec<SpaceId>,
+    /// The route goes through the cascade cache of `(target, pi)` instead of the parent's row.
+    map: bool,
+}
+
+/// One mapped cascade whose child is the table: the child's own row events keep the cache of
+/// cascade `ci` of plan `pi` of target `target`.
+#[derive(Debug, Clone)]
+struct MapChild {
+    target: usize,
+    pi: usize,
+    plan: Arc<ViewPlan>,
+    ci: usize,
 }
 
 /// How an occurrence's rows reach its target's ids.
@@ -102,6 +127,7 @@ struct Occ {
 struct Watched {
     occs: Vec<Occ>,
     cascades: Vec<Cas>,
+    maps: Vec<MapChild>,
 }
 
 /// A source table as one TABLE_MAP of it shows it.
@@ -112,6 +138,8 @@ pub struct Source {
     skip: Vec<usize>,
     /// Cascades (indexes into the table's list) whose parent has another column count.
     skip_cas: Vec<usize>,
+    /// Maps (indexes into the table's list) whose child has another column count.
+    skip_maps: Vec<usize>,
 }
 
 /// The per-table occurrence lists of every target.
@@ -207,10 +235,11 @@ impl Consumer {
             ));
         }
         let mut compiled_cas: Vec<(TableRef, Cas)> = Vec::new();
+        let mut compiled_maps: Vec<(TableRef, MapChild)> = Vec::new();
         for (ci, c) in access.cascades.iter().enumerate() {
             match &c.via {
                 Via::Traced => {}
-                Via::Direct { .. } | Via::Derived { .. } => {
+                Via::Direct { .. } | Via::Derived { .. } | Via::Map { .. } => {
                     let sets = plan
                         .partial
                         .sets
@@ -221,17 +250,31 @@ impl Consumer {
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?;
+                    let map = matches!(c.via, Via::Map { .. });
                     compiled_cas.push((
                         c.parent.clone(),
                         Cas {
                             target: t,
+                            pi,
                             plan: plan.clone(),
                             ci,
                             sets,
+                            map,
                         },
                     ));
+                    // The child's own row events keep that cache.
+                    if map {
+                        compiled_maps.push((
+                            plan.cascades[ci].child.clone(),
+                            MapChild {
+                                target: t,
+                                pi,
+                                plan: plan.clone(),
+                                ci,
+                            },
+                        ));
+                    }
                 }
-                Via::Map { .. } => return Err("map cascades need PR 6L".to_string()),
                 Via::Untraced { reason } => return Err(format!("cascade untraced: {reason}")),
             }
         }
@@ -254,6 +297,10 @@ impl Consumer {
             let i = self.entry(table);
             self.watched[i].cascades.push(cas);
         }
+        for (table, m) in compiled_maps {
+            let i = self.entry(table);
+            self.watched[i].maps.push(m);
+        }
         Ok(())
     }
 
@@ -270,11 +317,12 @@ impl Consumer {
         }
     }
 
-    /// Drops every occurrence and cascade of target `t` (table indexes stay valid).
+    /// Drops every occurrence, cascade and map of target `t` (table indexes stay valid).
     pub fn remove(&mut self, t: usize) {
         for w in self.watched.iter_mut() {
             w.occs.retain(|o| o.target != t);
             w.cascades.retain(|c| c.target != t);
+            w.maps.retain(|m| m.target != t);
         }
     }
 
@@ -282,12 +330,13 @@ impl Consumer {
     pub fn watched(&self, table: &TableRef) -> bool {
         self.by_table.get(table).is_some_and(|&i| {
             let w = &self.watched[i];
-            !w.occs.is_empty() || !w.cascades.is_empty()
+            !w.occs.is_empty() || !w.cascades.is_empty() || !w.maps.is_empty()
         })
     }
 
     /// `table` as a TABLE_MAP with `columns` columns shows it (`None`: any shape): occurrences
-    /// planned for another column count, and cascades whose parent has one, skip its rows.
+    /// planned for another column count, cascades whose parent has one, and maps whose child
+    /// has one, skip its rows.
     pub fn source(&self, table: &TableRef, columns: Option<usize>) -> Option<Source> {
         let idx = *self.by_table.get(table)?;
         let w = &self.watched[idx];
@@ -307,14 +356,24 @@ impl Consumer {
             })
             .map(|(i, _)| i)
             .collect();
+        let skip_maps = w
+            .maps
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                columns.is_some_and(|n| m.plan.cascades[m.ci].child_table.columns.len() != n)
+            })
+            .map(|(i, _)| i)
+            .collect();
         Some(Source {
             idx,
             skip,
             skip_cas,
+            skip_maps,
         })
     }
 
-    /// The targets with an occurrence or cascade that `s` skips, ascending, once each.
+    /// The targets with an occurrence, cascade or map that `s` skips, ascending, once each.
     pub fn mismatched(&self, s: &Source) -> Vec<usize> {
         let w = &self.watched[s.idx];
         let mut targets: Vec<usize> = s
@@ -322,6 +381,7 @@ impl Consumer {
             .iter()
             .map(|&i| w.occs[i].target)
             .chain(s.skip_cas.iter().map(|&i| w.cascades[i].target))
+            .chain(s.skip_maps.iter().map(|&i| w.maps[i].target))
             .collect();
         targets.sort_unstable();
         targets.dedup();
@@ -356,9 +416,9 @@ impl Consumer {
             }
             sink.row(o.target, false);
             match &o.way {
-                Way::Direct { cols } => ids(o, SpaceId::FULL, cols, b, a, sink),
-                Way::Partial { space, cols } => ids(o, *space, cols, b, a, sink),
-                Way::Hop { hop } => hop_ids(o, *hop, b, a, hops, sink),
+                Way::Direct { cols } => ids(o, SpaceId::FULL, cols, false, b, a, sink),
+                Way::Partial { space, cols } => ids(o, *space, cols, false, b, a, sink),
+                Way::Hop { hop } => hop_ids(o, *hop, false, b, a, hops, sink),
             }
             // A row of a chain table changes what the hop's link values reach: its partner values'
             // entries go (or all of the hop's when the partner is another alias); answers in flight
@@ -378,17 +438,119 @@ impl Consumer {
             if s.skip_cas.contains(&i) || !sink.open(cas.target) {
                 continue;
             }
-            cascade(cas, before, after, sink);
+            cascade(self, cas, before, after, hops, sink);
+        }
+        for (i, m) in self.watched[s.idx].maps.iter().enumerate() {
+            if s.skip_maps.contains(&i) || !sink.open(m.target) {
+                continue;
+            }
+            feed_map(m, before, after, sink);
+        }
+    }
+
+    /// The change the storage engine made to a child row, replayed as a row change of `table`:
+    /// like [`Consumer::row`] over that table's routes of target `t` alone (the section's replay),
+    /// with no skip list, and every id marked `cascaded`.
+    fn replay<U, S: Sink<U>>(
+        &self,
+        t: usize,
+        table: &TableRef,
+        before: Option<&BinlogRow>,
+        after: Option<&BinlogRow>,
+        hops: &mut Hops,
+        sink: &mut S,
+    ) {
+        if !sink.open(t) {
+            return;
+        }
+        let Some(&i) = self.by_table.get(table) else {
+            return;
+        };
+        let w = &self.watched[i];
+        for o in w.occs.iter().filter(|o| o.target == t) {
+            if let (Some(b), Some(a)) = (before, after) {
+                if !changed(b, a, &o.read) {
+                    sink.row(t, true);
+                    continue;
+                }
+            }
+            let b = before.filter(|r| ConstFilter::passes(&o.filters, r, &o.table));
+            let a = after.filter(|r| ConstFilter::passes(&o.filters, r, &o.table));
+            if b.is_none() && a.is_none() {
+                sink.row(t, true);
+                continue;
+            }
+            sink.row(t, false);
+            match &o.way {
+                Way::Direct { cols } => ids(o, SpaceId::FULL, cols, true, b, a, sink),
+                Way::Partial { space, cols } => ids(o, *space, cols, true, b, a, sink),
+                Way::Hop { hop } => hop_ids(o, *hop, true, b, a, hops, sink),
+            }
+            for &h in &o.chains {
+                match hops.plan(h).and_then(|p| p.partner.clone()) {
+                    Some((pa, cols)) if pa == o.alias => {
+                        for r in b.into_iter().chain(a) {
+                            hops.evict(h, &project(o, r, &cols));
+                        }
+                    }
+                    _ => hops.clear(h),
+                }
+            }
+        }
+        for cas in w.cascades.iter().filter(|c| c.target == t) {
+            cascade(self, cas, before, after, hops, sink);
+        }
+        for m in w.maps.iter().filter(|m| m.target == t) {
+            feed_map(m, before, after, sink);
+        }
+    }
+
+    /// Replays the seeding log of plan `pi`'s cache of target `t` (from `Cache::install`), in
+    /// binlog order: children straight into the cache, parents again with their kept rows
+    /// expanded. A gap (a missed binlog range) is a note for the caller's safety net.
+    pub fn install<U, S: Sink<U>>(
+        &self,
+        t: usize,
+        pi: usize,
+        log: Vec<crate::cascade::Logged>,
+        hops: &mut Hops,
+        sink: &mut S,
+    ) {
+        for entry in log {
+            match entry {
+                cascade::Logged::Child { route, old, new } => {
+                    sink.cache(t, pi).child(route, old, new);
+                }
+                cascade::Logged::Parent { route, old, new } => {
+                    if sink.cache(t, pi).gap {
+                        sink.note(t, Note::CascadeGap);
+                    }
+                    let Some(rows) = sink.cache(t, pi).parent(route, &old, new.as_ref()) else {
+                        continue;
+                    };
+                    // The target's own route of this cascade, for `expand`.
+                    let Some(cas) = self
+                        .watched
+                        .iter()
+                        .flat_map(|w| w.cascades.iter())
+                        .find(|c| c.target == t && c.pi == pi && c.ci == route)
+                    else {
+                        continue;
+                    };
+                    expand(self, cas, &rows, new.as_ref(), hops, sink);
+                }
+            }
         }
     }
 }
 
 /// The ids of columns `cols` of the images (Direct and Partial paths) into space `space` of `o`'s
-/// target.
+/// target. `cascaded`: the row is one the storage engine changed (6L5's replay), not a logged one.
 fn ids<U, S: Sink<U>>(
     o: &Occ,
     space: SpaceId,
     cols: &[usize],
+    cascaded: bool,
     before: Option<&BinlogRow>,
     after: Option<&BinlogRow>,
     sink: &mut S,
@@ -400,8 +562,8 @@ fn ids<U, S: Sink<U>>(
             _ => None,
         };
         match int {
-            Some(i) => sink.int(t, space, intset::from_i64(i), op, false),
-            None => sink.tuple(t, space, k, op, false),
+            Some(i) => sink.int(t, space, intset::from_i64(i), op, cascaded),
+            None => sink.tuple(t, space, k, op, cascaded),
         }
     };
     if let &[c] = cols {
@@ -449,9 +611,11 @@ fn send<U, S: Sink<U>>(t: usize, s: SpaceId, k: Tuple, op: Op, cascaded: bool, s
 /// The consumer never rebuilds: a short parent image becomes a note for the caller's
 /// safety net (guard R1 c).
 fn cascade<U, S: Sink<U>>(
+    cons: &Consumer,
     cas: &Cas,
     before: Option<&BinlogRow>,
     after: Option<&BinlogRow>,
+    hops: &mut Hops,
     sink: &mut S,
 ) {
     let c = &cas.plan.cascades[cas.ci];
@@ -489,6 +653,10 @@ fn cascade<U, S: Sink<U>>(
         }
     }
     sink.row(cas.target, false);
+    if cas.map {
+        feed_mapped_cascade(cons, cas, action, b, after, hops, sink);
+        return;
+    }
     if c.derived {
         derived(cas, c, action, b, after, sink);
         return;
@@ -586,6 +754,122 @@ fn derived<U, S: Sink<U>>(
     }
 }
 
+/// A child row of a mapped cascade keeps its entry in the cache of `(target, plan)` (ported from
+/// `accumulate::feed_map`, same decisions): an update of no stored column, and a row neither
+/// image keeps, are nothing; while the cache seeds the change goes to its log instead, which is
+/// what makes the caller hold the position until [`Consumer::install`]. No id.
+fn feed_map<U, S: Sink<U>>(
+    m: &MapChild,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+    sink: &mut S,
+) {
+    let c = &m.plan.cascades[m.ci];
+    let Some(map) = &c.map else { return };
+    if let (Some(b), Some(a)) = (before, after) {
+        if !map.cols.iter().any(|&k| {
+            value_at(b, k) != value_at(a, k)
+                || matches!(value_at(a, k), Some(BinlogValue::JsonDiff(_)))
+        }) {
+            return;
+        }
+    }
+    let old = before.and_then(|r| cascade::kept(c, r));
+    let new = after.and_then(|r| cascade::kept(c, r));
+    if old.is_none() && new.is_none() {
+        return;
+    }
+    let old_key = old
+        .as_ref()
+        .map(|(k, _)| k.clone())
+        .filter(|k| new.as_ref().is_none_or(|(nk, _)| nk != k));
+    let seeding = sink.cache(m.target, m.pi).is_seeding();
+    sink.cache(m.target, m.pi).child(m.ci, old_key, new);
+    if seeding {
+        sink.note(m.target, Note::Logged);
+    }
+}
+
+/// A parent row of a mapped cascade (ported from `accumulate::feed_mapped_cascade`): the kept
+/// children under the parent's old key come back and replay as the child row changes the storage
+/// engine made; `None` from the cache means the change went to the seeding log, and a gap is a
+/// note for the caller's safety net (the consumer never rebuilds).
+fn feed_mapped_cascade<U, S: Sink<U>>(
+    cons: &Consumer,
+    cas: &Cas,
+    action: FkAction,
+    b: &BinlogRow,
+    after: Option<&BinlogRow>,
+    hops: &mut Hops,
+    sink: &mut S,
+) {
+    let c = &cas.plan.cascades[cas.ci];
+    let full = |r: &BinlogRow| r.len() == c.parent.columns.len();
+    if !full(b) || after.is_some_and(|a| !full(a)) {
+        sink.note(cas.target, Note::ShortParentImage);
+        return;
+    }
+    let key = |r: &BinlogRow| -> Tuple {
+        c.parent_cols
+            .iter()
+            .map(|&p| Datum::from_binlog(value_at(r, p), &c.parent.columns[p]))
+            .collect()
+    };
+    // The children's FK after the change: the new key (a CASCADE update), NULLs (SET NULL), or
+    // none (the children go with the parent).
+    let new = match (after, action) {
+        (Some(a), FkAction::Cascade) => Some(key(a)),
+        (None, FkAction::Cascade) => None,
+        _ => Some(c.parent_cols.iter().map(|_| Datum::Null).collect()),
+    };
+    let old = key(b);
+    if sink.cache(cas.target, cas.pi).gap {
+        sink.note(cas.target, Note::CascadeGap);
+    }
+    match sink
+        .cache(cas.target, cas.pi)
+        .parent(cas.ci, &old, new.as_ref())
+    {
+        None => sink.note(cas.target, Note::Logged),
+        // No kept child row under `old` (none exists, or a gap): no id can change.
+        Some(rows) if rows.is_empty() => {}
+        Some(rows) => expand(cons, cas, &rows, new.as_ref(), hops, sink),
+    }
+}
+
+/// The kept child rows of a parent change, expanded into child row changes at event time (ported
+/// from `accumulate::expand`): a complete row replays through the consumer's own occurrences of
+/// the child table (so it gets the ids a logged row gets), with its kept image before and, for a
+/// key update, the same image carrying the new FK; an incomplete row (a stored column missing
+/// from the image) is a note, not an id.
+fn expand<U, S: Sink<U>>(
+    cons: &Consumer,
+    cas: &Cas,
+    rows: &[cascade::KeptRow],
+    new: Option<&Tuple>,
+    hops: &mut Hops,
+    sink: &mut S,
+) {
+    let c = &cas.plan.cascades[cas.ci];
+    sink.note(cas.target, Note::CascadeRows(rows.len() as u64));
+    for row in rows {
+        if !row.complete {
+            sink.note(cas.target, Note::IncompleteKeptRow);
+            continue;
+        }
+        let before = cascade::kept_image(c, row, None);
+        let after = new.map(|fk| cascade::kept_image(c, row, Some(fk)));
+        cons.replay(
+            cas.target,
+            &c.child,
+            Some(&before),
+            after.as_ref(),
+            hops,
+            sink,
+        );
+    }
+}
+
 /// Columns `cols` of `r` as a key, the way `o`'s table declares them.
 fn project(o: &Occ, r: &BinlogRow, cols: &[usize]) -> Tuple {
     cols.iter()
@@ -599,6 +883,7 @@ fn project(o: &Occ, r: &BinlogRow, cols: &[usize]) -> Tuple {
 fn hop_ids<U, S: Sink<U>>(
     o: &Occ,
     h: HopId,
+    cascaded: bool,
     before: Option<&BinlogRow>,
     after: Option<&BinlogRow>,
     hops: &mut Hops,
@@ -616,8 +901,8 @@ fn hop_ids<U, S: Sink<U>>(
                 sink.hop(t, true);
                 for k in ids {
                     match k {
-                        Key::Int(v) => sink.int(t, space, *v, Op::Update, false),
-                        Key::Tuple(k) => sink.tuple(t, space, k.clone(), Op::Update, false),
+                        Key::Int(v) => sink.int(t, space, *v, Op::Update, cascaded),
+                        Key::Tuple(k) => sink.tuple(t, space, k.clone(), Op::Update, cascaded),
                     }
                 }
             }
@@ -2058,22 +2343,562 @@ mod tests {
         assert!(rec.ids.is_empty() && rec.items.is_empty(), "{rec:?}");
     }
 
-    #[test]
-    fn map_cascades_are_refused_until_6l() {
-        let p = plan_in(TUPLE_AND_A_COLUMN, &cascading_catalog());
-        let mut ap = AccessPlan::of(&p);
-        assert!(matches!(ap.route, Route::Dedup), "{ap}");
-        ap.cascades[0].via = Via::Map {
-            key: vec![0],
-            cols: vec![0, 1],
-        };
+    /// A catalog of `[(name, columns, pk, cascades)]` over the neutral column types of [`table`].
+    fn catalog_with(
+        entries: &[(&str, &[(&str, &str)], &[usize], Vec<ForeignKey>)],
+    ) -> HashMap<TableRef, Arc<TableInfo>> {
+        entries
+            .iter()
+            .map(|(name, cols, pk, cascades)| {
+                let (tr, t) = table(name, cols, pk);
+                let mut t = (*t).clone();
+                t.cascades = cascades.clone();
+                (tr, Arc::new(t))
+            })
+            .collect()
+    }
+
+    /// `child.child_cols -> parent.parent_cols`, `on_delete` on deletes and `Cascade` on updates.
+    fn fk(
+        parent: &str,
+        child_cols: &[usize],
+        parent_cols: &[&str],
+        on_delete: FkAction,
+    ) -> ForeignKey {
+        ForeignKey {
+            parent: table_ref(parent),
+            child_cols: child_cols.to_vec(),
+            parent_cols: parent_cols.iter().map(|s| (*s).to_string()).collect(),
+            on_delete,
+            on_update: FkAction::Cascade,
+        }
+    }
+
+    /// A one-part parent key, as the cascade cache holds it.
+    fn fkv(v: i64) -> Tuple {
+        vec![Datum::Int(v)].into()
+    }
+
+    /// Compiles `sql` over `cat` as target 0, plan 0.
+    fn compile_cat(sql: &str, cat: &HashMap<TableRef, Arc<TableInfo>>) -> (C, AccessPlan) {
+        let p = plan_in(sql, cat);
+        let ap = AccessPlan::of(&p);
         let spaces = Spaces::of(p.unit_exprs.len(), &p.partial.sets);
         let mut c = Consumer::default();
         let mut hops = Hops::new(1000);
-        let err = c.add(0, 0, &p, &ap, &spaces, &mut hops).unwrap_err();
-        assert!(err.contains("6L"), "{err}");
-        for t in plan_tables(&ap) {
-            assert!(!c.watched(&t), "the map refusal watched {t:?}");
-        }
+        c.add(0, 0, &p, &ap, &spaces, &mut hops).unwrap();
+        (C { c, hops }, ap)
+    }
+
+    /// The cascade index of the route whose child is `child`.
+    fn cas_to(ap: &AccessPlan, child: &str) -> usize {
+        ap.cascades
+            .iter()
+            .position(|c| c.child.1 == child)
+            .unwrap_or_else(|| panic!("no cascade onto {child}"))
+    }
+
+    /// Ported from `accumulate::mapped_cascades_keep_and_replay_child_rows`: the map keeps what
+    /// the alias's filters keep, a parent row replays the kept children through the consumer's
+    /// own occurrences of the child table, and the notes stand where the old view's rebuild did.
+    #[test]
+    fn mapped_cascades_keep_and_replay_child_rows() {
+        let cat = catalog_with(&[
+            ("grp", &[("gid", "int")], &[0], vec![]),
+            ("obj", &[("oid", "int")], &[0], vec![]),
+            (
+                "link",
+                &[("gid", "int"), ("oid", "int")],
+                &[0, 1],
+                vec![fk("obj", &[1], &["oid"], FkAction::Cascade)],
+            ),
+            (
+                "attrs",
+                &[
+                    ("id", "bigint"),
+                    ("oid", "int"),
+                    ("aid", "smallint"),
+                    ("val", "int"),
+                ],
+                &[0],
+                vec![fk("obj", &[1], &["oid"], FkAction::Cascade)],
+            ),
+        ]);
+        let sql = "SELECT g.gid, COUNT(*) AS n, MAX(a.val) AS x FROM grp g JOIN link c ON \
+                   c.gid = g.gid JOIN attrs a ON a.oid = c.oid AND a.aid = 7 GROUP BY g.gid";
+        let (mut x, ap) = compile_cat(sql, &cat);
+        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+        let (to_attrs, to_link) = (cas_to(&ap, "attrs"), cas_to(&ap, "link"));
+        assert!(
+            matches!(ap.cascades[to_attrs].via, Via::Map { .. })
+                && matches!(ap.cascades[to_link].via, Via::Map { .. }),
+            "{:?}",
+            ap.cascades
+        );
+        let s = x.c.source(&table_ref("attrs"), Some(4)).expect("watched");
+        let ls = x.c.source(&table_ref("link"), Some(2)).expect("watched");
+        let os = x.c.source(&table_ref("obj"), Some(1)).expect("watched");
+        let mut rec = Rec::default();
+        let kept_of = |rec: &Rec, fk: i64| {
+            rec.caches
+                .get(&(0, 0))
+                .map(|c| {
+                    c.under(to_attrs, &fkv(fk))
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        // The row an alias's filter keeps is kept; an update of a column no route takes a value
+        // from leaves it as it was. A child row change sends no id of its own.
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(1), Some(10), Some(7), Some(5)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        let kept = kept_of(&rec, 10).into_iter().next().expect("kept");
+        assert_eq!(
+            (kept.fk.to_vec(), kept.complete),
+            (vec![Datum::Int(10)], true)
+        );
+        x.c.row(
+            &s,
+            Some(&row(&[Some(1), Some(10), Some(7), Some(5)])),
+            Some(&row(&[Some(1), Some(10), Some(7), Some(6)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(kept_of(&rec, 10).len(), 1, "an unread column keeps the row");
+        // Another key value: the alias's filters drop it, so nothing new is kept.
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(2), Some(10), Some(8), Some(5)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(kept_of(&rec, 10).len(), 1);
+        // A new FK: kept under it; out of the filters, and deleted: gone.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(1), Some(10), Some(7), Some(5)])),
+            Some(&row(&[Some(1), Some(11), Some(7), Some(5)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(kept_of(&rec, 10).is_empty() && kept_of(&rec, 11).len() == 1);
+        x.c.row(
+            &s,
+            Some(&row(&[Some(1), Some(11), Some(7), Some(5)])),
+            Some(&row(&[Some(1), Some(11), Some(9), Some(5)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(kept_of(&rec, 11).is_empty());
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(3), Some(12), Some(7), Some(5)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        x.c.row(
+            &s,
+            Some(&row(&[Some(3), Some(12), Some(7), Some(5)])),
+            None,
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(kept_of(&rec, 12).is_empty());
+        assert!(rec.ids.is_empty() && rec.notes.is_empty(), "{rec:?}");
+
+        // A parent delete replays the kept children through the consumer's own occurrences of
+        // their tables: the link row's id as a cascaded delete, the attrs row reaching its target
+        // through its hop, exactly as the logged row of the same key would.
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(1), Some(10), Some(7), Some(5)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        x.c.row(
+            &ls,
+            None,
+            Some(&row(&[Some(4), Some(10)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        let (n, m, k) = (rec.ids.len(), rec.items.len(), rec.hops.len());
+        x.c.row(&os, Some(&row(&[Some(10)])), None, &mut x.hops, &mut rec);
+        assert_eq!(
+            rec.ids[n..],
+            [(
+                0,
+                SpaceId::FULL,
+                Key::Int(intset::from_i64(4)),
+                Op::Delete,
+                true
+            )],
+            "{rec:?}"
+        );
+        assert_eq!(rec.hops[k..], [(0, false)], "the attrs row reaches its hop");
+        assert!(
+            matches!(&rec.items[m..], [(_, Item::Hop { .. })]),
+            "{:?}",
+            &rec.items[m..]
+        );
+        assert_eq!(
+            rec.notes
+                .iter()
+                .filter(|(t, _)| *t == 0)
+                .filter(|(_, nt)| matches!(nt, Note::CascadeRows(1)))
+                .count(),
+            2,
+            "{rec:?}"
+        );
+        assert!(kept_of(&rec, 10).is_empty(), "the replay took the rows");
+
+        // A gap: the note, and nothing else.
+        let mut rec = Rec::default();
+        let mut gap = cascade::Cache::default();
+        gap.gap = true;
+        rec.caches.insert((0, 0), gap);
+        x.c.row(&os, Some(&row(&[Some(20)])), None, &mut x.hops, &mut rec);
+        assert!(rec.ids.is_empty() && rec.items.is_empty(), "{rec:?}");
+        assert_eq!(
+            rec.notes,
+            vec![(0, Note::CascadeGap), (0, Note::CascadeGap)],
+            "one note a mapped cascade of the parent"
+        );
+
+        // While the cache seeds, a child or parent change is only logged: `Logged` holds the
+        // position, and `install` is what yields the ids.
+        let mut rec = Rec::default();
+        rec.caches.insert((0, 0), cascade::Cache::seeding());
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(1), Some(10), Some(7), Some(5)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        let (n, h, m) = (rec.ids.len(), rec.hops.len(), rec.items.len());
+        x.c.row(&os, Some(&row(&[Some(10)])), None, &mut x.hops, &mut rec);
+        assert!(
+            rec.ids[n..].is_empty() && rec.hops[h..].is_empty() && rec.items[m..].is_empty(),
+            "while the cache seeds the parent gives nothing: {rec:?}"
+        );
+        assert!(
+            rec.notes.iter().all(|(_, nt)| *nt == Note::Logged) && rec.notes.len() == 3,
+            "{rec:?}"
+        );
+        let log = rec
+            .caches
+            .get_mut(&(0, 0))
+            .unwrap()
+            .install(cascade::Cache::default());
+        assert_eq!(log.len(), 3);
+        let mut rec = Rec::default();
+        x.c.install(0, 0, log, &mut x.hops, &mut rec);
+        assert_eq!(
+            rec.hops,
+            [(0, false)],
+            "the seeded row replays through its hop"
+        );
+        assert!(
+            matches!(&rec.items[..], [(_, Item::Hop { .. })]),
+            "{:?}",
+            rec.items
+        );
+
+        // A kept row whose image lacked a stored column: a note, and no id.
+        let mut rec = Rec::default();
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(9), Some(30)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        x.c.row(&os, Some(&row(&[Some(30)])), None, &mut x.hops, &mut rec);
+        assert!(rec.ids.is_empty(), "{rec:?}");
+        assert!(rec.notes.contains(&(0, Note::IncompleteKeptRow)), "{rec:?}");
+
+        // SET NULL: the kept rows come back with their FK cleared. The link row's own key is the
+        // group the view groups by, so it goes out once as a cascaded Update and the row stays
+        // kept under NULL; the attrs row reaches its hop with both link values.
+        let cleared = catalog_with(&[
+            ("grp", &[("gid", "int")], &[0], vec![]),
+            ("obj", &[("oid", "int")], &[0], vec![]),
+            (
+                "link",
+                &[("gid", "int"), ("oid", "int")],
+                &[0, 1],
+                vec![fk("obj", &[1], &["oid"], FkAction::SetNull)],
+            ),
+            (
+                "attrs",
+                &[
+                    ("id", "bigint"),
+                    ("oid", "int"),
+                    ("aid", "smallint"),
+                    ("val", "int"),
+                ],
+                &[0],
+                vec![fk("obj", &[1], &["oid"], FkAction::SetNull)],
+            ),
+        ]);
+        let (mut z, _) = compile_cat(sql, &cleared);
+        let zs = z.c.source(&table_ref("attrs"), Some(4)).expect("watched");
+        let zl = z.c.source(&table_ref("link"), Some(2)).expect("watched");
+        let zo = z.c.source(&table_ref("obj"), Some(1)).expect("watched");
+        let mut rec = Rec::default();
+        z.c.row(
+            &zl,
+            None,
+            Some(&row(&[Some(4), Some(10)])),
+            &mut z.hops,
+            &mut rec,
+        );
+        z.c.row(
+            &zs,
+            None,
+            Some(&row(&[Some(1), Some(10), Some(7), Some(5)])),
+            &mut z.hops,
+            &mut rec,
+        );
+        let (n, m, h) = (rec.ids.len(), rec.items.len(), rec.hops.len());
+        z.c.row(&zo, Some(&row(&[Some(10)])), None, &mut z.hops, &mut rec);
+        assert_eq!(
+            rec.ids[n..],
+            [(
+                0,
+                SpaceId::FULL,
+                Key::Int(intset::from_i64(4)),
+                Op::Update,
+                true
+            )],
+            "a child key the clearing leaves alone is one Update: {rec:?}"
+        );
+        assert!(
+            !rec.items[m..].is_empty()
+                && rec.items[m..]
+                    .iter()
+                    .all(|(_, it)| matches!(it, Item::Hop { .. }))
+                && rec.hops[h..].iter().all(|&(_, hit)| !hit),
+            "the attrs row reaches its hop: {:?} {:?}",
+            &rec.items[m..],
+            &rec.hops[h..]
+        );
+        let null = vec![Datum::Null].into();
+        assert_eq!(
+            rec.caches[&(0, 0)].under(to_link, &null).len(),
+            0,
+            "a row whose FK the engine cleared is not kept"
+        );
+        assert_eq!(
+            rec.notes
+                .iter()
+                .filter(|(_, nt)| matches!(nt, Note::CascadeRows(1)))
+                .count(),
+            2,
+            "both children come back, one a route: {rec:?}"
+        );
+    }
+
+    /// Ported from `accumulate::cache_only_cascade_changes_hold_no_replay_position`: the rows of
+    /// a level the view does not read live only in the cache, and their parent's change reaches
+    /// the view through the rows kept below them.
+    #[test]
+    fn cache_only_cascade_changes_hold_no_replay_position() {
+        let levels = |on_delete: FkAction| {
+            catalog_with(&[
+                ("grp", &[("id", "int")], &[0], vec![]),
+                (
+                    "mid",
+                    &[("id", "int"), ("gid", "int")],
+                    &[0],
+                    vec![fk("grp", &[1], &["id"], on_delete)],
+                ),
+                (
+                    "leaf",
+                    &[("mid_id", "int"), ("seq", "int"), ("qty", "int")],
+                    &[0, 1],
+                    vec![fk("mid", &[0], &["id"], on_delete)],
+                ),
+            ])
+        };
+        let sql = "SELECT mid_id, seq, qty FROM leaf WHERE qty >= 0";
+        let (mut x, ap) = compile_cat(sql, &levels(FkAction::Cascade));
+        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+        let (to_mid, to_leaf) = (cas_to(&ap, "mid"), cas_to(&ap, "leaf"));
+        assert!(
+            matches!(ap.cascades[to_mid].via, Via::Map { .. })
+                && matches!(ap.cascades[to_leaf].via, Via::Map { .. }),
+            "{:?}",
+            ap.cascades
+        );
+        let gs = x.c.source(&table_ref("grp"), Some(1)).expect("watched");
+        let ms = x.c.source(&table_ref("mid"), Some(2)).expect("watched");
+        let ls = x.c.source(&table_ref("leaf"), Some(3)).expect("watched");
+        let kept = |rec: &Rec, ci: usize, fk: i64| {
+            rec.caches
+                .get(&(0, 0))
+                .map(|c| c.under(ci, &fkv(fk)).len())
+                .unwrap_or_default()
+        };
+        let kept_at = |rec: &Rec, ci: usize, fk: Tuple| {
+            rec.caches
+                .get(&(0, 0))
+                .map(|c| c.under(ci, &fk).len())
+                .unwrap_or_default()
+        };
+
+        // A new row of the level the view does not read: kept, and nothing goes out.
+        let mut rec = Rec::default();
+        x.c.row(
+            &ms,
+            None,
+            Some(&row(&[Some(5), Some(1)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(kept(&rec, to_mid, 1), 1);
+        assert!(
+            rec.ids.is_empty() && rec.notes.is_empty() && rec.items.is_empty(),
+            "{rec:?}"
+        );
+
+        // Its parent deleted: the kept row replays through the consumer's routes of `mid`, of
+        // which the view has none, and no leaf row is kept under it: no id.
+        let n = rec.notes.len();
+        x.c.row(&gs, Some(&row(&[Some(1)])), None, &mut x.hops, &mut rec);
+        assert_eq!(rec.notes[n..], [(0, Note::CascadeRows(1))], "{rec:?}");
+        assert!(rec.ids.is_empty(), "{rec:?}");
+        assert_eq!(kept(&rec, to_mid, 1), 0, "the replay took the row");
+
+        // With a leaf row kept under the next level's id, the same parent change marks that
+        // leaf row: one cascaded delete of its key.
+        let mut rec = Rec::default();
+        x.c.row(
+            &ms,
+            None,
+            Some(&row(&[Some(6), Some(2)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        x.c.row(
+            &ls,
+            None,
+            Some(&row(&[Some(6), Some(1), Some(3)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(rec.notes.is_empty(), "{rec:?}");
+        let n = rec.ids.len();
+        x.c.row(&gs, Some(&row(&[Some(2)])), None, &mut x.hops, &mut rec);
+        assert_eq!(
+            rec.ids[n..],
+            [(
+                0,
+                SpaceId::FULL,
+                Key::Tuple(vec![Datum::Int(6), Datum::Int(1)].into()),
+                Op::Delete,
+                true
+            )],
+            "{rec:?}"
+        );
+        assert_eq!(kept(&rec, to_leaf, 6), 0);
+
+        // SET NULL: the middle row comes back with its own FK cleared, and the view has no route
+        // of `mid`: nothing goes out. The leaf below it keeps its rows: their FK points at the
+        // middle key, which did not move; a row whose own FK is NULL is not kept at all.
+        let (mut y, _) = compile_cat(sql, &levels(FkAction::SetNull));
+        let yms = y.c.source(&table_ref("mid"), Some(2)).expect("watched");
+        let yls = y.c.source(&table_ref("leaf"), Some(3)).expect("watched");
+        let ygs = y.c.source(&table_ref("grp"), Some(1)).expect("watched");
+        let mut rec = Rec::default();
+        y.c.row(
+            &yms,
+            None,
+            Some(&row(&[Some(6), Some(2)])),
+            &mut y.hops,
+            &mut rec,
+        );
+        y.c.row(
+            &yls,
+            None,
+            Some(&row(&[Some(6), Some(1), Some(3)])),
+            &mut y.hops,
+            &mut rec,
+        );
+        let (n, m) = (rec.ids.len(), rec.notes.len());
+        y.c.row(&ygs, Some(&row(&[Some(2)])), None, &mut y.hops, &mut rec);
+        assert!(rec.ids[n..].is_empty(), "{rec:?}");
+        assert_eq!(rec.notes[m..], [(0, Note::CascadeRows(1))], "{rec:?}");
+        assert_eq!(kept(&rec, to_leaf, 6), 1, "the leaf row stays");
+        assert_eq!(
+            kept_at(&rec, to_mid, vec![Datum::Null].into()),
+            0,
+            "a row whose FK the engine cleared is not kept"
+        );
+
+        // While the cache seeds, the same change holds the position instead: `Logged`, no id,
+        // and `install` yields what the ready cache gave.
+        let mut rec = Rec::default();
+        rec.caches.insert((0, 0), cascade::Cache::seeding());
+        x.c.row(
+            &ms,
+            None,
+            Some(&row(&[Some(7), Some(3)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        x.c.row(
+            &ls,
+            None,
+            Some(&row(&[Some(7), Some(1), Some(3)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(
+            rec.notes.iter().all(|(_, nt)| *nt == Note::Logged),
+            "{rec:?}"
+        );
+        let (n, m) = (rec.ids.len(), rec.notes.len());
+        x.c.row(&gs, Some(&row(&[Some(3)])), None, &mut x.hops, &mut rec);
+        assert!(
+            rec.ids[n..].is_empty(),
+            "the parent change is only logged: {rec:?}"
+        );
+        assert_eq!(
+            rec.notes[m..],
+            [(0, Note::Logged)],
+            "and it holds the position"
+        );
+        let log = rec
+            .caches
+            .get_mut(&(0, 0))
+            .unwrap()
+            .install(cascade::Cache::default());
+        assert_eq!(log.len(), 3, "the two children and the parent");
+        let mut rec = Rec::default();
+        x.c.install(0, 0, log, &mut x.hops, &mut rec);
+        assert_eq!(
+            rec.ids,
+            [(
+                0,
+                SpaceId::FULL,
+                Key::Tuple(vec![Datum::Int(7), Datum::Int(1)].into()),
+                Op::Delete,
+                true
+            )],
+            "{rec:?}"
+        );
     }
 }
