@@ -10,11 +10,11 @@ use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::Value;
 
 use crate::analyze::{parse_definition, ViewPlan};
-use crate::catalog::{Column, TableInfo, TableRef};
+use crate::catalog::{Column, FkAction, ForeignKey, TableInfo, TableRef};
 use crate::datum::{Datum, Key as Tuple};
 use crate::intset;
 
-use super::consumer::Sink;
+use super::consumer::{Note, Sink};
 use super::key::{Item, Key, NoItem, Op, SpaceId};
 
 /// A column of the declared type: `data_type` with a trailing `unsigned` moved into the
@@ -89,6 +89,23 @@ pub(crate) fn catalog() -> HashMap<TableRef, Arc<TableInfo>> {
     ]
     .into_iter()
     .collect()
+}
+
+/// [`catalog`] with `items`.`owner_id` referencing `owners`.`id`: deletes cascade with
+/// `on_delete` (and key updates with Cascade), the `Via::Direct` shape where the parent's
+/// key gives the unit.
+pub(crate) fn catalog_fk(on_delete: FkAction) -> HashMap<TableRef, Arc<TableInfo>> {
+    let mut cat = catalog();
+    let mut t = (*cat[&("db".into(), "items".into())]).clone();
+    t.cascades = vec![ForeignKey {
+        parent: ("db".into(), "owners".into()),
+        child_cols: vec![2],
+        parent_cols: vec!["id".into()],
+        on_delete,
+        on_update: FkAction::Cascade,
+    }];
+    cat.insert(("db".into(), "items".into()), Arc::new(t));
+    cat
 }
 
 /// The plan of `CREATE VIEW v AS <sql>` over `tables`, through the analyzer's front end.
@@ -169,6 +186,7 @@ pub(crate) struct Rec {
     pub rows: Vec<(usize, bool)>,
     pub ids: Vec<(usize, SpaceId, Key, Op, bool)>,
     pub items: Vec<(usize, Item<NoItem>)>,
+    pub notes: Vec<(usize, Note)>,
 }
 
 impl Rec {
@@ -217,5 +235,9 @@ impl Sink<NoItem> for Rec {
 
     fn item(&mut self, t: usize, i: Item<NoItem>) {
         self.items.push((t, i));
+    }
+
+    fn note(&mut self, t: usize, n: Note) {
+        self.notes.push((t, n));
     }
 }

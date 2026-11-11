@@ -15,6 +15,6 @@ pub(crate) mod testkit;
 
 pub use buffer::IdSet;
 pub use buffer::{Fact, Facts};
-pub use consumer::{Sink, Source};
+pub use consumer::{Note, Sink, Source};
 pub use key::{HopId, Item, Key, NoItem, NoJob, Op, SpaceId, Spaces};
 pub use lane::{JobId, Schedule};
