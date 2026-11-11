@@ -22,8 +22,8 @@ use crate::catalog::{FkAction, TableInfo, TableRef};
 use crate::datum::{Datum, Key as Tuple};
 use crate::intset;
 
-use super::hop::Hops;
-use super::key::{Item, Key, Op, SpaceId, Spaces};
+use super::hop::{HopPlan, Hops};
+use super::key::{HopId, Item, Key, Op, SpaceId, Spaces};
 
 /// The value of column `c` of `row` (`None`: not in the image).
 pub fn value_at(row: &BinlogRow, c: usize) -> Option<&BinlogValue<'_>> {
@@ -54,6 +54,8 @@ pub trait Sink<U> {
     fn item(&mut self, t: usize, i: Item<U>);
     /// A note for target `t`.
     fn note(&mut self, t: usize, n: Note);
+    /// A hop lookup of target `t`: a hit or a miss.
+    fn hop(&mut self, t: usize, hit: bool);
 }
 
 /// Something a row showed that is not an id: counts, and changes whose ids are unknown.
@@ -78,16 +80,21 @@ struct Cas {
 enum Way {
     Direct { cols: Vec<usize> },
     Partial { space: SpaceId, cols: Vec<usize> },
+    Hop { hop: HopId },
 }
 
 /// One occurrence, compiled.
 #[derive(Debug, Clone)]
 struct Occ {
     target: usize,
+    /// The occurrence's index in its plan (what a hop's `chain` and `partner` name).
+    alias: usize,
     table: Arc<TableInfo>,
     read: Vec<bool>,
     filters: Vec<ConstFilter>,
     way: Way,
+    /// The hops whose chain holds this alias: its rows change what those reach.
+    chains: Vec<HopId>,
 }
 
 /// Every route of one source table.
@@ -121,11 +128,11 @@ impl Consumer {
     pub fn add(
         &mut self,
         t: usize,
-        _pi: usize,
+        pi: usize,
         plan: &Arc<ViewPlan>,
         access: &AccessPlan,
         spaces: &Spaces,
-        _hops: &mut Hops,
+        hops: &mut Hops,
     ) -> Result<(), String> {
         if !matches!(access.route, Route::Dedup) {
             let reason = match &access.route {
@@ -136,6 +143,9 @@ impl Consumer {
         }
         // All or nothing: nothing is inserted before every occurrence and cascade compiles.
         let mut compiled: Vec<(TableRef, Occ)> = Vec::with_capacity(access.occurrences.len());
+        // Pass 1 compiles the occurrences; a hop's plan waits for its id, so a refusal that comes
+        // later registers neither an occurrence nor a hop.
+        let mut fresh: Vec<(usize, HopPlan)> = Vec::new();
         for (ai, occ) in access.occurrences.iter().enumerate() {
             let table = plan.aliases[ai].table.clone();
             let way = match &occ.path {
@@ -148,7 +158,35 @@ impl Consumer {
                         .ok_or_else(|| format!("`{}`: no space for {:?}", occ.alias, positions))?,
                     cols: cols.clone(),
                 },
-                Path::Hop(_) => return Err("hop paths need PR 6J".to_string()),
+                Path::Hop(h) => {
+                    // 6A: the positions are the full id or one partial set.
+                    let space = spaces.find(&h.positions).ok_or_else(|| {
+                        format!("`{}`: no space for {:?}", occ.alias, h.positions)
+                    })?;
+                    // Every partner column on one chain alias: that alias, its columns in link order.
+                    let partner = match h.partner_cols.first() {
+                        Some(&(a, _)) if h.partner_cols.iter().all(|&(pa, _)| pa == a) => {
+                            Some((a, h.partner_cols.iter().map(|&(_, c)| c).collect()))
+                        }
+                        _ => None,
+                    };
+                    fresh.push((
+                        ai,
+                        HopPlan {
+                            target: t,
+                            plan: pi,
+                            alias: ai,
+                            space,
+                            link_cols: h.link_cols.clone(),
+                            chain: h.aliases.clone(),
+                            partner,
+                        },
+                    ));
+                    // Pass 2 gives it the hop's id.
+                    Way::Hop {
+                        hop: HopId(u32::MAX),
+                    }
+                }
                 _ => return Err(format!("`{}`: {:?}", occ.alias, occ.path)),
             };
             let read = occ
@@ -159,10 +197,12 @@ impl Consumer {
                 occ.table.clone(),
                 Occ {
                     target: t,
+                    alias: ai,
                     table,
                     read,
                     filters: occ.filters.clone(),
                     way,
+                    chains: Vec::new(),
                 },
             ));
         }
@@ -193,6 +233,17 @@ impl Consumer {
                 }
                 Via::Map { .. } => return Err("map cascades need PR 6L".to_string()),
                 Via::Untraced { reason } => return Err(format!("cascade untraced: {reason}")),
+            }
+        }
+        // Pass 2 (no `Err` after this point): the hop ids, and every occurrence of this `(t, pi)`
+        // (all of `compiled`) whose alias the chain holds marks that hop as one it invalidates.
+        for (ai, p) in fresh {
+            let hop = hops.add(p.clone());
+            compiled[ai].1.way = Way::Hop { hop };
+            for (_, o) in compiled.iter_mut() {
+                if p.chain.contains(&o.alias) {
+                    o.chains.push(hop);
+                }
             }
         }
         for (table, occ) in compiled {
@@ -283,7 +334,7 @@ impl Consumer {
         s: &Source,
         before: Option<&BinlogRow>,
         after: Option<&BinlogRow>,
-        _hops: &mut Hops,
+        hops: &mut Hops,
         sink: &mut S,
     ) {
         for (i, o) in self.watched[s.idx].occs.iter().enumerate() {
@@ -307,6 +358,20 @@ impl Consumer {
             match &o.way {
                 Way::Direct { cols } => ids(o, SpaceId::FULL, cols, b, a, sink),
                 Way::Partial { space, cols } => ids(o, *space, cols, b, a, sink),
+                Way::Hop { hop } => hop_ids(o, *hop, b, a, hops, sink),
+            }
+            // A row of a chain table changes what the hop's link values reach: its partner values'
+            // entries go (or all of the hop's when the partner is another alias); answers in flight
+            // for them are not cached.
+            for &h in &o.chains {
+                match hops.plan(h).and_then(|p| p.partner.clone()) {
+                    Some((pa, cols)) if pa == o.alias => {
+                        for r in b.into_iter().chain(a) {
+                            hops.evict(h, &project(o, r, &cols));
+                        }
+                    }
+                    _ => hops.clear(h),
+                }
             }
         }
         for (i, cas) in self.watched[s.idx].cascades.iter().enumerate() {
@@ -357,13 +422,10 @@ fn ids<U, S: Sink<U>>(
         }
         return;
     }
-    let project = |r: &BinlogRow| -> Tuple {
-        cols.iter()
-            .map(|&c| Datum::from_binlog(value_at(r, c), &o.table.columns[c]))
-            .collect()
-    };
-    let new = after.map(project);
-    let old = before.map(project).filter(|k| new.as_ref() != Some(k));
+    let new = after.map(|r| project(o, r, cols));
+    let old = before
+        .map(|r| project(o, r, cols))
+        .filter(|k| new.as_ref() != Some(k));
     let same = before.is_some() && old.is_none();
     if let Some(k) = old {
         give(k, Op::Delete, sink);
@@ -520,6 +582,49 @@ fn derived<U, S: Sink<U>>(
         };
         for k in std::iter::once(key(b)).chain(new) {
             send(cas.target, cas.sets[*set], k, Op::Update, true, sink);
+        }
+    }
+}
+
+/// Columns `cols` of `r` as a key, the way `o`'s table declares them.
+fn project(o: &Occ, r: &BinlogRow, cols: &[usize]) -> Tuple {
+    cols.iter()
+        .map(|&c| Datum::from_binlog(value_at(r, c), &o.table.columns[c]))
+        .collect()
+}
+
+/// The ids the images' link values reach through hop `h`: a hit marks the cached ids, a miss defers
+/// one item per link value. The hop's own rows never invalidate its cache (6A: its SELECT does not
+/// read the occurrence's table), so only the chain tables' rows do, in `row`.
+fn hop_ids<U, S: Sink<U>>(
+    o: &Occ,
+    h: HopId,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+    hops: &mut Hops,
+    sink: &mut S,
+) {
+    let Some(p) = hops.plan(h) else { return };
+    let (t, space) = (o.target, p.space);
+    let link_cols = p.link_cols.clone();
+    let link = |r: &BinlogRow| project(o, r, &link_cols);
+    let new = after.map(link);
+    let old = before.map(link).filter(|l| new.as_ref() != Some(l));
+    for l in old.into_iter().chain(new) {
+        match hops.get(h, &l) {
+            Some(ids) => {
+                sink.hop(t, true);
+                for k in ids {
+                    match k {
+                        Key::Int(v) => sink.int(t, space, *v, Op::Update, false),
+                        Key::Tuple(k) => sink.tuple(t, space, k.clone(), Op::Update, false),
+                    }
+                }
+            }
+            None => {
+                sink.hop(t, false);
+                sink.item(t, Item::Hop { hop: h, link: l });
+            }
         }
     }
 }
@@ -1111,7 +1216,7 @@ mod tests {
     }
 
     /// `add` compiles everything before it inserts anything, so each refusal leaves every table of
-    /// the plan unwatched. (The hop refusal, the fourth, is `hop_plans_are_refused_until_6j`.)
+    /// the plan unwatched. (Hop paths compile since 6J; their tests are the last group below.)
     #[test]
     fn a_refusal_watches_no_table_of_the_plan() {
         let mut c = Consumer::default();
@@ -1258,26 +1363,256 @@ mod tests {
         }
     }
 
+    /// The one-hop view of access.rs `one_hop_reaches_the_full_id`: `l` reaches the full id through
+    /// the link, so its rows are looked up in the hop cache and `i`'s rows invalidate it.
+    const ONE_HOP: &str =
+        "SELECT i.id, l.child_id FROM items i JOIN item_links l ON l.parent_id = \
+                           i.kind_id";
+
+    /// The two-hop view of access.rs `two_hops_through_two_tables`: `o` reaches the id through `l`
+    /// and `i`, so both of them are its chain and the partner is `l`.`child_id`.
+    const TWO_HOPS: &str = "SELECT i.id, MAX(o.name) n FROM items i JOIN item_links l ON \
+                            l.parent_id = i.kind_id JOIN owners o ON o.id = l.child_id GROUP BY \
+                            i.id";
+
+    /// A one-part link value, the way the hop cache keys an entry by it.
+    fn link(v: i64) -> Tuple {
+        Box::new([Datum::Int(v)])
+    }
+
+    /// Cached ids, as [`Hops::answer`] takes them.
+    fn cached(vs: &[i64]) -> Vec<Key> {
+        vs.iter().map(|&v| Key::from_datum(Datum::Int(v))).collect()
+    }
+
+    /// The hop of occurrence `alias` of the compiled target.
+    fn hop_for(x: &C, alias: usize) -> HopId {
+        (0..)
+            .map(HopId)
+            .find(|h| x.hops.plan(*h).is_some_and(|p| p.alias == alias))
+            .expect("that occurrence is not a hop")
+    }
+
+    /// An answer for link value `v` of hop `h`, the way a job's completion gives it.
+    fn cache(x: &mut C, h: HopId, v: i64, ids: Vec<Key>) {
+        let l = link(v);
+        x.hops.taken(h, &l);
+        assert!(x.hops.answer(h, l, ids), "{v} is not in flight");
+    }
+
     #[test]
-    fn hop_plans_are_refused_until_6j() {
-        let p = plan(
-            "SELECT i.id, l.child_id FROM items i LEFT JOIN item_links l ON l.parent_id = \
-             i.kind_id",
-        );
-        let ap = AccessPlan::of(&p);
-        assert!(matches!(ap.route, Route::Dedup), "{ap}");
+    fn hop_hit_marks_cached_ids() {
+        let (mut x, ap) = compile(ONE_HOP);
         assert!(
-            matches!(ap.occurrences[1].path, Path::Hop(_)),
+            matches!(&ap.occurrences[1].path, Path::Hop(_)),
             "{:?}",
             ap.occurrences[1].path
         );
-        let spaces = Spaces::of(p.unit_exprs.len(), &p.partial.sets);
-        let mut c = Consumer::default();
-        let mut hops = Hops::new(1000);
-        let err = c.add(0, 0, &p, &ap, &spaces, &mut hops).unwrap_err();
-        assert!(err.contains("6J"), "{err}");
-        assert!(!c.watched(&table_ref("items")), "all or nothing");
-        assert!(!c.watched(&table_ref("item_links")), "all or nothing");
+        let h = hop_for(&x, 1);
+        let p = x.hops.plan(h).expect("the hop of `l`");
+        assert_eq!(
+            (p.link_cols.as_slice(), p.chain.as_slice()),
+            (&[1][..], &[0][..]),
+            "link `l`.`parent_id`, the chain is `i`"
+        );
+        assert_eq!(
+            p.partner,
+            Some((0, vec![1])),
+            "the partner is `i`.`kind_id`"
+        );
+        assert_eq!(p.space, SpaceId::FULL, "the hop reaches the full id");
+        cache(&mut x, h, 3, cached(&[10, 11]));
+        let s =
+            x.c.source(&table_ref("item_links"), Some(2))
+                .expect("watched");
+        let mut rec = Rec::default();
+        // Insert [5, 3]: its link value is cached, so its ids are marked and nothing defers.
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(5), Some(3)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.ints(0, SpaceId::FULL),
+            vec![(10, Op::Update), (11, Op::Update)],
+            "{rec:?}"
+        );
+        assert_eq!(rec.hops, vec![(0, true)], "one lookup, a hit");
+        assert!(rec.items.is_empty(), "a hit defers nothing: {rec:?}");
+    }
+
+    #[test]
+    fn hop_miss_defers_one_item_per_link_value() {
+        let (mut x, _) = compile(ONE_HOP);
+        let h = hop_for(&x, 1);
+        let s =
+            x.c.source(&table_ref("item_links"), Some(2))
+                .expect("watched");
+        let mut rec = Rec::default();
+        // Update [5, 3] to [5, 4]: nothing is cached, so each link value defers its own item.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(5), Some(3)])),
+            Some(&row(&[Some(5), Some(4)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.items,
+            vec![
+                (
+                    0,
+                    Item::Hop {
+                        hop: h,
+                        link: link(3)
+                    }
+                ),
+                (
+                    0,
+                    Item::Hop {
+                        hop: h,
+                        link: link(4)
+                    }
+                ),
+            ],
+            "the old and the new link value, in that order"
+        );
+        assert_eq!(rec.hops, vec![(0, false), (0, false)], "both missed");
+        assert!(rec.ids.is_empty(), "a miss marks nothing: {rec:?}");
+    }
+
+    #[test]
+    fn delete_through_a_hop_uses_the_before_image() {
+        let (mut x, _) = compile(ONE_HOP);
+        let h = hop_for(&x, 1);
+        cache(&mut x, h, 3, cached(&[10, 11]));
+        let s =
+            x.c.source(&table_ref("item_links"), Some(2))
+                .expect("watched");
+        let mut rec = Rec::default();
+        // Delete [5, 3]: the before-image is the only one that gives the link value.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(5), Some(3)])),
+            None,
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.ints(0, SpaceId::FULL),
+            vec![(10, Op::Update), (11, Op::Update)],
+            "{rec:?}"
+        );
+        assert_eq!(rec.hops, vec![(0, true)]);
+        assert!(rec.items.is_empty(), "{rec:?}");
+    }
+
+    #[test]
+    fn partner_row_change_evicts_its_values() {
+        let (mut x, _) = compile(ONE_HOP);
+        let h = hop_for(&x, 1);
+        for v in [3, 4, 5] {
+            cache(&mut x, h, v, cached(&[100 + v]));
+        }
+        let s = x.c.source(&table_ref("items"), Some(3)).expect("watched");
+        let mut rec = Rec::default();
+        // An `items` row moves its `kind_id` from 3 to 4: that alias holds every partner column, so
+        // both images' partner values lose their entries.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(1), Some(3), Some(9)])),
+            Some(&row(&[Some(1), Some(4), Some(9)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(x.hops.get(h, &link(3)), None, "the old partner value");
+        assert_eq!(x.hops.get(h, &link(4)), None, "the new partner value");
+        assert_eq!(
+            x.hops.get(h, &link(5)),
+            Some(&cached(&[105])[..]),
+            "another cached link stays"
+        );
+        assert!(rec.hops.is_empty(), "`i` is not a hop: {rec:?}");
+    }
+
+    #[test]
+    fn other_chain_row_clears_the_hop() {
+        let (mut x, ap) = compile(TWO_HOPS);
+        assert!(
+            matches!(&ap.occurrences[2].path, Path::Hop(h) if h.aliases == [0, 1]),
+            "{:?}",
+            ap.occurrences[2].path
+        );
+        let oh = hop_for(&x, 2);
+        let p = x.hops.plan(oh).expect("the hop of `o`").clone();
+        assert_eq!(p.chain, vec![0, 1], "the chain is `i` and `l`");
+        assert_eq!(
+            p.partner,
+            Some((1, vec![0])),
+            "the partner is `l`.`child_id`"
+        );
+        for v in [3, 4] {
+            cache(&mut x, oh, v, cached(&[v]));
+        }
+        let mut rec = Rec::default();
+        // An `items` row: a chain alias that is not the partner's, so all of `o`'s hop goes.
+        let items = x.c.source(&table_ref("items"), Some(3)).expect("watched");
+        x.c.row(
+            &items,
+            Some(&row(&[Some(1), Some(3), Some(9)])),
+            Some(&row(&[Some(1), Some(4), Some(9)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert!(
+            x.hops.is_empty(),
+            "a row of another chain alias clears the hop: {p:?}"
+        );
+        for v in [3, 4, 7] {
+            cache(&mut x, oh, v, cached(&[v]));
+        }
+        // An `item_links` row: the partner's own alias, so only its child_id values go.
+        let links =
+            x.c.source(&table_ref("item_links"), Some(2))
+                .expect("watched");
+        x.c.row(
+            &links,
+            Some(&row(&[Some(3), Some(9)])),
+            Some(&row(&[Some(4), Some(9)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(x.hops.get(oh, &link(3)), None, "the old child_id");
+        assert_eq!(x.hops.get(oh, &link(4)), None, "the new child_id");
+        assert_eq!(
+            x.hops.get(oh, &link(7)),
+            Some(&cached(&[7])[..]),
+            "an entry no partner value of this row names stays"
+        );
+    }
+
+    #[test]
+    fn unread_partner_update_keeps_the_cache() {
+        let (mut x, _) = compile(ONE_HOP);
+        let h = hop_for(&x, 1);
+        cache(&mut x, h, 3, cached(&[10]));
+        cache(&mut x, h, 4, cached(&[11]));
+        let s = x.c.source(&table_ref("items"), Some(3)).expect("watched");
+        let mut rec = Rec::default();
+        // `owner_id` is no column the view reads: the occurrence does not take the row at all, so
+        // the chain invalidation of its alias never runs.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(1), Some(3), Some(9)])),
+            Some(&row(&[Some(1), Some(3), Some(10)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(rec.rows, vec![(0, true)], "only an unread column changed");
+        assert_eq!(x.hops.get(h, &link(3)), Some(&cached(&[10])[..]));
+        assert_eq!(x.hops.get(h, &link(4)), Some(&cached(&[11])[..]));
     }
 
     /// Compiles the owner-count view over [`catalog_fk`] as target 0.

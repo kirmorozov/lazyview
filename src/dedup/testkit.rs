@@ -187,6 +187,7 @@ pub(crate) struct Rec {
     pub ids: Vec<(usize, SpaceId, Key, Op, bool)>,
     pub items: Vec<(usize, Item<NoItem>)>,
     pub notes: Vec<(usize, Note)>,
+    pub hops: Vec<(usize, bool)>,
 }
 
 impl Rec {
@@ -239,5 +240,8 @@ impl Sink<NoItem> for Rec {
 
     fn note(&mut self, t: usize, n: Note) {
         self.notes.push((t, n));
+    }
+    fn hop(&mut self, t: usize, hit: bool) {
+        self.hops.push((t, hit));
     }
 }
