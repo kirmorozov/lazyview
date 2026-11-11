@@ -4,7 +4,7 @@
 //! function of the family's module. No trait objects, nothing on a per-row path.
 
 use anyhow::{bail, Result};
-use mysql_async::Value;
+use mysql_async::{Conn, Value};
 
 use crate::accumulate::{UnitChunk, UnitKind};
 use crate::mv::{Layout, Upsert};
@@ -45,6 +45,55 @@ impl Kind {
     }
 }
 
+/// Ownership marker prefix of the comment of every table lazyview creates (see [`marker`]).
+pub const MARKER_PREFIX: &str = "lazyview:v1 ";
+
+/// Ownership marker for the tables of view `view` built from definition `def_id`, stored as the
+/// table comment: `lazyview:v1 view=<name> def=<id>`, the name percent-encoded (`%`, quotes,
+/// backslashes, spaces and control characters), so the comment needs no escaping.
+/// Family-independent text; only where it is stored differs (a MySQL table comment, a
+/// PostgreSQL `COMMENT ON TABLE`).
+pub fn marker(view: &str, def_id: u64) -> String {
+    let mut name = String::new();
+    for c in view.chars() {
+        if matches!(c, '%' | '\'' | '"' | '\\' | ' ' | '`') || c.is_control() {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                name.push_str(&format!("%{b:02X}"));
+            }
+        } else {
+            name.push(c);
+        }
+    }
+    format!("{MARKER_PREFIX}view={name} def={def_id}")
+}
+
+/// Name of the shadow table a new version is built into (≤ 64 chars).
+pub fn shadow_name(name: &str) -> String {
+    side_name(name, "__lv_new")
+}
+
+/// Name the replaced version is renamed to during a swap.
+pub fn old_name(name: &str) -> String {
+    side_name(name, "__lv_old")
+}
+
+/// `v__lv_new` / `v__lv_old` → `v` (other names unchanged).
+pub fn base_name(name: &str) -> &str {
+    name.strip_suffix("__lv_new")
+        .or_else(|| name.strip_suffix("__lv_old"))
+        .unwrap_or(name)
+}
+
+fn side_name(name: &str, suffix: &str) -> String {
+    let n = format!("{name}{suffix}");
+    if n.len() <= 64 {
+        n
+    } else {
+        format!("_lv_{}{suffix}", crate::analyze::definition_hash(name))
+    }
+}
+
 /// The multi-row INSERT of `n` rows into `table`, upserting by the row key with `upsert`.
 /// One dispatch per statement (never per row): the family's own function renders it.
 pub(crate) fn insert_sql(
@@ -74,5 +123,116 @@ pub(crate) fn unit_filter(
     match kind {
         Kind::Mysql => mysql::unit_filter(chunk, cols, kinds),
         Kind::Postgres => postgres::unit_filter(chunk, cols, kinds),
+    }
+}
+
+/// `CREATE TABLE` of `layout` for `table`, with an optional ownership marker. Dispatched
+/// once per DDL statement.
+pub(crate) fn create_table_sql(
+    kind: Kind,
+    layout: &Layout,
+    schema: &str,
+    table: &str,
+    marker: Option<&str>,
+) -> String {
+    match kind {
+        Kind::Mysql => mysql::create_sql_marked(layout, schema, table, marker),
+        Kind::Postgres => postgres::create_table_sql(layout, schema, table, marker),
+    }
+}
+
+/// `BASE TABLE` / `VIEW` / None. One dispatch per metadata read.
+pub(crate) async fn table_kind(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    match kind {
+        Kind::Mysql => mysql::table_kind(conn, schema, name).await,
+        Kind::Postgres => postgres::table_kind(conn, schema, name).await,
+    }
+}
+
+/// Visible + invisible column names and types of an existing table.
+pub(crate) async fn table_columns(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+) -> Result<Vec<(String, String)>> {
+    match kind {
+        Kind::Mysql => mysql::table_columns(conn, schema, name).await,
+        Kind::Postgres => postgres::table_columns(conn, schema, name).await,
+    }
+}
+
+/// Whether an existing table's columns are the layout's.
+pub(crate) fn layout_matches(kind: Kind, layout: &Layout, existing: &[(String, String)]) -> bool {
+    match kind {
+        Kind::Mysql => mysql::layout_matches(layout, existing),
+        Kind::Postgres => postgres::layout_matches(layout, existing),
+    }
+}
+
+/// Whether `table` has the unique index its rows are upserted by (see [`Layout::row_key`]).
+pub(crate) async fn has_row_index(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+) -> Result<bool> {
+    match kind {
+        Kind::Mysql => mysql::has_row_index(conn, schema, table, layout).await,
+        Kind::Postgres => postgres::has_row_index(conn, schema, table, layout).await,
+    }
+}
+
+/// The ownership marker (see [`marker`]) of an existing table, if its comment is one.
+pub(crate) async fn table_marker(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    match kind {
+        Kind::Mysql => mysql::table_marker(conn, schema, name).await,
+        Kind::Postgres => postgres::table_marker(conn, schema, name).await,
+    }
+}
+
+/// Creates the shadow table of `name` with the ownership marker as its comment.
+pub(crate) async fn create_shadow_marked(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+    layout: &Layout,
+    marker: &str,
+) -> Result<String> {
+    match kind {
+        Kind::Mysql => mysql::create_shadow_marked(conn, schema, name, layout, marker).await,
+        Kind::Postgres => postgres::create_shadow(conn, schema, name, layout, marker).await,
+    }
+}
+
+/// Atomically replaces `name` with its shadow table (or renames the shadow when `name` is new).
+pub(crate) async fn swap(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -> Result<()> {
+    match kind {
+        Kind::Mysql => mysql::swap(conn, schema, name).await,
+        Kind::Postgres => postgres::swap(conn, schema, name).await,
+    }
+}
+
+pub(crate) async fn drop_table(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+) -> Result<()> {
+    match kind {
+        Kind::Mysql => mysql::drop_table(conn, schema, name).await,
+        Kind::Postgres => postgres::drop_table(conn, schema, name).await,
     }
 }

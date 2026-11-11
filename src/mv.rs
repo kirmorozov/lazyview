@@ -4,7 +4,7 @@
 //! Sources are only ever read with plain SELECTs (never INSERT ... SELECT), so the service takes
 //! no locks on source rows; all writes go to the target tables.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
@@ -17,19 +17,13 @@ use crate::datum::{Datum, Key};
 use crate::metrics::Metrics;
 use crate::target::Kind;
 
+pub use crate::target::{base_name, marker, old_name, shadow_name, MARKER_PREFIX};
+
 /// Maximum placeholders per statement (server limit is 65535). `Kind::Postgres` has a hard
 /// ceiling of 65535; this cap is below it for both families.
 const MAX_PARAMS: usize = 60_000;
-/// InnoDB's limit on the length of an index key, in bytes.
-const MAX_KEY_BYTES: u64 = 3072;
-/// Maximum number of columns in an index.
-const MAX_KEY_PARTS: usize = 16;
-/// Index prefix of TEXT / BLOB unit columns, in characters (bytes for BLOB).
-const TEXT_PREFIX: u64 = 255;
-/// Ownership marker prefix of the comment of every table lazyview creates (see [`marker`]).
-pub const MARKER_PREFIX: &str = "lazyview:v1 ";
 /// Name of the unique index over the row identity (see [`Layout::row_key`]).
-const ROW_INDEX: &str = "_lv_row";
+pub(crate) const ROW_INDEX: &str = "_lv_row";
 /// Estimated bytes per write statement unless configured (`LAZYVIEW_WRITE_BATCH_BYTES`).
 pub const DEFAULT_WRITE_BATCH_BYTES: usize = 4 << 20;
 
@@ -72,15 +66,6 @@ pub struct Layout {
     pub partial: Vec<Vec<usize>>,
 }
 
-/// The unique index behind [`Layout::row_key`].
-#[derive(Debug, Clone, PartialEq)]
-enum RowIndex {
-    /// The PRIMARY KEY on the unit.
-    Primary,
-    /// `_lv_row`, a UNIQUE KEY over these (whole) columns.
-    Unique(String),
-}
-
 impl Layout {
     pub fn col_list(&self) -> String {
         self.cols
@@ -101,126 +86,17 @@ impl Layout {
         self.create_sql_marked(schema, table, None)
     }
 
-    /// `CREATE TABLE` with an optional ownership marker as the table comment (see [`marker`]).
+    /// The table DDL of a fresh build, with an optional ownership marker as the table
+    /// comment (see [`marker`]).
     pub fn create_sql_marked(&self, schema: &str, table: &str, marker: Option<&str>) -> String {
-        let index = self.unit_index();
-        let row = self.row_index();
-        let primary = matches!(index, Some((true, _)));
-        let mut defs: Vec<String> = self
-            .cols
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let mut d = format!("{} {}", q(&c.name), c.column_type);
-                if let (Some(cs), Some(co)) = (&c.charset, &c.collation) {
-                    d.push_str(&format!(" CHARACTER SET {cs} COLLATE {co}"));
-                }
-                let in_pk = primary && self.unit_pos.contains(&i);
-                d.push_str(if in_pk { " NOT NULL" } else { " NULL" });
-                if i >= self.n_visible {
-                    d.push_str(" INVISIBLE");
-                }
-                d
-            })
-            .collect();
-        match (index, &row) {
-            (Some((true, parts)), _) => defs.push(format!("PRIMARY KEY ({parts})")),
-            // `_lv_row` starts with the unit columns: it serves unit filters too.
-            (Some((false, _)), Some(RowIndex::Unique(_))) => {}
-            (Some((false, parts)), _) => defs.push(format!("KEY `_lv_unit` ({parts})")),
-            (None, _) => {}
-        }
-        if let Some(RowIndex::Unique(parts)) = &row {
-            defs.push(format!("UNIQUE KEY `{ROW_INDEX}` ({parts})"));
-        }
-        for (name, parts) in self
-            .lineage_indexes()
-            .into_iter()
-            .chain(self.partial_indexes())
-        {
-            defs.push(format!("KEY {} ({parts})", q(&name)));
-        }
-        let comment = marker
-            .map(|m| format!(" COMMENT='{}'", m.replace('\'', "''")))
-            .unwrap_or_default();
-        format!(
-            "CREATE TABLE {}.{} (\n  {}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4{comment}",
-            q(schema),
-            q(table),
-            defs.join(",\n  ")
-        )
-    }
-
-    /// The unit index as `(primary, key parts)`: the PRIMARY KEY when the unit is unique and its
-    /// columns fit InnoDB's key limits, otherwise a non-unique KEY over as many leading unit
-    /// columns as fit (long strings as prefixes). None when not even the first unit column can
-    /// be indexed; unit DELETEs and INSERTs stay correct without an index.
-    fn unit_index(&self) -> Option<(bool, String)> {
-        let parts: Vec<(&MvCol, KeyPart)> = self
-            .unit_pos
-            .iter()
-            .map(|&p| (&self.cols[p], self.cols[p].key_part()))
-            .collect();
-        if self.primary && parts.len() <= MAX_KEY_PARTS {
-            let full: Option<u64> = parts.iter().map(|(_, k)| k.full_bytes()).sum();
-            if full.is_some_and(|b| b <= MAX_KEY_BYTES) {
-                return Some((true, self.unit_cols().join(", ")));
-            }
-        }
-        let lead: Vec<(&MvCol, KeyPart)> = parts
-            .into_iter()
-            .take_while(|(_, k)| *k != KeyPart::None)
-            .take(MAX_KEY_PARTS)
-            .collect();
-        (1..=lead.len())
-            .rev()
-            .find_map(|n| fit_key(&lead[..n]))
-            .map(|k| (false, k))
-    }
-
-    /// The unique index over [`Layout::identity`]: the PRIMARY KEY when the identity is the unit
-    /// and that is the primary key, else `_lv_row` over the whole identity columns (a prefix
-    /// would let distinct rows collide). None when the rows have no identity, a column cannot be
-    /// indexed whole, the key exceeds InnoDB's limits, or a TIMESTAMP column is read in the
-    /// session's time zone (the two instants of a DST fall-back hour read as one value).
-    fn row_index(&self) -> Option<RowIndex> {
-        if self.identity.is_empty()
-            || (!self.epoch_timestamps()
-                && self
-                    .identity
-                    .iter()
-                    .any(|&p| self.cols[p].data_type == "timestamp"))
-        {
-            return None;
-        }
-        if self.identity == self.unit_pos && matches!(self.unit_index(), Some((true, _))) {
-            return Some(RowIndex::Primary);
-        }
-        if self.identity.len() > MAX_KEY_PARTS {
-            return None;
-        }
-        let bytes: Option<u64> = self
-            .identity
-            .iter()
-            .map(|&p| self.cols[p].key_part().full_bytes())
-            .sum();
-        if !bytes.is_some_and(|b| b <= MAX_KEY_BYTES) {
-            return None;
-        }
-        Some(RowIndex::Unique(
-            self.identity
-                .iter()
-                .map(|&p| q(&self.cols[p].name))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ))
+        crate::target::create_table_sql(Kind::Mysql, self, schema, table, marker)
     }
 
     /// The row key changed rows are upserted by (positions in `cols`; see [`Layout::identity`]),
     /// when the table has a unique index over it. None: changed units are deleted and their
     /// rows inserted again.
     pub fn row_key(&self) -> Option<&[usize]> {
-        self.row_index().map(|_| self.identity.as_slice())
+        crate::target::mysql::row_index(self).map(|_| self.identity.as_slice())
     }
 
     /// How the values of `cols` are bound in a filter of a write (see [`write_diff`]): JSON as
@@ -239,7 +115,7 @@ impl Layout {
     /// Whether TIMESTAMP columns are read as epochs and written as UTC datetimes in a `+00:00`
     /// session, so that instants in a DST fall-back hour survive the round trip (read as local
     /// datetimes and written back in the same zone, the second 02:30 became the first).
-    fn epoch_timestamps(&self) -> bool {
+    pub(crate) fn epoch_timestamps(&self) -> bool {
         !self.epoch.is_empty()
     }
 
@@ -320,59 +196,11 @@ impl Layout {
         row
     }
 
-    /// One non-unique index per lineage key, `(name, key parts)` (none for a key that does not
-    /// fit InnoDB's limits).
-    fn lineage_indexes(&self) -> Vec<(String, String)> {
-        self.lineage
-            .iter()
-            .filter_map(|key| {
-                let alias = lineage_alias(&self.cols[*key.first()?].name)?;
-                let parts: Vec<(&MvCol, KeyPart)> = key
-                    .iter()
-                    .map(|&p| (&self.cols[p], self.cols[p].key_part()))
-                    .collect();
-                if parts.len() > MAX_KEY_PARTS || parts.iter().any(|(_, k)| *k == KeyPart::None) {
-                    return None;
-                }
-                Some((format!("_lv_a{alias}"), fit_key(&parts)?))
-            })
-            .collect()
-    }
-
-    /// One non-unique index `_lv_p<k>` per set of partial unit positions the unit index does
-    /// not start with: a partial refresh reads and replaces the rows matching those columns
-    /// alone (an index range instead of a scan).
-    fn partial_indexes(&self) -> Vec<(String, String)> {
-        let unit_index = self.unit_index().is_some();
-        self.partial
-            .iter()
-            .enumerate()
-            .filter(|(_, at)| !(unit_index && at.iter().copied().eq(0..at.len())))
-            .filter_map(|(k, at)| {
-                let parts: Vec<(&MvCol, KeyPart)> = at
-                    .iter()
-                    .map(|&u| {
-                        (
-                            &self.cols[self.unit_pos[u]],
-                            self.cols[self.unit_pos[u]].key_part(),
-                        )
-                    })
-                    .take_while(|(_, k)| *k != KeyPart::None)
-                    .take(MAX_KEY_PARTS)
-                    .collect();
-                if parts.is_empty() {
-                    return None;
-                }
-                Some((format!("_lv_p{k}"), fit_key(&parts)?))
-            })
-            .collect()
-    }
-
     /// Whether the table has an index on the unit columns (PRIMARY KEY or `_lv_unit`, see
     /// [`Layout::create_sql`]). Without one, unit DELETEs scan the table and concurrent writes of
     /// disjoint units would wait on each other's row locks.
     pub fn has_unit_index(&self) -> bool {
-        self.unit_index().is_some()
+        crate::target::mysql::unit_index(self).is_some()
     }
 
     /// How each unit column's keys are bound in a filter (see [`UnitChunk::filter_typed`]), from
@@ -392,177 +220,6 @@ impl Layout {
     pub fn unit_key(&self, row: &[Datum]) -> Key {
         self.unit_pos.iter().map(|&p| row[p].clone()).collect()
     }
-
-    /// This layout for a target of another product: every collation the target does not know is
-    /// replaced by the target's default collation of the column's character set; a column whose
-    /// character set is unknown too loses both clauses (the table default applies).
-    pub async fn with_target_collations(&self, conn: &mut Conn) -> Result<Layout> {
-        let rows: Vec<(String, String, String)> = conn
-            .query(
-                "SELECT CAST(COLLATION_NAME AS CHAR), CAST(CHARACTER_SET_NAME AS CHAR), \
-                 CAST(IS_DEFAULT AS CHAR) FROM information_schema.COLLATIONS",
-            )
-            .await
-            .context("reading the target's collations")?;
-        let known: HashSet<String> = rows
-            .iter()
-            .map(|(c, _, _)| c.to_ascii_lowercase())
-            .collect();
-        let default: HashMap<String, String> = rows
-            .iter()
-            .filter(|(_, _, d)| d.eq_ignore_ascii_case("yes"))
-            .map(|(c, cs, _)| (cs.to_ascii_lowercase(), c.clone()))
-            .collect();
-        let mut l = self.clone();
-        for c in &mut l.cols {
-            let (Some(cs), Some(co)) = (&c.charset, &c.collation) else {
-                continue;
-            };
-            if known.contains(&co.to_ascii_lowercase()) {
-                continue;
-            }
-            match default.get(&cs.to_ascii_lowercase()) {
-                Some(d) => c.collation = Some(d.clone()),
-                None => {
-                    c.charset = None;
-                    c.collation = None;
-                }
-            }
-        }
-        Ok(l)
-    }
-}
-
-/// How a column can be part of an index.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum KeyPart {
-    /// Fixed size, in bytes (an upper bound).
-    Fixed(u64),
-    /// String of `len` characters (bytes for binary strings) of at most `per_char` bytes each.
-    /// TEXT / BLOB columns (`must_prefix`) can only be indexed by a prefix.
-    Str {
-        len: u64,
-        per_char: u64,
-        must_prefix: bool,
-    },
-    /// Not indexable (JSON, spatial, unknown types).
-    None,
-}
-
-impl KeyPart {
-    /// Bytes the whole column takes in a key (None: it cannot be indexed whole).
-    fn full_bytes(&self) -> Option<u64> {
-        match *self {
-            KeyPart::Fixed(b) => Some(b),
-            KeyPart::Str {
-                len,
-                per_char,
-                must_prefix: false,
-            } => Some(len * per_char),
-            _ => None,
-        }
-    }
-}
-
-impl MvCol {
-    fn key_part(&self) -> KeyPart {
-        let ct = self.column_type.to_ascii_lowercase();
-        let n = paren_number(&ct);
-        let per_char = mbmaxlen(self.charset.as_deref());
-        let text = |len, per_char, must_prefix| KeyPart::Str {
-            len,
-            per_char,
-            must_prefix,
-        };
-        match self.data_type.as_str() {
-            "tinyint" | "year" => KeyPart::Fixed(1),
-            "smallint" | "enum" => KeyPart::Fixed(2),
-            "mediumint" | "date" => KeyPart::Fixed(3),
-            "int" | "integer" | "float" | "inet4" => KeyPart::Fixed(4),
-            "bigint" | "double" | "real" | "set" | "datetime" | "timestamp" | "time" => {
-                KeyPart::Fixed(8)
-            }
-            "decimal" | "numeric" => KeyPart::Fixed(n.unwrap_or(10) / 9 * 4 + 8),
-            "bit" => KeyPart::Fixed(n.unwrap_or(1).div_ceil(8)),
-            "uuid" | "inet6" => KeyPart::Fixed(16),
-            "char" | "varchar" => text(n.unwrap_or(255), per_char, false),
-            "binary" | "varbinary" => text(n.unwrap_or(255), 1, false),
-            "tinytext" | "text" | "mediumtext" | "longtext" => text(TEXT_PREFIX, per_char, true),
-            "tinyblob" | "blob" | "mediumblob" | "longblob" => text(TEXT_PREFIX, 1, true),
-            _ => KeyPart::None,
-        }
-    }
-}
-
-/// Key parts for `cols` within [`MAX_KEY_BYTES`]: fixed-size columns whole, string columns
-/// sharing the rest (each whole if it fits, else a prefix). None if a string would get no
-/// character at all.
-fn fit_key(cols: &[(&MvCol, KeyPart)]) -> Option<String> {
-    // (Length bytes of variable-length strings do not count.)
-    let fixed: u64 = cols
-        .iter()
-        .map(|(_, k)| match k {
-            KeyPart::Fixed(b) => *b,
-            _ => 0,
-        })
-        .sum();
-    let mut left = MAX_KEY_BYTES.checked_sub(fixed)?;
-    let mut strings: Vec<usize> = (0..cols.len())
-        .filter(|&i| matches!(cols[i].1, KeyPart::Str { .. }))
-        .collect();
-    strings.sort_by_key(|&i| match cols[i].1 {
-        KeyPart::Str { len, per_char, .. } => len * per_char,
-        _ => 0,
-    });
-    // Smallest first, so that what short strings leave over goes to the longer ones.
-    let mut chars = vec![0u64; cols.len()];
-    for (k, &i) in strings.iter().enumerate() {
-        let KeyPart::Str { len, per_char, .. } = cols[i].1 else {
-            continue;
-        };
-        let share = left / (strings.len() - k) as u64;
-        chars[i] = len.min(share / per_char);
-        if chars[i] == 0 {
-            return None;
-        }
-        left -= chars[i] * per_char;
-    }
-    let parts: Vec<String> = cols
-        .iter()
-        .zip(chars)
-        .map(|((c, k), n)| match *k {
-            KeyPart::Str {
-                len, must_prefix, ..
-            } if must_prefix || n < len => format!("{}({n})", q(&c.name)),
-            _ => q(&c.name),
-        })
-        .collect();
-    Some(parts.join(", "))
-}
-
-/// Maximum bytes per character of a character set (4 when unknown: the table default is utf8mb4).
-fn mbmaxlen(charset: Option<&str>) -> u64 {
-    match charset.map(str::to_ascii_lowercase).as_deref() {
-        Some(
-            "latin1" | "latin2" | "latin5" | "latin7" | "ascii" | "binary" | "dec8" | "cp850"
-            | "hp8" | "koi8r" | "koi8u" | "swe7" | "hebrew" | "tis620" | "greek" | "cp1250"
-            | "cp1251" | "cp1256" | "cp1257" | "armscii8" | "cp866" | "keybcs2" | "macce"
-            | "macroman" | "cp852" | "geostd8",
-        ) => 1,
-        Some("big5" | "sjis" | "euckr" | "gb2312" | "gbk" | "cp932" | "ucs2") => 2,
-        Some("utf8mb3" | "utf8" | "ujis" | "eucjpms") => 3,
-        _ => 4,
-    }
-}
-
-/// `varchar(300)` → 300, `decimal(10,2)` → 10.
-fn paren_number(column_type: &str) -> Option<u64> {
-    let start = column_type.find('(')? + 1;
-    let digits: String = column_type[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
 }
 
 /// `_lv_a<alias>_pk<j>` (a lineage column) → `(alias, j)`.
@@ -575,7 +232,7 @@ fn lineage_col(name: &str) -> Option<(usize, usize)> {
     Some((alias.parse().ok()?, j.parse().ok()?))
 }
 
-fn lineage_alias(name: &str) -> Option<usize> {
+pub(crate) fn lineage_alias(name: &str) -> Option<usize> {
     lineage_col(name).map(|(a, _)| a)
 }
 
@@ -706,60 +363,15 @@ fn civil_from_days(days: i64) -> (i64, u8, u8) {
     (y, m, d)
 }
 
-/// Ownership marker for the tables of view `view` built from definition `def_id`, stored as the
-/// table comment: `lazyview:v1 view=<name> def=<id>`, the name percent-encoded (`%`, quotes,
-/// backslashes, spaces and control characters), so the comment needs no escaping.
-pub fn marker(view: &str, def_id: u64) -> String {
-    let mut name = String::new();
-    for c in view.chars() {
-        if matches!(c, '%' | '\'' | '"' | '\\' | ' ' | '`') || c.is_control() {
-            let mut buf = [0u8; 4];
-            for b in c.encode_utf8(&mut buf).bytes() {
-                name.push_str(&format!("%{b:02X}"));
-            }
-        } else {
-            name.push(c);
-        }
-    }
-    format!("{MARKER_PREFIX}view={name} def={def_id}")
-}
-
-/// The ownership marker (see [`marker`]) of an existing table, if its comment is one.
-pub async fn table_marker(conn: &mut Conn, schema: &str, name: &str) -> Result<Option<String>> {
-    let comment: Option<Option<String>> = conn
-        .exec_first(
-            "SELECT CAST(TABLE_COMMENT AS CHAR) FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-            (schema, name),
-        )
-        .await?;
-    Ok(comment.flatten().filter(|c| c.starts_with(MARKER_PREFIX)))
-}
-
-/// Name of the shadow table a new version is built into (≤ 64 chars).
-pub fn shadow_name(name: &str) -> String {
-    side_name(name, "__lv_new")
-}
-
-/// Name the replaced version is renamed to during a swap.
-pub fn old_name(name: &str) -> String {
-    side_name(name, "__lv_old")
-}
-
-/// `v__lv_new` / `v__lv_old` → `v` (other names unchanged).
-pub fn base_name(name: &str) -> &str {
-    name.strip_suffix("__lv_new")
-        .or_else(|| name.strip_suffix("__lv_old"))
-        .unwrap_or(name)
-}
-
-fn side_name(name: &str, suffix: &str) -> String {
-    let n = format!("{name}{suffix}");
-    if n.len() <= 64 {
-        n
-    } else {
-        format!("_lv_{}{suffix}", crate::analyze::definition_hash(name))
-    }
+/// The ownership marker (see [`marker`]) of an existing table, if its comment is one
+/// (dispatched by target family, see [`crate::target`]).
+pub async fn table_marker(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    crate::target::table_marker(conn, kind, schema, name).await
 }
 
 /// Session settings for every connection the service opens: non-locking reads, an sql_mode
@@ -977,146 +589,66 @@ fn layout_from(plan: &ViewPlan, cols: Vec<MvCol>) -> Result<Layout> {
     })
 }
 
-/// Whether `table` has the unique index its rows are upserted by (see [`Layout::row_key`]);
-/// true when the layout has none. Tables created before upserts lack `_lv_row`.
+/// Whether `table` has the unique index its rows are upserted by (see
+/// [`Layout::row_key`]); true when the layout has none. Dispatched once per statement
+/// (see [`crate::target`]).
 pub async fn has_row_index(
     conn: &mut Conn,
+    kind: Kind,
     schema: &str,
     table: &str,
     layout: &Layout,
 ) -> Result<bool> {
-    let (index, cols) = match layout.row_index() {
-        None => return Ok(true),
-        Some(RowIndex::Primary) => ("PRIMARY", &layout.unit_pos),
-        Some(RowIndex::Unique(_)) => (ROW_INDEX, &layout.identity),
-    };
-    let parts: Vec<(String, i64, Option<i64>)> = conn
-        .exec(
-            "SELECT CAST(COLUMN_NAME AS CHAR), CAST(NON_UNIQUE AS SIGNED), CAST(SUB_PART AS SIGNED) \
-             FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
-             AND INDEX_NAME = ? ORDER BY SEQ_IN_INDEX",
-            (schema, table, index),
-        )
-        .await?;
-    Ok(parts.len() == cols.len()
-        && parts
-            .iter()
-            .zip(cols.iter())
-            .all(|((name, non_unique, sub), &p)| {
-                *non_unique == 0 && sub.is_none() && name.eq_ignore_ascii_case(&layout.cols[p].name)
-            }))
+    crate::target::has_row_index(conn, kind, schema, table, layout).await
 }
 
 /// `BASE TABLE` / `VIEW` / None.
-pub async fn table_kind(conn: &mut Conn, schema: &str, name: &str) -> Result<Option<String>> {
-    Ok(conn
-        .exec_first(
-            "SELECT CAST(TABLE_TYPE AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-            (schema, name),
-        )
-        .await?)
+pub async fn table_kind(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    crate::target::table_kind(conn, kind, schema, name).await
 }
 
-/// Visible + invisible column names and types of an existing table, to validate a layout on resume.
+/// Visible + invisible column names and types of an existing table, to validate a layout
+/// on resume.
 pub async fn table_columns(
     conn: &mut Conn,
+    kind: Kind,
     schema: &str,
     name: &str,
 ) -> Result<Vec<(String, String)>> {
-    Ok(conn
-        .exec(
-            "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR) FROM information_schema.COLUMNS \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-            (schema, name),
-        )
-        .await?)
+    crate::target::table_columns(conn, kind, schema, name).await
 }
 
-pub fn layout_matches(layout: &Layout, existing: &[(String, String)]) -> bool {
-    layout.cols.len() == existing.len()
-        && layout.cols.iter().zip(existing).all(|(c, (n, t))| {
-            c.name.eq_ignore_ascii_case(n) && c.column_type.eq_ignore_ascii_case(t)
-        })
+/// Whether an existing table's columns are the layout's.
+pub fn layout_matches(kind: Kind, layout: &Layout, existing: &[(String, String)]) -> bool {
+    crate::target::layout_matches(kind, layout, existing)
 }
 
-/// Creates the shadow table with an ownership marker (see [`marker`]) as the table comment.
+/// Creates the shadow table with an ownership marker (see [`marker`]) as the table
+/// comment.
 pub async fn create_shadow_marked(
     conn: &mut Conn,
+    kind: Kind,
     schema: &str,
     name: &str,
     layout: &Layout,
     marker: &str,
 ) -> Result<String> {
-    create_shadow_with(conn, schema, name, layout, Some(marker)).await
+    crate::target::create_shadow_marked(conn, kind, schema, name, layout, marker).await
 }
 
-async fn create_shadow_with(
-    conn: &mut Conn,
-    schema: &str,
-    name: &str,
-    layout: &Layout,
-    marker: Option<&str>,
-) -> Result<String> {
-    let shadow = shadow_name(name);
-    conn.query_drop(format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(&shadow)))
-        .await?;
-    match conn
-        .query_drop(layout.create_sql_marked(schema, &shadow, marker))
-        .await
-    {
-        Ok(()) => {}
-        // A collation or character set of the source this target does not know (MariaDB 13's
-        // default `utf8mb4_uca1400_ai_ci` on MySQL): the target's default collation of each
-        // column's character set is the closest match.
-        Err(mysql_async::Error::Server(e)) if e.code == 1273 || e.code == 1115 => {
-            let adapted = layout.with_target_collations(conn).await?;
-            tracing::warn!(
-                table = %name,
-                "{}; creating the table with the target's default collations instead",
-                e.message
-            );
-            conn.query_drop(adapted.create_sql_marked(schema, &shadow, marker))
-                .await?;
-        }
-        Err(e) => return Err(e.into()),
-    }
-    Ok(shadow)
+/// Atomically replaces `name` with its shadow table (or renames the shadow when `name`
+/// is new).
+pub async fn swap(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -> Result<()> {
+    crate::target::swap(conn, kind, schema, name).await
 }
 
-/// Atomically replaces `name` with its shadow table (or renames the shadow when `name` is new).
-pub async fn swap(conn: &mut Conn, schema: &str, name: &str) -> Result<()> {
-    let shadow = shadow_name(name);
-    let old = old_name(name);
-    let (s, n) = (q(schema), q(name));
-    // Readers with open transactions on the old table hold its metadata lock; don't queue
-    // behind them for long (the caller retries), and don't block new readers meanwhile.
-    conn.query_drop("SET SESSION lock_wait_timeout = 5").await?;
-    if table_kind(conn, schema, &shadow).await?.is_none() {
-        // Already swapped (an earlier attempt was interrupted after the rename).
-        return Ok(());
-    }
-    if table_kind(conn, schema, name).await?.is_some() {
-        conn.query_drop(format!("DROP TABLE IF EXISTS {s}.{}", q(&old)))
-            .await?;
-        conn.query_drop(format!(
-            "RENAME TABLE {s}.{n} TO {s}.{}, {s}.{} TO {s}.{n}",
-            q(&old),
-            q(&shadow)
-        ))
-        .await?;
-        conn.query_drop(format!("DROP TABLE IF EXISTS {s}.{}", q(&old)))
-            .await?;
-    } else {
-        conn.query_drop(format!("RENAME TABLE {s}.{} TO {s}.{n}", q(&shadow)))
-            .await?;
-    }
-    Ok(())
-}
-
-pub async fn drop_table(conn: &mut Conn, schema: &str, name: &str) -> Result<()> {
-    conn.query_drop(format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(name)))
-        .await?;
-    Ok(())
+pub async fn drop_table(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -> Result<()> {
+    crate::target::drop_table(conn, kind, schema, name).await
 }
 
 /// Session time zone in which TIMESTAMPs are written (see [`Layout::epoch_timestamps`]).

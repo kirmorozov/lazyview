@@ -1226,11 +1226,22 @@ impl Engine {
                     .owned
                     .contains_key(&(parsed.name.clone(), SOURCE_TARGET.to_string()))
                     || (marker.is_some()
-                        && mv::table_marker(&mut self.src, &self.schema, &parsed.name).await?
+                        && mv::table_marker(
+                            &mut self.src,
+                            target::Kind::Mysql,
+                            &self.schema,
+                            &parsed.name,
+                        )
+                        .await?
                             == marker);
                 if !ours {
-                    if let Some(kind) =
-                        mv::table_kind(&mut self.src, &self.schema, &parsed.name).await?
+                    if let Some(kind) = mv::table_kind(
+                        &mut self.src,
+                        target::Kind::Mysql,
+                        &self.schema,
+                        &parsed.name,
+                    )
+                    .await?
                     {
                         if targets.iter().any(|t| t == SOURCE_TARGET) {
                             bail!(
@@ -1997,7 +2008,9 @@ impl Engine {
                     continue;
                 }
                 info!(table = %table, "removing a table lazyview created for a definition that no longer exists");
-                if let Err(e) = mv::drop_table(&mut self.meta, &self.schema, &table).await {
+                if let Err(e) =
+                    mv::drop_table(&mut self.meta, target::Kind::Mysql, &self.schema, &table).await
+                {
                     warn!("dropping {table}: {e:#}");
                 }
             }
@@ -2130,12 +2143,13 @@ impl Engine {
         let mut resumed = Vec::new();
         for t in candidates {
             let ts = self.targets[&t].schema.clone();
+            let kind = self.targets[&t].kind;
             // Columns as the layout's, and the unique index rows are upserted by (tables
             // built before upserts lack `_lv_row`: rebuilt once).
             let fits = match self.target_conn(&t).await {
-                Ok(conn) => match mv::table_columns(conn, &ts, &name).await {
-                    Ok(c) if mv::layout_matches(&layout, &c) => {
-                        mv::has_row_index(conn, &ts, &name, &layout)
+                Ok(conn) => match mv::table_columns(conn, kind, &ts, &name).await {
+                    Ok(c) if mv::layout_matches(kind, &layout, &c) => {
+                        mv::has_row_index(conn, kind, &ts, &name, &layout)
                             .await
                             .unwrap_or(false)
                     }
@@ -2201,8 +2215,9 @@ impl Engine {
     /// Drops the shadow table of `name` on target `t` (best effort).
     async fn drop_shadow(&mut self, t: &str, name: &str) {
         let ts = self.targets[t].schema.clone();
+        let kind = self.targets[t].kind;
         if let Ok(c) = self.target_conn(t).await {
-            let _ = mv::drop_table(c, &ts, &mv::shadow_name(name)).await;
+            let _ = mv::drop_table(c, kind, &ts, &mv::shadow_name(name)).await;
         }
     }
 
@@ -2504,10 +2519,10 @@ impl Engine {
         }
         if self.cfg.drop_removed {
             if let Some(t) = self.targets.get(target) {
-                let ts = t.schema.clone();
+                let (ts, kind) = (t.schema.clone(), t.kind);
                 match self.target_conn(target).await {
                     Ok(c) => {
-                        if let Err(e) = mv::drop_table(c, &ts, name).await {
+                        if let Err(e) = mv::drop_table(c, kind, &ts, name).await {
                             warn!("dropping {name}@{target}: {e:#}");
                         }
                     }
@@ -4429,7 +4444,13 @@ impl Engine {
                         let check = (!live_has
                             && !self.owned.contains_key(&(n.name.clone(), t.clone())))
                         .then(|| marker.clone());
-                        (t.clone(), target.opts.clone(), target.schema.clone(), check)
+                        (
+                            t.clone(),
+                            target.opts.clone(),
+                            target.schema.clone(),
+                            target.kind,
+                            check,
+                        )
                     })
                     .collect();
                 n.task = tokio::spawn(swap_task(
@@ -4453,6 +4474,7 @@ impl Engine {
                 continue;
             }
             let ts = self.targets[&t].schema.clone();
+            let kind = self.targets[&t].kind;
             // Someone created a table with this name meanwhile: never replace it.
             let live_has = self.slots[i]
                 .live
@@ -4462,7 +4484,7 @@ impl Engine {
             if !live_has && !self.owned.contains_key(&(n.name.clone(), t.clone())) {
                 let marker = mv::marker(&n.name, self.slots[i].def_id);
                 let exists = match self.target_conn(&t).await {
-                    Ok(c) => foreign_table(c, &ts, &n.name, &marker).await,
+                    Ok(c) => foreign_table(c, kind, &ts, &n.name, &marker).await,
                     Err(_) => false,
                 };
                 if exists {
@@ -4479,7 +4501,8 @@ impl Engine {
             }
             let timeout = self.cfg.target_timeout;
             let r = match self.target_conn(&t).await {
-                Ok(c) => match tokio::time::timeout(timeout, mv::swap(c, &ts, &n.name)).await {
+                Ok(c) => match tokio::time::timeout(timeout, mv::swap(c, kind, &ts, &n.name)).await
+                {
                     Ok(r) => r,
                     Err(_) => Err(anyhow!("timed out after {timeout:?}")),
                 },
@@ -5812,14 +5835,14 @@ fn first_keyword(query: &str) -> &str {
 /// under the view's name. A target where that fails is left to the engine, which checks again
 /// and retries it as for any build.
 async fn swap_task(
-    targets: Vec<(String, Opts, String, Option<String>)>,
+    targets: Vec<(String, Opts, String, target::Kind, Option<String>)>,
     name: String,
     layout: Layout,
     tx: mpsc::UnboundedSender<BuildDone>,
     (def_id, generation): (u64, u64),
 ) {
     let mut swapped = Vec::new();
-    for (t, opts, schema, check) in targets {
+    for (t, opts, schema, kind, check) in targets {
         let r = async {
             let mut c = match tokio::time::timeout(
                 TARGET_CONNECT_TIMEOUT * 3,
@@ -5831,7 +5854,7 @@ async fn swap_task(
                 Err(_) => bail!("connecting to target {t}: timed out"),
             };
             if let Some(marker) = &check {
-                if foreign_table(&mut c, &schema, &name, marker).await {
+                if foreign_table(&mut c, kind, &schema, &name, marker).await {
                     let _ = c.disconnect().await;
                     bail!("a table `{name}` appeared during the build");
                 }
@@ -5839,7 +5862,7 @@ async fn swap_task(
             // A reader holding the old table's metadata lock: wait for it a while.
             let mut attempts = 0;
             let r = loop {
-                match mv::swap(&mut c, &schema, &name).await {
+                match mv::swap(&mut c, kind, &schema, &name).await {
                     Err(e) if server_code(&e) == Some(1205) && attempts < 12 => {
                         attempts += 1;
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -5870,13 +5893,19 @@ async fn swap_task(
 
 /// Whether a table `name` exists that lazyview did not create for this view (`marker`, see
 /// [`mv::marker`]): a swap must never replace it.
-async fn foreign_table(c: &mut Conn, schema: &str, name: &str, marker: &str) -> bool {
-    mv::table_kind(c, schema, name)
+async fn foreign_table(
+    c: &mut Conn,
+    kind: target::Kind,
+    schema: &str,
+    name: &str,
+    marker: &str,
+) -> bool {
+    mv::table_kind(c, kind, schema, name)
         .await
         .ok()
         .flatten()
         .is_some()
-        && mv::table_marker(c, schema, name)
+        && mv::table_marker(c, kind, schema, name)
             .await
             .ok()
             .flatten()
@@ -5907,16 +5936,18 @@ async fn prepare_target(
     let ours = |m: Option<String>| m.as_deref() == Some(spec.marker.as_str());
     if spec.check_side {
         for side in [mv::shadow_name(name), mv::old_name(name)] {
-            if mv::table_kind(&mut c, ts, &side).await?.is_some()
-                && !ours(mv::table_marker(&mut c, ts, &side).await?)
+            if mv::table_kind(&mut c, spec.kind, ts, &side)
+                .await?
+                .is_some()
+                && !ours(mv::table_marker(&mut c, spec.kind, ts, &side).await?)
             {
                 bail!("refusing to build `{name}`: table `{ts}`.`{side}` on target {t} exists and was not created by lazyview for this view");
             }
         }
     }
     if spec.check_table {
-        if let Some(k) = mv::table_kind(&mut c, ts, name).await? {
-            if !ours(mv::table_marker(&mut c, ts, name).await?) {
+        if let Some(k) = mv::table_kind(&mut c, spec.kind, ts, name).await? {
+            if !ours(mv::table_marker(&mut c, spec.kind, ts, name).await?) {
                 bail!(
                     "refusing to replace existing {} `{ts}`.`{name}` on target {t} that lazyview does not manage",
                     k.to_lowercase()
@@ -5924,7 +5955,7 @@ async fn prepare_target(
             }
         }
     }
-    mv::create_shadow_marked(&mut c, ts, name, layout, &spec.marker)
+    mv::create_shadow_marked(&mut c, spec.kind, ts, name, layout, &spec.marker)
         .await
         .with_context(|| format!("creating the shadow table on target {t}"))?;
     Ok((c, w))
@@ -6010,11 +6041,11 @@ async fn build_task(
             if !swap {
                 break;
             }
-            if spec.check_table && foreign_table(c, ts, &name, &spec.marker).await {
+            if spec.check_table && foreign_table(c, spec.kind, ts, &name, &spec.marker).await {
                 debug!(view = %name, target = %spec.target, "swap left to the engine: a table appeared during the build");
                 continue;
             }
-            match mv::swap(c, ts, &name).await {
+            match mv::swap(c, spec.kind, ts, &name).await {
                 Ok(()) => swapped.push(spec.target.clone()),
                 Err(e) => {
                     debug!(view = %name, target = %spec.target, "swap left to the engine: {e:#}")
