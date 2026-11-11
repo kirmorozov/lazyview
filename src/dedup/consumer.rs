@@ -632,6 +632,7 @@ fn hop_ids<U, S: Sink<U>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::Hop;
     use crate::catalog::{FkAction, ForeignKey};
     use crate::dedup::testkit::{
         catalog, catalog_fk, plan, plan_in, row, row_typed, table, Cell, Rec,
@@ -672,6 +673,36 @@ mod tests {
             })
             .collect();
         (C { c, hops }, aps)
+    }
+
+    /// Compiles `sql` with occurrence `ai`'s hop rewritten to the given plan data: the way to
+    /// exercise a composite link and a multi-column partner, which the analyzer's chain walks
+    /// give only through two id aliases (access.rs `chain` tests the shape directly).
+    fn compile_hop(
+        sql: &str,
+        ai: usize,
+        link_cols: &[usize],
+        partner_cols: &[(usize, usize)],
+    ) -> (C, AccessPlan) {
+        let p = plan(sql);
+        let mut ap = AccessPlan::of(&p);
+        let (positions, aliases, select) = match &ap.occurrences[ai].path {
+            Path::Hop(h) => (h.positions.clone(), h.aliases.clone(), h.select.clone()),
+            other => panic!("occurrence {ai} is not a hop: {other:?}"),
+        };
+        ap.occurrences[ai].path = Path::Hop(Hop {
+            link_cols: link_cols.to_vec(),
+            partner: vec![],
+            partner_cols: partner_cols.to_vec(),
+            positions,
+            aliases,
+            select,
+        });
+        let spaces = Spaces::of(p.unit_exprs.len(), &p.partial.sets);
+        let mut c = Consumer::default();
+        let mut hops = Hops::new(1000);
+        c.add(0, 0, &p, &ap, &spaces, &mut hops).unwrap();
+        (C { c, hops }, ap)
     }
 
     /// The compiled path of the occurrence the definition aliases `alias`.
@@ -1393,11 +1424,29 @@ mod tests {
             .expect("that occurrence is not a hop")
     }
 
+    /// A two-part link value, the way the hop cache keys an entry of a composite link.
+    fn link2(a: i64, b: i64) -> Tuple {
+        Box::new([Datum::Int(a), Datum::Int(b)])
+    }
+
+    /// Cached ids given as two-part tuples, the answers of a hop whose target id has two parts.
+    fn tuple_ids(pairs: &[(i64, i64)]) -> Vec<Key> {
+        pairs
+            .iter()
+            .map(|&(a, b)| Key::from_parts(Box::new([Datum::Int(a), Datum::Int(b)])))
+            .collect()
+    }
+
+    /// An answer for link value `l` of hop `h`, the way a job's completion gives it.
+    fn cache2(x: &mut C, h: HopId, l: Tuple, ids: Vec<Key>) {
+        x.hops.taken(h, &l);
+        let what = format!("{l:?}");
+        assert!(x.hops.answer(h, l, ids), "{what} is not in flight");
+    }
+
     /// An answer for link value `v` of hop `h`, the way a job's completion gives it.
     fn cache(x: &mut C, h: HopId, v: i64, ids: Vec<Key>) {
-        let l = link(v);
-        x.hops.taken(h, &l);
-        assert!(x.hops.answer(h, l, ids), "{v} is not in flight");
+        cache2(x, h, link(v), ids);
     }
 
     #[test]
@@ -1613,6 +1662,101 @@ mod tests {
         assert_eq!(rec.rows, vec![(0, true)], "only an unread column changed");
         assert_eq!(x.hops.get(h, &link(3)), Some(&cached(&[10])[..]));
         assert_eq!(x.hops.get(h, &link(4)), Some(&cached(&[11])[..]));
+    }
+
+    /// A hop whose link value is two columns of `l` and whose cached ids are tuples: a hit
+    /// marks the tuple ids through the `Key::Tuple` branch, a miss defers the whole link.
+    #[test]
+    fn composite_link_hit_marks_tuple_ids_and_miss_defers_the_whole_link() {
+        // `l`'s (parent_id, child_id) are the link, in that order.
+        let (mut x, _) = compile_hop(ONE_HOP, 1, &[1, 0], &[(0, 1), (0, 2)]);
+        let h = hop_for(&x, 1);
+        let p = x.hops.plan(h).expect("the hop of `l`").clone();
+        assert_eq!(
+            (p.link_cols.as_slice(), p.chain.as_slice(), p.space),
+            (&[1, 0][..], &[0][..], SpaceId::FULL),
+            "the link is `l`.`parent_id` then `l`.`child_id`"
+        );
+        assert_eq!(
+            p.partner,
+            Some((0, vec![1, 2])),
+            "both partner columns are on the one alias `i`: `kind_id` then `owner_id`, \
+             matching the link order"
+        );
+        cache2(&mut x, h, link2(3, 4), tuple_ids(&[(11, 12), (21, 22)]));
+        let s =
+            x.c.source(&table_ref("item_links"), Some(2))
+                .expect("watched");
+        let mut rec = Rec::default();
+        // Insert child_id 4, parent_id 3: the cached link value marks its tuple ids and
+        // defers nothing.
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(4), Some(3)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.tuples(0, SpaceId::FULL),
+            vec![
+                (vec![Datum::Int(11), Datum::Int(12)], Op::Update),
+                (vec![Datum::Int(21), Datum::Int(22)], Op::Update),
+            ],
+            "{rec:?}"
+        );
+        assert!(rec.items.is_empty(), "a hit defers nothing: {rec:?}");
+        // Insert child_id 5, parent_id 3: the link value is not cached, so the item carries
+        // the whole two-column value, not just one part of it.
+        x.c.row(
+            &s,
+            None,
+            Some(&row(&[Some(5), Some(3)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(
+            rec.items,
+            vec![(
+                0,
+                Item::Hop {
+                    hop: h,
+                    link: link2(3, 5)
+                }
+            )],
+            "the deferred link names both columns: {rec:?}"
+        );
+        assert_eq!(rec.hops, vec![(0, true), (0, false)], "one hit, one miss");
+    }
+
+    /// The partner of the same two-column hop is `i`'s (kind_id, owner_id) pair: a row of the
+    /// partner alias evicts both images' partner values, projected together from the image.
+    #[test]
+    fn composite_partner_row_evicts_both_values() {
+        let (mut x, _) = compile_hop(ONE_HOP, 1, &[1, 0], &[(0, 1), (0, 2)]);
+        let h = hop_for(&x, 1);
+        for l in [link2(3, 9), link2(4, 10), link2(3, 10)] {
+            cache2(&mut x, h, l, cached(&[100]));
+        }
+        let s = x.c.source(&table_ref("items"), Some(3)).expect("watched");
+        let mut rec = Rec::default();
+        // `kind_id` 3 to 4 and `owner_id` 9 to 10: both images' partner pairs lose their
+        // entries.
+        x.c.row(
+            &s,
+            Some(&row(&[Some(1), Some(3), Some(9)])),
+            Some(&row(&[Some(1), Some(4), Some(10)])),
+            &mut x.hops,
+            &mut rec,
+        );
+        assert_eq!(x.hops.get(h, &link2(3, 9)), None, "the old partner pair");
+        assert_eq!(x.hops.get(h, &link2(4, 10)), None, "the new partner pair");
+        assert_eq!(
+            x.hops.get(h, &link2(3, 10)),
+            Some(&cached(&[100])[..]),
+            "a pair this row does not name stays: only a whole-hop clear could take it"
+        );
+        assert!(rec.hops.is_empty(), "`i` is not a hop: {rec:?}");
     }
 
     /// Compiles the owner-count view over [`catalog_fk`] as target 0.
