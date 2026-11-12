@@ -286,12 +286,8 @@ fn targets_one_target_down() {
             let mut admin = killer_db.conn().await?;
             let mut killed = 0;
             for _ in 0..20 {
-                let ids = rows(
-                    &mut admin,
-                    &format!("SELECT ID FROM information_schema.PROCESSLIST WHERE DB = {} AND ID <> CONNECTION_ID()", q(&killer_db.name)),
-                )
-                .await?;
-                for id in ids.into_iter().filter_map(|r| r[0].clone()) {
+                let ids = session_ids(&mut admin, &format!("DB = {}", q(&killer_db.name))).await?;
+                for id in ids {
                     if exec(&mut admin, &format!("KILL {id}")).await.is_ok() {
                         killed += 1;
                     }

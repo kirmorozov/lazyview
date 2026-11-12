@@ -276,26 +276,17 @@ fn exclusive_killed_connections_are_not_fatal() {
                     let (dsn, u) = (dsn.clone(), u.clone());
                     async move {
                         let mut p = connect(&dsn).await?;
-                        let n = scalar_i64(
-                            &mut p,
-                            &format!(
-                                "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
-                             WHERE USER = '{u}' AND ID <> CONNECTION_ID()"
-                            ),
-                        )
-                        .await?;
+                        let alive = !session_ids(&mut p, &format!("USER = {}", q(&u)))
+                            .await?
+                            .is_empty();
                         p.disconnect().await.ok();
-                        Ok(n > 0)
+                        Ok(alive)
                     }
                 },
             )
             .await?;
             // Every other session of the engine user on this (exclusive) server: the engine's.
-            let ids: Vec<u64> = c
-                .query(format!(
-                    "SELECT ID FROM information_schema.PROCESSLIST WHERE USER = '{user}' AND ID <> CONNECTION_ID()"
-                ))
-                .await?;
+            let ids = session_ids(&mut c, &format!("USER = {}", q(&user))).await?;
             ensure!(!ids.is_empty(), "no engine sessions to kill");
             for id in ids {
                 let _ = c.query_drop(format!("KILL {id}")).await;

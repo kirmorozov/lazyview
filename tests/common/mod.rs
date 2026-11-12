@@ -267,6 +267,38 @@ pub async fn scalar(conn: &mut Conn, sql: &str) -> Result<Option<String>> {
         .and_then(|r| r.into_iter().next().flatten()))
 }
 
+/// The ids of all *other* sessions (excluding this connection) matching `filter`, an SQL
+/// condition over the shared columns `USER`, `DB`, `ID` (e.g. `DB = 'items'`). The session
+/// list is read from `performance_schema.processlist` (utf8mb4) when the server has it and
+/// falls back to `information_schema.PROCESSLIST` when that query fails (e.g. MariaDB with
+/// performance_schema off). The information_schema view carries other sessions' query text
+/// in utf8mb3 and fails outright on MySQL/Percona 8.0.22+ as soon as one concurrent query
+/// contains a 4-byte character, which the utf8mb4 table does not.
+pub async fn session_ids(conn: &mut Conn, filter: &str) -> Result<Vec<u64>> {
+    let sql = |table: &str, id: &str| {
+        format!("SELECT {id} FROM {table} WHERE {filter} AND {id} <> CONNECTION_ID()")
+    };
+    let rows = match rows(
+        conn,
+        &sql("performance_schema.processlist", "PROCESSLIST_ID"),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => rows(conn, &sql("information_schema.PROCESSLIST", "ID")).await?,
+    };
+    rows.into_iter()
+        .map(|r| {
+            r[0].clone()
+                .ok_or_else(|| anyhow!("process list: NULL session id"))
+                .and_then(|s| {
+                    s.parse::<u64>()
+                        .with_context(|| format!("process list: bad session id {s}"))
+                })
+        })
+        .collect()
+}
+
 pub async fn scalar_i64(conn: &mut Conn, sql: &str) -> Result<i64> {
     let v = scalar(conn, sql)
         .await?
