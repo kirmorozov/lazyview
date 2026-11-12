@@ -350,35 +350,80 @@ pub async fn scalar(conn: &mut Conn, sql: &str) -> Result<Option<String>> {
 }
 
 /// The ids of all *other* sessions (excluding this connection) matching `filter`, an SQL
-/// condition over the shared columns `USER`, `DB`, `ID` (e.g. `DB = 'items'`). The session
-/// list is read from `performance_schema.processlist` (utf8mb4) when the server has it and
-/// falls back to `information_schema.PROCESSLIST` when that query fails (e.g. MariaDB with
-/// performance_schema off). The information_schema view carries other sessions' query text
-/// in utf8mb3 and fails outright on MySQL/Percona 8.0.22+ as soon as one concurrent query
-/// contains a 4-byte character, which the utf8mb4 table does not.
+/// condition over the shared columns `USER`, `DB`, `ID` (e.g. `DB = 'items'`).
+///
+/// There are two sources because servers differ. `performance_schema.processlist` is the good
+/// one: it is utf8mb4, so it can carry other sessions' query text even when that text holds a
+/// 4-byte character. Its id column is `ID` (`PROCESSLIST_ID` is the name the same value has in
+/// `performance_schema.threads`, not here). The table is readable only when the server was
+/// started with performance_schema on, and the shared MySQL/Percona test servers run it off (the
+/// buffer costs about 1.5 GiB over the six of them, on a sidecar already near its memory cap);
+/// MariaDB has no such table at all. Both cases read
+/// `information_schema.PROCESSLIST`, whose id column is `ID` too. The probe runs once per call:
+/// an unknown variable (some MariaDB builds) counts as off. When the probe says on, the fallback
+/// is used only if the table is really missing (server error 1146, ER_NO_SUCH_TABLE); any other
+/// failure is returned with its context, so a wrong query can never hide behind the fallback.
+///
+/// The utf8mb3 view has one flake the table does not: when a *concurrent* session has an
+/// in-flight query containing a 4-byte character, reading the view fails with server error 3854,
+/// a charset-conversion failure inside the server (it hit CI's `targets_one_target_down` on the
+/// MySQL 9.7 line). That depends on what another session happens to be running at that instant,
+/// so it is transient by nature: the read is retried on that error alone (decided by
+/// `server_code`, never by message text), at most 5 attempts, 200 ms apart. Any other error, or a
+/// 3854 that survives every attempt, is returned with its context.
 pub async fn session_ids(conn: &mut Conn, filter: &str) -> Result<Vec<u64>> {
-    let sql = |table: &str, id: &str| {
-        format!("SELECT {id} FROM {table} WHERE {filter} AND {id} <> CONNECTION_ID()")
+    let sql =
+        |table: &str| format!("SELECT ID FROM {table} WHERE {filter} AND ID <> CONNECTION_ID()");
+    let ids = |rows: Vec<Vec<Option<String>>>| -> Result<Vec<u64>> {
+        rows.into_iter()
+            .map(|r| {
+                r[0].clone()
+                    .ok_or_else(|| anyhow!("process list: NULL session id"))
+                    .and_then(|s| {
+                        s.parse::<u64>()
+                            .with_context(|| format!("process list: bad session id {s}"))
+                    })
+            })
+            .collect()
     };
-    let rows = match rows(
-        conn,
-        &sql("performance_schema.processlist", "PROCESSLIST_ID"),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => rows(conn, &sql("information_schema.PROCESSLIST", "ID")).await?,
+    // `@@performance_schema` is read-only, set at startup. Any answer that is not off means the
+    // utf8mb4 table should be there; the 1146 fallback below still covers the cases where it is
+    // not, so reading this too broadly costs one extra query and never a wrong answer.
+    let ps_on = match scalar(conn, "SELECT @@performance_schema").await {
+        Ok(Some(v)) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        ),
+        // Unknown variable (some MariaDB builds), or no answer: no utf8mb4 table.
+        Err(_) | Ok(None) => false,
     };
-    rows.into_iter()
-        .map(|r| {
-            r[0].clone()
-                .ok_or_else(|| anyhow!("process list: NULL session id"))
-                .and_then(|s| {
-                    s.parse::<u64>()
-                        .with_context(|| format!("process list: bad session id {s}"))
+    if ps_on {
+        match rows(conn, &sql("performance_schema.processlist")).await {
+            Ok(r) => return ids(r),
+            // 1146 ER_NO_SUCH_TABLE: the only legitimate reason to use the utf8mb3 view.
+            Err(e) if server_code(&e) == Some(1146) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match rows(conn, &sql("information_schema.PROCESSLIST")).await {
+            Ok(r) => return ids(r),
+            Err(e) if server_code(&e) == Some(3854) && attempt < ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(200)).await
+            }
+            Err(e) if server_code(&e) == Some(3854) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "information_schema.PROCESSLIST: error 3854 survived {attempt} attempts"
+                    )
                 })
-        })
-        .collect()
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 pub async fn scalar_i64(conn: &mut Conn, sql: &str) -> Result<i64> {
