@@ -1949,8 +1949,13 @@ mod tests {
             second.iter().all(|i| !third.contains(i)),
             "the two chunks never mix: {second:?} {third:?}"
         );
+        // The retried items return to the buffer's HashSet and `begin` drains it in hash order,
+        // so the pair may come back reversed: compare the chunks as sets, same length and every
+        // item of one in the other (chunk items are distinct, so this is set equality).
         assert!(
-            pairs.iter().any(|p| **p == first),
+            pairs
+                .iter()
+                .any(|p| p.len() == first.len() && p.iter().all(|i| first.contains(i))),
             "the retried pair runs again alone: {second:?} {third:?}"
         );
         assert!(
