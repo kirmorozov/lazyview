@@ -1309,6 +1309,15 @@ impl SoakWorkload {
     }
 
     /// Multi-table DELETE and a bulk update across two tables.
+    ///
+    /// No derived write may put a NULL into a NOT NULL column: `entities.amount` is nullable and
+    /// the seed leaves it NULL about a fifth of the time, so the joined value is `COALESCE`d
+    /// before it reaches `items.price` (NOT NULL) — under a strict `sql_mode` the bare product is
+    /// ERROR 1048 (`Column 'price' cannot be null`), which is seed-dependent and therefore looks
+    /// like a flaky CI run. The other derived writes are safe by schema: every
+    /// `UPDATE … JOIN … SET` here reads only a primary key (`e.id`, `s.id`) or a NOT NULL column
+    /// of the target row (`i.qty`), and every `INSERT … SELECT` list is literals plus a NOT NULL
+    /// primary key.
     fn multi(&mut self) -> Vec<String> {
         let i = self.item();
         let e = self.entity();
@@ -1319,7 +1328,7 @@ impl SoakWorkload {
         } else {
             vec![format!(
                 "UPDATE items i JOIN entities e ON e.id = i.entity_id
-                 SET i.price = e.amount * 2 WHERE e.id = {e} AND i.id BETWEEN {i} AND {}",
+                 SET i.price = COALESCE(e.amount, 0) * 2 WHERE e.id = {e} AND i.id BETWEEN {i} AND {}",
                 i + 2
             )]
         }
