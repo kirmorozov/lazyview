@@ -141,7 +141,6 @@ pub struct Drained<U> {
 }
 
 /// A target's flush job in flight: a copy of its chunk, put back when it fails or is stale.
-#[allow(dead_code)] // read from PR 6O on, which removes this line
 #[derive(Debug)]
 struct Running<U> {
     id: JobId,
@@ -150,7 +149,6 @@ struct Running<U> {
     facts: Option<Vec<(SpaceId, Key, Fact)>>,
 }
 
-#[allow(dead_code)] // read from PR 6N / 6O on; 6O removes this line
 struct Target<P, U, J> {
     id: TargetId,
     spec: TargetSpec<P>,
@@ -170,7 +168,6 @@ struct Target<P, U, J> {
 }
 
 /// The dedup core.
-#[allow(dead_code)] // read from PR 6N / 6O on; 6O removes this line
 pub struct Core<P, U = NoItem, J = NoJob> {
     cfg: CoreConfig,
     targets: Vec<Option<Target<P, U, J>>>,
@@ -182,6 +179,8 @@ pub struct Core<P, U = NoItem, J = NoJob> {
     starting: Vec<usize>,
     next_job: u64,
     next_incarnation: u32,
+    /// Started jobs not completed yet: their target.
+    jobs: std::collections::HashMap<JobId, TargetId>,
 }
 
 impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
@@ -197,6 +196,7 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
             starting: Vec::new(),
             next_job: 0,
             next_incarnation: 1,
+            jobs: std::collections::HashMap::new(),
         }
     }
 
@@ -416,6 +416,83 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
         self.targets.get(s)?.as_ref().filter(|tg| tg.id == t)?;
         Some(s)
     }
+}
+
+/// A chunk of a flush job.
+#[derive(Debug)]
+pub struct Chunk<P, U> {
+    pub ids: Vec<(SpaceId, IdSet)>,
+    pub items: Vec<Item<U>>,
+    /// Per id, its merged fact (targets that declare facts).
+    pub facts: Option<Vec<(SpaceId, Key, Fact)>>,
+    /// The generation's oldest release (lazyview pins lagging target databases there).
+    pub origin: P,
+    /// The generation's newest release: the caller's fence covers it before reading.
+    pub high: P,
+}
+
+#[derive(Debug)]
+pub enum JobKind<P, U, J> {
+    Flush(Chunk<P, U>),
+    Executor(J),
+}
+
+#[derive(Debug)]
+pub struct Job<P, U, J> {
+    pub id: JobId,
+    pub target: TargetId,
+    pub kind: JobKind<P, U, J>,
+}
+
+/// What the action did. Everything not listed is done.
+#[derive(Debug)]
+pub struct JobResult<U> {
+    /// Every id and item of the chunk goes back to pending (the job failed as a whole).
+    pub retry_all: bool,
+    /// Ids to act on again (transient failures for them).
+    pub retry: Vec<(SpaceId, IdSet)>,
+    /// Items to resolve again (a failed hop query chunk: only these).
+    pub items_retry: Vec<Item<U>>,
+    /// Per hop, the (link value, id) pairs its queries returned; a taken link without a pair reached no id.
+    pub hop_answers: Vec<(HopId, Vec<(Tuple, Key)>)>,
+    /// Ids the action found from items and acted on in this job.
+    pub resolved: u64,
+    /// The lane starts nothing before this (the action's backoff).
+    pub not_before: Option<Instant>,
+}
+
+impl<U> JobResult<U> {
+    /// Everything done.
+    pub fn ok() -> Self {
+        JobResult {
+            retry_all: false,
+            retry: Vec::new(),
+            items_retry: Vec::new(),
+            hop_answers: Vec::new(),
+            resolved: 0,
+            not_before: None,
+        }
+    }
+
+    /// Everything back to pending, nothing started before `not_before`.
+    pub fn failed(not_before: Option<Instant>) -> Self {
+        JobResult {
+            retry_all: true,
+            retry: Vec::new(),
+            items_retry: Vec::new(),
+            hop_answers: Vec::new(),
+            resolved: 0,
+            not_before,
+        }
+    }
+}
+
+/// How `complete` took a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completed {
+    Done,
+    /// The target was replaced or removed meanwhile: its chunk went back to pending (or away).
+    Stale,
 }
 
 /// Where the consumer's output goes: the targets' buffers, or the open staged transaction.
@@ -761,6 +838,284 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
         for (xid, origin) in self.stage.unpin_older(now, self.cfg.max_prepared_age) {
             self.events.push(CoreEvent::PrepareTooOld { xid, origin });
         }
+    }
+}
+
+impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
+    /// The jobs due at `now`: at most one per target.
+    pub fn due(&mut self, now: Instant) -> Vec<Job<P, U, J>> {
+        let mut out = Vec::new();
+        for tg in self.targets.iter_mut().flatten() {
+            if tg.held {
+                continue;
+            }
+            let due = tg.lane.due(
+                now,
+                &tg.spec.schedule,
+                tg.buffer.pending_len() > 0,
+                tg.buffer.in_flight(),
+            );
+            let kind = match due {
+                Some(lane::Due::Executor) => match tg.lane.pop() {
+                    Some(j) => JobKind::Executor(j),
+                    None => continue,
+                },
+                Some(lane::Due::Flush) => {
+                    if !tg.buffer.in_flight() {
+                        tg.buffer.begin();
+                        tg.lane.reset_timers();
+                    }
+                    let Some(t) = tg
+                        .buffer
+                        .take(tg.spec.schedule.chunk_ids, tg.spec.schedule.chunk_items)
+                    else {
+                        continue;
+                    };
+                    for i in &t.items {
+                        if let Item::Hop { hop, link } = i {
+                            self.hops.taken(*hop, link);
+                        }
+                    }
+                    tg.stats.jobs += 1;
+                    tg.stats.ids_taken += t.ids.iter().map(|(_, s)| s.len() as u64).sum::<u64>();
+                    tg.stats.items_taken += t.items.len() as u64;
+                    tg.running = Some(Running {
+                        id: JobId(self.next_job),
+                        ids: t.ids.clone(),
+                        items: t.items.clone(),
+                        facts: t.facts.clone(),
+                    });
+                    JobKind::Flush(Chunk {
+                        ids: t.ids,
+                        items: t.items,
+                        facts: t.facts,
+                        origin: t.origin,
+                        high: t.high,
+                    })
+                }
+                None => continue,
+            };
+            let id = JobId(self.next_job);
+            self.next_job += 1;
+            tg.lane.start(id);
+            self.jobs.insert(id, tg.id);
+            out.push(Job {
+                id,
+                target: tg.id,
+                kind,
+            });
+        }
+        out
+    }
+
+    /// When `due` may first return a job without a new event.
+    pub fn next_wake(&self) -> Option<Instant> {
+        self.targets
+            .iter()
+            .flatten()
+            .filter(|tg| !tg.held)
+            .filter_map(|tg| {
+                tg.lane
+                    .next_wake(&tg.spec.schedule, tg.buffer.pending_len() > 0)
+            })
+            .min()
+    }
+
+    /// The earliest retry hold of a target with work (lazyview's flush deadline wakes for it; its own
+    /// batch window paces everything else).
+    pub fn next_retry(&self) -> Option<Instant> {
+        self.targets
+            .iter()
+            .flatten()
+            .filter(|tg| !tg.held && tg.buffer.pending_len() > 0)
+            .filter_map(|tg| tg.lane.not_before())
+            .min()
+    }
+
+    /// A caller's own job on `t`'s lane (lazy-wire-fire's reset batches).
+    pub fn enqueue(&mut self, t: TargetId, job: J) {
+        if let Some(tg) = self.slot(t).and_then(|s| self.targets[s].as_mut()) {
+            tg.lane.enqueue(job);
+        }
+    }
+
+    /// The result of `job`.
+    pub fn complete(&mut self, job: JobId, r: JobResult<U>) -> Completed {
+        let Some(target) = self.jobs.remove(&job) else {
+            return Completed::Stale;
+        };
+        let Some(tg) = self
+            .targets
+            .get_mut(target.slot as usize)
+            .and_then(|s| s.as_mut())
+        else {
+            return Completed::Stale; // removed: its chunk went with `Drained`
+        };
+        if tg.id != target {
+            // replaced: the lane is the new incarnation's, the buffer kept the chunk
+            tg.lane.finish(job, None);
+            if let Some(copy) = tg.running.take() {
+                debug_assert_eq!(copy.id, job, "the lane runs the job `due` started");
+                if let Some(f) = copy.facts {
+                    tg.buffer.retry_facts(f);
+                }
+                tg.buffer.done(copy.ids, copy.items);
+                if !tg.buffer.in_flight() && tg.buffer.pending_len() > 0 {
+                    // retried work: a new generation at once, so the lane is due again.
+                    tg.buffer.begin();
+                }
+            }
+            return Completed::Stale;
+        }
+        tg.lane.finish(job, r.not_before);
+        let Some(copy) = tg.running.take() else {
+            return Completed::Done; // an executor job
+        };
+        debug_assert_eq!(copy.id, job, "the lane runs the job `due` started");
+        let JobResult {
+            retry_all,
+            retry,
+            items_retry,
+            hop_answers,
+            resolved,
+            not_before: _,
+        } = r;
+        if retry_all {
+            if let Some(f) = copy.facts.clone() {
+                tg.buffer.retry_facts(f);
+            }
+        } else if let Some(fs) = copy.facts.as_ref() {
+            let back: Vec<(SpaceId, Key, Fact)> = fs
+                .iter()
+                .filter(|(s, k, _)| retry.iter().any(|(s2, set)| s2 == s && set.contains(k)))
+                .cloned()
+                .collect();
+            tg.buffer.retry_facts(back);
+        }
+        let (ids, items) = if retry_all {
+            (copy.ids.clone(), copy.items.clone())
+        } else {
+            (retry, items_retry)
+        };
+        for i in &copy.items {
+            if let Item::Hop { hop, link } = i {
+                if items.contains(i) {
+                    self.hops.forget(*hop, link);
+                } else {
+                    let ids = hop_answers
+                        .iter()
+                        .find(|(h, _)| h == hop)
+                        .map(|(_, pairs)| {
+                            pairs
+                                .iter()
+                                .filter(|(l, _)| l == link)
+                                .map(|(_, k)| k.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.hops.answer(*hop, link.clone(), ids);
+                }
+            }
+        }
+        let n_ids = ids.iter().map(|(_, s)| s.len() as u64).sum::<u64>();
+        let n_items = items.len() as u64;
+        tg.buffer.done(ids, items);
+        if !tg.buffer.in_flight() && tg.buffer.pending_len() > 0 {
+            // retried work: a new generation at once, so the lane is due again.
+            tg.buffer.begin();
+        }
+        tg.stats.ids_retried += n_ids;
+        tg.stats.items_retried += n_items;
+        tg.stats.ids_resolved += resolved;
+        Completed::Done
+    }
+
+    /// The oldest replay position `t` pins.
+    pub fn pinned(&self, t: TargetId) -> Option<P> {
+        let slot = self.slot(t)?;
+        let tg = self.targets[slot].as_ref().unwrap();
+        match (tg.buffer.pinned(), tg.seed_pin.as_ref()) {
+            (Some(a), Some(b)) => Some(std::cmp::min(a, b).clone()),
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        }
+    }
+
+    /// Where a restart must read from: the oldest pin of every target and prepare, else the boundary.
+    pub fn floor(&self) -> P {
+        let mut f = self.stage.boundary().clone();
+        if let Some(p) = self.stage.pin() {
+            if p < &f {
+                f = p.clone();
+            }
+        }
+        for tg in self.targets.iter().flatten() {
+            for p in tg.buffer.pinned().into_iter().chain(tg.seed_pin.as_ref()) {
+                if p < &f {
+                    f = p.clone();
+                }
+            }
+        }
+        f
+    }
+
+    /// Ids and items `t` holds (pending, in the generation, in the running chunk).
+    pub fn pending(&self, t: TargetId) -> usize {
+        let Some(tg) = self.slot(t).and_then(|s| self.targets[s].as_ref()) else {
+            return 0;
+        };
+        let mut n = tg.buffer.pending_len() + tg.buffer.flight_len();
+        if let Some(r) = &tg.running {
+            n += r.ids.iter().map(|(_, s)| s.len()).sum::<usize>() + r.items.len();
+        }
+        n
+    }
+
+    pub fn pending_any(&self) -> bool {
+        self.targets.iter().flatten().any(|tg| {
+            tg.buffer.pending_len() + tg.buffer.flight_len() > 0
+                || tg
+                    .running
+                    .as_ref()
+                    .is_some_and(|r| !r.ids.is_empty() || !r.items.is_empty())
+        })
+    }
+
+    pub fn busy(&self, t: TargetId) -> bool {
+        self.slot(t)
+            .and_then(|s| self.targets[s].as_ref())
+            .is_some_and(|tg| tg.lane.busy())
+    }
+
+    /// `t`'s counters since the last call.
+    pub fn take_stats(&mut self, t: TargetId) -> TargetStats {
+        match self.slot(t).and_then(|s| self.targets[s].as_mut()) {
+            Some(tg) => std::mem::take(&mut tg.stats),
+            None => TargetStats::default(),
+        }
+    }
+
+    /// Estimated heap bytes of every buffer, running chunk and the hop cache.
+    pub fn bytes(&self) -> usize {
+        let mut b: usize = self
+            .targets
+            .iter()
+            .flatten()
+            .map(|tg| tg.buffer.bytes())
+            .sum();
+        for tg in self.targets.iter().flatten() {
+            if let Some(r) = &tg.running {
+                b += r.ids.iter().map(|(_, s)| s.bytes()).sum::<usize>() + r.items.len() * 64;
+            }
+        }
+        b + self.hops.bytes()
+    }
+
+    /// `bytes() > cfg.max_bytes`: the caller stops reading until jobs bring it down (lazyview: it
+    /// flushes; its drain queue then bounds the reader).
+    pub fn over_bound(&self) -> bool {
+        self.bytes() > self.cfg.max_bytes
     }
 }
 
@@ -1382,6 +1737,318 @@ mod tests {
         assert!(
             !seed_pinned(&core, t),
             "installing the seeded cache clears the pin"
+        );
+    }
+
+    use crate::datum::Datum;
+
+    const VIEW_HOP: &str = "SELECT i.id, l.child_id FROM items i JOIN item_links l ON \
+                            l.parent_id = i.kind_id";
+
+    fn links_ref() -> TableRef {
+        ("db".into(), "item_links".into())
+    }
+
+    fn flush_ids(j: &Job<u64, NoItem, NoJob>) -> usize {
+        match &j.kind {
+            JobKind::Flush(c) => c.ids.iter().map(|(_, s)| s.len()).sum(),
+            JobKind::Executor(_) => usize::MAX,
+        }
+    }
+
+    fn flush_items(j: &Job<u64, NoItem, NoJob>) -> Vec<Item<NoItem>> {
+        match &j.kind {
+            JobKind::Flush(c) => c.items.clone(),
+            JobKind::Executor(_) => panic!("a flush job"),
+        }
+    }
+
+    #[test]
+    fn due_gives_one_job_per_target_and_bounded_chunks() {
+        let mut core = core();
+        let mut s = spec(vec![testkit::plan(VIEW_SIMPLE)]);
+        s.schedule = Schedule::immediate(1000, 1000);
+        let a = core.add_target(s.clone()).unwrap();
+        let b = core.add_target(s).unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        for n in 1..=2_500i64 {
+            core.row(
+                &src,
+                None,
+                Some(&testkit::row(&[Some(n), Some(1), Some(1)])),
+            );
+        }
+        let now = Instant::now();
+        core.commit(1, true, now);
+        let j1 = core.due(now);
+        assert_eq!(j1.len(), 2, "one job per target");
+        assert_eq!((j1[0].target, j1[1].target), (a, b));
+        assert_eq!((flush_ids(&j1[0]), flush_ids(&j1[1])), (1000, 1000));
+        assert!(core.due(now).is_empty(), "both lanes are busy");
+        assert_eq!(core.complete(j1[0].id, JobResult::ok()), Completed::Done);
+        let j2 = core.due(now);
+        assert_eq!(j2.len(), 1, "the target with the running job gets nothing");
+        assert_eq!((j2[0].target, flush_ids(&j2[0])), (a, 1000));
+        assert_eq!(core.complete(j1[1].id, JobResult::ok()), Completed::Done);
+        let j3 = core.due(now);
+        assert_eq!((j3.len(), j3[0].target, flush_ids(&j3[0])), (1, b, 1000));
+        assert_eq!(core.complete(j2[0].id, JobResult::ok()), Completed::Done);
+        let j4 = core.due(now);
+        assert_eq!((j4.len(), j4[0].target, flush_ids(&j4[0])), (1, a, 500));
+        assert_eq!(core.complete(j3[0].id, JobResult::ok()), Completed::Done);
+        let j5 = core.due(now);
+        assert_eq!((j5.len(), j5[0].target, flush_ids(&j5[0])), (1, b, 500));
+        assert_eq!(core.complete(j4[0].id, JobResult::ok()), Completed::Done);
+        assert_eq!(core.complete(j5[0].id, JobResult::ok()), Completed::Done);
+        assert!(core.due(now).is_empty(), "3 jobs per target in all");
+        let st = core.take_stats(a);
+        assert_eq!((st.jobs, st.ids_taken), (3, 2500));
+    }
+
+    #[test]
+    fn retry_all_keeps_the_generation_pinned() {
+        // proposal §9 case 6: a failed chunk keeps the generation's pin while its ids wait again.
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        core.commit(7, true, Instant::now());
+        for n in 1..=3i64 {
+            core.row(
+                &src,
+                None,
+                Some(&testkit::row(&[Some(n), Some(1), Some(1)])),
+            );
+        }
+        let now = Instant::now();
+        core.commit(8, true, now);
+        assert_eq!(core.pinned(t), Some(7), "the ids pin their origin");
+        let jobs = core.due(now);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            core.complete(jobs[0].id, JobResult::failed(None)),
+            Completed::Done
+        );
+        assert_eq!(core.pinned(t), Some(7), "the retried chunk keeps the pin");
+        assert_eq!(core.pending(t), 3, "the ids are pending again");
+        let jobs = core.due(now);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(core.complete(jobs[0].id, JobResult::ok()), Completed::Done);
+        assert_eq!(core.pinned(t), None, "nothing pins once all is done");
+    }
+
+    #[test]
+    fn stale_results_put_the_chunk_back() {
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        for n in 1..=2i64 {
+            core.row(
+                &src,
+                None,
+                Some(&testkit::row(&[Some(n), Some(1), Some(1)])),
+            );
+        }
+        let now = Instant::now();
+        core.commit(1, true, now);
+        let jobs = core.due(now);
+        assert_eq!(jobs.len(), 1);
+        let fresh = core
+            .replace_target(t, spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        assert_eq!(core.complete(jobs[0].id, JobResult::ok()), Completed::Stale);
+        assert_eq!(
+            core.pending(fresh),
+            2,
+            "the chunk is pending for the new incarnation"
+        );
+    }
+
+    #[test]
+    fn hop_answers_fill_the_cache_and_empty_ones_too() {
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_HOP)]))
+            .unwrap();
+        let h = (0..16u32)
+            .map(HopId)
+            .find(|h| core.hops.plan(*h).is_some())
+            .expect("the join has one hop");
+        assert_eq!(core.hop_of(h).unwrap().0, t);
+        let ls = core.source(&links_ref(), None).unwrap();
+        core.row(&ls, None, Some(&testkit::row(&[Some(5), Some(3)])));
+        core.row(&ls, None, Some(&testkit::row(&[Some(6), Some(4)])));
+        let now = Instant::now();
+        core.commit(1, true, now);
+        let jobs = core.due(now);
+        assert_eq!(jobs.len(), 1);
+        let items = flush_items(&jobs[0]);
+        assert_eq!(items.len(), 2, "one item per link value");
+        assert!(
+            items
+                .iter()
+                .all(|i| matches!(i, Item::Hop { hop, .. } if *hop == h)),
+            "{items:?}"
+        );
+        let r = JobResult {
+            hop_answers: vec![(h, vec![(Box::new([Datum::Int(3)]), Key::Int(10))])],
+            ..JobResult::ok()
+        };
+        assert_eq!(core.complete(jobs[0].id, r), Completed::Done);
+        assert_eq!(
+            core.hops.get(h, &[Datum::Int(3)]),
+            Some(&[Key::Int(10)][..])
+        );
+        assert_eq!(
+            core.hops.get(h, &[Datum::Int(4)]),
+            Some(&[][..]),
+            "the taken link without a pair reached no id"
+        );
+    }
+
+    #[test]
+    fn a_failed_item_chunk_is_retried_alone() {
+        // proposal §9 case 4 (S4): a failed hop chunk retries alone, not mixed with the rest.
+        let mut core = core();
+        let mut s = spec(vec![testkit::plan(VIEW_HOP)]);
+        s.schedule = Schedule::immediate(100, 2);
+        core.add_target(s).unwrap();
+        let ls = core.source(&links_ref(), None).unwrap();
+        for n in 0..4i64 {
+            core.row(
+                &ls,
+                None,
+                Some(&testkit::row(&[Some(10 + n), Some(100 + n)])),
+            );
+        }
+        let now = Instant::now();
+        core.commit(1, true, now);
+        let j1 = core.due(now);
+        assert_eq!(j1.len(), 1, "at most one job per target");
+        let first = flush_items(&j1[0]);
+        assert_eq!(first.len(), 2, "chunk_items 2");
+        let r = JobResult {
+            items_retry: first.clone(),
+            ..JobResult::ok()
+        };
+        assert_eq!(core.complete(j1[0].id, r), Completed::Done);
+        let j2 = core.due(now);
+        assert_eq!(j2.len(), 1);
+        let second = flush_items(&j2[0]);
+        assert_eq!(core.complete(j2[0].id, JobResult::ok()), Completed::Done);
+        let j3 = core.due(now);
+        assert_eq!(j3.len(), 1);
+        let third = flush_items(&j3[0]);
+        assert_eq!(core.complete(j3[0].id, JobResult::ok()), Completed::Done);
+        assert!(core.due(now).is_empty(), "everything is taken and done");
+        let pairs = [&second, &third];
+        assert!(
+            second.iter().all(|i| !third.contains(i)),
+            "the two chunks never mix: {second:?} {third:?}"
+        );
+        assert!(
+            pairs.iter().any(|p| **p == first),
+            "the retried pair runs again alone: {second:?} {third:?}"
+        );
+        assert!(
+            pairs.iter().any(|p| p.iter().all(|i| !first.contains(i))),
+            "the other two run alone: {second:?} {third:?}"
+        );
+    }
+
+    #[test]
+    fn floor_is_the_oldest_pin() {
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        let now = Instant::now();
+        core.commit(5, true, now);
+        core.xa_start("x");
+        core.xa_prepare("x", 9, now); // pins where it prepared, then the boundary is 9
+        assert_eq!(core.stage.pin(), Some(&5), "the prepare pins at 5");
+        core.row_at(
+            &3,
+            &src,
+            None,
+            Some(&testkit::row(&[Some(1), Some(1), Some(1)])),
+        );
+        assert_eq!(core.pinned(t), Some(3), "the target pins at 3");
+        assert_eq!(core.floor(), 3);
+        core.commit(12, false, now);
+        assert_eq!(
+            core.stage.boundary(),
+            &9,
+            "settle false: the boundary stays"
+        );
+        assert_eq!(core.floor(), 3);
+    }
+
+    #[test]
+    fn held_target_keeps_its_position() {
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        let now = Instant::now();
+        core.commit(4, true, now);
+        core.row(
+            &src,
+            None,
+            Some(&testkit::row(&[Some(1), Some(1), Some(1)])),
+        );
+        core.commit(5, true, now);
+        core.hold(t, true);
+        assert!(core.due(now).is_empty(), "a held target starts nothing");
+        assert_eq!(core.floor(), 4, "it keeps its position pinned");
+    }
+
+    #[test]
+    fn over_bound_counts_every_buffer() {
+        let mut core = Core::<u64, NoItem, NoJob>::new(0, CoreConfig::direct(1_000));
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        assert!(!core.over_bound());
+        assert!(!core.pending_any());
+        let src = core.source(&items_ref(), None).unwrap();
+        for n in 0..100i64 {
+            core.row(
+                &src,
+                None,
+                Some(&testkit::row(&[Some(n), Some(1), Some(1)])),
+            );
+        }
+        core.commit(1, true, Instant::now());
+        assert!(core.pending_any(), "the ids sit in the buffer");
+        assert_eq!(core.pending(t), 100);
+        assert!(core.over_bound(), "100 integer ids exceed the bound");
+    }
+
+    #[test]
+    fn executor_jobs_run_on_the_lane() {
+        let mut core: Core<u64, NoItem, u32> = Core::new(0, CoreConfig::direct(8 << 20));
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        core.enqueue(t, 7);
+        let jobs = core.due(Instant::now());
+        assert_eq!(jobs.len(), 1);
+        assert!(matches!(jobs[0].kind, JobKind::Executor(7)));
+        assert_eq!(jobs[0].target, t);
+        assert!(core.busy(t));
+        assert_eq!(core.complete(jobs[0].id, JobResult::ok()), Completed::Done);
+        assert!(!core.busy(t));
+        assert!(core.due(Instant::now()).is_empty());
+        assert_eq!(
+            core.complete(jobs[0].id, JobResult::ok()),
+            Completed::Stale,
+            "a completed job is not taken twice"
         );
     }
 }
