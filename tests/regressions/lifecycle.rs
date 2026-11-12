@@ -368,3 +368,75 @@ fn reg_crash_with_stale_full_view() {
         eng.stop().await
     });
 }
+
+/// A server identity that cannot be read keeps the resume guard: the read is repeated and the
+/// saved position refused (it used to read as `""`, leaving the "written by another server"
+/// check off for the whole run).
+#[test]
+fn reg_unreadable_identity_keeps_resume_guard() {
+    scenario("reg_identity_blip", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_items",
+            Kind::Incremental,
+            "SELECT id, grp FROM items",
+        )];
+        let ddl = [
+            "CREATE TABLE items (id INT PRIMARY KEY, grp INT NOT NULL)",
+            "INSERT INTO items VALUES (1, 1), (2, 2)",
+        ];
+        let (db, eng) = setup(&ctx, "reg_identity_blip", &ddl, &specs, &[]).await?;
+        eng.stop().await?;
+        let mut c = db.conn().await?;
+        let saved = scalar(&mut c, "SELECT server_identity FROM _lazyview_status").await?;
+        ensure!(
+            saved.as_deref().is_some_and(|s| !s.is_empty()),
+            "no saved identity: {saved:?}"
+        );
+        // Failover stand-in: the saved position names another server. With the hook the first
+        // identity read of the next start fails; the retry must still read this server.
+        let foreign = "UPDATE _lazyview_status SET server_identity = 'other-server'";
+        exec(&mut c, foreign).await?;
+        let eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_FAIL_IDENTITY", "1")])?;
+        match eng.wait_finished(Duration::from_secs(60)).await? {
+            Err(e) if e.contains("other-server") => {}
+            other => bail!("repeated read: expected a refusal naming other-server, got {other:?}"),
+        }
+        // Asked to rebuild instead of failing, the run refuses the position (every view is
+        // rebuilt) and goes on streaming, equal to the oracle.
+        let mut eng = ctx.start_engine(
+            &db,
+            &[
+                ("LAZYVIEW_TEST_FAIL_IDENTITY", "1"),
+                ("LAZYVIEW_ON_MISSING_BINLOG", "rebuild"),
+            ],
+        )?;
+        // The state rows still say `ready` from the run before: wait for the rebuild itself.
+        wait_until(
+            "the foreign position refused: every view rebuilt",
+            t_ready(),
+            || {
+                let s = eng.snapshot();
+                async move { Ok(s.full_rebuilds >= 1) }
+            },
+        )
+        .await?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "after refusing a foreign position",
+        )
+        .await?;
+        eng.stop().await?;
+        // Without the hook the guard still fires: the same foreign identity, nothing injected.
+        exec(&mut c, foreign).await?;
+        let eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_FAIL_IDENTITY", "0")])?;
+        match eng.wait_finished(Duration::from_secs(60)).await? {
+            Err(e) if e.contains("other-server") => {}
+            other => bail!("no hook: expected a refusal naming other-server, got {other:?}"),
+        }
+        Ok(())
+    });
+}

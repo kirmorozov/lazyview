@@ -7,6 +7,8 @@
 //!   once the build finishes, and then the shadow is swapped in atomically (`RENAME TABLE`).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -282,6 +284,59 @@ async fn connect_wait(
             _ = shutdown.changed() => if *shutdown.borrow() { return Ok(None) },
         }
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// Tries of one idempotent read of the source connection before it is given up on
+/// (see [`retry_src`]).
+const SRC_TRIES: usize = 5;
+
+/// Repeats one idempotent read of the source connection: [`SRC_TRIES`] tries, 200 ms × 2ⁿ
+/// capped at 2 s, `metrics.beat()` between tries, and a re-opened connection before a retry
+/// after a connection-class error (the reconnect half of [`Engine::heal_src`]: this early in a
+/// start nothing is fenced yet, so there is no verdict to drop). `f` gets the 1-based try
+/// number, so a read can fail its first tries (a test hook). A read that keeps failing is an
+/// `Err`, never a default: a value a correctness guard depends on must stay an error.
+/// R2 replaces this copy with the shared `retry_source`.
+async fn retry_src<T, F>(
+    metrics: &Metrics,
+    what: &str,
+    src: &mut Conn,
+    opts: &Opts,
+    lock_wait_s: u64,
+    mut f: F,
+) -> Result<T>
+where
+    F: for<'a> FnMut(usize, &'a mut Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+{
+    let mut backoff = Duration::from_millis(200);
+    let mut try_no = 0;
+    loop {
+        try_no += 1;
+        let err = match f(try_no, src).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if try_no >= SRC_TRIES {
+            return Err(err);
+        }
+        warn!(
+            "{what} failed (try {try_no} of {SRC_TRIES}): {}; retrying in {backoff:?}",
+            err.root_cause()
+        );
+        metrics.beat();
+        if is_conn_error(&err) {
+            match connect_source(opts, lock_wait_s).await {
+                Ok(c) => *src = c,
+                Err(e) => warn!(
+                    "{what}: source database still unreachable: {}",
+                    e.root_cause()
+                ),
+            }
+        } else {
+            tokio::time::sleep(backoff).await;
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(2));
     }
 }
 
@@ -827,7 +882,17 @@ async fn session_sql_mode(conn: &mut Conn) -> Result<String> {
 
 /// Identity of the server that writes the binlog: a saved position only means something on
 /// that server. MySQL/Percona: `@@server_uuid`; MariaDB: server id and GTID domain.
-async fn server_identity(conn: &mut Conn, flavor: Flavor) -> Result<String> {
+/// `fail_first` (test hook `LAZYVIEW_TEST_FAIL_IDENTITY`) fails the first such `try_no` reads
+/// of one start: a stand-in for a connection blip on this read.
+async fn server_identity(
+    conn: &mut Conn,
+    flavor: Flavor,
+    fail_first: Option<usize>,
+    try_no: usize,
+) -> Result<String> {
+    if fail_first.is_some_and(|n| try_no <= n) {
+        bail!("injected identity failure");
+    }
     let sql = match flavor {
         Flavor::MySql => "SELECT CAST(@@server_uuid AS CHAR)",
         Flavor::MariaDb => "SELECT CAST(CONCAT(@@server_id, ':', @@gtid_domain_id) AS CHAR)",
@@ -1115,9 +1180,24 @@ impl Engine {
         };
         // A position saved on another server (failover, restore, RESET MASTER) may name a file
         // that exists here too, with other contents.
-        let identity = server_identity(&mut e.src, e.flavor)
-            .await
-            .unwrap_or_default();
+        // An unreadable identity must not open the resume guard: retry, then refuse to start on a
+        // saved position we cannot attribute to this server.
+        let id_flavor = e.flavor;
+        let id_fail = e.cfg.test_fail_identity;
+        let identity = match retry_src(
+            &e.metrics,
+            "reading the server identity",
+            &mut e.src,
+            &e.src_opts,
+            e.cfg.lock_wait_s,
+            |try_no, src| Box::pin(server_identity(src, id_flavor, id_fail, try_no)),
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(_) if stored.is_none() => String::new(), // nothing to check against: fresh start
+            Err(e) => return Err(e).context("cannot read the source server identity"),
+        };
         let saved_identity = meta::load_identity(&mut e.meta, &e.cfg.instance_id)
             .await?
             .filter(|s| !s.is_empty());

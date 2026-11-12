@@ -136,6 +136,9 @@ pub struct Config {
     /// for targets that are behind instead of the engine's constant (see
     /// `Engine::lag_over_budget`: past it the engine only reports).
     pub test_lag_hold_bytes: Option<usize>,
+    /// Test hook `LAZYVIEW_TEST_FAIL_IDENTITY=<n>`: the first `n` source identity reads of a
+    /// start fail (see `engine::server_identity`), the stand-in for a connection blip there.
+    pub test_fail_identity: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_LOCK_WAIT_S=<s>` (default 60): how long at most a session the
     /// engine opens waits for a table lock (`SET SESSION lock_wait_timeout`, the third statement
     /// of `mv::session_setup`); a refresh blocked longer fails and is retried with backoff.
@@ -321,6 +324,8 @@ impl Config {
                 .filter(|&b| b > 0),
             test_lag_hold_bytes: Some(num("LAZYVIEW_TEST_LAG_HOLD_BYTES", 0)? as usize)
                 .filter(|&b| b > 0),
+            test_fail_identity: Some(num("LAZYVIEW_TEST_FAIL_IDENTITY", 0)? as usize)
+                .filter(|&n| n > 0),
             lock_wait_s: num("LAZYVIEW_TEST_LOCK_WAIT_S", DEFAULT_LOCK_WAIT_S)?.max(1),
             heartbeat: Duration::from_millis(num("LAZYVIEW_HEARTBEAT_MS", 5_000)?.max(100)),
             visibility_delay: Duration::from_millis(num("LAZYVIEW_VISIBILITY_DELAY_MS", 20)?),
