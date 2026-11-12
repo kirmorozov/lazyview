@@ -148,14 +148,6 @@ pub const ECOMMERCE_DDL: &[&str] = &[
      )",
 ];
 
-/// Columns no view reads (updates of these must cost nothing).
-pub const UNREFERENCED: &[(&str, &str)] = &[
-    ("customers", "last_seen_at"),
-    ("orders", "note"),
-    ("products", "updated_at"),
-    ("regions", "notes"),
-];
-
 /// The shared, heavily overlapping view set (minus `LAZYVIEW_TEST_SKIP_VIEWS`).
 pub fn ecommerce_views() -> Vec<ViewSpec> {
     super::skip_views(all_ecommerce_views())

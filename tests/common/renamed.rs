@@ -421,6 +421,22 @@ pub(crate) async fn observed(ctx: &Ctx) -> Result<Observed> {
     })
 }
 
+/// The nine engine counters compared between a plain and a renamed run (the comparison in this
+/// file and the one in `tests/rename_invariance.rs`).
+pub fn counters(s: &Snapshot) -> [(&'static str, u64); 9] {
+    [
+        ("units_refreshed", s.units_refreshed),
+        ("lookup_queries", s.lookup_queries),
+        ("source_queries", s.source_queries),
+        ("mv_queries", s.mv_queries),
+        ("mv_rows_inserted", s.mv_rows_inserted),
+        ("mv_rows_upserted", s.mv_rows_upserted),
+        ("mv_rows_deleted", s.mv_rows_deleted),
+        ("full_rebuilds", s.full_rebuilds),
+        ("lookback_overflows", s.lookback_overflows),
+    ]
+}
+
 /// Detail texts compare equal when equal, or when both are truncated and agree up to the
 /// shorter one (minus the name the cut may have split).
 fn same_state(a: &str, b: &str) -> bool {
@@ -476,20 +492,7 @@ pub(crate) fn compare_renamed(
             .get(i)
             .map(|(_, s)| s.clone())
             .unwrap_or_default();
-        let pick = |s: &Snapshot| {
-            [
-                ("units_refreshed", s.units_refreshed),
-                ("lookup_queries", s.lookup_queries),
-                ("source_queries", s.source_queries),
-                ("mv_queries", s.mv_queries),
-                ("mv_rows_inserted", s.mv_rows_inserted),
-                ("mv_rows_upserted", s.mv_rows_upserted),
-                ("mv_rows_deleted", s.mv_rows_deleted),
-                ("full_rebuilds", s.full_rebuilds),
-                ("lookback_overflows", s.lookback_overflows),
-            ]
-        };
-        for ((k, a), (_, b)) in pick(p).into_iter().zip(pick(&r)) {
+        for ((k, a), (_, b)) in counters(p).into_iter().zip(counters(&r)) {
             if a != b {
                 report.push(format!("engine {i} ({label}) {k}: plain {a}, renamed {b}"));
             }

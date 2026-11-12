@@ -245,6 +245,17 @@ impl Engine {
     }
 }
 
+/// Waits until the engine is caught up and idle, so a following step or measurement starts a new
+/// batch window (two catch-ups on one connection around one fixed idle sleep).
+pub async fn quiesce(engine: &mut Engine, db: &Db) -> Result<()> {
+    let mut c = db.conn().await?;
+    engine.wait_caught_up(&mut c, t_catchup()).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    engine.wait_caught_up(&mut c, t_catchup()).await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
 pub use lazyview::stats::ViewSnapshot as ViewStats;
 
 /// A free local TCP address for an engine's `LAZYVIEW_HEALTH_ADDR`.
@@ -255,14 +266,21 @@ pub fn free_local_addr() -> Result<String> {
     Ok(format!("127.0.0.1:{port}"))
 }
 
-/// `GET <path>` on an engine's health endpoint (`addr` as given in `LAZYVIEW_HEALTH_ADDR`):
-/// status and body.
-pub async fn http_get(addr: &str, path: &str) -> Result<(u16, String)> {
+/// An HTTP response read off one short-lived connection to an engine's health endpoint.
+pub struct Resp {
+    pub status: u16,
+    pub head: String,
+    pub body: String,
+}
+
+/// One HTTP request to an engine's health endpoint (`addr` as given in `LAZYVIEW_HEALTH_ADDR`):
+/// 5 s connect and read timeouts, the response split at `\r\n\r\n`, status from the status line.
+pub async fn request(addr: &str, method: &str, path: &str, headers: &str) -> Result<Resp> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
         .await
         .context("connect timeout")??;
-    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+    s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n").as_bytes())
         .await?;
     let mut buf = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
@@ -273,11 +291,22 @@ pub async fn http_get(addr: &str, path: &str) -> Result<(u16, String)> {
         .split_once("\r\n\r\n")
         .with_context(|| format!("bad HTTP response {text:?}"))?;
     let status = head
-        .split(' ')
+        .split_whitespace()
         .nth(1)
-        .and_then(|c| c.parse().ok())
-        .with_context(|| format!("bad status line in {head:?}"))?;
-    Ok((status, body.to_string()))
+        .and_then(|v| v.parse().ok())
+        .with_context(|| format!("bad status line {head:?}"))?;
+    Ok(Resp {
+        status,
+        head: head.to_string(),
+        body: body.to_string(),
+    })
+}
+
+/// `GET <path>` on an engine's health endpoint (`addr` as given in `LAZYVIEW_HEALTH_ADDR`):
+/// status and body.
+pub async fn http_get(addr: &str, path: &str) -> Result<(u16, String)> {
+    let r = request(addr, "GET", path, "").await?;
+    Ok((r.status, r.body))
 }
 
 /// `GET /stats` of an engine started with `LAZYVIEW_HEALTH_ADDR=addr`, as JSON.

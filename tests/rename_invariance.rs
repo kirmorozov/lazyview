@@ -13,7 +13,6 @@ mod common;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use common::rename::{rust_literals, Names};
@@ -213,31 +212,6 @@ fn step(g: &mut Gen, next_id: &mut i64) -> Vec<String> {
         });
     }
     v
-}
-
-/// The counters compared between the plain and the renamed run.
-fn counters(s: &Snapshot) -> [(&'static str, u64); 9] {
-    [
-        ("units_refreshed", s.units_refreshed),
-        ("lookup_queries", s.lookup_queries),
-        ("source_queries", s.source_queries),
-        ("mv_queries", s.mv_queries),
-        ("mv_rows_inserted", s.mv_rows_inserted),
-        ("mv_rows_upserted", s.mv_rows_upserted),
-        ("mv_rows_deleted", s.mv_rows_deleted),
-        ("full_rebuilds", s.full_rebuilds),
-        ("lookback_overflows", s.lookback_overflows),
-    ]
-}
-
-/// Caught up and idle: the next step starts a new batch.
-async fn quiesce(engine: &mut Engine, db: &Db) -> Result<()> {
-    let mut c = db.conn().await?;
-    engine.wait_caught_up(&mut c, t_catchup()).await?;
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    engine.wait_caught_up(&mut c, t_catchup()).await?;
-    c.disconnect().await.ok();
-    Ok(())
 }
 
 /// The state row of the view (mode, detail; names mapped back on the renamed side).

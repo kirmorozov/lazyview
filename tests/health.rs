@@ -42,38 +42,6 @@ fn init_env() {
 /// The readiness probe of deploy/k8s/base/deployment.yaml.
 const K8S_READY: &str = "/readyz?standby=ok&building=ok";
 
-struct Resp {
-    status: u16,
-    head: String,
-    body: String,
-}
-
-async fn request(addr: &str, method: &str, path: &str, headers: &str) -> Result<Resp> {
-    let mut s = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
-        .await
-        .context("connect timeout")??;
-    s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n").as_bytes())
-        .await?;
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
-        .await
-        .context("read timeout")??;
-    let text = String::from_utf8_lossy(&buf).to_string();
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .with_context(|| format!("bad HTTP response {text:?}"))?;
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .with_context(|| format!("bad status line {head:?}"))?;
-    Ok(Resp {
-        status,
-        head: head.to_string(),
-        body: body.to_string(),
-    })
-}
-
 async fn get(addr: &str, path: &str) -> Result<Resp> {
     request(addr, "GET", path, "").await
 }

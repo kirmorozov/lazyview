@@ -727,30 +727,6 @@ fn lifecycle_chained_definitions_together() {
     });
 }
 
-async fn http_get(addr: &str, path: &str) -> Result<(u16, String)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("connect {addr}"))?;
-    s.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .await?;
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await?;
-    let text = String::from_utf8_lossy(&buf).to_string();
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .with_context(|| format!("bad HTTP response: {text:?}"))?;
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|x| x.1.to_string())
-        .unwrap_or_default();
-    Ok((status, body))
-}
-
 /// Health endpoint: /healthz 200 while alive, /readyz 200 once all views are ready, /metrics in
 /// Prometheus format with the engine counters.
 #[test]

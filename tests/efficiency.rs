@@ -22,16 +22,6 @@ const MV_QUERIES_PER_VIEW_MAX: u64 = 4;
 /// One SELECT of the unit from the sources (+1 slack).
 const SOURCE_QUERIES_PER_VIEW_MAX: u64 = 2;
 
-/// Waits until the engine is caught up and idle, so a following measurement starts a new window.
-async fn quiesce(engine: &mut Engine, db: &Db) -> Result<()> {
-    let mut c = db.conn().await?;
-    engine.wait_caught_up(&mut c, t_catchup()).await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    engine.wait_caught_up(&mut c, t_catchup()).await?;
-    c.disconnect().await.ok();
-    Ok(())
-}
-
 /// Runs `stmts` (as one transaction or as autocommit statements), waits for catch-up and returns
 /// the metric delta.
 async fn measure_writes(
