@@ -224,6 +224,11 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Stage<P, U> {
         std::mem::take(&mut self.touched)
     }
 
+    /// The targets list of the open transaction.
+    pub fn touched_mut(&mut self) -> &mut Vec<usize> {
+        &mut self.touched
+    }
+
     /// The reader restarted at `to`: the open transaction is forgotten (it is read again).
     pub fn rewound(&mut self, to: P) {
         self.open = None;

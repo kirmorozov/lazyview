@@ -24,11 +24,15 @@ pub(crate) mod testkit;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use mysql_async::binlog::row::BinlogRow;
 
 use crate::access::{AccessPlan, Route};
 use crate::analyze::ViewPlan;
 use crate::cascade::Cache;
+use crate::catalog::TableRef;
+use crate::datum::Key as Tuple;
 
 pub use buffer::{Fact, Facts, IdSet};
 pub use consumer::{Note, Sink, Source};
@@ -414,8 +418,358 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
     }
 }
 
+/// Where the consumer's output goes: the targets' buffers, or the open staged transaction.
+struct Feed<'a, P, U, J> {
+    targets: &'a mut [Option<Target<P, U, J>>],
+    origin: &'a P,
+    staged: Option<&'a mut stage::Staged<U>>,
+    touched: &'a mut Vec<usize>,
+    events: &'a mut Vec<CoreEvent<P>>,
+}
+
+impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Sink<U> for Feed<'_, P, U, J> {
+    fn open(&self, t: usize) -> bool {
+        self.targets[t]
+            .as_ref()
+            .is_some_and(|tg| tg.started && !tg.held)
+    }
+
+    fn row(&mut self, t: usize, skipped: bool) {
+        let tg = self.targets[t].as_mut().unwrap();
+        tg.stats.rows += 1;
+        tg.stats.rows_skipped += u64::from(skipped);
+        if !skipped && self.staged.is_none() && !tg.touched {
+            tg.touched = true;
+            self.touched.push(t);
+        }
+    }
+
+    fn int(&mut self, t: usize, s: SpaceId, v: u64, op: Op, cascaded: bool) {
+        match self.staged.as_mut() {
+            Some(staged) => {
+                let n = self.targets[t].as_ref().unwrap().spaces.len();
+                staged.mark(t, n, s, Key::Int(v)); // counted at release
+            }
+            None => {
+                let tg = self.targets[t].as_mut().unwrap();
+                let new = tg.buffer.mark_int(s, v, self.origin);
+                tg.stats.ids_marked += 1;
+                tg.stats.ids_absorbed += u64::from(!new);
+                if tg.spec.needs.facts {
+                    tg.buffer.note(s, &Key::Int(v), op, cascaded, new);
+                }
+            }
+        }
+    }
+
+    fn tuple(&mut self, t: usize, s: SpaceId, k: Tuple, op: Op, cascaded: bool) {
+        match self.staged.as_mut() {
+            Some(staged) => {
+                let n = self.targets[t].as_ref().unwrap().spaces.len();
+                staged.mark(t, n, s, Key::Tuple(k)); // counted at release
+            }
+            None => {
+                let tg = self.targets[t].as_mut().unwrap();
+                let new = tg.buffer.mark_tuple(s, k.clone(), self.origin);
+                tg.stats.ids_marked += 1;
+                tg.stats.ids_absorbed += u64::from(!new);
+                if tg.spec.needs.facts {
+                    tg.buffer.note(s, &Key::Tuple(k), op, cascaded, new);
+                }
+            }
+        }
+    }
+
+    fn item(&mut self, t: usize, i: Item<U>) {
+        match self.staged.as_mut() {
+            Some(staged) => {
+                let n = self.targets[t].as_ref().unwrap().spaces.len();
+                staged.item(t, n, i); // counted at release
+            }
+            None => {
+                let tg = self.targets[t].as_mut().unwrap();
+                let new = tg.buffer.item(i, self.origin);
+                tg.stats.items_marked += 1;
+                tg.stats.items_absorbed += u64::from(!new);
+            }
+        }
+    }
+
+    fn hop(&mut self, t: usize, hit: bool) {
+        let tg = self.targets[t].as_mut().unwrap();
+        if hit {
+            tg.stats.hop_hits += 1;
+        } else {
+            tg.stats.hop_misses += 1;
+        }
+    }
+
+    fn note(&mut self, t: usize, n: Note) {
+        let tg = self.targets[t].as_mut().unwrap();
+        match n {
+            Note::ShortParentImage => self.events.push(CoreEvent::Unknown {
+                target: tg.id,
+                why: "a cascade parent's row image lacks columns",
+            }),
+            Note::IncompleteKeptRow => self.events.push(CoreEvent::Unknown {
+                target: tg.id,
+                why: "a kept cascade child row lacks columns",
+            }),
+            Note::CascadeGap => {
+                tg.stats.cascade_gaps += 1;
+                self.events.push(CoreEvent::CascadeGap { target: tg.id });
+            }
+            Note::CascadeRows(n) => tg.stats.cascade_rows += n,
+            Note::Logged => {
+                tg.seed_pin.get_or_insert_with(|| self.origin.clone());
+            }
+        }
+    }
+
+    fn cache(&mut self, t: usize, pi: usize) -> &mut Cache {
+        &mut self.targets[t].as_mut().unwrap().caches[pi]
+    }
+}
+
+impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
+    /// `table` as one TABLE_MAP shows it (`columns`: its column count; `None`: any shape).
+    pub fn source(&self, table: &TableRef, columns: Option<usize>) -> Option<Source> {
+        self.consumer.source(table, columns)
+    }
+
+    /// The targets with an occurrence of another shape in `s` (the caller re-plans them).
+    pub fn mismatched(&self, s: &Source) -> Vec<TargetId> {
+        self.consumer
+            .mismatched(s)
+            .into_iter()
+            .filter_map(|slot| self.targets[slot].as_ref().map(|tg| tg.id))
+            .collect()
+    }
+
+    /// One row change of `s`'s table in the open transaction.
+    pub fn row(&mut self, s: &Source, before: Option<&BinlogRow>, after: Option<&BinlogRow>) {
+        let Self {
+            targets,
+            consumer,
+            hops,
+            stage,
+            events,
+            ..
+        } = self;
+        let (origin, staged, touched) = stage.parts();
+        let mut feed = Feed {
+            targets,
+            origin,
+            staged,
+            touched,
+            events,
+        };
+        consumer.row(s, before, after, hops, &mut feed);
+    }
+
+    /// [`Self::row`] with replay position `origin` (rows the caller kept, e.g. an XA transaction's at its
+    /// XA COMMIT); never staged.
+    pub fn row_at(
+        &mut self,
+        origin: &P,
+        s: &Source,
+        before: Option<&BinlogRow>,
+        after: Option<&BinlogRow>,
+    ) {
+        let Self {
+            targets,
+            consumer,
+            hops,
+            stage,
+            events,
+            ..
+        } = self;
+        let mut feed = Feed {
+            targets,
+            origin,
+            staged: None,
+            touched: stage.touched_mut(),
+            events,
+        };
+        consumer.row(s, before, after, hops, &mut feed);
+    }
+
+    /// A caller's own key for target `t` in the open transaction (lazy-wire-fire's manual triggers).
+    pub fn stage_key(&mut self, t: TargetId, s: SpaceId, k: Key, op: Op) {
+        let Some(slot) = self.slot(t) else { return };
+        let Self {
+            targets,
+            stage,
+            events,
+            ..
+        } = self;
+        let (origin, staged, touched) = stage.parts();
+        let mut feed = Feed {
+            targets,
+            origin,
+            staged,
+            touched,
+            events,
+        };
+        feed.row(slot, false);
+        match k {
+            Key::Int(v) => feed.int(slot, s, v, op, false),
+            Key::Tuple(k) => feed.tuple(slot, s, k, op, false),
+        }
+    }
+
+    /// A caller's own item for target `t` in the open transaction.
+    pub fn stage_item(&mut self, t: TargetId, i: U) {
+        let Some(slot) = self.slot(t) else { return };
+        let Self {
+            targets,
+            stage,
+            events,
+            ..
+        } = self;
+        let (origin, staged, touched) = stage.parts();
+        let mut feed = Feed {
+            targets,
+            origin,
+            staged,
+            touched,
+            events,
+        };
+        feed.row(slot, false);
+        feed.item(slot, Item::User(i));
+    }
+
+    /// A boundary at `end` (COMMIT, or a statement / heartbeat boundary); `settle == false`: a
+    /// transaction of the caller's own tables only, the boundary stays.
+    pub fn commit(&mut self, end: P, settle: bool, now: Instant) {
+        if let Some(r) = self.stage.commit(end.clone(), settle) {
+            self.release(r, &end, now);
+        }
+        self.ended(&end, now);
+    }
+
+    pub fn rollback(&mut self, end: P, now: Instant) {
+        if let Some(r) = self.stage.rollback(end.clone()) {
+            self.release(r, &end, now);
+        }
+        self.ended(&end, now);
+    }
+
+    pub fn xa_start(&mut self, xid: &str) {
+        self.stage.xa_start(xid);
+    }
+
+    pub fn xa_prepare(&mut self, xid: &str, end: P, now: Instant) {
+        self.stage.xa_prepare(xid, end.clone(), now);
+        self.ended(&end, now);
+    }
+
+    pub fn xa_end(&mut self, xid: &str, commit: bool, end: P, now: Instant) {
+        match self.stage.xa_end(xid, commit, end.clone()) {
+            stage::XaEnd::Released(r) => self.release(r, &end, now),
+            stage::XaEnd::Unknown => self.events.push(CoreEvent::UnknownPrepare {
+                xid: xid.to_string(),
+                at: end.clone(),
+            }),
+            stage::XaEnd::RolledBack => {}
+        }
+        self.ended(&end, now);
+    }
+
+    /// The reader restarted at `to`: the open transaction is read again.
+    pub fn rewound(&mut self, to: P) {
+        self.stage.rewound(to);
+        for tg in self.targets.iter_mut().flatten() {
+            tg.touched = false;
+        }
+    }
+
+    /// Installs a seeded cascade cache into `t`'s seeding one (plan `pi`) and replays its log.
+    pub fn install_cache(&mut self, t: TargetId, pi: usize, seeded: Cache) {
+        let Some(slot) = self.slot(t) else { return };
+        let log = self.targets[slot].as_mut().unwrap().caches[pi].install(seeded);
+        let Self {
+            targets,
+            consumer,
+            hops,
+            stage,
+            events,
+            ..
+        } = self;
+        let mut touched = Vec::new();
+        let mut feed = Feed {
+            targets,
+            origin: stage.boundary(),
+            staged: None,
+            touched: &mut touched,
+            events,
+        };
+        consumer.install(slot, pi, log, hops, &mut feed);
+        targets[slot].as_mut().unwrap().seed_pin = None;
+    }
+
+    /// The events since the last call.
+    pub fn events(&mut self) -> Vec<CoreEvent<P>> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// A released staged transaction's ids go to the buffers, pinned at its origin.
+    fn release(&mut self, r: stage::Release<P, U>, end: &P, now: Instant) {
+        for (slot, sets, items) in r.staged.into_parts() {
+            let Some(tg) = self.targets[slot].as_mut() else {
+                continue;
+            };
+            tg.buffer.pin(&r.origin);
+            for (i, set) in sets.into_iter().enumerate() {
+                for k in set.to_keys() {
+                    let new = tg.buffer.mark(SpaceId(i as u16), k, &r.origin);
+                    tg.stats.ids_marked += 1;
+                    tg.stats.ids_absorbed += u64::from(!new);
+                }
+            }
+            for i in items {
+                let new = tg.buffer.item(i, &r.origin);
+                tg.stats.items_marked += 1;
+                tg.stats.items_absorbed += u64::from(!new);
+            }
+            tg.buffer.released(end);
+            tg.lane.released(now);
+        }
+    }
+
+    /// After every boundary: touched targets release, starting targets may start, old prepares unpin.
+    fn ended(&mut self, end: &P, now: Instant) {
+        for slot in self.stage.take_touched() {
+            if let Some(tg) = self.targets[slot].as_mut() {
+                tg.buffer.released(end);
+                tg.lane.released(now);
+                tg.touched = false;
+            }
+        }
+        let boundary = self.stage.boundary().clone();
+        let (start, keep): (Vec<usize>, Vec<usize>) = self.starting.drain(..).partition(|&s| {
+            self.targets[s]
+                .as_ref()
+                .is_some_and(|tg| tg.spec.start <= boundary)
+        });
+        for s in start {
+            if let Some(tg) = self.targets[s].as_mut() {
+                tg.started = true;
+            }
+        }
+        self.starting = keep;
+        for (xid, origin) in self.stage.unpin_older(now, self.cfg.max_prepared_age) {
+            self.events.push(CoreEvent::PrepareTooOld { xid, origin });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::catalog::{FkAction, ForeignKey, TableInfo};
+
     use super::*;
 
     /// A core of `u64` positions: direct mode, room for the hop cache.
@@ -721,6 +1075,313 @@ mod tests {
             mapped,
             vec![(t, 0, 1), (t, 0, 2), (t, 0, 3)],
             "the aliases stay positional however they are spelled"
+        );
+    }
+
+    const VIEW_SIMPLE: &str = "SELECT i.id, i.kind_id FROM items i";
+
+    fn items_ref() -> TableRef {
+        ("db".into(), "items".into())
+    }
+
+    fn pending(core: &Core<u64>, t: TargetId) -> usize {
+        core.targets[t.slot as usize]
+            .as_ref()
+            .unwrap()
+            .buffer
+            .pending_len()
+    }
+
+    fn pinned(core: &Core<u64>, t: TargetId) -> Option<u64> {
+        core.targets[t.slot as usize]
+            .as_ref()
+            .unwrap()
+            .buffer
+            .pinned()
+            .copied()
+    }
+
+    fn seed_pinned(core: &Core<u64>, t: TargetId) -> bool {
+        core.targets[t.slot as usize]
+            .as_ref()
+            .unwrap()
+            .seed_pin
+            .is_some()
+    }
+
+    #[test]
+    fn rows_reach_open_targets_only() {
+        let mut core = core();
+        let held = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        core.hold(held, true);
+        let mut late_spec = spec(vec![testkit::plan(VIEW_SIMPLE)]);
+        late_spec.start = 10;
+        let late = core.add_target(late_spec).unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        let ins = testkit::row(&[Some(1), Some(7), Some(1)]);
+        core.row(&src, None, Some(&ins));
+        let rows = |core: &Core<u64>, t: TargetId| {
+            core.targets[t.slot as usize].as_ref().unwrap().stats.rows
+        };
+        assert_eq!(
+            (rows(&core, held), rows(&core, late)),
+            (0, 0),
+            "held and unstarted are closed"
+        );
+        core.commit(10, true, Instant::now());
+        core.row(&src, None, Some(&ins));
+        assert_eq!(
+            (rows(&core, held), rows(&core, late)),
+            (0, 1),
+            "the started target is open"
+        );
+    }
+
+    #[test]
+    fn commit_releases_touched_targets() {
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        core.row(
+            &src,
+            None,
+            Some(&testkit::row(&[Some(1), Some(7), Some(1)])),
+        );
+        let now = Instant::now();
+        core.commit(1, true, now);
+        let tg = core.targets[t.slot as usize].as_ref().unwrap();
+        assert!(!tg.touched);
+        assert_eq!(tg.buffer.pending_len(), 1, "the id is pending");
+        assert_eq!(
+            tg.lane.due(now, &Schedule::immediate(10, 10), true, false),
+            Some(lane::Due::Flush),
+            "the lane's timer is set"
+        );
+    }
+
+    #[test]
+    fn xa_ids_wait_for_xa_commit() {
+        // proposal §9 case 7: an XA transaction's ids wait for its XA COMMIT, pinned at its origin.
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        let _links = core
+            .add_target(spec(vec![testkit::plan(
+                "SELECT l.child_id FROM item_links l",
+            )]))
+            .unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        let ls = core
+            .source(&("db".into(), "item_links".into()), None)
+            .unwrap();
+        let now = Instant::now();
+        core.xa_start("x");
+        core.row(
+            &src,
+            None,
+            Some(&testkit::row(&[Some(1), Some(7), Some(1)])),
+        );
+        core.xa_prepare("x", 5, now);
+        for n in 0..1_000u64 {
+            core.row(
+                &ls,
+                None,
+                Some(&testkit::row(&[Some(2 + n as i64), Some(3)])),
+            );
+            core.commit(6 + n, true, now);
+        }
+        assert_eq!(pending(&core, t), 0, "the XA id is not in the buffer");
+        core.xa_end("x", true, 2_000, now);
+        assert_eq!(pending(&core, t), 1, "the XA COMMIT releases the id");
+        assert_eq!(pinned(&core, t), Some(0), "pinned at the XA's origin");
+        core.xa_start("z");
+        core.row(
+            &src,
+            None,
+            Some(&testkit::row(&[Some(2), Some(7), Some(1)])),
+        );
+        core.xa_prepare("z", 2_001, now);
+        core.xa_end("z", false, 2_002, now);
+        assert_eq!(pending(&core, t), 1, "a rolled back XA leaves nothing");
+        core.xa_end("y", true, 2_003, now);
+        assert!(
+            core.events().contains(&CoreEvent::UnknownPrepare {
+                xid: "y".into(),
+                at: 2_003
+            }),
+            "an unknown xid is an event"
+        );
+    }
+
+    #[test]
+    fn row_at_uses_the_given_origin() {
+        let mut core = Core::<u64, NoItem, NoJob>::new(50, CoreConfig::direct(8 << 20));
+        let t = core
+            .add_target(spec(vec![testkit::plan(VIEW_SIMPLE)]))
+            .unwrap();
+        let src = core.source(&items_ref(), None).unwrap();
+        core.row_at(
+            &3,
+            &src,
+            None,
+            Some(&testkit::row(&[Some(1), Some(7), Some(1)])),
+        );
+        let tg = core.targets[t.slot as usize].as_ref().unwrap();
+        assert_eq!(
+            tg.buffer.pinned(),
+            Some(&3),
+            "the kept row pins at its own origin"
+        );
+    }
+
+    #[test]
+    fn stage_key_lands_in_a_labeled_space() {
+        // §9 case 5: the caller's own text keys round-trip through the labeled space.
+        let mut core = core();
+        let mut s = spec(vec![testkit::plan(VIEW_SIMPLE)]);
+        s.labels = vec!["tag_".into()];
+        let t = core.add_target(s).unwrap();
+        let tag = SpaceId(core.spaces(t).unwrap().len() as u16 - 1);
+        for k in ["007", "A-1", "42"] {
+            core.stage_key(t, tag, Key::from_text(k), Op::Update);
+        }
+        core.commit(1, true, Instant::now());
+        let tg = core.targets[t.slot as usize].as_mut().unwrap();
+        assert!(tg.buffer.begin());
+        let taken = tg.buffer.take(10, 10).unwrap();
+        let set = taken
+            .ids
+            .iter()
+            .find(|(sp, _)| *sp == tag)
+            .map(|(_, set)| set)
+            .expect("the tag space");
+        let mut got: Vec<String> = set
+            .to_keys()
+            .into_iter()
+            .map(|k| {
+                let mut s = String::new();
+                k.to_text(&mut s);
+                s
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["007".to_string(), "42".to_string(), "A-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_short_parent_image_is_an_unknown_event() {
+        let fk = |parent: &str, child_col: usize, parent_col: &str| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols: vec![child_col],
+            parent_cols: vec![parent_col.into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        // 6K's derived-cascade catalog: `attrs` cascades from `obj` and `kind`.
+        let mut cat: HashMap<TableRef, Arc<TableInfo>> = [
+            testkit::table("kind", &[("kid", "smallint unsigned")], &[0]),
+            testkit::table("obj", &[("oid", "int unsigned")], &[0]),
+            testkit::table("link", &[("gid", "int"), ("oid", "int unsigned")], &[0, 1]),
+            testkit::table(
+                "attrs",
+                &[
+                    ("id", "int"),
+                    ("oid", "int unsigned"),
+                    ("aid", "smallint unsigned"),
+                    ("val", "int"),
+                ],
+                &[0],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut attrs = (*cat[&("db".into(), "attrs".into())]).clone();
+        attrs.cascades = vec![fk("obj", 1, "oid"), fk("kind", 2, "kid")];
+        cat.insert(("db".into(), "attrs".into()), Arc::new(attrs));
+        let p = testkit::plan_in(
+            "SELECT c.gid, c.oid, MAX(a.val) AS x FROM link c \
+             JOIN attrs a ON a.oid = c.oid AND a.aid = 7 GROUP BY c.gid, c.oid",
+            &cat,
+        );
+        let mut core = core();
+        let t = core.add_target(spec(vec![p])).unwrap();
+        let kind = core
+            .source(&("db".into(), "kind".into()), None)
+            .expect("watched");
+        core.row(&kind, Some(&testkit::row(&[])), None);
+        assert!(
+            core.events().contains(&CoreEvent::Unknown {
+                target: t,
+                why: "a cascade parent's row image lacks columns",
+            }),
+            "a short parent image is the caller's safety net"
+        );
+    }
+
+    #[test]
+    fn seeding_pins_until_install() {
+        let fk = |child_col: usize| ForeignKey {
+            parent: ("db".into(), "obj".into()),
+            child_cols: vec![child_col],
+            parent_cols: vec!["oid".into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        // 6L's mapped-cascade catalog: `link` and `attrs` cascade from `obj`.
+        let mut cat: HashMap<TableRef, Arc<TableInfo>> = [
+            testkit::table("grp", &[("gid", "int")], &[0]),
+            testkit::table("obj", &[("oid", "int")], &[0]),
+            testkit::table("link", &[("gid", "int"), ("oid", "int")], &[0, 1]),
+            testkit::table(
+                "attrs",
+                &[
+                    ("id", "bigint"),
+                    ("oid", "int"),
+                    ("aid", "smallint"),
+                    ("val", "int"),
+                ],
+                &[0],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        for name in ["link", "attrs"] {
+            let mut t = (*cat[&("db".into(), name.into())]).clone();
+            t.cascades = vec![fk(1)];
+            cat.insert(("db".into(), name.into()), Arc::new(t));
+        }
+        let p = testkit::plan_in(
+            "SELECT g.gid, COUNT(*) AS n, MAX(a.val) AS x FROM grp g JOIN link c ON c.gid = g.gid \
+             JOIN attrs a ON a.oid = c.oid AND a.aid = 7 GROUP BY g.gid",
+            &cat,
+        );
+        let mut core = core();
+        let t = core.add_target(spec(vec![p])).unwrap();
+        core.set_cache(t, 0, Cache::seeding());
+        let attrs = core
+            .source(&("db".into(), "attrs".into()), None)
+            .expect("watched");
+        core.row(
+            &attrs,
+            None,
+            Some(&testkit::row(&[Some(1), Some(10), Some(7), Some(5)])),
+        );
+        assert!(
+            seed_pinned(&core, t),
+            "a map-child row logged while the cache seeds pins the position"
+        );
+        core.install_cache(t, 0, Cache::default());
+        assert!(
+            !seed_pinned(&core, t),
+            "installing the seeded cache clears the pin"
         );
     }
 }
