@@ -756,3 +756,95 @@ async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
     }
     eng.stop().await
 }
+
+/// A transient failure of the consistent-snapshot read used to end the flush's exact fence: the
+/// error fell through to `LAZYVIEW_VISIBILITY_DELAY_MS` and nothing re-probed the fence. The whole
+/// read is repeated now (`retry_src`), so with the delay at 0 the rows are still read at the
+/// fenced position — and after `heal_src` (the engine's source sessions killed) the next flush
+/// probes the fence again. The probe is the fence only where the engine has no GTID one, so the
+/// retry assertions run there; every flavor pins the writes exact with the delay at 0, before and
+/// after the reconnect.
+#[test]
+fn reg_transient_snapshot_failure_keeps_exact_fence() {
+    scenario("reg_snap_fence", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_entities",
+            Kind::Incremental,
+            "SELECT id, grp, status FROM entities",
+        )];
+        let ov = [
+            ("LAZYVIEW_VISIBILITY_DELAY_MS", "0"),
+            ("LAZYVIEW_BATCH_WINDOW_MS", "0"),
+            ("LAZYVIEW_TEST_FAIL_SNAPSHOT", "1"),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_snap_fence", ENTITIES, &specs, &ov).await?;
+        // `retry_src` warns on every try it repeats: the proof the read was retried, not given up.
+        let retried = |e: &Engine| -> usize {
+            std::fs::read_to_string(&e.log_path)
+                .unwrap_or_default()
+                .matches("reading the binlog snapshot position failed (try 1 of ")
+                .count()
+        };
+        let before = eng.snapshot();
+        let mut c = db.conn().await?;
+        // MySQL/Percona with GTIDs fence with `WAIT_FOR_EXECUTED_GTID_SET` and never probe the
+        // snapshot; the probe (and so the hook) is the fence only where there is no GTID one.
+        let gtid = scalar(&mut c, "SELECT @@gtid_mode")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let probes_snapshot = !gtid.eq_ignore_ascii_case("ON");
+        exec_all(
+            &mut c,
+            &[
+                "INSERT INTO entities VALUES (20, 4, 'new')",
+                "UPDATE entities SET status = 'paid' WHERE id = 20",
+            ],
+        )
+        .await?;
+        eng.wait_caught_up(&mut c, t_ready()).await?;
+        if probes_snapshot {
+            ensure!(
+                retried(&eng) >= 1,
+                "the injected fence failure was never retried: the flush fell back to the delay — log {}",
+                eng.log_path.display()
+            );
+        }
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "injected snapshot failure, no visibility delay",
+        )
+        .await?;
+        // The engine's own source sessions die (a dropped connection stand-in): `heal_src` opens
+        // a new one and the next flush must re-probe the fence — fail once, then succeed.
+        let probes = retried(&eng);
+        drop(c);
+        let mut admin = db.conn().await?;
+        for id in session_ids(&mut admin, &format!("DB = {}", q(&db.name))).await? {
+            let _ = exec(&mut admin, &format!("KILL {id}")).await;
+        }
+        let mut c = db.conn().await?;
+        exec(&mut c, "INSERT INTO entities VALUES (21, 5, 'new')").await?;
+        exec(&mut c, "UPDATE entities SET status = 'paid' WHERE id = 21").await?;
+        eng.wait_caught_up(&mut c, t_ready()).await?;
+        if probes_snapshot {
+            ensure!(
+                retried(&eng) > probes,
+                "the snapshot fence was not re-probed after the reconnect: {probes} probes before, log {}",
+                eng.log_path.display()
+            );
+        }
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0,
+            "a retried fence must never rebuild: {}",
+            fmt_snapshot(&d)
+        );
+        verify(&ctx, &mut eng, &db, &specs, "after the source reconnect").await?;
+        eng.stop().await
+    });
+}

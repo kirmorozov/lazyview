@@ -901,6 +901,44 @@ async fn server_identity(
     Ok(v.flatten().unwrap_or_default())
 }
 
+/// The position the source session's consistent snapshot includes: one transaction read at
+/// REPEATABLE READ, committed whatever the status read did. `fail_first`/`try_no` are the
+/// `LAZYVIEW_TEST_FAIL_SNAPSHOT` hook (decision 4): a transient, non-connection failure.
+async fn snapshot_position(
+    conn: &mut Conn,
+    fail_first: Option<usize>,
+    try_no: usize,
+) -> Result<Option<Position>> {
+    if fail_first.is_some_and(|n| try_no <= n) {
+        bail!("injected snapshot fence failure");
+    }
+    // The session reads with READ COMMITTED; the snapshot needs REPEATABLE READ.
+    conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        .await?;
+    let rows: Result<Vec<(String, String)>, _> = conn
+        .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
+        .await;
+    // The commit must run whatever the status read did: an open snapshot would poison the session.
+    let committed = conn.query_drop("COMMIT").await;
+    let rows = rows.context("reading the binlog snapshot position")?;
+    committed.context("committing the snapshot fence transaction")?;
+    let mut file = None;
+    let mut pos = None;
+    for (k, v) in rows {
+        match k.to_ascii_lowercase().as_str() {
+            "binlog_snapshot_file" => file = Some(v),
+            "binlog_snapshot_position" => pos = v.trim().parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    Ok(match (file, pos) {
+        (Some(file), Some(pos)) if !file.is_empty() => Some(Position { file, pos }),
+        _ => None,
+    })
+}
+
 /// Whether an UPDATE changed any column marked in `cols`. Images that are not full rows
 /// (`binlog_row_image` other than FULL) count as changed; so do partial JSON updates.
 fn columns_changed(before: &BinlogRow, after: &BinlogRow, cols: &[bool]) -> bool {
@@ -1732,6 +1770,9 @@ impl Engine {
                 // fence table).
                 self.commit_fence = None;
                 self.commit_fenced = None;
+                // and re-probes the consistent snapshot: a verdict made on the dead connection
+                // must not survive the reconnect.
+                self.snapshot_fence = None;
                 info!("reconnected to source database");
             }
             Err(e) => warn!("source database still unreachable: {}", e.root_cause()),
@@ -4266,31 +4307,19 @@ impl Engine {
     /// The binlog position up to which every transaction is visible, from a consistent snapshot
     /// (`None`: the server does not report one, e.g. MySQL Community).
     async fn visible_upto(&mut self) -> Result<Option<Position>> {
-        // The session reads with READ COMMITTED; the snapshot needs REPEATABLE READ.
-        self.src
-            .query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            .await?;
-        self.src
-            .query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-            .await?;
-        let rows: Result<Vec<(String, String)>, _> = self
-            .src
-            .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
-            .await;
-        self.src.query_drop("COMMIT").await?;
-        let mut file = None;
-        let mut pos = None;
-        for (k, v) in rows? {
-            match k.to_ascii_lowercase().as_str() {
-                "binlog_snapshot_file" => file = Some(v),
-                "binlog_snapshot_position" => pos = v.trim().parse::<u64>().ok(),
-                _ => {}
-            }
-        }
-        Ok(match (file, pos) {
-            (Some(file), Some(pos)) if !file.is_empty() => Some(Position { file, pos }),
-            _ => None,
-        })
+        // A transient failure here used to end the flush's exact fence: repeat the whole read
+        // (the boundary shape of `retry_src`), and let the caller fall back to the visibility
+        // delay only once the tries are spent.
+        let fail = self.cfg.test_fail_snapshot;
+        retry_src(
+            &self.metrics,
+            "reading the binlog snapshot position",
+            &mut self.src,
+            &self.src_opts,
+            self.cfg.lock_wait_s,
+            |try_no, src| Box::pin(snapshot_position(src, fail, try_no)),
+        )
+        .await
     }
 
     async fn replan_slot(&mut self, i: usize, freeze: bool) {
