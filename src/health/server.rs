@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::metrics::Metrics;
+use crate::metrics::{lock, Metrics};
 
 use super::probes::{render_json, render_text};
 use super::prometheus::prometheus;
@@ -239,7 +239,7 @@ struct Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.ctx.table().conns.remove(&self.id);
+        lock(&self.ctx.conns).conns.remove(&self.id);
     }
 }
 
@@ -264,14 +264,10 @@ impl Ctx {
         }
     }
 
-    fn table(&self) -> std::sync::MutexGuard<'_, ConnTable> {
-        self.conns.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// Registers a new connection, evicting an idle one at the limit. `None`: every open
     /// connection is being answered; refuse this one.
     fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<(Slot, Arc<AtomicU8>, oneshot::Receiver<()>)> {
-        let mut t = self.table();
+        let mut t = lock(&self.conns);
         if t.conns.len() >= self.max_conns {
             let now = Instant::now();
             let victim = t.victim(now)?;

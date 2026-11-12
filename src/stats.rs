@@ -27,14 +27,14 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::accumulate::UnitSet;
-use crate::metrics::unix_now;
+use crate::metrics::{lock, unix_now};
 use crate::mv::Applied;
 
 /// Flush batches the channel to the aggregator task holds (see [`spawn_aggregator`]); a batch
@@ -510,19 +510,15 @@ impl Default for Registry {
 }
 
 impl Registry {
-    fn lock(&self) -> MutexGuard<'_, Arc<Snapshot>> {
-        self.published.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// Swaps in the aggregator's latest snapshot.
     fn publish(&self, s: Snapshot) {
-        *self.lock() = Arc::new(s);
+        *lock(&self.published) = Arc::new(s);
     }
 
     /// The latest published statistics. Best effort: they may lag the engine by a flush or
     /// more, and miss the batches counted in `batches_dropped`.
     pub fn snapshot(&self) -> Snapshot {
-        let s: Arc<Snapshot> = self.lock().clone();
+        let s: Arc<Snapshot> = lock(&self.published).clone();
         Snapshot {
             since_unix: self.since_unix,
             now_unix: unix_now(),
@@ -533,7 +529,7 @@ impl Registry {
 
     /// The statistics of one view (`<schema>.<view>`), as last published.
     pub fn view(&self, name: &str) -> Option<ViewSnapshot> {
-        let s: Arc<Snapshot> = self.lock().clone();
+        let s: Arc<Snapshot> = lock(&self.published).clone();
         s.views.get(name).cloned()
     }
 
@@ -545,7 +541,7 @@ impl Registry {
     /// Whether the published snapshot accounts for the first `sent` batches (applied or
     /// dropped). Read [`Registry::sent`] first, then wait for this to see every earlier flush.
     pub fn includes(&self, sent: u64) -> bool {
-        self.lock().batches + self.dropped.load(Ordering::Relaxed) >= sent
+        lock(&self.published).batches + self.dropped.load(Ordering::Relaxed) >= sent
     }
 }
 

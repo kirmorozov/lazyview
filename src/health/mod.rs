@@ -67,17 +67,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use anyhow::{bail, Result};
-
 use crate::binlog::Position;
-use crate::metrics::{unix_now, Metrics};
+use crate::metrics::{lock, unix_now, Metrics};
 
 mod probes;
 mod prometheus;
 mod server;
 
-pub use probes::{evaluate, Check, Probe, ReadyOpts, Report};
-pub use server::{probe, probe_path, serve, serve_with};
+pub(super) use probes::{evaluate, Probe, ReadyOpts};
+pub use server::{probe, serve};
 
 pub const DEFAULT_STALL_SECS: u64 = 120;
 pub const DEFAULT_BOOT_STALL_SECS: u64 = 900;
@@ -115,19 +113,6 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub fn from_env() -> Result<Settings> {
-        Self::from_lookup(|k| std::env::var(k).ok())
-    }
-
-    /// Strict: every invalid variable is named in the error (for configuration validation).
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Settings> {
-        let (s, errors) = Self::from_lookup_lenient(get);
-        if !errors.is_empty() {
-            bail!("{}", errors.join("; "));
-        }
-        Ok(s)
-    }
-
     /// Keeps every valid variable; an invalid one falls back to its own default and is reported.
     pub fn from_lookup_lenient(get: impl Fn(&str) -> Option<String>) -> (Settings, Vec<String>) {
         let d = Settings::default();
@@ -305,7 +290,7 @@ impl Tracker {
         }
         let applied_changed = {
             let cur = m.applied();
-            let mut a = self.applied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut a = lock(&self.applied);
             if cur != a.0 {
                 *a = (cur, now);
             }
@@ -337,6 +322,7 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::probes::Report;
     use std::collections::HashMap;
 
     pub(super) const NOW: u64 = 1_800_000_000;
@@ -418,9 +404,11 @@ mod tests {
 
     #[test]
     fn settings_from_lookup() {
-        let s = |pairs: &[(&str, &str)]| Settings::from_lookup(lookup(pairs));
+        let s = |pairs: &[(&str, &str)]| Settings::from_lookup_lenient(lookup(pairs));
+        let (got, errs) = s(&[]);
+        assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(
-            s(&[]).unwrap(),
+            got,
             Settings {
                 stall_secs: 120,
                 boot_stall_secs: 900,
@@ -428,14 +416,15 @@ mod tests {
                 disconnect_grace_secs: 30
             }
         );
+        let (got, errs) = s(&[
+            ("LAZYVIEW_LIVENESS_STALL_SECS", " 300 "),
+            ("LAZYVIEW_LIVENESS_BOOT_STALL_SECS", "1800"),
+            ("LAZYVIEW_READY_REQUIRE_ALL", "TRUE"),
+            ("LAZYVIEW_READY_DISCONNECT_GRACE_SECS", "0"),
+        ]);
+        assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(
-            s(&[
-                ("LAZYVIEW_LIVENESS_STALL_SECS", " 300 "),
-                ("LAZYVIEW_LIVENESS_BOOT_STALL_SECS", "1800"),
-                ("LAZYVIEW_READY_REQUIRE_ALL", "TRUE"),
-                ("LAZYVIEW_READY_DISCONNECT_GRACE_SECS", "0")
-            ])
-            .unwrap(),
+            got,
             Settings {
                 stall_secs: 300,
                 boot_stall_secs: 1800,
@@ -444,19 +433,15 @@ mod tests {
             }
         );
         // the boot budget never undercuts the normal one
-        let r = s(&[("LAZYVIEW_LIVENESS_STALL_SECS", "1200")]).unwrap();
+        let (r, errs) = s(&[("LAZYVIEW_LIVENESS_STALL_SECS", "1200")]);
+        assert!(errs.is_empty(), "{errs:?}");
         assert_eq!((r.stall_secs, r.boot_stall_secs), (1200, 1200));
-        assert!(
-            !s(&[("LAZYVIEW_READY_REQUIRE_ALL", "")])
-                .unwrap()
-                .require_all
-        );
-        assert_eq!(
-            s(&[("LAZYVIEW_LIVENESS_STALL_SECS", "30")])
-                .unwrap()
-                .stall_secs,
-            30
-        );
+        let (r, errs) = s(&[("LAZYVIEW_READY_REQUIRE_ALL", "")]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!r.require_all);
+        let (r, errs) = s(&[("LAZYVIEW_LIVENESS_STALL_SECS", "30")]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(r.stall_secs, 30);
         for bad in [
             ("LAZYVIEW_LIVENESS_STALL_SECS", "0"),
             ("LAZYVIEW_LIVENESS_STALL_SECS", "29"),
@@ -465,8 +450,8 @@ mod tests {
             ("LAZYVIEW_READY_REQUIRE_ALL", "maybe"),
             ("LAZYVIEW_READY_DISCONNECT_GRACE_SECS", "-1"),
         ] {
-            let e = s(&[bad]).unwrap_err().to_string();
-            assert!(e.contains(bad.0), "{bad:?}: {e}");
+            let (_, errs) = s(&[bad]);
+            assert!(errs.iter().any(|e| e.contains(bad.0)), "{bad:?}: {errs:?}");
         }
         // slow binlog heartbeats need a longer stall window
         let hb = |stall: Option<&str>| {
@@ -503,15 +488,15 @@ mod tests {
         assert_eq!(errs.len(), 2, "{errs:?}");
         assert!(errs[0].contains("LAZYVIEW_LIVENESS_STALL_SECS") && errs[0].contains("\"2m\""));
         assert!(errs[1].contains("LAZYVIEW_LIVENESS_BOOT_STALL_SECS"));
-        let e = Settings::from_lookup(lookup(&[
+        let (_, errs) = Settings::from_lookup_lenient(lookup(&[
             ("LAZYVIEW_LIVENESS_STALL_SECS", "2m"),
             ("LAZYVIEW_READY_REQUIRE_ALL", "maybe"),
-        ]))
-        .unwrap_err()
-        .to_string();
+        ]));
+        let both = errs.join("; ");
         assert!(
-            e.contains("LAZYVIEW_LIVENESS_STALL_SECS") && e.contains("LAZYVIEW_READY_REQUIRE_ALL"),
-            "{e}"
+            both.contains("LAZYVIEW_LIVENESS_STALL_SECS")
+                && both.contains("LAZYVIEW_READY_REQUIRE_ALL"),
+            "{both}"
         );
     }
 

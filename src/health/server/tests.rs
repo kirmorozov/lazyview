@@ -309,7 +309,7 @@ async fn idle_connections_do_not_starve_probes() {
         assert!(resp.starts_with("HTTP/1.1 200 "), "{resp:?}");
         assert!(took < Duration::from_secs(1), "probe took {took:?}");
     }
-    assert!(ctx.table().conns.len() <= 16);
+    assert!(lock(&ctx.conns).conns.len() <= 16);
     // the oldest idle connections were closed by the server
     let mut closed = 0;
     for s in &mut idle {
