@@ -204,6 +204,56 @@ fn reg_mapped_cascade_is_logged() {
     });
 }
 
+/// A view whose targets include an unreachable instance must still be built and maintained on
+/// the reachable ones (v_orders_left with targets 'b,down' never appeared on b).
+#[test]
+fn reg_multi_target_with_one_down() {
+    scenario_multi("reg_target_down", 1, |ctx| async move {
+        let src = ctx.new_db("reg_tdown_src").await?;
+        let tb = ctx.new_db_on(1, "reg_tdown_b").await?;
+        let mut c = src.conn().await?;
+        for s in DDL {
+            exec(&mut c, s).await?;
+        }
+        ensure_lazyview_table(&mut c).await?;
+        let spec = join_view().with_targets("b,down");
+        add_views(&mut c, std::slice::from_ref(&spec)).await?;
+        let env = target_env(&[
+            ("b", &tb.dsn),
+            ("down", "mysql://lv:lv@127.0.0.1:1/nowhere"),
+        ]);
+        let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+        let tmap: std::collections::HashMap<String, Db> = [("b".to_string(), tb.clone())].into();
+        let healthy = vec![spec.clone().with_targets("b")];
+        let limit = Duration::from_secs(90);
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &healthy,
+            limit,
+            "built on b although 'down' is unreachable",
+        )
+        .await?;
+        exec_all(&mut c, &["UPDATE customers SET name = 'zed' WHERE id = 3"]).await?;
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &healthy,
+            limit,
+            "maintained on b",
+        )
+        .await?;
+        if eng.exited().is_some() {
+            bail!("engine exited");
+        }
+        Ok(())
+    });
+}
+
 /// Writes to `entities` (unless `links_only`) and `links` until `stop`: inserts into both,
 /// flips the status of existing entities. Ids come from `seq`.
 async fn churn(
