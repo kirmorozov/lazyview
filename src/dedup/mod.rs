@@ -554,4 +554,173 @@ mod tests {
         assert_eq!(hops.len(), 1, "the join has one hop");
         assert_eq!(core.hop_of(hops[0]), Some((t, 0, 1)));
     }
+
+    /// Plan 0 reads one table; plan 1 joins three and its `item_values` occurrence is a partial
+    /// path, so only the merge over `plans[1..]` can bring that set into the target's spaces.
+    fn two_plans() -> (Arc<ViewPlan>, Arc<ViewPlan>) {
+        (
+            testkit::plan(
+                "SELECT v.item_id, v.key_id, MAX(v.val) AS m FROM item_values v GROUP BY \
+                 v.item_id, v.key_id",
+            ),
+            testkit::plan(
+                "SELECT l.parent_id, i.id, MAX(v.val) AS v FROM item_links l JOIN items i ON \
+                 i.id = l.child_id JOIN item_values v ON v.item_id = i.id AND v.key_id = 7 \
+                 GROUP BY l.parent_id, i.id",
+            ),
+        )
+    }
+
+    #[test]
+    fn two_plan_target_merges_spaces_access_and_caches() {
+        let mut core = core();
+        let (p0, p1) = two_plans();
+        let t = core
+            .add_target(spec(vec![p0, p1]))
+            .expect("two Dedup plans of the same arity");
+        let sp = core.spaces(t).unwrap();
+        assert_eq!(sp.find(&[0, 1]), Some(SpaceId::FULL), "the merged full id");
+        assert_eq!(
+            sp.find(&[1]),
+            Some(SpaceId(1)),
+            "plan 1's partial set is merged in (only plans[1..] can add it)"
+        );
+        assert_eq!(sp.len(), 2, "the full id plus plan 1's set");
+        let acc = core.access(t).unwrap();
+        assert_eq!(acc.len(), 2, "one access plan per plan");
+        assert_eq!(
+            acc[0].occurrences.len(),
+            1,
+            "plan 0 reads item_values alone"
+        );
+        assert_eq!(
+            acc[1].occurrences.len(),
+            3,
+            "plan 1 reads item_links, items, item_values"
+        );
+        assert_ne!(acc[0], acc[1], "each plan keeps its own access");
+        assert_eq!(
+            core.targets[t.slot as usize].as_ref().unwrap().caches.len(),
+            2,
+            "one cascade cache per plan"
+        );
+        let watched = |t: &str| core.consumer.watched(&("db".to_string(), t.to_string()));
+        assert!(
+            watched("item_values") && watched("item_links") && watched("items"),
+            "consumer.add ran for both plans"
+        );
+        assert!(!watched("kinds"), "only the plans' tables are watched");
+    }
+
+    #[test]
+    fn replace_target_refusals_leave_the_target_alone() {
+        let mut core = core();
+        let (p0, p1) = two_plans();
+        let t = core.add_target(spec(vec![p0.clone(), p1.clone()])).unwrap();
+        let before = core.targets[t.slot as usize].as_ref().unwrap().id;
+        let e = core
+            .replace_target(t, spec(vec![testkit::plan("SELECT COUNT(*) n FROM items")]))
+            .expect_err("not on the Dedup route");
+        assert!(e.contains("route recompute"), "{e}");
+        let e = core
+            .replace_target(
+                t,
+                spec(vec![testkit::plan("SELECT i.id FROM items i"), p1.clone()]),
+            )
+            .expect_err("1 id parts against 2");
+        assert!(e.contains("id parts"), "{e}");
+        let e = core
+            .replace_target(t, spec(vec![p0.clone()]))
+            .expect_err("plan 0 alone loses plan 1's partial set");
+        assert!(e.contains("the spaces differ"), "{e}");
+        assert_eq!(core.targets(), vec![t], "a refusal changes nothing");
+        assert_eq!(core.targets[t.slot as usize].as_ref().unwrap().id, before);
+        assert_eq!(core.spaces(t).unwrap().len(), 2, "still the merged spaces");
+        assert!(
+            core.consumer
+                .watched(&("db".to_string(), "item_links".to_string())),
+            "still registered with the consumer"
+        );
+    }
+
+    #[test]
+    fn composite_ids_are_accepted_and_mixed_arity_refused() {
+        let mut core = core();
+        let three = "SELECT v.item_id, v.key_id, v.scope_id FROM item_values v";
+        let p3 = testkit::plan(three);
+        assert_eq!(
+            p3.unit_exprs.len(),
+            3,
+            "{three} plans its unit as {:?}",
+            p3.unit_exprs
+        );
+        let t = core.add_target(spec(vec![p3.clone()])).unwrap();
+        let sp = core.spaces(t).unwrap();
+        assert_eq!(
+            sp.find(&[0, 1, 2]),
+            Some(SpaceId::FULL),
+            "the three-part id"
+        );
+        assert_eq!(sp.find(&[0, 1]), None, "and only that space");
+        assert_eq!(core.access(t).unwrap().len(), 1);
+        assert!(core.remove_target(t).is_some());
+        let one = testkit::plan("SELECT i.id FROM items i");
+        let e = core
+            .add_target(spec(vec![one.clone(), p3.clone()]))
+            .expect_err("1 part then 3");
+        assert!(e.contains("3 id parts"), "{e}");
+        let e = core
+            .add_target(spec(vec![p3.clone(), one.clone()]))
+            .expect_err("3 parts then 1");
+        assert!(e.contains("1 id parts"), "{e}");
+        assert!(core.targets().is_empty(), "a refusal registers nothing");
+    }
+
+    /// All hop ids the core knows (the cache ids fill densely from 0 at add time).
+    fn hop_ids(core: &Core<u64>) -> Vec<HopId> {
+        (0..32u32)
+            .map(HopId)
+            .filter(|h| core.hops.plan(*h).is_some())
+            .collect()
+    }
+
+    #[test]
+    fn hop_of_maps_each_hop_of_a_two_hop_chain() {
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(
+                "SELECT i.id AS unit_0, l.child_id, o.id AS unit_1 FROM items i JOIN item_links \
+                 l ON l.parent_id = i.kind_id JOIN owners o ON o.id = l.parent_id",
+            )]))
+            .unwrap();
+        let hops = hop_ids(&core);
+        assert_eq!(hops.len(), 2, "items->item_links->owners: two hops");
+        assert_eq!(core.hop_of(hops[0]), Some((t, 0, 1)), "the first hop");
+        assert_eq!(core.hop_of(hops[1]), Some((t, 0, 2)), "the second hop");
+    }
+
+    #[test]
+    fn hop_of_follows_positional_aliases_not_names() {
+        let mut core = core();
+        let t = core
+            .add_target(spec(vec![testkit::plan(
+                "SELECT x.id AS unit_0, y.child_id, z.id AS unit_1, k.id AS unit_2 FROM items x \
+                 JOIN item_links y ON y.parent_id = x.kind_id JOIN owners z ON z.id = \
+                 y.parent_id JOIN kinds k ON k.id = x.kind_id",
+            )]))
+            .unwrap();
+        let hops = hop_ids(&core);
+        assert_eq!(
+            hops.len(),
+            3,
+            "three joined tables after the base: three hops"
+        );
+        let mapped: Vec<(TargetId, usize, usize)> =
+            hops.iter().map(|h| core.hop_of(*h).unwrap()).collect();
+        assert_eq!(
+            mapped,
+            vec![(t, 0, 1), (t, 0, 2), (t, 0, 3)],
+            "the aliases stay positional however they are spelled"
+        );
+    }
 }
