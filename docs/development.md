@@ -298,8 +298,13 @@ Workflows in `.github/workflows/`:
   (LTS, GA, AWS-only, pre-release) is in each job's title), `integration-multi`
   (the multi-server scenarios against `mysql84`, `percona97` and `mariadb130` together, with
   `LAZYVIEW_TEST_REQUIRE_MULTI=1`; the single-server jobs set it to `0`) and the image smoke and
-  end-to-end tests on every push and pull request. The servers run with the durable defaults
-  (no `docker-compose.local.yml`).
+  end-to-end tests on every pull request, `v*` tag and `workflow_dispatch`. A push to `main` runs
+  only lint, unit, e2e and the matrix's `mysql84` default-supervisor entry: landing is fast-forward
+  only, so the pushed commit is exactly the PR head whose pull request run just went green on the
+  same tree, and repeating the other 14 flavors and `integration-multi` there would double the
+  runner load of every landing. The `mysql84` entry stays because it alone writes the shared
+  `integration` rust-cache (its `save-if`) that the pull request runs restore. The servers run with
+  the durable defaults (no `docker-compose.local.yml`).
 * Every image is built and tested before it is pushed: `--version`, exit code `2` without
   configuration, user `65532`, no shell and the healthcheck, on both architectures (arm64 under
   QEMU). An end-to-end run of `docker-compose.example.yml` against MySQL 8.4 (amd64) follows.
