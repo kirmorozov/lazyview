@@ -421,9 +421,9 @@ pub(crate) async fn observed(ctx: &Ctx) -> Result<Observed> {
     })
 }
 
-/// The nine engine counters compared between a plain and a renamed run (the comparison in this
+/// The eight engine counters compared between a plain and a renamed run (the comparison in this
 /// file and the one in `tests/rename_invariance.rs`).
-pub fn counters(s: &Snapshot) -> [(&'static str, u64); 9] {
+pub fn counters(s: &Snapshot) -> [(&'static str, u64); 8] {
     [
         ("units_refreshed", s.units_refreshed),
         ("lookup_queries", s.lookup_queries),
@@ -433,7 +433,6 @@ pub fn counters(s: &Snapshot) -> [(&'static str, u64); 9] {
         ("mv_rows_upserted", s.mv_rows_upserted),
         ("mv_rows_deleted", s.mv_rows_deleted),
         ("full_rebuilds", s.full_rebuilds),
-        ("lookback_overflows", s.lookback_overflows),
     ]
 }
 

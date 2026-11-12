@@ -364,7 +364,7 @@ fn reg_grouped_chain_long_catch_up_is_chunked() {
         verify(&ctx, &mut eng, &db, &specs, "after a long catch-up").await?;
         let d = eng.snapshot();
         ensure!(
-            d.lookback_overflows == 0 && d.full_rebuilds == 0 && d.lookup_queries > 0,
+            d.full_rebuilds == 0 && d.lookup_queries > 0,
             "the long catch-up gave up its lookups or rebuilt the view: {}",
             fmt_snapshot(&d)
         );

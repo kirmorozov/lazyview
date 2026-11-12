@@ -264,10 +264,9 @@ fn reg_pinned_aliases_see_only_their_rows() {
         ctx.log(format!("whole run: {}", fmt_snapshot(&d)));
         ensure_pruned(&d, 10)?;
         ensure!(
-            d.full_rebuilds == 0 && d.lookback_overflows == 0,
-            "single-object transactions rebuilt the views ({} rebuilds, {} lookback overflows): {}",
+            d.full_rebuilds == 0,
+            "single-object transactions rebuilt the views ({} rebuilds): {}",
             d.full_rebuilds,
-            d.lookback_overflows,
             fmt_snapshot(&d)
         );
         eng.stop().await
@@ -513,10 +512,9 @@ fn reg_partial_units() {
         ctx.log(format!("whole run: {}", fmt_snapshot(&d)));
         ensure_pruned(&d, 1)?;
         ensure!(
-            d.full_rebuilds == 0 && d.lookback_overflows == 0 && d.lookup_queries == 0,
-            "partial units: {} rebuilds, {} lookback overflows, {} lookup queries: {}",
+            d.full_rebuilds == 0 && d.lookup_queries == 0,
+            "partial units: {} rebuilds, {} lookup queries: {}",
             d.full_rebuilds,
-            d.lookback_overflows,
             d.lookup_queries,
             fmt_snapshot(&d)
         );
@@ -986,7 +984,7 @@ fn reg_cascades_through_the_map() {
         let d = eng.snapshot().since(&start);
         ctx.log(format!("cascades through the map: {}", fmt_snapshot(&d)));
         ensure!(
-            d.full_rebuilds == 0 && d.lookback_overflows == 0 && d.cascade_rows > 0,
+            d.full_rebuilds == 0 && d.cascade_rows > 0,
             "cascades through the map rebuilt the views, or replayed no row: {}",
             fmt_snapshot(&d)
         );

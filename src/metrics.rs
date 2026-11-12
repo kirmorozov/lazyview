@@ -70,8 +70,6 @@ counters!(
     definition_reloads,
     // Definitions whose planning took longer than LAZYVIEW_PLAN_TIMEOUT_MS.
     plans_timed_out,
-    // Kept for dashboards: lookups no longer give up (they run in chunks), so this stays 0.
-    lookback_overflows,
     // Refresh supervisor (docs/design-supervisor.md §5).
     supervisor_increases,
     supervisor_decreases,

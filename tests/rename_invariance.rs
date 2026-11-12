@@ -349,7 +349,6 @@ fn add(a: &Snapshot, b: &Snapshot) -> Snapshot {
     s.mv_rows_upserted += b.mv_rows_upserted;
     s.mv_rows_deleted += b.mv_rows_deleted;
     s.full_rebuilds += b.full_rebuilds;
-    s.lookback_overflows += b.lookback_overflows;
     s
 }
 
