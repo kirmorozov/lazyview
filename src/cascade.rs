@@ -43,7 +43,7 @@ pub struct KeptRow {
 pub fn kept(c: &CascadeRoute, r: &BinlogRow) -> Option<(Key, KeptRow)> {
     let m = c.map.as_ref()?;
     let t = &c.child_table;
-    let datum = |r: &BinlogRow, k: usize| Datum::from_binlog(value_at(r, k), &t.columns[k]);
+    let datum = |r: &BinlogRow, k: usize| Datum::from_binlog(r.as_ref(k), &t.columns[k]);
     if !m.keeps(r, t) {
         return None;
     }
@@ -55,7 +55,7 @@ pub fn kept(c: &CascadeRoute, r: &BinlogRow) -> Option<(Key, KeptRow)> {
     let values = m
         .cols
         .iter()
-        .map(|&k| match value_at(r, k) {
+        .map(|&k| match r.as_ref(k) {
             None | Some(BinlogValue::JsonDiff(_)) => {
                 complete = false;
                 None
@@ -72,11 +72,6 @@ pub fn kept(c: &CascadeRoute, r: &BinlogRow) -> Option<(Key, KeptRow)> {
             complete,
         },
     ))
-}
-
-/// The value of column `c` of `row` in the binlog event (`None`: the column is absent).
-fn value_at(row: &BinlogRow, c: usize) -> Option<&BinlogValue<'_>> {
-    row.as_ref(c)
 }
 
 /// The child row `row` of cascade `c`'s map as a binlog image of the child table: its stored

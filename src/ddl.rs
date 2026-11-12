@@ -1,7 +1,7 @@
 //! Which tables a non-row binlog statement (DDL) may affect.
 //!
 //! With `binlog_format=ROW` every data change arrives as row events; QUERY events only carry DDL
-//! and administrative statements. [`statement_tables`] tells the engine which tables such a
+//! and administrative statements. [`statement_effects`] tells the engine which tables such a
 //! statement may have changed (structure or content) so their catalog entries can be invalidated
 //! and dependent views rebuilt. It is deliberately cheap (sqlparser *tokenizer* only, no parsing)
 //! and conservative: when a statement form is recognised every table it names is reported, even
@@ -10,8 +10,24 @@
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
+/// What a non-row statement may affect.
+#[derive(Debug, Default, PartialEq)]
+pub struct StatementEffects {
+    /// The tables it may have changed (see [`statement_effects`]).
+    pub tables: Vec<(String, String)>,
+    /// The base tables it removes: those of `DROP TABLE[S] [IF EXISTS] a, b`. Not `DROP TEMPORARY
+    /// TABLE` (it never removes a base table), `DROP INDEX i ON t` or `DROP VIEW`.
+    pub dropped: Vec<(String, String)>,
+    /// Every row of each table in `tables` is still there after the statement: ALTER TABLE
+    /// (without RENAME), CREATE INDEX, DROP INDEX. False for anything else (RENAME TABLE,
+    /// ALTER TABLE ... RENAME TO/AS, TRUNCATE, REPAIR, CREATE [OR REPLACE] TABLE, DROP, database
+    /// statements, views, statements that cannot be parsed).
+    pub rows_kept: bool,
+}
+
 /// Tables possibly affected by the non-row statement `query`, executed with default database
-/// `default_schema`. Unqualified names resolve to `default_schema`; names keep their spelling.
+/// `default_schema`, plus the tables it removes (see [`StatementEffects`]). Unqualified names
+/// resolve to `default_schema`; names keep their spelling.
 ///
 /// * `ALTER TABLE t …` → `t`, plus rename / exchange targets (`RENAME [TO|AS] t2`,
 ///   `EXCHANGE PARTITION p WITH TABLE t2`, MariaDB `CONVERT TABLE t2 TO PARTITION …`,
@@ -35,26 +51,6 @@ use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 /// Comments are ignored, except executable comments (`/*! … */`, `/*!50001 … */`, MariaDB
 /// `/*M! … */`) whose content is treated as SQL. A statement the tokenizer rejects yields
 /// `(default_schema, "*")` when it starts like DDL (it cannot be analysed, so assume the worst).
-pub fn statement_tables(query: &str, default_schema: &str) -> Vec<(String, String)> {
-    statement_effects(query, default_schema).tables
-}
-
-/// What a non-row statement may affect.
-#[derive(Debug, Default, PartialEq)]
-pub struct StatementEffects {
-    /// The tables it may have changed, as [`statement_tables`].
-    pub tables: Vec<(String, String)>,
-    /// The base tables it removes: those of `DROP TABLE[S] [IF EXISTS] a, b`. Not `DROP TEMPORARY
-    /// TABLE` (it never removes a base table), `DROP INDEX i ON t` or `DROP VIEW`.
-    pub dropped: Vec<(String, String)>,
-    /// Every row of each table in `tables` is still there after the statement: ALTER TABLE
-    /// (without RENAME), CREATE INDEX, DROP INDEX. False for anything else (RENAME TABLE,
-    /// ALTER TABLE ... RENAME TO/AS, TRUNCATE, REPAIR, CREATE [OR REPLACE] TABLE, DROP, database
-    /// statements, views, statements that cannot be parsed).
-    pub rows_kept: bool,
-}
-
-/// [`statement_tables`] plus the tables the statement removes (see [`StatementEffects`]).
 pub fn statement_effects(query: &str, default_schema: &str) -> StatementEffects {
     let toks = match lex(query) {
         Some(t) => t,

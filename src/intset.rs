@@ -66,11 +66,6 @@ pub struct IntSet {
 
 #[cfg(not(feature = "roaring"))]
 impl IntSet {
-    /// Creates an empty set.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Inserts `v`. Returns true when the value was new.
     pub fn insert(&mut self, v: u64) -> bool {
         let new = self.set.insert(v);
@@ -204,11 +199,6 @@ impl PartialEq for IntSet {
 
 #[cfg(feature = "roaring")]
 impl IntSet {
-    /// Creates an empty set.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Inserts `v`. Returns true when the value was new.
     pub fn insert(&mut self, v: u64) -> bool {
         self.set.insert(v)
@@ -305,12 +295,12 @@ mod tests {
 
     #[test]
     fn partial_eq_ignores_cache() {
-        let mut a = IntSet::new();
+        let mut a = IntSet::default();
         for v in 1..=10 {
             a.insert(v);
         }
         a.pop_smallest(5); // a holds 6..=10; on the hash backend its cache stays fresh here
-        let mut b = IntSet::new();
+        let mut b = IntSet::default();
         for v in 6..=10 {
             b.insert(v);
         }
@@ -322,7 +312,7 @@ mod tests {
 
     #[test]
     fn pops_interleaved_with_inserts() {
-        let mut s = IntSet::new();
+        let mut s = IntSet::default();
         let mut refset: BTreeSet<u64> = BTreeSet::new();
         for v in 0..100 {
             s.insert(v);
@@ -361,7 +351,7 @@ mod tests {
     #[cfg(not(feature = "roaring"))]
     #[test]
     fn cache_freshness_tracks_pending() {
-        let mut s = IntSet::new();
+        let mut s = IntSet::default();
         s.insert(5);
         s.insert(1);
         assert!(!s.fresh);
@@ -384,7 +374,7 @@ mod tests {
     #[test]
     fn random_operation_sequences() {
         let mut rng = SplitMix64(0x0123_4567_89AB_CDEF);
-        let mut s = IntSet::new();
+        let mut s = IntSet::default();
         let mut refset: BTreeSet<u64> = BTreeSet::new();
         const OPS: u64 = 3000;
         for op in 0..OPS {
@@ -398,7 +388,7 @@ mod tests {
                     assert_eq!(s.is_empty(), refset.is_empty());
                 }
                 9 => {
-                    let mut s_other = IntSet::new();
+                    let mut s_other = IntSet::default();
                     s_other.insert(rng.next_u64() % 2000);
                     s_other.insert(rng.next_u64() % 2000);
                     let other = s_other.to_sorted_vec();
@@ -432,7 +422,7 @@ mod tests {
 
     #[test]
     fn clear_empties_and_reinserts() {
-        let mut s = IntSet::new();
+        let mut s = IntSet::default();
         for v in [1, 2, 3] {
             s.insert(v);
         }
@@ -453,17 +443,17 @@ mod tests {
 
     #[test]
     fn partial_eq_equal_len_differs_in_content() {
-        let mut a = IntSet::new();
+        let mut a = IntSet::default();
         a.insert(1);
         a.insert(2);
-        let mut b = IntSet::new();
+        let mut b = IntSet::default();
         b.insert(3);
         b.insert(4);
         // Same length, different contents: not equal either way.
         assert_ne!(a, b);
         assert_ne!(b, a);
         // Same contents, different cache state: still equal.
-        let mut c = IntSet::new();
+        let mut c = IntSet::default();
         for v in [0, 1, 2] {
             c.insert(v);
         }
@@ -471,7 +461,7 @@ mod tests {
         assert_eq!(a, c);
         assert_eq!(c, a);
         // Different lengths: not equal.
-        let mut d = IntSet::new();
+        let mut d = IntSet::default();
         for v in [1, 2, 3] {
             d.insert(v);
         }
@@ -481,7 +471,7 @@ mod tests {
 
     #[test]
     fn sorted_vec_fresh_with_empty_pending() {
-        let mut s = IntSet::new();
+        let mut s = IntSet::default();
         s.insert(2);
         s.insert(1);
         assert_eq!(s.pop_smallest(1), [1]);

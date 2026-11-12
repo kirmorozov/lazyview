@@ -1,7 +1,7 @@
-use super::{statement_effects, statement_tables};
+use super::statement_effects;
 
 fn t(q: &str) -> Vec<(String, String)> {
-    statement_tables(q, "d")
+    statement_effects(q, "d").tables
 }
 
 fn names(v: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -37,7 +37,7 @@ fn dropped_tables() {
         "DROP DATABASE d",
     ] {
         assert!(dropped(q).is_empty(), "{q}");
-        assert!(!statement_tables(q, "d").is_empty(), "{q}");
+        assert!(!statement_effects(q, "d").tables.is_empty(), "{q}");
     }
 }
 
@@ -391,5 +391,8 @@ fn multiple_statements_and_odd_input() {
     assert_eq!(t("/* x */ DROP TABLE `unterminated"), names(&[("d", "*")]));
     assert!(t("SELECT 'unterminated").is_empty());
     // Unqualified names with an empty default schema.
-    assert_eq!(statement_tables("DROP TABLE a", ""), names(&[("", "a")]));
+    assert_eq!(
+        statement_effects("DROP TABLE a", "").tables,
+        names(&[("", "a")])
+    );
 }

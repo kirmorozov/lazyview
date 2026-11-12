@@ -172,10 +172,6 @@ impl Tracker {
             queued: None,
         }
     }
-
-    pub(super) fn table_map(&self, table_id: u64) -> Option<&TableMapEvent<'static>> {
-        self.tables.get(&table_id).map(|(_, t, _)| t)
-    }
 }
 
 pub struct BinlogReader {
@@ -268,11 +264,6 @@ impl BinlogReader {
     /// points; this one may be inside a transaction.
     pub fn position(&self) -> &Position {
         &self.t.pos
-    }
-
-    /// The table map currently known for `table_id` (column types / metadata).
-    pub fn table_map(&self, table_id: u64) -> Option<&TableMapEvent<'static>> {
-        self.t.table_map(table_id)
     }
 
     /// Next item; `Ok(None)` when the server closed the stream.
