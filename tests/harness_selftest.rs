@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, ensure};
 use common::oracle::{diff_tables, hand_materialize, Table};
+use common::soakcheck::{
+    percentiles, scan_warn_text, slope_kib_per_hour, soak_rss_slope_mib_h, unexpected_warns,
+};
 use common::workload::{
     ecommerce_views, run_batches, run_concurrent, run_txn, seed_statements, setup_ecommerce, Sizes,
     Txn, Workload,
@@ -378,4 +381,107 @@ fn selftest_duplicate_key_retry() {
         );
         Ok(())
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The soak checks' pure parts (S2.8 of `tmp/out/lvs-soak/breakdown.md`): no server, no engine.
+// ---------------------------------------------------------------------------------------------
+
+/// Nearest-rank percentiles (§4's lag numbers): the 1..=100 case, an unsorted slice, one sample,
+/// and the empty case a run that never reached a check shows.
+#[test]
+fn selftest_percentiles() {
+    let hundred: Vec<f64> = (1..=100).map(|x| x as f64).collect();
+    assert_eq!(percentiles(&hundred), (50.0, 95.0, 100.0));
+    assert_eq!(percentiles(&[3.0, 1.0, 2.0, 10.0]), (2.0, 10.0, 10.0));
+    assert_eq!(percentiles(&[7.5]), (7.5, 7.5, 7.5));
+    assert_eq!(percentiles(&[]), (0.0, 0.0, 0.0));
+}
+
+/// The RSS trend rule of §4/D7: flat samples are flat, +1 KiB/s is 3600 KiB/h, one point or none
+/// cannot show a trend, and a flat run is inside the default budget.
+#[test]
+fn selftest_slope_flat_and_growing() {
+    let flat: Vec<(f64, u64)> = (0u64..20).map(|i| (i as f64 * 60.0, 500_000)).collect();
+    assert!(
+        slope_kib_per_hour(&flat).abs() < 1e-9,
+        "flat samples: {}",
+        slope_kib_per_hour(&flat)
+    );
+    // One KiB per second (every sample one minute later, 60 KiB higher).
+    let growing: Vec<(f64, u64)> = (0u64..20)
+        .map(|i| (i as f64 * 60.0, 500_000 + i * 60))
+        .collect();
+    let slope = slope_kib_per_hour(&growing);
+    assert!(
+        (slope - 3600.0).abs() < 1e-6,
+        "1 KiB/s must be 3600 KiB/h, got {slope}"
+    );
+    assert_eq!(slope_kib_per_hour(&[(0.0, 1)]), 0.0);
+    assert_eq!(slope_kib_per_hour(&[]), 0.0);
+    // D7's default budget is 64 MiB/h: a flat run is inside it, a 1 KiB/s leak is not a leak yet.
+    assert!(slope_kib_per_hour(&flat) <= soak_rss_slope_mib_h() * 1024.0);
+    assert!(slope < soak_rss_slope_mib_h() * 1024.0);
+    assert!(slope_kib_per_hour(&growing) > slope_kib_per_hour(&flat));
+}
+
+/// WARN accounting (§4): a synthetic 40-line log, two allowlisted buckets (a target behind and
+/// reconnecting, `EXPECTED_WARNS`) and one unexpected one; an `ERROR` line and a panic are hard
+/// failures, and a level word inside a message must not move the line's bucket.
+#[test]
+fn selftest_warn_bucketing() {
+    let mut lines: Vec<String> = (0..37)
+        .map(|i| format!("2026-11-12T11:00:{i:02}Z  INFO lazyview::engine: flush {i} rows=3"))
+        .collect();
+    lines.push(
+        "2026-11-12T11:01:00Z  WARN lazyview::engine: view=items target=t1 buffered_mib=2 the \
+         changes kept for this target exceed their 4194304 byte budget"
+            .to_string(),
+    );
+    lines.push(
+        "2026-11-12T11:01:01Z  WARN lazyview::engine: view=items target=t1 write failed: \
+         connection reset; retrying in 250ms"
+            .to_string(),
+    );
+    lines
+        .push("2026-11-12T11:01:02Z  WARN lazyview::engine: something nobody expected".to_string());
+    assert_eq!(lines.len(), 40, "the synthetic log is 40 lines");
+
+    let warns = scan_warn_text(&lines.join("\n"), "synthetic").expect("the log has no ERROR line");
+    assert_eq!(warns.len(), 3, "one bucket per WARN: {warns:?}");
+    assert_eq!(warns.values().sum::<u64>(), 3);
+    let bad = unexpected_warns(&warns);
+    assert_eq!(bad.len(), 1, "one unexpected bucket: {warns:?}");
+    assert!(
+        bad[0].starts_with("something nobody"),
+        "the unexpected bucket: {}",
+        bad[0]
+    );
+    // The two expected buckets are bucketed by their message, not by their `view=`/`target=` fields.
+    assert!(warns
+        .keys()
+        .any(|k| k.starts_with("the changes kept for this target")));
+    assert!(warns
+        .keys()
+        .any(|k| k.starts_with("write failed: connection reset")));
+
+    // A level word inside a message does not make the line an ERROR, and an ERROR line fails.
+    let quiet = "2026-11-12T11:02:00Z  INFO lazyview::engine: no WARN here, ERROR words stay INFO";
+    assert!(scan_warn_text(quiet, "synthetic").unwrap().is_empty());
+    assert!(
+        scan_warn_text(
+            "2026-11-12T11:03:00Z ERROR lazyview::engine: refresh failed: ERROR 1062 (23000)",
+            "synthetic"
+        )
+        .is_err(),
+        "an ERROR line fails the run"
+    );
+    assert!(
+        scan_warn_text(
+            "thread 'main' panicked at src/engine.rs:1: boom",
+            "synthetic"
+        )
+        .is_err(),
+        "a panic fails the run"
+    );
 }

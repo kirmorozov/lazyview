@@ -12,6 +12,7 @@ pub mod oracle;
 // The analyzer's test-only renamer (one implementation for unit and integration tests).
 #[path = "../../src/analyzer/rename.rs"]
 pub mod rename;
+pub mod soakcheck;
 pub mod soakwork;
 pub mod typed;
 pub mod workload;

@@ -1,7 +1,8 @@
 //! The soak harness's workload tests (PR S1 of `tmp/out/lvs-soak/breakdown.md`): the neutral
-//! schema, the neutral view set and the seeded mix of `tests/common/soakwork.rs`. The smoke and
-//! long modes, the chaos schedule and the checks come with PR S2 / S3; what lives here proves the
-//! generator and the view set before anything runs for hours.
+//! schema, the neutral view set and the seeded mix of `tests/common/soakwork.rs`. The checks, the
+//! samplers and the one-page report are the callers in `tests/common/soakcheck.rs` (PR S2); the
+//! seeded chaos schedule and the two modes come with PR S3. What lives here proves the generator
+//! and the view set before anything runs for hours.
 
 mod common;
 
