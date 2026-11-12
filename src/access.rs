@@ -71,8 +71,9 @@ pub enum Path {
         positions: Vec<usize>,
         cols: Vec<usize>,
     },
-    /// The units come through the materialized key columns (`cols`).
-    Lineage { cols: Vec<String> },
+    /// The units come through the materialized key columns (`cols`); `reason`: why the
+    /// link-table hop was refused (stored at plan time, read by `AccessPlan::of`).
+    Lineage { cols: Vec<String>, reason: String },
     /// The id through link tables.
     Hop(Hop),
     /// No clear derivation; `reason`.
@@ -339,8 +340,9 @@ fn occurrences(p: &ViewPlan) -> Vec<Occurrence> {
                     // the alias's lineage (when it has one) or is untraced with the reason.
                     match (hop(p, i), p.lineage_of(i)) {
                         (Ok(h), _) => Path::Hop(h),
-                        (Err(_), Some(k)) => Path::Lineage {
+                        (Err(r), Some(k)) => Path::Lineage {
                             cols: k.cols.clone(),
+                            reason: r,
                         },
                         (Err(r), None) => Path::Untraced { reason: r },
                     }
@@ -685,18 +687,16 @@ impl AccessPlan {
         } else {
             match occurrences
                 .iter()
-                .enumerate()
-                .find(|(_, o)| matches!(o.path, Path::Lineage { .. } | Path::Untraced { .. }))
+                .find(|o| matches!(o.path, Path::Lineage { .. } | Path::Untraced { .. }))
             {
-                Some((i, o)) => Route::ViewPlan {
+                Some(o) => Route::ViewPlan {
                     reason: format!(
                         "{} ({}): {}",
                         quote_ident(&o.alias),
                         quote_ident(&o.table.1),
                         match &o.path {
-                            // The hop was refused for this occurrence; the refusal is the why.
-                            Path::Lineage { .. } =>
-                                format!("lineage only: {}", hop(p, i).err().unwrap_or_default()),
+                            // The refusal was stored with the lineage at plan time.
+                            Path::Lineage { reason, .. } => format!("lineage only: {reason}"),
                             Path::Untraced { reason } => reason.clone(),
                             _ => unreachable!(),
                         }
@@ -846,7 +846,7 @@ fn path_str(p: &Path) -> String {
             ordinals(&h.positions),
             1 + h.aliases.len()
         ),
-        Path::Lineage { cols } => format!("lineage ({})", cols.join(", ")),
+        Path::Lineage { cols, .. } => format!("lineage ({})", cols.join(", ")),
         Path::Untraced { reason } => format!("untraced ({reason})"),
     }
 }

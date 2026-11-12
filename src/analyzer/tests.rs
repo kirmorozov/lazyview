@@ -161,15 +161,6 @@ fn outcome(sql: &str, cat: &HashMap<TableRef, Arc<TableInfo>>) -> super::Outcome
     super::analyze(&d, "db", cat, &opts).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
 }
 
-/// The table the engine would create for an internal view (its columns, `pk` = its unit).
-fn internal_table(
-    iv: &super::InternalView,
-    cols: &[(&str, &str)],
-    pk: &[usize],
-) -> (TableRef, Arc<TableInfo>) {
-    table(&iv.name, cols, pk)
-}
-
 /// Catalog for the formulation tests below: `item` is a cascading child of `entity`, `pair_item`
 /// one of `pair` through a composite key; `attr` / `attr_n` reference `entity` without a foreign
 /// key (NOT NULL / nullable column).

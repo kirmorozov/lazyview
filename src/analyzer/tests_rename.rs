@@ -508,10 +508,88 @@ fn check(sql: &str, cat: &Catalog, seed: u64) -> Result<bool, String> {
     ))
 }
 
+/// The string literals of a Rust source (plain and raw strings, `\` line continuations): the
+/// SQL statements tests write. Test-only, so it lives beside its users and not in the shipped
+/// renamer; the integration harness keeps its copy in `tests/common/mod.rs`.
+fn rust_literals(src: &str) -> Vec<String> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'\'' => {
+                // A char literal or a lifetime.
+                i += if b.get(i + 2) == Some(&b'\'') {
+                    3
+                } else if b.get(i + 1) == Some(&b'\\') {
+                    4
+                } else {
+                    1
+                };
+            }
+            b'r' if matches!(b.get(i + 1), Some(b'"' | b'#'))
+                && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) =>
+            {
+                let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+                let start = i + 2 + hashes;
+                let close = format!("\"{}", "#".repeat(hashes));
+                let Some(end) = src[start..].find(&close).map(|e| start + e) else {
+                    break;
+                };
+                out.push(src[start..end].to_string());
+                i = end + close.len();
+            }
+            b'"' => {
+                let mut s = String::new();
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    if b[j] == b'\\' {
+                        j += 1;
+                        match b.get(j) {
+                            Some(b'n') => s.push('\n'),
+                            Some(b't') => s.push('\t'),
+                            Some(b'\\') => s.push('\\'),
+                            Some(b'"') => s.push('"'),
+                            Some(b'\'') => s.push('\''),
+                            Some(b'0') => s.push('\0'),
+                            Some(b'\n') => {
+                                while b.get(j + 1).is_some_and(|c| c.is_ascii_whitespace()) {
+                                    j += 1;
+                                }
+                            }
+                            Some(_) => {
+                                s.push('\\');
+                                let c = src[j..].chars().next().unwrap();
+                                s.push(c);
+                                j += c.len_utf8() - 1;
+                            }
+                            None => {}
+                        }
+                        j += 1;
+                        continue;
+                    }
+                    let c = src[j..].chars().next().unwrap();
+                    s.push(c);
+                    j += c.len_utf8();
+                }
+                out.push(s);
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 /// The SELECTs of the analyzer's own tests (CTE merges, aggregation pull-up, semi-joins,
 /// windows, ...) as definitions; those over other catalogs fail alike in both plans.
 fn analyzer_corpus() -> Vec<String> {
-    let mut v: Vec<String> = monkey::rust_literals(include_str!("tests.rs"))
+    let mut v: Vec<String> = rust_literals(include_str!("tests.rs"))
         .into_iter()
         .filter(|s| {
             let t = s.trim_start();

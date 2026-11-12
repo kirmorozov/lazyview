@@ -463,7 +463,12 @@ impl ViewPlan {
         own: &str,
         mut others: impl FnMut(usize) -> Option<String>,
     ) -> String {
-        let mut exists = self.aliases[alias].semi.clone().unwrap_or_default();
+        // Both callers reach this only under `semi.is_some()` (`lookup_sql` and the FROM loop).
+        let mut exists = self.aliases[alias]
+            .semi
+            .as_deref()
+            .expect("caller checked semi")
+            .to_string();
         for (j, a) in self.aliases.iter().enumerate() {
             let marker = semi_table_marker(j);
             if exists.contains(&marker) {
@@ -550,9 +555,11 @@ impl ViewPlan {
         push_where(&mut sql, where_sql, filter.as_deref());
         let mut order: Vec<(usize, usize)> = Vec::new();
         for k in 0..subst.len() {
+            // `substitute_factor` placed every marker just above: a missing one is a bug.
+            debug_assert!(sql.contains(&marker(k)), "substitution marker missing");
             let at = sql
                 .find(&marker(k))
-                .ok_or_else(|| anyhow!("internal: substitution marker missing"))?;
+                .expect("internal: substitution marker missing");
             order.push((at, k));
         }
         order.sort_unstable();

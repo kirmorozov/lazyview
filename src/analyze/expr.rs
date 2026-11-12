@@ -184,9 +184,9 @@ pub(crate) fn order_subquery_tables(
             };
             let _ = q.visit(&mut n);
             for t in referenced_tables(q, schema) {
-                let Some(info) = tables.get(&t) else {
-                    continue;
-                };
+                // Caller contract (`plan_block`: `tables` holds metadata for every table the
+                // query reads): a gap is a bug, not a silently skipped table.
+                let info = &tables[&t];
                 let mut cols: Vec<bool> = info
                     .columns
                     .iter()

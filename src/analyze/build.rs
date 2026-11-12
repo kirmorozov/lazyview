@@ -1266,9 +1266,11 @@ fn render_substituted_from(
         .map(|t| t.to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    // `substitute_factor` placed the marker just above: a missing one is a bug.
+    debug_assert!(s.contains(SUBST_MARKER), "substitution marker missing");
     let (a, b) = s
         .split_once(SUBST_MARKER)
-        .ok_or_else(|| anyhow!("internal: substitution marker missing"))?;
+        .expect("internal: substitution marker missing");
     Ok((a.to_string(), b.to_string()))
 }
 

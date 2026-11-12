@@ -15,7 +15,8 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
-use common::rename::{rust_literals, Names};
+use common::rename::Names;
+use common::rust_literals;
 use common::workload::Gen;
 use common::*;
 use lazyview::Snapshot;

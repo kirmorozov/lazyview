@@ -48,7 +48,7 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
         (Mode::Grouped, iv.name.as_str())
     );
     // Once its table exists, the parent is a chained view over it.
-    let (k, t) = internal_table(iv, &[("customer_id", "int"), ("s", "decimal")], &[]);
+    let (k, t) = table(&iv.name, &[("customer_id", "int"), ("s", "decimal")], &[]);
     cat.insert(k, t);
     let super::Outcome::Plan(v) = outcome(sql, &cat) else {
         panic!("expected a plan")
@@ -307,7 +307,7 @@ fn internal_views_for_windows_and_top_n() {
         "{}",
         ivs[0].sql
     );
-    let (k, t) = internal_table(&ivs[0], &[("id", "int"), ("amount", "decimal")], &[]);
+    let (k, t) = table(&ivs[0].name, &[("id", "int"), ("amount", "decimal")], &[]);
     cat.insert(k, t);
     let super::Outcome::Plan(v) = outcome(top, &cat) else {
         panic!("expected a plan")
@@ -349,7 +349,7 @@ fn tuple_lineage_views_for_untraceable_groups() {
             j.name
         )
     );
-    let (k, t) = internal_table(j, &[("_lv_c0", "int"), ("_lv_c1", "int")], &[]);
+    let (k, t) = table(&j.name, &[("_lv_c0", "int"), ("_lv_c1", "int")], &[]);
     cat.insert(k, t);
     let super::Outcome::Plan(v) = outcome(sql, &cat) else {
         panic!("expected a plan")
@@ -382,7 +382,11 @@ fn tuple_lineage_views_for_untraceable_groups() {
         "{}",
         ivs[0].sql
     );
-    let (k, t) = internal_table(&ivs[0], &[("_lv_c0", "int"), ("_lv_c1", "varchar")], &[]);
+    let (k, t) = table(
+        &ivs[0].name,
+        &[("_lv_c0", "int"), ("_lv_c1", "varchar")],
+        &[],
+    );
     cat.insert(k, t);
     let super::Outcome::Plan(v) = outcome(sql, &cat) else {
         panic!("expected a plan")
