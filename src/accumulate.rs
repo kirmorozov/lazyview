@@ -92,6 +92,25 @@ impl UnitSet {
     }
 }
 
+/// The dedup core's id set is the same pair of sets: moved, not copied.
+impl From<crate::dedup::IdSet> for UnitSet {
+    fn from(s: crate::dedup::IdSet) -> UnitSet {
+        UnitSet {
+            ints: s.ints,
+            keys: s.keys,
+        }
+    }
+}
+
+impl From<UnitSet> for crate::dedup::IdSet {
+    fn from(u: UnitSet) -> crate::dedup::IdSet {
+        crate::dedup::IdSet {
+            ints: u.ints,
+            keys: u.keys,
+        }
+    }
+}
+
 /// Consumes a [`UnitSet`] chunk by chunk, materializing each chunk only when it is requested
 /// (the chunk size may change from one chunk to the next). Order as in [`UnitSet::chunks`]:
 /// sorted integer keys first, then the other keys.

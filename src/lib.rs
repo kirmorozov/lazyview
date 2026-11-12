@@ -13,6 +13,7 @@ pub mod datum;
 pub mod ddl;
 pub mod dedup;
 pub mod engine;
+pub mod exec;
 pub mod fence;
 pub mod health;
 pub mod intset;
