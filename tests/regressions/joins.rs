@@ -147,19 +147,14 @@ fn reg_hop_selects_cover_the_view_ids() {
         ];
         let (db, eng) = setup(&ctx, "reg_hop", &ddl, &specs, &[]).await?;
         let mut c = db.conn().await?;
-        let mut collations = std::collections::HashMap::new();
+        let mut catalog = lazyview::catalog::Catalog::default();
         let mut tables = std::collections::HashMap::new();
         for name in ["items", "docs", "entities", "orders", "customers"] {
-            let t = lazyview::catalog::load_table(
-                &mut c,
-                &db.name,
-                name,
-                ctx.server().is_mariadb(),
-                &mut collations,
-            )
-            .await?
-            .with_context(|| format!("table {name}"))?;
-            tables.insert((db.name.clone(), name.to_string()), std::sync::Arc::new(t));
+            let t = catalog
+                .get(&mut c, &db.name, name, ctx.server().is_mariadb())
+                .await?
+                .with_context(|| format!("table {name}"))?;
+            tables.insert((db.name.clone(), name.to_string()), t);
         }
         let mut hops = 0usize;
         for s in &specs {
@@ -266,19 +261,14 @@ fn reg_hop_select_after_link_delete() {
         let mut c = db.conn().await?;
         exec_all(&mut c, &["DELETE FROM docs WHERE id = 1"]).await?;
         verify(&ctx, &mut eng, &db, &specs, "doc 1 deleted").await?;
-        let mut collations = std::collections::HashMap::new();
+        let mut catalog = lazyview::catalog::Catalog::default();
         let mut tables = std::collections::HashMap::new();
         for name in ["items", "docs"] {
-            let t = lazyview::catalog::load_table(
-                &mut c,
-                &db.name,
-                name,
-                ctx.server().is_mariadb(),
-                &mut collations,
-            )
-            .await?
-            .with_context(|| format!("table {name}"))?;
-            tables.insert((db.name.clone(), name.to_string()), std::sync::Arc::new(t));
+            let t = catalog
+                .get(&mut c, &db.name, name, ctx.server().is_mariadb())
+                .await?
+                .with_context(|| format!("table {name}"))?;
+            tables.insert((db.name.clone(), name.to_string()), t);
         }
         let p = lazyview::analyze::plan(
             &lazyview::analyze::parse_definition(&specs[0].definition).unwrap(),

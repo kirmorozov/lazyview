@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Conn;
 
@@ -333,7 +333,7 @@ impl Catalog {
     }
 }
 
-pub async fn load_table(
+async fn load_table(
     conn: &mut Conn,
     schema: &str,
     name: &str,
@@ -343,12 +343,7 @@ pub async fn load_table(
     let Some(columns) = load_columns(conn, schema, name, mariadb, default_collations).await? else {
         return Ok(None);
     };
-    let pk_names = load_pk(conn, schema, name).await?;
-    let unique_keys = load_unique_keys(conn, schema, name, &columns).await?;
-    let pk = pk_names
-        .iter()
-        .filter_map(|n| columns.iter().position(|c| &c.name == n))
-        .collect();
+    let (pk, unique_keys) = load_keys(conn, schema, name, &columns).await?;
     let cascades = load_foreign_keys(conn, schema, name, &columns).await?;
     let (is_view, view_bases) = load_view_bases(conn, schema, name).await?;
     Ok(Some(TableInfo {
@@ -453,37 +448,28 @@ async fn load_columns(
     Ok(Some(columns))
 }
 
-/// PRIMARY key column names in `ORDINAL_POSITION` order.
-async fn load_pk(conn: &mut Conn, schema: &str, name: &str) -> Result<Vec<String>> {
-    let pk_names: Vec<String> = conn
-        .exec(
-            "SELECT CAST(COLUMN_NAME AS CHAR) FROM information_schema.KEY_COLUMN_USAGE \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION",
-            (schema, name),
-        )
-        .await?;
-    Ok(pk_names)
-}
-
-/// Other keys that identify a row, from `information_schema.STATISTICS`.
-async fn load_unique_keys(
+/// The PRIMARY key ordinals and the other keys that identify a row, from one
+/// `information_schema.STATISTICS` read (the PK is the `PRIMARY` group; PK columns are
+/// always whole and NOT NULL on every flavor, so the filters that reject a prefix,
+/// functional or nullable column cannot drop one).
+async fn load_keys(
     conn: &mut Conn,
     schema: &str,
     name: &str,
     columns: &[Column],
-) -> Result<Vec<Vec<usize>>> {
+) -> Result<(Vec<usize>, Vec<Vec<usize>>)> {
     type KeyRow = (String, u64, Option<String>, Option<u64>, String);
     let key_rows: Vec<KeyRow> = conn
         .exec(
             "SELECT CAST(INDEX_NAME AS CHAR), SEQ_IN_INDEX, CAST(COLUMN_NAME AS CHAR), SUB_PART, \
              CAST(COALESCE(NULLABLE, '') AS CHAR) \
              FROM information_schema.STATISTICS \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0 AND INDEX_NAME <> 'PRIMARY' \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0 \
              ORDER BY INDEX_NAME, SEQ_IN_INDEX",
             (schema, name),
         )
         .await?;
-    Ok(unique_keys_from(&key_rows, columns))
+    keys_from(name, &key_rows, columns)
 }
 
 /// Foreign keys of this (child) table that change child rows, grouped by constraint name from
@@ -514,7 +500,9 @@ async fn load_foreign_keys(
             continue;
         }
         let Some(ci) = columns.iter().position(|c| c.name == col) else {
-            continue;
+            // The FK rows and COLUMNS come from this connection's `information_schema` for the
+            // same (schema, table): a missing column is broken metadata, never a lost cascade.
+            bail!("internal: FK `{cname}` of table `{name}` names column `{col}`, which the table does not have");
         };
         if last.as_deref() != Some(cname.as_str()) {
             cascades.push(ForeignKey {
@@ -559,44 +547,64 @@ async fn load_view_bases(
     })
 }
 
-/// UNIQUE keys usable as row keys: whole columns only (no prefix `SUB_PART`, no functional
-/// part, which has no column name), every column NOT NULL (a nullable unique column admits
-/// several NULL rows). Rows come ordered by index name and sequence.
-fn unique_keys_from(
+/// The PRIMARY key ordinals and the other UNIQUE keys usable as row keys: whole columns only
+/// (no prefix `SUB_PART`, no functional part, which has no column name), every column NOT NULL
+/// (a nullable unique column admits several NULL rows). Rows come ordered by index name and
+/// sequence. An index column the table does not have is broken metadata: a loud error naming
+/// table and column, never a silently shorter key (`TableInfo::row_key` feeds the dedup key).
+fn keys_from(
+    table: &str,
     rows: &[(String, u64, Option<String>, Option<u64>, String)],
     columns: &[Column],
-) -> Vec<Vec<usize>> {
+) -> Result<(Vec<usize>, Vec<Vec<usize>>)> {
+    let mut pk: Vec<usize> = Vec::new();
     let mut out: Vec<Vec<usize>> = Vec::new();
     let mut current: Option<(String, Option<Vec<usize>>)> = None;
-    let flush = |cur: &mut Option<(String, Option<Vec<usize>>)>, out: &mut Vec<Vec<usize>>| {
-        if let Some((_, Some(k))) = cur.take() {
-            if !k.is_empty() && !out.contains(&k) {
-                out.push(k);
+    let flush = |cur: &mut Option<(String, Option<Vec<usize>>)>,
+                 pk: &mut Vec<usize>,
+                 out: &mut Vec<Vec<usize>>| {
+        if let Some((index, Some(k))) = cur.take() {
+            if !k.is_empty() {
+                if index == "PRIMARY" {
+                    *pk = k;
+                } else {
+                    out.push(k);
+                }
             }
         }
     };
     for (index, _, col, sub_part, _) in rows {
         if current.as_ref().map(|(n, _)| n != index).unwrap_or(true) {
-            flush(&mut current, &mut out);
+            flush(&mut current, &mut pk, &mut out);
             current = Some((index.clone(), Some(Vec::new())));
         }
         let Some((_, key)) = &mut current else {
             continue;
         };
-        let ci = col
-            .as_deref()
-            .and_then(|c| columns.iter().position(|x| x.name == c));
+        let ci = match col.as_deref() {
+            Some(c) => match columns.iter().position(|x| x.name == c) {
+                Some(ci) => Some(ci),
+                None => bail!(
+                    "internal: index `{index}` of table `{table}` names column `{c}`, which the table does not have"
+                ),
+            },
+            None => None,
+        };
         match (ci, sub_part) {
             (Some(ci), None) if !columns[ci].nullable => {
                 if let Some(k) = key {
                     k.push(ci);
                 }
             }
+            _ if index == "PRIMARY" => bail!(
+                "internal: table `{table}` has an unusable PRIMARY column ({}: functional, prefix or nullable)",
+                col.as_deref().unwrap_or("(functional)")
+            ),
             _ => *key = None,
         }
     }
-    flush(&mut current, &mut out);
-    out
+    flush(&mut current, &mut pk, &mut out);
+    Ok((pk, out))
 }
 
 /// Ordinals of the columns a generated column's expression reads (parsed with the MySQL

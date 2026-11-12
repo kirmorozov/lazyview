@@ -16,6 +16,7 @@ fn unique_keys_and_generated_dependencies() {
         (i.to_string(), n, c.map(str::to_string), sub, String::new())
     };
     let rows = vec![
+        row("PRIMARY", 1, Some("id"), None),
         row("u_ab", 1, Some("a"), None),
         row("u_ab", 2, Some("b"), None),
         row("u_code", 1, Some("code"), None),
@@ -24,7 +25,9 @@ fn unique_keys_and_generated_dependencies() {
         row("u_pref", 1, Some("code"), Some(3)),
         row("u_pref", 2, Some("a"), None),
     ];
-    assert_eq!(unique_keys_from(&rows, &cols), vec![vec![3, 4], vec![1]]);
+    let (pk, keys) = keys_from("items", &rows, &cols).unwrap();
+    assert_eq!(pk, vec![0]);
+    assert_eq!(keys, vec![vec![3, 4], vec![1]]);
     let names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
     assert_eq!(generated_deps("(`a` + `b`)", &names), Some(vec![3, 4]));
     assert_eq!(generated_deps("`a` * 2", &names), Some(vec![3]));
