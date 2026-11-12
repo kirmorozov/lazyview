@@ -171,6 +171,49 @@ pub(super) fn value_str(v: Option<&Value>) -> String {
     }
 }
 
+/// `ER_UNKNOWN_SYSTEM_VARIABLE`: the server's own verdict that a variable does not exist.
+const ER_UNKNOWN_SYSTEM_VARIABLE: u16 = 1193;
+
+/// Reads `@@GLOBAL.<var>`.
+/// `None` only when the server says the variable does not exist (1193); any other error is fatal.
+pub(super) async fn probe_var(conn: &mut Conn, var: &str) -> Result<Option<String>> {
+    match conn
+        .query_first::<Value, _>(format!("SELECT @@GLOBAL.{var}"))
+        .await
+    {
+        Ok(v) => Ok(Some(value_str(v.as_ref()))),
+        Err(e) if probe_var_is_absent(&e) => Ok(None),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading @@GLOBAL.{var}"))),
+    }
+}
+
+/// Whether `err` is the "unknown system variable" code and nothing else.
+pub(super) fn probe_var_is_absent(err: &mysql_async::Error) -> bool {
+    matches!(
+        err,
+        mysql_async::Error::Server(se) if se.code == ER_UNKNOWN_SYSTEM_VARIABLE
+    )
+}
+
+/// [`probe_var`] repeated across transient failures: 5 attempts, 200 ms × 2ⁿ capped at 2 s. The
+/// `SELECT` is idempotent, so a repeat is a re-read. This file is copy set, so it owns its small
+/// loop: no metrics and no logging — the heartbeat is the engine's job, and the engine's startup
+/// path already retries the whole [`server_info`] call through `connect_wait`.
+async fn probe_var_retry(conn: &mut Conn, var: &str) -> Result<Option<String>> {
+    let mut attempt = 1;
+    loop {
+        match probe_var(conn, var).await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt >= 5 => return Err(e),
+            Err(_) => {
+                let ms = (200u64 << (attempt - 1)).min(2_000);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Checks `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`; returns a clear error
 /// listing every violated requirement.
 ///
@@ -192,37 +235,27 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     let format = value_str(row.as_ref(2));
     let image = value_str(row.as_ref(3));
     let flavor = Flavor::from_version(&version);
-    let mut compress = String::new();
-    let mut storage_engine = String::new();
+    let mut compress: Option<String> = None;
+    let mut storage_engine: Option<String> = None;
     if flavor == Flavor::MariaDb {
-        // Variables missing on older servers (binlog_storage_engine before 12.3): nothing to
-        // check.
-        let v: Option<Value> = conn
-            .query_first("SELECT @@GLOBAL.log_bin_compress")
-            .await
-            .unwrap_or(None);
-        compress = value_str(v.as_ref());
-        let v: Option<Value> = conn
-            .query_first("SELECT @@GLOBAL.binlog_storage_engine")
-            .await
-            .unwrap_or(None);
-        storage_engine = value_str(v.as_ref());
+        // Variables missing on older servers (binlog_storage_engine before 12.3) come back `None`:
+        // nothing to check. A probe that only failed is an error, never "absent".
+        compress = probe_var_retry(conn, "log_bin_compress").await?;
+        storage_engine = probe_var_retry(conn, "binlog_storage_engine").await?;
     }
     let mut problems = requirement_problems(
         flavor,
         &log_bin,
         &format,
         &image,
-        &compress,
-        &storage_engine,
+        compress.as_deref().unwrap_or(""),
+        storage_engine.as_deref().unwrap_or(""),
     );
     if flavor == Flavor::MySql {
         // Partial JSON row images carry diffs instead of values; lazyview needs full values.
-        let opts: Option<Value> = conn
-            .query_first("SELECT @@GLOBAL.binlog_row_value_options")
-            .await
-            .unwrap_or(None);
-        if value_str(opts.as_ref())
+        let opts = probe_var_retry(conn, "binlog_row_value_options").await?;
+        if opts
+            .unwrap_or_default()
             .to_ascii_uppercase()
             .contains("PARTIAL_JSON")
         {

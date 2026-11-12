@@ -785,3 +785,18 @@ fn flavor_detection() {
     assert_eq!(Flavor::from_version("9.7.2-2"), Flavor::MySql);
     assert_eq!(Flavor::from_version("26.7.0"), Flavor::MySql);
 }
+
+#[test]
+fn probe_absent_only_for_unknown_variable() {
+    let se = |code| {
+        mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: "x".into(),
+            state: "HY000".into(),
+        })
+    };
+    // 1193 ER_UNKNOWN_SYSTEM_VARIABLE: the server says the variable does not exist.
+    assert!(connect::probe_var_is_absent(&se(1193)));
+    // 2013 lost connection: a blip, so it must fail preflight, never read as "absent".
+    assert!(!connect::probe_var_is_absent(&se(2013)));
+}
