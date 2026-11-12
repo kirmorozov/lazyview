@@ -1389,13 +1389,13 @@ async fn stream_mariadb_partial_rows_reassembled() {
         } else {
             None
         };
-        let Some(default) = threshold else {
+        if threshold.is_none() {
             println!(
                 "stream_mariadb_partial_rows_reassembled [{name}]: no binlog_row_event_fragment_threshold on {}, skipping",
                 info.version
             );
             return Ok(());
-        };
+        }
         let s = unique_schema("pr");
         w.query_drop(format!("CREATE DATABASE `{s}`")).await?;
         w.query_drop(format!(
@@ -1403,14 +1403,15 @@ async fn stream_mariadb_partial_rows_reassembled() {
         ))
         .await?;
         let start = current_position(&mut w).await?;
-        w.query_drop("SET GLOBAL binlog_row_event_fragment_threshold = 1024")
-            .await?;
-        let res = partial_rows_workload(&dsn, &mut w, &s, &start).await;
         // The server's setting comes back whatever happened (the schema stays for a failure).
-        w.query_drop(format!(
-            "SET GLOBAL binlog_row_event_fragment_threshold = {default}"
-        ))
+        let mut globals = common::Globals::set(
+            &mut w,
+            &dsn,
+            &[("binlog_row_event_fragment_threshold", "1024")],
+        )
         .await?;
+        let res = partial_rows_workload(&dsn, &mut w, &s, &start).await;
+        globals.restore(&mut w).await?;
         res?;
         w.query_drop(format!("DROP DATABASE `{s}`")).await?;
         Ok(())

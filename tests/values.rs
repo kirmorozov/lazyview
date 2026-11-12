@@ -521,19 +521,14 @@ fn values_timestamp_dst_fall_back() {
         // SET GLOBAL time_zone affects every connection on the server, so a suite running in
         // parallel against the same servers would see shifted DATE()s. Opt-in: CI sets it (it
         // runs one test binary at a time).
-        if std::env::var("LAZYVIEW_TEST_GLOBAL_TZ")
-            .map(|v| v != "1")
-            .unwrap_or(true)
-        {
+        if !opted_in("LAZYVIEW_TEST_GLOBAL_TZ") {
             ctx.note("SKIP: changes GLOBAL time_zone; set LAZYVIEW_TEST_GLOBAL_TZ=1 to run it");
             return Ok(());
         }
-        let old = scalar(&mut admin, "SELECT @@GLOBAL.time_zone")
-            .await?
-            .unwrap_or_else(|| "SYSTEM".into());
-        exec(&mut admin, "SET GLOBAL time_zone = 'Europe/Berlin'").await?;
+        let mut globals =
+            Globals::set(&mut admin, &db.dsn, &[("time_zone", "Europe/Berlin")]).await?;
         let r = dst_scenario(&ctx, &db).await;
-        let restored = exec(&mut admin, &format!("SET GLOBAL time_zone = {}", q(&old))).await;
+        let restored = globals.restore(&mut admin).await;
         r.and(restored)
     });
 }

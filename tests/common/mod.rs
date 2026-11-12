@@ -34,12 +34,14 @@ use rand::RngExt;
 use tokio::sync::{oneshot, watch};
 
 pub use engine::*;
+pub use globals::*;
 pub use meta::*;
 pub use oracle::{check_views, check_views_targets, Kind, ViewSpec};
 pub use renamed::*;
 use renamed::{compare_renamed, observed, renamed_schemas};
 
 mod engine;
+mod globals;
 mod meta;
 mod renamed;
 

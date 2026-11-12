@@ -667,10 +667,7 @@ fn reg_unparseable_definition_keeps_its_table() {
 #[test]
 fn reg_global_sql_mode_parser_flags() {
     scenario("reg_sql_mode", |ctx| async move {
-        if std::env::var("LAZYVIEW_TEST_GLOBAL_SQL_MODE")
-            .map(|v| v != "1")
-            .unwrap_or(true)
-        {
+        if !opted_in("LAZYVIEW_TEST_GLOBAL_SQL_MODE") {
             ctx.note(
                 "SKIP: changes GLOBAL sql_mode; set LAZYVIEW_TEST_GLOBAL_SQL_MODE=1 to run it",
             );
@@ -678,16 +675,19 @@ fn reg_global_sql_mode_parser_flags() {
         }
         let db = ctx.new_db("reg_sql_mode").await?;
         let mut admin = db.conn().await?;
+        // The mode to set: the server's current one plus the two flags (what the old
+        // `CONCAT(@@GLOBAL.sql_mode, ...)` built, from one read), so the guard sets a literal.
         let old = scalar(&mut admin, "SELECT CAST(@@GLOBAL.sql_mode AS CHAR)")
             .await?
             .unwrap_or_default();
-        exec(
-            &mut admin,
-            "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ANSI_QUOTES,PIPES_AS_CONCAT')",
-        )
-        .await?;
+        let want = if old.is_empty() {
+            "ANSI_QUOTES,PIPES_AS_CONCAT".to_string()
+        } else {
+            format!("{old},ANSI_QUOTES,PIPES_AS_CONCAT")
+        };
+        let mut globals = Globals::set(&mut admin, &db.dsn, &[("sql_mode", &want)]).await?;
         let r = sql_mode_scenario(&ctx, &db).await;
-        let restored = exec(&mut admin, &format!("SET GLOBAL sql_mode = {}", q(&old))).await;
+        let restored = globals.restore(&mut admin).await;
         r.and(restored)
     });
 }

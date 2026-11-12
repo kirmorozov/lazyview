@@ -10,7 +10,7 @@ mod common;
 
 use std::sync::Mutex;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Result};
 use common::*;
 use mysql_async::Conn;
 
@@ -44,10 +44,6 @@ fn view() -> ViewSpec {
 const OPT_IN: &str = "LAZYVIEW_TEST_GLOBAL_BINLOG_COMMIT";
 const OPT_IN_SKIP: &str = "changes GLOBAL sync_binlog, binlog_group_commit_sync_delay and binlog_order_commits; set LAZYVIEW_TEST_GLOBAL_BINLOG_COMMIT=1 to run it";
 
-fn opted_in() -> bool {
-    std::env::var(OPT_IN).map(|v| v == "1").unwrap_or(false)
-}
-
 /// `None`: Oracle MySQL with `gtid_mode=OFF`, where the commit fence applies. Otherwise the reason.
 async fn fence_applies(conn: &mut Conn) -> Result<Option<String>> {
     let comment = scalar(conn, "SELECT @@version_comment")
@@ -66,101 +62,6 @@ async fn fence_applies(conn: &mut Conn) -> Result<Option<String>> {
         )));
     }
     Ok(None)
-}
-
-/// A numeric value as a number (the server rejects a quoted string for an integer variable),
-/// anything else as a string literal (`ON`, `OFF`).
-fn lit(value: &str) -> String {
-    if value.parse::<i64>().is_ok() {
-        value.to_string()
-    } else {
-        q(value)
-    }
-}
-
-/// Puts back `SET GLOBAL name = value` for each pair: every pair is tried, the errors are reported
-/// together.
-async fn apply(conn: &mut Conn, values: &[(String, String)]) -> Result<()> {
-    let mut errs = Vec::new();
-    for (name, value) in values {
-        if let Err(e) = exec(conn, &format!("SET GLOBAL {name} = {}", lit(value))).await {
-            errs.push(format!("{name}: {e:#}"));
-        }
-    }
-    ensure!(errs.is_empty(), "SET GLOBAL failed: {}", errs.join("; "));
-    Ok(())
-}
-
-/// Server globals saved before a test changed them. [`Globals::restore`] puts them back on the
-/// normal path; `Drop` restores them from a thread of its own if the test ended early.
-struct Globals {
-    dsn: String,
-    saved: Vec<(String, String)>,
-    restored: bool,
-}
-
-impl Globals {
-    /// Saves the current values of `changes`' names, then applies `changes`.
-    async fn set(admin: &mut Conn, dsn: &str, changes: &[(&str, &str)]) -> Result<Globals> {
-        let mut saved = Vec::new();
-        for (name, _) in changes {
-            let v = scalar(admin, &format!("SELECT @@GLOBAL.{name}"))
-                .await?
-                .with_context(|| format!("@@GLOBAL.{name} is NULL"))?;
-            saved.push((name.to_string(), v));
-        }
-        let mut g = Globals {
-            dsn: dsn.to_string(),
-            saved,
-            restored: false,
-        };
-        // In order, stopping at the first failure: a half-applied change set is put back from
-        // `saved` and the test fails with the SET error.
-        for (name, value) in changes {
-            if let Err(e) = exec(admin, &format!("SET GLOBAL {name} = {}", lit(value))).await {
-                let _ = g.restore(admin).await;
-                return Err(e.context(format!("SET GLOBAL {name}")));
-            }
-        }
-        Ok(g)
-    }
-
-    async fn restore(&mut self, admin: &mut Conn) -> Result<()> {
-        apply(admin, &self.saved).await?;
-        self.restored = true;
-        Ok(())
-    }
-}
-
-impl Drop for Globals {
-    fn drop(&mut self) {
-        if self.restored {
-            return;
-        }
-        let (dsn, values) = (self.dsn.clone(), self.saved.clone());
-        // Drop cannot await: restore on a runtime of this thread (never nested in the test's).
-        let res = std::thread::spawn(move || -> Result<()> {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
-                let mut c = connect(&dsn).await?;
-                apply(&mut c, &values).await
-            })
-        })
-        .join();
-        match res {
-            Ok(Ok(())) => eprintln!("globals restored on drop"),
-            _ => eprintln!(
-                "GLOBALS NOT RESTORED, run by hand: {}",
-                self.saved
-                    .iter()
-                    .map(|(n, v)| format!("SET GLOBAL {n} = {};", lit(v)))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
-        }
-    }
 }
 
 /// The test's result, or the first error: the run's, then the globals restore's.
@@ -245,7 +146,7 @@ async fn off_run(ctx: &Ctx, db: &Db, specs: &[ViewSpec]) -> Result<(usize, std::
 fn visibility_commit_fence_exact() {
     let _serial = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
     scenario("visibility_commit_fence_exact", |ctx| async move {
-        if !opted_in() {
+        if !opted_in(OPT_IN) {
             ctx.skip(OPT_IN_SKIP);
             return Ok(());
         }
@@ -276,7 +177,7 @@ fn visibility_order_commits_off_falls_back() {
     scenario(
         "visibility_order_commits_off_falls_back",
         |ctx| async move {
-            if !opted_in() {
+            if !opted_in(OPT_IN) {
                 ctx.skip(OPT_IN_SKIP);
                 return Ok(());
             }

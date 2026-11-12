@@ -1201,10 +1201,7 @@ fn lifecycle_refuses_log_bin_compress() {
             );
             return Ok(());
         }
-        if std::env::var("LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS")
-            .map(|v| v != "1")
-            .unwrap_or(true)
-        {
+        if !opted_in("LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS") {
             ctx.skip(
                 "changes GLOBAL log_bin_compress; set LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1 to run it",
             );
@@ -1216,18 +1213,12 @@ fn lifecycle_refuses_log_bin_compress() {
         let mut c = db.conn().await?;
         ensure_lazyview_table(&mut c).await?;
         add_views(&mut c, &specs).await?;
-        let old = scalar(&mut c, "SELECT @@GLOBAL.log_bin_compress").await?;
-        let old = if old.as_deref() == Some("1") {
-            "ON"
-        } else {
-            "OFF"
-        };
-        exec(&mut c, "SET GLOBAL log_bin_compress = ON").await?;
+        let mut globals = Globals::set(&mut c, &db.dsn, &[("log_bin_compress", "ON")]).await?;
         let refused = match ctx.start_engine(&db, &[]) {
             Ok(eng) => eng.wait_finished(Duration::from_secs(60)).await,
             Err(e) => Err(e),
         };
-        let restored = exec(&mut c, &format!("SET GLOBAL log_bin_compress = {old}")).await;
+        let restored = globals.restore(&mut c).await;
         match refused? {
             Err(e) if e.contains("log_bin_compress is ON") => {}
             other => bail!("expected a refusal naming log_bin_compress, got {other:?}"),
