@@ -1,6 +1,8 @@
 use super::vocab::*;
 use super::*;
 
+pub(crate) use crate::analyzer::object_table_ref;
+
 /// The statement as written in `_lazyview.definition`.
 #[derive(Debug, Clone)]
 pub struct ParsedDef {
@@ -172,7 +174,7 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
             t => bail!("unexpected `{t}` after the end of the SELECT statement"),
         }
     }
-    let offsets = Offsets::new(def);
+    let text = crate::analyzer::Text::new(def, tokens.clone());
     // The SELECT as written: its first token up to the last one before the trailing clauses.
     let end = rest
         .iter()
@@ -185,14 +187,14 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
     let query_sql = body
         .first()
         .zip(body.last())
-        .and_then(|(a, b)| offsets.text(a, b))
+        .and_then(|(a, b)| text.text(a, b))
         .filter(|sql| {
             parse_sql(sql, |p| p.parse_query()).map(|q| q.to_string()) == Some(query.to_string())
         })
         .map(str::to_string)
         .unwrap_or_else(|| query.to_string());
     let item_sql = match query.body.as_ref() {
-        SetExpr::Select(sel) => select_item_sql(&tokens, sel, &offsets),
+        SetExpr::Select(sel) => text.items(sel),
         _ => Vec::new(),
     };
     let name = parts.pop().unwrap();
@@ -245,105 +247,10 @@ pub fn parse_select(sql: &str, name: &str) -> Result<ParsedDef> {
     Ok(def)
 }
 
+/// Tokens of `sql` with locations, without unescaping (the analyzer's tokenizer, see
+/// [`crate::analyzer::source`]).
 pub(crate) fn tokenize(sql: &str) -> Result<Vec<TokenWithSpan>> {
-    Tokenizer::new(&MySqlDialect {}, sql)
-        .with_unescape(false)
-        .tokenize_with_location()
-        .map_err(|e| anyhow!("tokenize: {e}"))
-}
-
-/// Maps tokenizer locations (1-based lines and character columns) to byte offsets of a string.
-struct Offsets<'a> {
-    sql: &'a str,
-    line_starts: Vec<usize>,
-}
-
-impl<'a> Offsets<'a> {
-    fn new(sql: &'a str) -> Self {
-        let line_starts = std::iter::once(0)
-            .chain(sql.match_indices('\n').map(|(i, _)| i + 1))
-            .collect();
-        Offsets { sql, line_starts }
-    }
-
-    fn at(&self, loc: Location) -> Option<usize> {
-        let line = usize::try_from(loc.line).ok()?.checked_sub(1)?;
-        let col = usize::try_from(loc.column).ok()?.checked_sub(1)?;
-        let start = *self.line_starts.get(line)?;
-        self.sql[start..]
-            .char_indices()
-            .map(|(i, _)| start + i)
-            .chain(std::iter::once(self.sql.len()))
-            .nth(col)
-    }
-
-    /// Source text from the start of token `a` to the end of token `b`.
-    fn text(&self, a: &TokenWithSpan, b: &TokenWithSpan) -> Option<&'a str> {
-        self.sql.get(self.at(a.span.start)?..self.at(b.span.end)?)
-    }
-}
-
-/// Source text of each projection item of `select`, kept only where it parses back to the same
-/// item.
-fn select_item_sql(
-    tokens: &[TokenWithSpan],
-    select: &Select,
-    offsets: &Offsets,
-) -> Vec<Option<String>> {
-    match split_projection(tokens, select.select_token.0.span.start, offsets) {
-        Some(texts) if texts.len() == select.projection.len() => texts
-            .into_iter()
-            .zip(&select.projection)
-            .map(|(text, item)| {
-                let parsed = parse_sql(text, |p| p.parse_select_item())?;
-                (parsed.to_string() == item.to_string()).then(|| text.to_string())
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Splits the projection list after the `SELECT` keyword at `select_at` at its top-level commas.
-fn split_projection<'a>(
-    tokens: &[TokenWithSpan],
-    select_at: Location,
-    offsets: &Offsets<'a>,
-) -> Option<Vec<&'a str>> {
-    let is_word = |t: &Token, list: &[&str]| matches!(t, Token::Word(w) if w.quote_style.is_none() && list.iter().any(|k| w.value.eq_ignore_ascii_case(k)));
-    let mut i = tokens.iter().position(|t| t.span.start == select_at)? + 1;
-    while tokens.get(i).is_some_and(|t| {
-        matches!(t.token, Token::Whitespace(_)) || is_word(&t.token, SELECT_MODIFIERS)
-    }) {
-        i += 1;
-    }
-    let mut items = Vec::new();
-    let (mut depth, mut first, mut last) = (0usize, None, None);
-    loop {
-        let t = tokens.get(i);
-        let at_end = match t.map(|t| &t.token) {
-            None | Some(Token::EOF | Token::SemiColon) => true,
-            Some(Token::Comma | Token::RParen) => depth == 0,
-            Some(tok) => depth == 0 && is_word(tok, PROJECTION_END),
-        };
-        if at_end {
-            items.push(offsets.text(first?, last?)?);
-            if !matches!(t.map(|t| &t.token), Some(Token::Comma)) {
-                return Some(items);
-            }
-            (first, last) = (None, None);
-        } else {
-            match t.map(|t| &t.token) {
-                Some(Token::LParen) => depth += 1,
-                Some(Token::RParen) => depth -= 1,
-                _ => {}
-            }
-            if !matches!(t.map(|t| &t.token), Some(Token::Whitespace(_))) {
-                first = first.or(t);
-                last = t;
-            }
-        }
-        i += 1;
-    }
+    crate::analyzer::tokenize(sql).ok_or_else(|| anyhow!("tokenize: the text does not tokenize"))
 }
 
 /// Every table a statement reads, including inside subqueries (used for full-refresh views and
@@ -433,20 +340,4 @@ pub fn function_calls(query: &Query) -> Vec<(Option<String>, String)> {
         ControlFlow::<()>::Continue(())
     });
     out.into_iter().collect()
-}
-
-pub(crate) fn object_table_ref(name: &ObjectName, default_schema: &str) -> Option<TableRef> {
-    let idents: Vec<String> = name
-        .0
-        .iter()
-        .map(|p| match p {
-            ObjectNamePart::Identifier(i) => Some(ident_name(i)),
-            _ => None,
-        })
-        .collect::<Option<_>>()?;
-    match idents.as_slice() {
-        [t] => Some((default_schema.to_string(), t.clone())),
-        [s, t] => Some((s.clone(), t.clone())),
-        _ => None,
-    }
 }

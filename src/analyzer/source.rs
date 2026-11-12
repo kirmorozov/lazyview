@@ -93,7 +93,7 @@ impl<'a> Text<'a> {
             .nth(col)
     }
 
-    fn text(&self, a: &TokenWithSpan, b: &TokenWithSpan) -> Option<&'a str> {
+    pub(crate) fn text(&self, a: &TokenWithSpan, b: &TokenWithSpan) -> Option<&'a str> {
         self.sql.get(self.at(a.span.start)?..self.at(b.span.end)?)
     }
 

@@ -16,7 +16,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Word};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Word};
 
 use crate::analyzer::expr_key;
 use crate::catalog::{ColKind, FkAction, TableInfo, TableRef, TypeFamily};

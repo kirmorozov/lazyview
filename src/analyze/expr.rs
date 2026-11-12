@@ -1,6 +1,8 @@
 use super::*;
 use super::{parse::*, plan::*, routes::*, vocab::*};
 
+pub(crate) use crate::analyzer::{function_name, has_subquery};
+
 /// Column reference resolved against the FROM clause.
 pub(crate) type ColRef = (usize, usize);
 
@@ -110,21 +112,6 @@ impl Usage<'_> {
             ControlFlow::<()>::Continue(())
         });
     }
-}
-
-pub(crate) fn has_subquery(e: &Expr) -> bool {
-    let mut found = false;
-    let _ = visit_expressions(e, |x: &Expr| {
-        if matches!(
-            x,
-            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }
-        ) {
-            found = true;
-            return ControlFlow::Break(());
-        }
-        ControlFlow::Continue(())
-    });
-    found
 }
 
 /// The tables the subqueries of an ORDER BY read, each with the columns those subqueries may
@@ -685,13 +672,6 @@ pub(crate) fn json_valued(e: &Expr, json_col: &dyn Fn(&Expr) -> bool) -> bool {
                     .is_some_and(|x| json_valued(x, json_col))
         }
         _ => json_computed(e),
-    }
-}
-
-pub(crate) fn function_name(f: &sqlparser::ast::Function) -> String {
-    match f.name.0.last() {
-        Some(ObjectNamePart::Identifier(i)) => ident_name(i).to_ascii_uppercase(),
-        _ => String::new(),
     }
 }
 

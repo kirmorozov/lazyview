@@ -1,5 +1,7 @@
 use super::*;
 
+pub(crate) use crate::analyzer::AGGREGATES;
+
 /// Placeholder table name used to render "FROM with one table replaced by literal rows".
 pub(crate) const SUBST_MARKER: &str = "__lv_subst_marker__";
 
@@ -9,27 +11,6 @@ pub(crate) const SUBST_MARKER: &str = "__lv_subst_marker__";
 pub(crate) fn semi_table_marker(alias: usize) -> String {
     format!("__lv_semi_table_{alias}__")
 }
-
-pub(crate) const AGGREGATES: &[&str] = &[
-    "COUNT",
-    "SUM",
-    "AVG",
-    "MIN",
-    "MAX",
-    "GROUP_CONCAT",
-    "BIT_AND",
-    "BIT_OR",
-    "BIT_XOR",
-    "STD",
-    "STDDEV",
-    "STDDEV_POP",
-    "STDDEV_SAMP",
-    "VAR_POP",
-    "VAR_SAMP",
-    "VARIANCE",
-    "JSON_ARRAYAGG",
-    "JSON_OBJECTAGG",
-];
 
 pub(crate) const NONDETERMINISTIC: &[&str] = &[
     "NOW",
@@ -264,38 +245,6 @@ pub(crate) const NULL_STRICT: &[&str] = &[
     "JSON_PRETTY",
     "JSON_STORAGE_SIZE",
     "JSON_VALUE",
-];
-
-/// SELECT modifiers that may precede the first projection item.
-pub(crate) const SELECT_MODIFIERS: &[&str] = &[
-    "ALL",
-    "DISTINCT",
-    "DISTINCTROW",
-    "HIGH_PRIORITY",
-    "STRAIGHT_JOIN",
-    "SQL_SMALL_RESULT",
-    "SQL_BIG_RESULT",
-    "SQL_BUFFER_RESULT",
-    "SQL_NO_CACHE",
-    "SQL_CACHE",
-    "SQL_CALC_FOUND_ROWS",
-];
-
-/// Reserved words that end a projection list.
-pub(crate) const PROJECTION_END: &[&str] = &[
-    "FROM",
-    "INTO",
-    "WHERE",
-    "GROUP",
-    "HAVING",
-    "WINDOW",
-    "ORDER",
-    "LIMIT",
-    "UNION",
-    "EXCEPT",
-    "INTERSECT",
-    "FOR",
-    "LOCK",
 ];
 
 /// The name a (raw-tokenized) identifier stands for: a doubled quote character inside a quoted

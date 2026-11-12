@@ -29,6 +29,10 @@ use sqlparser::ast::{Query, SetExpr, TableFactor};
 use crate::analyze::{self, Mode, ParsedDef, ViewPlan};
 pub(crate) use normalize::expr_key;
 
+pub(crate) use ast::{function_name, has_subquery, object_table_ref};
+pub(crate) use normalize::AGGREGATES;
+pub(crate) use source::{tokenize, Text};
+
 /// The block planner's reason for a group key on the NULL side of a LEFT JOIN.
 const NULL_SIDE_KEY: &str = "group key on the NULL side of a LEFT JOIN";
 use crate::catalog::{TableInfo, TableRef};
