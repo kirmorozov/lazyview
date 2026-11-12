@@ -8,7 +8,8 @@ use anyhow::{anyhow, bail, Result};
 use mysql_async::Value;
 
 use crate::accumulate::{UnitChunk, UnitKind};
-use crate::mv::{Layout, Upsert, WriteOpts};
+use crate::analyze::quote_ident as q;
+use crate::mv::{Layout, MvCol, Upsert, WriteOpts};
 
 pub mod mysql;
 pub mod postgres;
@@ -243,7 +244,7 @@ pub(crate) async fn table_kind(
 ) -> Result<Option<String>> {
     match kind {
         Kind::Mysql => mysql::table_kind(conn, schema, name).await,
-        Kind::Postgres => postgres::table_kind(conn, schema, name).await,
+        Kind::Postgres => unreachable!("a PostgreSQL metadata read runs on the target's own connection          (PgConn::table_kind); the engine rejects a PostgreSQL build until T4"),
     }
 }
 
@@ -256,7 +257,7 @@ pub(crate) async fn table_columns(
 ) -> Result<Vec<(String, String)>> {
     match kind {
         Kind::Mysql => mysql::table_columns(conn, schema, name).await,
-        Kind::Postgres => postgres::table_columns(conn, schema, name).await,
+        Kind::Postgres => unreachable!("a PostgreSQL metadata read runs on the target's own connection          (PgConn::table_columns); the engine rejects a PostgreSQL build until T4"),
     }
 }
 
@@ -278,7 +279,9 @@ pub(crate) async fn has_row_index(
 ) -> Result<bool> {
     match kind {
         Kind::Mysql => mysql::has_row_index(conn, schema, table, layout).await,
-        Kind::Postgres => postgres::has_row_index(conn, schema, table, layout).await,
+        Kind::Postgres => unreachable!(
+            "a PostgreSQL metadata read runs on the target's own connection (PgConn::has_row_index); the engine rejects a PostgreSQL build until T4"
+        ),
     }
 }
 
@@ -291,7 +294,7 @@ pub(crate) async fn table_marker(
 ) -> Result<Option<String>> {
     match kind {
         Kind::Mysql => mysql::table_marker(conn, schema, name).await,
-        Kind::Postgres => postgres::table_marker(conn, schema, name).await,
+        Kind::Postgres => unreachable!("a PostgreSQL metadata read runs on the target's own connection          (PgConn::table_marker); the engine rejects a PostgreSQL build until T4"),
     }
 }
 
@@ -306,7 +309,9 @@ pub(crate) async fn create_shadow_marked(
 ) -> Result<String> {
     match kind {
         Kind::Mysql => mysql::create_shadow_marked(conn, schema, name, layout, marker).await,
-        Kind::Postgres => postgres::create_shadow(conn, schema, name, layout, marker).await,
+        Kind::Postgres => unreachable!(
+            "the PostgreSQL DDL runs on the target's own connection (PgConn::create_shadow); the engine rejects a PostgreSQL build until T4"
+        ),
     }
 }
 
@@ -378,5 +383,389 @@ pub(crate) async fn fence(kind: Kind, opts: &Opts, id: u32) -> Result<()> {
         (Kind::Mysql, Opts::Mysql(o)) => mysql::kill_and_wait(o, id).await,
         (Kind::Postgres, _) => postgres::fence(opts, id).await,
         _ => bail!("internal: target family and parsed DSN disagree"),
+    }
+}
+
+// --- The index planner (T3): which indexes a layout's table gets, and the key parts of each.
+// Family-independent code: a column's key widths come from the family of the view's most
+// restrictive target, the key text is quoted for the family whose table is being created, and
+// the byte budget is the view's (`Layout::key_budget`) instead of one family's constant. The
+// family modules only render what this decides (the index set is decided once per view).
+
+/// Key bytes an index of a MySQL-family target may use: InnoDB's limit (DYNAMIC row format).
+pub(crate) const MY_KEY_BYTES: u64 = 3072;
+/// Key bytes an index of a PostgreSQL target may use: the share of an 8 KiB page that is left to
+/// a b-tree tuple (0.6); its index names carry the 63-byte cap of [`postgres::index_name`].
+pub(crate) const PG_KEY_BYTES: u64 = 2704;
+/// Maximum number of columns in an index: InnoDB's limit, the tighter of the two families' so
+/// that both of a view's targets get the same index columns.
+const MAX_KEY_PARTS: usize = 16;
+
+/// The key bytes a view's indexes may use: the tightest limit among its targets, so the one
+/// index set this planner decides fits every table it is created in (T3.1). A MySQL-only view
+/// keeps 3072, the number every build used before PostgreSQL targets existed.
+pub(crate) fn min_key_budget(kinds: impl IntoIterator<Item = Kind>) -> u64 {
+    kinds
+        .into_iter()
+        .map(|k| match k {
+            Kind::Mysql => MY_KEY_BYTES,
+            Kind::Postgres => PG_KEY_BYTES,
+        })
+        .min()
+        .unwrap_or(MY_KEY_BYTES)
+}
+
+impl Kind {
+    /// The family a view's index choice is made for, from the key budget [`min_key_budget`] gave
+    /// it: any budget tighter than the MySQL family's means one of the view's targets is a
+    /// PostgreSQL one. One family decides for the whole view, because `crate::mv` writes one set
+    /// of ops to all of a view's targets and a row key cannot differ between them.
+    pub(crate) fn from_key_budget(key_budget: u64) -> Kind {
+        if key_budget < MY_KEY_BYTES {
+            Kind::Postgres
+        } else {
+            Kind::Mysql
+        }
+    }
+}
+
+/// The unique index behind [`crate::mv::Layout::row_key`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RowIndex {
+    /// The PRIMARY KEY on the unit.
+    Primary,
+    /// `_lv_row`, a UNIQUE index over these (whole) columns.
+    Unique(String),
+}
+
+/// How a column can be part of an index.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum KeyPart {
+    /// Fixed size, in bytes (an upper bound).
+    Fixed(u64),
+    /// String of `len` characters (bytes for binary strings) of at most `per_char` bytes each.
+    /// TEXT / BLOB columns (`must_prefix`) can only be indexed by a prefix, which only the MySQL
+    /// family can express.
+    Str {
+        len: u64,
+        per_char: u64,
+        must_prefix: bool,
+    },
+    /// Not indexable (JSON, spatial, unknown types).
+    None,
+}
+
+impl KeyPart {
+    /// Bytes the whole column takes in a key (None: it cannot be indexed whole).
+    pub(crate) fn full_bytes(&self) -> Option<u64> {
+        match *self {
+            KeyPart::Fixed(b) => Some(b),
+            KeyPart::Str {
+                len,
+                per_char,
+                must_prefix: false,
+            } => Some(len * per_char),
+            _ => None,
+        }
+    }
+}
+
+/// What one target's index plan is computed from (T3.1): whose widths, whose quoting, how many
+/// bytes. A view's targets share `widths` and `budget` and differ only in `dialect`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KeyPlan {
+    /// The family whose column types decide the widths (the view's most restrictive target).
+    pub(crate) widths: Kind,
+    /// The family of the table being created: how the key parts are quoted.
+    pub(crate) dialect: Kind,
+    /// Bytes an index key may take: `Layout::key_budget`, from [`min_key_budget`].
+    pub(crate) budget: u64,
+}
+
+impl KeyPlan {
+    /// The plan for a table of the family `dialect` of a view whose layout carries the budget.
+    pub(crate) fn for_layout(layout: &Layout, dialect: Kind) -> KeyPlan {
+        KeyPlan {
+            widths: Kind::from_key_budget(layout.key_budget),
+            dialect,
+            budget: layout.key_budget,
+        }
+    }
+
+    /// `name` as this family's DDL writes it.
+    fn quote(&self, name: &str) -> String {
+        match self.dialect {
+            Kind::Mysql => q(name),
+            Kind::Postgres => postgres::quote_ident(name),
+        }
+    }
+
+    /// How `col` can be part of an index of this plan's family.
+    fn part(&self, col: &MvCol) -> KeyPart {
+        match self.widths {
+            Kind::Mysql => mysql::key_part(col),
+            Kind::Postgres => postgres::key_part(col),
+        }
+    }
+}
+
+/// Key parts of `cols` within the plan's budget. The MySQL family takes fixed-size columns whole
+/// and lets string columns share the rest (each whole if it fits, else a prefix). A PostgreSQL
+/// index never carries a prefix (T3.2): there the whole key goes or nothing does, which is the
+/// same decision [`min_key_budget`] already made.
+pub(crate) fn fit_key(cols: &[(&MvCol, KeyPart)], plan: &KeyPlan) -> Option<String> {
+    if matches!(plan.dialect, Kind::Postgres) {
+        let whole: Option<u64> = cols.iter().map(|(_, k)| k.full_bytes()).sum();
+        if whole? > plan.budget {
+            return None;
+        }
+        return Some(
+            cols.iter()
+                .map(|(c, _)| plan.quote(&c.name))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    // (Length bytes of variable-length strings do not count.)
+    let fixed: u64 = cols
+        .iter()
+        .map(|(_, k)| match k {
+            KeyPart::Fixed(b) => *b,
+            _ => 0,
+        })
+        .sum();
+    let mut left = plan.budget.checked_sub(fixed)?;
+    let mut strings: Vec<usize> = (0..cols.len())
+        .filter(|&i| matches!(cols[i].1, KeyPart::Str { .. }))
+        .collect();
+    strings.sort_by_key(|&i| match cols[i].1 {
+        KeyPart::Str { len, per_char, .. } => len * per_char,
+        _ => 0,
+    });
+    // Smallest first, so that what short strings leave over goes to the longer ones.
+    let mut chars = vec![0u64; cols.len()];
+    for (k, &i) in strings.iter().enumerate() {
+        let KeyPart::Str { len, per_char, .. } = cols[i].1 else {
+            continue;
+        };
+        let share = left / (strings.len() - k) as u64;
+        chars[i] = len.min(share / per_char);
+        if chars[i] == 0 {
+            return None;
+        }
+        left -= chars[i] * per_char;
+    }
+    let parts: Vec<String> = cols
+        .iter()
+        .zip(chars)
+        .map(|((c, k), n)| match *k {
+            KeyPart::Str {
+                len, must_prefix, ..
+            } if must_prefix || n < len => format!("{}({n})", plan.quote(&c.name)),
+            _ => plan.quote(&c.name),
+        })
+        .collect();
+    Some(parts.join(", "))
+}
+
+/// The unit index as `(primary, key parts)`: the PRIMARY KEY when the unit is unique and its
+/// columns fit the plan, otherwise a non-unique index over as many leading unit columns as fit
+/// (long strings as prefixes, which only the MySQL family has). None when not even the first unit
+/// column can be indexed; unit DELETEs and INSERTs stay correct without an index.
+pub(crate) fn unit_index(layout: &Layout, plan: &KeyPlan) -> Option<(bool, String)> {
+    let parts: Vec<(&MvCol, KeyPart)> = layout
+        .unit_pos
+        .iter()
+        .map(|&p| (&layout.cols[p], plan.part(&layout.cols[p])))
+        .collect();
+    if layout.primary && parts.len() <= MAX_KEY_PARTS {
+        let full: Option<u64> = parts.iter().map(|(_, k)| k.full_bytes()).sum();
+        if full.is_some_and(|b| b <= plan.budget) {
+            let cols = layout
+                .unit_pos
+                .iter()
+                .map(|&p| plan.quote(&layout.cols[p].name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some((true, cols));
+        }
+    }
+    let lead: Vec<(&MvCol, KeyPart)> = parts
+        .into_iter()
+        .take_while(|(_, k)| *k != KeyPart::None)
+        .take(MAX_KEY_PARTS)
+        .collect();
+    (1..=lead.len())
+        .rev()
+        .find_map(|n| fit_key(&lead[..n], plan))
+        .map(|k| (false, k))
+}
+
+/// The unique index over [`crate::mv::Layout::identity`]: the PRIMARY KEY when the identity is
+/// the unit and that is the primary key, else `_lv_row` over the whole identity columns (a prefix
+/// would let distinct rows collide). None when the rows have no identity, a column cannot be
+/// indexed whole, the key exceeds the plan, or a TIMESTAMP column is read in the session's time
+/// zone (the two instants of a DST fall-back hour read as one value).
+pub(crate) fn row_index(layout: &Layout, plan: &KeyPlan) -> Option<RowIndex> {
+    if layout.identity.is_empty()
+        || (!layout.epoch_timestamps()
+            && layout
+                .identity
+                .iter()
+                .any(|&p| layout.cols[p].data_type == "timestamp"))
+    {
+        return None;
+    }
+    if layout.identity == layout.unit_pos && matches!(unit_index(layout, plan), Some((true, _))) {
+        return Some(RowIndex::Primary);
+    }
+    if layout.identity.len() > MAX_KEY_PARTS {
+        return None;
+    }
+    let bytes: Option<u64> = layout
+        .identity
+        .iter()
+        .map(|&p| plan.part(&layout.cols[p]).full_bytes())
+        .sum();
+    if !bytes.is_some_and(|b| b <= plan.budget) {
+        return None;
+    }
+    Some(RowIndex::Unique(
+        layout
+            .identity
+            .iter()
+            .map(|&p| plan.quote(&layout.cols[p].name))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ))
+}
+
+/// One non-unique index per lineage key, `(name, key parts)` (none for a key that does not fit
+/// the plan).
+pub(crate) fn lineage_indexes(layout: &Layout, plan: &KeyPlan) -> Vec<(String, String)> {
+    layout
+        .lineage
+        .iter()
+        .filter_map(|key| {
+            let alias = crate::mv::lineage_alias(&layout.cols[*key.first()?].name)?;
+            let parts: Vec<(&MvCol, KeyPart)> = key
+                .iter()
+                .map(|&p| (&layout.cols[p], plan.part(&layout.cols[p])))
+                .collect();
+            if parts.len() > MAX_KEY_PARTS || parts.iter().any(|(_, k)| *k == KeyPart::None) {
+                return None;
+            }
+            Some((format!("_lv_a{alias}"), fit_key(&parts, plan)?))
+        })
+        .collect()
+}
+
+/// One non-unique index `_lv_p<k>` per set of partial unit positions the unit index does not
+/// start with: a partial refresh reads and replaces the rows matching those columns alone (an
+/// index range instead of a scan).
+pub(crate) fn partial_indexes(layout: &Layout, plan: &KeyPlan) -> Vec<(String, String)> {
+    let unit_index = unit_index(layout, plan).is_some();
+    layout
+        .partial
+        .iter()
+        .enumerate()
+        .filter(|(_, at)| !(unit_index && at.iter().copied().eq(0..at.len())))
+        .filter_map(|(k, at)| {
+            let parts: Vec<(&MvCol, KeyPart)> = at
+                .iter()
+                .map(|&u| {
+                    (
+                        &layout.cols[layout.unit_pos[u]],
+                        plan.part(&layout.cols[layout.unit_pos[u]]),
+                    )
+                })
+                .take_while(|(_, k)| *k != KeyPart::None)
+                .take(MAX_KEY_PARTS)
+                .collect();
+            if parts.is_empty() {
+                return None;
+            }
+            Some((format!("_lv_p{k}"), fit_key(&parts, plan)?))
+        })
+        .collect()
+}
+
+// --- Statements of the source, which is always MySQL-family ([`Kind`]): `crate::mv` names no
+// family for them, so the family is chosen here, once (T3 closes S4's staged wrappers).
+
+/// The statements that give a source pool connection the service's session settings.
+pub(crate) fn source_session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
+    mysql::session_setup(sql_mode, lock_wait_s)
+}
+
+/// Applies the session settings of a source connection to a fresh direct connection.
+pub(crate) async fn init_source_session(
+    conn: &mut mysql_async::Conn,
+    lock_wait_s: u64,
+) -> Result<()> {
+    mysql::init_session(conn, lock_wait_s).await
+}
+
+/// `mode` without the flags that reject values the source holds and the flags that change how SQL
+/// text is parsed.
+pub(crate) fn permissive_sql_mode(mode: &str) -> String {
+    mysql::permissive_sql_mode(mode)
+}
+
+/// Session time zone in which TIMESTAMPs are written (a MySQL-family session, which is what a
+/// source always is).
+pub(crate) use mysql::UTC_SESSION;
+
+/// [`WriteOpts`] of a server reporting `version` and `max_packet`: the MySQL module is kind-aware
+/// and decides the upsert form of both families (`postgres::PgConn::write_opts` is the PostgreSQL
+/// connection's own path).
+pub(crate) fn for_server(
+    kind: Kind,
+    version: &str,
+    max_packet: u64,
+    batch_rows: usize,
+    batch_bytes: usize,
+) -> WriteOpts {
+    mysql::for_server(kind, version, max_packet, batch_rows, batch_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T3.1: the key budget is the tightest of a view's targets and the family the index choice
+    /// is made for follows it, so a MySQL-only view keeps exactly the bytes it always used.
+    #[test]
+    fn key_budget_is_the_minimum_over_targets() {
+        let none: [Kind; 0] = [];
+        let mysql_only = [Kind::Mysql, Kind::Mysql];
+        let both = [Kind::Mysql, Kind::Postgres];
+        assert_eq!(min_key_budget(none), MY_KEY_BYTES);
+        assert_eq!(min_key_budget([Kind::Mysql]), MY_KEY_BYTES);
+        assert_eq!(min_key_budget(mysql_only), MY_KEY_BYTES, "unchanged today");
+        assert_eq!(min_key_budget([Kind::Postgres]), PG_KEY_BYTES);
+        assert_eq!(min_key_budget(both), PG_KEY_BYTES, "the tightest wins");
+        assert_eq!(MY_KEY_BYTES, 3072);
+        assert_eq!(PG_KEY_BYTES, 2704);
+        assert_eq!(Kind::from_key_budget(MY_KEY_BYTES), Kind::Mysql);
+        assert_eq!(Kind::from_key_budget(PG_KEY_BYTES), Kind::Postgres);
+        // A MySQL table of a view that also has a PostgreSQL target is planned with the
+        // PostgreSQL widths (one index set for the whole view) and the MySQL quoting.
+        let layout = Layout {
+            cols: Vec::new(),
+            n_visible: 0,
+            hidden: Vec::new(),
+            unit_pos: Vec::new(),
+            primary: false,
+            lineage: Vec::new(),
+            epoch: Vec::new(),
+            identity: Vec::new(),
+            partial: Vec::new(),
+            key_budget: PG_KEY_BYTES,
+        };
+        let plan = KeyPlan::for_layout(&layout, Kind::Mysql);
+        assert_eq!(plan.widths, Kind::Postgres);
+        assert_eq!(plan.dialect, Kind::Mysql);
+        assert_eq!(plan.budget, PG_KEY_BYTES);
     }
 }

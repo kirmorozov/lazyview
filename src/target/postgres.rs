@@ -13,6 +13,10 @@ use mysql_async::{Conn, Value};
 
 use crate::accumulate::{UnitChunk, UnitKind};
 use crate::mv::{Layout, MvCol, Upsert, WriteOpts};
+use crate::target::{
+    lineage_indexes, partial_indexes, row_index, shadow_name, unit_index, KeyPart, KeyPlan, Kind,
+    RowIndex, MARKER_PREFIX, PG_KEY_BYTES,
+};
 
 mod connect;
 
@@ -77,70 +81,6 @@ pub(crate) fn unit_filter(
     _kinds: &[UnitKind],
 ) -> (String, Vec<Value>) {
     unreachable!("PostgreSQL writes land in PR T4")
-}
-
-/// `CREATE TABLE` + one `CREATE INDEX` per index + `COMMENT ON TABLE` — PR T3 lands the real
-/// DDL (types from T2's map, schema-wide index names, the 63-byte cap). Unreachable today.
-pub(crate) fn create_table_sql(
-    _layout: &Layout,
-    _schema: &str,
-    _table: &str,
-    _marker: Option<&str>,
-) -> String {
-    unreachable!("PostgreSQL DDL lands in PR T3")
-}
-
-/// `relkind` from `pg_class` — PR T3. Unreachable today.
-pub(crate) async fn table_kind(
-    _conn: &mut Conn,
-    _schema: &str,
-    _name: &str,
-) -> Result<Option<String>> {
-    unreachable!("PostgreSQL metadata reads land in PR T3")
-}
-
-/// `format_type` from `pg_attribute` — PR T3. Unreachable today.
-pub(crate) async fn table_columns(
-    _conn: &mut Conn,
-    _schema: &str,
-    _name: &str,
-) -> Result<Vec<(String, String)>> {
-    unreachable!("PostgreSQL metadata reads land in PR T3")
-}
-
-/// Exact-name, case-insensitive-type comparison — PR T3. Unreachable today.
-pub(crate) fn layout_matches(_layout: &Layout, _existing: &[(String, String)]) -> bool {
-    unreachable!("PostgreSQL metadata reads land in PR T3")
-}
-
-/// Unique index by column list over `pg_index` — PR T3. Unreachable today.
-pub(crate) async fn has_row_index(
-    _conn: &mut Conn,
-    _schema: &str,
-    _table: &str,
-    _layout: &Layout,
-) -> Result<bool> {
-    unreachable!("PostgreSQL metadata reads land in PR T3")
-}
-
-/// `obj_description` — PR T3. Unreachable today.
-pub(crate) async fn table_marker(
-    _conn: &mut Conn,
-    _schema: &str,
-    _name: &str,
-) -> Result<Option<String>> {
-    unreachable!("PostgreSQL metadata reads land in PR T3")
-}
-
-/// Drop and create the shadow — PR T3.4. Unreachable today.
-pub(crate) async fn create_shadow(
-    _conn: &mut Conn,
-    _schema: &str,
-    _name: &str,
-    _layout: &Layout,
-    _marker: &str,
-) -> Result<String> {
-    unreachable!("PostgreSQL DDL lands in PR T3")
 }
 
 /// The transactional swap (rename + index renames + drop in one `simple_query`) — PR T4.6.
@@ -275,6 +215,282 @@ pub(crate) fn pg_type(col: &MvCol) -> String {
     }
 }
 
+/// `CREATE TABLE`, one `CREATE INDEX` per index of the layout's set, and the ownership marker:
+/// one batch, sent as a single simple query (T3.2). The types come from [`pg_type`]; there is no
+/// `ENGINE`, no `CHARACTER SET`/`COLLATE` and no `INVISIBLE` (D6: PostgreSQL has neither invisible
+/// columns nor a per-table engine); `NOT NULL` goes exactly where the MySQL DDL puts it (the unit
+/// columns of a primary layout); and the index *set* is the layout's own decision, `crate::target`'s
+/// planner, never recomputed here. A key part never carries a prefix: what needs one to fit InnoDB
+/// does not fit here either (T3.2).
+pub(crate) fn create_table_sql(
+    layout: &Layout,
+    schema: &str,
+    table: &str,
+    marker: Option<&str>,
+) -> String {
+    let plan = KeyPlan::for_layout(layout, Kind::Postgres);
+    let unit = unit_index(layout, &plan);
+    let row = row_index(layout, &plan);
+    let primary = matches!(unit, Some((true, _)));
+    let mut defs: Vec<String> = layout
+        .cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let null = if primary && layout.unit_pos.contains(&i) {
+                " NOT NULL"
+            } else {
+                " NULL"
+            };
+            format!("{} {}{null}", quote_ident(&c.name), pg_type(c))
+        })
+        .collect();
+    let t = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    // The batch: the table, its indexes (the unique row key first), the marker. One round trip
+    // (`PgConn::create_shadow` sends it whole); PostgreSQL has no collation to fail on, so unlike
+    // the MySQL path there is no second attempt.
+    let mut batch: Vec<String> = Vec::new();
+    if let Some(RowIndex::Unique(parts)) = &row {
+        batch.push(create_index(table, &t, "lv_row", parts, true));
+    }
+    match &unit {
+        Some((true, parts)) => defs.push(format!("PRIMARY KEY ({parts})")),
+        Some((false, parts)) => batch.push(create_index(table, &t, "lv_unit", parts, false)),
+        None => {}
+    }
+    for (name, parts) in lineage_indexes(layout, &plan)
+        .into_iter()
+        .chain(partial_indexes(layout, &plan))
+    {
+        // The planner names them `_lv_a<k>` / `_lv_p<k>`; here the table's name goes in front,
+        // because a PostgreSQL index name is schema-wide (D7).
+        batch.push(create_index(
+            table,
+            &t,
+            name.trim_start_matches('_'),
+            &parts,
+            false,
+        ));
+    }
+    let mut sql = format!("CREATE TABLE {t} (\n  {}\n);", defs.join(",\n  "));
+    for statement in batch {
+        sql.push('\n');
+        sql.push_str(&statement);
+    }
+    if let Some(m) = marker {
+        // `crate::target::marker` percent-encodes everything that would need escaping; doubling
+        // the quote is the belt, as in the MySQL form.
+        sql.push_str(&format!(
+            "\nCOMMENT ON TABLE {t} IS '{}';",
+            m.replace('\'', "''")
+        ));
+    }
+    sql
+}
+
+/// One `CREATE [UNIQUE] INDEX` of the batch, named `<table>_<suffix>` with the 63-byte cap of
+/// [`index_name`] (D7).
+fn create_index(table: &str, table_ref: &str, suffix: &str, parts: &str, unique: bool) -> String {
+    format!(
+        "CREATE {}INDEX {} ON {table_ref} ({parts});",
+        if unique { "UNIQUE " } else { "" },
+        quote_ident(&index_name(table, suffix)),
+    )
+}
+
+/// A PostgreSQL identifier: double quotes (the case of an identifier is preserved, unlike an
+/// unquoted MySQL one), a doubled `"` inside.
+pub(crate) fn quote_ident(id: &str) -> String {
+    let mut s = String::with_capacity(id.len() + 2);
+    s.push('"');
+    for c in id.chars() {
+        if c == '"' {
+            s.push('"');
+        }
+        s.push(c);
+    }
+    s.push('"');
+    s
+}
+
+/// Characters of an unsized `text` / `bytea` column the planner may consider: no key is longer
+/// than the budget, so counting further serves no purpose.
+const PG_TEXT_CHARS: u64 = PG_KEY_BYTES / 4;
+
+/// How a column can be part of an index *here*: the widths follow [`pg_type`], because a b-tree is
+/// sized by the type the value is stored as (a `bigint unsigned` source is a `numeric(20,0)`
+/// column and a `time(6)` source is `text` here). Text and bytea have no declared length, so they
+/// can never be taken whole - and a PostgreSQL index carries no prefix (T3.2), so not at all;
+/// `jsonb` has no b-tree operator class and a type the map does not size cannot be planned.
+pub(crate) fn key_part(col: &MvCol) -> KeyPart {
+    let text = |per_char| KeyPart::Str {
+        len: PG_TEXT_CHARS,
+        per_char,
+        must_prefix: true,
+    };
+    match pg_type(col).as_str() {
+        "smallint" => KeyPart::Fixed(2),
+        "integer" | "real" => KeyPart::Fixed(4),
+        "bigint" | "double precision" => KeyPart::Fixed(8),
+        "date" => KeyPart::Fixed(4),
+        // `timestamp`, `timestamp(3)` and the `with time zone` forms of T2's map: 8 bytes.
+        s if s.starts_with("timestamp") => KeyPart::Fixed(8),
+        // A numeric's digits travel in the key: 40 characters is the widest the map renders (D3).
+        s if s.starts_with("numeric") => KeyPart::Str {
+            len: 40,
+            per_char: 4,
+            must_prefix: false,
+        },
+        "text" => text(4),
+        "bytea" => text(1),
+        _ => KeyPart::None,
+    }
+}
+
+/// Whether an existing table's columns are the layout's: the names exactly (PostgreSQL preserves
+/// the case of a quoted identifier, which is how lazyview writes them) and the types against the
+/// string [`pg_type`] gives for the source column - `format_type` spells `double precision` and
+/// `numeric(10,2)` the same way (T3.3), so a mismatch is a real difference and never a spelling.
+pub(crate) fn layout_matches(layout: &Layout, existing: &[(String, String)]) -> bool {
+    layout.cols.len() == existing.len()
+        && layout
+            .cols
+            .iter()
+            .zip(existing)
+            .all(|(c, (n, t))| &c.name == n && pg_type(c).eq_ignore_ascii_case(t.trim()))
+}
+
+impl PgConn {
+    /// `BASE TABLE` / `VIEW` / `MATERIALIZED VIEW` / None from `relkind` (T3.3): `pg_catalog`
+    /// only, never a name pattern (H3). A partitioned table (`p`) is a base table to lazyview.
+    #[allow(dead_code)] // T4 wires the PostgreSQL build path; these are proven against a server
+    pub(crate) async fn table_kind(&self, schema: &str, name: &str) -> Result<Option<String>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT c.relkind::text FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&schema.to_string(), &name.to_string()],
+            )
+            .await?;
+        Ok(row
+            .and_then(|r| r.get::<_, Option<String>>(0))
+            .and_then(|k| match k.as_str() {
+                "r" | "p" => Some("BASE TABLE".to_string()),
+                "v" => Some("VIEW".to_string()),
+                "m" => Some("MATERIALIZED VIEW".to_string()),
+                // An index, a sequence, a TOAST table: nothing lazyview manages.
+                _ => None,
+            }))
+    }
+
+    /// Visible and hidden columns as `(name, format_type)`, in order: the strings [`pg_type`]
+    /// renders for the source types, so [`layout_matches`] compares them verbatim (T3.3).
+    #[allow(dead_code)] // as above
+    pub(crate) async fn table_columns(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
+                &[&schema.to_string(), &name.to_string()],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect())
+    }
+
+    /// Whether `table` has the unique index its rows are upserted by, found by its column list
+    /// and not by its name (robust to the renames of the swap, D7); true when the layout has no
+    /// row key. Like the MySQL family's `_lv_row` it is a plain unique index, so a key holding a
+    /// NULL does not conflict there either - which is why the resume guard asks for this index
+    /// instead of assuming one (T3.3).
+    #[allow(dead_code)] // as above
+    pub(crate) async fn has_row_index(
+        &self,
+        schema: &str,
+        table: &str,
+        layout: &Layout,
+    ) -> Result<bool> {
+        let plan = KeyPlan::for_layout(layout, Kind::Postgres);
+        let cols: &Vec<usize> = match row_index(layout, &plan) {
+            // Rows are refreshed by deleting whole units then: there is no index to have.
+            None => return Ok(true),
+            Some(RowIndex::Primary) => &layout.unit_pos,
+            Some(RowIndex::Unique(_)) => &layout.identity,
+        };
+        let names: Vec<String> = cols.iter().map(|&p| layout.cols[p].name.clone()).collect();
+        let n = i16::try_from(names.len()).unwrap_or(i16::MAX);
+        let found = self
+            .client
+            .query_opt(
+                "SELECT 1 FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 JOIN pg_index i ON i.indrelid = t.oid \
+                 WHERE n.nspname = $1 AND t.relname = $2 AND i.indisunique \
+                   AND i.indnkeyatts = $3 \
+                   AND (SELECT array_agg(a.attname::text ORDER BY x.ord) \
+                          FROM unnest(i.indkey) WITH ORDINALITY x(attnum, ord) \
+                          JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = x.attnum) \
+                        = $4::text[]",
+                &[&schema.to_string(), &table.to_string(), &n, &names],
+            )
+            .await?;
+        Ok(found.is_some())
+    }
+
+    /// The ownership marker (see [`crate::target::marker`]) of an existing table, if its
+    /// description is one: [`create_table_sql`] stores it with `COMMENT ON TABLE` (T3.3).
+    #[allow(dead_code)] // as above
+    pub(crate) async fn table_marker(&self, schema: &str, name: &str) -> Result<Option<String>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT obj_description(c.oid) FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&schema.to_string(), &name.to_string()],
+            )
+            .await?;
+        // No table, and a table without a description, are both None here - and both mean
+        // "not ours".
+        let comment = row.and_then(|r| r.get::<_, Option<String>>(0));
+        Ok(comment.filter(|c| c.starts_with(MARKER_PREFIX)))
+    }
+
+    /// Drops and creates the shadow table of `name`, with the ownership marker as its comment,
+    /// and returns its name (T3.4): the whole batch of [`create_table_sql`] - table, indexes,
+    /// marker - as one simple query. There is no second attempt with the target's collations:
+    /// PostgreSQL has no unknown-collation failure, so that branch stays in `target/mysql.rs`.
+    #[allow(dead_code)] // as above
+    pub(crate) async fn create_shadow(
+        &self,
+        schema: &str,
+        name: &str,
+        layout: &Layout,
+        marker: &str,
+    ) -> Result<String> {
+        let shadow = shadow_name(name);
+        let t = format!("{}.{}", quote_ident(schema), quote_ident(&shadow));
+        self.client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {t};{}",
+                create_table_sql(layout, schema, &shadow, Some(marker))
+            ))
+            .await?;
+        Ok(shadow)
+    }
+}
+
 /// The multi-row INSERT's and the diff read's parameter text for one value (`None` = SQL NULL).
 /// PostgreSQL sends text-format parameters, so this is what crosses the wire.
 ///
@@ -379,7 +595,6 @@ pub(crate) fn cell_value(text: Option<&str>, col: &MvCol, nullable: bool) -> Val
 /// in its own transaction (D7). PostgreSQL truncates an identifier at 63 bytes *silently*, so a
 /// longer name takes the same `definition_hash` fallback [`crate::target::side_name`] uses - it
 /// always fits, because the hash is 16 hex characters and the suffix is a few characters.
-#[allow(dead_code)] // the DDL of PR T3 names the indexes with this; the test here proves it
 pub(crate) fn index_name(table: &str, suffix: &str) -> String {
     let n = format!("{table}_{suffix}");
     if n.len() <= 63 {
@@ -1004,5 +1219,216 @@ mod tests {
         assert_eq!(s[4], "SET lock_timeout = '30s'");
         // The analogue of MySQL's `lock_wait_timeout` never waits zero seconds.
         assert_eq!(session_setup(0)[4], "SET lock_timeout = '1s'");
+    }
+
+    fn layout(cols: Vec<MvCol>, n_visible: usize, unit_pos: Vec<usize>, primary: bool) -> Layout {
+        let hidden: Vec<usize> = (n_visible..cols.len()).collect();
+        Layout {
+            cols,
+            n_visible,
+            hidden,
+            unit_pos,
+            primary,
+            lineage: Vec::new(),
+            epoch: Vec::new(),
+            identity: Vec::new(),
+            partial: Vec::new(),
+            key_budget: PG_KEY_BYTES,
+        }
+    }
+
+    /// The PostgreSQL DDL of one build (T3.2): the target's own types, `NOT NULL` exactly where
+    /// the MySQL DDL puts it, one statement per index of the layout's set named `<table>_lv_*`,
+    /// and the marker as its own `COMMENT ON TABLE` - the whole thing one batch.
+    #[test]
+    fn create_table_sql_pg() {
+        let mut l = layout(
+            vec![
+                col("id", "bigint", "bigint"),
+                col("amount", "decimal", "decimal(10,2)"),
+                col("_lv_u0", "int", "int"),
+            ],
+            2,
+            vec![2],
+            false,
+        );
+        l.identity = vec![0];
+        let expected = [
+            "CREATE TABLE \"s\".\"items__lv_new\" (",
+            "  \"id\" bigint NULL,",
+            "  \"amount\" numeric(10,2) NULL,",
+            "  \"_lv_u0\" integer NULL",
+            ");",
+            "CREATE UNIQUE INDEX \"items__lv_new_lv_row\" ON \"s\".\"items__lv_new\" (\"id\");",
+            "CREATE INDEX \"items__lv_new_lv_unit\" ON \"s\".\"items__lv_new\" (\"_lv_u0\");",
+            "COMMENT ON TABLE \"s\".\"items__lv_new\" IS 'lazyview:v1 view=items def=7';",
+        ]
+        .join("\n");
+        assert_eq!(
+            create_table_sql(
+                &l,
+                "s",
+                "items__lv_new",
+                Some(&crate::target::marker("items", 7))
+            ),
+            expected
+        );
+        // A primary layout: the NOT NULLs sit on the unit columns, inline as the PRIMARY KEY, and
+        // no `_lv_unit` index duplicates it.
+        let mut p = layout(
+            vec![col("g", "int", "int"), col("n", "bigint", "bigint")],
+            2,
+            vec![0],
+            true,
+        );
+        p.identity = vec![0];
+        let sql = create_table_sql(&p, "s", "t", None);
+        assert!(sql.contains("\"g\" integer NOT NULL"), "{sql}");
+        assert!(sql.contains("PRIMARY KEY (\"g\")"), "{sql}");
+        assert!(
+            !sql.contains("_lv_unit") && !sql.contains("COMMENT ON"),
+            "{sql}"
+        );
+        // Nothing MySQL travelled with them.
+        for absent in [
+            "ENGINE",
+            "CHARSET",
+            "CHARACTER SET",
+            "COLLATE",
+            "INVISIBLE",
+            "USING BTREE",
+        ] {
+            assert!(!sql.contains(absent), "{absent}: {sql}");
+        }
+        // `layout_matches` compares the map's spelling with `format_type`'s, name exactly.
+        let existing = vec![
+            ("id".to_string(), "bigint".to_string()),
+            ("amount".to_string(), "numeric(10,2)".to_string()),
+            ("_lv_u0".to_string(), "integer".to_string()),
+        ];
+        assert!(layout_matches(&l, &existing), "{existing:?}");
+        assert!(
+            !layout_matches(
+                &l,
+                &[
+                    ("Id".to_string(), "bigint".to_string()),
+                    existing[1].clone(),
+                    existing[2].clone()
+                ]
+            ),
+            "PG preserves the case of a quoted name"
+        );
+        assert!(
+            !layout_matches(
+                &l,
+                &[
+                    existing[0].clone(),
+                    ("amount".to_string(), "numeric".to_string()),
+                    existing[2].clone()
+                ]
+            ),
+            "a dropped scale is a real difference"
+        );
+    }
+
+    /// The names the DDL emits are the capped ones of [`index_name`], for every suffix a view's
+    /// index set uses (`_lv_row`, `_lv_unit`, `_lv_a<k>`, `_lv_p<k>`): PostgreSQL truncates an
+    /// identifier at 63 bytes silently, so a name that would not fit takes the hash form.
+    #[test]
+    fn index_names_and_63_byte_cap() {
+        let mut l = layout(
+            vec![col("k", "int", "int"), col("u", "int", "int")],
+            1,
+            vec![0, 1],
+            false,
+        );
+        l.identity = vec![0];
+        l.partial = vec![vec![1]];
+        let far = "x".repeat(300);
+        let sql = create_table_sql(&l, "s", &far, None);
+        let mut emitted = 0;
+        for line in sql
+            .lines()
+            .filter(|l| l.starts_with("CREATE INDEX") || l.starts_with("CREATE UNIQUE INDEX"))
+        {
+            let name = line.split('"').nth(1).unwrap_or_default().to_string();
+            assert!(name.len() <= 63, "{name}");
+            assert!(name.starts_with("_lv_"), "{name}");
+            emitted += 1;
+        }
+        assert_eq!(emitted, 3, "{sql}");
+        // A short table name keeps the readable form: the table in front of the suffix.
+        let sql = create_table_sql(&l, "s", "items", None);
+        // `_lv_p0` is the k-th partial set of the layout, not its first column.
+        for (unique, suffix) in [(true, "lv_row"), (false, "lv_unit"), (false, "lv_p0")] {
+            assert!(
+                sql.contains(&format!(
+                    "CREATE {}INDEX \"items_{suffix}\" ON",
+                    if unique { "UNIQUE " } else { "" }
+                )),
+                "{sql}"
+            );
+        }
+    }
+
+    /// The marker is its own statement, quoted the PostgreSQL way, and a long key never travels
+    /// with a MySQL prefix: what needs one to fit InnoDB is not indexed here at all (T3.2).
+    #[test]
+    fn marker_statement_and_prefix() {
+        let l = layout(vec![col("k", "int", "int")], 1, vec![], false);
+        let sql = create_table_sql(&l, "s", "t", Some("lazyview:v1 view=a%20b%27c%25 def=1"));
+        assert!(
+            sql.ends_with("COMMENT ON TABLE \"s\".\"t\" IS 'lazyview:v1 view=a%20b%27c%25 def=1';"),
+            "{sql}"
+        );
+        // A quote in the comment is doubled, as in the MySQL form.
+        let sql = create_table_sql(&l, "s", "t", Some("it's"));
+        assert!(sql.ends_with("IS 'it''s';"), "{sql}");
+        // An unsized string column: the MySQL family indexes it by a prefix, PostgreSQL does not
+        // index it, and no `(n)` appears in its DDL.
+        let mut l = layout(
+            vec![col("s", "varchar", "varchar(4000)")],
+            1,
+            vec![0],
+            false,
+        );
+        l.identity = vec![0];
+        let mysql = crate::target::create_table_sql(Kind::Mysql, &l, "s", "t", None);
+        assert!(mysql.contains("`s`("), "{mysql}");
+        let sql = create_table_sql(&l, "s", "t", None);
+        assert!(!sql.contains("_lv_"), "{sql}");
+        assert!(!sql.contains("(4000)"), "{sql}");
+    }
+
+    /// The map's spelling is `format_type`'s for every kind the planner sizes (T3.3): a pair that
+    /// disagrees is a bug in the map, not in the comparison.
+    #[test]
+    fn format_type_agrees_with_the_map() {
+        for (data_type, column_type, ty) in [
+            ("tinyint", "tinyint(1)", "smallint"),
+            ("smallint", "smallint unsigned", "integer"),
+            ("int", "int unsigned", "bigint"),
+            ("bigint", "bigint unsigned", "numeric(20,0)"),
+            ("decimal", "decimal(10,2)", "numeric(10,2)"),
+            ("float", "float", "real"),
+            ("double", "double", "double precision"),
+            ("date", "date", "date"),
+            ("datetime", "datetime(6)", "timestamp(6)"),
+            ("timestamp", "timestamp(3)", "timestamp(3) with time zone"),
+            ("time", "time(6)", "text"),
+            ("json", "json", "jsonb"),
+            ("blob", "blob", "bytea"),
+            ("varchar", "varchar(64)", "text"),
+        ] {
+            let c = col("c", data_type, column_type);
+            assert_eq!(pg_type(&c), ty, "{column_type}");
+            assert!(
+                layout_matches(
+                    &layout(vec![c.clone()], 1, vec![], false),
+                    &[(c.name.clone(), ty.to_string())]
+                ),
+                "{column_type} does not match its own type"
+            );
+        }
     }
 }

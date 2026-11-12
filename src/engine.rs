@@ -2274,7 +2274,13 @@ impl Engine {
         if candidates.is_empty() {
             return Ok(targets);
         }
-        let layout = mv::probe(&mut self.src, &self.schema, plan).await?;
+        let mut layout = mv::probe(&mut self.src, &self.schema, plan).await?;
+        // The index budget of this view's tables: the tightest of the targets it has (T3.1).
+        layout.key_budget = target::min_key_budget(
+            targets
+                .iter()
+                .filter_map(|t| self.targets.get(t).map(|s| s.kind)),
+        );
         let mut resumed = Vec::new();
         for t in candidates {
             let ts = self.targets[&t].schema.clone();
@@ -6155,7 +6161,10 @@ async fn build_task(
             tokio::time::sleep(d).await;
         }
         let mut src = connect_source(&src_opts, lock_wait_s).await?;
-        let layout = mv::probe(&mut src, &src_schema, &plan).await?;
+        let mut layout = mv::probe(&mut src, &src_schema, &plan).await?;
+        // The index budget of this view's tables: the tightest of the targets it is built into
+        // (T3.1); a MySQL-only view keeps the 3072 bytes every build used before PostgreSQL targets.
+        layout.key_budget = target::min_key_budget(targets.iter().map(|s| s.kind));
         // The cascade cache is read on the source before the table is filled, so that no
         // cascade falls between the two reads: the binlog this version replays holds the rest.
         let cache = seed_cache(&mut src, &plan).await?;

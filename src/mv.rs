@@ -64,6 +64,12 @@ pub struct Layout {
     /// Sets of unit positions refreshed by partial unit keys (the plan's `partial.sets`): each
     /// gets an index unless the unit index starts with it.
     pub partial: Vec<Vec<usize>>,
+    /// Key bytes an index of this view's tables may use: the tightest of its targets' limits
+    /// (`crate::target::min_key_budget`, T3.1), which is what every index of the view is sized
+    /// with. `crate::engine` sets it when the layout is probed for a build; a layout that never
+    /// saw a target (a probe on the source, a test) carries the MySQL family's 3072, which is
+    /// what every build used before PostgreSQL targets existed.
+    pub key_budget: u64,
 }
 
 impl Layout {
@@ -82,21 +88,41 @@ impl Layout {
             .collect()
     }
 
-    pub fn create_sql(&self, schema: &str, table: &str) -> String {
-        self.create_sql_marked(schema, table, None)
+    pub fn create_sql(&self, kind: Kind, schema: &str, table: &str) -> String {
+        self.create_sql_marked(kind, schema, table, None)
     }
 
-    /// The table DDL of a fresh build, with an optional ownership marker as the table
-    /// comment (see [`marker`]).
-    pub fn create_sql_marked(&self, schema: &str, table: &str, marker: Option<&str>) -> String {
-        crate::target::create_table_sql(Kind::Mysql, self, schema, table, marker)
+    /// The table DDL of a fresh build for the target family `kind`, with an optional ownership
+    /// marker as the table comment (see [`marker`]). The family is the target's, never decided
+    /// here: the engine passes its target's kind (S4's staged seam, closed by T3).
+    pub fn create_sql_marked(
+        &self,
+        kind: Kind,
+        schema: &str,
+        table: &str,
+        marker: Option<&str>,
+    ) -> String {
+        crate::target::create_table_sql(kind, self, schema, table, marker)
     }
 
     /// The row key changed rows are upserted by (positions in `cols`; see [`Layout::identity`]),
     /// when the table has a unique index over it. None: changed units are deleted and their
     /// rows inserted again.
     pub fn row_key(&self) -> Option<&[usize]> {
-        crate::target::mysql::row_index(self).map(|_| self.identity.as_slice())
+        self.row_key_for(self.key_kind())
+    }
+
+    /// As [`Layout::row_key`], for the table or the write of the family `dialect`: its key parts
+    /// are quoted there, while the widths stay the view's (one row key for all its targets).
+    pub fn row_key_for(&self, dialect: Kind) -> Option<&[usize]> {
+        crate::target::row_index(self, &crate::target::KeyPlan::for_layout(self, dialect))
+            .map(|_| self.identity.as_slice())
+    }
+
+    /// The family a view-level index decision is made for: the most restrictive of its targets,
+    /// read back from the key budget (see [`crate::target::Kind::from_key_budget`]).
+    fn key_kind(&self) -> Kind {
+        Kind::from_key_budget(self.key_budget)
     }
 
     /// How the values of `cols` are bound in a filter of a write (see [`write_diff`]): JSON as
@@ -200,7 +226,8 @@ impl Layout {
     /// [`Layout::create_sql`]). Without one, unit DELETEs scan the table and concurrent writes of
     /// disjoint units would wait on each other's row locks.
     pub fn has_unit_index(&self) -> bool {
-        crate::target::mysql::unit_index(self).is_some()
+        let plan = crate::target::KeyPlan::for_layout(self, self.key_kind());
+        crate::target::unit_index(self, &plan).is_some()
     }
 
     /// How each unit column's keys are bound in a filter (see [`UnitChunk::filter_typed`]), from
@@ -375,21 +402,21 @@ pub async fn table_marker(
 }
 
 /// Session settings for every connection the service opens (the target module renders them:
-/// [`crate::target::mysql::init_session`]).
+/// [`crate::target::init_source_session`]).
 pub async fn init_session(conn: &mut Conn, lock_wait_s: u64) -> Result<()> {
-    crate::target::mysql::init_session(conn, lock_wait_s).await
+    crate::target::init_source_session(conn, lock_wait_s).await
 }
 
 /// The statements that give a MySQL-family connection the service's session settings (see
-/// [`crate::target::mysql::session_setup`]).
+/// [`crate::target::source_session_setup`]).
 pub fn session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
-    crate::target::mysql::session_setup(sql_mode, lock_wait_s)
+    crate::target::source_session_setup(sql_mode, lock_wait_s)
 }
 
 /// `mode` without the flags that reject values the source holds and the flags that change how
-/// SQL text is parsed (see [`crate::target::mysql::permissive_sql_mode`]).
+/// SQL text is parsed (see [`crate::target::permissive_sql_mode`]).
 pub fn permissive_sql_mode(mode: &str) -> String {
-    crate::target::mysql::permissive_sql_mode(mode)
+    crate::target::permissive_sql_mode(mode)
 }
 
 /// Derives the materialized layout by creating a temporary view on the source and reading its
@@ -534,6 +561,7 @@ fn layout_from(plan: &ViewPlan, cols: Vec<MvCol>) -> Result<Layout> {
         epoch,
         identity,
         partial: plan.partial.sets.clone(),
+        key_budget: crate::target::MY_KEY_BYTES,
     })
 }
 
@@ -600,7 +628,7 @@ pub async fn drop_table(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -
 }
 
 /// Session time zone in which TIMESTAMPs are written (see [`Layout::epoch_timestamps`]).
-pub(crate) use crate::target::mysql::UTC_SESSION;
+pub(crate) use crate::target::UTC_SESSION;
 
 fn rows_per_insert(layout: &Layout, batch_rows: usize) -> usize {
     (MAX_PARAMS / layout.cols.len().max(1)).clamp(1, batch_rows.max(1))
@@ -636,7 +664,7 @@ pub struct WriteOpts {
 impl WriteOpts {
     /// For a server reporting `version` (`@@version`) and `max_packet`
     /// (`@@max_allowed_packet`); the target module decides the upsert form (see
-    /// [`crate::target::mysql::for_server`]).
+    /// [`crate::target::for_server`]).
     pub fn for_server(
         kind: crate::target::Kind,
         version: &str,
@@ -644,7 +672,7 @@ impl WriteOpts {
         batch_rows: usize,
         batch_bytes: usize,
     ) -> WriteOpts {
-        crate::target::mysql::for_server(kind, version, max_packet, batch_rows, batch_bytes)
+        crate::target::for_server(kind, version, max_packet, batch_rows, batch_bytes)
     }
 }
 
@@ -722,7 +750,7 @@ pub async fn insert_rows<C: Queryable>(
             layout,
             chunk.len(),
             upsert.then_some(w.upsert),
-            upsert.then(|| layout.row_key()).flatten(),
+            upsert.then(|| layout.row_key_for(w.kind)).flatten(),
         );
         let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
         conn.exec_drop(sql, params).await?;
@@ -747,7 +775,7 @@ async fn delete_keys<C: Queryable>(
     w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<()> {
-    let Some(key) = layout.row_key() else {
+    let Some(key) = layout.row_key_for(kind) else {
         bail!("internal: rows of `{table}` have no row key");
     };
     let cols: Vec<String> = key.iter().map(|&p| q(&layout.cols[p].name)).collect();
@@ -1321,6 +1349,7 @@ mod tests {
             epoch: Vec::new(),
             identity: Vec::new(),
             partial: Vec::new(),
+            key_budget: crate::target::MY_KEY_BYTES,
         }
     }
 
@@ -1334,7 +1363,7 @@ mod tests {
         ];
         let mut l = layout(cols, 3, vec![0, 1], true);
         l.partial = vec![vec![1], vec![0]];
-        let sql = l.create_sql("s", "t");
+        let sql = l.create_sql(Kind::Mysql, "s", "t");
         assert!(sql.contains("PRIMARY KEY (`g`, `o`)"), "{sql}");
         assert!(sql.contains("KEY `_lv_p0` (`o`)"), "{sql}");
         assert!(!sql.contains("_lv_p1"), "a prefix of the unit index: {sql}");
@@ -1485,7 +1514,7 @@ mod tests {
         l.hidden = vec![];
         l.unit_pos = vec![0];
         l.lineage = vec![vec![3, 4], vec![5]];
-        let sql = l.create_sql("s", "t");
+        let sql = l.create_sql(Kind::Mysql, "s", "t");
         assert!(
             sql.contains("KEY `_lv_a1` (`_lv_a1_pk0`, `_lv_a1_pk1`)"),
             "{sql}"
@@ -1509,7 +1538,9 @@ mod tests {
             vec![0],
             true,
         );
-        assert!(l.create_sql("s", "t").contains("PRIMARY KEY (`k`)"));
+        assert!(l
+            .create_sql(Kind::Mysql, "s", "t")
+            .contains("PRIMARY KEY (`k`)"));
         let l = layout(
             vec![
                 col("k", "varchar", "varchar(1000)", Some("utf8mb4")),
@@ -1519,7 +1550,7 @@ mod tests {
             vec![0],
             true,
         );
-        let sql = l.create_sql("s", "t");
+        let sql = l.create_sql(Kind::Mysql, "s", "t");
         assert!(!sql.contains("PRIMARY KEY"), "{sql}");
         assert!(sql.contains("KEY `_lv_unit` (`k`(768))"), "{sql}");
         assert!(sql.contains("`k` varchar(1000) NULL"), "{sql}");
@@ -1527,14 +1558,14 @@ mod tests {
             .map(|i| col(&format!("t{i}"), "text", "text", Some("utf8mb4")))
             .collect();
         let l = layout(texts, 4, vec![0, 1, 2, 3], false);
-        let sql = l.create_sql("s", "t");
+        let sql = l.create_sql(Kind::Mysql, "s", "t");
         assert!(
             sql.contains("KEY `_lv_unit` (`t1`(192), `t2`(192), `t3`(192), `t4`(192))"),
             "{sql}"
         );
         let l = layout(vec![col("j", "json", "json", None)], 1, vec![0], false);
         assert!(
-            !l.create_sql("s", "t").contains("KEY"),
+            !l.create_sql(Kind::Mysql, "s", "t").contains("KEY"),
             "JSON units get no index"
         );
         assert!(!l.has_unit_index());
@@ -1646,7 +1677,7 @@ mod tests {
         );
         l.identity = vec![0];
         assert_eq!(l.row_key(), Some(&[0][..]));
-        let sql = l.create_sql("s", "t");
+        let sql = l.create_sql(Kind::Mysql, "s", "t");
         assert!(
             sql.contains("PRIMARY KEY (`g`)") && !sql.contains("UNIQUE"),
             "{sql}"
@@ -1667,7 +1698,7 @@ mod tests {
         l.lineage = vec![vec![2], vec![3]];
         l.identity = vec![0, 2, 3];
         assert_eq!(l.row_key(), Some(&[0, 2, 3][..]));
-        let sql = l.create_sql("s", "t");
+        let sql = l.create_sql(Kind::Mysql, "s", "t");
         assert!(
             sql.contains("UNIQUE KEY `_lv_row` (`id`, `_lv_a1_pk0`, `_lv_a2_pk0`)"),
             "{sql}"
@@ -1690,7 +1721,7 @@ mod tests {
         );
         l.identity = vec![0];
         assert!(l
-            .create_sql("s", "t")
+            .create_sql(Kind::Mysql, "s", "t")
             .contains("UNIQUE KEY `_lv_row` (`g`)"));
         // A column that can only be indexed by a prefix: no row key, `_lv_unit` stays.
         let mut l = layout(
@@ -1704,7 +1735,7 @@ mod tests {
         );
         l.identity = vec![0];
         assert_eq!(l.row_key(), None);
-        let sql = l.create_sql("s", "t");
+        let sql = l.create_sql(Kind::Mysql, "s", "t");
         assert!(
             sql.contains("KEY `_lv_unit` (`k`(768))") && !sql.contains("UNIQUE"),
             "{sql}"
@@ -1732,7 +1763,9 @@ mod tests {
         );
         l.identity = vec![0];
         assert_eq!(l.row_key(), None, "local TIMESTAMPs");
-        assert!(l.create_sql("s", "t").contains("PRIMARY KEY (`ts`)"));
+        assert!(l
+            .create_sql(Kind::Mysql, "s", "t")
+            .contains("PRIMARY KEY (`ts`)"));
         l.epoch = vec![(0, "ts".into())];
         assert_eq!(l.row_key(), Some(&[0][..]));
         // No identity: no row key.
@@ -1960,7 +1993,7 @@ mod tests {
         assert_eq!(marker("a b'c%", 1), "lazyview:v1 view=a%20b%27c%25 def=1");
         let l = layout(vec![col("v", "int", "int", None)], 1, vec![], false);
         assert!(l
-            .create_sql_marked("s", "t", Some("it's"))
+            .create_sql_marked(Kind::Mysql, "s", "t", Some("it's"))
             .ends_with("DEFAULT CHARSET=utf8mb4 COMMENT='it''s'"));
         assert_eq!(
             permissive_sql_mode(
@@ -1993,5 +2026,46 @@ mod tests {
         // A quote cannot end the string literal early.
         assert_eq!(session_setup("A'B", 2)[1], "SET SESSION sql_mode = 'AB'");
         assert_eq!(session_setup("", 2)[2], "SET SESSION lock_wait_timeout = 2");
+    }
+
+    /// The DDL entry of a MySQL-family target: `Layout` renders nothing of its own, the family
+    /// is the caller's (the lead's closure of S4's staged seam).
+    #[test]
+    fn ddl_entry_renders_the_mysql_family() {
+        let l = layout(vec![col("k", "int", "int", None)], 1, vec![], false);
+        let sql = l.create_sql_marked(Kind::Mysql, "s", "t", Some("lazyview:v1 view=t def=1"));
+        assert!(sql.starts_with("CREATE TABLE `s`.`t` ("), "{sql}");
+        assert!(
+            sql.contains("ENGINE=InnoDB") && sql.contains("COMMENT='lazyview:v1 view=t def=1'"),
+            "{sql}"
+        );
+    }
+
+    /// The same layout on a PostgreSQL target: the target's types, one statement per index, the
+    /// marker as a separate `COMMENT ON TABLE`, and no MySQL clause anywhere.
+    #[test]
+    fn ddl_entry_renders_the_postgres_family() {
+        let mut l = layout(
+            vec![col("k", "bigint", "bigint unsigned", None)],
+            1,
+            vec![],
+            false,
+        );
+        l.identity = vec![0];
+        l.key_budget = crate::target::PG_KEY_BYTES;
+        let sql = l.create_sql_marked(Kind::Postgres, "s", "t", Some("lazyview:v1 view=t def=1"));
+        assert!(sql.starts_with("CREATE TABLE \"s\".\"t\" ("), "{sql}");
+        assert!(sql.contains("\"k\" numeric(20,0) NULL"), "{sql}");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX \"t_lv_row\" ON \"s\".\"t\" (\"k\");"),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("COMMENT ON TABLE \"s\".\"t\" IS 'lazyview:v1 view=t def=1';"),
+            "{sql}"
+        );
+        for absent in ["ENGINE", "CHARSET", "INVISIBLE", "CHARACTER SET"] {
+            assert!(!sql.contains(absent), "{absent}: {sql}");
+        }
     }
 }

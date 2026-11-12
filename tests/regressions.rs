@@ -99,6 +99,8 @@ async fn probe(
         identity: Vec::new(),
         partial: Vec::new(),
         cols,
+        // These tables are only ever built on a MySQL target: the MySQL family's key budget.
+        key_budget: 3072,
     })
 }
 

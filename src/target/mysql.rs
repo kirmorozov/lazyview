@@ -12,7 +12,10 @@ use crate::accumulate::{UnitChunk, UnitKind};
 use crate::analyze::quote_ident as q;
 use crate::mv::{Layout, MvCol, Upsert, WriteOpts, ROW_INDEX};
 use crate::supervisor::{Timeout, CONNECT_TIMEOUT, FENCE_WAIT};
-use crate::target::{old_name, shadow_name, Kind, MARKER_PREFIX};
+use crate::target::{
+    lineage_indexes, old_name, partial_indexes, row_index, shadow_name, unit_index, KeyPart,
+    KeyPlan, Kind, RowIndex, MARKER_PREFIX,
+};
 
 /// Row alias of upserts (`INSERT ... AS <alias> ON DUPLICATE KEY UPDATE`).
 const ROW_ALIAS: &str = "_lv_new";
@@ -77,21 +80,8 @@ pub(crate) fn unit_filter(
     chunk.filter_typed(cols, kinds)
 }
 
-/// InnoDB's limit on the length of an index key, in bytes.
-const MAX_KEY_BYTES: u64 = 3072;
-/// Maximum number of columns in an index.
-const MAX_KEY_PARTS: usize = 16;
 /// Index prefix of TEXT / BLOB unit columns, in characters (bytes for BLOB).
 const TEXT_PREFIX: u64 = 255;
-
-/// The unique index behind [`Layout::row_key`].
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum RowIndex {
-    /// The PRIMARY KEY on the unit.
-    Primary,
-    /// `_lv_row`, a UNIQUE KEY over these (whole) columns.
-    Unique(String),
-}
 
 /// `CREATE TABLE` with an optional ownership marker as the table comment (see
 /// [`crate::target::marker`]).
@@ -101,8 +91,9 @@ pub(crate) fn create_sql_marked(
     table: &str,
     marker: Option<&str>,
 ) -> String {
-    let index = unit_index(layout);
-    let row = row_index(layout);
+    let plan = KeyPlan::for_layout(layout, Kind::Mysql);
+    let index = unit_index(layout, &plan);
+    let row = row_index(layout, &plan);
     let primary = matches!(index, Some((true, _)));
     let mut defs: Vec<String> = layout
         .cols
@@ -131,9 +122,9 @@ pub(crate) fn create_sql_marked(
     if let Some(RowIndex::Unique(parts)) = &row {
         defs.push(format!("UNIQUE KEY `{ROW_INDEX}` ({parts})"));
     }
-    for (name, parts) in lineage_indexes(layout)
+    for (name, parts) in lineage_indexes(layout, &plan)
         .into_iter()
-        .chain(partial_indexes(layout))
+        .chain(partial_indexes(layout, &plan))
     {
         defs.push(format!("KEY {} ({parts})", q(&name)));
     }
@@ -146,153 +137,6 @@ pub(crate) fn create_sql_marked(
         q(table),
         defs.join(",\n  ")
     )
-}
-
-/// The unit index as `(primary, key parts)`: the PRIMARY KEY when the unit is unique and its
-/// columns fit InnoDB's key limits, otherwise a non-unique KEY over as many leading unit
-/// columns as fit (long strings as prefixes). None when not even the first unit column can
-/// be indexed; unit DELETEs and INSERTs stay correct without an index.
-pub(crate) fn unit_index(layout: &Layout) -> Option<(bool, String)> {
-    let parts: Vec<(&MvCol, KeyPart)> = layout
-        .unit_pos
-        .iter()
-        .map(|&p| (&layout.cols[p], key_part(&layout.cols[p])))
-        .collect();
-    if layout.primary && parts.len() <= MAX_KEY_PARTS {
-        let full: Option<u64> = parts.iter().map(|(_, k)| k.full_bytes()).sum();
-        if full.is_some_and(|b| b <= MAX_KEY_BYTES) {
-            return Some((true, layout.unit_cols().join(", ")));
-        }
-    }
-    let lead: Vec<(&MvCol, KeyPart)> = parts
-        .into_iter()
-        .take_while(|(_, k)| *k != KeyPart::None)
-        .take(MAX_KEY_PARTS)
-        .collect();
-    (1..=lead.len())
-        .rev()
-        .find_map(|n| fit_key(&lead[..n]))
-        .map(|k| (false, k))
-}
-
-/// The unique index over [`Layout::identity`]: the PRIMARY KEY when the identity is the unit
-/// and that is the primary key, else `_lv_row` over the whole identity columns (a prefix
-/// would let distinct rows collide). None when the rows have no identity, a column cannot be
-/// indexed whole, the key exceeds InnoDB's limits, or a TIMESTAMP column is read in the
-/// session's time zone (the two instants of a DST fall-back hour read as one value).
-pub(crate) fn row_index(layout: &Layout) -> Option<RowIndex> {
-    if layout.identity.is_empty()
-        || (!layout.epoch_timestamps()
-            && layout
-                .identity
-                .iter()
-                .any(|&p| layout.cols[p].data_type == "timestamp"))
-    {
-        return None;
-    }
-    if layout.identity == layout.unit_pos && matches!(unit_index(layout), Some((true, _))) {
-        return Some(RowIndex::Primary);
-    }
-    if layout.identity.len() > MAX_KEY_PARTS {
-        return None;
-    }
-    let bytes: Option<u64> = layout
-        .identity
-        .iter()
-        .map(|&p| key_part(&layout.cols[p]).full_bytes())
-        .sum();
-    if !bytes.is_some_and(|b| b <= MAX_KEY_BYTES) {
-        return None;
-    }
-    Some(RowIndex::Unique(
-        layout
-            .identity
-            .iter()
-            .map(|&p| q(&layout.cols[p].name))
-            .collect::<Vec<_>>()
-            .join(", "),
-    ))
-}
-
-/// One non-unique index per lineage key, `(name, key parts)` (none for a key that does not
-/// fit InnoDB's limits).
-pub(crate) fn lineage_indexes(layout: &Layout) -> Vec<(String, String)> {
-    layout
-        .lineage
-        .iter()
-        .filter_map(|key| {
-            let alias = crate::mv::lineage_alias(&layout.cols[*key.first()?].name)?;
-            let parts: Vec<(&MvCol, KeyPart)> = key
-                .iter()
-                .map(|&p| (&layout.cols[p], key_part(&layout.cols[p])))
-                .collect();
-            if parts.len() > MAX_KEY_PARTS || parts.iter().any(|(_, k)| *k == KeyPart::None) {
-                return None;
-            }
-            Some((format!("_lv_a{alias}"), fit_key(&parts)?))
-        })
-        .collect()
-}
-
-/// One non-unique index `_lv_p<k>` per set of partial unit positions the unit index does
-/// not start with: a partial refresh reads and replaces the rows matching those columns
-/// alone (an index range instead of a scan).
-pub(crate) fn partial_indexes(layout: &Layout) -> Vec<(String, String)> {
-    let unit_index = unit_index(layout).is_some();
-    layout
-        .partial
-        .iter()
-        .enumerate()
-        .filter(|(_, at)| !(unit_index && at.iter().copied().eq(0..at.len())))
-        .filter_map(|(k, at)| {
-            let parts: Vec<(&MvCol, KeyPart)> = at
-                .iter()
-                .map(|&u| {
-                    (
-                        &layout.cols[layout.unit_pos[u]],
-                        key_part(&layout.cols[layout.unit_pos[u]]),
-                    )
-                })
-                .take_while(|(_, k)| *k != KeyPart::None)
-                .take(MAX_KEY_PARTS)
-                .collect();
-            if parts.is_empty() {
-                return None;
-            }
-            Some((format!("_lv_p{k}"), fit_key(&parts)?))
-        })
-        .collect()
-}
-
-/// How a column can be part of an index.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum KeyPart {
-    /// Fixed size, in bytes (an upper bound).
-    Fixed(u64),
-    /// String of `len` characters (bytes for binary strings) of at most `per_char` bytes each.
-    /// TEXT / BLOB columns (`must_prefix`) can only be indexed by a prefix.
-    Str {
-        len: u64,
-        per_char: u64,
-        must_prefix: bool,
-    },
-    /// Not indexable (JSON, spatial, unknown types).
-    None,
-}
-
-impl KeyPart {
-    /// Bytes the whole column takes in a key (None: it cannot be indexed whole).
-    pub(crate) fn full_bytes(&self) -> Option<u64> {
-        match *self {
-            KeyPart::Fixed(b) => Some(b),
-            KeyPart::Str {
-                len,
-                per_char,
-                must_prefix: false,
-            } => Some(len * per_char),
-            _ => None,
-        }
-    }
 }
 
 /// How `col` can be part of an index.
@@ -322,52 +166,6 @@ pub(crate) fn key_part(col: &MvCol) -> KeyPart {
         "tinyblob" | "blob" | "mediumblob" | "longblob" => text(TEXT_PREFIX, 1, true),
         _ => KeyPart::None,
     }
-}
-
-/// Key parts for `cols` within [`MAX_KEY_BYTES`]: fixed-size columns whole, string columns
-/// sharing the rest (each whole if it fits, else a prefix). None if a string would get no
-/// character at all.
-pub(crate) fn fit_key(cols: &[(&MvCol, KeyPart)]) -> Option<String> {
-    // (Length bytes of variable-length strings do not count.)
-    let fixed: u64 = cols
-        .iter()
-        .map(|(_, k)| match k {
-            KeyPart::Fixed(b) => *b,
-            _ => 0,
-        })
-        .sum();
-    let mut left = MAX_KEY_BYTES.checked_sub(fixed)?;
-    let mut strings: Vec<usize> = (0..cols.len())
-        .filter(|&i| matches!(cols[i].1, KeyPart::Str { .. }))
-        .collect();
-    strings.sort_by_key(|&i| match cols[i].1 {
-        KeyPart::Str { len, per_char, .. } => len * per_char,
-        _ => 0,
-    });
-    // Smallest first, so that what short strings leave over goes to the longer ones.
-    let mut chars = vec![0u64; cols.len()];
-    for (k, &i) in strings.iter().enumerate() {
-        let KeyPart::Str { len, per_char, .. } = cols[i].1 else {
-            continue;
-        };
-        let share = left / (strings.len() - k) as u64;
-        chars[i] = len.min(share / per_char);
-        if chars[i] == 0 {
-            return None;
-        }
-        left -= chars[i] * per_char;
-    }
-    let parts: Vec<String> = cols
-        .iter()
-        .zip(chars)
-        .map(|((c, k), n)| match *k {
-            KeyPart::Str {
-                len, must_prefix, ..
-            } if must_prefix || n < len => format!("{}({n})", q(&c.name)),
-            _ => q(&c.name),
-        })
-        .collect();
-    Some(parts.join(", "))
 }
 
 /// Maximum bytes per character of a character set (4 when unknown: the table default is utf8mb4).
@@ -459,7 +257,7 @@ pub(crate) async fn has_row_index(
     table: &str,
     layout: &Layout,
 ) -> Result<bool> {
-    let (index, cols) = match row_index(layout) {
+    let (index, cols) = match row_index(layout, &KeyPlan::for_layout(layout, Kind::Mysql)) {
         None => return Ok(true),
         Some(RowIndex::Primary) => ("PRIMARY", &layout.unit_pos),
         Some(RowIndex::Unique(_)) => (ROW_INDEX, &layout.identity),
@@ -540,7 +338,7 @@ async fn create_shadow(
     conn.query_drop(format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(&shadow)))
         .await?;
     match conn
-        .query_drop(layout.create_sql_marked(schema, &shadow, marker))
+        .query_drop(layout.create_sql_marked(Kind::Mysql, schema, &shadow, marker))
         .await
     {
         Ok(()) => {}
@@ -554,7 +352,7 @@ async fn create_shadow(
                 "{}; creating the table with the target's default collations instead",
                 e.message
             );
-            conn.query_drop(adapted.create_sql_marked(schema, &shadow, marker))
+            conn.query_drop(adapted.create_sql_marked(Kind::Mysql, schema, &shadow, marker))
                 .await?;
         }
         Err(e) => return Err(e.into()),
