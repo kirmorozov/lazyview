@@ -713,15 +713,28 @@ pub(crate) fn for_server(
     }
 }
 
+/// Only 1094 (`ER_NO_SUCH_THREAD`) proves the killed thread is gone. Any other server error —
+/// 1045/1044 (no `SUPER`/`CONNECTION_ADMIN`), 1290 (`--read-only`), 1142 (killed) — means the
+/// KILL never ran, so the fence must fail and `Endpoint::fence` parks the id in `zombies`.
+fn kill_is_gone(err: &mysql_async::Error) -> bool {
+    const ER_NO_SUCH_THREAD: u16 = 1094;
+    matches!(err, mysql_async::Error::Server(se) if se.code == ER_NO_SUCH_THREAD)
+}
+
 /// `KILL CONNECTION id` on a fresh connection, then waits until `SHOW PROCESSLIST` (which lists
 /// the user's own threads without privileges) no longer has it.
 pub(crate) async fn kill_and_wait(opts: &Opts, id: u32) -> Result<()> {
     let fut = async {
         let mut c = Conn::new(opts.clone()).await?;
         match c.query_drop(format!("KILL CONNECTION {id}")).await {
-            // 1094: unknown thread id (already gone).
-            Ok(()) | Err(mysql_async::Error::Server(_)) => {}
-            Err(e) => return Err(anyhow::Error::from(e)),
+            Ok(()) => {}
+            // Only "unknown thread id" proves the thread is gone; anything else means the KILL did not run.
+            Err(e) if kill_is_gone(&e) => {}
+            Err(e) => {
+                return Err(
+                    anyhow::Error::from(e).context(format!("killing target connection {id}"))
+                )
+            }
         }
         let deadline = tokio::time::Instant::now() + FENCE_WAIT;
         loop {
@@ -761,4 +774,34 @@ pub(crate) fn schema_of(opts: &Opts, what: &str) -> Result<String> {
     opts.db_name().map(str::to_string).ok_or_else(|| {
         anyhow!("{what} DSN must name a database (mysql://user:pass@host:port/<schema>)")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_err(code: u16) -> mysql_async::Error {
+        mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: "denied".into(),
+            state: "HY000".into(),
+        })
+    }
+
+    /// Only 1094 means the killed thread is already gone; an error that means the KILL never
+    /// ran must keep the fence failing. Fails before the fix: any server error read as
+    /// "already gone", so 1045/1290/1142 returned `true`.
+    #[test]
+    fn kill_is_gone_only_takes_unknown_thread() {
+        assert!(kill_is_gone(&server_err(1094)));
+        for code in [1045u16, 1290, 1142] {
+            assert!(
+                !kill_is_gone(&server_err(code)),
+                "{code} is not already gone"
+            );
+        }
+        let io =
+            mysql_async::Error::Io(mysql_async::IoError::Io(std::io::Error::other("net down")));
+        assert!(!kill_is_gone(&io));
+    }
 }
