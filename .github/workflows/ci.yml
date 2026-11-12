@@ -1,6 +1,11 @@
 name: ci
 
-# lint, unit, e2e, integration and integration-multi run on every push and pull request.
+# pull_request runs everything: lint, unit, e2e, the integration matrix and integration-multi (19 jobs).
+# push to main runs only lint, unit, e2e, image and the integration matrix's mysql84 default-supervisor
+# entry (it is the single writer of the shared `integration` rust-cache that the PR runs restore); the
+# other 14 matrix entries and integration-multi are skipped there because landing is fast-forward only,
+# so the pushed commit is exactly the PR head whose pull_request run just went green on the same tree.
+# push v* and workflow_dispatch run the full set (release needs the matrix and integration-multi).
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
 #   main  -> `image`   (needs lint + unit + e2e; the integration jobs run alongside, not required)
 #   v*    -> `release` (needs lint + unit + e2e + the integration matrix + the multi-server job;
@@ -85,28 +90,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Service names and host ports from docker-compose.test.yml.
-        include:
-          - { flavor: mysql84, port: 33084, tier: LTS, advisory: false }
-          - { flavor: mysql97, port: 33097, tier: LTS, advisory: false }
-          - { flavor: mysql2610, port: 33261, tier: GA, advisory: false }
-          # AWS-only: community EOL, still run by Amazon RDS / Aurora (drop one = its entry here + its
-          # service in docker-compose.test.yml).
-          - { flavor: mysql80, port: 33080, tier: AWS-only, advisory: false }
-          - { flavor: percona84, port: 33184, tier: LTS, advisory: false }
-          - { flavor: percona97, port: 33197, tier: LTS, advisory: false }
-          - { flavor: mariadb1011, port: 33111, tier: LTS, advisory: false }
-          - { flavor: mariadb114, port: 33114, tier: LTS, advisory: false }
-          - { flavor: mariadb118, port: 33118, tier: LTS, advisory: false }
-          - { flavor: mariadb123, port: 33123, tier: LTS, advisory: false }
-          - { flavor: mariadb130, port: 33130, tier: GA, advisory: false }
-          - { flavor: mariadb106, port: 33106, tier: AWS-only, advisory: false }
-          # The sequential refresh path (LAZYVIEW_SUPERVISOR=off) on one blocking flavor; the
-          # other jobs run the default (concurrent) one.
-          - { flavor: mariadb1011, port: 33111, tier: LTS, advisory: false, supervisor: "off" }
-          # Pre-releases (compose profile `prerelease`): tested, not supported, never required.
-          - { flavor: mariadb131-rc, port: 33131, tier: pre-release, advisory: true }
-          - { flavor: mariadb132-pre, port: 33132, tier: pre-release, advisory: true }
+        # Service names and host ports from docker-compose.test.yml. The AWS-only flavors are
+        # community-EOL but still run by Amazon RDS / Aurora (drop one = its entry here + its service
+        # in docker-compose.test.yml). The supervisor:"off" entry is the sequential refresh path
+        # (LAZYVIEW_SUPERVISOR=off); the other jobs run the default (concurrent) one. The advisory
+        # pre-releases (compose profile `prerelease`) are tested, not supported, never required.
+        # A push to main runs only the mysql84 default-supervisor entry: landing is fast-forward
+        # only, so the other 14 entries already ran green on the pull_request of this very commit,
+        # and mysql84 stays because it alone saves the shared `integration` rust-cache (save-if
+        # below) that the PR runs restore.
+        include: >-
+          ${{ fromJSON(
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+          && '[{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false}]'
+          || '[{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false},{"flavor":"mysql97","port":33097,"tier":"LTS","advisory":false},{"flavor":"mysql2610","port":33261,"tier":"GA","advisory":false},{"flavor":"mysql80","port":33080,"tier":"AWS-only","advisory":false},{"flavor":"percona84","port":33184,"tier":"LTS","advisory":false},{"flavor":"percona97","port":33197,"tier":"LTS","advisory":false},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false},{"flavor":"mariadb118","port":33118,"tier":"LTS","advisory":false},{"flavor":"mariadb123","port":33123,"tier":"LTS","advisory":false},{"flavor":"mariadb130","port":33130,"tier":"GA","advisory":false},{"flavor":"mariadb106","port":33106,"tier":"AWS-only","advisory":false},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false,"supervisor":"off"},{"flavor":"mariadb131-rc","port":33131,"tier":"pre-release","advisory":true},{"flavor":"mariadb132-pre","port":33132,"tier":"pre-release","advisory":true}]'
+          ) }}
     env:
       COMPOSE_FILE: docker-compose.test.yml
       COMPOSE_PROFILES: prerelease
@@ -193,6 +191,9 @@ jobs:
     # MySQL 8.4 LTS, Percona 9.7 and MariaDB 13.0, whose default utf8mb4_uca1400_ai_ci
     # collation the MySQL targets lack.
     name: integration (multi-server, mysql84 + percona97 + mariadb130)
+    # Skipped on pushes to main: its scenarios already ran green on the pull_request of the very
+    # commit being landed (fast-forward only). v* tags and workflow_dispatch still run it (release needs it).
+    if: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
