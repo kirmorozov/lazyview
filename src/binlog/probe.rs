@@ -203,8 +203,14 @@ pub fn is_duplicate_server_id(err: &anyhow::Error) -> bool {
 }
 
 pub(super) fn is_duplicate_server_id_error(se: &mysql_async::ServerError) -> bool {
+    // MariaDB's ER_SLAVE_SAME_ID (4052) is unambiguous by code; 1236 is also used for unrelated
+    // fatal dump errors, so only there the message has to say "same server_id" (and
+    // `missing_binlog_message` owns the other half of 1236).
+    if se.code == 4052 {
+        return true;
+    }
     let m = se.message.to_ascii_lowercase();
-    matches!(se.code, ER_SOURCE_FATAL_ERROR_READING_BINLOG | 4052)
+    se.code == ER_SOURCE_FATAL_ERROR_READING_BINLOG
         && (m.contains("same server_uuid/server_id") || m.contains("same server_id"))
 }
 

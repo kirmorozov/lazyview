@@ -202,9 +202,6 @@ impl BinlogReader {
         from: &Position,
         heartbeat: Duration,
     ) -> Result<Self> {
-        if server_id == 0 {
-            bail!("replica server_id must not be 0");
-        }
         let mut conn = Conn::new(opts)
             .await
             .context("opening the binlog connection")?;
@@ -429,7 +426,11 @@ impl Time2Twin {
 /// values with a fraction, silently.
 fn time2_twin(ev: &Event, tme: &TableMapEvent<'_>) -> Result<Option<Time2Twin>> {
     let Ok(n) = usize::try_from(tme.columns_count()) else {
-        return Ok(None);
+        bail!(
+            "the column count of {} does not fit this platform; its TIME(1)/TIME(2) columns \
+             cannot be decoded",
+            tme_name(tme)
+        );
     };
     let cols: Vec<usize> = (0..n)
         .filter(|&i| {
