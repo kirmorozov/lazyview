@@ -4,7 +4,7 @@
 //! same id hammered across tables, updates of columns no view reads).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
 
 use super::oracle::{Kind, ViewSpec};
-use super::{exec, q, scaled, server_code, Db};
+use super::{exec, q, rows, scaled, server_code, Db};
 
 /// `NULL` with probability `p`, else the (lazily evaluated) value.
 macro_rules! opt {
@@ -1554,7 +1554,11 @@ pub fn txn_retryable(e: &anyhow::Error, duplicate_ok: bool) -> bool {
 /// although the same transaction just deleted the row. Reproduced with two writers replaying
 /// the fk ops and a third session creating and dropping views and tables: 19 and 2 errors in
 /// 3,000 transactions on 26.7 (durable / local settings), none without the DDL, none on 8.4.
+/// A batch in XA form (see [`xa_branch`]) skips this loop and goes to [`run_xa_txn`].
 pub async fn run_txn(conn: &mut Conn, t: &Txn) -> Result<()> {
+    if let Some(xid) = xa_branch(t) {
+        return run_xa_txn(conn, t, xid).await;
+    }
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -1583,6 +1587,155 @@ pub async fn run_txn(conn: &mut Conn, t: &Txn) -> Result<()> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// XA branches (soak S1.6, Q1)
+// ---------------------------------------------------------------------------------------------
+
+/// Every retry of an XA branch that the server had rolled back (deadlock, restart, killed
+/// mid-branch): the report's `xa_rolled_back_retries` line reads it (`tests/soak.rs`). Process
+/// scope because `run_txn` carries no run state — the soak binary runs one scenario at a time.
+pub static XA_ROLLED_BACK_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `t` is an XA branch — first statement `XA START '<xid>'`, last statement resolving
+/// that same xid (`XA COMMIT` / `XA ROLLBACK`, optionally `ONE PHASE`) — returning its xid. Such
+/// a batch runs statement-for-statement like the single-statement fast path (wrapping a branch
+/// in `START TRANSACTION` is ERROR 1399), but as *one unit*: [`run_xa_txn`] retries the whole
+/// branch when the server rolls it back, which per-statement batches could never do.
+fn xa_branch(t: &Txn) -> Option<&str> {
+    if t.rollback || t.stmts.len() < 3 {
+        return None;
+    }
+    let xid = quoted_xid(t.stmts.first()?, "XA START ")?;
+    let last = t.stmts.last()?;
+    for prefix in ["XA COMMIT ", "XA ROLLBACK "] {
+        if quoted_xid(last, prefix) == Some(xid) {
+            return Some(xid);
+        }
+    }
+    None
+}
+
+/// The `'<xid>'` of a statement that starts with `prefix` (ignoring leading whitespace), when the
+/// prefix and a quoted value follow it.
+fn quoted_xid<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.trim_start()
+        .strip_prefix(prefix)?
+        .strip_prefix('\'')?
+        .split('\'')
+        .next()
+}
+
+/// Whether the branch's last statement commits (rather than rolls back) the branch.
+fn xa_commits(t: &Txn) -> bool {
+    t.stmts
+        .last()
+        .is_some_and(|s| s.trim_start().starts_with("XA COMMIT"))
+}
+
+/// One XA branch, retried as a whole while the server keeps rolling it back: an XA branch is
+/// rolled back invisibly under the session (deadlock detection answers the *next* XA statement
+/// with `XA_RBDEADLOCK`, and a server restart under an open branch loses it), which is how the
+/// 30-minute smoke died at +852 s (`ERROR 1614 (XA102): XA_RBDEADLOCK` on attempt 2 — the retry
+/// loop below is what "attempt" means here). The decision to retry is by server code only
+/// ([`server_code`], never message text): `1213`/`1205` (deadlock, lock wait — the branch
+/// survives but its work is gone), `1402` (unknown XID — the branch is not there), `1613`/`1614`
+/// (the server rolled the branch back) and the `1399` (XAER_RMFAIL) that follows them when the
+/// next XA statement meets the lost state. Anything else is fatal, as before. The xid is not
+/// re-minted: [`SoakIds::xid`](`super::soakwork::SoakIds`) mints it unique to this batch, so any
+/// branch under it was left by this batch's own earlier attempt, which [`recover_xa_branch`]
+/// resolves before the re-run — re-running cannot double-apply and cannot collide.
+async fn run_xa_txn(conn: &mut Conn, t: &Txn, xid: &str) -> Result<()> {
+    let last = t.stmts.len() - 1;
+    let commit = xa_commits(t);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut at = 0usize;
+        let res: Result<()> = async {
+            for (i, s) in t.stmts.iter().enumerate() {
+                at = i;
+                exec(conn, s).await?;
+            }
+            Ok(())
+        }
+        .await;
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let retryable = matches!(
+                    server_code(&e),
+                    Some(1213 | 1205 | 1399 | 1402 | 1613 | 1614)
+                );
+                if !retryable || attempt >= 30 {
+                    return Err(e).with_context(|| {
+                        format!("transaction '{}' failed (attempt {attempt})", t.label)
+                    });
+                }
+                XA_ROLLED_BACK_RETRIES.fetch_add(1, Ordering::Relaxed);
+                // `XA COMMIT` failing with no branch left is an ambiguous *success* (a prepared
+                // branch does not vanish on its own), so only that statement's failure may skip
+                // the re-run; every other failure point leaves the branch's work undone.
+                let ambiguous = commit && at == last;
+                match recover_xa_branch(conn, xid, commit, ambiguous).await {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(e) => return Err(e),
+                }
+                tokio::time::sleep(Duration::from_millis(5 * attempt)).await;
+            }
+        }
+    }
+}
+
+/// Makes the session usable again and leaves no trace of the branch before the re-run; `true`
+/// when the branch reached its intended outcome during recovery (the batch is then done, not
+/// re-run). Only a *prepared* branch survives — and a prepared branch under this xid was put
+/// there by this batch's own attempt (ids are unique per batch), so resolving it exactly the way
+/// the batch itself would (commit a committing branch, roll back a rolling-back one) applies the
+/// branch exactly once and keeps the F5/D5 rule "no branch is ever left prepared" true across
+/// the retry.
+async fn recover_xa_branch(
+    conn: &mut Conn,
+    xid: &str,
+    commit: bool,
+    ambiguous: bool,
+) -> Result<bool> {
+    // A dead session (container restart, KILL CONNECTION) is reconnected by the reset; one still
+    // alive but stuck in XA state answers `XA RECOVER` below with 1399, which reads as "not
+    // prepared" and is cleaned by the best-effort rollback.
+    if rows(conn, "SELECT 1").await.is_err() {
+        conn.reset()
+            .await
+            .context("xa recovery: reconnecting after the branch was lost")?;
+    }
+    let recovered = match rows(conn, "XA RECOVER CONVERT XID").await {
+        Ok(rs) => Some(rs),
+        // No CONVERT XID variant on every server, and 1399 mid-branch: fall back to the plain
+        // form, and read a second failure as "nothing prepared to find".
+        Err(_) => rows(conn, "XA RECOVER").await.ok(),
+    };
+    let prepared = recovered.is_some_and(|rs| {
+        rs.iter()
+            .any(|r| r.iter().any(|c| c.as_deref() == Some(xid)))
+    });
+    if prepared {
+        let cmd = if commit { "XA COMMIT" } else { "XA ROLLBACK" };
+        match exec(conn, &format!("{cmd} '{xid}'")).await {
+            Ok(()) => return Ok(true),
+            // 1402: it resolved between the probe and here (only this harness ever touches the
+            // id, so this is the re-run of this same recovery) — the outcome stands either way.
+            Err(e) if matches!(server_code(&e), Some(1402)) => return Ok(true),
+            Err(e) => {
+                return Err(e).with_context(|| format!("xa recovery: {cmd} '{xid}'"));
+            }
+        }
+    }
+    // An active branch can only sit on a session we still own; drop it so the re-run's `XA START`
+    // meets no duplicate xid. Its error (1402, unknown XID) is exactly the expected case.
+    let _ = exec(conn, &format!("XA ROLLBACK '{xid}'")).await;
+    Ok(ambiguous)
 }
 
 /// Runs `n` batches from `wl` on `conn`; returns the number of transactions executed.

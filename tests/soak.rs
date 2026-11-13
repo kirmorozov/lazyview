@@ -17,7 +17,7 @@ use common::soakwork::{
     run_paced, run_soak_batches, setup_soak, soak_rate, soak_views, soak_writers, SoakIds,
     SoakWorkload, SOAK_TABLES,
 };
-use common::workload::Sizes;
+use common::workload::{Sizes, XA_ROLLED_BACK_RETRIES};
 use common::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -250,6 +250,9 @@ async fn soak_run(
     let events = plan(seed, minutes, per_hour);
     let mut next_check = began + Duration::from_secs(check_s);
     let mut window = Window::now(&eng);
+    // The approved-rebuild ledger of the per-view F5 rule (S3.3/Q3): chaos events fill it, the
+    // checks honor it, and a fresh engine empties it (`ChaosRun::start_engine_with`).
+    let mut approved: HashMap<String, u64> = HashMap::new();
     let mut totals: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut done = 0usize;
     let out = loop {
@@ -274,6 +277,7 @@ async fn soak_run(
                 writers: &writers.0,
                 ov: &ov,
                 logs,
+                approved: &mut approved,
             };
             let (row, next) = run_event(&mut run, eng, kind, at).await?;
             eng = next;
@@ -320,6 +324,7 @@ async fn soak_run(
             &targets,
             &specs,
             &writers.0,
+            &approved,
             &format!("scheduled @+{}s", began.elapsed().as_secs()),
         )
         .await?;
@@ -419,6 +424,10 @@ fn write_report(ctx: &Ctx, dir: &Path, report: &mut Report, logs: &[PathBuf]) {
     if let Ok(w) = scan_warns(logs) {
         report.warns = w;
     }
+    // The XA retry counter of Q1 (`workload.rs`): the report must say how often the server rolled
+    // a branch back and the harness re-ran it.
+    report.xa_rolled_back_retries =
+        XA_ROLLED_BACK_RETRIES.load(std::sync::atomic::Ordering::Relaxed);
     match report.write(dir) {
         Ok(()) => ctx.log(format!(
             "report: {}/report.md — {}",

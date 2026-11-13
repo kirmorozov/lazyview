@@ -845,10 +845,13 @@ impl SoakWorkload {
     }
 
     /// An XA branch: `XA START` … `XA END` … `XA PREPARE` then `XA COMMIT` / `XA ROLLBACK`, or
-    /// `XA COMMIT … ONE PHASE`, the statement shapes of `tests/xa.rs:14`–`28`. Every statement is
-    /// its own single-statement `Txn`, so `run_txn` sends it without wrapping it in a transaction
-    /// of its own, and the branch is always resolved inside this batch (F5/D5: no branch is ever
-    /// left prepared, so no crash can meet `XA … prepared before this run`).
+    /// `XA COMMIT … ONE PHASE`, the statement shapes of `tests/xa.rs:14`–`28`. The whole branch
+    /// is **one** `Txn`, which [`run_txn`] recognizes and runs as one unit: when the server rolls
+    /// the branch back under the session (deadlock, restart) the entire branch is retried
+    /// (`workload.rs` `run_xa_txn`, Q1) — per-statement batches could not, they lost the smoke
+    /// run of S3 at `XA COMMIT`. The branch is still always resolved inside the batch (F5/D5: no
+    /// branch is ever left prepared, so no crash can meet `XA … prepared before this run`; the
+    /// retry resolves a found prepared branch the same way it would have).
     fn xa_batch(&mut self) -> Vec<Txn> {
         let n = SoakIds::fresh(&self.ids.xid);
         let xid = format!("soak-{n}");
@@ -899,15 +902,12 @@ impl SoakWorkload {
             }
             _ => stmts.push(format!("XA COMMIT '{xid}' ONE PHASE")),
         }
-        stmts
-            .into_iter()
-            .map(|s| Txn {
-                label: label.to_string(),
-                stmts: vec![s],
-                rollback: false,
-                retry_duplicate: false,
-            })
-            .collect()
+        vec![Txn {
+            label: label.to_string(),
+            stmts,
+            rollback: false,
+            retry_duplicate: false,
+        }]
     }
 
     /// One random operation: (label, statements). Weights follow §2: the FK and cascade ops are a

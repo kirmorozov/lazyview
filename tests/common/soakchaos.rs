@@ -18,6 +18,7 @@
 //!   the run's `Vec`, because `finish_run` removes the log dir (F12) and the logs are the
 //!   evidence.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -184,7 +185,10 @@ pub async fn docker_blocking(args: Vec<String>) -> Result<()> {
 // ---------------------------------------------------------------------------------------------
 
 /// What an event may use: the run's schema and views, its writers (so the event's check can pause
-/// them), the overrides every engine of the run starts with, and the log files collected so far.
+/// them), the overrides every engine of the run starts with, the log files collected so far, and
+/// the run's approved-rebuild ledger (`soakcheck::quiesce_and_check`: `view@target` → the
+/// cumulative `whole_view_refreshes` an event has accounted for, which the per-view F5 rule then
+/// tolerates; an event that explains a rebuild approves it, everything else fails).
 pub struct ChaosRun<'a> {
     pub ctx: &'a Ctx,
     pub src: &'a Db,
@@ -193,6 +197,7 @@ pub struct ChaosRun<'a> {
     pub writers: &'a [watch::Sender<bool>],
     pub ov: &'a [(&'a str, &'a str)],
     pub logs: &'a mut Vec<PathBuf>,
+    pub approved: &'a mut HashMap<String, u64>,
 }
 
 impl ChaosRun<'_> {
@@ -214,6 +219,10 @@ impl ChaosRun<'_> {
         ov.push(("LAZYVIEW_HEALTH_ADDR", addr.as_str()));
         let eng = self.ctx.start_engine(self.src, &ov)?;
         self.logs.push(eng.log_path.clone());
+        // Per-view `/stats` counters are per engine start (`engine.rs:24` a fresh `Metrics`):
+        // approvals were earned against the old engine's cumulative numbers, which the new
+        // engine's zeros make meaningless — the ledger empties with the engine.
+        self.approved.clear();
         Ok(eng)
     }
 }
@@ -439,10 +448,20 @@ pub async fn run_event(
                 ));
             }
         },
-        // The shapes of `tests/ddl.rs:74`–`82`. What no view reads must not rebuild anything;
-        // the widened column is a documented rebuild (F5) and is reported, not failed.
+        // The shapes of `tests/ddl.rs:74`–`82`. What no view reads must not rebuild anything, and
+        // the widened column is the documented rebuild of F5 ("source column type changed") —
+        // both asserted per view, not just reported (Q3): the affected set is derived from the
+        // plans themselves ([`plan_readers_of`], never from view names), a rebuild inside it is
+        // approved and reported, and a rebuild of any *other* incremental view is named and fails.
         Chaos::SourceDdl => {
             let before = eng.snapshot();
+            // The expectation and the rebuild baseline, both before any DDL of this event.
+            let readers = plan_readers_of(run, "entities", "kind").await?;
+            let base: HashMap<String, u64> = view_rows(&eng, run.src, run.specs)
+                .await?
+                .into_iter()
+                .map(|v| (format!("{}@{}", v.name, v.target), v.whole_view_refreshes))
+                .collect();
             let mut c = run.src.conn().await?;
             exec(&mut c, "ALTER TABLE items ADD COLUMN spare INT NULL").await?;
             exec(&mut c, "ALTER TABLE items DROP COLUMN spare").await?;
@@ -471,12 +490,71 @@ pub async fn run_event(
             if d.definition_reloads > 0 {
                 extra.push("a definition was reloaded".to_string());
             }
+            // The per-view rule (F5) on the deltas of this event: `/stats` numbers are cumulative
+            // since the engine started, so the event compares against its own baseline, approves
+            // the plan-reading incremental views up to what it observed (the number the later
+            // scheduled checks hold them to), and fails any other incremental view that moved.
+            let mut rebuilt: Vec<String> = Vec::new();
+            let mut stray: Vec<String> = Vec::new();
+            let mut reading = 0usize;
+            for v in view_rows(&eng, run.src, run.specs).await? {
+                let key = format!("{}@{}", v.name, v.target);
+                if !v.mode.eq_ignore_ascii_case("incremental") {
+                    continue; // the Full/Chained views rebuild by design (F5)
+                }
+                let delta = v
+                    .whole_view_refreshes
+                    .saturating_sub(base.get(&key).copied().unwrap_or(0));
+                if readers.contains(&key) {
+                    reading += 1;
+                    let e = run.approved.entry(key.clone()).or_default();
+                    *e = (*e).max(v.whole_view_refreshes);
+                    if delta > 0 {
+                        rebuilt.push(format!("{key} +{delta}"));
+                    }
+                } else if delta > 0 {
+                    stray.push(format!("{key} +{delta} (its plan does not read `kind`)"));
+                }
+            }
+            if !stray.is_empty() {
+                problems.push(format!(
+                    "whole-view refreshes outside the plan-derived set: {}",
+                    stray.join(", ")
+                ));
+            }
+            // A rebuild of F5 can land while this event reads its numbers: give the plan-reading
+            // views one more settle before the check below holds the counters to the ledger.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            for v in view_rows(&eng, run.src, run.specs).await? {
+                let key = format!("{}@{}", v.name, v.target);
+                if readers.contains(&key) && v.mode.eq_ignore_ascii_case("incremental") {
+                    let e = run.approved.entry(key.clone()).or_default();
+                    *e = (*e).max(v.whole_view_refreshes);
+                }
+            }
+            // Which happened is reported, not assumed: the documented rebuild, or no rebuild at
+            // all — the latter is legal (a widening the kept rows survive), and those views are
+            // then still held to their oracle by the exactness check that ends every event (§3),
+            // which sweeps the whole set including them.
+            let widened = if rebuilt.is_empty() {
+                format!(
+                    "widened `kind`: no rebuild among the {reading} plan-reading incremental \
+                     views (kept; the event's check swept their oracle — reason: source column \
+                     type changed (F5))"
+                )
+            } else {
+                format!(
+                    "widened `kind`: rebuilt {} (reason: source column type changed (F5), \
+                     approved)",
+                    rebuilt.join(", ")
+                )
+            };
             extra.push(format!(
-                "adds/drops/ANALYZE: full_rebuilds {} (must be 0 outside the documented cases, \
-                 F5), widened `kind` and the index: full_rebuilds {} total, definition_reloads {}",
+                "adds/drops/ANALYZE: full_rebuilds {}, widened `kind` and the index: \
+                 full_rebuilds {} total, definition_reloads {}; {widened}",
                 counter(&after_quiet, "full_rebuilds"),
                 counter(&all, "full_rebuilds"),
-                d.definition_reloads
+                d.definition_reloads,
             ));
         }
     }
@@ -499,6 +577,7 @@ pub async fn run_event(
         run.targets,
         run.specs,
         run.writers,
+        run.approved,
         &what,
     )
     .await
@@ -534,6 +613,76 @@ pub async fn run_event(
 // ---------------------------------------------------------------------------------------------
 // The event helpers
 // ---------------------------------------------------------------------------------------------
+
+/// The `view@target` keys of the views whose *plan* reads column `col` of `table` — derived from
+/// the engine's own records, never from view names: `_lazyview_state.access` holds the plan's
+/// EXPLAIN body (`src/meta.rs:308`), whose lines `src/access.rs:776` writes as
+/// `occ <alias> <schema>.<table> read (0, 3, …)` with the 0-based column ordinals the plan may
+/// read (`*` for every column, `src/analyze/routes.rs:434`); the ordinal of the column comes
+/// from `information_schema`. The set is what the engine itself believes reads the column — a
+/// superset by design — which is exactly the set an F5 rebuild is confined to (Q3).
+async fn plan_readers_of(run: &ChaosRun<'_>, table: &str, col: &str) -> Result<HashSet<String>> {
+    let mut c = run.src.conn().await?;
+    let ordinal = scalar_i64(
+        &mut c,
+        &format!(
+            "SELECT ORDINAL_POSITION - 1 FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} AND COLUMN_NAME = {}",
+            q(table),
+            q(col)
+        ),
+    )
+    .await
+    .with_context(|| format!("column `{table}`.`{col}` has no ordinal: the schema changed"))?;
+    let state = rows(
+        &mut c,
+        "SELECT CAST(name AS CHAR), CAST(target AS CHAR), COALESCE(CAST(access AS CHAR), '') \
+         FROM _lazyview_state",
+    )
+    .await?;
+    c.disconnect().await.ok();
+    let names: Vec<&str> = run.specs.iter().map(|s| s.name.as_str()).collect();
+    let mut out = HashSet::new();
+    for r in state {
+        let (Some(name), Some(target), Some(access)) = (r[0].clone(), r[1].clone(), r[2].clone())
+        else {
+            continue;
+        };
+        if names.contains(&name.as_str()) && reads_column(&access, table, ordinal) {
+            out.insert(format!("{name}@{target}"));
+        }
+    }
+    ensure!(
+        !out.is_empty(),
+        "no view's plan reads `{table}`.`{col}`: the access records or the neutral set changed"
+    );
+    Ok(out)
+}
+
+/// Whether one `access` text reads the column at 0-based `ordinal` of `table`: any `occ` line for
+/// the table whose read list is `*` (the whole table) or contains the ordinal.
+fn reads_column(access: &str, table: &str, ordinal: i64) -> bool {
+    access.lines().any(|line| {
+        // `occ <alias> <schema>.<table> read <list> [filter …] -> <path>` (`src/access.rs:776`)
+        let mut it = match line.strip_prefix("occ ") {
+            Some(rest) => rest.split_whitespace(),
+            None => return false,
+        };
+        let (Some(_alias), Some(tref), Some("read"), Some(list)) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
+            return false;
+        };
+        if tref.rsplit_once('.').map_or(tref, |(_, t)| t) != table {
+            return false;
+        }
+        list == "*"
+            || list
+                .trim_matches(|c| c == '(' || c == ')')
+                .split(',')
+                .any(|o| o.trim().parse::<i64>() == Ok(ordinal))
+    })
+}
 
 /// Blocks one view's own table with a `BEFORE INSERT … SIGNAL` trigger — the shape of
 /// `reg_down_target_keeps_its_keys` (`regressions/availability.rs:275`), which is what makes the

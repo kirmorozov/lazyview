@@ -228,9 +228,23 @@ pub struct Report {
     pub counters: Vec<(&'static str, u64)>,
     pub txns: u64,
     pub ops: BTreeMap<&'static str, u64>,
+    /// Retries of XA branches the server had rolled back (`workload.rs` `run_xa_txn`, Q1), set
+    /// by the run from `workload::XA_ROLLED_BACK_RETRIES` before writing the report.
+    pub xa_rolled_back_retries: u64,
 }
 
 impl Report {
+    /// How many WARN lines are the cascade cache's gap of issue #167 ([`CASCADE_GAP_WARN`]) —
+    /// the chaos-expected line Q2 allowlisted, counted from the scanned buckets so the report
+    /// says whether the run met it (a *divergence* is a failed oracle check, never this number).
+    pub fn cascade_gap_warns(&self) -> u64 {
+        self.warns
+            .iter()
+            .filter(|(k, _)| k.contains(CASCADE_GAP_WARN))
+            .map(|(_, n)| *n)
+            .sum()
+    }
+
     /// A report header for one run: the DSN goes in redacted, the version is the crate's.
     pub fn new(mode: &str, seed: u64, dsn: &str, flavor: &str) -> Report {
         Report {
@@ -309,6 +323,13 @@ impl Report {
             "- counters: {}",
             fmt_counts(self.counters.iter().copied())
         );
+        let _ = writeln!(
+            s,
+            "- xa branch retries: {} · cascade-gap WARN lines: {} (issue #167; an oracle \
+             divergence is a failed check, not this count)",
+            self.xa_rolled_back_retries,
+            self.cascade_gap_warns(),
+        );
         s.push_str("\n## checks\n\n| | check | detail |\n|---|---|---|\n");
         for c in &self.checks {
             let _ = writeln!(s, "| {} | {} | {} |", c.mark(), c.name, one_line(&c.detail));
@@ -361,6 +382,8 @@ impl Report {
                 "samples": self.rss.len(),
             },
             "warns": self.warns,
+            "xa_rolled_back_retries": self.xa_rolled_back_retries,
+            "cascade_gap_warns": self.cascade_gap_warns(),
             "checks": self.checks.iter().map(|c| serde_json::json!({
                 "name": c.name, "pass": c.pass, "detail": c.detail,
             })).collect::<Vec<_>>(),
@@ -408,14 +431,21 @@ pub fn set_writers(writers: &[watch::Sender<bool>], stop: bool) {
 /// sample, the engine-log scan — then the writers resume. They resume on the failure path too: a
 /// failed check must never leave the load stopped.
 ///
-/// A check fails on an oracle mismatch, on an incremental view with a whole-view refresh (D5: never
-/// allowlisted), on a WARN outside [`EXPECTED_WARNS`], on an `ERROR`/panic line, and on any
+/// A check fails on an oracle mismatch, on an incremental view with a whole-view refresh (D5:
+/// the only case that ever passes is a count an event recorded in `approved`), on a WARN
+/// outside [`EXPECTED_WARNS`], on an `ERROR`/panic line, and on any
 /// hard-budget counter rising. `full_rebuilds`, `target_catchups` and `lag_over_budget` are not
-/// checked here: they have the documented cases of F5 and are what a target-down event must produce
-/// (S3.3 asserts those itself).
+/// checked here: they have the documented cases of F5 and are what a target-down event must
+/// produce (S3.3 asserts those itself).
+///
+/// `approved` maps `view@target` to the cumulative `whole_view_refreshes` a chaos event has
+/// accounted for (S3.3: the source-ddl event approves the views whose plan reads the column it
+/// widens, on the engine it checked). A view above its approved count fails like an unapproved
+/// one; the map empties whenever the run starts a fresh engine, whose counters start at zero.
 ///
 /// The counter table is measured against [`Snapshot::default()`], i.e. since the engine started;
 /// between two consecutive checks the caller keeps a [`Window`] and calls [`counters`].
+#[allow(clippy::too_many_arguments)] // the check's whole context, like `soak_run` (S3.4)
 pub async fn quiesce_and_check(
     ctx: &Ctx,
     eng: &mut Engine,
@@ -423,10 +453,11 @@ pub async fn quiesce_and_check(
     targets: &HashMap<String, Db>,
     specs: &[ViewSpec],
     writers: &[watch::Sender<bool>],
+    approved: &HashMap<String, u64>,
     what: &str,
 ) -> Result<CheckRow> {
     set_writers(writers, true);
-    let out = check_once(ctx, eng, src, targets, specs, what).await;
+    let out = check_once(ctx, eng, src, targets, specs, approved, what).await;
     set_writers(writers, false);
     out
 }
@@ -437,6 +468,7 @@ async fn check_once(
     src: &Db,
     targets: &HashMap<String, Db>,
     specs: &[ViewSpec],
+    approved: &HashMap<String, u64>,
     what: &str,
 ) -> Result<CheckRow> {
     let t = Instant::now();
@@ -470,11 +502,22 @@ async fn check_once(
             });
         }
     }
-    // (4) the per-view rebuild rule (F5): `_lazyview_state.mode` × `whole_view_refreshes`.
+    // (4) the per-view rebuild rule (F5): `_lazyview_state.mode` × `whole_view_refreshes`. The
+    // per-view counter is cumulative since the engine started, so a chaos event that legitimately
+    // caused a rebuild (`approved`, recorded by the event's own assertion) raises that view's bar
+    // to the count the event explained — every refresh *beyond* what an event accounted for, and
+    // everything on a view no event touched, still fails and is named (D5).
     let views = view_rows(eng, src, specs).await?;
     let refreshers: Vec<String> = views
         .iter()
-        .filter(|v| v.mode.eq_ignore_ascii_case("incremental") && v.whole_view_refreshes > 0)
+        .filter(|v| {
+            v.mode.eq_ignore_ascii_case("incremental")
+                && v.whole_view_refreshes
+                    > approved
+                        .get(&format!("{}@{}", v.name, v.target))
+                        .copied()
+                        .unwrap_or(0)
+        })
         .map(|v| format!("{}@{} = {}", v.name, v.target, v.whole_view_refreshes))
         .collect();
     let whole_view_refreshes: u64 = views.iter().map(|v| v.whole_view_refreshes).sum();
@@ -815,7 +858,13 @@ pub fn metric_value(body: &str, name: &str) -> Option<f64> {
 /// How much of a `WARN` message forms its bucket (§4: the first 60 characters).
 pub const WARN_BUCKET: usize = 60;
 
-/// The WARN patterns a soak run expects — the three chaos-own cases of §4. A bucket whose message
+/// The WARN pattern of the cascade cache's gap line (`src/accumulate.rs:913`): after a restart
+/// the engine replays a binlog window the in-memory cascade cache never saw, and says so at most
+/// once a minute per view. Chaos-expected (issue #167); the oracle sweep of every check still
+/// fails a view whose rows actually diverge, and that is named.
+pub const CASCADE_GAP_WARN: &str = "the cascade cache missed binlog events";
+
+/// The WARN patterns a soak run expects — the chaos-own cases of §4. A bucket whose message
 /// contains one of them is expected; every other bucket fails the check.
 pub const EXPECTED_WARNS: &[&str] = &[
     // A target is down or behind: every failed refresh / write is reported and retried with
@@ -827,6 +876,9 @@ pub const EXPECTED_WARNS: &[&str] = &[
     // The kept-changes budget was crossed while a target was behind (`src/engine.rs:3782`, the
     // `reg_down_target_keeps_its_keys` warning of F4).
     "exceed their",
+    // Chaos-expected: an engine restart replays a window the in-memory cascade cache cannot see
+    // (`src/accumulate.rs:913`, issue #167) — counted in the report as `cascade_gap_warns`.
+    CASCADE_GAP_WARN,
 ];
 
 /// The `WARN` buckets of the given engine logs (§4): every [`Engine`]'s `log_path` (`engine.rs:15`,
