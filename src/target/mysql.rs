@@ -46,7 +46,9 @@ pub(crate) fn insert_sql(
             .join(", ")
     };
     match upsert {
-        None => {}
+        // `ON CONFLICT` is PostgreSQL's (target/postgres.rs renders it, T4); a MySQL
+        // connection never carries these opts (they come from `PgConn::write_opts`).
+        None | Some(Upsert::OnConflict) => {}
         Some(Upsert::RowAlias) => {
             // (The row alias must differ from the table name.)
             let alias = if table.eq_ignore_ascii_case(ROW_ALIAS) {
@@ -61,10 +63,6 @@ pub(crate) fn insert_sql(
             let updates = set(&|c| format!("VALUES({c})"));
             sql.push_str(&format!(" ON DUPLICATE KEY UPDATE {updates}"));
         }
-        // `ON CONFLICT` is PostgreSQL's (target/postgres.rs renders it, T4); a MySQL
-        // connection never carries these opts (they come from `PgConn::write_opts`).
-        #[allow(unreachable_patterns)]
-        _ => unreachable!("ON CONFLICT is the PostgreSQL family's"),
     }
     sql
 }
@@ -324,21 +322,11 @@ pub(crate) async fn create_shadow_marked(
     layout: &Layout,
     marker: &str,
 ) -> Result<String> {
-    create_shadow(conn, schema, name, layout, Some(marker)).await
-}
-
-async fn create_shadow(
-    conn: &mut Conn,
-    schema: &str,
-    name: &str,
-    layout: &Layout,
-    marker: Option<&str>,
-) -> Result<String> {
     let shadow = shadow_name(name);
     conn.query_drop(format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(&shadow)))
         .await?;
     match conn
-        .query_drop(layout.create_sql_marked(Kind::Mysql, schema, &shadow, marker))
+        .query_drop(layout.create_sql_marked(Kind::Mysql, schema, &shadow, Some(marker)))
         .await
     {
         Ok(()) => {}
@@ -352,7 +340,7 @@ async fn create_shadow(
                 "{}; creating the table with the target's default collations instead",
                 e.message
             );
-            conn.query_drop(adapted.create_sql_marked(Kind::Mysql, schema, &shadow, marker))
+            conn.query_drop(adapted.create_sql_marked(Kind::Mysql, schema, &shadow, Some(marker)))
                 .await?;
         }
         Err(e) => return Err(e.into()),
@@ -559,12 +547,6 @@ pub(crate) async fn kill_and_wait(opts: &Opts, id: u32) -> Result<()> {
         Ok(r) => r,
         Err(_) => Err(anyhow::Error::new(Timeout(FENCE_WAIT + CONNECT_TIMEOUT))),
     }
-}
-
-/// The connection options of a MySQL-family target DSN. The source-side parser stays in
-/// [`crate::binlog`]: a target DSN is not a replica DSN.
-pub(crate) fn opts(dsn: &str) -> Result<Opts> {
-    crate::binlog::replica_opts(dsn)
 }
 
 /// The schema a target DSN names (its path).

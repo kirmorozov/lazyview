@@ -88,7 +88,7 @@ impl Kind {
                     .await
                     .map(Conn::Postgres)
             }
-            _ => bail!("internal: target family and parsed DSN disagree"),
+            _ => unreachable!("internal: target family and parsed DSN disagree"),
         }
     }
 }
@@ -130,10 +130,11 @@ pub enum Opts {
     Postgres(String),
 }
 
-/// Parses a target DSN once: its family and options (`src/engine.rs`, at startup).
+/// Parses a target DSN once: its family and options (`src/engine.rs`, at startup). The
+/// MySQL-family parser stays in [`crate::binlog`]: a target DSN is not a replica DSN.
 pub fn opts(dsn: &str) -> Result<(Kind, Opts)> {
     match Kind::from_dsn(dsn)? {
-        Kind::Mysql => Ok((Kind::Mysql, Opts::Mysql(mysql::opts(dsn)?))),
+        Kind::Mysql => Ok((Kind::Mysql, Opts::Mysql(crate::binlog::replica_opts(dsn)?))),
         Kind::Postgres => Ok((Kind::Postgres, Opts::Postgres(dsn.to_string()))),
     }
 }
@@ -411,7 +412,7 @@ pub(crate) async fn fence(kind: Kind, opts: &Opts, id: u32) -> Result<()> {
     match (kind, opts) {
         (Kind::Mysql, Opts::Mysql(o)) => mysql::kill_and_wait(o, id).await,
         (Kind::Postgres, _) => postgres::fence_and_wait(opts, id).await,
-        _ => bail!("internal: target family and parsed DSN disagree"),
+        _ => unreachable!("internal: target family and parsed DSN disagree"),
     }
 }
 
