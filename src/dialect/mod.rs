@@ -1,44 +1,24 @@
 //! The server-family seam shared by a source and a target: one discriminator and the
 //! answers planning time asks it about. Dispatch happens once (per plan, per connect),
 //! never per row.
+//!
+//! Copy set: lazy-wire-fire copies `src/dialect/mod.rs` and `src/dialect/mysql.rs` verbatim,
+//! as a pair (`mysql` is this module's only child). These two files reference only each other,
+//! std and external crates — no host code — so the quoting answers the copy set calls (the
+//! forwarders in `crate::analyze::vocab`) compile standalone. The host layer adds everything
+//! lazyview-only: the DSN rules and the cross-family quoting dispatch live on the target's
+//! `Kind`, a re-export of [`Family`] (see `src/target/mod.rs`).
 
 pub mod mysql;
 
-use anyhow::{bail, Result};
-
-/// The family of one server, source or target: the same discriminator [`crate::target::Kind`]
-/// carries; a source's family comes from its DSN scheme, never from `crate::binlog::Flavor`
-/// (the MySQL-family product identity).
-pub use crate::target::Kind as Family;
-
-impl Family {
-    /// The family a *source* DSN (`LAZYVIEW_DSN`) names, mirroring [`Family::from_dsn`]:
-    /// only the scheme decides. `postgres://` and `postgresql://` name a PostgreSQL
-    /// source, which is not supported yet — one message, the `LAZYVIEW_DSN` rejection in
-    /// `crate::config`; the enabling PR returns [`Family::Postgres`] instead. Any other
-    /// scheme (or a bare one) is answered `Mysql`: the DSN itself stays validated by the
-    /// MySQL-only parser [`crate::binlog::replica_opts`], as today.
-    pub fn from_source_dsn(dsn: &str) -> Result<Family> {
-        let scheme = dsn
-            .split_once("://")
-            .map(|(s, _)| s.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        match scheme.as_str() {
-            "postgres" | "postgresql" => {
-                bail!("PostgreSQL sources are not supported yet (postgres:// LAZYVIEW_DSN)")
-            }
-            _ => Ok(Family::Mysql),
-        }
-    }
-}
-
-/// The quoted form of one identifier of one family — the only place a quote character is chosen.
-/// The MySQL family answers through [`mysql::quote_ident`], PostgreSQL through the target's own
-/// quoting ([`crate::target::postgres::quote_ident`]); a second quoting function is a guard finding.
-#[allow(dead_code)] // A3's source SELECT and the PostgreSQL source modules are its first users
-pub(crate) fn quote_ident(family: Family, id: &str) -> String {
-    match family {
-        Family::Mysql => mysql::quote_ident(id),
-        Family::Postgres => crate::target::postgres::quote_ident(id),
-    }
+/// The family of one server, source or target. The target module (`src/target/mod.rs`)
+/// re-exports this enum as its `Kind` and owns the host-side answers about it (the DSN rules,
+/// the statement and quoting dispatch); a source's family comes from its DSN scheme, never
+/// from `crate::binlog::Flavor` (the MySQL-family product identity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// MySQL, MariaDB, Percona: the statement shapes of lazyview's mv layer today.
+    Mysql,
+    /// PostgreSQL, from a `postgres://` DSN (`src/target/postgres.rs`).
+    Postgres,
 }

@@ -1,6 +1,9 @@
 //! The MySQL family's answers on the dialect seam: the identifier quoting, moved verbatim from
-//! `crate::analyze::vocab`. `std` and `sqlparser` only — no host code, so the file travels with
-//! the copy set.
+//! `crate::analyze::vocab`. `std` and `sqlparser` only — no host code.
+//!
+//! Copy set: lazy-wire-fire copies this file together with `src/dialect/mod.rs` (its parent,
+//! the [`Family`](super::Family) discriminator) verbatim, as a pair, so the quoting answers
+//! the copy-set forwarders in `crate::analyze::vocab` delegate to compile standalone.
 
 use sqlparser::ast::Ident;
 

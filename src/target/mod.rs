@@ -14,15 +14,11 @@ use crate::mv::{Layout, MvCol, Upsert, WriteOpts};
 pub mod mysql;
 pub mod postgres;
 
-/// The family of one target instance. A source is always MySQL-family (`crate::config::Flavor`
-/// is the source's product; this is the target's).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    /// MySQL, MariaDB, Percona: the statements of [`crate::mv`] today.
-    Mysql,
-    /// PostgreSQL, from a `postgres://` target DSN (`src/target/postgres.rs`).
-    Postgres,
-}
+/// The family of one server: the discriminator [`crate::dialect::Family`] defines (the copyable
+/// seam), re-exported here as the target's type and extended below with lazyview's host-side
+/// answers about it. A source is always MySQL-family (`crate::config::Flavor` is the source's
+/// product; this is the target's).
+pub use crate::dialect::Family as Kind;
 
 impl Kind {
     /// The family a target DSN names. Only the scheme decides; the family module parses the
@@ -42,6 +38,25 @@ impl Kind {
             _ => bail!(
                 "invalid target DSN: scheme `{scheme}` is not mysql://, mariadb:// or postgres://"
             ),
+        }
+    }
+
+    /// The family a *source* DSN (`LAZYVIEW_DSN`) names, mirroring [`Kind::from_dsn`]:
+    /// only the scheme decides. `postgres://` and `postgresql://` name a PostgreSQL
+    /// source, which is not supported yet — one message, the `LAZYVIEW_DSN` rejection in
+    /// `crate::config`; the enabling PR returns [`Kind::Postgres`] instead. Any other
+    /// scheme (or a bare one) is answered `Mysql`: the DSN itself stays validated by the
+    /// MySQL-only parser [`crate::binlog::replica_opts`], as today.
+    pub fn from_source_dsn(dsn: &str) -> Result<Kind> {
+        let scheme = dsn
+            .split_once("://")
+            .map(|(s, _)| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        match scheme.as_str() {
+            "postgres" | "postgresql" => {
+                bail!("PostgreSQL sources are not supported yet (postgres:// LAZYVIEW_DSN)")
+            }
+            _ => Ok(Kind::Mysql),
         }
     }
 
@@ -185,6 +200,19 @@ fn side_name(name: &str, suffix: &str) -> String {
         n
     } else {
         format!("_lv_{}{suffix}", crate::analyze::definition_hash(name))
+    }
+}
+
+/// The quoted form of one identifier of one family. The MySQL family answers through the
+/// copyable dialect ([`mysql::quote_ident`](crate::dialect::mysql::quote_ident)), PostgreSQL
+/// through this module's own [`postgres::quote_ident`]. One dispatch per plan / per connect,
+/// never per row. The family-local renderers (this module, `crate::fence`,
+/// `crate::analyzer::rename`) fold into this seam when `dialect-call-sites` (#57) closes.
+#[allow(dead_code)] // A3's source SELECT and the PostgreSQL source modules are its first users
+pub(crate) fn quote_ident(kind: Kind, id: &str) -> String {
+    match kind {
+        Kind::Mysql => crate::dialect::mysql::quote_ident(id),
+        Kind::Postgres => postgres::quote_ident(id),
     }
 }
 
@@ -733,6 +761,34 @@ pub(crate) fn for_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The discriminator is the dialect's own: `Kind` is [`crate::dialect::Family`] itself, not
+    /// a parallel enum — the direction the copyable seam needs (a byte-for-byte copy of the
+    /// dialect must not lean on this host module). Fails to compile if `target::Kind` is ever
+    /// redefined apart from the dialect again.
+    #[test]
+    fn kind_is_the_dialect_family() {
+        fn family_is_kind(f: crate::dialect::Family) -> Kind {
+            f
+        }
+        assert_eq!(
+            family_is_kind(crate::dialect::Family::Postgres),
+            Kind::Postgres
+        );
+        assert_eq!(family_is_kind(crate::dialect::Family::Mysql), Kind::Mysql);
+    }
+
+    /// The quoting seam dispatches each family to its own renderer: MySQL answers backticks
+    /// with a doubled backtick inside, PostgreSQL double quotes with a doubled double quote
+    /// inside (embedded quote characters pin both answers; a swapped or drifted match arm
+    /// fails one of the four asserts).
+    #[test]
+    fn quote_ident_dispatches_per_family() {
+        assert_eq!(quote_ident(Kind::Mysql, "a`b"), "`a``b`");
+        assert_eq!(quote_ident(Kind::Mysql, "plain"), "`plain`");
+        assert_eq!(quote_ident(Kind::Postgres, "a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote_ident(Kind::Postgres, "plain"), "\"plain\"");
+    }
 
     /// T3.1: the key budget is the tightest of a view's targets and the family the index choice
     /// is made for follows it, so a MySQL-only view keeps exactly the bytes it always used.

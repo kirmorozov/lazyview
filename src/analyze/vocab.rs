@@ -247,8 +247,9 @@ pub(crate) const NULL_STRICT: &[&str] = &[
     "JSON_VALUE",
 ];
 
-// The four quoting answers live in the dialect (`crate::dialect::mysql`); these are the analyzer's
-// old paths, kept so its call sites and the copy set keep working until `dialect-call-sites`
+// The four quoting answers live in the dialect (`crate::dialect::mysql`), which travels with
+// the copy set (src/dialect/mod.rs + src/dialect/mysql.rs, no host code); these are the
+// analyzer's old paths, kept so its call sites keep working until `dialect-call-sites`
 // closes them.
 
 /// The name a (raw-tokenized) identifier stands for; the answer is the dialect's.
