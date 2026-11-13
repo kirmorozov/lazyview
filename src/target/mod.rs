@@ -11,7 +11,7 @@ use crate::accumulate::{UnitChunk, UnitKind};
 use crate::analyze::quote_ident as q;
 use crate::metrics::Metrics;
 use crate::mv::{Layout, MvCol, Upsert, WriteOpts};
-use crate::supervisor::Policy;
+use crate::supervisor::{Policy, Timeout, CONNECT_TIMEOUT};
 
 pub mod mysql;
 pub mod postgres;
@@ -65,28 +65,40 @@ impl Kind {
     /// Opens one target connection of this family: the driver connect plus the family's
     /// session settings (`mysql::init_session` / `postgres::session_setup`, which the
     /// PostgreSQL connect applies itself). One dispatch per connection.
+    ///
+    /// One owner of the connect timeout: both families use
+    /// [`CONNECT_TIMEOUT`](crate::supervisor::CONNECT_TIMEOUT), the constant the write pool's
+    /// `Endpoint::conn` bounds a pooled connection with, so a target connect is not timed by a
+    /// second, different constant. An expired deadline raises the pool's own
+    /// [`Timeout`](crate::supervisor::Timeout), the caller-side arm of
+    /// [`is_overload`](crate::supervisor::is_overload); the driver's own failures keep their
+    /// chain, so the same classifier reaches [`crate::binlog::is_transient`] for the server
+    /// codes and IO kinds. A caller adds no second connect timeout of its own: the
+    /// `Engine::target_conn` above this keeps its fail-fast `retry_at` parking and its one
+    /// documented liveness bound for the whole reconnect sequence.
     pub(crate) async fn connect(&self, opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
         match (self, opts) {
             (Kind::Mysql, Opts::Mysql(o)) => {
-                let mut c = match tokio::time::timeout(
-                    crate::engine::CONNECT_TIMEOUT,
-                    mysql_async::Conn::new(o.clone()),
-                )
-                .await
-                {
-                    Ok(r) => r?,
-                    Err(_) => bail!(
-                        "connecting to {}:{}: timed out after {:?}",
-                        o.ip_or_hostname(),
-                        o.tcp_port(),
-                        crate::engine::CONNECT_TIMEOUT
-                    ),
-                };
+                let mut c =
+                    match tokio::time::timeout(CONNECT_TIMEOUT, mysql_async::Conn::new(o.clone()))
+                        .await
+                    {
+                        Ok(r) => r?,
+                        Err(_) => {
+                            return Err(anyhow::Error::new(Timeout(CONNECT_TIMEOUT)).context(
+                                format!(
+                                    "connecting to {}:{}: timed out after {CONNECT_TIMEOUT:?}",
+                                    o.ip_or_hostname(),
+                                    o.tcp_port()
+                                ),
+                            ))
+                        }
+                    };
                 mysql::init_session(&mut c, lock_wait_s).await?;
                 Ok(Conn::Mysql(c))
             }
             (Kind::Postgres, Opts::Postgres(d)) => {
-                postgres::PgConn::connect(d, lock_wait_s, crate::engine::CONNECT_TIMEOUT)
+                postgres::PgConn::connect(d, lock_wait_s, CONNECT_TIMEOUT)
                     .await
                     .map(Conn::Postgres)
             }
