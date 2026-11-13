@@ -511,6 +511,23 @@ fn rotation_and_table_map_retention() {
     assert_eq!(t.pos, pos("binlog.000003", 4));
 }
 
+// The accessor an embedder uses to read a table's column types / metadata; it delegates to
+// Tracker::table_map, which BinlogReader::table_map is a thin wrapper over.
+#[test]
+fn table_map_accessor() {
+    let mut t = Tracker::new(Flavor::MySql, &pos("binlog.000001", 4));
+    t.map_event(table_map(100, 7, "db", "items")).unwrap();
+    let tme = t.table_map(7).expect("TABLE_MAP for id 7");
+    assert_eq!(
+        (tme.database_name().as_ref(), tme.table_name().as_ref()),
+        ("db", "items")
+    );
+    assert_eq!(tme.columns_count(), 1);
+    // 0x03 = MYSQL_TYPE_LONG, the single column `table_map` builds.
+    assert_eq!(tme.get_column_type(0).unwrap().map(|c| c as u8), Some(0x03));
+    assert!(t.table_map(8).is_none(), "an unseen id has no table map");
+}
+
 #[test]
 fn unsupported_and_ignored_events() {
     let mut t = Tracker::new(Flavor::MariaDb, &pos("mariadb-bin.000001", 4));
