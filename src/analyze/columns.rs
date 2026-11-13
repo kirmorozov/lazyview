@@ -142,18 +142,20 @@ fn value_kind(e: &Expr, t: &TableInfo) -> ValueKind {
         Expr::Function(f) => {
             let a = args(f);
             let kinds = |xs: &[Expr]| xs.iter().map(|x| value_kind(x, t)).collect::<Vec<_>>();
+            // The name groups are the dialect's answer; what a group means for a column's type
+            // is this module's (`ValueKind`), and the order of the groups below is its rule.
             match function_name(f).as_str() {
-                "CONCAT" | "CONCAT_WS" | "LOWER" | "LCASE" | "UPPER" | "UCASE" | "SUBSTRING"
-                | "SUBSTR" | "LEFT" | "RIGHT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "LPAD"
-                | "RPAD" | "REVERSE" | "JSON_UNQUOTE" | "JSON_VALUE" => Str,
-                "ABS" | "ROUND" | "TRUNCATE" | "FLOOR" | "CEIL" | "CEILING" => a
+                n if crate::dialect::mysql::STR_FUNCTIONS.contains(&n) => Str,
+                n if crate::dialect::mysql::NUMERIC_FUNCTIONS.contains(&n) => a
                     .first()
                     .map(|x| numeric(value_kind(x, t)))
                     .unwrap_or(Unknown),
-                "SIGN" => Num,
-                "IFNULL" | "COALESCE" | "GREATEST" | "LEAST" => common(kinds(&a)),
-                "IF" if a.len() == 3 => common(kinds(&a[1..])),
-                "DATE" => Date,
+                n if crate::dialect::mysql::NUM_FUNCTIONS.contains(&n) => Num,
+                n if crate::dialect::mysql::COMMON_KIND_FUNCTIONS.contains(&n) => common(kinds(&a)),
+                n if crate::dialect::mysql::CONDITIONAL_FUNCTIONS.contains(&n) && a.len() == 3 => {
+                    common(kinds(&a[1..]))
+                }
+                n if crate::dialect::mysql::DATE_FUNCTIONS.contains(&n) => Date,
                 _ => Unknown,
             }
         }

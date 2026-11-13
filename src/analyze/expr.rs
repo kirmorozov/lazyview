@@ -306,7 +306,8 @@ static NULL_EXPR: Expr = Expr::Value(sqlparser::ast::ValueWithSpan {
 });
 
 /// The expression is NULL whenever a column it references is NULL (conservative): columns,
-/// literals, strict operators and the strict builtins of `NULL_STRICT` over such expressions.
+/// literals, strict operators and the strict builtins of
+/// [`crate::dialect::mysql::NULL_STRICT`] over such expressions.
 /// `||` is not among the operators: the servers read it as OR in the default sql_mode (the
 /// definition is refused at parse time); `<=>`, AND / OR / XOR, CASE, IS NULL, IN and every
 /// unlisted function count as able to yield a value for NULL.
@@ -351,7 +352,7 @@ pub(crate) fn null_propagating(e: &Expr) -> bool {
         Expr::Extract { expr, .. } => null_propagating(expr),
         Expr::Function(f) => {
             f.over.is_none()
-                && NULL_STRICT.contains(&function_name(f).as_str())
+                && crate::dialect::mysql::NULL_STRICT.contains(&function_name(f).as_str())
                 && function_args(f)
                     .map(|a| a.into_iter().all(null_propagating))
                     .unwrap_or(false)
@@ -607,32 +608,13 @@ pub(crate) fn col_refs(e: &Expr, scope: &Scope) -> Vec<ColRef> {
     out
 }
 
-/// Functions returning JSON values.
-const JSON_PRODUCING: &[&str] = &[
-    "JSON_EXTRACT",
-    "JSON_OBJECT",
-    "JSON_ARRAY",
-    "JSON_ARRAYAGG",
-    "JSON_OBJECTAGG",
-    "JSON_SET",
-    "JSON_INSERT",
-    "JSON_REPLACE",
-    "JSON_REMOVE",
-    "JSON_MERGE",
-    "JSON_MERGE_PATCH",
-    "JSON_MERGE_PRESERVE",
-    "JSON_KEYS",
-    "JSON_ARRAY_APPEND",
-    "JSON_ARRAY_INSERT",
-    "JSON_QUOTE",
-    "JSON_QUERY",
-];
-
 /// Whether a unit (group) expression is a JSON value computed by a function, `->` or a CAST.
 pub(crate) fn json_computed(e: &Expr) -> bool {
     match e {
         Expr::Nested(x) => json_computed(x),
-        Expr::Function(f) => JSON_PRODUCING.contains(&function_name(f).as_str()),
+        Expr::Function(f) => {
+            crate::dialect::mysql::JSON_PRODUCING.contains(&function_name(f).as_str())
+        }
         Expr::Cast { data_type, .. }
         | Expr::Convert {
             data_type: Some(data_type),
@@ -656,9 +638,13 @@ pub(crate) fn json_valued(e: &Expr, json_col: &dyn Fn(&Expr) -> bool) -> bool {
         Expr::Nested(x) => json_valued(x, json_col),
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => json_col(e),
         Expr::Function(f) => match (function_name(f).as_str(), function_args(f)) {
-            ("IFNULL" | "COALESCE", Some(a)) => any(&a),
-            ("NULLIF", Some(a)) => any(&a[..a.len().min(1)]),
-            ("IF", Some(a)) => any(&a[a.len().min(1)..]),
+            (n, Some(a)) if crate::dialect::mysql::JSON_ALL_ARG_FUNCTIONS.contains(&n) => any(&a),
+            (n, Some(a)) if crate::dialect::mysql::JSON_FIRST_ARG_FUNCTIONS.contains(&n) => {
+                any(&a[..a.len().min(1)])
+            }
+            (n, Some(a)) if crate::dialect::mysql::JSON_TAIL_ARG_FUNCTIONS.contains(&n) => {
+                any(&a[a.len().min(1)..])
+            }
             _ => json_computed(e),
         },
         Expr::Case {
@@ -710,7 +696,7 @@ pub(crate) fn scan_exprs(select: &Select) -> (Option<String>, bool, Vec<Vec<Expr
                     });
                 } else if AGGREGATES.contains(&n.as_str()) {
                     has_agg = true;
-                } else if NONDETERMINISTIC.contains(&n.as_str()) {
+                } else if crate::dialect::mysql::NONDETERMINISTIC.contains(&n.as_str()) {
                     reason.get_or_insert_with(|| format!("non-deterministic function {n}"));
                 }
             }
