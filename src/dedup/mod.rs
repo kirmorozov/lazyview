@@ -12,6 +12,8 @@
 //! lazyview: one target per live version of a view on the Dedup route; its action writes every target
 //! database (src/exec.rs). Facts off, no caller items (`NoItem`), no executor jobs (`NoJob`), direct mode.
 
+#[cfg(test)]
+mod acceptance;
 pub mod buffer;
 pub mod consumer;
 pub mod hop;
