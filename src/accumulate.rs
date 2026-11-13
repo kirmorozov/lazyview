@@ -757,15 +757,78 @@ fn feed_mapped_cascade(
         dirty.tally.cascade_gaps += 1;
         cascade_gap(&plan.name, &c.parent.name, &old, &mut dirty.cache.warned_at);
     }
+    // A gap window (a restart): the seed read already moved the children, so `by_fk[old]` holds
+    // nothing and the units under them would stay stale. Read the NEW side and expand it as if
+    // their FK were still `old` (the shape of the normal path). Nothing outside a gap window.
+    let moved = match (&new, dirty.cache.gap, action) {
+        (Some(n), true, FkAction::Cascade) => kept_under_new(c, &dirty.cache, ci, &old, n),
+        _ => Vec::new(),
+    };
     match dirty.cache.parent(ci, &old, new.as_ref()) {
         // Logged while seeding: `drain` expands it once the cache is installed, so the
         // version must hold this change's position until then.
         None => Fed::Recorded,
-        // No kept child row under `old` (none exists, or a gap): no unit can change. Recorded
-        // would pin the version's replay position with nothing left to refresh it.
-        Some(rows) if rows.is_empty() => Fed::Skipped,
-        Some(rows) => expand(plan, ci, rows, new.as_ref(), dirty),
+        // No kept child row under `old` (none exists) nor under `new` (a gap healed by the
+        // read above): no unit can change. Recorded would pin the version's replay position
+        // with nothing left to refresh it.
+        Some(rows) if rows.is_empty() && moved.is_empty() => Fed::Skipped,
+        Some(rows) => {
+            let mut fed = if rows.is_empty() {
+                Fed::Skipped
+            } else {
+                expand(plan, ci, rows, new.as_ref(), dirty)
+            };
+            if !moved.is_empty() && expand(plan, ci, moved, new.as_ref(), dirty) == Fed::Recorded {
+                fed = Fed::Recorded;
+            }
+            fed
+        }
     }
+}
+
+/// The kept rows of route `ci` under the parent's NEW key `new`, as [`expand`] wants them: clones
+/// that read as the child row BEFORE the key update, so the replay marks the units of both sides.
+/// Their stored FK value and their `KeptRow::fk` say `old` (`kept_image` reads the stored value,
+/// not `fk`), while `expand` gives the after image `new`. Rows the cache still counts under `old`
+/// are left to the normal path. Read it before `Cache::parent` moves the rows.
+fn kept_under_new(
+    c: &CascadeRoute,
+    cache: &cascade::Cache,
+    ci: usize,
+    old: &Key,
+    new: &Key,
+) -> Vec<KeptRow> {
+    let (Some(route), Some(m)) = (cache.rows(ci), c.map.as_ref()) else {
+        return Vec::new();
+    };
+    // Where the FK columns sit among the stored columns (a stored FK column is the image's value
+    // of it; `KeptRow::fk` is only what `kept` read at the event).
+    let fk_at: Vec<(usize, usize)> = c
+        .child_cols
+        .iter()
+        .enumerate()
+        .filter_map(|(j, &k)| m.cols.iter().position(|&x| x == k).map(|at| (at, j)))
+        .collect();
+    let under_old = route.by_fk.get(old);
+    route
+        .by_fk
+        .get(new)
+        .map(|keys| {
+            keys.iter()
+                .filter(|k| under_old.as_ref().is_none_or(|o| !o.contains(*k)))
+                .filter_map(|k| route.rows.get(k).cloned())
+                .map(|mut row| {
+                    for &(at, j) in &fk_at {
+                        if row.values[at].is_some() {
+                            row.values[at] = Some(old[j].clone());
+                        }
+                    }
+                    row.fk = old.clone();
+                    row
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The kept child rows of a parent change, expanded into child row changes at event time: a
@@ -895,8 +958,24 @@ pub fn drain(plan: &ViewPlan, dirty: &mut ViewDirty, log: Vec<cascade::Logged>) 
                 if dirty.cache.gap {
                     cascade_gap(&plan.name, &c.parent.name, &old, &mut dirty.cache.warned_at);
                 }
+                // A gap window: as in `feed_mapped_cascade`, a key update's children are already
+                // kept under `new`, so expand that side too (a logged `new` of a non-CASCADE
+                // action is NULLs, which keeps nothing).
+                let moved = match &new {
+                    Some(n)
+                        if dirty.cache.gap
+                            && c.on_update == FkAction::Cascade
+                            && !n.iter().any(Datum::is_null) =>
+                    {
+                        kept_under_new(c, &dirty.cache, route, &old, n)
+                    }
+                    _ => Vec::new(),
+                };
                 if let Some(rows) = dirty.cache.parent(route, &old, new.as_ref()) {
                     expand(plan, route, rows, new.as_ref(), dirty);
+                }
+                if !moved.is_empty() {
+                    expand(plan, route, moved, new.as_ref(), dirty);
                 }
             }
         }

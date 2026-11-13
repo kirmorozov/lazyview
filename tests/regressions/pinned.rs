@@ -1087,6 +1087,89 @@ fn reg_cascade_restart_gap() {
     });
 }
 
+/// Restart gap, a CASCADE key update (issue #167): the parent's key changes while the engine is
+/// stopped, so the resume replays it from before the startup seed and the cache counts a gap. The
+/// storage engine moved the children to the new key, so the lookup under the old one hits nothing:
+/// the units under them are refreshed from the cache's new side instead. The view is oracle-exact
+/// at once, with no whole-view refresh and no rebuild.
+///
+/// A MAP route: `entities` is the cascade's parent and no alias of it (an alias of the parent
+/// would trace the change itself, `^entities:traced`, and be immune), and its key gives no unit
+/// (the group is `l.gid`, which only a child row of `links` carries). The FK value is a view
+/// column, so a key update is visible: the groups of the moved rows change and only the cache
+/// knows those rows changed (an engine cascade writes no binlog rows).
+#[test]
+fn reg_cascade_window_parent_update() {
+    scenario("reg_casc_win_upd", |ctx| async move {
+        let mut ddl: Vec<String> = vec![
+            "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)"
+                .into(),
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (gid, eid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))"
+                .into(),
+        ];
+        ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into());
+        ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into());
+        ddl.push("INSERT INTO links VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into());
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![ViewSpec::new(
+            "r_win_upd",
+            Kind::Incremental,
+            "SELECT l.gid, COUNT(*) AS n, SUM(l.pos) AS s, MAX(l.eid) AS k FROM links l \
+             GROUP BY l.gid",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_casc_win_upd", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // The groups of the rows that will move are (1, 5) and (2, 5); the third one stays.
+        eng.stop().await?;
+        // Both the parent's key update and the ON UPDATE CASCADE that moved links 1 and 2 sit
+        // inside the replay window: the startup seed read them already under eid 9.
+        exec_all(&mut sc, &["UPDATE entities SET eid = 9 WHERE eid = 5"]).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        let f0 = eng.snapshot();
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // /stats is published at the end of a flush; after the resume nothing else writes, so
+        // wait for the periodic flush (position save, 5 s) to publish the gap of the replay.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let _s = loop {
+            if let Some(s) = eng.view_stats(&db, "r_win_upd") {
+                if s.cascade_gaps >= 1 {
+                    break s;
+                }
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "the replayed key update was never counted as a gap in /stats within 15 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        // Nothing was written under the moved groups since the resume: they are exact at once.
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the groups the replayed key update moved",
+        )
+        .await?;
+        let s = eng.stats_of(&db, "r_win_upd")?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            s.cascade_gaps >= 1 && s.whole_view_refreshes == 0 && d.full_rebuilds == 0,
+            "the replayed key update was not counted as a gap, or refreshed the whole view / \
+             rebuilt: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!("gap-window key update: {s:?} {}", fmt_snapshot(&d)));
+        eng.stop().await
+    });
+}
+
 /// Per-key delete cases (lazywf §12 / §9.4): a delete through 1 / 2 / 3 hops, an item and
 /// its links in one transaction, an explicit ON DELETE CASCADE, a SET NULL, a key move, and
 /// a delete + re-insert in one window. Each case is oracle-exact, refreshes no whole view,
