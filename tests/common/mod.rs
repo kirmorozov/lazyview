@@ -455,20 +455,6 @@ impl Db {
     }
 }
 
-/// Lowercase alnum/underscore tag, max `n` chars.
-fn tag_clean(tag: &str, n: usize) -> String {
-    tag.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .take(n)
-        .collect()
-}
-
 async fn create_db(
     server: &Server,
     server_idx: usize,
@@ -481,7 +467,10 @@ async fn create_db(
             .map(|_| (b'a' + r.random_range(0..26u8)) as char)
             .collect()
     };
-    let mut name = format!("lvt_{}_{}", tag_clean(tag, 40), suffix);
+    // The tag comes from the test: it is a literal or a `format!` over `[a-z0-9_]` labels, so it
+    // is embedded as-is. A tag that is not a usable identifier is a test bug and fails loudly in
+    // the `CREATE DATABASE` below.
+    let mut name = format!("lvt_{tag}_{suffix}");
     if let Some(n) = names {
         // The renamed run's schema: an opaque name under `lvt_` (the test reads it as
         // `Db::name`, so it is not mapped back), under which its connections are renamed.
