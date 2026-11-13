@@ -103,18 +103,39 @@ impl std::error::Error for Timeout {}
 
 /// Errors that mean the server is overloaded or unreachable rather than that the statement is
 /// wrong (§4.2): retried with backoff, and never a reason to rebuild a view. The one list is
-/// [`crate::binlog::is_transient`] (server codes and `io::ErrorKind`); this module's own
-/// [`Timeout`] (an op that exceeded `LAZYVIEW_TARGET_TIMEOUT_MS`) is the caller-side arm.
-/// The PostgreSQL family adds no list here (T5.3): the write pool bounds its own backends (D10).
+/// [`crate::binlog::is_transient`] (the MySQL server codes and five `io::ErrorKind`s — an IO
+/// error of another kind is a local failure, not a busy server, so it is not retried); this
+/// module's own [`Timeout`] (an op that exceeded `LAZYVIEW_TARGET_TIMEOUT_MS`) is the
+/// caller-side arm. The PostgreSQL family adds no server-code list here (T5.3): tokio-postgres
+/// reports no overload codes and the write pool bounds its own backends (D10). A lost PostgreSQL
+/// backend is connection-class, not overload, and is classified at the fence (§4.3).
 pub fn is_overload(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Timeout>()) || crate::binlog::is_transient(e)
 }
 
 /// A connection-class failure: the connection is unusable (and a transaction it began may or
-/// may not have committed). The same one list as [`is_overload`], [`crate::binlog::is_transient`];
-/// callers that also treat a [`Timeout`] as connection-class add that arm at their own site.
+/// may not have committed). The MySQL family uses the one list, [`crate::binlog::is_transient`];
+/// the PostgreSQL family's own arms are added at this caller site, the way [`is_overload`] adds
+/// its [`Timeout`] arm — `is_transient` is a MySQL list, so a closed tokio-postgres backend
+/// (T5.3) would slip through it and the zombie fence of §4.3 would never run behind a newer
+/// write. The arms are `tokio_postgres::Error::is_closed()` and its IO kind (tokio-postgres 0.7
+/// has no public `is_io()`), which reaches the chain as the `std::io::Error` cause: any IO kind
+/// means the backend is gone here, not only the five kinds `is_transient` retries.
 fn is_conn_lost(e: &anyhow::Error) -> bool {
     crate::binlog::is_transient(e)
+        || e.chain().any(|c| {
+            c.downcast_ref::<tokio_postgres::Error>()
+                .is_some_and(|e| e.is_closed())
+                || c.downcast_ref::<std::io::Error>().is_some()
+        })
+}
+
+/// The `lost` decision of [`fenced`] (§4.3): may this failed write still commit on the server?
+/// Then its backend must be fenced before the error surfaces. A [`Timeout`] counts as
+/// connection-class here (an op that outlived its statement timeout may be mid-commit), and so
+/// does every [`is_conn_lost`] failure, of either family.
+fn lost_backend(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Timeout>()) || is_conn_lost(e)
 }
 
 /// Retry delay `base · 2^(attempt-1)`, capped at `cap`, with ± 50 % jitter when `jitter`.
@@ -846,8 +867,7 @@ async fn fenced<T>(
         Err(_) => Err(anyhow::Error::new(Timeout(run.job.timeout))),
     };
     if let Err(e) = &r {
-        let lost = e.chain().any(|c| c.is::<Timeout>()) || is_conn_lost(e);
-        if lost && began.load(Ordering::SeqCst) {
+        if lost_backend(e) && began.load(Ordering::SeqCst) {
             // The transaction may still commit, after a newer write: kill it first.
             target.endpoint.fence(id, &run.metrics).await?;
         }
@@ -968,6 +988,79 @@ mod tests {
             let base = p.base * (1 << (n - 1));
             assert!(d >= base / 2 && d <= base * 3 / 2, "{d:?}");
         }
+    }
+
+    /// A MySQL server error with this code, as the driver reports it.
+    fn server_error(code: u16) -> anyhow::Error {
+        anyhow::Error::from(mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: String::new(),
+            state: String::new(),
+        }))
+        .context("write op")
+    }
+
+    /// The caller-side [`Timeout`] arm of [`is_overload`], and its negative case: an op that
+    /// outlived its timeout is overload, a wrong statement never is. The server-code and
+    /// `io::ErrorKind` set behind it is pinned by the one classifier's table (`binlog/tests`).
+    #[test]
+    fn overload_classes() {
+        assert!(
+            is_overload(&anyhow::Error::new(Timeout(Duration::from_secs(1))).context("write op")),
+            "an op that outlived its timeout is retried"
+        );
+        assert!(
+            !is_overload(&anyhow!("statement is wrong")),
+            "an error with no transient cause is never overload"
+        );
+        assert!(
+            !is_overload(&server_error(1064)),
+            "a rejected statement is never overload"
+        );
+    }
+
+    /// The `lost` decision of the zombie fence (§4.3): what [`fenced`] runs the fence on. The
+    /// PostgreSQL IO arm is what the MySQL-only one list cannot decide (its five kinds are a
+    /// subset of "the backend is gone"), so these cases fail if it is dropped; the
+    /// `tokio_postgres::Error::is_closed()` arm needs a backend that really closed (its
+    /// constructor is crate-private) and is exercised by the `sup_fence` scenario.
+    #[test]
+    fn lost_backend_classes_the_fence_on() {
+        // A timeout is connection-class (the write may still be committing), and the MySQL
+        // family is connection-class through the one list.
+        assert!(
+            lost_backend(&anyhow::Error::new(Timeout(Duration::from_secs(1))).context("write op")),
+            "a timed-out write may still commit"
+        );
+        assert!(lost_backend(&server_error(2013)), "gone away");
+        assert!(
+            lost_backend(&anyhow::Error::new(mysql_async::Error::Driver(
+                mysql_async::DriverError::ConnectionClosed
+            ))),
+            "the driver says the connection is closed"
+        );
+        // The PostgreSQL family (T5.3) is in no MySQL list: its backend is lost when the
+        // tokio-postgres error says closed, or when the failure reaches the chain as an io error
+        // of any kind — including the kinds is_transient does not retry.
+        let io = |kind: std::io::ErrorKind| {
+            anyhow::Error::new(std::io::Error::new(kind, "backend gone")).context("write op")
+        };
+        assert!(
+            lost_backend(&io(std::io::ErrorKind::Other)),
+            "an io kind outside the retried five still means a lost backend"
+        );
+        assert!(
+            lost_backend(&anyhow::Error::new(mysql_async::Error::Io(
+                mysql_async::IoError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+            ))),
+            "an io failure inside a driver error too"
+        );
+        // Never a lost backend: a statement that is simply wrong must not fence a live backend.
+        assert!(!lost_backend(&anyhow!("statement is wrong")));
+        assert!(
+            !lost_backend(&server_error(1045)),
+            "access denied is not lost"
+        );
     }
 
     #[tokio::test]
