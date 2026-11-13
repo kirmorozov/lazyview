@@ -9,7 +9,9 @@ use mysql_async::Value;
 
 use crate::accumulate::{UnitChunk, UnitKind};
 use crate::analyze::quote_ident as q;
+use crate::metrics::Metrics;
 use crate::mv::{Layout, MvCol, Upsert, WriteOpts};
+use crate::supervisor::Policy;
 
 pub mod mysql;
 pub mod postgres;
@@ -153,6 +155,21 @@ pub(crate) fn schema_of(opts: &Opts, what: &str) -> Result<String> {
             Ok(schema.to_string())
         }
     }
+}
+
+/// The family modules' one retry entry: a thin delegate to [`crate::supervisor::retrying`],
+/// so no target module hand-rolls a loop. `op` must be idempotent (see each call site's note).
+#[allow(dead_code)] // the call sites adopt this as they switch to the shared policy
+pub(crate) async fn with_retry<T, Fut>(
+    metrics: &Metrics,
+    what: &str,
+    policy: Policy,
+    op: impl FnMut() -> Fut,
+) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    crate::supervisor::retrying(metrics, what, policy, op).await
 }
 
 /// Ownership marker prefix of the comment of every table lazyview creates (see [`marker`]).

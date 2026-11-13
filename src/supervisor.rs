@@ -17,8 +17,8 @@
 //! fails only once the server no longer lists it (the zombie fence, §4.3); a target whose fence
 //! could not complete takes no writes until it does.
 //!
-//! Code constants: chunks of at least [`MIN_CHUNK`] units, [`RETRIES`] retries from
-//! [`BACKOFF`], diffs of [`OFFLOAD_ROWS`] rows or [`OFFLOAD_DATUMS`] values off the async
+//! Code constants: chunks of at least [`MIN_CHUNK`] units, the retry [`Policy`]es of
+//! [`retrying`], diffs of [`OFFLOAD_ROWS`] rows or [`OFFLOAD_DATUMS`] values off the async
 //! threads, idle pooled connections closed after [`INACTIVE_TTL`].
 
 use std::collections::{BTreeMap, HashMap};
@@ -40,10 +40,43 @@ use crate::mv::{self, Applied, Diff, Layout, Prepared, WriteOpts};
 
 /// Smallest chunk a view's units are split into (unless `LAZYVIEW_QUERY_CHUNK` is smaller).
 pub const MIN_CHUNK: usize = 100;
-/// Retries of an op that failed with an overload error.
-pub const RETRIES: u32 = 3;
-/// First retry delay (doubling, ± 50 % jitter).
-pub const BACKOFF: Duration = Duration::from_millis(50);
+/// One retry policy: how many retries an op gets and the shape of the wait between tries.
+/// Every edge-call retry loop goes through [`retrying`] with one of the three policies below
+/// (target modules reach it through [`crate::target::with_retry`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Policy {
+    pub attempts: u32,
+    pub base: Duration,
+    pub cap: Duration,
+    pub jitter: bool,
+}
+
+// READS and CONNECT get their call sites as the engine and target loops switch over.
+#[allow(dead_code)]
+impl Policy {
+    /// An idempotent statement (the old `RETRIES` + [`backoff`]): 3 retries,
+    /// 50 ms doubling up to 500 ms, jittered.
+    pub(crate) const STATEMENTS: Policy = Policy {
+        attempts: 3,
+        base: Duration::from_millis(50),
+        cap: Duration::from_millis(500),
+        jitter: true,
+    };
+    /// An idempotent read at a source boundary: 5 retries, 200 ms doubling to 2 s, jittered.
+    pub(crate) const READS: Policy = Policy {
+        attempts: 5,
+        base: Duration::from_millis(200),
+        cap: Duration::from_secs(2),
+        jitter: true,
+    };
+    /// A repeat of a connect: 5 retries, 1 s doubling to 30 s, jittered.
+    pub(crate) const CONNECT: Policy = Policy {
+        attempts: 5,
+        base: Duration::from_secs(1),
+        cap: Duration::from_secs(30),
+        jitter: true,
+    };
+}
 /// Diffs (old + new rows) of at least this many rows run off the async threads...
 pub const OFFLOAD_ROWS: usize = 4096;
 /// ... or of this many values.
@@ -69,61 +102,33 @@ impl std::fmt::Display for Timeout {
 impl std::error::Error for Timeout {}
 
 /// Errors that mean the server is overloaded or unreachable rather than that the statement is
-/// wrong (§4.2): retried with backoff, and never a reason to rebuild a view. The PostgreSQL
-/// family never classifies here (T5.3): it has no "too many connections" class (the write pool
-/// bounds its own backends, D10), and a server-side kill surfaces as a lost connection
-/// ([`is_conn_lost`]). MySQL's classification is untouched.
+/// wrong (§4.2): retried with backoff, and never a reason to rebuild a view. The one list is
+/// [`crate::binlog::is_transient`] (server codes and `io::ErrorKind`); this module's own
+/// [`Timeout`] (an op that exceeded `LAZYVIEW_TARGET_TIMEOUT_MS`) is the caller-side arm.
+/// The PostgreSQL family adds no list here (T5.3): the write pool bounds its own backends (D10).
 pub fn is_overload(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
-        c.is::<Timeout>()
-            || match c.downcast_ref::<mysql_async::Error>() {
-                // 1040 too many connections, 1203 max_user_connections, 1205 lock wait timeout,
-                // 1213 deadlock, 1053 server shutdown, 2006 / 2013 gone away / lost, 3024 / 1969
-                // statement time limit.
-                Some(mysql_async::Error::Server(s)) => matches!(
-                    s.code,
-                    1040 | 1203 | 1205 | 1213 | 1053 | 2006 | 2013 | 3024 | 1969
-                ),
-                Some(mysql_async::Error::Io(_)) => true,
-                Some(mysql_async::Error::Driver(d)) => {
-                    matches!(d, mysql_async::DriverError::ConnectionClosed)
-                }
-                _ => false,
-            }
-    })
+    e.chain().any(|c| c.is::<Timeout>()) || crate::binlog::is_transient(e)
 }
 
 /// A connection-class failure: the connection is unusable (and a transaction it began may or
-/// may not have committed). The PostgreSQL arm (T5.3) is lost-connection when the backend is
-/// closed or the failure is an IO one — `tokio_postgres::Error::is_closed()`, and its IO kind
-/// (no public `is_io()` in tokio-postgres 0.7) reaches the chain as the `std::io::Error` cause.
+/// may not have committed). The same one list as [`is_overload`], [`crate::binlog::is_transient`];
+/// callers that also treat a [`Timeout`] as connection-class add that arm at their own site.
 fn is_conn_lost(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
-        matches!(
-            c.downcast_ref::<mysql_async::Error>(),
-            Some(mysql_async::Error::Io(_))
-                | Some(mysql_async::Error::Driver(
-                    mysql_async::DriverError::ConnectionClosed
-                ))
-        ) || matches!(
-            c.downcast_ref::<mysql_async::Error>(),
-            Some(mysql_async::Error::Server(s)) if s.code == 2006 || s.code == 2013
-        ) || c
-            .downcast_ref::<tokio_postgres::Error>()
-            .is_some_and(|e| e.is_closed())
-            || c.downcast_ref::<std::io::Error>().is_some()
-    })
+    crate::binlog::is_transient(e)
 }
 
-/// Retry delay `BACKOFF · 2^(attempt-1)` with ± 50 % jitter.
-fn backoff(attempt: u32) -> Duration {
-    let base = BACKOFF * (1u32 << attempt.saturating_sub(1).min(6));
+/// Retry delay `base · 2^(attempt-1)`, capped at `cap`, with ± 50 % jitter when `jitter`.
+fn backoff(attempt: u32, base: Duration, cap: Duration, jitter: bool) -> Duration {
+    let d = (base * (1u32 << attempt.saturating_sub(1).min(6))).min(cap);
+    if !jitter {
+        return d;
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     // 0.5 .. 1.5
-    base.mul_f64(0.5 + f64::from(nanos % 1000) / 1000.0)
+    d.mul_f64(0.5 + f64::from(nanos % 1000) / 1000.0)
 }
 
 /// The connections behind an [`Endpoint`], one variant per family: `conn()` and
@@ -595,9 +600,15 @@ impl Supervisor {
     }
 }
 
-/// Runs `op` until it succeeds, fails with an error that is no overload, or [`RETRIES`]
-/// retries are used up.
-async fn retrying<T, F, Fut>(metrics: &Metrics, what: &str, mut op: F) -> Result<T>
+/// Runs `op` until it succeeds, the error is not transient, or `attempts` are spent; sleeps
+/// `backoff(attempt)` between tries and beats the liveness heartbeat each round so a retry
+/// loop cannot starve /livez. `op` must be idempotent (see each call site's note).
+pub(crate) async fn retrying<T, F, Fut>(
+    metrics: &Metrics,
+    what: &str,
+    policy: Policy,
+    mut op: F,
+) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -607,13 +618,14 @@ where
         match op().await {
             Err(e) if is_overload(&e) => {
                 Metrics::add(&metrics.supervisor_overload_errors, 1);
-                if attempt >= RETRIES {
+                if attempt >= policy.attempts {
                     return Err(e);
                 }
                 attempt += 1;
                 Metrics::add(&metrics.supervisor_retries, 1);
-                debug!("{what}: {e:#}; retry {attempt} of {RETRIES}");
-                tokio::time::sleep(backoff(attempt)).await;
+                debug!("{what}: {e:#}; retry {attempt} of {}", policy.attempts);
+                metrics.beat();
+                tokio::time::sleep(backoff(attempt, policy.base, policy.cap, policy.jitter)).await;
             }
             r => return r,
         }
@@ -650,28 +662,33 @@ fn next_chunk(cursors: &mut Vec<(Option<Vec<usize>>, ChunkCursor)>, n: usize) ->
 /// Reads a chunk from the sources, then writes it to every target (concurrently).
 async fn chunk_op(run: Arc<Run>, chunk: Option<UnitChunk>, permit: Permit) -> Result<()> {
     let job = &run.job;
-    let rows = retrying(&run.metrics, "reading the sources", || async {
-        // The read pool is a source, and a source is always the MySQL family (§0.2).
-        let WriteConn::Mysql(mut c) = run.read.conn().await? else {
-            unreachable!("internal: a read pool built for another family")
-        };
-        match tokio::time::timeout(
-            job.timeout,
-            mv::read_source(
-                &mut c,
-                &job.plan,
-                &job.layout,
-                chunk.as_ref(),
-                &run.metrics,
-                job.fresh,
-            ),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => Err(anyhow::Error::new(Timeout(job.timeout))),
-        }
-    })
+    let rows = retrying(
+        &run.metrics,
+        "reading the sources",
+        Policy::STATEMENTS,
+        || async {
+            // The read pool is a source, and a source is always the MySQL family (§0.2).
+            let WriteConn::Mysql(mut c) = run.read.conn().await? else {
+                unreachable!("internal: a read pool built for another family")
+            };
+            match tokio::time::timeout(
+                job.timeout,
+                mv::read_source(
+                    &mut c,
+                    &job.plan,
+                    &job.layout,
+                    chunk.as_ref(),
+                    &run.metrics,
+                    job.fresh,
+                ),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::Error::new(Timeout(job.timeout))),
+            }
+        },
+    )
     .await;
     drop(permit);
     let rows = rows?;
@@ -723,6 +740,7 @@ async fn write_op(
     retrying(
         &run.metrics,
         &format!("writing to target {}", target.name),
+        Policy::STATEMENTS,
         || async {
             let _permit = target.endpoint.acquire().await;
             run.writes.fetch_add(1, Ordering::SeqCst);
@@ -941,27 +959,13 @@ mod tests {
     }
 
     #[test]
-    fn overload_classes() {
-        let server = |code: u16| {
-            anyhow::Error::from(mysql_async::Error::Server(mysql_async::ServerError {
-                code,
-                message: String::new(),
-                state: String::new(),
-            }))
-        };
-        for code in [1040, 1203, 1205, 1213, 2013] {
-            assert!(is_overload(&server(code)), "{code}");
-        }
-        for code in [1054, 1146, 1062, 1064] {
-            assert!(!is_overload(&server(code)), "{code}");
-        }
-        assert!(is_overload(
-            &anyhow::Error::new(Timeout(Duration::from_secs(1))).context("target t")
-        ));
-        assert!(!is_overload(&anyhow!("view is broken")));
+    fn backoff_bounds() {
+        // The transient set is pinned by the one classifier's own table (binlog/tests);
+        // this pins the maths the shared loop sleeps on.
+        let p = Policy::STATEMENTS;
         for n in 1..=4 {
-            let d = backoff(n);
-            let base = BACKOFF * (1 << (n - 1));
+            let d = backoff(n, p.base, p.cap, p.jitter);
+            let base = p.base * (1 << (n - 1));
             assert!(d >= base / 2 && d <= base * 3 / 2, "{d:?}");
         }
     }
