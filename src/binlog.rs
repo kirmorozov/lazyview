@@ -64,7 +64,7 @@ mod stream;
 pub use self::connect::{replica_opts, server_info, set_product, Flavor, Position, ServerInfo};
 pub use self::probe::{
     binlog_exists, binlog_filters, current_position, is_access_denied, is_duplicate_server_id,
-    is_missing_binlog, schema_filtered, MissingBinlog,
+    is_missing_binlog, is_transient, schema_filtered, MissingBinlog,
 };
 pub use self::stream::{BinlogReader, Item, RowsKind};
 

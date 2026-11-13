@@ -817,3 +817,53 @@ fn probe_absent_only_for_unknown_variable() {
     // 2013 lost connection: a blip, so it must fail preflight, never read as "absent".
     assert!(!connect::probe_var_is_absent(&se(2013)));
 }
+
+#[test]
+fn transient_classifier_table() {
+    let srv = |code| {
+        anyhow::Error::new(mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: "x".into(),
+            state: "HY000".into(),
+        }))
+    };
+    // The one transient set: the server or this connection is going away.
+    for code in [
+        1040, 1053, 1203, 1205, 1213, 1290, 1317, 1927, 1969, 2006, 2013, 3024, 3169, 4031,
+    ] {
+        assert!(is_transient(&srv(code)), "{code} must be transient");
+        assert!(
+            is_transient(&srv(code).context("outer")),
+            "{code} through a context"
+        );
+    }
+    // Never transient by accident: privilege, syntax, constraint, unknown variable, purged binlog.
+    for code in [1045, 1064, 1062, 1193, 1236] {
+        assert!(
+            !is_transient(&srv(code).context("outer")),
+            "{code} must not be transient"
+        );
+    }
+    // IO kinds that mean the connection is gone classify; a plain io::Error in the chain too.
+    for kind in [
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::UnexpectedEof,
+    ] {
+        assert!(is_transient(&anyhow::Error::new(mysql_async::Error::Io(
+            mysql_async::IoError::Io(std::io::Error::new(kind, "x"))
+        ))));
+        assert!(
+            is_transient(&anyhow::Error::new(std::io::Error::new(kind, "x"))),
+            "{kind:?}"
+        );
+    }
+    assert!(!is_transient(&anyhow::Error::new(mysql_async::Error::Io(
+        mysql_async::IoError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "x",))
+    ))));
+    assert!(is_transient(&anyhow::Error::new(
+        mysql_async::Error::Driver(mysql_async::DriverError::ConnectionClosed)
+    )));
+}
