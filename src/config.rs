@@ -79,6 +79,10 @@ pub fn default_cpu_workers() -> usize {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub dsn: String,
+    /// The family the source DSN's scheme chose, once at `from_lookup`; read at connect.
+    /// A `postgres://` source is refused there until the enabling PR (see
+    /// [`crate::dialect::Family::from_source_dsn`]).
+    pub source_family: crate::dialect::Family,
     /// Named target instances for materialized tables (`_lazyview.target`); NULL/absent target
     /// means the source instance.
     pub targets: BTreeMap<String, String>,
@@ -169,6 +173,10 @@ impl Config {
         let dsn = connection(&get, "LAZYVIEW", false)?.ok_or_else(|| {
             anyhow!("no database configured: set LAZYVIEW_HOST, LAZYVIEW_USER, LAZYVIEW_PASSWORD, LAZYVIEW_DATABASE (or LAZYVIEW_DSN=mysql://user:pass@host:3306/db)")
         })?;
+        // The DSN's scheme chooses the source's family once (a `postgres://` source is
+        // refused here with the "not supported yet" message; binlog::replica_opts stays
+        // the MySQL-only DSN parser).
+        let source_family = crate::dialect::Family::from_source_dsn(&dsn)?;
         let instance_id = get("LAZYVIEW_INSTANCE_ID").unwrap_or_else(|| "default".into());
         let num = |k: &str, d: u64| -> Result<u64> {
             match get(k) {
@@ -283,6 +291,7 @@ impl Config {
         };
         Ok(Config {
             dsn,
+            source_family,
             targets,
             start_mode,
             sync: flag("LAZYVIEW_SYNC", true)?,
@@ -579,9 +588,41 @@ mod tests {
             c.targets.get("pg2").map(String::as_str),
             Some("postgresql://a@b/d")
         );
-        // The source stays MySQL-family: a postgres:// LAZYVIEW_DSN still errors (the
-        // replica options are parsed with the MySQL URL parser, src/binlog.rs).
+        // The source stays MySQL-family: a postgres:// LAZYVIEW_DSN is refused by
+        // dialect::Family::from_source_dsn with the "not supported yet" message (the
+        // enabling PR flips this to acceptance), and binlog::replica_opts stays the
+        // MySQL-only DSN parser.
+        let e = cfg(&[("LAZYVIEW_DSN", "postgres://a@b/d")]).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "PostgreSQL sources are not supported yet (postgres:// LAZYVIEW_DSN)"
+        );
         assert!(crate::binlog::replica_opts("postgres://a@b/d").is_err());
+    }
+
+    #[test]
+    fn source_dsn_scheme_sets_the_family() {
+        // The DSN's scheme chooses the family once, stored on Config and read at connect.
+        for dsn in ["mysql://u@h:3306/db", "mariadb://u@h/db", "x"] {
+            let c = cfg(&[("LAZYVIEW_DSN", dsn)]).unwrap();
+            assert_eq!(c.source_family, crate::dialect::Family::Mysql, "{dsn}");
+        }
+    }
+
+    #[test]
+    fn postgres_source_dsn_is_rejected_with_the_message() {
+        for dsn in [
+            "postgres://a@b/d",
+            "postgresql://a@b/d",
+            "PostgreSQL://a@b/d",
+        ] {
+            let e = cfg(&[("LAZYVIEW_DSN", dsn)]).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "PostgreSQL sources are not supported yet (postgres:// LAZYVIEW_DSN)",
+                "{dsn}"
+            );
+        }
     }
 
     #[test]

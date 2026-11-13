@@ -25,6 +25,7 @@ pub mod stats;
 pub use config::Config;
 pub use metrics::{Metrics, Snapshot};
 pub mod accumulate;
+pub mod dialect;
 pub mod meta;
 pub mod mv;
 pub mod plan_swap;
