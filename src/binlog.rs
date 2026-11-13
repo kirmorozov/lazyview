@@ -37,7 +37,6 @@
 //! * MariaDB >= 12.3 splits a rows event larger than `binlog_row_event_fragment_threshold`
 //!   (default 1 GiB) into `Partial_rows` events; they are reassembled into the rows event.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -61,12 +60,18 @@ mod probe;
 mod query;
 mod stream;
 
-pub use self::connect::{replica_opts, server_info, set_product, Flavor, Position, ServerInfo};
+// The flavor-neutral types below live in [`crate::source`] now. Embedder seam: they stay
+// reachable from `crate::binlog` for one release, so an embedder that names them here keeps
+// compiling; new code names them in `crate::source`.
+pub use self::connect::{replica_opts, server_info, set_product};
 pub use self::probe::{
-    binlog_exists, binlog_filters, current_position, is_access_denied, is_duplicate_server_id,
-    is_missing_binlog, is_transient, schema_filtered, MissingBinlog,
+    binlog_exists, binlog_filters, current_position, is_transient, schema_filtered,
 };
-pub use self::stream::{BinlogReader, Item, RowsKind};
+pub use self::stream::BinlogReader;
+pub use crate::source::{
+    is_access_denied, is_duplicate_server_id, is_missing_binlog, Flavor, Item, MissingBinlog,
+    Position, RowsKind, ServerInfo,
+};
 
 #[cfg(test)]
 use self::connect::{product, requirement_problems, split_ca_params, unmet_requirements};

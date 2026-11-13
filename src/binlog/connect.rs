@@ -22,65 +22,6 @@ pub(super) fn product() -> (&'static str, &'static str) {
     }
 }
 
-/// A binlog coordinate. `pos` is the offset of the next event to read.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Position {
-    pub file: String,
-    pub pos: u64,
-}
-
-impl Position {
-    /// Numeric suffix of the binlog file name (`binlog.000012` → 12).
-    pub fn file_seq(&self) -> u64 {
-        self.file
-            .rsplit('.')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    }
-}
-
-impl PartialOrd for Position {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Position {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.file_seq(), self.pos).cmp(&(other.file_seq(), other.pos))
-    }
-}
-
-impl std::fmt::Display for Position {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.file, self.pos)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Flavor {
-    MySql,
-    MariaDb,
-}
-
-impl Flavor {
-    /// Flavor from a `VERSION()` string (`10.11.14-MariaDB-log` → MariaDB; Percona is MySQL).
-    pub fn from_version(version: &str) -> Flavor {
-        if version.to_ascii_lowercase().contains("mariadb") {
-            Flavor::MariaDb
-        } else {
-            Flavor::MySql
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ServerInfo {
-    pub flavor: Flavor,
-    pub version: String,
-}
-
 /// Connection options for a DSN, tuned for a replication client.
 ///
 /// The DSN is parsed with `Opts::from_url` (so `require_ssl`, `verify_ca`, `prefer_socket`, …

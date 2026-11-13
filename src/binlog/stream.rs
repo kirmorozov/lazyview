@@ -1,88 +1,8 @@
 use super::*;
 
 use crate::binlog::connect::product;
-use crate::binlog::probe::{
-    is_duplicate_server_id_error, missing_binlog_message, ACCESS_DENIED_CODES,
-};
 use crate::binlog::query::{classify_query, mariadb_gtid, mysql_gtid, xa_prepare_event, QueryKind};
-
-/// One decoded stream item. Row data stays undecoded until [`BinlogReader::rows`] is called, so
-/// events for unwatched tables cost nothing beyond framing.
-#[derive(Debug, Clone)]
-pub enum Item {
-    TableMap {
-        table_id: u64,
-        schema: String,
-        table: String,
-        columns: u64,
-    },
-    Rows {
-        table_id: u64,
-        kind: RowsKind,
-        event: Event,
-    },
-    /// Transaction committed (XID or COMMIT query). `pos` is where to resume after it.
-    ///
-    /// Also ends a one-phase XA transaction (`XA COMMIT … ONE PHASE`); on MySQL/Percona that
-    /// transaction starts with [`Item::XaStart`], on MariaDB it is logged as a plain one.
-    Commit {
-        pos: Position,
-    },
-    /// An XA transaction begins; its rows follow, and it ends with [`Item::XaPrepare`] (or
-    /// `Commit` for one-phase commits). MySQL: `XA START` query; MariaDB: GTID event flagged
-    /// as prepared XA (emitted right after its [`Item::Gtid`]).
-    XaStart {
-        xid: String,
-    },
-    /// `XA PREPARE`: the XA transaction's rows are durable but **not visible** until the
-    /// matching [`Item::XaEnd`], which may come much later (other transactions in between).
-    /// A resumable boundary like `Commit`.
-    XaPrepare {
-        xid: String,
-        pos: Position,
-    },
-    /// `XA COMMIT xid` (`commit = true`) or `XA ROLLBACK xid` of a prepared XA transaction. A
-    /// resumable boundary; carries no rows.
-    XaEnd {
-        xid: String,
-        commit: bool,
-        pos: Position,
-    },
-    /// Any non-transactional statement (DDL etc.), already committed. `pos` as above.
-    ///
-    /// Exception: `CREATE TABLE … SELECT` is logged as this statement followed by the new
-    /// table's row events and a `Commit` in the same transaction; `pos` (right after the
-    /// statement) then lies inside that transaction, and resuming there yields those rows and
-    /// the `Commit`. When the exact end of a statement inside a transaction is unknown
-    /// (MariaDB 11.4+, after a TABLE_MAP), `pos` is the previous boundary instead (`Commit`
-    /// likewise), so resuming replays that transaction.
-    Statement {
-        schema: String,
-        query: String,
-        pos: Position,
-    },
-    /// GTID of the transaction (or statement) whose items follow. MySQL/Percona:
-    /// `uuid:gno` (`uuid:tag:gno` for tagged GTIDs); MariaDB: `domain-server-seq`.
-    Gtid {
-        gtid: String,
-    },
-    /// The source reports possibly lost changes (an `INCIDENT` event: it could not log the rows
-    /// of a statement, e.g. an unsafe statement written in row format). The copy set only reads
-    /// it; the caller logs it. `pos` is the position right after the event, not a boundary: the
-    /// transaction continues.
-    Incident {
-        pos: Position,
-    },
-    Heartbeat,
-    Other,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowsKind {
-    Insert,
-    Update,
-    Delete,
-}
+use crate::source::{is_duplicate_server_id_error, missing_binlog_message, ACCESS_DENIED_CODES};
 
 // Raw event type codes (MariaDB's are not in mysql_common's `EventType`).
 pub(super) mod ty {
@@ -192,7 +112,7 @@ impl BinlogReader {
     /// Opens a dedicated connection and starts streaming from `from` as replica `server_id`.
     ///
     /// The first event is awaited here, so a purged/missing binlog fails `connect` with an error
-    /// for which [`is_missing_binlog`] is true. With a non-zero `heartbeat` the server sends a
+    /// for which [`crate::source::is_missing_binlog`] is true. With a non-zero `heartbeat` the server sends a
     /// heartbeat after that much idle time, and [`next`](Self::next) fails if nothing at all
     /// arrives for `3 × heartbeat + 10 s`.
     pub async fn connect(

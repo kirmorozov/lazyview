@@ -15,6 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use lazyview::binlog::*;
+use lazyview::source::{
+    is_access_denied, is_duplicate_server_id, is_missing_binlog, Flavor, Item, Position, RowsKind,
+};
 use mysql_async::binlog::events::Event;
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::prelude::*;

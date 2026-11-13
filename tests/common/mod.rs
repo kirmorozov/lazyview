@@ -105,7 +105,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use lazyview::binlog::Position;
+use lazyview::source::Position;
 use lazyview::{Config, Metrics, Snapshot};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts, Row, Value};

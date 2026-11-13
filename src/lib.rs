@@ -20,6 +20,7 @@ pub mod intset;
 pub mod lookback;
 pub mod metrics;
 pub mod pgoutput;
+pub mod source;
 pub mod stats;
 
 pub use config::Config;

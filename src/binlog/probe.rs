@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::binlog::connect::value_str;
+use crate::source::{server_errors, ACCESS_DENIED_CODES};
 
 pub(super) fn show(v: &str) -> &str {
     if v.is_empty() {
@@ -130,61 +131,7 @@ pub async fn binlog_exists(conn: &mut Conn, file: &str) -> Result<bool> {
     Ok(rows.iter().any(|r| value_str(r.as_ref(0)) == file))
 }
 
-/// The requested binlog file/position is not (or no longer) available on the server
-/// (typically purged by `binlog_expire_logs_seconds` / `PURGE BINARY LOGS`).
-#[derive(Debug, thiserror::Error)]
-#[error("binlog {from} is not available on the server (purged?): {message}")]
-pub struct MissingBinlog {
-    pub from: Position,
-    pub message: String,
-}
-
-/// ER_MASTER_FATAL_ERROR_READING_BINLOG; also used for unrelated fatal dump errors, hence the
-/// message check in [`missing_binlog_message`].
-const ER_SOURCE_FATAL_ERROR_READING_BINLOG: u16 = 1236;
-
-pub(super) fn missing_binlog_message(e: &mysql_async::ServerError) -> bool {
-    if e.code != ER_SOURCE_FATAL_ERROR_READING_BINLOG {
-        return false;
-    }
-    let m = e.message.to_ascii_lowercase();
-    // MySQL / Percona / MariaDB wordings for "file not in the index" / "file gone from disk" /
-    // "GTIDs purged".
-    [
-        "could not find first log file",
-        "could not open log file",
-        "not found (errcode",
-        "no such file",
-        "purged",
-    ]
-    .iter()
-    .any(|p| m.contains(p))
-}
-
-/// Whether `err` (anywhere in its chain) means the requested binlog was purged / does not exist.
-pub fn is_missing_binlog(err: &anyhow::Error) -> bool {
-    err.chain().any(|e| {
-        e.downcast_ref::<MissingBinlog>().is_some()
-            || matches!(e.downcast_ref::<mysql_async::Error>(), Some(mysql_async::Error::Server(se)) if missing_binlog_message(se))
-            || e.downcast_ref::<mysql_async::ServerError>().is_some_and(missing_binlog_message)
-    })
-}
-
 const ER_PARSE_ERROR: u16 = 1064;
-
-/// Server error codes meaning "not allowed": ER_DBACCESS_DENIED_ERROR (1044),
-/// ER_ACCESS_DENIED_ERROR (1045; also what COM_REGISTER_SLAVE answers without REPLICATION SLAVE),
-/// ER_TABLEACCESS_DENIED_ERROR (1142), ER_SPECIFIC_ACCESS_DENIED_ERROR (1227),
-/// ER_PROCACCESS_DENIED_ERROR (1370).
-pub(super) const ACCESS_DENIED_CODES: [u16; 5] = [1044, 1045, 1142, 1227, 1370];
-
-fn server_errors(err: &anyhow::Error) -> impl Iterator<Item = &mysql_async::ServerError> {
-    err.chain()
-        .filter_map(|e| match e.downcast_ref::<mysql_async::Error>() {
-            Some(mysql_async::Error::Server(se)) => Some(se),
-            _ => e.downcast_ref::<mysql_async::ServerError>(),
-        })
-}
 
 /// Transient: this connection, or the server, is going away — repeat an idempotent call.
 /// Classification is by server error code and `io::ErrorKind` only. The one documented exception
@@ -213,34 +160,6 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
                 _ => false,
             }) || c.downcast_ref::<std::io::Error>().is_some_and(transient_io)
         })
-}
-
-/// Whether `err` is a privilege problem (wrong credentials, or a missing grant such as
-/// REPLICATION SLAVE / REPLICATION CLIENT / BINLOG MONITOR).
-pub fn is_access_denied(err: &anyhow::Error) -> bool {
-    server_errors(err).any(|se| ACCESS_DENIED_CODES.contains(&se.code))
-        || err
-            .chain()
-            .any(|e| e.to_string().contains("REPLICATION SLAVE privilege"))
-}
-
-/// Whether `err` means another replica connected with the same server_id (the server then drops
-/// the older connection): MySQL/Percona 1236 "A replica with the same server_uuid/server_id …",
-/// MariaDB 4052 (ER_SLAVE_SAME_ID) "A slave with the same server_uuid/server_id …".
-pub fn is_duplicate_server_id(err: &anyhow::Error) -> bool {
-    server_errors(err).any(is_duplicate_server_id_error)
-}
-
-pub(super) fn is_duplicate_server_id_error(se: &mysql_async::ServerError) -> bool {
-    // MariaDB's ER_SLAVE_SAME_ID (4052) is unambiguous by code; 1236 is also used for unrelated
-    // fatal dump errors, so only there the message has to say "same server_id" (and
-    // `missing_binlog_message` owns the other half of 1236).
-    if se.code == 4052 {
-        return true;
-    }
-    let m = se.message.to_ascii_lowercase();
-    se.code == ER_SOURCE_FATAL_ERROR_READING_BINLOG
-        && (m.contains("same server_uuid/server_id") || m.contains("same server_id"))
 }
 
 /// Adds a "how to fix" line to privilege errors of replication statements.
