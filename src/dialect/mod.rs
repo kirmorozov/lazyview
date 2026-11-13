@@ -2,6 +2,8 @@
 //! answers planning time asks it about. Dispatch happens once (per plan, per connect),
 //! never per row.
 
+pub mod mysql;
+
 use anyhow::{bail, Result};
 
 /// The family of one server, source or target: the same discriminator [`crate::target::Kind`]
@@ -27,5 +29,16 @@ impl Family {
             }
             _ => Ok(Family::Mysql),
         }
+    }
+}
+
+/// The quoted form of one identifier of one family — the only place a quote character is chosen.
+/// The MySQL family answers through [`mysql::quote_ident`], PostgreSQL through the target's own
+/// quoting ([`crate::target::postgres::quote_ident`]); a second quoting function is a guard finding.
+#[allow(dead_code)] // A3's source SELECT and the PostgreSQL source modules are its first users
+pub(crate) fn quote_ident(family: Family, id: &str) -> String {
+    match family {
+        Family::Mysql => mysql::quote_ident(id),
+        Family::Postgres => crate::target::postgres::quote_ident(id),
     }
 }

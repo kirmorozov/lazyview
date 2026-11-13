@@ -247,29 +247,26 @@ pub(crate) const NULL_STRICT: &[&str] = &[
     "JSON_VALUE",
 ];
 
-/// The name a (raw-tokenized) identifier stands for: a doubled quote character inside a quoted
-/// identifier is one character of the name. The owner of both readings of a name, shared with
-/// `crate::analyzer` (see [`ident_name`]).
+// The four quoting answers live in the dialect (`crate::dialect::mysql`); these are the analyzer's
+// old paths, kept so its call sites and the copy set keep working until `dialect-call-sites`
+// closes them.
+
+/// The name a (raw-tokenized) identifier stands for; the answer is the dialect's.
 pub(crate) fn unquote(value: &str, quote: Option<char>) -> String {
-    match quote {
-        Some(q) => value.replace(&format!("{q}{q}"), &q.to_string()),
-        None => value.to_string(),
-    }
+    crate::dialect::mysql::unquote(value, quote)
 }
 
-/// The name an identifier of a parsed AST stands for.
+/// The name an identifier of a parsed AST stands for; the answer is the dialect's.
 pub(crate) fn ident_name(i: &Ident) -> String {
-    unquote(&i.value, i.quote_style)
+    crate::dialect::mysql::ident_name(i)
 }
 
-/// A backtick-quoted identifier for the AST. The stored value keeps the doubled backticks a name
-/// needs inside quotes, exactly as the tokenizer leaves them, so a generated identifier and a
-/// parsed one of the same name hold the same value (see [`unquote`], [`expr_key`]).
+/// A backtick-quoted identifier for the AST; the answer is the dialect's.
 pub(crate) fn qident(id: &str) -> Ident {
-    Ident::with_quote('`', id.replace('`', "``"))
+    crate::dialect::mysql::qident(id)
 }
 
-/// A backtick-quoted identifier: the name `` a`b `` renders as `` `a``b` ``.
+/// A backtick-quoted identifier; the answer is the dialect's.
 pub fn quote_ident(id: &str) -> String {
-    format!("`{}`", id.replace('`', "``"))
+    crate::dialect::mysql::quote_ident(id)
 }
