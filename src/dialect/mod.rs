@@ -2,6 +2,11 @@
 //! answers planning time asks it about. Dispatch happens once (per plan, per connect),
 //! never per row.
 //!
+//! The answers so far are the identifier quoting, the function vocabularies and the parameter and
+//! coercion renderings (the placeholder, how a JSON value binds, how a `?` takes a character set):
+//! all of them [`mysql`]'s, since MySQL family is the only one with answers here. A new family adds
+//! its own answers next to these rather than branching on a server name at the call site.
+//!
 //! Copy set: lazy-wire-fire copies `src/dialect/mod.rs` and `src/dialect/mysql.rs` verbatim,
 //! as a pair (`mysql` is this module's only child). These two files reference only each other,
 //! std and external crates — no host code — so the quoting answers the copy set calls (the

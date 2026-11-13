@@ -36,6 +36,34 @@ pub(crate) fn quote_ident(id: &str) -> String {
     format!("`{}`", id.replace('`', "``"))
 }
 
+// The parameter and coercion renderings: what a bound value is written as belongs to the family,
+// so a caller that renders a parameter or a character-set coercion asks these instead of writing
+// the shape itself (the write side's JSON unit keys and a source reader's parameter column are such
+// callers). `pub`, unlike the answers above with an in-crate caller only, because these two are
+// asked from outside this crate as well. The PostgreSQL forms (`$n`, a JSON text with no cast) come
+// with the PostgreSQL dialect.
+
+/// How a bound parameter is written: `?`. PostgreSQL numbers its parameters (`$1`, `$2`, …) instead.
+pub fn placeholder() -> &'static str {
+    "?"
+}
+
+/// How a JSON value is bound: the server needs the type, so it is `CAST(? AS JSON)`. A JSON text
+/// needs no cast on PostgreSQL, which is why the question belongs to the dialect.
+pub fn json_param() -> &'static str {
+    "CAST(? AS JSON)"
+}
+
+/// How a bound `?` is converted to the character set `cs`, cut to `n` characters when the column
+/// has a length: `CONVERT(? USING cs)`, inside `LEFT(…, n)` in that case. The VIRTUAL-column
+/// reader (`crate::analyze::columns`) asks this; PostgreSQL has no `CONVERT … USING` form.
+pub(crate) fn charset_coercion(cs: &str, n: Option<u64>) -> String {
+    match n {
+        Some(n) => format!("LEFT(CONVERT(? USING {cs}), {n})"),
+        None => format!("CONVERT(? USING {cs})"),
+    }
+}
+
 // The function vocabularies, moved verbatim from `crate::analyze` (`vocab.rs`, `columns.rs`,
 // `expr.rs`): the name groups are the dialect's answer, the reading of a group stays with the
 // analyzer (`ValueKind` is `crate::analyze::columns`' own type). PostgreSQL's lists arrive with
@@ -318,3 +346,24 @@ pub(crate) const JSON_FIRST_ARG_FUNCTIONS: &[&str] = &["NULLIF"];
 /// The functions whose value is JSON when an argument after the first one is (`IF`, whose
 /// first argument is the condition).
 pub(crate) const JSON_TAIL_ARG_FUNCTIONS: &[&str] = &["IF"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The renderings a caller on the seam gets: pinned to the exact SQL the servers accept, so a
+    /// moved literal cannot quietly rewrite a statement.
+    #[test]
+    fn parameter_and_coercion_renderings() {
+        assert_eq!(placeholder(), "?");
+        assert_eq!(json_param(), "CAST(? AS JSON)");
+        assert_eq!(
+            charset_coercion("utf8mb4", None),
+            "CONVERT(? USING utf8mb4)"
+        );
+        assert_eq!(
+            charset_coercion("utf8mb4", Some(12)),
+            "LEFT(CONVERT(? USING utf8mb4), 12)"
+        );
+    }
+}

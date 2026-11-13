@@ -228,10 +228,7 @@ fn virtual_conversion(c: &crate::catalog::Column, kind: ValueKind) -> Option<Str
         }
     };
     let text = |cs: &str, co: &str, len: Option<u64>, trim: bool| {
-        let cast = match len {
-            Some(n) => format!("LEFT(CONVERT(? USING {cs}), {n})"),
-            None => format!("CONVERT(? USING {cs})"),
-        };
+        let cast = crate::dialect::mysql::charset_coercion(cs, len);
         if trim {
             format!("TRIM(TRAILING ' ' FROM {cast}) COLLATE {co}")
         } else {
