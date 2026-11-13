@@ -383,9 +383,8 @@ pub struct Job {
 pub struct Outcome {
     /// Targets whose writes failed (skipped for the rest of the run).
     pub failed: Vec<(String, anyhow::Error)>,
-    /// Ops started (chunks read) and the most write ops in flight at once.
+    /// Ops started (chunks read).
     pub chunks: usize,
-    pub peak_writes: usize,
     /// View rows written per kind, over every target.
     pub rows: crate::stats::Rows,
 }
@@ -402,14 +401,12 @@ struct Run {
     /// One write op at a time per target (tables without a unit index).
     serial: Option<HashMap<String, Arc<Semaphore>>>,
     writes: AtomicUsize,
-    peak: AtomicUsize,
     /// Rows written (one lock per chunk and target).
     rows: Mutex<crate::stats::Rows>,
 }
 
 /// The pools and limits of the refresh supervisor.
 pub struct Supervisor {
-    pub mode: SupervisorMode,
     cfg: SupervisorConfig,
     read: Arc<Endpoint>,
     write: BTreeMap<String, Arc<Endpoint>>,
@@ -442,7 +439,6 @@ impl Supervisor {
             &metrics,
         );
         Some(Supervisor {
-            mode: cfg.mode,
             cfg: cfg.clone(),
             read,
             write: BTreeMap::new(),
@@ -527,7 +523,6 @@ impl Supervisor {
             failed: Mutex::new(BTreeMap::new()),
             serial,
             writes: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
             rows: Mutex::new(Default::default()),
         });
         // The units, then each set of partial unit keys.
@@ -582,14 +577,12 @@ impl Supervisor {
             view = %run.job.plan.name,
             chunks,
             chunk_size = size.unwrap_or(0),
-            peak_writes = run.peak.load(Ordering::Relaxed),
             "refreshed concurrently"
         );
         let rows = *metrics::lock(&run.rows);
         Ok(Outcome {
             failed: failed.into_iter().collect(),
             chunks,
-            peak_writes: run.peak.load(Ordering::Relaxed),
             rows,
         })
     }
@@ -732,8 +725,7 @@ async fn write_op(
         &format!("writing to target {}", target.name),
         || async {
             let _permit = target.endpoint.acquire().await;
-            let now = run.writes.fetch_add(1, Ordering::SeqCst) + 1;
-            run.peak.fetch_max(now, Ordering::SeqCst);
+            run.writes.fetch_add(1, Ordering::SeqCst);
             let r = write_once(run, target, chunk, prepared).await;
             run.writes.fetch_sub(1, Ordering::SeqCst);
             r
