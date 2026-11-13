@@ -2,20 +2,28 @@
 //! The connect level (PR T1) is real: [`PgConn`], its session ([`session_setup`]) and its
 //! [`WriteOpts`]; so are the type map and the text codec of PR T2 ([`pg_type`], [`param_text`],
 //! [`cell_value`]), which decide what a source column becomes here and how a value crosses.
-//! The statement functions below are stubs until the PR that lands their real
-//! form (T3-T5); the write path of `crate::mv` and the engine reject a PostgreSQL target before
-//! any of them is reached (their `Kind::Postgres` arms are unreachable in this PR).
+//! The statement functions below are real from the PR that owns them (T3: the DDL, T4: the
+//! upsert, the filter, the diff read and the swap); the ones of the write path are `PgConn`
+//! methods, because a PostgreSQL statement never runs on a MySQL connection, and the engine
+//! reaches them once the write pool of PR T5 hands a write its `PgConn` (the same staging T3's DDL
+//! waited for T4 for).
 
 use std::borrow::Cow;
+use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use mysql_async::{Conn, Value};
+use tokio_postgres::types::{private::BytesMut, Format, IsNull, ToSql, Type};
+use tokio_postgres::GenericClient;
 
 use crate::accumulate::{UnitChunk, UnitKind};
-use crate::mv::{Layout, MvCol, Upsert, WriteOpts};
+use crate::datum::{Datum, Key};
+use crate::metrics::Metrics;
+use crate::mv::{Applied, Diff, Layout, MvCol, Upsert, WriteOpts};
 use crate::target::{
-    lineage_indexes, partial_indexes, row_index, shadow_name, unit_index, KeyPart, KeyPlan, Kind,
-    RowIndex, MARKER_PREFIX, PG_KEY_BYTES,
+    lineage_indexes, old_name, partial_indexes, row_index, shadow_name, unit_index, KeyPart,
+    KeyPlan, Kind, RowIndex, MARKER_PREFIX, PG_KEY_BYTES,
 };
 
 mod connect;
@@ -61,37 +69,362 @@ impl PgConn {
     }
 }
 
-/// `INSERT ... ON CONFLICT (row key) DO UPDATE` — PR T4 replaces this stub with the real
-/// statement. Unreachable in this PR: the engine rejects a PostgreSQL write before T4.
+// ---------------------------------------------------------------------------
+// The write statements (PR T4): the upsert, the unit filter, the diff read, the
+// write transaction and the swap. A PostgreSQL statement never runs on a MySQL
+// connection, so the `mysql_async::Conn`-typed arms of `crate::target` stay
+// unreachable and the real statements are `PgConn` methods; the pool that hands
+// a write its `PgConn` is PR T5 (the staging T3's DDL used the same way).
+// ---------------------------------------------------------------------------
+
+/// `INSERT ... ON CONFLICT (<row key>) DO UPDATE` of `n` rows (T4.1), or the plain multi-row
+/// `INSERT` of a build when `key` is `None` (`fill` never upserts, T4.7). Placeholders are
+/// `$1..$n` in statement order — one row after another, one column after another — which is the
+/// order the writer binds its values in.
 pub(crate) fn insert_sql(
-    _schema: &str,
-    _table: &str,
-    _layout: &Layout,
-    _n: usize,
-    _key: Option<&[usize]>,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    n: usize,
+    key: Option<&[usize]>,
 ) -> String {
-    unreachable!("PostgreSQL writes land in PR T4")
+    let cols: Vec<String> = layout.cols.iter().map(|c| quote_ident(&c.name)).collect();
+    let width = layout.cols.len().max(1);
+    let rows: Vec<String> = (0..n)
+        .map(|r| {
+            format!(
+                "({})",
+                (0..width)
+                    .map(|i| format!("${}", r * width + i + 1))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect();
+    let mut sql = format!(
+        "INSERT INTO {}.{} ({}) VALUES {}",
+        quote_ident(schema),
+        quote_ident(table),
+        cols.join(","),
+        rows.join(",")
+    );
+    if let Some(key) = key {
+        // Every column is in the `DO UPDATE SET` list, the key columns too: a collation-equal key
+        // takes the new bytes, the same reason as the MySQL form (src/mv.rs:1236-1244). The
+        // conflict target names the row key, the table's only unique key (T3.2 builds its index).
+        let set = |i: &usize| {
+            let n = quote_ident(&layout.cols[*i].name);
+            format!("{n} = EXCLUDED.{n}")
+        };
+        let mut sets: Vec<String> = layout
+            .cols
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !key.contains(i))
+            .map(|(i, _)| set(&i))
+            .collect();
+        sets.extend(key.iter().map(set));
+        let target = key
+            .iter()
+            .map(|&i| quote_ident(&layout.cols[i].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(
+            " ON CONFLICT ({target}) DO UPDATE SET {}",
+            sets.join(", ")
+        ));
+    }
+    sql
 }
 
-/// The `$n` form of the unit filter — PR T4 replaces this stub (no `CAST(? AS JSON)`: a jsonb
-/// column compares to an untyped parameter by jsonb equality). Unreachable in this PR.
+/// The `$n` form of the unit filter (T4.2) with the parameters the dispatcher hands back. No
+/// column is named for a position here, so each is the type map's own fallback, `text` (D2); the
+/// write path renders its filters with [`filter_bind`] and the real columns, which is what gives a
+/// `bytea` key its `\x` form and a zero date its NULL (D5).
 pub(crate) fn unit_filter(
-    _chunk: &UnitChunk,
-    _cols: &[String],
-    _kinds: &[UnitKind],
+    chunk: &UnitChunk,
+    cols: &[String],
+    kinds: &[UnitKind],
 ) -> (String, Vec<Value>) {
-    unreachable!("PostgreSQL writes land in PR T4")
+    let (f, params) = filter_bind(chunk, cols, kinds, &[]);
+    (
+        f,
+        params
+            .into_iter()
+            .map(|p| match p {
+                None => Value::NULL,
+                Some(s) => Value::Bytes(s.into_bytes()),
+            })
+            .collect(),
+    )
 }
 
-/// The transactional swap (rename + index renames + drop in one `simple_query`) — PR T4.6.
-/// Unreachable today.
+/// `(predicate, parameters)` of `chunk` over `cols`: the shape of
+/// [`crate::accumulate::UnitChunk::filter_typed`] — every expression parenthesized, integer runs
+/// as `BETWEEN` ranges and inline `IN` literals, a key component that binds as NULL as an `IS NULL`
+/// literal — with `$n` placeholders numbered in statement order and **no** `CAST(? AS JSON)`: a
+/// jsonb column compares to an untyped parameter by jsonb equality.
+///
+/// `types[i]` is the target column of position `i`: it decides the text a key is bound as
+/// ([`param_text`], T2) and turns the zero date into the NULL the writer stored for it (D5); a
+/// position without a column is a `text` one. Neither `UnitKind` changes anything here: JSON
+/// compares as jsonb, and a TIMESTAMP is one instant for a `TimeZone = 'UTC'` session (T1.4), so
+/// MySQL's `CAST(? AS JSON)` and its DST hour-widening (`src/accumulate.rs:288-300`) are both
+/// artifacts of the MySQL session and not of the keys.
+fn filter_bind(
+    chunk: &UnitChunk,
+    cols: &[String],
+    _kinds: &[UnitKind],
+    types: &[&MvCol],
+) -> (String, Vec<Option<String>>) {
+    if let UnitChunk::Partial(at, c) = chunk {
+        // Only these positions are constrained (`src/accumulate.rs:241-248`); the callers pass one
+        // column per position, so the two lists stay parallel here.
+        let cols: Vec<String> = at.iter().map(|&u| cols[u].clone()).collect();
+        let types: Vec<&MvCol> = at.iter().filter_map(|&u| types.get(u).copied()).collect();
+        return filter_bind(c, &cols, &[], &types);
+    }
+    let exprs: Vec<String> = cols.iter().map(|e| format!("({e})")).collect();
+    let mut params: Vec<Option<String>> = Vec::new();
+    // One key as `((c)) = $n` per column, and one key as the `($1,$2)` row of an `IN` list.
+    let conj = |params: &mut Vec<Option<String>>, k: &Key| -> Vec<String> {
+        exprs
+            .iter()
+            .zip(k.iter())
+            .enumerate()
+            .map(|(i, (e, d))| match bind_key(d, types.get(i).copied()) {
+                None => format!("{e} IS NULL"),
+                Some(t) => {
+                    params.push(Some(t));
+                    format!("{e} = ${}", params.len())
+                }
+            })
+            .collect()
+    };
+    let row = |params: &mut Vec<Option<String>>, k: &Key| -> Vec<String> {
+        k.iter()
+            .enumerate()
+            .map(|(i, d)| {
+                params.push(bind_key(d, types.get(i).copied()));
+                format!("${}", params.len())
+            })
+            .collect()
+    };
+    let parts = match chunk {
+        UnitChunk::Ints(v) => {
+            let e = &exprs[0];
+            let mut singles = Vec::new();
+            let mut parts = Vec::new();
+            let mut i = 0;
+            while i < v.len() {
+                let mut j = i;
+                while j + 1 < v.len() && v[j + 1] == v[j] + 1 {
+                    j += 1;
+                }
+                if j - i >= 3 {
+                    parts.push(format!("{e} BETWEEN {} AND {}", v[i], v[j]));
+                } else {
+                    singles.extend(v[i..=j].iter().map(|x| x.to_string()));
+                }
+                i = j + 1;
+            }
+            if !singles.is_empty() {
+                parts.push(format!("{e} IN ({})", singles.join(",")));
+            }
+            parts // the runs are literals: no parameter, exactly as the MySQL form
+        }
+        UnitChunk::Keys(keys) => {
+            // A component that binds as NULL cannot sit in a row-value `IN` list (NULL equals
+            // nothing there), so those keys go one by one. MySQL's partition adds the TIME and the
+            // local-timestamp keys; PostgreSQL needs neither.
+            let (null_safe, plain): (Vec<&Key>, Vec<&Key>) = keys.iter().partition(|k| {
+                k.iter()
+                    .enumerate()
+                    .any(|(i, d)| bind_key(d, types.get(i).copied()).is_none())
+            });
+            let mut parts: Vec<String> = Vec::new();
+            if !plain.is_empty() {
+                if plain.len() == 1 {
+                    parts.push(format!("({})", conj(&mut params, plain[0]).join(" AND ")));
+                } else {
+                    let items: Vec<String> = plain
+                        .iter()
+                        .map(|k| format!("({})", row(&mut params, k).join(",")))
+                        .collect();
+                    let lhs = if exprs.len() == 1 {
+                        exprs[0].clone()
+                    } else {
+                        format!("({})", exprs.join(", "))
+                    };
+                    parts.push(format!("{lhs} IN ({})", items.join(",")));
+                }
+            }
+            for k in &null_safe {
+                parts.push(format!("({})", conj(&mut params, k).join(" AND ")));
+            }
+            parts
+        }
+        UnitChunk::Partial(..) => unreachable!("rendered above"),
+    };
+    (or_join(parts), params)
+}
+
+/// The text one key component is bound as, or `None` when the target stores a NULL for it (the
+/// zero date, D5): [`param_text`] of its column, or of a `text` column when the filter does not
+/// name one (the type map's own fallback, D2).
+fn bind_key(d: &Datum, col: Option<&MvCol>) -> Option<String> {
+    let v = d.to_value();
+    let rendered = match col {
+        Some(c) => param_text(&v, c),
+        None => {
+            let text = MvCol {
+                name: String::new(),
+                src_name: String::new(),
+                column_type: "text".into(),
+                data_type: "text".into(),
+                charset: None,
+                collation: None,
+                nullable: true,
+            };
+            param_text(&v, &text)
+        }
+    };
+    rendered.map(Cow::into_owned)
+}
+
+/// `FALSE` for nothing, the one part for one, the alternatives ORed otherwise (the shape of
+/// `crate::accumulate`'s own joiner, which the target module may not call).
+fn or_join(parts: Vec<String>) -> String {
+    match parts.len() {
+        0 => "FALSE".to_string(),
+        1 => parts.into_iter().next().unwrap(),
+        _ => format!("({})", parts.join(" OR ")),
+    }
+}
+
+/// One parameter of a PostgreSQL statement: the text form [`param_text`] renders, sent to the
+/// server in its **text** format whatever type the server infers for the position — the server then
+/// runs that type's own input function on the bytes, which is how a value crosses both engines as
+/// text (T2, and why no `with-*` type feature is needed). `None` is a SQL NULL.
+#[derive(Debug)]
+#[allow(dead_code)] // the write path of PR T5 binds these; see [`PgConn::insert_rows`]
+struct Param(Option<String>);
+
+impl ToSql for Param {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> std::result::Result<IsNull, Box<dyn Error + Sync + Send>> {
+        match &self.0 {
+            None => Ok(IsNull::Yes),
+            Some(s) => {
+                out.extend_from_slice(s.as_bytes());
+                Ok(IsNull::No)
+            }
+        }
+    }
+
+    /// Any type: the text is the server's own input form for whatever it infers here.
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    fn to_sql_checked(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> std::result::Result<IsNull, Box<dyn Error + Sync + Send>> {
+        self.to_sql(ty, out)
+    }
+
+    fn encode_format(&self, _ty: &Type) -> Format {
+        Format::Text
+    }
+}
+
+/// The driver's parameter slice of a statement: one [`Param`] per `$n`, in statement order.
+#[allow(dead_code)] // as above
+fn refs(params: &[Param]) -> Vec<&(dyn ToSql + Sync)> {
+    params.iter().map(|p| p as &(dyn ToSql + Sync)).collect()
+}
+
+/// The quoted predicate expressions of `pos` and the columns behind them: a filter binds its keys
+/// by the target column's type, so the two lists are always built together.
+#[allow(dead_code)] // as above
+fn unit_cols<'a>(layout: &'a Layout, pos: &[usize]) -> (Vec<String>, Vec<&'a MvCol>) {
+    (
+        pos.iter()
+            .map(|&p| quote_ident(&layout.cols[p].name))
+            .collect(),
+        pos.iter().map(|&p| &layout.cols[p]).collect(),
+    )
+}
+
+/// The swap as one statement block (T4.6): the mirror of `src/mv.rs:1071-1098`, and one
+/// `simple_query` is one round trip and one transaction (PostgreSQL's DDL is transactional, so a
+/// swap that runs into `lock_timeout` aborts whole and the caller retries on its `not_before`
+/// timer, as MySQL's deferred swap does — `src/engine.rs:4351`, `:5686`). `live` is the second of
+/// the two MySQL edge cases: a table that does not exist yet is a plain rename; the first (a
+/// shadow already gone) is answered by [`PgConn::swap`] before any statement.
+#[allow(dead_code)] // the swap of PR T5's write path; [`swap_statement_block`] proves the block
+fn swap_block(schema: &str, name: &str, live: bool, renames: &[String]) -> String {
+    let (s, base) = (quote_ident(schema), quote_ident(name));
+    let (shadow, old) = (
+        quote_ident(&shadow_name(name)),
+        quote_ident(&old_name(name)),
+    );
+    let mut stmts = vec![
+        "BEGIN;".to_string(),
+        "SET LOCAL lock_timeout = '5s';".to_string(),
+    ];
+    if live {
+        stmts.push(format!("ALTER TABLE {s}.{base} RENAME TO {old};"));
+    }
+    // Frees the index names the shadow's are about to take (D7) and an interrupted swap's leftovers.
+    stmts.push(format!("DROP TABLE IF EXISTS {s}.{old};"));
+    stmts.push(format!("ALTER TABLE {s}.{shadow} RENAME TO {base};"));
+    stmts.extend(renames.iter().map(|r| format!("{r};")));
+    if !live {
+        stmts.push(format!("DROP TABLE IF EXISTS {s}.{old};"));
+    }
+    stmts.push("COMMIT;".to_string());
+    stmts.join("\n")
+}
+
+/// The shadow's indexes renamed to the base table's names (D7), from the names the catalog reports
+/// for the shadow. The index *set* is the layout's decision (T3.2), so a name is always the table's
+/// name in front of `lv_row` / `lv_unit` / `lv_a<k>` / `lv_p<k>` — also under the 63-byte
+/// `definition_hash` fallback, whose name still ends that way — and the base's own name is the
+/// same [`index_name`] the build used.
+#[allow(dead_code)] // as above
+fn index_renames(schema: &str, name: &str, found: &[String]) -> Vec<String> {
+    found
+        .iter()
+        .filter_map(|n| {
+            let (_, rest) = n.rsplit_once("_lv_")?;
+            Some(format!(
+                "ALTER INDEX {}.{} RENAME TO {}",
+                quote_ident(schema),
+                quote_ident(n),
+                quote_ident(&index_name(name, &format!("lv_{rest}")))
+            ))
+        })
+        .collect()
+}
+
+/// The transactional swap of `crate::target::swap`'s PostgreSQL arm: it runs on the target's own
+/// connection ([`PgConn::swap`]), never on a MySQL one.
 pub(crate) async fn swap(_conn: &mut Conn, _schema: &str, _name: &str) -> Result<()> {
-    unreachable!("PostgreSQL writes land in PR T4")
+    unreachable!("the PostgreSQL swap runs on the target's own connection (PgConn::swap)")
 }
 
-/// `DROP TABLE IF EXISTS` — PR T4. Unreachable today.
+/// `DROP TABLE IF EXISTS` of `crate::target::drop_table`'s PostgreSQL arm, on the target's own
+/// connection ([`PgConn::drop_table`]).
 pub(crate) async fn drop_table(_conn: &mut Conn, _schema: &str, _name: &str) -> Result<()> {
-    unreachable!("PostgreSQL writes land in PR T4")
+    unreachable!(
+        "the PostgreSQL DROP TABLE runs on the target's own connection (PgConn::drop_table)"
+    )
 }
 
 /// Session settings of every PostgreSQL target connection: values are stored and read back in
@@ -489,6 +822,285 @@ impl PgConn {
             .await?;
         Ok(shadow)
     }
+
+    /// The multi-row `INSERT`s / upserts of `rows` into `table` (T4.1): the same `batches` helper,
+    /// the same `MAX_PARAMS` cap and the same metrics as `crate::mv::insert_rows`, one statement
+    /// per batch, every value rendered by [`param_text`] for its target column (T2).
+    #[allow(dead_code, clippy::too_many_arguments)] // PR T5's write pool hands the write path a `PgConn` (as T3's DDL waited for T4)
+    pub(crate) async fn insert_rows(
+        &self,
+        schema: &str,
+        table: &str,
+        layout: &Layout,
+        rows: &[Vec<Value>],
+        w: &WriteOpts,
+        upsert: bool,
+        metrics: &Metrics,
+    ) -> Result<()> {
+        insert_rows_on(
+            &self.client,
+            schema,
+            table,
+            layout,
+            rows,
+            w,
+            upsert,
+            metrics,
+        )
+        .await
+    }
+
+    /// The DELETEs of `keys` by row key (T4.3), batched like `crate::mv::delete_keys`.
+    #[allow(dead_code)] // as above
+    pub(crate) async fn delete_keys(
+        &self,
+        schema: &str,
+        table: &str,
+        layout: &Layout,
+        keys: &[Key],
+        w: &WriteOpts,
+        metrics: &Metrics,
+    ) -> Result<()> {
+        delete_keys_on(&self.client, schema, table, layout, keys, w, metrics).await
+    }
+
+    /// The current rows of the units in `chunk` (all rows when `None`), for a diff (T4.4). Every
+    /// column is fetched as `col::text`, the form [`cell_value`] decodes, so the read needs no
+    /// `with-*` type feature either. Not `layout.read_list()` / `normalize`: those are the MySQL
+    /// family's SQL (`UNIX_TIMESTAMP`, `src/mv.rs:269-282`).
+    #[allow(dead_code)] // as above
+    pub(crate) async fn read_old(
+        &self,
+        schema: &str,
+        table: &str,
+        layout: &Layout,
+        chunk: Option<&UnitChunk>,
+        metrics: &Metrics,
+    ) -> Result<Vec<Vec<Value>>> {
+        let list = layout
+            .cols
+            .iter()
+            .map(|c| format!("{}::text", quote_ident(&c.name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (filter, bound) = match chunk {
+            Some(c) => {
+                let (cols, types) = unit_cols(layout, &layout.unit_pos);
+                filter_bind(c, &cols, &layout.unit_kinds(), &types)
+            }
+            None => ("TRUE".to_string(), Vec::new()),
+        };
+        let sql = format!(
+            "SELECT {list} FROM {}.{} WHERE {filter}",
+            quote_ident(schema),
+            quote_ident(table)
+        );
+        let params: Vec<Param> = bound.into_iter().map(Param).collect();
+        let binds = refs(&params);
+        let rows = self.client.query(sql.as_str(), &binds).await?;
+        Metrics::add(&metrics.mv_queries, 1);
+        // A column is NOT NULL exactly where the build put one (T3.2), which is what tells a NULL
+        // that can only be the zero date from one that is a real NULL (D5).
+        let primary = matches!(
+            unit_index(layout, &KeyPlan::for_layout(layout, Kind::Postgres)),
+            Some((true, _))
+        );
+        Ok(rows
+            .iter()
+            .map(|r| {
+                layout
+                    .cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let nullable = !(primary && layout.unit_pos.contains(&i));
+                        cell_value(r.get::<_, Option<String>>(i).as_deref(), c, nullable)
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// Brings `table` in line with a diff in one transaction (T4.5): the unit DELETE or the
+    /// DELETEs by row key, then the INSERTs, then the commit — the shape of
+    /// `crate::mv::write_tx_mysql`, whose `start_transaction` (`src/mv.rs:1746`) this is the
+    /// analogue of. No `@lv_tz` session dance (§0.10): the session is UTC from connect (T1.4).
+    /// `began` is set where `write_diff` sets it, before the transaction is opened.
+    #[allow(dead_code, clippy::too_many_arguments)] // as above
+    pub(crate) async fn write_tx(
+        &mut self,
+        schema: &str,
+        table: &str,
+        layout: &Layout,
+        d: &Diff,
+        w: &WriteOpts,
+        metrics: &Metrics,
+        began: &AtomicBool,
+    ) -> Result<Applied> {
+        let out = Applied {
+            units_changed: d.changed.len() as u64,
+            deleted: d.deleted_rows,
+            inserted: d.inserts.len() as u64,
+            upserted: if d.by_unit { 0 } else { d.inserts.len() as u64 },
+            updated: d.updated_rows,
+            unchanged: d.unchanged_rows,
+        };
+        began.store(true, Ordering::SeqCst);
+        let tx = self.client.transaction().await?;
+        if d.by_unit && d.deleted_rows > 0 {
+            let (cols, types) = unit_cols(layout, &layout.unit_pos);
+            let chunk = crate::mv::keys_chunk(d.changed.clone());
+            let (f, bound) =
+                filter_bind(&chunk, &cols, &layout.write_kinds(&layout.unit_pos), &types);
+            let sql = format!(
+                "DELETE FROM {}.{} WHERE {f}",
+                quote_ident(schema),
+                quote_ident(table)
+            );
+            exec(&tx, &sql, bound).await?;
+            Metrics::add(&metrics.mv_queries, 1);
+        }
+        if !d.by_unit {
+            delete_keys_on(&tx, schema, table, layout, &d.delete_keys, w, metrics).await?;
+        }
+        Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
+        insert_rows_on(
+            &tx, schema, table, layout, &d.inserts, w, !d.by_unit, metrics,
+        )
+        .await?;
+        tx.commit().await?;
+        Metrics::add(&metrics.units_changed, out.units_changed);
+        Ok(out)
+    }
+
+    /// The transactional swap (T4.6): the shadow becomes `name` and its indexes take the base
+    /// table's names, in one `simple_query`. Both edge cases of the MySQL swap are here: a shadow
+    /// that is already gone is `Ok(())` (an interrupted build, nothing to do), and a live table
+    /// that does not exist yet is a plain rename.
+    #[allow(dead_code)] // as above
+    pub(crate) async fn swap(&self, schema: &str, name: &str) -> Result<()> {
+        let shadow = shadow_name(name);
+        if self.table_kind(schema, &shadow).await?.is_none() {
+            return Ok(());
+        }
+        let live = self.table_kind(schema, name).await?.is_some();
+        // The shadow's own indexes, read from the catalog (`pg_catalog` only, H3): what the build
+        // actually created, not what a second copy of the layout's decision would name.
+        let found: Vec<String> = self
+            .client
+            .query(
+                "SELECT c.relname FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indexrelid \
+                 JOIN pg_class t ON t.oid = i.indrelid \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 WHERE n.nspname = $1 AND t.relname = $2 ORDER BY c.relname",
+                &[&schema.to_string(), &shadow.to_string()],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        let renames = index_renames(schema, name, &found);
+        self.client
+            .simple_query(&swap_block(schema, name, live, &renames))
+            .await?;
+        Ok(())
+    }
+
+    /// `DROP TABLE IF EXISTS` (the analogue of `crate::target::mysql::drop_table`).
+    #[allow(dead_code)] // as above
+    pub(crate) async fn drop_table(&self, schema: &str, name: &str) -> Result<()> {
+        self.client
+            .execute(
+                &format!(
+                    "DROP TABLE IF EXISTS {}.{}",
+                    quote_ident(schema),
+                    quote_ident(name)
+                ),
+                &[],
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// One statement with [`Param`]eters (the unit DELETE of a flush: run inside the transaction).
+#[allow(dead_code)] // reached only through the write path of PR T5
+async fn exec<C: GenericClient>(c: &C, sql: &str, bound: Vec<Option<String>>) -> Result<()> {
+    let params: Vec<Param> = bound.into_iter().map(Param).collect();
+    let binds = refs(&params);
+    c.execute(sql, &binds).await?;
+    Ok(())
+}
+
+/// The batches of one `insert_rows` (T4.1), on the client or inside a flush's transaction: the
+/// same [`crate::mv::batches`] limits the MySQL writer pays (`src/mv.rs:1289`), one statement per
+/// batch, so the parameters are the rows of that batch in statement order.
+#[allow(dead_code, clippy::too_many_arguments)] // as above
+async fn insert_rows_on<C: GenericClient>(
+    c: &C,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    rows: &[Vec<Value>],
+    w: &WriteOpts,
+    upsert: bool,
+    metrics: &Metrics,
+) -> Result<()> {
+    let per = crate::mv::rows_per_insert(layout, w.batch_rows);
+    let text = 3 + 2 * layout.cols.len();
+    let row_bytes = |r: &Vec<Value>| text + r.iter().map(crate::mv::value_bytes).sum::<usize>();
+    let key = upsert.then(|| layout.row_key_for(Kind::Postgres)).flatten();
+    for chunk in crate::mv::batches(rows, per, w.batch_bytes, row_bytes) {
+        let sql = insert_sql(schema, table, layout, chunk.len(), key);
+        let mut bound: Vec<Option<String>> = Vec::with_capacity(chunk.len() * layout.cols.len());
+        for r in chunk {
+            for (i, col) in layout.cols.iter().enumerate() {
+                bound.push(
+                    r.get(i)
+                        .and_then(|v| param_text(v, col).map(Cow::into_owned)),
+                );
+            }
+        }
+        exec(c, &sql, bound).await?;
+        Metrics::add(&metrics.mv_queries, 1);
+        Metrics::add(&metrics.mv_rows_inserted, chunk.len() as u64);
+        if upsert {
+            Metrics::add(&metrics.mv_rows_upserted, chunk.len() as u64);
+        }
+    }
+    Ok(())
+}
+
+/// The batches of one `delete_keys` (T4.3), on the client or inside a flush's transaction.
+#[allow(dead_code)] // as above
+async fn delete_keys_on<C: GenericClient>(
+    c: &C,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    keys: &[Key],
+    w: &WriteOpts,
+    metrics: &Metrics,
+) -> Result<()> {
+    let Some(key) = layout.row_key_for(Kind::Postgres) else {
+        bail!("internal: rows of `{table}` have no row key");
+    };
+    let (cols, types) = unit_cols(layout, key);
+    let per = crate::mv::MAX_PARAMS / cols.len().max(1);
+    let key_bytes = |k: &Key| 4 + k.iter().map(crate::mv::datum_bytes).sum::<usize>();
+    for piece in crate::mv::batches(keys, per, w.batch_bytes, key_bytes) {
+        let chunk = crate::mv::keys_chunk(piece.to_vec());
+        let (f, bound) = filter_bind(&chunk, &cols, &[], &types);
+        let sql = format!(
+            "DELETE FROM {}.{} WHERE {f}",
+            quote_ident(schema),
+            quote_ident(table)
+        );
+        exec(c, &sql, bound).await?;
+        Metrics::add(&metrics.mv_queries, 1);
+    }
+    Ok(())
 }
 
 /// The multi-row INSERT's and the diff read's parameter text for one value (`None` = SQL NULL).
@@ -498,7 +1110,7 @@ impl PgConn {
 /// `extra_float_digits = 1` makes PostgreSQL agree with bit for bit, D4), `Bytes` goes as itself
 /// for `text`/`numeric`/`jsonb` and as `\x`+hex for `bytea` (the session's `bytea_output`), and
 /// the zero date is written NULL (D5, see [`cell_value`]).
-#[allow(dead_code)] // the writer of PR T4 calls this; the tests here prove it
+#[allow(dead_code)] // reached only through the write path of PR T5; the tests here prove it
 pub(crate) fn param_text<'a>(v: &'a Value, col: &MvCol) -> Option<Cow<'a, str>> {
     match v {
         Value::NULL => None,
@@ -1430,5 +2042,174 @@ mod tests {
                 "{column_type} does not match its own type"
             );
         }
+    }
+
+    /// The upsert names the row key as its conflict target and sets every column, the key columns
+    /// too (T4.1); with no row key the same statement is the plain INSERT of a build (T4.7).
+    #[test]
+    fn upsert_pg_names_the_row_key() {
+        let mut l = layout(
+            vec![
+                col("id", "bigint", "bigint"),
+                col("amount", "decimal", "decimal(10,2)"),
+                col("_lv_u0", "int", "int"),
+            ],
+            2,
+            vec![2],
+            false,
+        );
+        l.identity = vec![0];
+        assert_eq!(l.row_key_for(Kind::Postgres), Some(&[0][..]));
+        assert_eq!(
+            insert_sql("s", "items", &l, 2, Some(&[0][..])),
+            "INSERT INTO \"s\".\"items\" (\"id\",\"amount\",\"_lv_u0\") \
+             VALUES ($1,$2,$3),($4,$5,$6) \
+             ON CONFLICT (\"id\") DO UPDATE SET \"amount\" = EXCLUDED.\"amount\", \
+             \"_lv_u0\" = EXCLUDED.\"_lv_u0\", \"id\" = EXCLUDED.\"id\""
+        );
+        // No row key: the plain multi-row INSERT of `fill`, no `ON CONFLICT` at all.
+        let plain = insert_sql("s", "items", &l, 1, None);
+        assert!(!plain.contains("ON CONFLICT"), "{plain}");
+        assert_eq!(
+            plain,
+            "INSERT INTO \"s\".\"items\" (\"id\",\"amount\",\"_lv_u0\") VALUES ($1,$2,$3)"
+        );
+        // A two-column row key is the conflict target and is set column by column; the `$n` run
+        // continues across rows, which is the order the writer binds its values in.
+        let two = insert_sql("s", "items", &l, 2, Some(&[0, 1][..]));
+        assert!(
+            two.contains("ON CONFLICT (\"id\", \"amount\")")
+                && two.contains("\"id\" = EXCLUDED.\"id\", \"amount\" = EXCLUDED.\"amount\"")
+                && two.contains("VALUES ($1,$2,$3),($4,$5,$6) ON CONFLICT"),
+            "{two}"
+        );
+    }
+
+    /// The swap is one block (T4.6): `BEGIN`, its own `lock_timeout`, the live table renamed away
+    /// only when it exists, the shadow's indexes renamed to the base table's names in the same
+    /// transaction (D7), and the `DROP TABLE IF EXISTS` of both MySQL edge cases.
+    #[test]
+    fn swap_statement_block() {
+        let renames = vec![
+            "ALTER INDEX \"s\".\"items__lv_new_lv_row\" RENAME TO \"items_lv_row\"".to_string(),
+            "ALTER INDEX \"s\".\"items__lv_new_lv_unit\" RENAME TO \"items_lv_unit\"".to_string(),
+        ];
+        let expected = [
+            "BEGIN;",
+            "SET LOCAL lock_timeout = '5s';",
+            "ALTER TABLE \"s\".\"items\" RENAME TO \"items__lv_old\";",
+            "DROP TABLE IF EXISTS \"s\".\"items__lv_old\";",
+            "ALTER TABLE \"s\".\"items__lv_new\" RENAME TO \"items\";",
+            "ALTER INDEX \"s\".\"items__lv_new_lv_row\" RENAME TO \"items_lv_row\";",
+            "ALTER INDEX \"s\".\"items__lv_new_lv_unit\" RENAME TO \"items_lv_unit\";",
+            "COMMIT;",
+        ]
+        .join("\n");
+        assert_eq!(swap_block("s", "items", true, &renames), expected);
+        // A first build has no live table to rename away, and its `__lv_old` was never there.
+        let first = swap_block("s", "items", false, &[]);
+        assert!(!first.contains("RENAME TO \"items__lv_old\""), "{first}");
+        assert_eq!(first.matches("DROP TABLE IF EXISTS").count(), 2, "{first}");
+        assert!(
+            first.starts_with("BEGIN;") && first.ends_with("COMMIT;"),
+            "{first}"
+        );
+        // The catalog's names become the base table's, under the 63-byte cap and under its
+        // `definition_hash` fallback alike; a name that is not the view's is left alone.
+        let found = vec![
+            "items_lv_row".to_string(),
+            "_lv_0123456789abcdef_lv_a0".to_string(),
+            "other".to_string(),
+        ];
+        let r = index_renames("s", "items", &found);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert_eq!(
+            r[0],
+            "ALTER INDEX \"s\".\"items_lv_row\" RENAME TO \"items_lv_row\""
+        );
+        assert_eq!(
+            r[1],
+            "ALTER INDEX \"s\".\"_lv_0123456789abcdef_lv_a0\" RENAME TO \"items_lv_a0\""
+        );
+    }
+
+    /// The `$n` filter of T4.2: integer runs as `BETWEEN` / `IN` literals with no parameter at all,
+    /// several keys as one row-value `IN` list numbered in statement order, one key as
+    /// `((expr)) = $n`, and a component that binds as NULL - a SQL NULL or the zero date (D5) - as
+    /// an `IS NULL` literal, never as a `= NULL` that could match nothing.
+    #[test]
+    fn unit_filter_pg_forms() {
+        let cols: Vec<String> = vec!["\"_lv_u0\"".into(), "\"_lv_u1\"".into()];
+        let id = col("_lv_u0", "bigint", "bigint");
+        let day = col("_lv_u1", "date", "date");
+        let ts = col("_lv_u1", "datetime", "datetime(6)");
+        let types: Vec<&MvCol> = vec![&id, &day];
+        let ints = UnitChunk::Ints(vec![1, 2, 3, 4, 9, 10]);
+        let (f, p) = filter_bind(&ints, &cols, &[], &types);
+        assert_eq!(
+            f,
+            "((\"_lv_u0\") BETWEEN 1 AND 4 OR (\"_lv_u0\") IN (9,10))"
+        );
+        assert!(p.is_empty(), "{p:?}");
+
+        let keys = UnitChunk::Keys(vec![
+            vec![Datum::Int(1), Datum::Date(2024, 2, 29, 0, 0, 0, 0)].into_boxed_slice(),
+            vec![Datum::Int(2), Datum::Date(2024, 2, 29, 0, 0, 0, 0)].into_boxed_slice(),
+        ]);
+        let (f, p) = filter_bind(&keys, &cols, &[], &types);
+        assert_eq!(f, "((\"_lv_u0\"), (\"_lv_u1\")) IN (($1,$2),($3,$4))");
+        assert_eq!(
+            p,
+            vec![
+                Some("1".into()),
+                Some("2024-02-29".into()),
+                Some("2".into()),
+                Some("2024-02-29".into())
+            ]
+        );
+
+        let types: Vec<&MvCol> = vec![&id, &ts];
+        let one = UnitChunk::Keys(vec![vec![
+            Datum::Int(7),
+            Datum::Date(2020, 1, 2, 3, 4, 5, 6),
+        ]
+        .into_boxed_slice()]);
+        let (f, p) = filter_bind(&one, &cols, &[], &types);
+        assert_eq!(f, "((\"_lv_u0\") = $1 AND (\"_lv_u1\") = $2)");
+        assert_eq!(
+            p,
+            vec![Some("7".into()), Some("2020-01-02 03:04:05.000006".into())]
+        );
+
+        // A NULL component and a zero date both bind as the NULL the target stores: `IS NULL`.
+        let nulls = UnitChunk::Keys(vec![
+            vec![Datum::Null, Datum::Date(0, 0, 0, 0, 0, 0, 0)].into_boxed_slice()
+        ]);
+        let (f, p) = filter_bind(&nulls, &cols, &[], &types);
+        assert_eq!(f, "((\"_lv_u0\") IS NULL AND (\"_lv_u1\") IS NULL)");
+        assert!(p.is_empty(), "{p:?}");
+
+        // A partial unit key constrains only its own positions.
+        let part = UnitChunk::Partial(
+            vec![0],
+            Box::new(UnitChunk::Keys(
+                vec![vec![Datum::Int(5)].into_boxed_slice()],
+            )),
+        );
+        let (f, p) = filter_bind(&part, &cols, &[], &types);
+        assert_eq!(f, "((\"_lv_u0\") = $1)");
+        assert_eq!(p, vec![Some("5".into())]);
+
+        // The dispatcher's arm names no columns, so every position is the map's `text` fallback
+        // (D2) and the parameters are its text forms.
+        let (f, p) = unit_filter(&one, &cols, &[]);
+        assert_eq!(f, "((\"_lv_u0\") = $1 AND (\"_lv_u1\") = $2)");
+        assert_eq!(
+            p,
+            vec![
+                Value::Bytes(b"7".to_vec()),
+                Value::Bytes(b"2020-01-02 03:04:05.000006".to_vec())
+            ]
+        );
     }
 }

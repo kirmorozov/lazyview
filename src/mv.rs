@@ -21,7 +21,7 @@ pub use crate::target::{base_name, marker, old_name, shadow_name, MARKER_PREFIX}
 
 /// Maximum placeholders per statement (server limit is 65535). `Kind::Postgres` has a hard
 /// ceiling of 65535; this cap is below it for both families.
-const MAX_PARAMS: usize = 60_000;
+pub(crate) const MAX_PARAMS: usize = 60_000;
 /// Name of the unique index over the row identity (see [`Layout::row_key`]).
 pub(crate) const ROW_INDEX: &str = "_lv_row";
 /// Estimated bytes per write statement unless configured (`LAZYVIEW_WRITE_BATCH_BYTES`).
@@ -128,7 +128,7 @@ impl Layout {
     /// How the values of `cols` are bound in a filter of a write (see [`write_diff`]): JSON as
     /// JSON values, TIMESTAMPs read in the session's time zone by local time (in a `+00:00`
     /// write session they are exact UTC datetimes).
-    fn write_kinds(&self, cols: &[usize]) -> Vec<UnitKind> {
+    pub(crate) fn write_kinds(&self, cols: &[usize]) -> Vec<UnitKind> {
         cols.iter()
             .map(|&p| match self.cols[p].data_type.as_str() {
                 "timestamp" if !self.epoch_timestamps() => UnitKind::Timestamp,
@@ -630,7 +630,7 @@ pub async fn drop_table(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -
 /// Session time zone in which TIMESTAMPs are written (see [`Layout::epoch_timestamps`]).
 pub(crate) use crate::target::UTC_SESSION;
 
-fn rows_per_insert(layout: &Layout, batch_rows: usize) -> usize {
+pub(crate) fn rows_per_insert(layout: &Layout, batch_rows: usize) -> usize {
     (MAX_PARAMS / layout.cols.len().max(1)).clamp(1, batch_rows.max(1))
 }
 
@@ -687,7 +687,7 @@ pub async fn write_opts(
 }
 
 /// Estimated bytes a value takes in a statement.
-fn value_bytes(v: &Value) -> usize {
+pub(crate) fn value_bytes(v: &Value) -> usize {
     match v {
         Value::Bytes(b) => b.len() + 9,
         Value::NULL => 1,
@@ -695,7 +695,7 @@ fn value_bytes(v: &Value) -> usize {
     }
 }
 
-fn datum_bytes(d: &Datum) -> usize {
+pub(crate) fn datum_bytes(d: &Datum) -> usize {
     match d {
         Datum::Bytes(b) => b.len() + 9,
         _ => 13,
@@ -704,7 +704,7 @@ fn datum_bytes(d: &Datum) -> usize {
 
 /// Consecutive runs of `items` with at most `max_items` items and `max_bytes` estimated bytes
 /// each (at least one item per run).
-fn batches<T>(
+pub(crate) fn batches<T>(
     items: &[T],
     max_items: usize,
     max_bytes: usize,
@@ -1184,12 +1184,15 @@ pub async fn write_diff(
         conn.query_drop(format!("SET @lv_tz = @@SESSION.time_zone, {UTC_SESSION}"))
             .await?;
     }
-    // One dispatch per write (never per row): the transaction's open/commit stays with the
-    // family. PR T4 opens the PostgreSQL transaction inside its own arm; this PR's PostgreSQL
-    // arm is unreachable, as every PostgreSQL target DSN is rejected at `Kind::from_dsn`.
+    // The transaction's open/commit stays with the family (one dispatch per write, never per
+    // row). The PostgreSQL flush is `postgres::PgConn::write_tx` (T4.5), which opens its own
+    // transaction; this arm is unreachable because the connection here is a MySQL one and the
+    // pool that hands a write a `PgConn` is PR T5.
     let r = match w.kind {
         Kind::Mysql => write_tx_mysql(conn, schema, table, layout, d, w, metrics).await,
-        Kind::Postgres => unreachable!("PostgreSQL targets are rejected by Kind::from_dsn"),
+        Kind::Postgres => unreachable!(
+            "the PostgreSQL write transaction runs on the target's own connection (PgConn::write_tx)"
+        ),
     };
     if utc {
         let restored = conn.query_drop("SET SESSION time_zone = @lv_tz").await;
@@ -1280,7 +1283,8 @@ pub async fn apply(
     w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<Applied> {
-    // The callers pass the family explicitly until PR T4 supplies the target's own kind.
+    // `apply` runs on a MySQL connection (the PostgreSQL diff read is `PgConn::read_old`), so the
+    // family of this read is the MySQL one.
     let old = read_old(conn, schema, table, layout, Kind::Mysql, chunk, metrics).await?;
     let new = prepare(layout, new_rows.to_vec());
     let d = diff(layout, old, &new)
