@@ -729,6 +729,9 @@ struct Engine {
     /// Concurrent refreshes on connection pools; `None` with `LAZYVIEW_SUPERVISOR=off` (one
     /// sequential refresh on the connections above).
     sup: Option<Supervisor>,
+    /// Executor (a): the dedup core and its targets, one per live version on the Dedup route
+    /// (src/exec.rs).
+    dedup: crate::exec::Dedup,
 }
 
 /// One connection attempt (TCP, TLS and handshake) is bounded well inside the liveness window:
@@ -1087,6 +1090,12 @@ impl Engine {
             file: String::new(),
             pos: 0,
         };
+        let dedup = crate::exec::Dedup::new(
+            zero.clone(),
+            cfg.batch_max_keys.max(1),
+            cfg.query_chunk.max(1),
+            8 * DRAIN_MAX_BYTES,
+        );
         // Detached: the task ends when the engine, owner of its only sender, is dropped.
         let (stats_tx, stats_task) = crate::stats::spawn_aggregator(metrics.view_stats.clone());
         drop(stats_task);
@@ -1140,6 +1149,7 @@ impl Engine {
             stats_tx,
             last_meta_ping: Instant::now(),
             sup,
+            dedup,
         };
 
         if !e.cfg.sync {
@@ -2681,6 +2691,24 @@ impl Engine {
     }
 
     fn rebuild_routes(&mut self) {
+        // Executor (a): live versions on the Dedup route have a core target (src/exec.rs).
+        let live: Vec<(u64, Arc<ViewPlan>)> = self
+            .slots
+            .iter()
+            .filter_map(|s| {
+                s.live
+                    .as_ref()
+                    .filter(|l| !l.frozen)
+                    .map(|l| (s.def_id, l.plan.clone()))
+            })
+            .collect();
+        let synced = self.dedup.sync(&live);
+        for (id, why) in &synced.refused {
+            warn!(
+                definition = id,
+                "the dedup core refused the view's plan, it keeps the viewplan executor: {why}"
+            );
+        }
         let mut routes: HashMap<TableRef, Vec<RouteT>> = HashMap::new();
         for (si, s) in self.slots.iter().enumerate() {
             let versions = [
@@ -3596,6 +3624,8 @@ impl Engine {
             lower_pos(&mut floor, s.stale_since.as_ref());
             if let Some(l) = s.live.as_ref().filter(|l| !l.frozen) {
                 lower_pos(&mut floor, l.since.as_ref());
+                let pin = self.dedup.pinned(s.def_id);
+                lower_pos(&mut floor, pin.as_ref());
                 if held {
                     lower_pos(&mut floor, l.recent.floor());
                 }
@@ -4131,8 +4161,12 @@ impl Engine {
                 let mode = plan.map(|p| mode_name(p).0).unwrap_or("unknown");
                 let (tally, pending, cached) = match s.live.as_mut() {
                     Some(l) => (
-                        std::mem::take(&mut l.dirty.tally),
-                        pending_ids(&l.dirty, &l.plan),
+                        {
+                            let mut t = std::mem::take(&mut l.dirty.tally);
+                            t.add(&self.dedup.tally(s.def_id));
+                            t
+                        },
+                        pending_ids(&l.dirty, &l.plan) + self.dedup.pending(s.def_id),
                         l.dirty
                             .cache
                             .routes
@@ -4890,6 +4924,44 @@ impl Engine {
         })
     }
 
+    /// After a successful refresh of slot `i`'s live version (from `live_end`; executor (a) too): targets whose
+    /// writes failed start lagging at `floor` and get the refreshed units later, lagging targets get them too,
+    /// and the view's statistics count the refresh.
+    fn note_refresh(
+        &mut self,
+        i: usize,
+        name: &str,
+        r: Refreshed,
+        lagging: &[String],
+        floor: Position,
+    ) {
+        let s = &mut self.slots[i];
+        let Some(l) = s.live.as_mut() else {
+            return;
+        };
+        // Targets that missed this refresh (or earlier ones) get the units later.
+        for (t, e) in &r.failed {
+            warn!(view = %name, target = %t, "write failed: {e:#}; retrying");
+            l.lag.entry(t.clone()).or_insert(Lag {
+                units: UnitSet::default(),
+                partial: Vec::new(),
+                all: false,
+                since: floor.clone(),
+                failures: 1,
+                retry_at: Instant::now() + target_backoff(1),
+                down: false,
+            });
+        }
+        for t in r.failed.iter().map(|(t, _)| t).chain(lagging) {
+            if let Some(g) = l.lag.get_mut(t) {
+                g.units.extend(r.units.clone());
+                extend_partial(&mut g.partial, r.partial.clone());
+                g.all |= r.all;
+            }
+        }
+        s.stats.refreshed(r.units, r.partial, r.all, &r.work);
+    }
+
     /// What [`Self::refresh_live`] does with the result `r` of the refresh `st`.
     async fn live_end(&mut self, i: usize, st: LiveRefresh, r: Result<Refreshed>) {
         let LiveRefresh {
@@ -4950,27 +5022,11 @@ impl Engine {
                     return;
                 };
                 let floor = l.since.clone().unwrap_or_else(|| self.boundary.clone());
-                // Targets that missed this refresh (or earlier ones) get the units later.
-                for (t, e) in &r.failed {
-                    warn!(view = %name, target = %t, "write failed: {e:#}; retrying");
-                    l.lag.entry(t.clone()).or_insert(Lag {
-                        units: UnitSet::default(),
-                        partial: Vec::new(),
-                        all: false,
-                        since: floor.clone(),
-                        failures: 1,
-                        retry_at: Instant::now() + target_backoff(1),
-                        down: false,
-                    });
-                }
-                for t in r.failed.iter().map(|(t, _)| t).chain(&lagging) {
-                    if let Some(g) = l.lag.get_mut(t) {
-                        g.units.extend(r.units.clone());
-                        extend_partial(&mut g.partial, r.partial.clone());
-                        g.all |= r.all;
-                    }
-                }
-                s.stats.refreshed(r.units, r.partial, r.all, &r.work);
+                self.note_refresh(i, &name, r, &lagging, floor);
+                let s = &mut self.slots[i];
+                let Some(l) = s.live.as_mut() else {
+                    return;
+                };
                 if dirty.rebuild {
                     let live_since = l.since.clone();
                     if let Some(n) = s.next.as_mut() {
