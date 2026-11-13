@@ -4,15 +4,16 @@
 //! [`cell_value`]), which decide what a source column becomes here and how a value crosses.
 //! The statement functions below are real from the PR that owns them (T3: the DDL, T4: the
 //! upsert, the filter, the diff read and the swap); the ones of the write path are `PgConn`
-//! methods, because a PostgreSQL statement never runs on a MySQL connection, and the engine
-//! reaches them once the write pool of PR T5 hands a write its `PgConn` (the same staging T3's DDL
-//! waited for T4 for).
+//! methods, because a PostgreSQL statement never runs on a MySQL connection, and the
+//! supervisor reaches them through the write pool of PR T5, which hands each write op its
+//! dedicated `PgConn`.
 
 use std::borrow::Cow;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use mysql_async::{Conn, Value};
 use tokio_postgres::types::{private::BytesMut, Format, IsNull, ToSql, Type};
 use tokio_postgres::GenericClient;
@@ -33,9 +34,8 @@ mod connect;
 /// backend) and the DSN it came from.
 pub struct PgConn {
     pub(crate) client: tokio_postgres::Client,
-    /// Read once at connect; `pg_terminate_backend` (the zombie fence) uses it when PR T5
-    /// lands the pool that hands an op's id to the fence.
-    #[allow(dead_code)]
+    /// Read once at connect; the write pool (T5.1) hands it to `write_once` and
+    /// [`fence_and_wait`] terminates exactly this backend.
     pub(crate) pid: i32,
     pub(crate) dsn: String,
 }
@@ -73,8 +73,8 @@ impl PgConn {
 // The write statements (PR T4): the upsert, the unit filter, the diff read, the
 // write transaction and the swap. A PostgreSQL statement never runs on a MySQL
 // connection, so the `mysql_async::Conn`-typed arms of `crate::target` stay
-// unreachable and the real statements are `PgConn` methods; the pool that hands
-// a write its `PgConn` is PR T5 (the staging T3's DDL used the same way).
+// unreachable and the real statements are `PgConn` methods; the write pool (T5.1)
+// hands each write op its own dedicated `PgConn`.
 // ---------------------------------------------------------------------------
 
 /// `INSERT ... ON CONFLICT (<row key>) DO UPDATE` of `n` rows (T4.1), or the plain multi-row
@@ -462,10 +462,94 @@ pub(crate) async fn write_opts(
     unreachable!("the engine reads PostgreSQL WriteOpts from the PgConn")
 }
 
-/// `SELECT pg_terminate_backend($1)` on a fresh connection and the `pg_stat_activity` poll —
-/// PR T5.2 lands it. Unreachable today (the PostgreSQL pool is T5 too).
-pub(crate) async fn fence(_opts: &crate::target::Opts, _id: u32) -> Result<()> {
-    unreachable!("the PostgreSQL pool and fence land in PR T5")
+// ---------------------------------------------------------------------------
+// The write pool and the zombie fence (PR T5). The pool is thin (D10): the permits,
+// gauges and zombie list stay `Endpoint`'s (`src/supervisor.rs`); this connects one
+// dedicated backend per checked-out permit and holds nothing else.
+// ---------------------------------------------------------------------------
+
+/// The PostgreSQL write pool: every [`PgPool::conn`] is a fresh **dedicated** backend
+/// (so [`fence_and_wait`] terminates exactly the op it fences — one backend per in-flight
+/// write, as MySQL has one `Conn` per `Conn::new` in `kill_and_wait`). The limiter is the
+/// `Endpoint`'s own `Semaphore`, reused unchanged, so at most `max` backends exist at any
+/// moment; the pool itself holds no connection (the op's [`PgConn`] is the only owner, and
+/// dropping it ends the driver task and closes the backend — there is nothing idle to
+/// keep, unlike the MySQL pool). The session settings run at connect (T1.4,
+/// [`PgConn::connect`] — the analogue of the MySQL pool's `.setup(setup)`).
+pub(crate) struct PgPool {
+    dsn: String,
+    lock_wait_s: u64,
+}
+
+impl PgPool {
+    pub(crate) fn new(dsn: String, lock_wait_s: u64) -> Arc<PgPool> {
+        Arc::new(PgPool { dsn, lock_wait_s })
+    }
+
+    /// One dedicated backend for a write op; the caller fences it with its `pid` and
+    /// drops it when the op is done. `Endpoint::conn` wraps this in
+    /// [`CONNECT_TIMEOUT`](crate::supervisor::CONNECT_TIMEOUT), as it wraps `get_conn`.
+    pub(crate) async fn conn(&self) -> Result<PgConn> {
+        PgConn::connect(
+            &self.dsn,
+            self.lock_wait_s,
+            crate::supervisor::CONNECT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Closes the pool's backends: the pool holds none (a dedicated backend lives exactly
+    /// as long as the op that owns it, and every op has finished before the engine
+    /// disconnects — invariant I1), so this is the "all of them, which is none" close.
+    pub(crate) fn disconnect(&self) {}
+}
+
+/// The two statements [`fence_and_wait`] sends, as constants so `fence_statement_forms`
+/// pins their shape.
+const TERMINATE_SQL: &str = "SELECT pg_terminate_backend($1)";
+const LISTED_SQL: &str = "SELECT 1 FROM pg_stat_activity WHERE pid = $1";
+
+/// The zombie fence (T5.2), the shape of `mysql::kill_and_wait`: terminate on a **fresh**
+/// connection (the fenced op may still sit in its own statement), then poll
+/// `pg_stat_activity` until the backend is gone — same `FENCE_WAIT` bound, same
+/// "still listed" error shape, so `settle_zombies` and `write_once`'s `lost && began` rule
+/// work unchanged. `id` is the op's [`PgConn::pid`]: with one dedicated backend per write
+/// (D10) this kills exactly the fenced op.
+pub(crate) async fn fence_and_wait(opts: &crate::target::Opts, id: u32) -> Result<()> {
+    let crate::target::Opts::Postgres(dsn) = opts else {
+        unreachable!("internal: the PostgreSQL fence with a MySQL DSN")
+    };
+    let fut = async {
+        // The two statements take no locks, so this connection needs no session settings
+        // beyond what connect applies — `kill_and_wait`'s bare `Conn::new`, the PG form.
+        let c = PgConn::connect(dsn, 0, crate::supervisor::CONNECT_TIMEOUT).await?;
+        let pid = id as i32;
+        // false (not an error) when the backend is already gone.
+        c.client
+            .execute(TERMINATE_SQL, &[&pid])
+            .await
+            .with_context(|| format!("terminating target backend {id}"))?;
+        let deadline = tokio::time::Instant::now() + crate::supervisor::FENCE_WAIT;
+        loop {
+            let rows = c.client.query(LISTED_SQL, &[&pid]).await?;
+            if rows.is_empty() {
+                return Ok(()); // dropping `c` ends the driver task, closing the connection
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "connection {} still listed {:?} after pg_terminate_backend",
+                    id,
+                    crate::supervisor::FENCE_WAIT
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    let bound = crate::supervisor::FENCE_WAIT + crate::supervisor::CONNECT_TIMEOUT;
+    match tokio::time::timeout(bound, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::Error::new(crate::supervisor::Timeout(bound))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,8 +951,8 @@ impl PgConn {
     /// The current rows of the units in `chunk` (all rows when `None`), for a diff (T4.4). Every
     /// column is fetched as `col::text`, the form [`cell_value`] decodes, so the read needs no
     /// `with-*` type feature either. Not `layout.read_list()` / `normalize`: those are the MySQL
-    /// family's SQL (`UNIX_TIMESTAMP`, `src/mv.rs:269-282`).
-    #[allow(dead_code)] // as above
+    /// family's SQL (`UNIX_TIMESTAMP`, `src/mv.rs:269-282`). Called by `supervisor::write_once`
+    /// on the op's [`PgConn`] from the write pool (T5.1).
     pub(crate) async fn read_old(
         &self,
         schema: &str,
@@ -925,8 +1009,9 @@ impl PgConn {
     /// DELETEs by row key, then the INSERTs, then the commit — the shape of
     /// `crate::mv::write_tx_mysql`, whose `start_transaction` (`src/mv.rs:1746`) this is the
     /// analogue of. No `@lv_tz` session dance (§0.10): the session is UTC from connect (T1.4).
-    /// `began` is set where `write_diff` sets it, before the transaction is opened.
-    #[allow(dead_code, clippy::too_many_arguments)] // as above
+    /// `began` is set where `write_diff` sets it, before the transaction is opened. Called by
+    /// `supervisor::write_once` on the op's own [`PgConn`] from the write pool (T5.1).
+    #[allow(clippy::too_many_arguments)] // mirrors write_tx_mysql
     pub(crate) async fn write_tx(
         &mut self,
         schema: &str,
@@ -2210,6 +2295,28 @@ mod tests {
                 Value::Bytes(b"7".to_vec()),
                 Value::Bytes(b"2020-01-02 03:04:05.000006".to_vec())
             ]
+        );
+    }
+
+    #[test]
+    fn fence_statement_forms() {
+        // T5.2: the fence sends the MySQL pair in PG dress — terminate on a fresh
+        // connection, then poll `pg_stat_activity` until the backend is gone, with the
+        // same "still listed" error shape as `kill_and_wait` so `settle_zombies` and the
+        // `lost && began` rule read it unchanged.
+        assert_eq!(super::TERMINATE_SQL, "SELECT pg_terminate_backend($1)");
+        assert_eq!(
+            super::LISTED_SQL,
+            "SELECT 1 FROM pg_stat_activity WHERE pid = $1"
+        );
+        let msg = format!(
+            "connection {} still listed {:?} after pg_terminate_backend",
+            4242,
+            crate::supervisor::FENCE_WAIT
+        );
+        assert_eq!(
+            msg,
+            "connection 4242 still listed 5s after pg_terminate_backend"
         );
     }
 }

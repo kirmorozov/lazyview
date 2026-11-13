@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Value};
+use mysql_async::{Conn, Opts, OptsBuilder, PoolConstraints, PoolOpts, Value};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
@@ -69,7 +69,10 @@ impl std::fmt::Display for Timeout {
 impl std::error::Error for Timeout {}
 
 /// Errors that mean the server is overloaded or unreachable rather than that the statement is
-/// wrong (§4.2): retried with backoff, and never a reason to rebuild a view.
+/// wrong (§4.2): retried with backoff, and never a reason to rebuild a view. The PostgreSQL
+/// family never classifies here (T5.3): it has no "too many connections" class (the write pool
+/// bounds its own backends, D10), and a server-side kill surfaces as a lost connection
+/// ([`is_conn_lost`]). MySQL's classification is untouched.
 pub fn is_overload(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         c.is::<Timeout>()
@@ -91,7 +94,9 @@ pub fn is_overload(e: &anyhow::Error) -> bool {
 }
 
 /// A connection-class failure: the connection is unusable (and a transaction it began may or
-/// may not have committed).
+/// may not have committed). The PostgreSQL arm (T5.3) is lost-connection when the backend is
+/// closed or the failure is an IO one — `tokio_postgres::Error::is_closed()`, and its IO kind
+/// (no public `is_io()` in tokio-postgres 0.7) reaches the chain as the `std::io::Error` cause.
 fn is_conn_lost(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         matches!(
@@ -103,7 +108,10 @@ fn is_conn_lost(e: &anyhow::Error) -> bool {
         ) || matches!(
             c.downcast_ref::<mysql_async::Error>(),
             Some(mysql_async::Error::Server(s)) if s.code == 2006 || s.code == 2013
-        )
+        ) || c
+            .downcast_ref::<tokio_postgres::Error>()
+            .is_some_and(|e| e.is_closed())
+            || c.downcast_ref::<std::io::Error>().is_some()
     })
 }
 
@@ -116,6 +124,23 @@ fn backoff(attempt: u32) -> Duration {
         .unwrap_or(0);
     // 0.5 .. 1.5
     base.mul_f64(0.5 + f64::from(nanos % 1000) / 1000.0)
+}
+
+/// The connections behind an [`Endpoint`], one variant per family: `conn()` and
+/// `disconnect()` match on it (once per call, never per row).
+enum Pool {
+    Mysql(mysql_async::Pool),
+    /// The thin dedicated-backend pool of PR T5.1 (`target::postgres::PgPool`, D10).
+    Postgres(Arc<crate::target::postgres::PgPool>),
+}
+
+/// One connection a write op runs on: the statement arms of `write_once` and the id its
+/// fence must kill (`conn.id()` for MySQL, `PgConn::pid` for PostgreSQL) come from the
+/// same match, over there.
+enum WriteConn {
+    Mysql(Conn),
+    /// The dedicated backend of the thin pool (T5.1): dropped when the op is done.
+    Postgres(crate::target::postgres::PgConn),
 }
 
 /// One connection pool with a fixed number of permits (the pool size).
@@ -168,17 +193,24 @@ impl Endpoint {
             .with_reset_connection(false)
             .with_inactive_connection_ttl(INACTIVE_TTL)
             .with_ttl_check_interval(Duration::from_secs(5));
-        let setup = crate::target::session_setup(kind, sql_mode, lock_wait_s);
-        // The PostgreSQL write pool (its own dedicated backends, D10) is PR T5: the engine
-        // rejects a PostgreSQL target before pooling it (its writes are T4).
-        let crate::target::Opts::Mysql(o) = opts else {
-            unreachable!("PostgreSQL target pools land in PR T5")
+        let pool = match (kind, opts) {
+            (crate::target::Kind::Mysql, crate::target::Opts::Mysql(o)) => {
+                Pool::Mysql(mysql_async::Pool::new(
+                    OptsBuilder::from_opts(o.clone())
+                        .pool_opts(pool_opts)
+                        .setup(crate::target::session_setup(kind, sql_mode, lock_wait_s)),
+                ))
+            }
+            (crate::target::Kind::Postgres, crate::target::Opts::Postgres(dsn)) => {
+                // The PostgreSQL write pool (its own dedicated backends, D10): the session
+                // setup runs at connect (T1.4), the analogue of `.setup(..)` above.
+                Pool::Postgres(crate::target::postgres::PgPool::new(
+                    dsn.clone(),
+                    lock_wait_s,
+                ))
+            }
+            _ => unreachable!("internal: target family and parsed DSN disagree"),
         };
-        let pool = Pool::new(
-            OptsBuilder::from_opts(o.clone())
-                .pool_opts(pool_opts)
-                .setup(setup),
-        );
         let gauges = Arc::new(PoolGauges::new(metric_kind, name));
         Metrics::set(&gauges.max, max as u64);
         Metrics::set_f64(&gauges.limit, max as f64);
@@ -212,11 +244,22 @@ impl Endpoint {
         }
     }
 
-    async fn conn(&self) -> Result<Conn> {
-        match tokio::time::timeout(CONNECT_TIMEOUT, self.pool.get_conn()).await {
-            Ok(r) => r.with_context(|| format!("connecting to {}", self.name)),
-            Err(_) => Err(anyhow::Error::new(Timeout(CONNECT_TIMEOUT))
-                .context(format!("connecting to {}", self.name))),
+    async fn conn(&self) -> Result<WriteConn> {
+        match &self.pool {
+            Pool::Mysql(p) => match tokio::time::timeout(CONNECT_TIMEOUT, p.get_conn()).await {
+                Ok(r) => r
+                    .with_context(|| format!("connecting to {}", self.name))
+                    .map(WriteConn::Mysql),
+                Err(_) => Err(anyhow::Error::new(Timeout(CONNECT_TIMEOUT))
+                    .context(format!("connecting to {}", self.name))),
+            },
+            Pool::Postgres(p) => match tokio::time::timeout(CONNECT_TIMEOUT, p.conn()).await {
+                Ok(r) => r
+                    .with_context(|| format!("connecting to {}", self.name))
+                    .map(WriteConn::Postgres),
+                Err(_) => Err(anyhow::Error::new(Timeout(CONNECT_TIMEOUT))
+                    .context(format!("connecting to {}", self.name))),
+            },
         }
     }
 
@@ -256,7 +299,12 @@ impl Endpoint {
     }
 
     pub async fn disconnect(&self) {
-        let _ = self.pool.clone().disconnect().await;
+        match &self.pool {
+            Pool::Mysql(p) => {
+                let _ = p.clone().disconnect().await;
+            }
+            Pool::Postgres(p) => p.disconnect(),
+        }
     }
 }
 
@@ -610,7 +658,10 @@ fn next_chunk(cursors: &mut Vec<(Option<Vec<usize>>, ChunkCursor)>, n: usize) ->
 async fn chunk_op(run: Arc<Run>, chunk: Option<UnitChunk>, permit: Permit) -> Result<()> {
     let job = &run.job;
     let rows = retrying(&run.metrics, "reading the sources", || async {
-        let mut c = run.read.conn().await?;
+        // The read pool is a source, and a source is always the MySQL family (§0.2).
+        let WriteConn::Mysql(mut c) = run.read.conn().await? else {
+            unreachable!("internal: a read pool built for another family")
+        };
         match tokio::time::timeout(
             job.timeout,
             mv::read_source(
@@ -700,44 +751,94 @@ async fn write_once(
 ) -> Result<Applied> {
     let job = &run.job;
     target.endpoint.settle_zombies().await?;
-    let mut conn = target.endpoint.conn().await?;
-    let id = conn.id();
     let began = AtomicBool::new(false);
-    let r = tokio::time::timeout(job.timeout, async {
-        let old = mv::read_old(
-            &mut conn,
-            &target.schema,
-            &job.table,
-            &job.layout,
-            // The caller passes the family explicitly until PR T4 supplies the real one.
-            crate::target::Kind::Mysql,
-            chunk.as_ref(),
-            &run.metrics,
-        )
-        .await?;
-        let d = diff(run, old, prepared).await?;
-        mv::write_diff(
-            &mut conn,
-            &target.schema,
-            &job.table,
-            &job.layout,
-            &d,
-            &target.write,
-            &run.metrics,
-            &began,
-        )
-        .await
-    })
-    .await;
+    // The one match (T5.2): it picks the statement arm and the id the fence must kill
+    // (`conn.id()` for MySQL, `PgConn::pid` for PostgreSQL).
+    match target.endpoint.conn().await? {
+        WriteConn::Mysql(mut conn) => {
+            let id = conn.id();
+            let r = tokio::time::timeout(job.timeout, async {
+                let old = mv::read_old(
+                    &mut conn,
+                    &target.schema,
+                    &job.table,
+                    &job.layout,
+                    // This op's family; the PostgreSQL op reads on its own PgConn below.
+                    crate::target::Kind::Mysql,
+                    chunk.as_ref(),
+                    &run.metrics,
+                )
+                .await?;
+                let d = diff(run, old, prepared).await?;
+                mv::write_diff(
+                    &mut conn,
+                    &target.schema,
+                    &job.table,
+                    &job.layout,
+                    &d,
+                    &target.write,
+                    &run.metrics,
+                    &began,
+                )
+                .await
+            })
+            .await;
+            fenced(run, target, id, &began, r, conn).await
+        }
+        WriteConn::Postgres(mut conn) => {
+            // Same timeout, same `lost && began` rule, same fence (T5.2 dispatches it to
+            // `postgres::fence_and_wait`, which terminates exactly this op's dedicated
+            // backend, D10); the statements are the `PgConn` methods T4 staged for this.
+            let id = conn.pid as u32;
+            let r = tokio::time::timeout(job.timeout, async {
+                let old = conn
+                    .read_old(
+                        &target.schema,
+                        &job.table,
+                        &job.layout,
+                        chunk.as_ref(),
+                        &run.metrics,
+                    )
+                    .await?;
+                let d = diff(run, old, prepared).await?;
+                conn.write_tx(
+                    &target.schema,
+                    &job.table,
+                    &job.layout,
+                    &d,
+                    &target.write,
+                    &run.metrics,
+                    &began,
+                )
+                .await
+            })
+            .await;
+            fenced(run, target, id, &began, r, conn).await
+        }
+    }
+}
+
+/// The shared tail of one write op: the timeout's `Err` becomes [`Timeout`], then §4.3 —
+/// a write that lost its connection or timed out after its transaction began may still
+/// commit, so the connection is dropped and the backend `id` fenced before the error
+/// surfaces (`settle_zombies` then blocks further writes until the fence completes).
+async fn fenced<T>(
+    run: &Run,
+    target: &TargetJob,
+    id: u32,
+    began: &AtomicBool,
+    r: std::result::Result<anyhow::Result<Applied>, tokio::time::error::Elapsed>,
+    conn: T,
+) -> Result<Applied> {
+    drop(conn);
     let r = match r {
         Ok(r) => r,
-        Err(_) => Err(anyhow::Error::new(Timeout(job.timeout))),
+        Err(_) => Err(anyhow::Error::new(Timeout(run.job.timeout))),
     };
     if let Err(e) = &r {
         let lost = e.chain().any(|c| c.is::<Timeout>()) || is_conn_lost(e);
         if lost && began.load(Ordering::SeqCst) {
             // The transaction may still commit, after a newer write: kill it first.
-            drop(conn);
             target.endpoint.fence(id, &run.metrics).await?;
         }
     }

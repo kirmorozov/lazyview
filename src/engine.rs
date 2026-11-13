@@ -5350,15 +5350,6 @@ impl Engine {
                 ));
                 continue;
             };
-            if target.kind == target::Kind::Postgres {
-                // The connect level is wired (PR T1); the writes land with T4 and the
-                // write pool (which would build a MySQL pool from these opts) with T5.
-                p.failed.push((
-                    t.clone(),
-                    anyhow!("PostgreSQL targets cannot be written yet (PRs T2-T5)"),
-                ));
-                continue;
-            }
             let (opts, schema) = (target.opts.clone(), target.schema.clone());
             let endpoint = self
                 .sup
