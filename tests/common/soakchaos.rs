@@ -448,15 +448,17 @@ pub async fn run_event(
                 ));
             }
         },
-        // The shapes of `tests/ddl.rs:74`–`82`. What no view reads must not rebuild anything, and
-        // the widened column is the documented rebuild of F5 ("source column type changed") —
-        // both asserted per view, not just reported (Q3): the affected set is derived from the
-        // plans themselves ([`plan_readers_of`], never from view names), a rebuild inside it is
-        // approved and reported, and a rebuild of any *other* incremental view is named and fails.
+        // The shapes of `tests/ddl.rs:74`–`82`. What no plan references must not rebuild anything,
+        // and the widened column is the documented rebuild of F5 ("source column type changed") —
+        // both asserted per view, not just reported (Q3): the approved set is what the engine
+        // itself would replan — table granularity, [`plan_stale_of`], never view names — a rebuild
+        // inside it is approved and reported, a rebuild of any *other* incremental view is named
+        // and fails, and whether the plan-`kind`-reading views rebuilt is reported, not assumed.
         Chaos::SourceDdl => {
             let before = eng.snapshot();
             // The expectation and the rebuild baseline, both before any DDL of this event.
-            let readers = plan_readers_of(run, "entities", "kind").await?;
+            let stale = plan_stale_of(run, &["items", "entities"]).await?;
+            let kind_reading = kind_readers_of(run).await?;
             let base: HashMap<String, u64> = view_rows(&eng, run.src, run.specs)
                 .await?
                 .into_iter()
@@ -496,7 +498,9 @@ pub async fn run_event(
             // scheduled checks hold them to), and fails any other incremental view that moved.
             let mut rebuilt: Vec<String> = Vec::new();
             let mut stray: Vec<String> = Vec::new();
-            let mut reading = 0usize;
+            let mut kind_total = 0usize;
+            let mut kind_built = 0usize;
+            let mut approved_rows = 0usize;
             for v in view_rows(&eng, run.src, run.specs).await? {
                 let key = format!("{}@{}", v.name, v.target);
                 if !v.mode.eq_ignore_ascii_case("incremental") {
@@ -505,15 +509,23 @@ pub async fn run_event(
                 let delta = v
                     .whole_view_refreshes
                     .saturating_sub(base.get(&key).copied().unwrap_or(0));
-                if readers.contains(&key) {
-                    reading += 1;
+                if kind_reading.contains(&key) {
+                    kind_total += 1;
+                }
+                if stale.contains(&key) {
+                    approved_rows += 1;
                     let e = run.approved.entry(key.clone()).or_default();
                     *e = (*e).max(v.whole_view_refreshes);
                     if delta > 0 {
                         rebuilt.push(format!("{key} +{delta}"));
+                        if kind_reading.contains(&key) {
+                            kind_built += 1;
+                        }
                     }
                 } else if delta > 0 {
-                    stray.push(format!("{key} +{delta} (its plan does not read `kind`)"));
+                    stray.push(format!(
+                        "{key} +{delta} (its plan references neither `items` nor `entities`)"
+                    ));
                 }
             }
             if !stray.is_empty() {
@@ -522,36 +534,37 @@ pub async fn run_event(
                     stray.join(", ")
                 ));
             }
-            // A rebuild of F5 can land while this event reads its numbers: give the plan-reading
-            // views one more settle before the check below holds the counters to the ledger.
+            // A rebuild of F5 can land while this event reads its numbers: give the plan-referencing
+            // views one more settle before the check below holds them to the ledger.
             tokio::time::sleep(Duration::from_secs(2)).await;
             for v in view_rows(&eng, run.src, run.specs).await? {
                 let key = format!("{}@{}", v.name, v.target);
-                if readers.contains(&key) && v.mode.eq_ignore_ascii_case("incremental") {
+                if stale.contains(&key) && v.mode.eq_ignore_ascii_case("incremental") {
                     let e = run.approved.entry(key.clone()).or_default();
                     *e = (*e).max(v.whole_view_refreshes);
                 }
             }
-            // Which happened is reported, not assumed: the documented rebuild, or no rebuild at
-            // all — the latter is legal (a widening the kept rows survive), and those views are
-            // then still held to their oracle by the exactness check that ends every event (§3),
-            // which sweeps the whole set including them.
-            let widened = if rebuilt.is_empty() {
+            // Which happened is reported, not assumed: the documented rebuild of the plans that
+            // read `kind`, or no rebuild at all — the latter is legal (a widening the kept rows
+            // survive), and those views are then still held to their oracle by the exactness check
+            // that ends every event (§3), which sweeps the whole set including them.
+            let widened = if kind_built == 0 {
                 format!(
-                    "widened `kind`: no rebuild among the {reading} plan-reading incremental \
-                     views (kept; the event's check swept their oracle — reason: source column \
-                     type changed (F5))"
+                    "widened `kind`: no rebuild among the {kind_total} plan-`kind`-reading \
+                     incremental views (kept; the event's check swept their oracle — reason: \
+                     source column type changed (F5))"
                 )
             } else {
                 format!(
-                    "widened `kind`: rebuilt {} (reason: source column type changed (F5), \
-                     approved)",
-                    rebuilt.join(", ")
+                    "widened `kind`: rebuilt {kind_built}/{kind_total} plan-`kind`-reading \
+                     incremental views (reason: source column type changed (F5), approved)"
                 )
             };
             extra.push(format!(
                 "adds/drops/ANALYZE: full_rebuilds {}, widened `kind` and the index: \
-                 full_rebuilds {} total, definition_reloads {}; {widened}",
+                 full_rebuilds {} total, definition_reloads {}; {widened}; approved {approved_rows} \
+                 incremental plans referencing `items`/`entities` (table granularity, \
+                 `on_tables_changed`)",
                 counter(&after_quiet, "full_rebuilds"),
                 counter(&all, "full_rebuilds"),
                 d.definition_reloads,
@@ -614,26 +627,10 @@ pub async fn run_event(
 // The event helpers
 // ---------------------------------------------------------------------------------------------
 
-/// The `view@target` keys of the views whose *plan* reads column `col` of `table` — derived from
-/// the engine's own records, never from view names: `_lazyview_state.access` holds the plan's
-/// EXPLAIN body (`src/meta.rs:308`), whose lines `src/access.rs:776` writes as
-/// `occ <alias> <schema>.<table> read (0, 3, …)` with the 0-based column ordinals the plan may
-/// read (`*` for every column, `src/analyze/routes.rs:434`); the ordinal of the column comes
-/// from `information_schema`. The set is what the engine itself believes reads the column — a
-/// superset by design — which is exactly the set an F5 rebuild is confined to (Q3).
-async fn plan_readers_of(run: &ChaosRun<'_>, table: &str, col: &str) -> Result<HashSet<String>> {
+/// The `(name, target, access)` rows of `_lazyview_state` — the engine's own records
+/// (`src/meta.rs:308`), never view-name patterns.
+async fn state_rows(run: &ChaosRun<'_>) -> Result<Vec<(String, String, String)>> {
     let mut c = run.src.conn().await?;
-    let ordinal = scalar_i64(
-        &mut c,
-        &format!(
-            "SELECT ORDINAL_POSITION - 1 FROM information_schema.COLUMNS \
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} AND COLUMN_NAME = {}",
-            q(table),
-            q(col)
-        ),
-    )
-    .await
-    .with_context(|| format!("column `{table}`.`{col}` has no ordinal: the schema changed"))?;
     let state = rows(
         &mut c,
         "SELECT CAST(name AS CHAR), CAST(target AS CHAR), COALESCE(CAST(access AS CHAR), '') \
@@ -642,21 +639,96 @@ async fn plan_readers_of(run: &ChaosRun<'_>, table: &str, col: &str) -> Result<H
     .await?;
     c.disconnect().await.ok();
     let names: Vec<&str> = run.specs.iter().map(|s| s.name.as_str()).collect();
-    let mut out = HashSet::new();
-    for r in state {
-        let (Some(name), Some(target), Some(access)) = (r[0].clone(), r[1].clone(), r[2].clone())
-        else {
-            continue;
-        };
-        if names.contains(&name.as_str()) && reads_column(&access, table, ordinal) {
-            out.insert(format!("{name}@{target}"));
-        }
-    }
+    Ok(state
+        .into_iter()
+        .filter_map(|r| match (r[0].clone(), r[1].clone(), r[2].clone()) {
+            (Some(name), Some(target), Some(access)) if names.contains(&name.as_str()) => {
+                Some((name, target, access))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// The tables one `access` text's plan mentions: the `<table>` of every
+/// `occ <alias> <schema>.<table> read <list>` line (`src/access.rs:776`), read lists ignored.
+fn occ_tables(access: &str) -> HashSet<String> {
+    access
+        .lines()
+        .filter_map(|l| l.strip_prefix("occ "))
+        .filter_map(|r| r.split_whitespace().nth(1))
+        .map(|tref| tref.rsplit_once('.').map_or(tref, |(_, t)| t).to_string())
+        .collect()
+}
+
+/// The `view@target` keys of the views the DDL of the `SourceDdl` event may rebuild (Q3). The
+/// engine decides this at table granularity, not column: `on_tables_changed`
+/// (`src/engine.rs:3670`) replans every slot whose plan mentions a changed table
+/// (`p.tables.iter().any(hit)`, `src/engine.rs:3696`) — whatever the read lists — and rebuilds
+/// without freezing when a chained view's parent table was swapped. So the expected set is the
+/// fixpoint: the views whose plan references one of `seeds`, plus the views whose plan
+/// references an affected view's own table (chains), closed under that rule. A whole-view
+/// refresh of an incremental view outside it is a named failure; inside it the event approves
+/// the refresh into the ledger.
+async fn plan_stale_of(run: &ChaosRun<'_>, seeds: &[&str]) -> Result<HashSet<String>> {
+    let state = state_rows(run).await?;
+    let refs: Vec<(String, String, HashSet<String>)> = state
+        .iter()
+        .map(|(name, target, access)| {
+            (format!("{name}@{target}"), name.clone(), occ_tables(access))
+        })
+        .collect();
+    let mut stale: HashSet<String> = refs
+        .iter()
+        .filter(|(_, _, tabs)| tabs.iter().any(|t| seeds.contains(&t.as_str())))
+        .map(|(key, _, _)| key.clone())
+        .collect();
     ensure!(
-        !out.is_empty(),
-        "no view's plan reads `{table}`.`{col}`: the access records or the neutral set changed"
+        !stale.is_empty(),
+        "no view's plan references {}: the access records or the schema changed",
+        seeds.join("/")
     );
-    Ok(out)
+    // Chains: a view whose plan references an affected view's table is affected too.
+    loop {
+        let stale_names: HashSet<&str> = stale
+            .iter()
+            .filter_map(|k| refs.iter().find(|(key, _, _)| key == k))
+            .map(|(_, name, _)| name.as_str())
+            .collect();
+        let grown: Vec<String> = refs
+            .iter()
+            .filter(|(key, _, tabs)| {
+                !stale.contains(key) && tabs.iter().any(|t| stale_names.contains(t.as_str()))
+            })
+            .map(|(key, _, _)| key.clone())
+            .collect();
+        if grown.is_empty() {
+            return Ok(stale);
+        }
+        stale.extend(grown);
+    }
+}
+
+/// The `view@target` keys of the views whose *plan* reads column `kind` of `entities`, for the
+/// event's report (the documented F5 rebuild, reported not assumed): the `occ` read lists carry
+/// the 0-based column ordinals the plan may read (`*` for every column, `src/access.rs:766`),
+/// the column's ordinal comes from `information_schema`.
+async fn kind_readers_of(run: &ChaosRun<'_>) -> Result<HashSet<String>> {
+    let mut c = run.src.conn().await?;
+    let ordinal = scalar_i64(
+        &mut c,
+        "SELECT ORDINAL_POSITION - 1 FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'entities' AND COLUMN_NAME = 'kind'",
+    )
+    .await
+    .context("`entities`.`kind` has no ordinal: the schema changed")?;
+    c.disconnect().await.ok();
+    let state = state_rows(run).await?;
+    Ok(state
+        .iter()
+        .filter(|(_, _, access)| reads_column(access, "entities", ordinal))
+        .map(|(name, target, _)| format!("{name}@{target}"))
+        .collect())
 }
 
 /// Whether one `access` text reads the column at 0-based `ordinal` of `table`: any `occ` line for
