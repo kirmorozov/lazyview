@@ -710,8 +710,10 @@ async fn delete_keys<C: Queryable>(
     Ok(())
 }
 
+/// One target of a build: its connection by family (the `target::Conn` enum, no trait
+/// object; T6), so one build fills MySQL and PostgreSQL shadows side by side from one read.
 pub struct BuildTarget<'a> {
-    pub conn: &'a mut Conn,
+    pub conn: &'a mut crate::target::Conn,
     pub schema: String,
     pub write: WriteOpts,
 }
@@ -731,9 +733,13 @@ pub async fn fill(
     // Read in pieces of a batch; each target splits them by its own limits.
     let per = rows_per_insert(layout, batch_rows);
     if layout.epoch_timestamps() {
-        // The build's own connections: they only insert from here on.
+        // The build's own connections: they only insert from here on. A PostgreSQL session
+        // needs no UTC block: its connect-time `session_setup` (T1.4) already pins
+        // `TimeZone='UTC'`, so the MySQL session dance is skipped for it (T4.7).
         for t in targets.iter_mut() {
-            t.conn.query_drop(format!("SET {UTC_SESSION}")).await?;
+            if let crate::target::Conn::Mysql(c) = &mut t.conn {
+                c.query_drop(format!("SET {UTC_SESSION}")).await?;
+            }
         }
     }
     let mut res = src.exec_iter(sql, ()).await?;
@@ -749,10 +755,20 @@ pub async fn fill(
         }
         if buf.len() >= per || (done && !buf.is_empty()) {
             for t in targets.iter_mut() {
-                insert_rows(
-                    t.conn, &t.schema, &shadow, layout, &buf, &t.write, false, metrics,
-                )
-                .await?;
+                // Plain INSERTs into the shadow, in the target's own dialect (T4.7): MySQL's
+                // `insert_rows` or the same statement bound by `PgConn::insert_rows` (T4.1).
+                match &mut t.conn {
+                    crate::target::Conn::Mysql(c) => {
+                        insert_rows(
+                            c, &t.schema, &shadow, layout, &buf, &t.write, false, metrics,
+                        )
+                        .await?
+                    }
+                    crate::target::Conn::Postgres(c) => {
+                        c.insert_rows(&t.schema, &shadow, layout, &buf, &t.write, false, metrics)
+                            .await?
+                    }
+                }
             }
             total += buf.len() as u64;
             buf.clear();

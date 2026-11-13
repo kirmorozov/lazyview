@@ -115,6 +115,27 @@ impl Conn {
         }
     }
 
+    /// The build path's ownership check `table_kind`, dispatched by this connection's family
+    /// (T6): the build code holds a `Conn`, so it never names a family below this point.
+    pub(crate) async fn table_kind(&mut self, schema: &str, name: &str) -> Result<Option<String>> {
+        match self {
+            Conn::Mysql(c) => mysql::table_kind(c, schema, name).await,
+            Conn::Postgres(c) => c.table_kind(schema, name).await,
+        }
+    }
+
+    /// The build path's ownership marker read (see [`marker`]), dispatched by family (T6).
+    pub(crate) async fn table_marker(
+        &mut self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<String>> {
+        match self {
+            Conn::Mysql(c) => mysql::table_marker(c, schema, name).await,
+            Conn::Postgres(c) => c.table_marker(schema, name).await,
+        }
+    }
+
     /// Closes the connection (the PostgreSQL driver task ends with it).
     pub(crate) async fn disconnect(self) -> Result<()> {
         match self {
@@ -344,33 +365,33 @@ pub(crate) async fn table_marker(
     }
 }
 
-/// Creates the shadow table of `name` with the ownership marker as its comment.
+/// Creates the shadow table of `name` with the ownership marker as its comment. One dispatch
+/// per build (T6): the connection's variant and `kind` must agree, as in [`Kind::connect`].
 pub(crate) async fn create_shadow_marked(
-    conn: &mut mysql_async::Conn,
+    conn: &mut Conn,
     kind: Kind,
     schema: &str,
     name: &str,
     layout: &Layout,
     marker: &str,
 ) -> Result<String> {
-    match kind {
-        Kind::Mysql => mysql::create_shadow_marked(conn, schema, name, layout, marker).await,
-        Kind::Postgres => unreachable!(
-            "the PostgreSQL DDL runs on the target's own connection (PgConn::create_shadow); the engine rejects a PostgreSQL build until T4"
-        ),
+    match (conn, kind) {
+        (Conn::Mysql(c), Kind::Mysql) => {
+            mysql::create_shadow_marked(c, schema, name, layout, marker).await
+        }
+        (Conn::Postgres(c), Kind::Postgres) => c.create_shadow(schema, name, layout, marker).await,
+        _ => bail!("internal: target connection and family disagree"),
     }
 }
 
 /// Atomically replaces `name` with its shadow table (or renames the shadow when `name` is new).
-pub(crate) async fn swap(
-    conn: &mut mysql_async::Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-) -> Result<()> {
-    match kind {
-        Kind::Mysql => mysql::swap(conn, schema, name).await,
-        Kind::Postgres => postgres::swap(conn, schema, name).await,
+/// One dispatch per swap (T6): the PostgreSQL arm is `PgConn::swap`, the transactional block
+/// of T4.6, on the target's own connection.
+pub(crate) async fn swap(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -> Result<()> {
+    match (conn, kind) {
+        (Conn::Mysql(c), Kind::Mysql) => mysql::swap(c, schema, name).await,
+        (Conn::Postgres(c), Kind::Postgres) => c.swap(schema, name).await,
+        _ => bail!("internal: target connection and family disagree"),
     }
 }
 

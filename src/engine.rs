@@ -4654,7 +4654,7 @@ impl Engine {
             if !live_has && !self.owned.contains_key(&(n.name.clone(), t.clone())) {
                 let marker = target::marker(&n.name, self.slots[i].def_id);
                 let exists = match self.target_conn(&t).await {
-                    Ok(c) => foreign_table(c, kind, &ts, &n.name, &marker).await,
+                    Ok(c) => foreign_table(c, &ts, &n.name, &marker).await,
                     Err(_) => false,
                 };
                 if exists {
@@ -4671,17 +4671,12 @@ impl Engine {
             }
             let timeout = self.cfg.target_timeout;
             let r = match self.target_conn(&t).await {
-                Ok(c) => match c.mysql() {
-                    Err(e) => Err(e),
-                    Ok(c) => {
-                        match tokio::time::timeout(timeout, target::swap(c, kind, &ts, &n.name))
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => Err(anyhow!("timed out after {timeout:?}")),
-                        }
+                Ok(c) => {
+                    match tokio::time::timeout(timeout, target::swap(c, kind, &ts, &n.name)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow!("timed out after {timeout:?}")),
                     }
-                },
+                }
                 Err(e) => Err(e),
             };
             match r {
@@ -6054,7 +6049,7 @@ async fn swap_task(
                 Err(_) => bail!("connecting to target {t}: timed out"),
             };
             if let Some(marker) = &check {
-                if foreign_table(&mut c, kind, &schema, &name, marker).await {
+                if foreign_table(&mut c, &schema, &name, marker).await {
                     let _ = c.disconnect().await;
                     bail!("a table `{name}` appeared during the build");
                 }
@@ -6062,7 +6057,7 @@ async fn swap_task(
             // A reader holding the old table's metadata lock: wait for it a while.
             let mut attempts = 0;
             let r = loop {
-                match target::swap(c.mysql()?, kind, &schema, &name).await {
+                match target::swap(&mut c, kind, &schema, &name).await {
                     Err(e) if server_code(&e) == Some(1205) && attempts < 12 => {
                         attempts += 1;
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -6093,28 +6088,9 @@ async fn swap_task(
 
 /// Whether a table `name` exists that lazyview did not create for this view (`marker`, see
 /// [`target::marker`]): a swap must never replace it.
-async fn foreign_table(
-    c: &mut target::Conn,
-    kind: target::Kind,
-    schema: &str,
-    name: &str,
-    marker: &str,
-) -> bool {
-    let Ok(c) = c.mysql() else {
-        // A PostgreSQL target is never built before T3 (see `prepare_target`).
-        return false;
-    };
-    target::table_kind(c, kind, schema, name)
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-        && target::table_marker(c, kind, schema, name)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(marker)
+async fn foreign_table(c: &mut target::Conn, schema: &str, name: &str, marker: &str) -> bool {
+    c.table_kind(schema, name).await.ok().flatten().is_some()
+        && c.table_marker(schema, name).await.ok().flatten().as_deref() != Some(marker)
 }
 
 /// Connects to a build target, runs its ownership checks and creates the shadow table.
@@ -6125,10 +6101,6 @@ async fn prepare_target(
     (batch_rows, batch_bytes): (usize, usize),
 ) -> Result<(target::Conn, mv::WriteOpts)> {
     let (t, ts) = (&spec.target, &spec.schema);
-    if spec.kind == target::Kind::Postgres {
-        // Its DDL, swap and writes land in T3/T4: refuse before connecting.
-        bail!("PostgreSQL targets cannot be built yet (PRs T2-T5)");
-    }
     let mut c = match tokio::time::timeout(
         TARGET_CONNECT_TIMEOUT * 3,
         connect_target(&spec.opts, spec.kind, crate::config::DEFAULT_LOCK_WAIT_S),
@@ -6138,24 +6110,24 @@ async fn prepare_target(
         Ok(r) => r.with_context(|| format!("connecting to target {t}"))?,
         Err(_) => bail!("connecting to target {t}: timed out"),
     };
-    let w = target::write_opts(c.mysql()?, spec.kind, batch_rows, batch_bytes)
-        .await
-        .with_context(|| format!("target {t}"))?;
+    // The batch limits come from the family's own connection (engine.rs:2232's pattern): the
+    // MySQL `max_packet/2` cap or PostgreSQL's rows-and-bytes-only batching (T1.5).
+    let w = match &mut c {
+        target::Conn::Mysql(mc) => target::write_opts(mc, spec.kind, batch_rows, batch_bytes).await,
+        target::Conn::Postgres(pc) => pc.write_opts(spec.kind, batch_rows, batch_bytes).await,
+    }
+    .with_context(|| format!("target {t}"))?;
     let ours = |m: Option<String>| m.as_deref() == Some(spec.marker.as_str());
     if spec.check_side {
         for side in [target::shadow_name(name), target::old_name(name)] {
-            if target::table_kind(c.mysql()?, spec.kind, ts, &side)
-                .await?
-                .is_some()
-                && !ours(target::table_marker(c.mysql()?, spec.kind, ts, &side).await?)
-            {
+            if c.table_kind(ts, &side).await?.is_some() && !ours(c.table_marker(ts, &side).await?) {
                 bail!("refusing to build `{name}`: table `{ts}`.`{side}` on target {t} exists and was not created by lazyview for this view");
             }
         }
     }
     if spec.check_table {
-        if let Some(k) = target::table_kind(c.mysql()?, spec.kind, ts, name).await? {
-            if !ours(target::table_marker(c.mysql()?, spec.kind, ts, name).await?) {
+        if let Some(k) = c.table_kind(ts, name).await? {
+            if !ours(c.table_marker(ts, name).await?) {
                 bail!(
                     "refusing to replace existing {} `{ts}`.`{name}` on target {t} that lazyview does not manage",
                     k.to_lowercase()
@@ -6163,7 +6135,7 @@ async fn prepare_target(
             }
         }
     }
-    target::create_shadow_marked(c.mysql()?, spec.kind, ts, name, layout, &spec.marker)
+    target::create_shadow_marked(&mut c, spec.kind, ts, name, layout, &spec.marker)
         .await
         .with_context(|| format!("creating the shadow table on target {t}"))?;
     Ok((c, w))
@@ -6233,7 +6205,7 @@ async fn build_task(
             let mut bt: Vec<BuildTarget> = Vec::new();
             for (c, s, w) in conns.iter_mut() {
                 bt.push(BuildTarget {
-                    conn: c.mysql()?,
+                    conn: c,
                     schema: s.clone(),
                     write: *w,
                 });
@@ -6252,11 +6224,11 @@ async fn build_task(
             if !swap {
                 break;
             }
-            if spec.check_table && foreign_table(c, spec.kind, ts, &name, &spec.marker).await {
+            if spec.check_table && foreign_table(c, ts, &name, &spec.marker).await {
                 debug!(view = %name, target = %spec.target, "swap left to the engine: a table appeared during the build");
                 continue;
             }
-            match target::swap(c.mysql()?, spec.kind, ts, &name).await {
+            match target::swap(c, spec.kind, ts, &name).await {
                 Ok(()) => swapped.push(spec.target.clone()),
                 Err(e) => {
                     debug!(view = %name, target = %spec.target, "swap left to the engine: {e:#}")

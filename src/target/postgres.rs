@@ -413,12 +413,6 @@ fn index_renames(schema: &str, name: &str, found: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The transactional swap of `crate::target::swap`'s PostgreSQL arm: it runs on the target's own
-/// connection ([`PgConn::swap`]), never on a MySQL one.
-pub(crate) async fn swap(_conn: &mut Conn, _schema: &str, _name: &str) -> Result<()> {
-    unreachable!("the PostgreSQL swap runs on the target's own connection (PgConn::swap)")
-}
-
 /// `DROP TABLE IF EXISTS` of `crate::target::drop_table`'s PostgreSQL arm, on the target's own
 /// connection ([`PgConn::drop_table`]).
 pub(crate) async fn drop_table(_conn: &mut Conn, _schema: &str, _name: &str) -> Result<()> {
@@ -780,7 +774,7 @@ pub(crate) fn layout_matches(layout: &Layout, existing: &[(String, String)]) -> 
 impl PgConn {
     /// `BASE TABLE` / `VIEW` / `MATERIALIZED VIEW` / None from `relkind` (T3.3): `pg_catalog`
     /// only, never a name pattern (H3). A partitioned table (`p`) is a base table to lazyview.
-    #[allow(dead_code)] // T4 wires the PostgreSQL build path; these are proven against a server
+    /// Reached through `target::Conn::table_kind` (the build's ownership checks, T6).
     pub(crate) async fn table_kind(&self, schema: &str, name: &str) -> Result<Option<String>> {
         let row = self
             .client
@@ -804,7 +798,7 @@ impl PgConn {
 
     /// Visible and hidden columns as `(name, format_type)`, in order: the strings [`pg_type`]
     /// renders for the source types, so [`layout_matches`] compares them verbatim (T3.3).
-    #[allow(dead_code)] // as above
+    #[allow(dead_code)] // the engine's resume/verify reads are the MySQL-typed dispatch; T6's build path reads only [`table_kind`] / [`table_marker`]
     pub(crate) async fn table_columns(
         &self,
         schema: &str,
@@ -867,7 +861,7 @@ impl PgConn {
 
     /// The ownership marker (see [`crate::target::marker`]) of an existing table, if its
     /// description is one: [`create_table_sql`] stores it with `COMMENT ON TABLE` (T3.3).
-    #[allow(dead_code)] // as above
+    /// Reached through `target::Conn::table_marker` (T6).
     pub(crate) async fn table_marker(&self, schema: &str, name: &str) -> Result<Option<String>> {
         let row = self
             .client
@@ -888,7 +882,7 @@ impl PgConn {
     /// and returns its name (T3.4): the whole batch of [`create_table_sql`] - table, indexes,
     /// marker - as one simple query. There is no second attempt with the target's collations:
     /// PostgreSQL has no unknown-collation failure, so that branch stays in `target/mysql.rs`.
-    #[allow(dead_code)] // as above
+    /// Reached through `target::create_shadow_marked` (the build, T6).
     pub(crate) async fn create_shadow(
         &self,
         schema: &str,
@@ -909,8 +903,9 @@ impl PgConn {
 
     /// The multi-row `INSERT`s / upserts of `rows` into `table` (T4.1): the same `batches` helper,
     /// the same `MAX_PARAMS` cap and the same metrics as `crate::mv::insert_rows`, one statement
-    /// per batch, every value rendered by [`param_text`] for its target column (T2).
-    #[allow(dead_code, clippy::too_many_arguments)] // PR T5's write pool hands the write path a `PgConn` (as T3's DDL waited for T4)
+    /// per batch, every value rendered by [`param_text`] for its target column (T2). Reached
+    /// through `crate::mv::fill` (the build's plain INSERTs, T6) and PR T5's write pool (upserts).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn insert_rows(
         &self,
         schema: &str,
@@ -1061,8 +1056,8 @@ impl PgConn {
     /// The transactional swap (T4.6): the shadow becomes `name` and its indexes take the base
     /// table's names, in one `simple_query`. Both edge cases of the MySQL swap are here: a shadow
     /// that is already gone is `Ok(())` (an interrupted build, nothing to do), and a live table
-    /// that does not exist yet is a plain rename.
-    #[allow(dead_code)] // as above
+    /// that does not exist yet is a plain rename. Reached through `target::swap` (the end of a
+    /// build, T6) and the engine's deferred swap.
     pub(crate) async fn swap(&self, schema: &str, name: &str) -> Result<()> {
         let shadow = shadow_name(name);
         if self.table_kind(schema, &shadow).await?.is_none() {

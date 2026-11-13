@@ -323,3 +323,193 @@ fn targets_one_target_down() {
         Ok(())
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// PostgreSQL target (PR T6): the first build of one view onto a `postgres://` target.
+// ---------------------------------------------------------------------------------------------
+
+use mysql_async::prelude::Queryable as _;
+use mysql_async::{Row, Value};
+
+/// Runs `stmts` on the PostgreSQL at `dsn` and, when `select` is given, fetches its rows as
+/// text (every column cast to `::text` by the caller, the T2 text forms). The driver task is
+/// joined when the client drops, so no backend outlives the call.
+async fn pg_exec(dsn: &str, stmts: &[&str], select: Option<&str>) -> Result<Vec<Vec<String>>> {
+    let (client, conn) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .with_context(|| format!("connecting to {dsn}"))?;
+    let driver = tokio::spawn(conn);
+    let r = async {
+        for s in stmts {
+            client
+                .batch_execute(s)
+                .await
+                .with_context(|| format!("PostgreSQL statement `{s}`"))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let mut out = Vec::new();
+    if r.is_ok() {
+        if let Some(q) = select {
+            let rows = client
+                .query(q, &[])
+                .await
+                .with_context(|| format!("PostgreSQL query `{q}`"))?;
+            for row in rows {
+                out.push(
+                    (0..row.len())
+                        .map(|i| row.get::<_, Option<String>>(i).unwrap_or_default())
+                        .collect(),
+                );
+            }
+        }
+    }
+    drop(client);
+    let _ = driver.await;
+    r?;
+    Ok(out)
+}
+
+/// The first build of a view onto a PostgreSQL target (T6): engine on a MySQL source, one
+/// neutral view (`links` over `entities`/`items`) targeted at a `postgres://` DSN, the build's
+/// rows compared with the source query. The throwaway database/schema is `lvsrc_t6_<flavor>`
+/// (created here, dropped at the end). Runs only when a PostgreSQL is published:
+/// `LAZYVIEW_T6_PG_DSN` (or C1's `LAZYVIEW_TEST_PG_DSNS`, first entry); otherwise it prints a
+/// SKIP line, so CI without a PostgreSQL server is unaffected.
+#[test]
+fn targets_pg_first_build() {
+    let base = std::env::var("LAZYVIEW_T6_PG_DSN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("LAZYVIEW_TEST_PG_DSNS")
+                .ok()
+                .and_then(|l| {
+                    l.split(',').next().map(|e| {
+                        e.split_once('=')
+                            .map_or_else(|| e.to_string(), |(_, d)| d.to_string())
+                    })
+                })
+                .filter(|s| !s.trim().is_empty())
+        });
+    let Some(base) = base else {
+        println!("SKIP targets_pg_first_build: no PostgreSQL DSN (LAZYVIEW_T6_PG_DSN / LAZYVIEW_TEST_PG_DSNS)");
+        return;
+    };
+    scenario("tg_pg_build", move |ctx| {
+        let base = base.clone();
+        async move {
+            let src = ctx.new_db("tg_pg_src").await?;
+            let schema = format!("lvsrc_t6_{}", src.flavor.replace('-', "_"));
+            let rest = base.split_once("://").map_or(base.as_str(), |(_, r)| r);
+            let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+            let admin_dsn = format!("postgres://{rest}"); // as given: its path is the admin database
+            let pg_dsn = match admin_dsn.rfind('/') {
+                Some(i) => format!("{}{schema}", &admin_dsn[..=i]),
+                None => bail!("the PostgreSQL DSN must name a database: {base}"),
+            };
+            // (re)create the throwaway database and its schema, the target's `schema_of` path.
+            pg_exec(
+                &admin_dsn,
+                &[
+                    &format!("DROP DATABASE IF EXISTS {schema} WITH (FORCE)"),
+                    &format!("CREATE DATABASE {schema}"),
+                ],
+                None,
+            )
+            .await?;
+            pg_exec(&pg_dsn, &[&format!("CREATE SCHEMA {schema}")], None).await?;
+            let mut c = src.conn().await?;
+            exec_all(
+            &mut c,
+            &[
+                "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL)",
+                "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL)",
+                "INSERT INTO entities VALUES (1,'alpha'),(2,'beta'),(3,'gamma')",
+                "INSERT INTO items VALUES (1,1,10.50),(2,1,20.25),(3,2,5.00),(4,3,7.75),(5,2,0.00)",
+            ],
+        )
+        .await?;
+            ensure_lazyview_table(&mut c).await?;
+            let spec = ViewSpec::new(
+            "links",
+            Kind::Incremental,
+            "SELECT e.id AS id, e.name AS name, i.amount AS amount FROM entities e JOIN items i ON i.entity_id = e.id",
+        )
+        .with_targets("pg");
+            add_views(&mut c, std::slice::from_ref(&spec)).await?;
+            let env = target_env(&[("pg", &pg_dsn)]);
+            let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+            wait_ready(&mut c, &mut eng, &["links"], t_ready()).await?;
+            // The source's own answer to the view's SELECT (raw text per cell).
+            let mut want: Vec<Vec<String>> = Vec::new();
+            let mut it = c
+            .query_iter(
+                "SELECT e.id, e.name, i.amount FROM entities e JOIN items i ON i.entity_id = e.id",
+            )
+            .await?;
+            let rows: Vec<Row> = it.collect().await?;
+            drop(it);
+            for row in rows {
+                want.push(
+                    (0..row.len())
+                        .map(|i| match row.get::<Value, _>(i) {
+                            Some(Value::Int(v)) => v.to_string(),
+                            Some(Value::Bytes(b)) => String::from_utf8_lossy(&b).into_owned(),
+                            Some(Value::NULL) | None => String::new(),
+                            Some(other) => format!("{other:?}"),
+                        })
+                        .collect(),
+                );
+            }
+            // The table the build created on the target, as text, with its ownership marker.
+            let got = pg_exec(
+            &pg_dsn,
+            &[],
+            Some(&format!(
+                "SELECT id::text, name::text, amount::text FROM \"{schema}\".links ORDER BY id, amount"
+            )),
+        )
+        .await?;
+            let marker = pg_exec(
+                &pg_dsn,
+                &[],
+                Some(&format!(
+                    "SELECT obj_description(c.oid)::text FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = '{schema}' AND c.relname = 'links'"
+                )),
+            )
+            .await?;
+            eng.stop().await?;
+            pg_exec(
+                &admin_dsn,
+                &[&format!("DROP DATABASE IF EXISTS {schema} WITH (FORCE)")],
+                None,
+            )
+            .await?;
+            want.sort();
+            let mut got = got;
+            got.sort();
+            ctx.log(format!(
+                "PostgreSQL build: {} rows in `{schema}`.links, marker {:?}",
+                got.len(),
+                marker.first().and_then(|m| m.first())
+            ));
+            ensure!(
+                marker
+                    .first()
+                    .and_then(|m| m.first())
+                    .is_some_and(|m| m.starts_with("lazyview:v1")),
+                "the built table carries no lazyview ownership marker: {marker:?}"
+            );
+            ensure!(
+                got == want,
+                "rows differ:\nsource: {want:?}\ntarget: {got:?}"
+            );
+            Ok(())
+        }
+    });
+}
