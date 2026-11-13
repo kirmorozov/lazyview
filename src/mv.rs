@@ -685,14 +685,12 @@ async fn delete_keys<C: Queryable>(
     schema: &str,
     table: &str,
     layout: &Layout,
+    key: &[usize],
     keys: &[Key],
     kind: Kind,
     w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<()> {
-    let Some(key) = layout.row_key_for(kind) else {
-        bail!("internal: rows of `{table}` have no row key");
-    };
     let cols: Vec<String> = key.iter().map(|&p| q(&layout.cols[p].name)).collect();
     let kinds = layout.write_kinds(key);
     let per = MAX_PARAMS / cols.len().max(1);
@@ -950,12 +948,6 @@ pub struct Diff {
     pub compared: usize,
 }
 
-impl Diff {
-    pub fn is_empty(&self) -> bool {
-        self.changed.is_empty()
-    }
-}
-
 /// Current MV rows of the units in `chunk` (all rows when `None`).
 pub async fn read_old(
     conn: &mut Conn,
@@ -1179,11 +1171,17 @@ async fn write_tx_mysql(
         Metrics::add(&metrics.mv_queries, 1);
     }
     if !d.by_unit {
+        // `by_unit` is false only when the layout has a row key (see [`diff`]), so the caller
+        // holds it already: `delete_keys` does not re-check it.
+        let key = layout
+            .row_key_for(w.kind)
+            .expect("internal: rows of a by-row diff have no row key");
         delete_keys(
             &mut tx,
             schema,
             table,
             layout,
+            key,
             &d.delete_keys,
             w.kind,
             w,
@@ -1214,9 +1212,7 @@ pub async fn apply(
     w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<Applied> {
-    // `apply` runs on a MySQL connection (the PostgreSQL diff read is `PgConn::read_old`), so the
-    // family of this read is the MySQL one.
-    let old = read_old(conn, schema, table, layout, Kind::Mysql, chunk, metrics).await?;
+    let old = read_old(conn, schema, table, layout, w.kind, chunk, metrics).await?;
     let new = prepare(layout, new_rows.to_vec());
     let d = diff(layout, old, &new)
         .with_context(|| format!("comparing the rows of `{schema}`.`{table}`"))?;
@@ -1570,7 +1566,7 @@ mod tests {
             row(2, "[3.25]", "[1, 2]"),
         ];
         let d = diff(&l, stored.clone(), &prepare(&l, source.clone())).unwrap();
-        assert!(d.is_empty(), "rewrote equal units: {:?}", d.changed);
+        assert!(d.changed.is_empty(), "rewrote equal units: {:?}", d.changed);
         // A real change of one unit rewrites that unit only.
         let mut changed = source.clone();
         changed[1] = row(2, "[3.26]", "[1, 2]");
@@ -1833,7 +1829,7 @@ mod tests {
         };
         // Nothing changed: nothing written.
         let d = diff(&l, old.clone(), &prepare(&l, old.clone())).unwrap();
-        assert!(d.is_empty() && d.inserts.is_empty() && d.delete_keys.is_empty());
+        assert!(d.changed.is_empty() && d.inserts.is_empty() && d.delete_keys.is_empty());
         // One row of a 3-row unit changes: one upsert, no delete, unit counted once.
         let mut new = old.clone();
         new[1] = r(1, "B", Some(11));
