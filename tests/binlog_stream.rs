@@ -95,7 +95,11 @@ fn with_param(dsn: &str, p: &str) -> String {
 }
 
 async fn connect(dsn: &str) -> Result<Conn> {
-    let mut c = Conn::new(replica_opts(dsn)?).await.context("connect")?;
+    // The harness's connect classifier (transient retries only, auth fails at once); the
+    // replica session settings stay this file's own.
+    let mut c = common::connect_opts(replica_opts(dsn)?)
+        .await
+        .context("connect")?;
     c.query_drop("SET time_zone = '+00:00'").await?;
     Ok(c)
 }

@@ -1537,6 +1537,15 @@ impl Workload {
 // Execution
 // ---------------------------------------------------------------------------------------------
 
+/// The harness's one retry predicate: deadlock and lock-wait timeouts are retried, a duplicate
+/// key only for transactions that delete a row and re-create it by the same key (`duplicate_ok`,
+/// MySQL 26.x with DDL in the schema), and anything the product's classifier calls transient.
+pub fn txn_retryable(e: &anyhow::Error, duplicate_ok: bool) -> bool {
+    matches!(server_code(e), Some(1213 | 1205))
+        || (duplicate_ok && server_code(e) == Some(1062))
+        || super::is_transient(e)
+}
+
 /// Runs one transaction, retrying the whole transaction on deadlock / lock wait timeout, and on
 /// a duplicate key for transactions that delete a row and re-create it by the same primary key
 /// (`retry_duplicate`): MySQL 26.x checks and cascades foreign keys in the SQL layer
@@ -1564,9 +1573,7 @@ pub async fn run_txn(conn: &mut Conn, t: &Txn) -> Result<()> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let _ = conn.query_drop("ROLLBACK").await;
-                let code = server_code(&e);
-                let duplicate = t.retry_duplicate && code == Some(1062);
-                if (matches!(code, Some(1213) | Some(1205)) || duplicate) && attempt < 30 {
+                if txn_retryable(&e, t.retry_duplicate) && attempt < 30 {
                     tokio::time::sleep(Duration::from_millis(5 * attempt)).await;
                     continue;
                 }

@@ -116,17 +116,27 @@ pub struct Table {
 
 pub async fn fetch(conn: &mut Conn, sql: &str) -> Result<Table> {
     let rs = super::renamed_sql(conn, sql)?;
-    let mut res = conn
-        .query_iter(rs.sql.as_str())
+    // A read: transient failures are retried here (the oracle read is an idempotent SELECT);
+    // DDL still re-runs only through fetch_oracle's recreate-once path.
+    let q = rs.sql.clone();
+    let (names, raw): (Vec<String>, Vec<Row>) =
+        super::retry_transient("fetch", std::time::Duration::from_secs(4), conn, |c| {
+            let q = q.clone();
+            Box::pin(async move {
+                let mut res = c.query_iter(q.as_str()).await?;
+                let names: Vec<String> = res
+                    .columns_ref()
+                    .iter()
+                    .map(|col| col.name_str().to_string())
+                    .collect();
+                let raw: Vec<Row> = res.collect().await?;
+                drop(res);
+                Ok((names, raw))
+            })
+        })
         .await
         .with_context(|| format!("SQL failed: {}", rs.shown(sql)))?;
-    let columns: Vec<String> = res
-        .columns_ref()
-        .iter()
-        .map(|c| rs.column(c.name_str().to_string()))
-        .collect();
-    let raw: Vec<Row> = res.collect().await?;
-    drop(res);
+    let columns: Vec<String> = names.into_iter().map(|c| rs.column(c)).collect();
     let rows = raw
         .into_iter()
         .map(|r| {

@@ -186,7 +186,13 @@ impl Engine {
                     return Ok(());
                 }
             }
-            self.check_alive()?;
+            if let Err(e) = self.check_alive() {
+                // A transient probe error spends budget, it does not abort the wait; a dead
+                // engine (the only non-transient error here) still fails at once.
+                if !super::is_transient(&e) || Instant::now() > deadline {
+                    return Err(e);
+                }
+            }
             if Instant::now() > deadline {
                 bail!(
                     "engine {} not caught up within {timeout:?}: applied={:?} target={target} metrics={:?} — log {}",

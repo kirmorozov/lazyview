@@ -146,7 +146,7 @@ async fn writer(db: Db, mut seed: u64, stop: Arc<AtomicBool>, txns: Arc<AtomicU6
                 txns.fetch_add(1, Ordering::Relaxed);
             }
             // Writers deadlock with each other now and then: drop the transaction.
-            Err(e) if retryable(&e) => {
+            Err(e) if common::workload::txn_retryable(&e, false) => {
                 exec(&mut c, "ROLLBACK").await.ok();
             }
             Err(e) => return Err(e),
@@ -154,12 +154,6 @@ async fn writer(db: Db, mut seed: u64, stop: Arc<AtomicBool>, txns: Arc<AtomicU6
     }
     c.disconnect().await.ok();
     Ok(())
-}
-
-/// A deadlock or lock wait timeout of the test's own transactions (they compete with each
-/// other and with the engine's writes).
-fn retryable(e: &anyhow::Error) -> bool {
-    matches!(server_code(e), Some(1213 | 1205))
 }
 
 /// Holds row locks on view rows of `db` for 300 ms every 700 ms (the engine's writes to them
@@ -186,7 +180,7 @@ async fn locker(db: Db, stop: Arc<AtomicBool>) -> Result<u64> {
         match r {
             Ok(()) => n += 1,
             // The engine's write won the deadlock: InnoDB rolled this one back.
-            Err(e) if retryable(&e) => {
+            Err(e) if common::workload::txn_retryable(&e, false) => {
                 exec(&mut c, "ROLLBACK").await.ok();
             }
             Err(e) => return Err(e),

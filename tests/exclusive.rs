@@ -49,7 +49,7 @@ async fn restart(db: &Db, container: &str) -> Result<()> {
     );
     let t = Instant::now();
     loop {
-        if let Ok(mut c) = db.conn().await {
+        if let Ok(mut c) = connect_once(&db.dsn).await {
             if c.query_drop("SELECT 1").await.is_ok() {
                 return Ok(());
             }

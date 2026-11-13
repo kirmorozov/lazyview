@@ -279,17 +279,36 @@ pub fn dsn_with_db(dsn: &str, db: &str) -> String {
 
 pub async fn connect(dsn: &str) -> Result<Conn> {
     let opts = Opts::from_url(dsn).with_context(|| format!("bad DSN {dsn}"))?;
-    let mut last = None;
+    connect_opts(opts)
+        .await
+        .with_context(|| format!("connect {}", redact(dsn)))
+}
+
+/// One attempt, no retries: for callers that poll on their own cadence (a restart wait) and
+/// must not have each poll amplified by an inner retry loop.
+pub async fn connect_once(dsn: &str) -> Result<Conn> {
+    let opts = Opts::from_url(dsn).with_context(|| format!("bad DSN {dsn}"))?;
+    Conn::new(opts).await.map_err(anyhow::Error::from)
+}
+
+/// Five attempts, but only while the error is transient ([`is_transient`]): an auth or bad-DSN
+/// error fails at once instead of burning ~3 s on retries that cannot fix themselves.
+pub async fn connect_opts(opts: Opts) -> Result<Conn> {
+    let mut last: Option<anyhow::Error> = None;
     for attempt in 0..5 {
         match Conn::new(opts.clone()).await {
             Ok(c) => return Ok(c),
             Err(e) => {
+                let e = anyhow::Error::from(e);
+                if !is_transient(&e) {
+                    return Err(e);
+                }
                 last = Some(e);
                 tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
             }
         }
     }
-    Err(anyhow!(last.unwrap())).with_context(|| format!("connect {}", redact(dsn)))
+    Err(last.unwrap())
 }
 
 pub fn redact(dsn: &str) -> String {
@@ -325,10 +344,15 @@ pub async fn txn(conn: &mut Conn, stmts: &[String], rollback: bool) -> Result<()
 /// Rows as text (NULL → None); binary values are hex-escaped.
 pub async fn rows(conn: &mut Conn, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
     let r = renamed_sql(conn, sql)?;
-    let rows: Vec<Row> = conn
-        .query(r.sql.as_str())
-        .await
-        .with_context(|| format!("SQL failed: {}", r.shown(sql)))?;
+    let q = r.sql.clone();
+    // A read: transient failures are retried here, so wait loops and assertions see a stable
+    // answer instead of a blip; single writes (exec) are never retried alone.
+    let rows: Vec<Row> = retry_transient("read", Duration::from_secs(4), conn, |c| {
+        let q = q.clone();
+        Box::pin(async move { Ok(c.query(q.as_str()).await?) })
+    })
+    .await
+    .with_context(|| format!("SQL failed: {}", r.shown(sql)))?;
     Ok(rows
         .into_iter()
         .map(|row| {
@@ -453,6 +477,43 @@ pub fn server_code(e: &anyhow::Error) -> Option<u16> {
         }
     }
     None
+}
+
+/// The harness's one transient check: the product's own list (`lazyview::binlog::is_transient`,
+/// R1's classifier), so harness and product cannot drift apart.
+pub fn is_transient(e: &anyhow::Error) -> bool {
+    lazyview::binlog::is_transient(e)
+}
+
+/// Runs `f` (an idempotent read, or a connect from fixed options) until it succeeds, its error
+/// is not transient, or `budget` is spent: 20 ms → 500 ms backoff with ±25 % jitter, at most
+/// 10 attempts (≈ 4 s). A failure that comes after retries names `label`; a single
+/// non-transient failure propagates exactly as before. `f` gets the connection on every attempt.
+pub async fn retry_transient<T>(
+    label: &str,
+    budget: Duration,
+    conn: &mut Conn,
+    mut f: impl FnMut(&mut Conn) -> std::pin::Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>,
+) -> Result<T> {
+    let deadline = Instant::now() + budget;
+    let mut delay = Duration::from_millis(20);
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match f(conn).await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_transient(&e) && attempts < 10 && Instant::now() < deadline => {
+                let pct: i64 = rand::rng().random_range(-25..=25);
+                let ms = (delay.as_millis() as i64 * (100 + pct) / 100).max(1) as u64;
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                delay = (delay * 2).min(Duration::from_millis(500));
+            }
+            Err(e) if attempts > 1 => {
+                return Err(e).context(format!("{label} (after {attempts} attempts)"))
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Quotes a string literal (backslash-escape mode, the server default).

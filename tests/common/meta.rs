@@ -133,7 +133,15 @@ async fn wait_ready_grace(
     let mut no_row_since: HashMap<String, Instant> = HashMap::new();
     loop {
         engine.check_alive()?;
-        let states = view_states(conn).await?;
+        let states = match view_states(conn).await {
+            Ok(s) => s,
+            // A transient read error spends budget, it does not abort the wait.
+            Err(e) if is_transient(&e) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let mut pending = Vec::new();
         // The engine is up and has made other views ready (any view, not only these).
         let any_ready = states.iter().any(|s| s.state == "ready");
@@ -215,7 +223,15 @@ pub async fn wait_rebuilt(
     let deadline = Instant::now() + timeout;
     loop {
         engine.check_alive()?;
-        let st = view_state(conn, name).await?;
+        let st = match view_state(conn, name).await {
+            Ok(s) => s,
+            // A transient read error spends budget, it does not abort the wait.
+            Err(e) if is_transient(&e) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if !st.is_empty()
             && st
                 .iter()
@@ -253,8 +269,16 @@ pub async fn wait_def_state(
     let deadline = Instant::now() + timeout;
     loop {
         engine.check_alive()?;
-        let rows: Vec<StateRow> = view_states(conn)
-            .await?
+        let states = match view_states(conn).await {
+            Ok(s) => s,
+            // A transient read error spends budget, it does not abort the wait.
+            Err(e) if is_transient(&e) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let rows: Vec<StateRow> = states
             .into_iter()
             .filter(|s| s.definition_id == Some(def_id))
             .collect();
@@ -279,11 +303,16 @@ pub async fn wait_state(
     let deadline = Instant::now() + timeout;
     loop {
         engine.check_alive()?;
-        if let Some(s) = view_state(conn, name)
-            .await?
-            .into_iter()
-            .find(|s| s.state == state)
-        {
+        let st = match view_state(conn, name).await {
+            Ok(s) => s,
+            // A transient read error spends budget, it does not abort the wait.
+            Err(e) if is_transient(&e) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(s) = st.into_iter().find(|s| s.state == state) {
             return Ok(s);
         }
         if Instant::now() > deadline {
