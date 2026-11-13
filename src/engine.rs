@@ -1355,12 +1355,12 @@ impl Engine {
             if t.0 == self.schema && t.1 == parsed.name {
                 // Named like a table it reads that lazyview did not build: that is a name clash
                 // (the documented refusal), not a view reading itself.
-                let marker = own_def.map(|id| mv::marker(&parsed.name, id));
+                let marker = own_def.map(|id| target::marker(&parsed.name, id));
                 let ours = self
                     .owned
                     .contains_key(&(parsed.name.clone(), SOURCE_TARGET.to_string()))
                     || (marker.is_some()
-                        && mv::table_marker(
+                        && target::table_marker(
                             &mut self.src,
                             target::Kind::Mysql,
                             &self.schema,
@@ -1369,7 +1369,7 @@ impl Engine {
                         .await?
                             == marker);
                 if !ours {
-                    if let Some(kind) = mv::table_kind(
+                    if let Some(kind) = target::table_kind(
                         &mut self.src,
                         target::Kind::Mysql,
                         &self.schema,
@@ -2131,12 +2131,12 @@ impl Engine {
                 .exec(
                     "SELECT CAST(TABLE_NAME AS CHAR) FROM information_schema.TABLES \
                      WHERE TABLE_SCHEMA = ? AND TABLE_COMMENT LIKE ?",
-                    (&self.schema, format!("{}%", mv::MARKER_PREFIX)),
+                    (&self.schema, format!("{}%", target::MARKER_PREFIX)),
                 )
                 .await
                 .unwrap_or_default();
             for table in marked {
-                let base = mv::base_name(&table).to_string();
+                let base = target::base_name(&table).to_string();
                 if used.contains(&(base, SOURCE_TARGET.to_string()))
                     || self
                         .owned
@@ -2146,7 +2146,8 @@ impl Engine {
                 }
                 info!(table = %table, "removing a table lazyview created for a definition that no longer exists");
                 if let Err(e) =
-                    mv::drop_table(&mut self.meta, target::Kind::Mysql, &self.schema, &table).await
+                    target::drop_table(&mut self.meta, target::Kind::Mysql, &self.schema, &table)
+                        .await
                 {
                     warn!("dropping {table}: {e:#}");
                 }
@@ -2228,7 +2229,9 @@ impl Engine {
             let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, async {
                 let mut c = connect_target(&target.opts, target.kind, self.cfg.lock_wait_s).await?;
                 let w = match &mut c {
-                    target::Conn::Mysql(c) => mv::write_opts(c, target.kind, rows, bytes).await?,
+                    target::Conn::Mysql(c) => {
+                        target::write_opts(c, target.kind, rows, bytes).await?
+                    }
                     target::Conn::Postgres(c) => c.write_opts(target.kind, rows, bytes).await?,
                 };
                 let mode = match &mut c {
@@ -2298,9 +2301,9 @@ impl Engine {
             // Columns as the layout's, and the unique index rows are upserted by (tables
             // built before upserts lack `_lv_row`: rebuilt once).
             let fits = match self.target_conn(&t).await {
-                Ok(conn) => match mv::table_columns(conn.mysql()?, kind, &ts, &name).await {
-                    Ok(c) if mv::layout_matches(kind, &layout, &c) => {
-                        mv::has_row_index(conn.mysql()?, kind, &ts, &name, &layout)
+                Ok(conn) => match target::table_columns(conn.mysql()?, kind, &ts, &name).await {
+                    Ok(c) if target::layout_matches(kind, &layout, &c) => {
+                        target::has_row_index(conn.mysql()?, kind, &ts, &name, &layout)
                             .await
                             .unwrap_or(false)
                     }
@@ -2369,7 +2372,7 @@ impl Engine {
         let kind = self.targets[t].kind;
         if let Ok(c) = self.target_conn(t).await {
             if let Ok(c) = c.mysql() {
-                let _ = mv::drop_table(c, kind, &ts, &mv::shadow_name(name)).await;
+                let _ = target::drop_table(c, kind, &ts, &target::shadow_name(name)).await;
             }
         }
     }
@@ -2424,7 +2427,7 @@ impl Engine {
                     opts: self.targets[t].opts.clone(),
                     kind: self.targets[t].kind,
                     schema: self.targets[t].schema.clone(),
-                    marker: mv::marker(&name, def_id),
+                    marker: target::marker(&name, def_id),
                     check_side: !routine
                         && !state
                             .get(&key)
@@ -2676,7 +2679,7 @@ impl Engine {
                 match self.target_conn(target).await {
                     Ok(c) => {
                         if let Ok(c) = c.mysql() {
-                            if let Err(e) = mv::drop_table(c, kind, &ts, name).await {
+                            if let Err(e) = target::drop_table(c, kind, &ts, name).await {
                                 warn!("dropping {name}@{target}: {e:#}");
                             }
                         }
@@ -3710,7 +3713,7 @@ impl Engine {
                 let upstream = tables.iter().all(|t| {
                     t.0 == self.schema
                         && self.slots.iter().any(|o| {
-                            o.def_id != s.def_id && Self::slot_uses(o, mv::base_name(&t.1))
+                            o.def_id != s.def_id && Self::slot_uses(o, target::base_name(&t.1))
                         })
                 });
                 todo.push((s.def_id, !upstream));
@@ -4553,7 +4556,7 @@ impl Engine {
             .as_ref()
             .map(|l| Arc::ptr_eq(&l.plan, &n.plan))
             .unwrap_or(false);
-        let shadow = mv::shadow_name(&n.name);
+        let shadow = target::shadow_name(&n.name);
         let mut dirty = n.dirty.take();
         let since = n.since.take();
         let full_again = matches!(n.plan.mode, Mode::Full(_)) && dirty.all;
@@ -4597,7 +4600,7 @@ impl Engine {
             // swap, so readers never see older data after it.
             let first = self.slots[i].live.is_none() && !n.partial;
             if (n.routine || first) && !n.swapping && !n.targets.is_empty() {
-                let marker = mv::marker(&n.name, self.slots[i].def_id);
+                let marker = target::marker(&n.name, self.slots[i].def_id);
                 let specs = n
                     .targets
                     .iter()
@@ -4649,7 +4652,7 @@ impl Engine {
                 .map(|l| l.name == n.name && l.targets.contains(&t))
                 .unwrap_or(false);
             if !live_has && !self.owned.contains_key(&(n.name.clone(), t.clone())) {
-                let marker = mv::marker(&n.name, self.slots[i].def_id);
+                let marker = target::marker(&n.name, self.slots[i].def_id);
                 let exists = match self.target_conn(&t).await {
                     Ok(c) => foreign_table(c, kind, &ts, &n.name, &marker).await,
                     Err(_) => false,
@@ -4671,7 +4674,9 @@ impl Engine {
                 Ok(c) => match c.mysql() {
                     Err(e) => Err(e),
                     Ok(c) => {
-                        match tokio::time::timeout(timeout, mv::swap(c, kind, &ts, &n.name)).await {
+                        match tokio::time::timeout(timeout, target::swap(c, kind, &ts, &n.name))
+                            .await
+                        {
                             Ok(r) => r,
                             Err(_) => Err(anyhow!("timed out after {timeout:?}")),
                         }
@@ -6066,7 +6071,7 @@ async fn swap_task(
             // A reader holding the old table's metadata lock: wait for it a while.
             let mut attempts = 0;
             let r = loop {
-                match mv::swap(c.mysql()?, kind, &schema, &name).await {
+                match target::swap(c.mysql()?, kind, &schema, &name).await {
                     Err(e) if server_code(&e) == Some(1205) && attempts < 12 => {
                         attempts += 1;
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -6096,7 +6101,7 @@ async fn swap_task(
 }
 
 /// Whether a table `name` exists that lazyview did not create for this view (`marker`, see
-/// [`mv::marker`]): a swap must never replace it.
+/// [`target::marker`]): a swap must never replace it.
 async fn foreign_table(
     c: &mut target::Conn,
     kind: target::Kind,
@@ -6108,12 +6113,12 @@ async fn foreign_table(
         // A PostgreSQL target is never built before T3 (see `prepare_target`).
         return false;
     };
-    mv::table_kind(c, kind, schema, name)
+    target::table_kind(c, kind, schema, name)
         .await
         .ok()
         .flatten()
         .is_some()
-        && mv::table_marker(c, kind, schema, name)
+        && target::table_marker(c, kind, schema, name)
             .await
             .ok()
             .flatten()
@@ -6142,24 +6147,24 @@ async fn prepare_target(
         Ok(r) => r.with_context(|| format!("connecting to target {t}"))?,
         Err(_) => bail!("connecting to target {t}: timed out"),
     };
-    let w = mv::write_opts(c.mysql()?, spec.kind, batch_rows, batch_bytes)
+    let w = target::write_opts(c.mysql()?, spec.kind, batch_rows, batch_bytes)
         .await
         .with_context(|| format!("target {t}"))?;
     let ours = |m: Option<String>| m.as_deref() == Some(spec.marker.as_str());
     if spec.check_side {
-        for side in [mv::shadow_name(name), mv::old_name(name)] {
-            if mv::table_kind(c.mysql()?, spec.kind, ts, &side)
+        for side in [target::shadow_name(name), target::old_name(name)] {
+            if target::table_kind(c.mysql()?, spec.kind, ts, &side)
                 .await?
                 .is_some()
-                && !ours(mv::table_marker(c.mysql()?, spec.kind, ts, &side).await?)
+                && !ours(target::table_marker(c.mysql()?, spec.kind, ts, &side).await?)
             {
                 bail!("refusing to build `{name}`: table `{ts}`.`{side}` on target {t} exists and was not created by lazyview for this view");
             }
         }
     }
     if spec.check_table {
-        if let Some(k) = mv::table_kind(c.mysql()?, spec.kind, ts, name).await? {
-            if !ours(mv::table_marker(c.mysql()?, spec.kind, ts, name).await?) {
+        if let Some(k) = target::table_kind(c.mysql()?, spec.kind, ts, name).await? {
+            if !ours(target::table_marker(c.mysql()?, spec.kind, ts, name).await?) {
                 bail!(
                     "refusing to replace existing {} `{ts}`.`{name}` on target {t} that lazyview does not manage",
                     k.to_lowercase()
@@ -6167,7 +6172,7 @@ async fn prepare_target(
             }
         }
     }
-    mv::create_shadow_marked(c.mysql()?, spec.kind, ts, name, layout, &spec.marker)
+    target::create_shadow_marked(c.mysql()?, spec.kind, ts, name, layout, &spec.marker)
         .await
         .with_context(|| format!("creating the shadow table on target {t}"))?;
     Ok((c, w))
@@ -6260,7 +6265,7 @@ async fn build_task(
                 debug!(view = %name, target = %spec.target, "swap left to the engine: a table appeared during the build");
                 continue;
             }
-            match mv::swap(c.mysql()?, spec.kind, ts, &name).await {
+            match target::swap(c.mysql()?, spec.kind, ts, &name).await {
                 Ok(()) => swapped.push(spec.target.clone()),
                 Err(e) => {
                     debug!(view = %name, target = %spec.target, "swap left to the engine: {e:#}")

@@ -35,7 +35,7 @@ fn reg_json_unit_filters_match_json_equal_groups() {
             l_j.unit_kinds()
         );
         let metrics = Metrics::default();
-        let w = mv::write_opts(
+        let w = lazyview::target::write_opts(
             &mut c,
             lazyview::target::Kind::Mysql,
             1000,
@@ -265,7 +265,7 @@ fn reg_json_unit_delete_with_epoch_timestamps() {
         let orc = "SELECT doc, MAX(ts) AS mx, COUNT(*) AS n FROM jt GROUP BY doc";
         let on = "o.doc <=> m.doc AND o.mx <=> m.mx";
         let metrics = Metrics::default();
-        let w = mv::write_opts(
+        let w = lazyview::target::write_opts(
             &mut c,
             lazyview::target::Kind::Mysql,
             1000,

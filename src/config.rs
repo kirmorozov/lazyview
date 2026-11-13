@@ -133,7 +133,7 @@ pub struct Config {
     pub test_fail_snapshot: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_LOCK_WAIT_S=<s>` (default 60): how long at most a session the
     /// engine opens waits for a table lock (`SET SESSION lock_wait_timeout`, the third statement
-    /// of `mv::session_setup`); a refresh blocked longer fails and is retried with backoff.
+    /// of `crate::target::source_session_setup`); a refresh blocked longer fails and is retried with backoff.
     pub lock_wait_s: u64,
     /// Background builds running at once (each holds 1 + targets connections).
     pub build_concurrency: usize,

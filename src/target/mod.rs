@@ -364,7 +364,8 @@ pub(crate) async fn init_session(
 
 /// [`WriteOpts`] of the server `conn` is connected to. One dispatch per connection setup.
 /// (The engine's PostgreSQL arm reads them from the [`postgres::PgConn`] directly.)
-pub(crate) async fn write_opts(
+/// `pub`: the integration tests build write options for a connection they open themselves.
+pub async fn write_opts(
     conn: &mut mysql_async::Conn,
     kind: Kind,
     batch_rows: usize,

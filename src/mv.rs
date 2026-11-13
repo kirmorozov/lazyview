@@ -17,8 +17,6 @@ use crate::datum::{Datum, Key};
 use crate::metrics::Metrics;
 use crate::target::Kind;
 
-pub use crate::target::{base_name, marker, old_name, shadow_name, MARKER_PREFIX};
-
 /// Maximum placeholders per statement (server limit is 65535). `Kind::Postgres` has a hard
 /// ceiling of 65535; this cap is below it for both families.
 pub(crate) const MAX_PARAMS: usize = 60_000;
@@ -93,7 +91,7 @@ impl Layout {
     }
 
     /// The table DDL of a fresh build for the target family `kind`, with an optional ownership
-    /// marker as the table comment (see [`marker`]). The family is the target's, never decided
+    /// marker as the table comment (see [`crate::target::marker`]). The family is the target's, never decided
     /// here: the engine passes its target's kind (S4's staged seam, closed by T3).
     pub fn create_sql_marked(
         &self,
@@ -390,17 +388,6 @@ fn civil_from_days(days: i64) -> (i64, u8, u8) {
     (y, m, d)
 }
 
-/// The ownership marker (see [`marker`]) of an existing table, if its comment is one
-/// (dispatched by target family, see [`crate::target`]).
-pub async fn table_marker(
-    conn: &mut Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-) -> Result<Option<String>> {
-    crate::target::table_marker(conn, kind, schema, name).await
-}
-
 /// Session settings for every connection the service opens (the target module renders them:
 /// [`crate::target::init_source_session`]).
 pub async fn init_session(conn: &mut Conn, lock_wait_s: u64) -> Result<()> {
@@ -565,68 +552,6 @@ fn layout_from(plan: &ViewPlan, cols: Vec<MvCol>) -> Result<Layout> {
     })
 }
 
-/// Whether `table` has the unique index its rows are upserted by (see
-/// [`Layout::row_key`]); true when the layout has none. Dispatched once per statement
-/// (see [`crate::target`]).
-pub async fn has_row_index(
-    conn: &mut Conn,
-    kind: Kind,
-    schema: &str,
-    table: &str,
-    layout: &Layout,
-) -> Result<bool> {
-    crate::target::has_row_index(conn, kind, schema, table, layout).await
-}
-
-/// `BASE TABLE` / `VIEW` / None.
-pub async fn table_kind(
-    conn: &mut Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-) -> Result<Option<String>> {
-    crate::target::table_kind(conn, kind, schema, name).await
-}
-
-/// Visible + invisible column names and types of an existing table, to validate a layout
-/// on resume.
-pub async fn table_columns(
-    conn: &mut Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-) -> Result<Vec<(String, String)>> {
-    crate::target::table_columns(conn, kind, schema, name).await
-}
-
-/// Whether an existing table's columns are the layout's.
-pub fn layout_matches(kind: Kind, layout: &Layout, existing: &[(String, String)]) -> bool {
-    crate::target::layout_matches(kind, layout, existing)
-}
-
-/// Creates the shadow table with an ownership marker (see [`marker`]) as the table
-/// comment.
-pub async fn create_shadow_marked(
-    conn: &mut Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-    layout: &Layout,
-    marker: &str,
-) -> Result<String> {
-    crate::target::create_shadow_marked(conn, kind, schema, name, layout, marker).await
-}
-
-/// Atomically replaces `name` with its shadow table (or renames the shadow when `name`
-/// is new).
-pub async fn swap(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -> Result<()> {
-    crate::target::swap(conn, kind, schema, name).await
-}
-
-pub async fn drop_table(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -> Result<()> {
-    crate::target::drop_table(conn, kind, schema, name).await
-}
-
 /// Session time zone in which TIMESTAMPs are written (see [`Layout::epoch_timestamps`]).
 pub(crate) use crate::target::UTC_SESSION;
 
@@ -674,16 +599,6 @@ impl WriteOpts {
     ) -> WriteOpts {
         crate::target::for_server(kind, version, max_packet, batch_rows, batch_bytes)
     }
-}
-
-/// [`WriteOpts`] for the server `conn` is connected to.
-pub async fn write_opts(
-    conn: &mut Conn,
-    kind: Kind,
-    batch_rows: usize,
-    batch_bytes: usize,
-) -> Result<WriteOpts> {
-    crate::target::write_opts(conn, kind, batch_rows, batch_bytes).await
 }
 
 /// Estimated bytes a value takes in a statement.
@@ -811,7 +726,7 @@ pub async fn fill(
     batch_rows: usize,
     metrics: &Metrics,
 ) -> Result<u64> {
-    let shadow = shadow_name(name);
+    let shadow = crate::target::shadow_name(name);
     let sql = layout.source_sql(plan, None);
     // Read in pieces of a batch; each target splits them by its own limits.
     let per = rows_per_insert(layout, batch_rows);
@@ -1989,47 +1904,6 @@ mod tests {
         let d = diff(&l3, old.clone(), &prepare(&l3, new)).unwrap();
         assert!(d.by_unit && d.delete_keys.is_empty());
         assert_eq!((d.inserts.len(), d.deleted_rows), (3, 3));
-    }
-
-    #[test]
-    fn markers_and_sql_modes() {
-        assert_eq!(marker("v", 7), "lazyview:v1 view=v def=7");
-        assert_eq!(marker("a b'c%", 1), "lazyview:v1 view=a%20b%27c%25 def=1");
-        let l = layout(vec![col("v", "int", "int", None)], 1, vec![], false);
-        assert!(l
-            .create_sql_marked(Kind::Mysql, "s", "t", Some("it's"))
-            .ends_with("DEFAULT CHARSET=utf8mb4 COMMENT='it''s'"));
-        assert_eq!(
-            permissive_sql_mode(
-                "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-            ),
-            "ONLY_FULL_GROUP_BY,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-        );
-        // Parser flags and the combination modes implying them go too (the server lists the
-        // members of a combination mode individually, so `ANSI` keeps `REAL_AS_FLOAT`).
-        assert_eq!(permissive_sql_mode("TRADITIONAL,ANSI_QUOTES"), "");
-        assert_eq!(
-            permissive_sql_mode(
-                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI,\
-                 NO_BACKSLASH_ESCAPES,HIGH_NOT_PRECEDENCE,NO_ENGINE_SUBSTITUTION"
-            ),
-            "REAL_AS_FLOAT,ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"
-        );
-    }
-
-    #[test]
-    fn session_setup_statements() {
-        assert_eq!(
-            session_setup("ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION", 60),
-            [
-                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
-                "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'".to_string(),
-                "SET SESSION lock_wait_timeout = 60".to_string(),
-            ]
-        );
-        // A quote cannot end the string literal early.
-        assert_eq!(session_setup("A'B", 2)[1], "SET SESSION sql_mode = 'AB'");
-        assert_eq!(session_setup("", 2)[2], "SET SESSION lock_wait_timeout = 2");
     }
 
     /// The DDL entry of a MySQL-family target: `Layout` renders nothing of its own, the family

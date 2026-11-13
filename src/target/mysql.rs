@@ -602,4 +602,77 @@ mod tests {
             mysql_async::Error::Io(mysql_async::IoError::Io(std::io::Error::other("net down")));
         assert!(!kill_is_gone(&io));
     }
+
+    fn col(name: &str, data_type: &str, column_type: &str) -> MvCol {
+        MvCol {
+            name: name.into(),
+            src_name: name.into(),
+            column_type: column_type.into(),
+            data_type: data_type.into(),
+            charset: None,
+            collation: None,
+            nullable: true,
+        }
+    }
+
+    fn layout(cols: Vec<MvCol>, n_visible: usize, unit_pos: Vec<usize>, primary: bool) -> Layout {
+        Layout {
+            hidden: (0..cols.len() - n_visible).collect(),
+            cols,
+            n_visible,
+            unit_pos,
+            primary,
+            lineage: Vec::new(),
+            epoch: Vec::new(),
+            identity: Vec::new(),
+            partial: Vec::new(),
+            key_budget: crate::target::MY_KEY_BYTES,
+        }
+    }
+
+    /// The ownership marker text, the quoting of the table comment and the SQL modes the
+    /// service drops when it reads a source (moved here with the items they test).
+    #[test]
+    fn markers_and_sql_modes() {
+        assert_eq!(crate::target::marker("v", 7), "lazyview:v1 view=v def=7");
+        assert_eq!(
+            crate::target::marker("a b'c%", 1),
+            "lazyview:v1 view=a%20b%27c%25 def=1"
+        );
+        let l = layout(vec![col("v", "int", "int")], 1, vec![], false);
+        assert!(create_sql_marked(&l, "s", "t", Some("it's"))
+            .ends_with("DEFAULT CHARSET=utf8mb4 COMMENT='it''s'"));
+        assert_eq!(
+            permissive_sql_mode(
+                "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+            ),
+            "ONLY_FULL_GROUP_BY,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+        );
+        // Parser flags and the combination modes implying them go too (the server lists the
+        // members of a combination mode individually, so `ANSI` keeps `REAL_AS_FLOAT`).
+        assert_eq!(permissive_sql_mode("TRADITIONAL,ANSI_QUOTES"), "");
+        assert_eq!(
+            permissive_sql_mode(
+                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI,\
+                 NO_BACKSLASH_ESCAPES,HIGH_NOT_PRECEDENCE,NO_ENGINE_SUBSTITUTION"
+            ),
+            "REAL_AS_FLOAT,ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"
+        );
+    }
+
+    /// The three statements a source session gets (moved here with the item it tests).
+    #[test]
+    fn session_setup_statements() {
+        assert_eq!(
+            session_setup("ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION", 60),
+            [
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'".to_string(),
+                "SET SESSION lock_wait_timeout = 60".to_string(),
+            ]
+        );
+        // A quote cannot end the string literal early.
+        assert_eq!(session_setup("A'B", 2)[1], "SET SESSION sql_mode = 'AB'");
+        assert_eq!(session_setup("", 2)[2], "SET SESSION lock_wait_timeout = 2");
+    }
 }
