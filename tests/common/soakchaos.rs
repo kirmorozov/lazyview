@@ -663,18 +663,25 @@ async fn plan_readers_of(run: &ChaosRun<'_>, table: &str, col: &str) -> Result<H
 /// the table whose read list is `*` (the whole table) or contains the ordinal.
 fn reads_column(access: &str, table: &str, ordinal: i64) -> bool {
     access.lines().any(|line| {
-        // `occ <alias> <schema>.<table> read <list> [filter …] -> <path>` (`src/access.rs:776`)
+        // `occ <alias> <schema>.<table> read <list> [filter …] -> <path>` (`src/access.rs:776`),
+        // the list `*` or `(n, n, …)` joined with ", " (`src/access.rs:766`) — with spaces, so
+        // one list spans several whitespace-separated tokens and is collected whole.
         let mut it = match line.strip_prefix("occ ") {
             Some(rest) => rest.split_whitespace(),
             None => return false,
         };
-        let (Some(_alias), Some(tref), Some("read"), Some(list)) =
-            (it.next(), it.next(), it.next(), it.next())
-        else {
+        let (Some(_alias), Some(tref), Some("read")) = (it.next(), it.next(), it.next()) else {
             return false;
         };
         if tref.rsplit_once('.').map_or(tref, |(_, t)| t) != table {
             return false;
+        }
+        let mut list = String::new();
+        for tok in it {
+            list.push_str(tok);
+            if list == "*" || list.ends_with(')') {
+                break;
+            }
         }
         list == "*"
             || list
@@ -842,5 +849,30 @@ async fn wait_server_up(db: &Db) -> Result<()> {
             "the source did not answer within 180 s of `docker start`"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reads_column;
+
+    // The lines are the engine's own shape (`src/access.rs:776`), including the ", "-joined
+    // read list that broke an earlier token-by-token parser, a `*`, and a filter whose
+    // `IN (…)` parens must not be mistaken for the read list.
+    const ACCESS: &str = "occ e lvt.entities read (0, 2) -> direct id = (0)\n\
+         occ i lvt.items read (1, 3, 4) -> direct id = (1)\n\
+         occ t lvt.tags read * -> untraced (`t` is a semi-join table)\n\
+         occ g lvt.groups read (0) filter g.col IN (3, 5) -> untraced\n\
+         occ e lvt.entities read () -> whole\n";
+
+    #[test]
+    fn reads_column_parses_the_engine_read_lists() {
+        assert!(reads_column(ACCESS, "entities", 0));
+        assert!(reads_column(ACCESS, "entities", 2)); // the second element of `(0, 2)`
+        assert!(!reads_column(ACCESS, "entities", 3)); // only in the items/groups filters
+        assert!(reads_column(ACCESS, "items", 4)); // last element of `(1, 3, 4)`
+        assert!(reads_column(ACCESS, "tags", 7)); // `*` reads every column
+        assert!(!reads_column(ACCESS, "groups", 3)); // `(0)` only; 3 is in the filter
+        assert!(!reads_column(ACCESS, "missing", 0));
     }
 }
