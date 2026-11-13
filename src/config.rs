@@ -48,8 +48,6 @@ pub struct SupervisorConfig {
     pub max_inflight_rows: usize,
     /// Diffs running off the async threads at once.
     pub cpu_workers: usize,
-    /// A view failing this long stops holding back the saved binlog position.
-    pub stale_after: Duration,
 }
 
 impl SupervisorConfig {
@@ -59,20 +57,6 @@ impl SupervisorConfig {
             .get(&target.to_ascii_lowercase())
             .copied()
             .unwrap_or(self.max_target)
-    }
-}
-
-impl Default for SupervisorConfig {
-    fn default() -> Self {
-        SupervisorConfig {
-            mode: SupervisorMode::Adaptive,
-            max_source: DEFAULT_MAX_SOURCE,
-            max_target: DEFAULT_MAX_TARGET,
-            max_target_override: BTreeMap::new(),
-            max_inflight_rows: 200_000,
-            cpu_workers: default_cpu_workers(),
-            stale_after: Duration::from_millis(300_000),
-        }
     }
 }
 
@@ -281,7 +265,6 @@ impl Config {
             max_inflight_rows: (num("LAZYVIEW_MAX_INFLIGHT_ROWS", 200_000)? as usize).max(1),
             cpu_workers: (num("LAZYVIEW_CPU_WORKERS", default_cpu_workers() as u64)? as usize)
                 .max(1),
-            stale_after: Duration::from_millis(num("LAZYVIEW_STALE_AFTER_MS", 300_000)?),
         };
         // `<marker>:<ms>` of the LAZYVIEW_TEST_*_DELAY hooks.
         let marker_delay = |k: &str| -> Result<Option<(String, Duration)>> {
@@ -397,9 +380,9 @@ fn finish_dsn(
     ca: Option<&str>,
 ) -> Result<String> {
     // The mariadb:// rewrite and the TLS parameter block below are MySQL-only: a PG DSN
-    // (targets only) goes to finish_pg_dsn, which maps the TLS modes and the CA file.
+    // (targets only) goes to finish_pg_dsn, which maps the TLS modes and the CA file; the DSN
+    // itself is validated once at the real boundary, target::opts.
     if allow_pg && dsn.starts_with("postgres") {
-        crate::target::Kind::from_dsn(dsn)?;
         return finish_pg_dsn(dsn, tls, prefix, ca);
     }
     let mut d = match dsn.strip_prefix("mariadb://") {
@@ -746,7 +729,6 @@ mod tests {
         assert_eq!((s.max_source, s.max_target), (4, 2));
         assert_eq!(s.max_inflight_rows, 200_000);
         assert!((1..=4).contains(&s.cpu_workers));
-        assert_eq!(s.stale_after, Duration::from_secs(300));
         assert_eq!(s.max_for_target("source"), 2);
         let c = cfg(&[
             ("LAZYVIEW_DSN", "mysql://a@b/c"),
@@ -759,7 +741,6 @@ mod tests {
             ("LAZYVIEW_TARGET_SOURCE_MAX_CONCURRENCY", "1"),
             ("LAZYVIEW_MAX_INFLIGHT_ROWS", "5000"),
             ("LAZYVIEW_CPU_WORKERS", "3"),
-            ("LAZYVIEW_STALE_AFTER_MS", "1000"),
         ])
         .unwrap();
         let s = &c.supervisor;
@@ -769,7 +750,6 @@ mod tests {
         assert_eq!(s.max_for_target("source"), 1);
         assert_eq!(s.max_for_target("other"), 6);
         assert_eq!((s.max_inflight_rows, s.cpu_workers), (5000, 3));
-        assert_eq!(s.stale_after, Duration::from_secs(1));
         let c = cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_SUPERVISOR", "off")]).unwrap();
         assert_eq!(c.supervisor.mode, SupervisorMode::Off);
         assert!(cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_SUPERVISOR", "fast")]).is_err());
