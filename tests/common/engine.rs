@@ -315,6 +315,54 @@ pub async fn http_get(addr: &str, path: &str) -> Result<(u16, String)> {
     Ok((r.status, r.body))
 }
 
+/// One HTTP request **with a JSON body** and the parsed answer, on the same one-shot connection as
+/// [`request`] (the shape chaos plan §2.1 asks for: `Host:`, `Content-Length`, `Connection: close`,
+/// `read_to_end` behind the 5 s timeouts). It does not call [`request`]: `request` sends no body,
+/// so a `POST` there would sit waiting for the bytes its own `Content-Length` promised. A
+/// body-less answer (the 204 of toxiproxy's `DELETE` and `POST /reset`) parses as
+/// [`serde_json::Value::Null`]. No new dependency: `serde_json` is already here for [`fetch_stats`].
+pub async fn http_json(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<(u16, serde_json::Value)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+        .await
+        .with_context(|| format!("{method} {addr}{path}: connect timeout"))?
+        .with_context(|| format!("{method} {addr}{path}: connect"))?;
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: \
+         application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::time::timeout(Duration::from_secs(5), s.write_all(req.as_bytes()))
+        .await
+        .with_context(|| format!("{method} {addr}{path}: write timeout"))?
+        .with_context(|| format!("{method} {addr}{path}: write"))?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+        .await
+        .with_context(|| format!("{method} {addr}{path}: read timeout"))?
+        .with_context(|| format!("{method} {addr}{path}: read"))?;
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let (head, answer) = text
+        .split_once("\r\n\r\n")
+        .with_context(|| format!("{method} {addr}{path}: bad HTTP response {text:?}"))?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u16>().ok())
+        .with_context(|| format!("{method} {addr}{path}: bad status line {head:?}"))?;
+    if answer.trim().is_empty() {
+        return Ok((status, serde_json::Value::Null));
+    }
+    let v = serde_json::from_str(answer.trim())
+        .with_context(|| format!("{method} {addr}{path}: status {status}, not JSON: {answer}"))?;
+    Ok((status, v))
+}
+
 /// `GET /stats` of an engine started with `LAZYVIEW_HEALTH_ADDR=addr`, as JSON.
 pub async fn fetch_stats(addr: &str) -> Result<serde_json::Value> {
     let (status, body) = http_get(addr, "/stats").await?;

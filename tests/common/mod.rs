@@ -15,6 +15,7 @@ pub mod rename;
 pub mod soakchaos;
 pub mod soakcheck;
 pub mod soakwork;
+pub mod toxi;
 pub mod typed;
 pub mod workload;
 
