@@ -172,6 +172,10 @@ fn pg_caps() -> SourceCaps {
         fresh_snapshot: false,
         json_cast: false,
         sql_generation_expressions: false,
+        // A PostgreSQL slot loses WAL past its retain window, so a lost resume point is an
+        // expected event here; `Config::on_missing_binlog` decides what it costs (unlike the
+        // placeholders above, this one reads from the source on the fail path).
+        cursor_purgeable: true,
     }
 }
 

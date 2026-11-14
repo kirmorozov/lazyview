@@ -36,6 +36,7 @@ use crate::metrics::Metrics;
 use crate::mv::{self, BuildTarget, Layout};
 use crate::plan_swap;
 use crate::source::SourceCaps;
+use crate::source::{self, Cursor};
 use crate::supervisor::{self, Supervisor};
 use crate::target;
 use mysql_async::binlog::row::BinlogRow;
@@ -553,8 +554,9 @@ type XaRow = (TableRef, Option<BinlogRow>, Option<BinlogRow>);
 
 /// An XA transaction read from the binlog; its rows are applied at XA COMMIT.
 struct XaTxn {
-    /// Position before it (replaying from there re-reads its rows).
-    start: Position,
+    /// The cursor before it (replaying from there re-reads its rows); `Cursor::is_some`
+    /// is whether the transaction has a start at all.
+    start: Cursor,
     rows: Vec<XaRow>,
     /// Estimated memory of `rows` (`KEY_BYTES` per row, see `buffer_bytes`). The rows of
     /// tables no view read are kept only while this stays under [`XA_HOLD_BYTES`].
@@ -705,8 +707,8 @@ struct Engine {
     /// Re-read `_lazyview` once more after this (no exact visibility fence available).
     defs_recheck: Option<Instant>,
     last_src_ping: Instant,
-    boundary: Position,
-    persisted: Position,
+    boundary: Cursor,
+    persisted: Cursor,
     last_persist: Instant,
     in_txn: bool,
     /// The current transaction touched something besides our own metadata tables.
@@ -1171,8 +1173,8 @@ impl Engine {
             failures: HashMap::new(),
             defs_recheck: None,
             last_src_ping: Instant::now(),
-            boundary: zero.clone(),
-            persisted: zero,
+            boundary: Cursor::none(info.flavor),
+            persisted: Cursor::none(info.flavor),
             last_persist: Instant::now(),
             in_txn: false,
             txn_foreign: false,
@@ -1267,12 +1269,12 @@ impl Engine {
             return Ok(Some((e, None)));
         }
 
-        let stored = meta::load_position(&mut e.meta, &e.cfg.instance_id).await?;
+        let stored = meta::load_position(&mut e.meta, &e.cfg.instance_id, e.flavor).await?;
         let mut rebuild_all =
             matches!(e.cfg.start_mode, StartMode::Rebuild | StartMode::Once) || stored.is_none();
         let mut start = match &stored {
             Some(p) if !rebuild_all => p.clone(),
-            _ => binlog::current_position(&mut e.src).await?,
+            _ => Cursor::from_position(e.flavor, &binlog::current_position(&mut e.src).await?),
         };
         // A position saved on another server (failover, restore, RESET MASTER) may name a file
         // that exists here too, with other contents.
@@ -1309,7 +1311,7 @@ impl Engine {
                 ),
                 false,
             ))
-        } else if !binlog::binlog_exists(&mut e.src, &start.file).await? {
+        } else if !source::can_resume(&mut e.src, &start).await? {
             Some((
                 format!("saved binlog position {start} is no longer available on the server"),
                 true,
@@ -1333,7 +1335,10 @@ impl Engine {
                 MissingBinlog::Rebuild => {
                     warn!("{why}; rebuilding all views");
                     rebuild_all = true;
-                    start = binlog::current_position(&mut e.src).await?;
+                    start = Cursor::from_position(
+                        e.flavor,
+                        &binlog::current_position(&mut e.src).await?,
+                    );
                 }
             }
         }
@@ -1362,7 +1367,7 @@ impl Engine {
         }
         e.persist_position(true).await?;
         e.update_gauges();
-        Ok(Some((e, Some(start))))
+        Ok(Some((e, Some(start.to_position()))))
     }
 
     // ---------------------------------------------------------------- definitions & planning
@@ -1770,7 +1775,7 @@ impl Engine {
     /// `freeze` stops maintaining the live version meanwhile (its plan no longer matches the
     /// source schema).
     fn schedule_replan(&mut self, def_id: u64, freeze: bool, retry: bool) {
-        let at = self.boundary.clone();
+        let at = self.boundary.to_position();
         self.schedule_replan_at(def_id, freeze, retry, &at);
     }
 
@@ -2105,7 +2110,7 @@ impl Engine {
             let mut build = d.targets.clone();
             if d.rebuild {
                 info!(view = %plan.name, "rebuild requested (_lazyview.rebuild = 1)");
-                self.slots[idx].rebuild_asked = Some(self.boundary.clone());
+                self.slots[idx].rebuild_asked = Some(self.boundary.to_position());
             } else if resume {
                 match self.try_resume(idx, &plan).await {
                     Ok(rest) => build = rest,
@@ -2589,7 +2594,7 @@ impl Engine {
             hash,
             swapped: HashSet::new(),
             not_before: None,
-            started: self.boundary.clone(),
+            started: self.boundary.to_position(),
             since: None,
             recent: Lookback::default(),
             routine,
@@ -2653,7 +2658,7 @@ impl Engine {
                     if s.hash == hash && s.targets == d.targets {
                         if d.rebuild && s.rebuild_asked.is_none() {
                             info!(view = %s.name, "rebuild requested (_lazyview.rebuild = 1)");
-                            self.slots[idx].rebuild_asked = Some(self.boundary.clone());
+                            self.slots[idx].rebuild_asked = Some(self.boundary.to_position());
                             // Also plans a definition again whose planning timed out.
                             self.slots[idx].plan_timed_out = None;
                             self.schedule_replan(id, false, false);
@@ -2667,7 +2672,7 @@ impl Engine {
             let is_new = self.slots[idx].live.is_none() && self.slots[idx].next.is_none();
             let s = &mut self.slots[idx];
             if d.rebuild && s.rebuild_asked.is_none() {
-                s.rebuild_asked = Some(self.boundary.clone());
+                s.rebuild_asked = Some(self.boundary.to_position());
             }
             s.definition = d.effective_definition();
             s.hash = hash;
@@ -2980,7 +2985,7 @@ impl Engine {
                 Err(e) => {
                     if Self::binlog_unusable(&e) {
                         self.on_missing_binlog(&e).await?;
-                        pos = self.boundary.clone();
+                        pos = self.boundary.to_position();
                         continue 'reconnect;
                     }
                     if binlog::is_duplicate_server_id(&e) && self.reroll_server_id() {
@@ -3103,7 +3108,7 @@ impl Engine {
             self.table_ids.clear();
             self.xa_current = None;
             self.txn_foreign = false;
-            pos = self.boundary.clone();
+            pos = self.boundary.to_position();
             // A stream that fails right after connecting backs off like a failed connect.
             let pause = if delivered {
                 Duration::from_millis(200)
@@ -3169,7 +3174,7 @@ impl Engine {
         let metrics = self.metrics.clone();
         // Everything fed so far (the binlog read position) is what this flush applies: the
         // position the targets will have applied when it is through (#215, see below).
-        let applied = self.boundary.clone();
+        let applied = self.boundary.to_position();
         let r = {
             let flush = self.flush();
             tokio::pin!(flush);
@@ -3316,20 +3321,28 @@ impl Engine {
         true
     }
 
-    /// Whether the file of the saved position (where the next start resumes) is verifiably gone
-    /// from the source (not in `SHOW BINARY LOGS`). A failed check counts as not gone.
-    async fn saved_file_gone(&mut self) -> bool {
-        let Ok(Some(saved)) = meta::load_position(&mut self.meta, &self.cfg.instance_id).await
+    /// Whether the saved cursor (where the next start resumes) is verifiably no longer served
+    /// by the source: a lost slot. A failed question counts as not lost.
+    async fn saved_cursor_gone(&mut self) -> bool {
+        let Ok(Some(saved)) =
+            meta::load_position(&mut self.meta, &self.cfg.instance_id, self.flavor).await
         else {
             return false;
         };
-        matches!(
-            binlog::binlog_exists(&mut self.src, &saved.file).await,
-            Ok(false)
-        )
+        matches!(source::can_resume(&mut self.src, &saved).await, Ok(false))
     }
 
+    /// The resume point the stream asked for is no longer served: a lost slot. On a source
+    /// that drops them on its own ([`SourceCaps::cursor_purgeable`]) this is an expected event and
+    /// `LAZYVIEW_ON_MISSING_BINLOG` decides what it costs; on one that does not, nothing policy-wise
+    /// explains it and only a fail is honest.
     async fn on_missing_binlog(&mut self, e: &anyhow::Error) -> Result<()> {
+        if !self.caps.cursor_purgeable {
+            bail!(
+                "resume point {} is no longer served by a source that does not lose them: {e:#}",
+                self.boundary
+            );
+        }
         match self.cfg.on_missing_binlog {
             MissingBinlog::Fail => {
                 let msg = format!(
@@ -3338,7 +3351,7 @@ impl Engine {
                 );
                 // 1236 also carries dump errors that leave the position readable: only a saved
                 // file that is verifiably gone marks the views; otherwise the next start resumes.
-                if self.saved_file_gone().await {
+                if self.saved_cursor_gone().await {
                     self.mark_unusable(&msg).await;
                 }
                 Err(anyhow!(msg))
@@ -3348,7 +3361,10 @@ impl Engine {
                     "binlog position {} purged; rebuilding all views",
                     self.boundary
                 );
-                self.boundary = binlog::current_position(&mut self.src).await?;
+                self.boundary = Cursor::from_position(
+                    self.flavor,
+                    &binlog::current_position(&mut self.src).await?,
+                );
                 let ids: Vec<u64> = self.slots.iter().map(|s| s.def_id).collect();
                 for id in ids {
                     self.schedule_replan(id, false, false);
@@ -3436,7 +3452,7 @@ impl Engine {
                     }
                     return Ok(());
                 };
-                let since = self.boundary.clone();
+                let since = self.boundary.to_position();
                 self.mark_any(&route, &since);
                 let need_rows =
                     self.xa_current.is_some() || route.iter().any(|r| r.kind != RouteKind::Any);
@@ -3538,8 +3554,11 @@ impl Engine {
                 // position back (`pending_floor`). Heartbeats are never queued (`Drained::push`),
                 // so the reader has read nothing past this one.
                 let p = reader.position();
-                if !self.in_txn && self.xa_current.is_none() && *p > self.boundary {
-                    self.boundary = p.clone();
+                if !self.in_txn
+                    && self.xa_current.is_none()
+                    && Cursor::from_position(self.flavor, p) > self.boundary
+                {
+                    self.boundary = Cursor::from_position(self.flavor, p);
                     self.persist_needed = true;
                     self.after_boundary();
                 }
@@ -3557,7 +3576,8 @@ impl Engine {
     fn end_txn(&mut self, pos: Position) -> Position {
         self.in_txn = false;
         self.table_ids.clear();
-        std::mem::replace(&mut self.boundary, pos)
+        std::mem::replace(&mut self.boundary, Cursor::from_position(self.flavor, &pos))
+            .to_position()
     }
 
     /// XA COMMIT of a transaction read in this run: its rows become visible now.
@@ -3571,8 +3591,8 @@ impl Engine {
         }
         for (t, rows) in by_table {
             if let Some(route) = self.routes.get(&t).cloned() {
-                self.mark_any(&route, &xa.start);
-                self.feed_rows(&route, &rows, &xa.start);
+                self.mark_any(&route, &xa.start.to_position());
+                self.feed_rows(&route, &rows, &xa.start.to_position());
             }
         }
         // Only the tables whose rows were dropped (past `XA_HOLD_BYTES`) still cost a view a
@@ -3600,7 +3620,7 @@ impl Engine {
                     warn!(view = %s.name, xid, "a view defined while this XA transaction was prepared reads a table whose rows were dropped; rebuilding it");
                     d.rebuild = true;
                     d.all = true;
-                    since.get_or_insert_with(|| xa.start.clone());
+                    since.get_or_insert_with(|| xa.start.to_position());
                 }
             }
         }
@@ -3753,7 +3773,7 @@ impl Engine {
     /// change whose images are remembered for later lookups (applied, but a restart must read
     /// them again to have them; see [`Lookback`]).
     fn pending_floor(&self, held: bool) -> Position {
-        let mut floor = self.boundary.clone();
+        let mut floor = self.boundary.to_position();
         for s in self.slots.iter().filter(|s| s.error.is_none()) {
             lower_pos(&mut floor, s.stale_since.as_ref());
             if let Some(l) = s.live.as_ref().filter(|l| !l.frozen) {
@@ -3775,7 +3795,7 @@ impl Engine {
     fn after_boundary(&mut self) {
         // Remembered images are forgotten once the binlog is read past their window, unless
         // images still to be resolved need them.
-        let read = self.boundary.clone();
+        let read = self.boundary.to_position();
         for l in self.slots.iter_mut().filter_map(|s| s.live.as_mut()) {
             if !l.recent.is_empty() && l.dirty.images.iter().all(HashSet::is_empty) {
                 l.recent.prune(&read);
@@ -4372,14 +4392,14 @@ impl Engine {
                 }
             }
         }
-        if self.snapshot_fence != Some(false) && !self.boundary.file.is_empty() {
+        if self.snapshot_fence != Some(false) && self.boundary.is_some() {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut pause = Duration::from_millis(1);
             loop {
                 match self.visible_upto().await {
                     Ok(Some(p)) => {
                         self.snapshot_fence = Some(true);
-                        if p >= self.boundary {
+                        if p >= self.boundary.to_position() {
                             return true;
                         }
                         if Instant::now() >= deadline {
@@ -4406,7 +4426,7 @@ impl Engine {
                 }
             }
         }
-        if self.snapshot_fence == Some(false) && !self.boundary.file.is_empty() {
+        if self.snapshot_fence == Some(false) && self.boundary.is_some() {
             if let Some(visible) = self.commit_fence().await {
                 return visible;
             }
@@ -4421,7 +4441,7 @@ impl Engine {
     /// (the server commits in binlog order, see `fence::ordered`). `Some(visible)` is the answer
     /// of `fence`; `None`: not available here, so the caller waits `LAZYVIEW_VISIBILITY_DELAY_MS`.
     async fn commit_fence(&mut self) -> Option<bool> {
-        if self.commit_fenced.as_ref() == Some(&self.boundary) {
+        if self.commit_fenced.as_ref() == Some(&self.boundary.to_position()) {
             return Some(true);
         }
         if self.commit_fence.is_none() {
@@ -4451,7 +4471,7 @@ impl Engine {
         }
         match fence::commit(&mut self.src, &self.cfg.instance_id).await {
             Ok(()) => {
-                self.commit_fenced = Some(self.boundary.clone());
+                self.commit_fenced = Some(self.boundary.to_position());
                 self.metrics.beat();
                 Some(true)
             }
@@ -5199,7 +5219,10 @@ impl Engine {
                 let Some(l) = s.live.as_mut() else {
                     return;
                 };
-                let floor = l.since.clone().unwrap_or_else(|| self.boundary.clone());
+                let floor = l
+                    .since
+                    .clone()
+                    .unwrap_or_else(|| self.boundary.to_position());
                 self.note_refresh(i, &name, r, &lagging, floor, &targets);
                 let s = &mut self.slots[i];
                 let Some(l) = s.live.as_mut() else {
@@ -5252,7 +5275,10 @@ impl Engine {
                     units: l.dirty.units.clone(),
                     partial: l.dirty.partial.clone(),
                     all: l.dirty.all,
-                    since: l.since.clone().unwrap_or_else(|| self.boundary.clone()),
+                    since: l
+                        .since
+                        .clone()
+                        .unwrap_or_else(|| self.boundary.to_position()),
                     failures: 0,
                     retry_at: now,
                     down: false,
@@ -5761,10 +5787,12 @@ impl Engine {
         if plain.iter().any(|&a| fresh(a)) {
             // Every change visible to the lookups above is in the binlog before this position.
             let until = binlog::current_position(&mut self.src).await?;
-            let from = since.unwrap_or(&self.boundary).clone();
+            let from = since
+                .cloned()
+                .unwrap_or_else(|| self.boundary.to_position());
             recent.remember(until, from, &plain, images);
         }
-        recent.prune(&self.boundary);
+        recent.prune(&self.boundary.to_position());
         Ok(())
     }
 
@@ -6021,13 +6049,13 @@ impl Engine {
     /// Saves the position replay must restart from: never past a change still pending (see
     /// [`Self::pending_floor`]) or an open prepared XA transaction (its rows must be re-read
     /// after a restart to be applied at XA COMMIT), unless that one stayed unresolved for
-    /// longer than [`XA_PIN_MAX`]. The boundary is a real binlog start (`find_start_position`
-    /// only returns `Ok` with a non-empty file), so it needs no guard here; [`meta::load_position`]
-    /// is the one place that reads an empty file as no position (a state row of an older build).
+    /// longer than [`XA_PIN_MAX`]. The boundary is a real resume point (`Cursor::is_some`), so
+    /// it needs no guard here; [`meta::load_position`] is the one place that can hand back no
+    /// cursor at all (nothing saved yet, or a row of an older build).
     async fn persist_position(&mut self, force: bool) -> Result<()> {
         let mut pos = self.pending_floor(true);
         for (xid, xa) in self.xa_pending.iter_mut() {
-            if xa.start.file.is_empty() {
+            if !xa.start.is_some() {
                 continue;
             }
             if xa.prepared_at.elapsed() > XA_PIN_MAX {
@@ -6037,14 +6065,14 @@ impl Engine {
                 }
                 continue;
             }
-            pos = pos.min(xa.start.clone());
+            pos = pos.min(xa.start.to_position());
         }
         if let Some((_, xa)) = &self.xa_current {
-            if !xa.start.file.is_empty() {
-                pos = pos.min(xa.start.clone());
+            if xa.start.is_some() {
+                pos = pos.min(xa.start.to_position());
             }
         }
-        if !force && (pos == self.persisted || !self.persist_needed) {
+        if !force && (pos == self.persisted.to_position() || !self.persist_needed) {
             // Held back where it was saved: look again one interval later (the flush deadline
             // is `last_persist` + interval; leaving it in the past would spin the loop).
             self.last_persist = Instant::now();
@@ -6054,13 +6082,13 @@ impl Engine {
         meta::save_position(
             &mut self.meta,
             &self.cfg.instance_id,
-            &pos,
+            &Cursor::from_position(self.flavor, &pos),
             self.leader.epoch,
         )
         .await?;
         // Held back: save again once the pending changes are applied.
-        self.persist_needed = pos < self.boundary;
-        self.persisted = pos;
+        self.persist_needed = pos < self.boundary.to_position();
+        self.persisted = Cursor::from_position(self.flavor, &pos);
         self.last_persist = Instant::now();
         Ok(())
     }

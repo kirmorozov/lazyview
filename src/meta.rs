@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Conn;
 use mysql_async::Params;
 
-use crate::binlog::Position;
+use crate::source::{Cursor, Flavor};
 
 pub const DEFS: &str = "_lazyview";
 pub const STATE: &str = "_lazyview_state";
@@ -48,6 +48,7 @@ const CREATE_STATUS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview_status` (
   `instance_id` VARCHAR(64) NOT NULL PRIMARY KEY,
   `binlog_file` VARCHAR(255) NOT NULL,
   `binlog_pos` BIGINT UNSIGNED NOT NULL,
+  `binlog_cursor` VARCHAR(255) NOT NULL DEFAULT '',
   `epoch` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `server_identity` VARCHAR(255) NULL,
   `updated_at` TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
@@ -87,6 +88,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         STATUS,
         "epoch",
         "BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER `binlog_pos`",
+    ),
+    (
+        STATUS,
+        "binlog_cursor",
+        "VARCHAR(255) NOT NULL DEFAULT '' AFTER `binlog_pos`",
     ),
     (STATUS, "server_identity", "VARCHAR(255) NULL AFTER `epoch`"),
     (STATE, "route", "VARCHAR(16) NULL AFTER `detail`"),
@@ -402,16 +408,34 @@ pub async fn delete_state(conn: &mut Conn, name: &str, target: &str) -> Result<(
     Ok(())
 }
 
-pub async fn load_position(conn: &mut Conn, instance: &str) -> Result<Option<Position>> {
-    let row: Option<(String, u64)> = conn
+/// The saved resume point. `binlog_cursor` holds the [`Cursor`]'s text; the two pre-cursor
+/// columns are the one-time format bump's fallback (a row written before the cursor exists still
+/// has its position there, and the flavor parses it back). Cursor text that does not parse is an
+/// error, never a fresh start: `LAZYVIEW_ON_MISSING_BINLOG=fail` is what keeps a wrong one from
+/// being quietly rebuilt over.
+pub async fn load_position(
+    conn: &mut Conn,
+    instance: &str,
+    flavor: Flavor,
+) -> Result<Option<Cursor>> {
+    let row: Option<(String, u64, String)> = conn
         .exec_first(
-            "SELECT `binlog_file`, `binlog_pos` FROM `_lazyview_status` WHERE `instance_id` = ?",
+            "SELECT `binlog_file`, `binlog_pos`, `binlog_cursor` FROM `_lazyview_status` WHERE `instance_id` = ?",
             (instance,),
         )
         .await?;
-    Ok(row
-        .filter(|(f, _)| !f.is_empty())
-        .map(|(file, pos)| Position { file, pos }))
+    let Some((file, pos, text)) = row else {
+        return Ok(None);
+    };
+    if !text.is_empty() {
+        return flavor.parse_cursor(&text).map(Some).with_context(|| {
+            format!("the saved position {text:?} is no cursor this source speaks")
+        });
+    }
+    if file.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Cursor::from_parts(flavor, file, pos)))
 }
 
 /// Identity of the server the saved position belongs to (see `engine::server_identity`).
@@ -435,15 +459,13 @@ pub async fn save_identity(conn: &mut Conn, instance: &str, identity: &str) -> R
 }
 
 /// Saves the position if `epoch` is still current; fails when another instance took over.
-pub async fn save_position(
-    conn: &mut Conn,
-    instance: &str,
-    p: &Position,
-    epoch: u64,
-) -> Result<()> {
+pub async fn save_position(conn: &mut Conn, instance: &str, c: &Cursor, epoch: u64) -> Result<()> {
+    // `binlog_cursor` is the value a start reads; the two pre-cursor columns stay filled through
+    // the bump, so an older build (and the harness) still finds the position there.
+    let at = c.to_position();
     conn.exec_drop(
-        "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ? WHERE `instance_id` = ? AND `epoch` = ?",
-        (&p.file, p.pos, instance, epoch),
+        "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ?, `binlog_cursor` = ? WHERE `instance_id` = ? AND `epoch` = ?",
+        (&at.file, at.pos, c.to_string(), instance, epoch),
     )
     .await?;
     if conn.affected_rows() == 0 {

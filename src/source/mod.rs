@@ -29,22 +29,15 @@ use mysql_async::binlog::events::{BinlogEventHeader, Event};
 pub(crate) mod maria;
 pub(crate) mod percona;
 
-/// A binlog coordinate. `pos` is the offset of the next event to read.
+/// The binlog coordinate a stream read hands back: `pos` is the offset of the next event to read.
+/// It is the *wire* shape, known inside the source layer and to whoever opens the stream; what
+/// the engine and the metadata tables hold is [`Cursor`], which says nothing about files.
+///
+/// Embedder seam: the fields, `Ord` and `Display` are read from outside this crate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Position {
     pub file: String,
     pub pos: u64,
-}
-
-impl Position {
-    /// Numeric suffix of the binlog file name (`binlog.000012` → 12).
-    pub fn file_seq(&self) -> u64 {
-        self.file
-            .rsplit('.')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    }
 }
 
 impl PartialOrd for Position {
@@ -55,13 +48,124 @@ impl PartialOrd for Position {
 
 impl Ord for Position {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.file_seq(), self.pos).cmp(&(other.file_seq(), other.pos))
+        // Embedder seam: the binlog-side ordering, by the MySQL-family file-sequence rule that
+        // [`mysql::position_key`] owns. The generic side orders [`Cursor`]s, whose rule is the
+        // flavor's.
+        mysql::position_key(self).cmp(&mysql::position_key(other))
     }
 }
 
 impl std::fmt::Display for Position {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.file, self.pos)
+    }
+}
+
+/// Where the source has got to, as everything outside the flavor modules knows it: an **opaque,
+/// ordered piece of text**. The engine compares, logs and persists this; the metadata tables
+/// store the [`Display`] text. What is behind it — a binlog file and offset for the MySQL family,
+/// the same pair ordered by LSN for MariaDB, later an LSN or xid for PostgreSQL — is the flavor's
+/// business: [`mysql::cursor_key`] and [`maria::cursor_key`] hold the ordering rules,
+/// [`mysql::parse`] the spelling, and the 4-byte file-header floor that made a raw offset of a
+/// fresh file meaningless (`pos.max(4)`) is [`mysql::floor_offset`]. The generic side gets
+/// ordering, equality, `Display` and a parse — never a file name or an offset.
+#[derive(Debug, Clone)]
+pub struct Cursor {
+    flavor: Flavor,
+    at: Position,
+}
+
+impl Cursor {
+    /// The cursor of a binlog coordinate, under `flavor`'s rules (a real file never starts
+    /// before its 4-byte header).
+    pub fn from_position(flavor: Flavor, at: &Position) -> Cursor {
+        Cursor {
+            flavor,
+            at: match flavor {
+                Flavor::MySql | Flavor::Percona => mysql::normalize(at),
+                Flavor::MariaDb => maria::normalize(at),
+            },
+        }
+    }
+
+    /// The cursor of a file and offset read from the source's own words (a status variable, a
+    /// row of the metadata tables).
+    pub fn from_parts(flavor: Flavor, file: String, pos: u64) -> Cursor {
+        Cursor::from_position(flavor, &Position { file, pos })
+    }
+
+    /// No position yet: the source was never read (an empty file is the one spelling of it).
+    pub fn none(flavor: Flavor) -> Cursor {
+        Cursor::from_parts(flavor, String::new(), 0)
+    }
+
+    /// Whether this is a position at all — the shape `!file.is_empty()` had before the cursor.
+    pub fn is_some(&self) -> bool {
+        !self.at.file.is_empty()
+    }
+
+    /// The binlog coordinate to open a stream from / to answer the server's own questions with.
+    pub fn to_position(&self) -> Position {
+        self.at.clone()
+    }
+}
+
+impl PartialOrd for Cursor {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Cursor {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // One engine has one source, so the flavors match in practice; the flavor first and the
+        // pair last keep `Ord` total and consistent with `Eq` when they do not.
+        let key = |c: &Cursor| match c.flavor {
+            Flavor::MySql | Flavor::Percona => mysql::cursor_key(&c.at),
+            Flavor::MariaDb => maria::cursor_key(&c.at),
+        };
+        (self.flavor as u8, key(self), &self.at.file, self.at.pos).cmp(&(
+            other.flavor as u8,
+            key(other),
+            &other.at.file,
+            other.at.pos,
+        ))
+    }
+}
+
+impl PartialEq for Cursor {
+    fn eq(&self, other: &Self) -> bool {
+        self.flavor == other.flavor && self.at == other.at
+    }
+}
+
+impl Eq for Cursor {}
+
+impl std::hash::Hash for Cursor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.flavor as u8, &self.at.file, self.at.pos).hash(state);
+    }
+}
+
+impl std::fmt::Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The text the metadata tables hold; identical in shape to the position it replaces, so
+        // logs and the saved position read the same across the format bump.
+        write!(f, "{}:{}", self.at.file, self.at.pos)
+    }
+}
+
+/// Whether the source still serves `cursor` — the question `binlog_exists(file)` asked when the
+/// policy was keyed on a file name. Per flavor: the MySQL family asks its own log index, MariaDB
+/// reaches the same code through `mysql.rs` (never a copy). A cursor the source no longer serves
+/// is a lost slot: the caller's `on_missing_binlog` policy applies to it, and
+/// [`SourceCaps::cursor_purgeable`] says whether losing one this way is something the source does
+/// on its own. A failed question is an error, never a `false`.
+pub async fn can_resume(conn: &mut mysql_async::Conn, cursor: &Cursor) -> anyhow::Result<bool> {
+    let at = cursor.to_position();
+    match cursor.flavor {
+        Flavor::MySql | Flavor::Percona => mysql::can_resume(conn, &at).await,
+        Flavor::MariaDb => maria::can_resume(conn, &at).await,
     }
 }
 
@@ -116,7 +220,19 @@ impl Flavor {
             fresh_snapshot: self == Flavor::MariaDb,
             json_cast: self.is_mysql_family(),
             sql_generation_expressions: self == Flavor::MariaDb,
+            cursor_purgeable: true,
         }
+    }
+
+    /// The cursor of the text the metadata tables hold (`file:pos`), or `None` when it is not a
+    /// cursor of this flavor. The one way back from text: a cursor that does not parse is an
+    /// error the caller raises, not a position to try.
+    pub fn parse_cursor(self, text: &str) -> Option<Cursor> {
+        let at = match self {
+            Flavor::MySql | Flavor::Percona => mysql::parse(text)?,
+            Flavor::MariaDb => maria::parse(text)?,
+        };
+        Some(Cursor::from_position(self, &at))
     }
 }
 
@@ -132,6 +248,11 @@ pub struct SourceCaps {
     /// `GENERATION_EXPRESSION` comes back as plain SQL (MariaDB) rather than string-escaped
     /// the way MySQL / Percona print it.
     pub sql_generation_expressions: bool,
+    /// The source can drop a resume point on its own (the MySQL family purges binlog files, a
+    /// PostgreSQL slot loses WAL past its retain window), so a cursor [`can_resume`] no longer
+    /// answers for is an expected event, not a broken cursor: `Config::on_missing_binlog` is
+    /// what decides what a lost slot costs.
+    pub cursor_purgeable: bool,
 }
 
 impl From<bool> for SourceCaps {

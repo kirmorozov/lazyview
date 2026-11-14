@@ -874,3 +874,67 @@ pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<
         .with_context(|| format!("default collation of character set {charset}"))?;
     Ok(v.flatten().map(|c| c.to_ascii_lowercase()))
 }
+
+// --- the cursor's rules: the ordering and the spelling the generic side must not know -------
+
+/// Numeric suffix of the binlog file name (`binlog.000012` → 12): the file's place in the index.
+pub(crate) fn file_seq(file: &str) -> u64 {
+    file.rsplit('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The MySQL-family order of two binlog coordinates: the file's place in the index, then the
+/// offset inside it (an offset says nothing about another file).
+pub(crate) fn position_key(p: &crate::source::Position) -> (u64, u64) {
+    (file_seq(&p.file), p.pos)
+}
+
+/// The cursor's order for this flavor — the same rule, reached from `Cursor`'s `Ord` so the
+/// ordering lives here and not on the generic side.
+pub(crate) fn cursor_key(p: &crate::source::Position) -> (u64, u64) {
+    position_key(p)
+}
+
+/// No event lives before a binlog file's 4-byte header, so offset 0 of a real file is not a
+/// resume point: the `pos.max(4)` the position used to carry, as the flavor's rule.
+pub(crate) fn floor_offset(pos: u64) -> u64 {
+    pos.max(4)
+}
+
+/// A coordinate as this flavor stores it: no file is no position (offset 0 of nothing); a named
+/// file never starts below its header.
+pub(crate) fn normalize(p: &crate::source::Position) -> crate::source::Position {
+    if p.file.is_empty() {
+        return crate::source::Position {
+            file: String::new(),
+            pos: 0,
+        };
+    }
+    crate::source::Position {
+        file: p.file.clone(),
+        pos: floor_offset(p.pos),
+    }
+}
+
+/// The one spelling of a cursor's text (`file:pos`) and its parse: the metadata tables' text
+/// comes back through here, so nothing outside the flavor modules splits it.
+pub(crate) fn parse(text: &str) -> Option<crate::source::Position> {
+    let (file, pos) = text.rsplit_once(':')?;
+    if file.is_empty() {
+        return None;
+    }
+    Some(crate::source::Position {
+        file: file.to_string(),
+        pos: pos.parse().ok()?,
+    })
+}
+
+/// Whether the server still has the file of `at` in its log index — what a lost slot means here.
+pub(crate) async fn can_resume(
+    conn: &mut mysql_async::Conn,
+    at: &crate::source::Position,
+) -> anyhow::Result<bool> {
+    crate::binlog::binlog_exists(conn, &at.file).await
+}

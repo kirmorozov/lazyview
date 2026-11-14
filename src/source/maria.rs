@@ -265,3 +265,30 @@ pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<
         .with_context(|| format!("default collation of character set {charset}"))?;
     Ok(v.flatten().map(|c| c.to_ascii_lowercase()))
 }
+
+// --- the cursor's rules: MariaDB's own ordering, the shared MySQL spelling ------------------
+
+/// MariaDB orders cursors by the LSN in `pos`: it grows across files, so the file name never
+/// breaks a tie. (The MySQL file-sequence rule happens to agree, because the file number follows
+/// the LSN; it is not the rule here, and the next flavor will not have files at all.)
+pub(crate) fn cursor_key(p: &crate::source::Position) -> (u64, u64) {
+    (0, p.pos)
+}
+
+/// The text is the MySQL family's (`file:pos`): a call into `mysql.rs`, never a copy.
+pub(crate) fn parse(text: &str) -> Option<crate::source::Position> {
+    crate::source::mysql::parse(text)
+}
+
+/// The 4-byte header floor is the shared one too.
+pub(crate) fn normalize(p: &crate::source::Position) -> crate::source::Position {
+    crate::source::mysql::normalize(p)
+}
+
+/// MariaDB answers `SHOW BINARY LOGS` the same way, so it asks through `mysql.rs`.
+pub(crate) async fn can_resume(
+    conn: &mut mysql_async::Conn,
+    at: &crate::source::Position,
+) -> anyhow::Result<bool> {
+    crate::source::mysql::can_resume(conn, at).await
+}

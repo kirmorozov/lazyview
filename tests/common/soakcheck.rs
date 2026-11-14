@@ -150,7 +150,7 @@ pub struct ViewRow {
 }
 
 /// One lag sample (§4): the source's binlog end, how long `applied()` took to reach it, and the
-/// binlog depth that was outstanding (`file_seq`, `src/binlog/connect.rs:34`).
+/// binlog depth that was outstanding (`common::file_seq`).
 #[derive(Debug, Clone, Default)]
 pub struct Lag {
     /// Seconds between reading the source's binlog end and `applied()` reaching it.
@@ -706,7 +706,7 @@ pub fn budget_problems(counters: &[(&'static str, u64)]) -> Vec<String> {
 // ---------------------------------------------------------------------------------------------
 
 /// One lag sample (§4): `server_position` (`mod.rs:355`), then `wait_applied` (`engine.rs:181`),
-/// with the binlog depth of what was outstanding as the secondary number (`file_seq`).
+/// with the binlog depth of what was outstanding as the secondary number (`common::file_seq`).
 pub async fn lag_sample(src: &mut Conn, eng: &mut Engine) -> Result<Lag> {
     let target = server_position(src).await?;
     let t = Instant::now();
@@ -719,7 +719,7 @@ pub async fn lag_sample(src: &mut Conn, eng: &mut Engine) -> Result<Lag> {
         settle_s,
         target: target.to_string(),
         applied: applied.to_string(),
-        file_seq_diff: target.file_seq().saturating_sub(applied.file_seq()),
+        file_seq_diff: file_seq(&target.file).saturating_sub(file_seq(&applied.file)),
         pos_diff: target.pos.saturating_sub(applied.pos),
     })
 }

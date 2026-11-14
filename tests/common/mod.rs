@@ -20,6 +20,16 @@ pub mod toxi;
 pub mod typed;
 pub mod workload;
 
+/// Numeric suffix of a binlog file name (`binlog.000012` → 12): the file's place in the index.
+/// The harness's own copy of a rule the product keeps inside its MySQL-family source module, for
+/// the two things tests count with it: "did the log rotate" and how many files were crossed.
+pub fn file_seq(file: &str) -> u64 {
+    file.rsplit('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 /// The string literals of a Rust source (plain and raw strings, `\` line continuations): the
 /// SQL statements tests write. The harness's own copy (the renamer above no longer ships it);
 /// `src/analyzer/tests_rename.rs` carries the same copy for the unit tests.

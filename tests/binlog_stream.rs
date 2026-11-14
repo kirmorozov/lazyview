@@ -844,7 +844,7 @@ async fn stream_scenario(dsn: String) -> Result<()> {
     }
     let (first, last) = (&seen.groups[0].end, &seen.groups.last().unwrap().end);
     ensure!(
-        last.file_seq() > first.file_seq(),
+        common::file_seq(&last.file) > common::file_seq(&first.file),
         "no rotation seen between {first} and {last}"
     );
     check_gtids(&mut w, &wl, &seen.groups).await?;
@@ -1014,7 +1014,10 @@ async fn stream_server_checks_and_missing_binlog() {
             );
 
             let pos = current_position(&mut c).await?;
-            ensure!(pos.pos >= 4 && pos.file_seq() > 0, "odd position {pos}");
+            ensure!(
+                pos.pos >= 4 && common::file_seq(&pos.file) > 0,
+                "odd position {pos}"
+            );
             ensure!(
                 binlog_exists(&mut c, &pos.file).await?,
                 "{} not listed",
