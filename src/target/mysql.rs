@@ -315,73 +315,139 @@ pub(crate) fn layout_matches(layout: &Layout, existing: &[(String, String)]) -> 
 
 /// Creates the shadow table with an ownership marker (see [`crate::target::marker`]) as the
 /// table comment.
+/// Whether `e` says the target does not know a collation / character set (MariaDB 13's
+/// default `utf8mb4_uca1400_ai_ci` on MySQL): the adapt branch below, never a retry.
+fn collation_gap(e: &mysql_async::Error) -> bool {
+    matches!(e, mysql_async::Error::Server(se) if se.code == 1273 || se.code == 1115)
+}
+
+/// Creates the shadow table: the drop + create is one idempotent block through the shared
+/// policy (R4.2); the 1273/1115 collation adapt keeps its own non-retry branch.
 pub(crate) async fn create_shadow_marked(
     conn: &mut Conn,
     schema: &str,
     name: &str,
     layout: &Layout,
     marker: &str,
+    metrics: &crate::metrics::Metrics,
 ) -> Result<String> {
     let shadow = shadow_name(name);
-    conn.query_drop(format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(&shadow)))
-        .await?;
-    match conn
-        .query_drop(layout.create_sql_marked(Kind::Mysql, schema, &shadow, Some(marker)))
-        .await
-    {
-        Ok(()) => {}
-        // A collation or character set of the source this target does not know (MariaDB 13's
-        // default `utf8mb4_uca1400_ai_ci` on MySQL): the target's default collation of each
-        // column's character set is the closest match.
-        Err(mysql_async::Error::Server(e)) if e.code == 1273 || e.code == 1115 => {
-            let adapted = with_target_collations(layout, conn).await?;
-            tracing::warn!(
-                table = %name,
-                "{}; creating the table with the target's default collations instead",
-                e.message
-            );
-            conn.query_drop(adapted.create_sql_marked(Kind::Mysql, schema, &shadow, Some(marker)))
-                .await?;
-        }
-        Err(e) => return Err(e.into()),
+    // The statements are identical on every try: render once, clone per try.
+    let drop_sql = format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(&shadow));
+    let create_sql = layout.create_sql_marked(Kind::Mysql, schema, &shadow, Some(marker));
+    let known = super::with_retry_mut(
+        metrics,
+        "creating the shadow table",
+        crate::supervisor::Policy::STATEMENTS,
+        conn,
+        |conn| {
+            let (drop_sql, create_sql) = (drop_sql.clone(), create_sql.clone());
+            Box::pin(async move {
+                conn.query_drop(drop_sql).await?;
+                match conn.query_drop(create_sql).await {
+                    Ok(()) => Ok(true),
+                    Err(e) if collation_gap(&e) => Ok(false),
+                    Err(e) => Err(e.into()),
+                }
+            })
+        },
+    )
+    .await?;
+    if known {
+        return Ok(shadow);
     }
+    // The target's default collation of each column's character set is the closest match.
+    let adapted = with_target_collations(layout, conn).await?;
+    tracing::warn!(
+        table = %name,
+        "the source collations are unknown to this target; creating the table with the target's default collations instead"
+    );
+    conn.query_drop(adapted.create_sql_marked(Kind::Mysql, schema, &shadow, Some(marker)))
+        .await?;
     Ok(shadow)
 }
 
 /// Atomically replaces `name` with its shadow table (or renames the shadow when `name` is new).
-pub(crate) async fn swap(conn: &mut Conn, schema: &str, name: &str) -> Result<()> {
+/// Atomically replaces `name` with its shadow table: one idempotent block through the shared
+/// policy (R4.2) — the `table_kind` checks below make a repeat a no-op ("already swapped"), so a
+/// transient 1205 (a reader's metadata lock) is simply retried — and the lock wait comes from
+/// the one knob, `lock_wait_s` (R4.3), not a second hardcoded 5 s.
+pub(crate) async fn swap(
+    conn: &mut Conn,
+    schema: &str,
+    name: &str,
+    lock_wait_s: u64,
+    metrics: &crate::metrics::Metrics,
+) -> Result<()> {
     let shadow = shadow_name(name);
     let old = old_name(name);
     let (s, n) = (q(schema), q(name));
-    // Readers with open transactions on the old table hold its metadata lock; don't queue
-    // behind them for long (the caller retries), and don't block new readers meanwhile.
-    conn.query_drop("SET SESSION lock_wait_timeout = 5").await?;
-    if table_kind(conn, schema, &shadow).await?.is_none() {
-        // Already swapped (an earlier attempt was interrupted after the rename).
-        return Ok(());
-    }
-    if table_kind(conn, schema, name).await?.is_some() {
-        conn.query_drop(format!("DROP TABLE IF EXISTS {s}.{}", q(&old)))
-            .await?;
-        conn.query_drop(format!(
-            "RENAME TABLE {s}.{n} TO {s}.{}, {s}.{} TO {s}.{n}",
-            q(&old),
-            q(&shadow)
-        ))
-        .await?;
-        conn.query_drop(format!("DROP TABLE IF EXISTS {s}.{}", q(&old)))
-            .await?;
-    } else {
-        conn.query_drop(format!("RENAME TABLE {s}.{} TO {s}.{n}", q(&shadow)))
-            .await?;
-    }
-    Ok(())
+    let (old_q, shadow_q) = (q(&old), q(&shadow));
+    // The statements are identical on every try: render them once, clone per try.
+    let set_lwt = format!("SET SESSION lock_wait_timeout = {lock_wait_s}");
+    let drop_old = format!("DROP TABLE IF EXISTS {s}.{old_q}");
+    let swap_two = format!("RENAME TABLE {s}.{n} TO {s}.{old_q}, {s}.{shadow_q} TO {s}.{n}");
+    let swap_one = format!("RENAME TABLE {s}.{shadow_q} TO {s}.{n}");
+    let (schema_t, shadow_t, name_t) = (schema.to_string(), shadow.clone(), name.to_string());
+    super::with_retry_mut(
+        metrics,
+        "swapping the shadow table",
+        crate::supervisor::Policy::STATEMENTS,
+        conn,
+        |conn| {
+            let (set_lwt, drop_old, swap_two, swap_one, schema_t, shadow_t, name_t) = (
+                set_lwt.clone(),
+                drop_old.clone(),
+                swap_two.clone(),
+                swap_one.clone(),
+                schema_t.clone(),
+                shadow_t.clone(),
+                name_t.clone(),
+            );
+            Box::pin(async move {
+                // Readers with open transactions on the old table hold its metadata lock; don't
+                // queue behind them for long (the helper retries), and don't block new readers.
+                conn.query_drop(set_lwt).await?;
+                if table_kind(conn, &schema_t, &shadow_t).await?.is_none() {
+                    // Already swapped (an earlier attempt was interrupted after the rename).
+                    return Ok(());
+                }
+                if table_kind(conn, &schema_t, &name_t).await?.is_some() {
+                    conn.query_drop(drop_old.clone()).await?;
+                    conn.query_drop(swap_two).await?;
+                    conn.query_drop(drop_old).await?;
+                } else {
+                    conn.query_drop(swap_one).await?;
+                }
+                Ok(())
+            })
+        },
+    )
+    .await
 }
 
-pub(crate) async fn drop_table(conn: &mut Conn, schema: &str, name: &str) -> Result<()> {
-    conn.query_drop(format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(name)))
-        .await?;
-    Ok(())
+pub(crate) async fn drop_table(
+    conn: &mut Conn,
+    schema: &str,
+    name: &str,
+    metrics: &crate::metrics::Metrics,
+) -> Result<()> {
+    // DROP TABLE IF EXISTS is a repeat (R4.2).
+    let sql = format!("DROP TABLE IF EXISTS {}.{}", q(schema), q(name));
+    super::with_retry_mut(
+        metrics,
+        "dropping a table",
+        crate::supervisor::Policy::STATEMENTS,
+        conn,
+        |conn| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                conn.query_drop(sql).await?;
+                Ok(())
+            })
+        },
+    )
+    .await
 }
 
 /// Session time zone in which TIMESTAMPs are written (see [`crate::mv::Layout::epoch_timestamps`]).
@@ -391,19 +457,36 @@ pub(crate) const UTC_SESSION: &str = "SESSION time_zone = '+00:00'";
 /// in which values are stored as they were read (zero dates, no strict-mode rejections), and a
 /// bounded table-lock wait (`lock_wait_s`) so a session blocked by a `LOCK TABLES` fails with
 /// 1205 instead of waiting out the server default (a year).
-pub(crate) async fn init_session(conn: &mut Conn, lock_wait_s: u64) -> Result<()> {
-    let mode: Option<String> = conn
-        .query_first("SELECT CAST(@@SESSION.sql_mode AS CHAR)")
-        .await?;
-    let mode = mode.unwrap_or_default();
-    let permissive = permissive_sql_mode(&mode);
-    let [isolation, set_mode, lock_wait] = session_setup(&permissive, lock_wait_s);
-    conn.query_drop(isolation).await?;
-    if permissive != mode {
-        conn.query_drop(set_mode).await?;
-    }
-    conn.query_drop(lock_wait).await?;
-    Ok(())
+pub(crate) async fn init_session(
+    conn: &mut Conn,
+    lock_wait_s: u64,
+    metrics: &crate::metrics::Metrics,
+) -> Result<()> {
+    // One idempotent block through the shared policy (R4.2): every read and SET here is a
+    // repeat, a transient failure simply re-runs the whole session setup.
+    super::with_retry_mut(
+        metrics,
+        "session setup",
+        crate::supervisor::Policy::STATEMENTS,
+        conn,
+        |conn| {
+            Box::pin(async move {
+                let mode: Option<String> = conn
+                    .query_first("SELECT CAST(@@SESSION.sql_mode AS CHAR)")
+                    .await?;
+                let mode = mode.unwrap_or_default();
+                let permissive = permissive_sql_mode(&mode);
+                let [isolation, set_mode, lock_wait] = session_setup(&permissive, lock_wait_s);
+                conn.query_drop(isolation).await?;
+                if permissive != mode {
+                    conn.query_drop(set_mode).await?;
+                }
+                conn.query_drop(lock_wait).await?;
+                Ok(())
+            })
+        },
+    )
+    .await
 }
 
 /// The statements that give a connection the service's session settings with `sql_mode` (a mode
@@ -463,11 +546,26 @@ pub(crate) async fn write_opts(
     kind: Kind,
     batch_rows: usize,
     batch_bytes: usize,
+    metrics: &crate::metrics::Metrics,
 ) -> Result<WriteOpts> {
-    let (version, packet): (String, u64) = conn
-        .query_first("SELECT CAST(@@version AS CHAR), @@max_allowed_packet")
-        .await?
-        .context("reading @@version and @@max_allowed_packet")?;
+    // The read is idempotent (R4.2).
+    let (version, packet): (String, u64) = super::with_retry_mut(
+        metrics,
+        "reading the target's write options",
+        crate::supervisor::Policy::STATEMENTS,
+        conn,
+        |conn| {
+            Box::pin(async move {
+                Ok(conn
+                    .query_first::<(String, u64), _>(
+                        "SELECT CAST(@@version AS CHAR), @@max_allowed_packet",
+                    )
+                    .await?)
+            })
+        },
+    )
+    .await?
+    .context("reading @@version and @@max_allowed_packet")?;
     Ok(for_server(kind, &version, packet, batch_rows, batch_bytes))
 }
 
@@ -509,19 +607,33 @@ fn kill_is_gone(err: &mysql_async::Error) -> bool {
 
 /// `KILL CONNECTION id` on a fresh connection, then waits until `SHOW PROCESSLIST` (which lists
 /// the user's own threads without privileges) no longer has it.
-pub(crate) async fn kill_and_wait(opts: &Opts, id: u32) -> Result<()> {
+pub(crate) async fn kill_and_wait(
+    opts: &Opts,
+    id: u32,
+    metrics: &crate::metrics::Metrics,
+) -> Result<()> {
     let fut = async {
-        let mut c = Conn::new(opts.clone()).await?;
-        match c.query_drop(format!("KILL CONNECTION {id}")).await {
-            Ok(()) => {}
-            // Only "unknown thread id" proves the thread is gone; anything else means the KILL did not run.
-            Err(e) if kill_is_gone(&e) => {}
-            Err(e) => {
-                return Err(
-                    anyhow::Error::from(e).context(format!("killing target connection {id}"))
-                )
-            }
-        }
+        // The connect and the KILL are repeats (R4.2): KILL is idempotent and "unknown thread
+        // id" already proves the thread is gone. The SHOW PROCESSLIST deadline poll below stays
+        // a poll.
+        let mut c = super::with_retry(
+            metrics,
+            "fencing a target connection",
+            crate::supervisor::Policy::STATEMENTS,
+            || async {
+                let mut c = Conn::new(opts.clone()).await?;
+                match c.query_drop(format!("KILL CONNECTION {id}")).await {
+                    Ok(()) => {}
+                    Err(e) if kill_is_gone(&e) => {}
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("killing target connection {id}")))
+                    }
+                }
+                Ok(c)
+            },
+        )
+        .await?;
         let deadline = tokio::time::Instant::now() + FENCE_WAIT;
         loop {
             let rows: Vec<mysql_async::Row> = c.query("SHOW PROCESSLIST").await?;

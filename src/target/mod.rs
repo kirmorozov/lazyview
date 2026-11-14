@@ -76,7 +76,12 @@ impl Kind {
     /// codes and IO kinds. A caller adds no second connect timeout of its own: the
     /// `Engine::target_conn` above this keeps its fail-fast `retry_at` parking and its one
     /// documented liveness bound for the whole reconnect sequence.
-    pub(crate) async fn connect(&self, opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
+    pub(crate) async fn connect(
+        &self,
+        opts: &Opts,
+        lock_wait_s: u64,
+        metrics: &Metrics,
+    ) -> Result<Conn> {
         match (self, opts) {
             (Kind::Mysql, Opts::Mysql(o)) => {
                 let mut c =
@@ -94,7 +99,7 @@ impl Kind {
                             ))
                         }
                     };
-                mysql::init_session(&mut c, lock_wait_s).await?;
+                mysql::init_session(&mut c, lock_wait_s, metrics).await?;
                 Ok(Conn::Mysql(c))
             }
             (Kind::Postgres, Opts::Postgres(d)) => {
@@ -192,7 +197,6 @@ pub(crate) fn schema_of(opts: &Opts, what: &str) -> Result<String> {
 
 /// The family modules' one retry entry: a thin delegate to [`crate::supervisor::retrying`],
 /// so no target module hand-rolls a loop. `op` must be idempotent (see each call site's note).
-#[allow(dead_code)] // the call sites adopt this as they switch to the shared policy
 pub(crate) async fn with_retry<T, Fut>(
     metrics: &Metrics,
     what: &str,
@@ -203,6 +207,24 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     crate::supervisor::retrying(metrics, what, policy, op).await
+}
+
+/// [`with_retry`] for ops that need exclusive use of one value (the target `Conn`): every try
+/// gets `&mut S` from the caller ([`crate::supervisor::retrying_mut`]).
+pub(crate) async fn with_retry_mut<T, S, F>(
+    metrics: &Metrics,
+    what: &str,
+    policy: Policy,
+    state: &mut S,
+    op: F,
+) -> Result<T>
+where
+    F: for<'a> FnMut(
+        &'a mut S,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>,
+{
+    crate::supervisor::retrying_mut(metrics, what, policy, state, op).await
 }
 
 /// Ownership marker prefix of the comment of every table lazyview creates (see [`marker`]).
@@ -386,10 +408,11 @@ pub(crate) async fn create_shadow_marked(
     name: &str,
     layout: &Layout,
     marker: &str,
+    metrics: &Metrics,
 ) -> Result<String> {
     match (conn, kind) {
         (Conn::Mysql(c), Kind::Mysql) => {
-            mysql::create_shadow_marked(c, schema, name, layout, marker).await
+            mysql::create_shadow_marked(c, schema, name, layout, marker, metrics).await
         }
         (Conn::Postgres(c), Kind::Postgres) => c.create_shadow(schema, name, layout, marker).await,
         _ => bail!("internal: target connection and family disagree"),
@@ -399,9 +422,16 @@ pub(crate) async fn create_shadow_marked(
 /// Atomically replaces `name` with its shadow table (or renames the shadow when `name` is new).
 /// One dispatch per swap (T6): the PostgreSQL arm is `PgConn::swap`, the transactional block
 /// of T4.6, on the target's own connection.
-pub(crate) async fn swap(conn: &mut Conn, kind: Kind, schema: &str, name: &str) -> Result<()> {
+pub(crate) async fn swap(
+    conn: &mut Conn,
+    kind: Kind,
+    schema: &str,
+    name: &str,
+    lock_wait_s: u64,
+    metrics: &Metrics,
+) -> Result<()> {
     match (conn, kind) {
-        (Conn::Mysql(c), Kind::Mysql) => mysql::swap(c, schema, name).await,
+        (Conn::Mysql(c), Kind::Mysql) => mysql::swap(c, schema, name, lock_wait_s, metrics).await,
         (Conn::Postgres(c), Kind::Postgres) => c.swap(schema, name).await,
         _ => bail!("internal: target connection and family disagree"),
     }
@@ -412,9 +442,10 @@ pub(crate) async fn drop_table(
     kind: Kind,
     schema: &str,
     name: &str,
+    metrics: &Metrics,
 ) -> Result<()> {
     match kind {
-        Kind::Mysql => mysql::drop_table(conn, schema, name).await,
+        Kind::Mysql => mysql::drop_table(conn, schema, name, metrics).await,
         Kind::Postgres => postgres::drop_table(conn, schema, name).await,
     }
 }
@@ -434,9 +465,10 @@ pub(crate) async fn init_session(
     conn: &mut mysql_async::Conn,
     kind: Kind,
     lock_wait_s: u64,
+    metrics: &Metrics,
 ) -> Result<()> {
     match kind {
-        Kind::Mysql => mysql::init_session(conn, lock_wait_s).await,
+        Kind::Mysql => mysql::init_session(conn, lock_wait_s, metrics).await,
         Kind::Postgres => postgres::init_session(conn, lock_wait_s).await,
     }
 }
@@ -450,17 +482,28 @@ pub async fn write_opts(
     batch_rows: usize,
     batch_bytes: usize,
 ) -> Result<WriteOpts> {
+    write_opts_with(conn, kind, batch_rows, batch_bytes, &Metrics::default()).await
+}
+
+/// [`write_opts`] with the [`Metrics`] the shared retry policy counts on (the engine's sites).
+pub(crate) async fn write_opts_with(
+    conn: &mut mysql_async::Conn,
+    kind: Kind,
+    batch_rows: usize,
+    batch_bytes: usize,
+    metrics: &Metrics,
+) -> Result<WriteOpts> {
     match kind {
-        Kind::Mysql => mysql::write_opts(conn, kind, batch_rows, batch_bytes).await,
+        Kind::Mysql => mysql::write_opts(conn, kind, batch_rows, batch_bytes, metrics).await,
         Kind::Postgres => postgres::write_opts(conn, kind, batch_rows, batch_bytes).await,
     }
 }
 
 /// Kills write op `id` and waits until the server no longer lists it (the zombie fence). One
 /// dispatch per fence, never per row.
-pub(crate) async fn fence(kind: Kind, opts: &Opts, id: u32) -> Result<()> {
+pub(crate) async fn fence(kind: Kind, opts: &Opts, id: u32, metrics: &Metrics) -> Result<()> {
     match (kind, opts) {
-        (Kind::Mysql, Opts::Mysql(o)) => mysql::kill_and_wait(o, id).await,
+        (Kind::Mysql, Opts::Mysql(o)) => mysql::kill_and_wait(o, id, metrics).await,
         (Kind::Postgres, _) => postgres::fence_and_wait(opts, id).await,
         _ => unreachable!("internal: target family and parsed DSN disagree"),
     }
@@ -783,7 +826,7 @@ pub(crate) async fn init_source_session(
     conn: &mut mysql_async::Conn,
     lock_wait_s: u64,
 ) -> Result<()> {
-    mysql::init_session(conn, lock_wait_s).await
+    mysql::init_session(conn, lock_wait_s, &Metrics::default()).await
 }
 
 /// `mode` without the flags that reject values the source holds and the flags that change how SQL
