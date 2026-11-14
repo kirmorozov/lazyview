@@ -316,10 +316,58 @@ impl Toxi {
             .to_string())
     }
 
+    /// One API exchange over raw HTTP/1.1 — the request shape of [`http_json`], with one thing it
+    /// does not do: a `Transfer-Encoding: chunked` answer is decoded ([`decode_chunked`]). The
+    /// toxiproxy API switches to chunked once an answer is large (the `GET /proxies` of a host
+    /// with dozens of proxies is), and a chunk-size line is neither JSON nor empty — without this
+    /// the [`Cleanup`] guard's `GET /proxies` fails on exactly the run that left many proxies
+    /// behind, so a failed scenario would poison the port band for every run after it. Found by
+    /// the T5 scenarios (finding: `http_json` in `tests/common/engine.rs` is chunk-blind; the
+    /// fix lives here, in the chaos client, until lv-super folds it into the shared helper).
     async fn call(&self, method: &str, path: &str, body: &str) -> Result<(u16, serde_json::Value)> {
-        http_json(&self.api, method, path, body)
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let t = Duration::from_secs(5);
+        let mut s = tokio::time::timeout(t, TcpStream::connect(&self.api))
             .await
-            .with_context(|| format!("toxiproxy {method} {path} at {}", self.api))
+            .with_context(|| format!("toxiproxy {method} {path} at {}: connect timeout", self.api))?
+            .with_context(|| format!("toxiproxy {method} {path} at {}", self.api))?;
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: \
+             application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            self.api,
+            body.len()
+        );
+        tokio::time::timeout(t, s.write_all(req.as_bytes()))
+            .await
+            .with_context(|| format!("toxiproxy {method} {path}: write timeout"))?
+            .with_context(|| format!("toxiproxy {method} {path}: write"))?;
+        let mut buf = Vec::new();
+        tokio::time::timeout(t, s.read_to_end(&mut buf))
+            .await
+            .with_context(|| format!("toxiproxy {method} {path}: read timeout"))?
+            .with_context(|| format!("toxiproxy {method} {path}: read"))?;
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let (head, answer) = text
+            .split_once("\r\n\r\n")
+            .with_context(|| format!("toxiproxy {method} {path}: bad HTTP response {text:?}"))?;
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse::<u16>().ok())
+            .with_context(|| format!("toxiproxy {method} {path}: bad status line {head:?}"))?;
+        let answer = decode_chunked(head, answer);
+        if answer.trim().is_empty() {
+            // The body-less answers: toxiproxy's 204s.
+            return Ok((status, serde_json::Value::Null));
+        }
+        let v = serde_json::from_str(answer.trim()).with_context(|| {
+            format!(
+                "toxiproxy {method} {path} at {}: status {status}, not JSON: {}",
+                self.api,
+                answer.chars().take(200).collect::<String>()
+            )
+        })?;
+        Ok((status, v))
     }
 
     /// The API's own words about a rejected call.
@@ -480,6 +528,25 @@ impl Toxi {
         );
         let items = v.as_array().cloned().unwrap_or_default();
         items.iter().map(Toxic::from_value).collect()
+    }
+
+    /// Arms a toxic and reads the arm back: `GET /proxies/{name}/toxics` must report what was
+    /// just posted, or the fault never landed (§2.5 — no scenario may arm a fault on faith). A
+    /// POST the API silently ignored would otherwise leave the scenario asserting against a
+    /// healthy network.
+    pub async fn arm(&self, p: &Proxy, t: &Toxic) -> Result<()> {
+        self.toxic(p, t).await?;
+        let armed = self.toxics(p).await?;
+        ensure!(
+            armed
+                .iter()
+                .any(|x| x.name == t.name && x.kind == t.kind && x.stream == t.stream),
+            "the fault never landed: {} named {} armed on {} is not in GET /toxics ({armed:?})",
+            t.kind,
+            t.name,
+            p.name,
+        );
+        Ok(())
     }
 
     /// `POST /reset`: clears every proxy's toxics on the host and re-enables them all. **Global**
@@ -711,4 +778,63 @@ pub fn dsn_via_proxy(base: &str, listen: u16) -> Result<String> {
     Ok(format!(
         "{scheme}://{creds}{at}127.0.0.1:{listen}{path}{query}"
     ))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Target-side helpers (T5: the scenarios of §3 rows 6–9)
+// ---------------------------------------------------------------------------------------------
+
+/// Decode a `Transfer-Encoding: chunked` answer (`size\r\nbytes\r\n` repetitions, terminated by
+/// `0\r\n`); the identity when the header is absent. Chunk extensions are not used by the
+/// toxiproxy API, so a size line is parsed as plain hex; on anything unparsable the function
+/// stops with what it has (the caller's JSON parse then fails loudly, as it must).
+fn decode_chunked(head: &str, answer: &str) -> String {
+    if !head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return answer.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = answer;
+    while let Some((line, tail)) = rest.split_once("\r\n") {
+        let Ok(size) = usize::from_str_radix(line.trim(), 16) else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        let take = size.min(tail.len());
+        out.push_str(&tail[..take]);
+        rest = tail[take..].strip_prefix("\r\n").unwrap_or(&tail[take..]);
+    }
+    out
+}
+
+/// [`target_env`](super::target_env) for **proxied** targets (§2.4): each entry is
+/// `(name, unproxied DSN, proxy)` and becomes a `LAZYVIEW_TARGET_<NAME>_DSN` pointing at the
+/// proxy's listen address; `None` keeps that target direct — which is how a scenario proves the
+/// healthy target is untouched while another one is under a fault. Everything the harness itself
+/// does with a target (seed checks, oracle reads) stays on the unproxied DSN.
+pub fn proxied_target_env(
+    targets: &[(&str, &str, Option<&Proxy>)],
+) -> Result<Vec<(String, String)>> {
+    let mut v = vec![(
+        "LAZYVIEW_TARGETS".to_string(),
+        targets.iter().map(|t| t.0).collect::<Vec<_>>().join(","),
+    )];
+    for (name, base, p) in targets {
+        let dsn = match p {
+            Some(p) => dsn_via_proxy(base, p.listen)?,
+            None => base.to_string(),
+        };
+        v.push((
+            format!(
+                "LAZYVIEW_TARGET_{}_DSN",
+                name.to_ascii_uppercase().replace('-', "_")
+            ),
+            dsn,
+        ));
+    }
+    Ok(v)
 }

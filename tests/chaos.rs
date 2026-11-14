@@ -19,6 +19,11 @@
 //! inside a refresh's result set. Each isolates one source role through the per-role DSN hooks of
 //! F4, asserts its own counter expectations *and* the three that every scenario owes: the fault
 //! landed, `verify` is exact at the end, and no incremental view was ever rebuilt (F6).
+//!
+//! Below them also live the target-side scenarios of T5 (§3 rows 6–9): a `reset_peer` cut
+//! mid-write-transaction on the target link, a black hole during a flush with the healthy target
+//! proving independence, bandwidth starvation and its drain, and fragmentation on both sides at
+//! once.
 
 mod common;
 
@@ -27,10 +32,14 @@ use std::time::Duration;
 use anyhow::{ensure, Context, Result};
 use common::soakchaos;
 use common::soakcheck::{counters, set_writers, view_rows, Window};
-use common::soakwork::{run_paced, setup_soak, soak_views, SoakIds};
-use common::toxi::{self, Cleanup, Dir, Echo, End, Proxy, Toxi, Toxic};
+use common::soakwork::{
+    run_paced, run_soak_batches, setup_soak, soak_views, SoakIds, SoakWorkload,
+};
+use common::toxi::{self, dsn_via_proxy, Cleanup, Dir, Echo, End, Proxy, Toxi, Toxic};
 use common::workload::Sizes;
 use common::*;
+use lazyview::Snapshot;
+use mysql_async::prelude::Queryable;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -1050,6 +1059,633 @@ fn chaos_src_refresh_result_cut() {
              rebuilt (the rule of reg_failing_refresh_retries_without_rebuild)",
             f.counter("full_rebuilds")
         );
+        Ok(())
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The target-side scenarios (plan §3 rows 6–9): faults on the write link of a target and
+// fragmentation on both sides at once. Everything the engine does to a target goes through that
+// target's proxy (`lv_<schema>_t1`); the harness — DDL, seed, writers, oracle — stays on direct
+// connections (F4/Q8), so every fault is attributable to the engine's own target traffic.
+// ---------------------------------------------------------------------------------------------
+
+/// The views the target-side scenarios exercise (§3 "common shape", narrowed from `soak_views()`
+/// to the paths at issue): a direct `WHERE` filter, a three-way join, a `links` hop, a
+/// `sets_items` cascade child and a global aggregate — all incremental — plus one `Full` view,
+/// which the per-view no-rebuild rule of the soak plan (F5/F6) keeps out. `targets` is the
+/// (view, target) fan-out, e.g. `"source,t1"`.
+fn chaos_specs(targets: &str) -> Vec<ViewSpec> {
+    const WANT: [&str; 6] = [
+        "w_items_direct",
+        "w_item_entity_grp",
+        "w_hop_partners",
+        "wc_child_only",
+        "w_global_entities",
+        "w_union_kinds",
+    ];
+    soak_views()
+        .into_iter()
+        .filter(|s| WANT.contains(&s.name.as_str()))
+        .map(|s| s.with_targets(targets))
+        .collect()
+}
+
+/// The per-view no-rebuild rule (F6): `mode = 'incremental'` ⇒ `whole_view_refreshes == 0`, and
+/// every whole rebuild the engine did since `before` (a snapshot taken after the initial
+/// `verify_targets`, so the first build is outside the window) is accounted for by the Full-mode
+/// view — the same rule `scripts/stats-check.sh` enforces, with the one `Full` view kept out of
+/// it exactly as the soak plan's F5/D5 keeps a `Chained`/`Full` view out.
+fn assert_no_rebuilds(
+    eng: &Engine,
+    db: &Db,
+    specs: &[ViewSpec],
+    before: &Snapshot,
+    what: &str,
+) -> Result<()> {
+    let d = eng.snapshot().since(before);
+    let mut full_whole = 0u64;
+    for s in specs {
+        let vs = eng.stats_of(db, &s.name)?;
+        if vs.mode.eq_ignore_ascii_case("incremental") {
+            ensure!(
+                vs.whole_view_refreshes == 0,
+                "{what}: incremental view {} was rebuilt {} time(s) outside the first build",
+                s.name,
+                vs.whole_view_refreshes
+            );
+        } else {
+            full_whole += vs.whole_view_refreshes;
+        }
+    }
+    ensure!(
+        d.full_rebuilds <= full_whole,
+        "{what}: engine full_rebuilds delta {} exceeds the {} whole refreshes of the Full-mode \
+         views — an incremental view was rebuilt, not refreshed",
+        d.full_rebuilds,
+        full_whole
+    );
+    Ok(())
+}
+
+/// Did the engine itself notice that a write to `t1` died at the network edge? Its log is the
+/// witness when the counters do not move (the plan's #6: the *fate* of the write must become
+/// known to the engine, through the fence, a refresh error, a supervisor retry or its own log).
+fn target_write_error_logged(log_path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    text.lines().any(|l| {
+        l.contains("t1")
+            && [
+                "reset by peer",
+                "connection closed",
+                "connection reset",
+                "broken pipe",
+                "io error",
+                "os error 104",
+            ]
+            .iter()
+            .any(|needle| l.contains(needle))
+    })
+}
+
+/// `t1` → its schema, the shape `verify_targets` takes for one target.
+fn tmap(t1: &Db) -> HashMap<String, Db> {
+    [("t1".to_string(), t1.clone())].into()
+}
+
+/// The engine's own report that `t1` became too slow to keep up (T5 §3 row 8's declared
+/// observables, F2: the test names what proves the toxic landed): a supervisor retry on a
+/// write that `timed out`, a `writing to target t1` / `write failed: target t1` line, or a
+/// `slow flush` of seconds while the link is capped. Each is attributable to the armed
+/// toxics; none of them requires the target to have been declared behind.
+fn slow_target_reported(log_path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    text.lines().any(|l| {
+        (l.contains("t1")
+            && [
+                "timed out after",
+                "writing to target t1",
+                "write failed: target t1",
+            ]
+            .iter()
+            .any(|needle| l.contains(needle)))
+            || l.contains("slow flush")
+    })
+}
+
+/// The engine's own source DSN (the suite's least-privilege user included, as `start_engine`
+/// does) routed through a proxy — what a T3 role hook is set to (§2.4).
+fn proxied_engine_dsn(db: &Db, listen: u16) -> Result<String> {
+    let base = match std::env::var("LAZYVIEW_TEST_ENGINE_USER") {
+        Ok(u) if !u.is_empty() => dsn_with_user(&db.dsn, &u),
+        _ => db.dsn.clone(),
+    };
+    dsn_via_proxy(&base, listen)
+}
+
+/// Pushes bounded pressure onto the target's write link from direct connections and hands back
+/// the stop handle plus its join handle; the caller stops and joins before the final oracle.
+fn spawn_target_writers(
+    ctx: &Ctx,
+    db: &Db,
+    ids: Arc<SoakIds>,
+    label: &str,
+    tps: u32,
+) -> (watch::Sender<bool>, tokio::task::JoinHandle<Result<usize>>) {
+    let (tx, rx) = watch::channel(false);
+    let (db_w, ids_w) = (db.clone(), ids);
+    let seed = ctx.sub_seed(label);
+    let h = tokio::spawn(async move { run_paced(&db_w, ids_w, seed, 4, tps, rx).await });
+    (tx, h)
+}
+
+async fn stop_writers(
+    ctx: &Ctx,
+    tx: watch::Sender<bool>,
+    h: tokio::task::JoinHandle<Result<usize>>,
+) -> Result<usize> {
+    let _ = tx.send(true);
+    let n = h.await.context("the paced writers task panicked")??;
+    ctx.log(format!(
+        "writers: {n} transactions through direct connections"
+    ));
+    Ok(n)
+}
+
+/// Every fault wait: the engine's own bounds (F5: a 2 s target timeout plus retry backoff) decide
+/// how long a fault takes to become observable; this only outlasts them.
+const FAULT_BUDGET: Duration = Duration::from_secs(90);
+
+/// #6 (§3): `lv_<s>_t1` **upstream** `reset_peer` while a flush is writing. The reset is armed
+/// with `timeout:300` (F2: "a TCP RST immediately **or after** `timeout`" — a non-zero timeout is
+/// what lets the write transaction get into flight before the RST cuts it, the plan's "batch big
+/// enough that the write transaction crosses the reset"); `LAZYVIEW_TARGET_TIMEOUT_MS=2000` and
+/// `LAZYVIEW_SUPERVISOR=fixed` per F5. The write's fate is genuinely unknown to the engine; the
+/// zombie fence (#28), a refresh error, a supervisor retry or the engine's own log must observe
+/// it, no row of a half-applied transaction may survive on `t1`, and the retry from the kept
+/// changes must land exactly. The MV row counts of `t1` right after the reset are logged — the
+/// evidence for the finding the PR body records (T5's step).
+#[test]
+fn chaos_tgt_reset_mid_write_txn() {
+    let _one = toxi::exclusive();
+    scenario("chaos_tgt_reset", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        let db = ctx.new_db("chaos_tgt_reset").await?;
+        // The guard first: no armed proxy can outlive a panic on a shared server (§2.2).
+        let _clean = toxi.for_schema(&db.name);
+        let t1 = ctx.new_db("chaos_tgt_reset_t1").await?;
+        let ids = setup_soak(&db, ctx.sub_seed("chaos_tgt_reset"), Sizes::tiny()).await?;
+        let specs = chaos_specs("source,t1");
+        let p1 = toxi
+            .proxy(&db.name, "t1", &toxi::upstream(&db.flavor))
+            .await?;
+        toxi.wait_listening(&p1).await?;
+        let mut ov = toxi::proxied_target_env(&[("t1", &t1.dsn, Some(&p1))])?;
+        for (k, v) in [
+            ("LAZYVIEW_HEARTBEAT_MS", "200"),
+            ("LAZYVIEW_TARGET_TIMEOUT_MS", "2000"),
+            ("LAZYVIEW_SUPERVISOR", "fixed"),
+        ] {
+            ov.push((k.to_string(), v.to_string()));
+        }
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &ov_refs(&ov)).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmap(&t1),
+            &specs,
+            "initial build on t1",
+        )
+        .await?;
+        let before = eng.snapshot();
+        // Arm on the target's link (the read-back says it landed), then drive flushes across it.
+        toxi.arm(&p1, &Toxic::reset_peer(300).on(Dir::Upstream).named("rst"))
+            .await?;
+        let (tx, writers) = spawn_target_writers(&ctx, &db, ids.clone(), "chaos_tgt_reset_w", 60);
+        // A cut write is never a silent success: the fence kills the lost backend, the flush
+        // fails as a refresh error, the supervisor retries it, or the engine logs the lost
+        // connection — one of them must move (§2.5, "the fault never landed").
+        wait_until(
+            "the reset target write to be observed (the fault never landed)",
+            FAULT_BUDGET,
+            || {
+                let m = eng.metrics.clone();
+                let lp = eng.log_path.clone();
+                async move {
+                    let s = m.snapshot();
+                    Ok(s.supervisor_zombie_kills > before.supervisor_zombie_kills
+                        || s.refresh_errors > before.refresh_errors
+                        || s.supervisor_retries > before.supervisor_retries
+                        || target_write_error_logged(&lp))
+                }
+            },
+        )
+        .await?;
+        // Evidence for the finding: which side of the reset the server ended up on — the row
+        // count of every `t1` MV while the fault is still armed.
+        let mut tc = t1.conn().await?;
+        for s in &specs {
+            let rows: Vec<mysql_async::Row> = tc
+                .query(format!("SELECT COUNT(*) FROM `{}`", s.name))
+                .await?;
+            let n = rows.first().and_then(|r| r.get::<i64, _>(0)).unwrap_or(-1);
+            ctx.log(format!(
+                "chaos_tgt_reset: t1 MV `{}` row count right after the reset: {n}",
+                s.name
+            ));
+        }
+        toxi.remove_toxic(&p1, "rst").await?;
+        stop_writers(&ctx, tx, writers).await?;
+        // `t1` catches up from the kept changes; `eventually_equal` polls the oracle without
+        // trusting `applied()` (built exactly for a target whose catch-up may take a moment).
+        eventually_equal(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmap(&t1),
+            &specs,
+            FAULT_BUDGET,
+            "t1 after the reset",
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        let pos = server_position(&mut c).await?;
+        eng.wait_applied(&pos, t_catchup()).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmap(&t1),
+            &specs,
+            "final after the reset",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.supervisor_zombie_kills >= 1
+                || d.refresh_errors >= 1
+                || d.supervisor_retries >= 1
+                || target_write_error_logged(&eng.log_path),
+            "chaos_tgt_reset: the lost write stayed invisible to the engine — no zombie kill, \
+             no refresh error, no supervisor retry, nothing in the log: {}",
+            fmt_snapshot(&d)
+        );
+        assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_tgt_reset")?;
+        eng.check_alive()?;
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// #7 (§3): `lv_<s>_t1` upstream `timeout{timeout:0}` for a bounded window while writers keep
+/// pushing, with `LAZYVIEW_TEST_LAG_HOLD_BYTES=1` so any lag crosses the budget. The target is
+/// reported behind, keeps its keys, and catches up when the toxic goes. The **other** target —
+/// direct, never proxied — must be exact throughout: the writers are quiesced for the check (an
+/// oracle comparison mid-stream compares two instants, not a state), and convergence must
+/// complete **while `t1` is still black-holed** — a flush pipeline that let one dead target
+/// stall the healthy one fails here, and that independence is the point.
+#[test]
+fn chaos_tgt_blackhole_during_flush() {
+    let _one = toxi::exclusive();
+    scenario("chaos_tgt_blackhole", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        let db = ctx.new_db("chaos_tgt_bh").await?;
+        let _clean = toxi.for_schema(&db.name);
+        let t1 = ctx.new_db("chaos_tgt_bh_t1").await?;
+        let t2 = ctx.new_db("chaos_tgt_bh_t2").await?;
+        let ids = setup_soak(&db, ctx.sub_seed("chaos_tgt_bh"), Sizes::tiny()).await?;
+        let specs = chaos_specs("source,t1,t2");
+        let p1 = toxi
+            .proxy(&db.name, "t1", &toxi::upstream(&db.flavor))
+            .await?;
+        toxi.wait_listening(&p1).await?;
+        let mut ov =
+            toxi::proxied_target_env(&[("t1", &t1.dsn, Some(&p1)), ("t2", &t2.dsn, None)])?;
+        for (k, v) in [
+            ("LAZYVIEW_HEARTBEAT_MS", "200"),
+            ("LAZYVIEW_TARGET_TIMEOUT_MS", "2000"),
+            ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "1"),
+        ] {
+            ov.push((k.to_string(), v.to_string()));
+        }
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &ov_refs(&ov)).await?;
+        let t12: HashMap<String, Db> = [
+            ("t1".to_string(), t1.clone()),
+            ("t2".to_string(), t2.clone()),
+        ]
+        .into();
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &t12,
+            &specs,
+            "initial build on both targets",
+        )
+        .await?;
+        let before = eng.snapshot();
+        toxi.arm(&p1, &Toxic::timeout(0).on(Dir::Upstream).named("bh"))
+            .await?;
+        let (tx, writers) = spawn_target_writers(&ctx, &db, ids.clone(), "chaos_tgt_bh_w", 60);
+        // The black-holed target must be *reported* behind (the budget is one byte): a Toxiproxy
+        // that silently did nothing fails right here.
+        wait_until(
+            "the black-holed target to be reported behind (the fault never landed)",
+            FAULT_BUDGET,
+            || {
+                let m = eng.metrics.clone();
+                async move { Ok(m.snapshot().lag_over_budget > before.lag_over_budget) }
+            },
+        )
+        .await?;
+        // Quiesce, then prove independence: with `t1` still black-holed, the source and the
+        // direct target `t2` must converge to the oracle — `t1`'s (view, target) pairs are
+        // skipped by leaving `t1` out of the map (oracle.rs). A healthy engine excludes the
+        // failed target from the refresh and retries it from the kept keys; if a dead `t1` can
+        // stall `t2`, this wait fails and the suite says so.
+        stop_writers(&ctx, tx, writers).await?;
+        wait_until(
+            "the direct target to stay exact while t1 is black-holed (independence broken)",
+            FAULT_BUDGET,
+            || async { Ok(check_views_targets(&db, &tmap(&t2), &specs).await.is_ok()) },
+        )
+        .await?;
+        toxi.remove_toxic(&p1, "bh").await?;
+        wait_until(
+            "t1 to catch up after the black hole (the fault never went away)",
+            FAULT_BUDGET,
+            || {
+                let m = eng.metrics.clone();
+                async move { Ok(m.snapshot().target_catchups > before.target_catchups) }
+            },
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        let pos = server_position(&mut c).await?;
+        eng.wait_applied(&pos, t_catchup()).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &t12,
+            &specs,
+            "final after the catch-up",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.lag_over_budget >= 1 && d.target_catchups >= 1,
+            "chaos_tgt_blackhole: neither the lag report nor the catch-up was observed: {}",
+            fmt_snapshot(&d)
+        );
+        assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_tgt_blackhole")?;
+        eng.check_alive()?;
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// #8 (§3): `lv_<s>_t1` `bandwidth{rate:32}` + `latency{latency:80}` under sustained writes above
+/// what the link can drain, armed in **both** directions (F2: a symmetric RTT needs one toxic per
+/// direction — a downstream-only cap would throttle nothing but the small ACKs of a MySQL write),
+/// with the F5 bound `LAZYVIEW_TARGET_TIMEOUT_MS=2000` deciding when a too-slow write counts as
+/// behind. The target falls behind, is reported over budget, and then drains: the applied-position
+/// gap is measured at both points, as bounded waits (writers keep the source position moving;
+/// the two samples straddle the toxic removal).
+#[test]
+fn chaos_tgt_bandwidth_starvation() {
+    let _one = toxi::exclusive();
+    scenario("chaos_tgt_bandwidth", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        let db = ctx.new_db("chaos_tgt_bw").await?;
+        let _clean = toxi.for_schema(&db.name);
+        let t1 = ctx.new_db("chaos_tgt_bw_t1").await?;
+        let ids = setup_soak(&db, ctx.sub_seed("chaos_tgt_bw"), Sizes::tiny()).await?;
+        let specs = chaos_specs("source,t1");
+        let p1 = toxi
+            .proxy(&db.name, "t1", &toxi::upstream(&db.flavor))
+            .await?;
+        toxi.wait_listening(&p1).await?;
+        let mut ov = toxi::proxied_target_env(&[("t1", &t1.dsn, Some(&p1))])?;
+        for (k, v) in [
+            ("LAZYVIEW_HEARTBEAT_MS", "200"),
+            ("LAZYVIEW_TARGET_TIMEOUT_MS", "2000"),
+            ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "1"),
+        ] {
+            ov.push((k.to_string(), v.to_string()));
+        }
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &ov_refs(&ov)).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmap(&t1),
+            &specs,
+            "initial build on t1",
+        )
+        .await?;
+        let before = eng.snapshot();
+        for t in [
+            Toxic::bandwidth(32, Dir::Upstream).named("bwu"),
+            Toxic::bandwidth(32, Dir::Downstream).named("bwd"),
+            Toxic::latency(80, 0, Dir::Upstream).named("latu"),
+            Toxic::latency(80, 0, Dir::Downstream).named("latd"),
+        ] {
+            toxi.arm(&p1, &t).await?;
+        }
+        // Sustained pressure above what 32 KB/s + 80 ms of RTT can drain (F2: a fault that
+        // never lands is a test failure). ~600 rows land every 20 ms while a flush of the
+        // same window needs seconds to push through the capped link — the write queue must
+        // grow, writes must cross the 2 s timeout, and the target must be reported behind.
+        // The landing observables are declared: the behind-report counter (`lag_over_budget`)
+        // or any of the engine's own too-slow reports for t1 (`slow_target_reported`).
+        let (tx, writers) = spawn_target_writers(&ctx, &db, ids.clone(), "chaos_tgt_bw_w", 600);
+        wait_until(
+            "the starved target to be reported behind (the fault never landed)",
+            FAULT_BUDGET,
+            || {
+                let m = eng.metrics.clone();
+                let lp = eng.log_path.clone();
+                async move {
+                    Ok(m.snapshot().lag_over_budget > before.lag_over_budget
+                        || slow_target_reported(&lp))
+                }
+            },
+        )
+        .await?;
+        // The gap, first sample: while the link starves, the engine is behind the server.
+        let mut c = db.conn().await?;
+        let pos = server_position(&mut c).await?;
+        let applied = eng.applied();
+        ctx.log(format!(
+            "chaos_tgt_bw: gap while armed — server {pos}, applied {applied:?}"
+        ));
+        ensure!(
+            applied.as_ref().is_some_and(|a| a < &pos),
+            "chaos_tgt_bw: the applied position never fell behind the server while the target \
+             was starved (applied {applied:?}, server {pos})"
+        );
+        for name in ["bwu", "bwd", "latu", "latd"] {
+            toxi.remove_toxic(&p1, name).await?;
+        }
+        wait_until(
+            "t1 to drain after the starvation (the fault never went away)",
+            FAULT_BUDGET,
+            || {
+                let m = eng.metrics.clone();
+                async move { Ok(m.snapshot().target_catchups > before.target_catchups) }
+            },
+        )
+        .await?;
+        stop_writers(&ctx, tx, writers).await?;
+        // The gap, second sample: the same position, now applied.
+        eng.wait_applied(&pos, t_catchup()).await?;
+        ctx.log(format!("chaos_tgt_bw: gap after the drain — applied {pos}"));
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmap(&t1),
+            &specs,
+            "final after the drain",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.target_catchups >= 1 && d.lag_over_budget >= 1,
+            "chaos_tgt_bw: neither the starvation lag nor the drain was observed: {}",
+            fmt_snapshot(&d)
+        );
+        assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_tgt_bw")?;
+        eng.check_alive()?;
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// #9 (§3): both sides fragmented at once — `slicer{average_size:1,size_variation:0,delay:2000µs}`
+/// upstream **and** downstream on every source link of the engine (the T3 role proxies: binlog,
+/// query, meta), `slicer{average_size:16}` + `latency{latency:40,jitter:40}` on the target link.
+/// A bounded workload (N transactions, the applied-waits bound the run — never a sleep) must come
+/// out exactly on every (view, target) with no refresh error and no rebuild of an incremental
+/// view: correctness under one-byte-per-packet traffic everywhere.
+#[test]
+fn chaos_both_sides_fragmented() {
+    let _one = toxi::exclusive();
+    scenario("chaos_both_sides", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        let db = ctx.new_db("chaos_both_sides").await?;
+        let _clean = toxi.for_schema(&db.name);
+        let t1 = ctx.new_db("chaos_both_sides_t1").await?;
+        let ids = setup_soak(&db, ctx.sub_seed("chaos_both_sides"), Sizes::tiny()).await?;
+        let specs = chaos_specs("source,t1");
+        // Every engine connection — binlog dump, source reads, metadata, target writes — behind
+        // its own proxy; only the harness stays direct (§2.4).
+        let mut src_ps = Vec::new();
+        for role in ["binlog", "query", "meta"] {
+            let p = toxi
+                .proxy(&db.name, role, &toxi::upstream(&db.flavor))
+                .await?;
+            toxi.wait_listening(&p).await?;
+            src_ps.push(p);
+        }
+        let p1 = toxi
+            .proxy(&db.name, "t1", &toxi::upstream(&db.flavor))
+            .await?;
+        toxi.wait_listening(&p1).await?;
+        let mut ov = toxi::proxied_target_env(&[("t1", &t1.dsn, Some(&p1))])?;
+        for (k, p) in [
+            ("LAZYVIEW_TEST_BINLOG_DSN", &src_ps[0]),
+            ("LAZYVIEW_TEST_QUERY_DSN", &src_ps[1]),
+            ("LAZYVIEW_TEST_META_DSN", &src_ps[2]),
+        ] {
+            ov.push((k.to_string(), proxied_engine_dsn(&db, p.listen)?));
+        }
+        ov.push(("LAZYVIEW_HEARTBEAT_MS".to_string(), "200".to_string()));
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &ov_refs(&ov)).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmap(&t1),
+            &specs,
+            "initial build, unfragmented",
+        )
+        .await?;
+        let before = eng.snapshot();
+        // One byte every 2 ms in both directions on every source link; 16-byte slices and
+        // jittery latency both ways on the target link (F2).
+        for p in &src_ps {
+            toxi.arm(p, &Toxic::slicer(1, 0, 2_000, Dir::Upstream).named("su"))
+                .await?;
+            toxi.arm(p, &Toxic::slicer(1, 0, 2_000, Dir::Downstream).named("sd"))
+                .await?;
+        }
+        for t in [
+            Toxic::slicer(16, 0, 0, Dir::Upstream).named("su"),
+            Toxic::slicer(16, 0, 0, Dir::Downstream).named("sd"),
+            Toxic::latency(40, 40, Dir::Upstream).named("lu"),
+            Toxic::latency(40, 40, Dir::Downstream).named("ld"),
+        ] {
+            toxi.arm(&p1, &t).await?;
+        }
+        // The bounded window: N transactions through a direct connection, and "applied" waits —
+        // not sleeps — decide how long it takes (F5/§2.5).
+        let mut c = db.conn().await?;
+        let mut wl = SoakWorkload::new(ctx.sub_seed("chaos_both_sides_w"), ids.clone());
+        let n = run_soak_batches(&mut c, &mut wl, 10).await?;
+        let pos = server_position(&mut c).await?;
+        eng.wait_applied(&pos, Duration::from_secs(120))
+            .await
+            .context(
+                "chaos_both_sides: applied never caught up through the fragmentation — a \
+                      finding: something blocks on a 1-byte-per-packet stream",
+            )?;
+        // The faults are gone before the oracle speaks (removal proven by the catch-up below).
+        for p in &src_ps {
+            toxi.remove_toxic(p, "su").await?;
+            toxi.remove_toxic(p, "sd").await?;
+        }
+        for name in ["su", "sd", "lu", "ld"] {
+            toxi.remove_toxic(&p1, name).await?;
+        }
+        let pos = server_position(&mut c).await?;
+        eng.wait_applied(&pos, t_catchup()).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmap(&t1),
+            &specs,
+            "final under fragmentation",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.refresh_errors == 0,
+            "chaos_both_sides: fragmentation broke a refresh — a finding: {}",
+            fmt_snapshot(&d)
+        );
+        assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_both_sides")?;
+        ctx.log(format!(
+            "chaos_both_sides: {n} transactions applied on a one-byte-per-slice link: {}",
+            fmt_snapshot(&d)
+        ));
+        eng.check_alive()?;
+        eng.stop().await?;
         Ok(())
     });
 }
