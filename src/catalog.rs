@@ -4,6 +4,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::source::SourceCaps;
 use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Conn;
@@ -95,8 +96,9 @@ impl Column {
         charset: Option<&str>,
         collation: Option<&str>,
         octet_len: Option<u64>,
-        mariadb: bool,
+        caps: impl Into<SourceCaps>,
     ) -> Column {
+        let caps = caps.into();
         let kind = col_kind(data_type, column_type);
         let dt = data_type.to_ascii_lowercase();
         let utf8_like = charset
@@ -124,7 +126,7 @@ impl Column {
                 None => "CAST(? AS BINARY)".to_string(),
             },
             (ColKind::Binary, _) => "CAST(? AS BINARY)".to_string(),
-            (ColKind::Json, _) if !mariadb => "CAST(? AS JSON)".to_string(),
+            (ColKind::Json, _) if caps.json_cast => "CAST(? AS JSON)".to_string(),
             (
                 ColKind::Plain,
                 "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext",
@@ -317,13 +319,20 @@ impl Catalog {
         conn: &mut Conn,
         schema: &str,
         name: &str,
-        mariadb: bool,
+        caps: impl Into<SourceCaps>,
     ) -> Result<Option<Arc<TableInfo>>> {
         let key = (schema.to_string(), name.to_string());
         if let Some(t) = self.tables.get(&key) {
             return Ok(Some(t.clone()));
         }
-        let Some(t) = load_table(conn, schema, name, mariadb, &mut self.default_collations).await?
+        let Some(t) = load_table(
+            conn,
+            schema,
+            name,
+            caps.into(),
+            &mut self.default_collations,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -337,10 +346,10 @@ async fn load_table(
     conn: &mut Conn,
     schema: &str,
     name: &str,
-    mariadb: bool,
+    caps: SourceCaps,
     default_collations: &mut HashMap<String, Option<String>>,
 ) -> Result<Option<TableInfo>> {
-    let Some(columns) = load_columns(conn, schema, name, mariadb, default_collations).await? else {
+    let Some(columns) = load_columns(conn, schema, name, caps, default_collations).await? else {
         return Ok(None);
     };
     let (pk, unique_keys) = load_keys(conn, schema, name, &columns).await?;
@@ -365,7 +374,7 @@ async fn load_columns(
     conn: &mut Conn,
     schema: &str,
     name: &str,
-    mariadb: bool,
+    caps: SourceCaps,
     default_collations: &mut HashMap<String, Option<String>>,
 ) -> Result<Option<Vec<Column>>> {
     type ColRow = (
@@ -411,8 +420,8 @@ async fn load_columns(
                 let generated = gen
                     .filter(|g| !g.trim().is_empty() && extra_uc.contains("GENERATED"))
                     .map(|expr| Generated {
-                        // MySQL / Percona print it string-escaped (`_utf8mb4\'$.a\'`), MariaDB as SQL.
-                        expr: if mariadb {
+                        // MariaDB prints it as plain SQL; MySQL / Percona print it string-escaped.
+                        expr: if caps.sql_generation_expressions {
                             expr
                         } else {
                             unescape_generation_expression(&expr)
@@ -431,7 +440,7 @@ async fn load_columns(
                         cs.as_deref(),
                         co.as_deref(),
                         octets,
-                        mariadb,
+                        caps,
                     )
                     .with_default_collation(default)
                 }

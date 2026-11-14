@@ -1,6 +1,7 @@
 //! The flavor-neutral side of a replication source: where it is (`Position`), what it is
-//! (`Flavor`, `ServerInfo`), what its stream yielded (`Item`, `RowsKind`) and what an error from
-//! it means (`MissingBinlog`, `is_missing_binlog`, `is_access_denied`, `is_duplicate_server_id`).
+//! (`Flavor`, `SourceCaps`, `ServerInfo`), what its stream yielded (`Item`, `RowsKind`) and what
+//! an error from it means (`MissingBinlog`, `is_missing_binlog`, `is_access_denied`,
+//! `is_duplicate_server_id`).
 //!
 //! These types name the source, not the wire protocol, so they live here rather than in
 //! [`crate::binlog`]: the reader, the engine and the catalog all speak them, and only `binlog`
@@ -63,6 +64,43 @@ impl Flavor {
         } else {
             Flavor::MySql
         }
+    }
+
+    /// The capabilities of this flavor, detected once at connect: callers read a flag here
+    /// instead of matching on the flavor or threading a `mariadb` bool through the call chain.
+    pub fn detect(self) -> SourceCaps {
+        SourceCaps {
+            fresh_snapshot: self == Flavor::MariaDb,
+            json_cast: self == Flavor::MySql,
+            sql_generation_expressions: self == Flavor::MariaDb,
+        }
+    }
+}
+
+/// What this source can do, chosen from its [`Flavor`] once at connect. A `Copy` value the
+/// engine holds beside the flavor, so no per-call flavor compare reaches the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceCaps {
+    /// Source reads must be prepared for this execution instead of reused from the
+    /// prepared-statement cache: MariaDB's cache keeps answering from the old plan after a DDL.
+    pub fresh_snapshot: bool,
+    /// The server accepts `CAST(? AS JSON)` as a parameter cast (MariaDB has no JSON cast type).
+    pub json_cast: bool,
+    /// `GENERATION_EXPRESSION` comes back as plain SQL (MariaDB) rather than string-escaped
+    /// the way MySQL / Percona print it.
+    pub sql_generation_expressions: bool,
+}
+
+impl From<bool> for SourceCaps {
+    /// The legacy `mariadb: bool` spelling (`true`: MariaDB), kept so callers built before
+    /// [`SourceCaps`] still compile; new callers pass the caps chosen at connect.
+    fn from(mariadb: bool) -> SourceCaps {
+        (if mariadb {
+            Flavor::MariaDb
+        } else {
+            Flavor::MySql
+        })
+        .detect()
     }
 }
 

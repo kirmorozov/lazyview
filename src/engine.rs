@@ -35,6 +35,7 @@ use crate::meta::{self, StateUpdate, SOURCE_TARGET};
 use crate::metrics::Metrics;
 use crate::mv::{self, BuildTarget, Layout};
 use crate::plan_swap;
+use crate::source::SourceCaps;
 use crate::supervisor::{self, Supervisor};
 use crate::target;
 use mysql_async::binlog::row::BinlogRow;
@@ -657,6 +658,8 @@ struct Engine {
     src_opts: Opts,
     schema: String,
     flavor: Flavor,
+    /// Source capabilities, detected from the flavor once at connect.
+    caps: SourceCaps,
     /// Source reads: lookups, refresh SELECTs, catalog.
     src: Conn,
     /// Metadata writes on the source.
@@ -1106,6 +1109,7 @@ impl Engine {
             src_opts,
             schema,
             flavor: info.flavor,
+            caps: info.flavor.detect(),
             src,
             meta: meta_conn,
             targets,
@@ -1321,9 +1325,7 @@ impl Engine {
     // ---------------------------------------------------------------- definitions & planning
 
     async fn table_info(&mut self, t: &TableRef) -> Result<Option<Arc<TableInfo>>> {
-        self.catalog
-            .get(&mut self.src, &t.0, &t.1, self.flavor == Flavor::MariaDb)
-            .await
+        self.catalog.get(&mut self.src, &t.0, &t.1, self.caps).await
     }
 
     /// Parses and plans a definition against the current catalog, except for the tables in
@@ -5168,7 +5170,7 @@ impl Engine {
             if !dirty.all {
                 return Ok(Refreshed::default());
             }
-            let fresh = self.flavor == Flavor::MariaDb;
+            let fresh = self.caps.fresh_snapshot;
             let rows =
                 mv::read_source(&mut self.src, plan, layout, None, &self.metrics, fresh).await?;
             work.source_queries += 1;
@@ -5240,7 +5242,7 @@ impl Engine {
                 layout,
                 Some(&chunk),
                 &self.metrics,
-                self.flavor == Flavor::MariaDb,
+                self.caps.fresh_snapshot,
             )
             .await?;
             work.source_queries += 1;
@@ -5369,7 +5371,7 @@ impl Engine {
                     .min(MAX_FILTER_PARAMS / plan.unit_exprs.len().max(1))
                     .max(1),
                 timeout: self.cfg.target_timeout,
-                fresh: self.flavor == Flavor::MariaDb,
+                fresh: self.caps.fresh_snapshot,
             });
         }
         self.metrics.beat();
@@ -5542,7 +5544,7 @@ impl Engine {
             }
         }
         for (k, v) in holds {
-            let fresh = self.flavor == Flavor::MariaDb;
+            let fresh = self.caps.fresh_snapshot;
             let sql = plan.key_lookup_sql(&plan.presence[*k].holds(v));
             let rows: Vec<mysql_async::Row> =
                 mv::exec_source(&mut self.src, sql, Vec::new(), fresh).await?;
@@ -5598,7 +5600,7 @@ impl Engine {
             }
             // New rows: the current rows that contain them.
             let (f, p) = chunk.filter(&k.exprs);
-            let fresh = self.flavor == Flavor::MariaDb;
+            let fresh = self.caps.fresh_snapshot;
             let rows: Vec<mysql_async::Row> =
                 mv::exec_source(&mut self.src, plan.key_lookup_sql(&f), p, fresh).await?;
             Metrics::add(&self.metrics.lookup_queries, 1);
@@ -5743,7 +5745,7 @@ impl Engine {
                         .flat_map(|key| key.iter().map(Datum::to_value))
                 })
                 .collect();
-            let fresh = self.flavor == Flavor::MariaDb;
+            let fresh = self.caps.fresh_snapshot;
             let rows: Vec<mysql_async::Row> =
                 mv::exec_source(&mut self.src, sql, params, fresh).await?;
             Metrics::add(&self.metrics.lookup_queries, 1);
