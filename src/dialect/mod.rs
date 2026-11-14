@@ -4,17 +4,19 @@
 //!
 //! The answers so far are the identifier quoting, the function vocabularies, the parameter and
 //! coercion renderings (the placeholder, how a JSON value binds, how a `?` takes a character set)
-//! the parse profile (how a definition's text is tokenized and handed to the query parser) and
-//! the source-read renderings (how a TIMESTAMP epoch is read and read back): all of them
+//! the parse profile (how a definition's text is tokenized and handed to the query parser), the
+//! source-read renderings (how a TIMESTAMP epoch is read and read back) and the row-value
+//! normalizations (the BIT and TIME canonical forms, the JSON canonical text): all of them
 //! [`mysql`]'s, since MySQL family is the only one with answers here. A new family adds
 //! its own answers next to these rather than branching on a server name at the call site.
 //!
 //! Copy set: lazy-wire-fire copies `src/dialect/mod.rs` and `src/dialect/mysql.rs` verbatim,
 //! as a pair (`mysql` is this module's only child). These two files reference only each other,
-//! std and external crates — no host code — so the quoting answers the copy set calls (the
-//! forwarders in `crate::analyze::vocab`) compile standalone. The host layer adds everything
-//! lazyview-only: the DSN rules and the cross-family quoting dispatch live on the target's
-//! `Kind`, a re-export of [`Family`] (see `src/target/mod.rs`).
+//! std, external crates and [`crate::datum`] (another copy-set file, whose `time_param` owns the
+//! TIME parameter form the row normalizations ask for) — no host code — so the quoting answers the
+//! copy set calls (the forwarders in `crate::analyze::vocab`) compile standalone. The host layer
+//! adds everything lazyview-only: the DSN rules and the cross-family quoting dispatch live on the
+//! target's `Kind`, a re-export of [`Family`] (see `src/target/mod.rs`).
 
 use anyhow::anyhow;
 use sqlparser::parser::Parser;

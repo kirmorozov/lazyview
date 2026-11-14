@@ -1,15 +1,17 @@
 //! The MySQL family's answers on the dialect seam: the identifier quoting, the function
 //! vocabularies, the parameter and coercion renderings, the parse profile (how a definition's
 //! text is tokenized and handed to the query parser, and how a rendered select item loses its
-//! alias) and the source-read renderings (the `UNIX_TIMESTAMP` epoch `SELECT`, its read list and
-//! the epoch-to-datetime reading back), moved verbatim from `crate::analyze::vocab`,
-//! `crate::analyze::columns`, `crate::analyze::expr`, `crate::analyze::parse` and `crate::mv`.
-//! `std`, `sqlparser`, `anyhow` and `mysql_async`'s `Value` only — no host code.
+//! alias), the source-read renderings (the `UNIX_TIMESTAMP` epoch `SELECT`, its read list and
+//! the epoch-to-datetime reading back) and the row-value normalizations, moved verbatim from
+//! `crate::analyze::vocab`, `crate::analyze::columns`, `crate::analyze::expr`,
+//! `crate::analyze::parse` and `crate::mv`. `std`, `sqlparser`, `anyhow`, `mysql_async`'s
+//! `Value` and `serde_json` only, plus `crate::datum` (a copy-set file too, the owner of the
+//! TIME parameter form) — no host code.
 //!
 //! Copy set: lazy-wire-fire copies this file together with `src/dialect/mod.rs` (its parent,
-//! the [`Family`](super::Family) discriminator) verbatim, as a pair, so the quoting answers and
-//! the function name lists the copy-set forwarders in `crate::analyze::vocab` delegate to
-//! compile standalone.
+//! the [`Family`](super::Family) discriminator) verbatim, as a pair, so the quoting answers, the
+//! function name lists the copy-set forwarders in `crate::analyze::vocab` delegate to, and the row
+//! forms compile standalone.
 
 use anyhow::anyhow;
 use mysql_async::Value;
@@ -71,6 +73,79 @@ pub(crate) fn charset_coercion(cs: &str, n: Option<u64>) -> String {
         Some(n) => format!("LEFT(CONVERT(? USING {cs}), {n})"),
         None => format!("CONVERT(? USING {cs})"),
     }
+}
+
+// The row-value normalizations, moved from the mv layer (`Layout::normalize`,
+// `Layout::normalize_source`, `json_canonical`): the form the values this family's servers send
+// are put into before a row is compared or written back. What a layout knows about its own columns
+// (their type names, which of them are the TIMESTAMP ones) is passed in, so these answer the
+// family's question only; `pub(crate)`, their caller is the mv layer's `Layout`.
+
+/// A row in the form that is compared and written back: BIT values as unsigned integers (bound as
+/// strings the server stores 0 for `b'11111111'`), TIME values in the form every server accepts as
+/// a parameter (see [`crate::datum::time_param`]), TIMESTAMP epochs as UTC datetimes through
+/// `to_utc` (the caller's `UNIX_TIMESTAMP` reading of them). `data_types` are the row's column type
+/// names in row order, `epoch` the positions of its TIMESTAMP columns.
+pub(crate) fn normalize_row<'a>(
+    data_types: impl Iterator<Item = &'a str>,
+    epoch: impl Iterator<Item = usize>,
+    row: &mut [Value],
+    mut to_utc: impl FnMut(Value) -> Value,
+) {
+    for (data_type, v) in data_types.zip(row.iter_mut()) {
+        match (data_type, &*v) {
+            ("bit", Value::Bytes(b)) => {
+                *v = Value::UInt(b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64));
+            }
+            // TIME values MySQL >= 9.0 rejects as binary parameters go as text (both the
+            // rows read from the source and those read back from the table, so they
+            // still compare equal).
+            ("time", Value::Time(..)) => {
+                *v = crate::datum::time_param(std::mem::replace(v, Value::NULL));
+            }
+            _ => {}
+        }
+    }
+    for p in epoch {
+        if let Some(v) = row.get_mut(p) {
+            *v = to_utc(std::mem::replace(v, Value::NULL));
+        }
+    }
+}
+
+/// A row read with the family's source SELECT in the form of [`normalize_row`]: that SELECT carries
+/// one `UNIX_TIMESTAMP` column per TIMESTAMP column, in front, so when `read_epochs` says the read
+/// included them and the row is the length such a read gives (`n_cols` + `n_epoch`), the epochs take
+/// the TIMESTAMP positions they were read for.
+pub(crate) fn normalize_source_row(
+    epoch: impl Iterator<Item = usize>,
+    n_epoch: usize,
+    n_cols: usize,
+    read_epochs: bool,
+    mut row: Vec<Value>,
+) -> Vec<Value> {
+    if read_epochs && row.len() == n_cols + n_epoch {
+        let epochs: Vec<Value> = row.drain(..n_epoch).collect();
+        for (p, e) in epoch.zip(epochs) {
+            row[p] = e;
+        }
+    }
+    row
+}
+
+/// A JSON text in the form the server stores it, for comparisons. MySQL parses JSON text into
+/// its binary format: integers stay integers, every other number becomes a DOUBLE, object keys
+/// are sorted and the last of duplicate keys wins. So a DECIMAL inside a JSON value the view
+/// computes (`JSON_ARRAYAGG(amount)` gives `[10.00, 20.50]`) is stored as `[10.0, 20.5]`: no
+/// client can write it back as a DECIMAL. Two texts get the same result here when the server
+/// stores the same value for them (numbers parsed with correct rounding, like the server's
+/// parser); the result is JSON-equal to the input, so it also binds as a `CAST(? AS JSON)`
+/// unit key. Text that does not parse is kept as it is.
+pub fn json_canonical(text: &[u8]) -> Vec<u8> {
+    serde_json::from_slice::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| serde_json::to_vec(&v).ok())
+        .unwrap_or_else(|| text.to_vec())
 }
 
 // The function vocabularies, moved verbatim from `crate::analyze` (`vocab.rs`, `columns.rs`,
@@ -583,5 +658,39 @@ mod tests {
         assert_eq!(item_expr("'a AS b'"), "'a AS b'");
         assert_eq!(item_expr("`ev`.`ts`"), "`ev`.`ts`");
         assert_eq!(item_expr("x AS `a` + 1"), "x AS `a` + 1");
+    }
+
+    /// JSON texts compare as the server stores them: a DECIMAL's scale and the formatting are
+    /// lost, integers and doubles stay apart.
+    #[test]
+    fn json_texts_compare_as_stored() {
+        let c = |s: &str| String::from_utf8(json_canonical(s.as_bytes())).unwrap();
+        // The text a view computes vs. what the MV table returns for it (measured, MySQL 8.4).
+        for (computed, stored) in [
+            ("[10.00, 20.50]", "[10.0, 20.5]"),
+            (r#"{"amt": 1.50}"#, r#"{"amt": 1.5}"#),
+            ("100.000", "100.0"),
+            ("0.000000150", "0.00000015"),
+            ("12345678901234567890.1234567890", "1.2345678901234567e19"),
+            ("18446744073709551616", "1.8446744073709552e19"),
+            (
+                r#"{"b":1,"a":2,"aa":3,"a":4}"#,
+                r#"{"a": 4, "b": 1, "aa": 3}"#,
+            ),
+            ("[0.30000000000000004, 1e20]", "[0.30000000000000004, 1e20]"),
+        ] {
+            assert_eq!(c(computed), c(stored), "{computed} vs {stored}");
+            assert_eq!(c(&c(stored)), c(stored), "canonical text is stable");
+        }
+        // Integers and doubles are different values in the server's format (`1` vs `1.0`).
+        assert_ne!(c("[1]"), c("[1.0]"));
+        assert_ne!(c(r#"{"a": 10}"#), c(r#"{"a": 10.0}"#));
+        assert_eq!(
+            c("[18446744073709551615, -9223372036854775808]"),
+            "[18446744073709551615,-9223372036854775808]"
+        );
+        assert_ne!(c("[10.00]"), c("[10.01]"));
+        assert_ne!(c(r#"["10.00"]"#), c(r#"["10.0"]"#), "strings stay exact");
+        assert_eq!(c("not json"), "not json");
     }
 }
