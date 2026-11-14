@@ -1021,7 +1021,6 @@ impl PgConn {
             units_changed: d.changed.len() as u64,
             deleted: d.deleted_rows,
             inserted: d.inserts.len() as u64,
-            upserted: if d.by_unit { 0 } else { d.inserts.len() as u64 },
             updated: d.updated_rows,
             unchanged: d.unchanged_rows,
         };
@@ -1029,7 +1028,7 @@ impl PgConn {
         let tx = self.client.transaction().await?;
         if d.by_unit && d.deleted_rows > 0 {
             let (cols, types) = unit_cols(layout, &layout.unit_pos);
-            let chunk = crate::mv::keys_chunk(d.changed.clone());
+            let chunk = crate::mv::keys_chunk(&d.changed);
             let (f, bound) =
                 filter_bind(&chunk, &cols, &layout.write_kinds(&layout.unit_pos), &types);
             let sql = format!(
@@ -1170,7 +1169,7 @@ async fn delete_keys_on<C: GenericClient>(
     let per = crate::mv::MAX_PARAMS / cols.len().max(1);
     let key_bytes = |k: &Key| 4 + k.iter().map(crate::mv::datum_bytes).sum::<usize>();
     for piece in crate::mv::batches(keys, per, w.batch_bytes, key_bytes) {
-        let chunk = crate::mv::keys_chunk(piece.to_vec());
+        let chunk = crate::mv::keys_chunk(piece);
         let (f, bound) = filter_bind(&chunk, &cols, &[], &types);
         let sql = format!(
             "DELETE FROM {}.{} WHERE {f}",

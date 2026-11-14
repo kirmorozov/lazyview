@@ -879,14 +879,14 @@ async fn fenced<T>(
 async fn diff(run: &Run, old: Vec<Vec<Value>>, new: &Arc<Prepared>) -> Result<Diff> {
     let datums: usize = old.iter().map(Vec::len).sum::<usize>() + new.datums;
     if old.len() + new.rows < OFFLOAD_ROWS && datums < OFFLOAD_DATUMS {
-        return mv::diff(&run.job.layout, old, new);
+        return Ok(mv::diff(&run.job.layout, old, new));
     }
     let (layout, new) = (run.job.layout.clone(), new.clone());
     let _cpu = run.cpu.clone().acquire_owned().await;
     Metrics::add(&run.metrics.supervisor_cpu_offloads, 1);
     tokio::task::spawn_blocking(move || mv::diff(&layout, old, &new))
         .await
-        .map_err(|e| anyhow!("internal: diff failed: {e}"))?
+        .map_err(|e| anyhow!("internal: diff failed: {e}"))
 }
 
 #[cfg(test)]

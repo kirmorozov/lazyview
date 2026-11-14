@@ -77,7 +77,6 @@ fn rows_split_upserts_into_inserted_and_updated() {
         units_changed: 2,
         deleted: 1,
         inserted: 5,
-        upserted: 5,
         updated: 3,
         unchanged: 7,
     });

@@ -696,7 +696,7 @@ async fn delete_keys<C: Queryable>(
     let per = MAX_PARAMS / cols.len().max(1);
     let key_bytes = |k: &Key| 4 + k.iter().map(datum_bytes).sum::<usize>();
     for piece in batches(keys, per, w.batch_bytes, key_bytes) {
-        let chunk = keys_chunk(piece.to_vec());
+        let chunk = keys_chunk(piece);
         let (f, p) = crate::target::unit_filter(kind, &chunk, &cols, &kinds);
         conn.exec_drop(
             format!("DELETE FROM {}.{} WHERE {f}", q(schema), q(table)),
@@ -889,8 +889,6 @@ pub struct Applied {
     pub deleted: u64,
     /// Rows written by INSERTs (upserts included).
     pub inserted: u64,
-    /// Of those, rows upserted by their row key.
-    pub upserted: u64,
     /// Of `inserted`, rows that replace an old row with the same row key in place.
     pub updated: u64,
     /// Old rows compared and found equal (not written).
@@ -996,9 +994,8 @@ fn same_rows(a: &[&Row2], b: &[&Row2]) -> bool {
 }
 
 /// Compares old MV rows with the prepared new rows per unit, and within a changed unit per row
-/// key when the layout has one (pure CPU work). Fails if new rows share a row key without a
-/// NULL: the identity the table's unique index is built on does not hold.
-pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Result<Diff> {
+/// key when the layout has one (pure CPU work).
+pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
     let compared = old.len() + new.rows;
     let old = group(
         layout,
@@ -1030,14 +1027,14 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Result<Dif
                 d.deleted_rows += o.len() as u64;
                 d.inserts.extend(n.iter().map(|r| r.1.clone()));
             }
-            Some(key) => diff_rows(key, o, n, &mut d)?,
+            Some(key) => diff_rows(key, o, n, &mut d),
         }
     }
-    Ok(d)
+    d
 }
 
 /// The rows of one changed unit, compared per row key (see [`diff`]).
-fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) -> Result<()> {
+fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) {
     fn by_key<'a>(key: &[usize], rows: Vec<&'a Row2>) -> HashMap<Key, Vec<&'a Row2>> {
         let mut m: HashMap<Key, Vec<&Row2>> = HashMap::new();
         for r in rows {
@@ -1055,13 +1052,12 @@ fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) -> R
             continue;
         }
         let null = crate::datum::key_has_null(&k);
-        if n.len() > 1 && !null {
-            bail!(
-                "internal: {} rows of the view share the row key {k:?}; the table's unique index \
-                 `{ROW_INDEX}` cannot hold them",
-                n.len()
-            );
-        }
+        debug_assert!(
+            null || n.len() <= 1,
+            "internal: {} rows of the view share the row key {k:?}; the table's unique index \
+             `{ROW_INDEX}` cannot hold them",
+            n.len()
+        );
         // An old row with the same key is replaced in place, unless the key has a NULL (or the
         // table holds it more than once): those are deleted and inserted again.
         if !o.is_empty() && (null || o.len() > 1) {
@@ -1076,7 +1072,6 @@ fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) -> R
         d.delete_keys.push(k);
         d.deleted_rows += o.len() as u64;
     }
-    Ok(())
 }
 
 /// Writes a diff in one transaction (see [`Diff`]). `began` is set once the transaction has
@@ -1141,7 +1136,6 @@ async fn write_tx_mysql(
         units_changed: d.changed.len() as u64,
         deleted: d.deleted_rows,
         inserted: d.inserts.len() as u64,
-        upserted: if d.by_unit { 0 } else { d.inserts.len() as u64 },
         updated: d.updated_rows,
         unchanged: d.unchanged_rows,
     };
@@ -1150,7 +1144,7 @@ async fn write_tx_mysql(
         let del_filter = if layout.unit_pos.is_empty() {
             ("TRUE".to_string(), Vec::new())
         } else {
-            let chunk = keys_chunk(d.changed.clone());
+            let chunk = keys_chunk(&d.changed);
             crate::target::unit_filter(
                 w.kind,
                 &chunk,
@@ -1214,8 +1208,7 @@ pub async fn apply(
 ) -> Result<Applied> {
     let old = read_old(conn, schema, table, layout, w.kind, chunk, metrics).await?;
     let new = prepare(layout, new_rows.to_vec());
-    let d = diff(layout, old, &new)
-        .with_context(|| format!("comparing the rows of `{schema}`.`{table}`"))?;
+    let d = diff(layout, old, &new);
     write_diff(
         conn,
         schema,
@@ -1230,7 +1223,7 @@ pub async fn apply(
 }
 
 /// Builds a chunk from arbitrary keys (sorted integers when possible).
-pub fn keys_chunk(keys: Vec<Key>) -> UnitChunk {
+pub(crate) fn keys_chunk(keys: &[Key]) -> UnitChunk {
     let ints: Option<Vec<i64>> = keys
         .iter()
         .map(|k| match &**k {
@@ -1244,7 +1237,7 @@ pub fn keys_chunk(keys: Vec<Key>) -> UnitChunk {
             v.dedup();
             UnitChunk::Ints(v)
         }
-        None => UnitChunk::Keys(keys),
+        None => UnitChunk::Keys(keys.to_vec()),
     }
 }
 
@@ -1565,12 +1558,12 @@ mod tests {
             row(1, "[10.0, 20.5]", r#"{"x": 1.5}"#),
             row(2, "[3.25]", "[1, 2]"),
         ];
-        let d = diff(&l, stored.clone(), &prepare(&l, source.clone())).unwrap();
+        let d = diff(&l, stored.clone(), &prepare(&l, source.clone()));
         assert!(d.changed.is_empty(), "rewrote equal units: {:?}", d.changed);
         // A real change of one unit rewrites that unit only.
         let mut changed = source.clone();
         changed[1] = row(2, "[3.26]", "[1, 2]");
-        let d = diff(&l, stored.clone(), &prepare(&l, changed)).unwrap();
+        let d = diff(&l, stored.clone(), &prepare(&l, changed));
         assert_eq!(d.changed.len(), 1);
         assert_eq!(
             d.changed[0][1],
@@ -1587,8 +1580,7 @@ mod tests {
             &l,
             stored,
             &prepare(&l, vec![source[0].clone(), row(2, "[3.25]", "[1, 2.0]")]),
-        )
-        .unwrap();
+        );
         assert_eq!(d.changed.len(), 2, "old [1,2] and new [1,2.0] units");
     }
 
@@ -1828,12 +1820,12 @@ mod tests {
             v
         };
         // Nothing changed: nothing written.
-        let d = diff(&l, old.clone(), &prepare(&l, old.clone())).unwrap();
+        let d = diff(&l, old.clone(), &prepare(&l, old.clone()));
         assert!(d.changed.is_empty() && d.inserts.is_empty() && d.delete_keys.is_empty());
         // One row of a 3-row unit changes: one upsert, no delete, unit counted once.
         let mut new = old.clone();
         new[1] = r(1, "B", Some(11));
-        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        let d = diff(&l, old.clone(), &prepare(&l, new));
         assert!(!d.by_unit);
         assert_eq!(d.changed.len(), 1);
         assert_eq!(d.inserts, vec![r(1, "B", Some(11))]);
@@ -1849,7 +1841,7 @@ mod tests {
             r(1, "d", Some(13)),
             r(2, "x", None),
         ];
-        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        let d = diff(&l, old.clone(), &prepare(&l, new));
         assert_eq!(d.changed.len(), 2);
         assert_eq!(d.inserts, vec![r(1, "d", Some(13))]);
         assert_eq!(sorted(d.delete_keys), vec![k(1, Some(12)), k(3, Some(30))]);
@@ -1857,20 +1849,20 @@ mod tests {
         // A row with a NULL in its key changes: delete (null-safe) + insert.
         let mut new = old.clone();
         new[3] = r(2, "X", None);
-        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        let d = diff(&l, old.clone(), &prepare(&l, new));
         assert_eq!(d.delete_keys, vec![k(2, None)]);
         assert_eq!(d.inserts, vec![r(2, "X", None)]);
         assert_eq!(d.deleted_rows, 1);
         // The unmatched row gets a match: its NULL-key row goes, the new key is upserted.
         let mut new = old.clone();
         new[3] = r(2, "x", Some(20));
-        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        let d = diff(&l, old.clone(), &prepare(&l, new));
         assert_eq!(d.delete_keys, vec![k(2, None)]);
         assert_eq!(d.inserts, vec![r(2, "x", Some(20))]);
         // A row moves from unit 3 to unit 1 (another unit's lineage now): both units change.
         let mut new = old.clone();
         new[4] = r(1, "y", Some(30));
-        let d = diff(&l, old.clone(), &prepare(&l, new)).unwrap();
+        let d = diff(&l, old.clone(), &prepare(&l, new));
         assert_eq!(d.changed.len(), 2);
         assert_eq!(d.delete_keys, vec![k(3, Some(30))]);
         assert_eq!(d.inserts, vec![r(1, "y", Some(30))]);
@@ -1887,33 +1879,25 @@ mod tests {
         );
         l2.identity = vec![0];
         let g = |s: &str, n: i64| vec![Value::Bytes(s.as_bytes().to_vec()), Value::Int(n)];
-        let d = diff(&l2, vec![g("a", 1)], &prepare(&l2, vec![g("A", 1)])).unwrap();
+        let d = diff(&l2, vec![g("a", 1)], &prepare(&l2, vec![g("A", 1)]));
         assert_eq!(
             d.delete_keys,
             vec![Key::from([Datum::Bytes(b"a".to_vec())])]
         );
         assert_eq!(d.inserts, vec![g("A", 1)]);
-        // Rows sharing a key without a NULL contradict the unique index: an error, not data loss.
-        let e = diff(
-            &l,
-            vec![],
-            &prepare(&l, vec![r(1, "a", Some(10)), r(1, "b", Some(10))]),
-        );
-        assert!(e.unwrap_err().to_string().contains("share the row key"));
-        // ... with a NULL they are legal (NULLs never conflict) and inserted as they are.
+        // Rows sharing a key with a NULL are legal (NULLs never conflict) and inserted as they are.
         let d = diff(
             &l,
             vec![],
             &prepare(&l, vec![r(5, "a", None), r(5, "b", None)]),
-        )
-        .unwrap();
+        );
         assert_eq!(d.inserts.len(), 2);
         // Without a row key the changed units are rewritten whole, as before.
         let mut l3 = l.clone();
         l3.identity = vec![];
         let mut new = old.clone();
         new[1] = r(1, "B", Some(11));
-        let d = diff(&l3, old.clone(), &prepare(&l3, new)).unwrap();
+        let d = diff(&l3, old.clone(), &prepare(&l3, new));
         assert!(d.by_unit && d.delete_keys.is_empty());
         assert_eq!((d.inserts.len(), d.deleted_rows), (3, 3));
     }
