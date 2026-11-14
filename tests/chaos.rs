@@ -765,10 +765,11 @@ fn chaos_src_binlog_reset_mid_txn() {
 }
 
 /// `timeout{timeout:0}` on the dump link never closes it and never delivers anything, so the only
-/// thing that can end the fault is the engine's own bounds: the silence detector (`idle_timeout` is
-/// heartbeat × 3 + 10 s, i.e. ~10.6 s with `LAZYVIEW_HEARTBEAT_MS=200`, F5) and then the 30 s
-/// first-event guard on the reconnect attempt. The harness waits for both, removes the toxic, and
-/// the stream comes back from the saved position.
+/// thing that can end the fault is the engine's own bounds (the one place they live now that the
+/// reader has no idle timeout of its own): the stream loop's silence detector,
+/// `(heartbeat × 3).max(15 s)` = 15 s with `LAZYVIEW_HEARTBEAT_MS=200` (F5), and then
+/// `BINLOG_CONNECT_TIMEOUT` on the reconnect attempt. The harness waits for both, removes the
+/// toxic, and the stream comes back from the saved position.
 #[test]
 fn chaos_src_binlog_blackhole() {
     let _one = toxi::exclusive();
@@ -783,21 +784,21 @@ fn chaos_src_binlog_blackhole() {
         let before = f.eng.snapshot();
         f.arm("binlog", &Toxic::timeout(0).named("black-hole"))
             .await?;
-        // The engine notices on its own: the silence detector, then the reconnect attempt that the
-        // 30 s first-event guard kills (the toxic applies to the new stream too, F5).
+        // The engine notices on its own: the stream loop's silence detector, then the reconnect
+        // attempt that the connect timeout kills (the toxic applies to the new stream too, F5).
         wait_until(
             "the silence detector to declare the stream dead",
             FAULT,
             || {
                 let f = &f;
-                async move { Ok(f.log_line("connection presumed dead")?.is_some()) }
+                async move { Ok(f.log_line("no binlog event or heartbeat")?.is_some()) }
             },
         )
         .await
         .with_context(|| {
             format!(
                 "the fault never landed: {} of silence across the dump link and the engine never \
-                 logged 'connection presumed dead'",
+                 logged 'no binlog event or heartbeat'",
                 FAULT.as_secs()
             )
         })?;
@@ -808,11 +809,13 @@ fn chaos_src_binlog_blackhole() {
         );
         ctx.log(format!(
             "black hole: {}",
-            f.log_line("connection presumed dead")?.unwrap_or_default()
+            f.log_line("no binlog event or heartbeat")?
+                .unwrap_or_default()
         ));
+        // The attempt itself, not the silence line above, is what proves the stream was retried.
         wait_until("the engine to attempt the reconnect", FAULT, || {
             let f = &f;
-            async move { Ok(f.log_line("reconnect")?.is_some()) }
+            async move { Ok(f.log_line("binlog connect failed")?.is_some()) }
         })
         .await
         .with_context(|| "the black-holed stream was never retried: no reconnect in the log")?;
