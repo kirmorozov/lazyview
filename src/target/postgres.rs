@@ -184,6 +184,13 @@ fn filter_bind(
         let types: Vec<&MvCol> = at.iter().filter_map(|&u| types.get(u).copied()).collect();
         return filter_bind(c, &cols, &[], &types);
     }
+    if cols.is_empty() {
+        // A view with no unit columns - the global aggregate, one unit: the whole table. An empty
+        // column list would render `() IN (())`, a syntax error here, so the filter matches every
+        // row: the same semantics as the MySQL family's empty-unit arm of `write_tx_mysql`
+        // (`src/mv.rs:1122-1125`), whose `TRUE` this is.
+        return ("TRUE".to_string(), Vec::new());
+    }
     let exprs: Vec<String> = cols.iter().map(|e| format!("({e})")).collect();
     let mut params: Vec<Option<String>> = Vec::new();
     // One key as `((c)) = $n` per column, and one key as the `($1,$2)` row of an `IN` list.
@@ -734,10 +741,16 @@ const PG_TEXT_CHARS: u64 = PG_KEY_BYTES / 4;
 /// can never be taken whole - and a PostgreSQL index carries no prefix (T3.2), so not at all;
 /// `jsonb` has no b-tree operator class and a type the map does not size cannot be planned.
 pub(crate) fn key_part(col: &MvCol) -> KeyPart {
-    let text = |per_char| KeyPart::Str {
-        len: PG_TEXT_CHARS,
-        per_char,
-        must_prefix: true,
+    // The `must_prefix` parts are read by the MySQL family's `fit_key` too: a view that also has
+    // a PostgreSQL target is planned with *these* widths for both tables (§0.5), so a prefix they
+    // render must be one MySQL accepts - `col(n)` only on its string and binary types (a prefix
+    // of an enum or a TIME is ERROR 1089), and never longer than the column itself (`category`
+    // is a varchar(32); the old 676-character width of the unsized `text` spelled a shadow table
+    // MySQL rejected, which held the whole build of such a view). `paren_number` is the source
+    // column's own declared length; what it does not declare stays the unsized cap.
+    let declared = || {
+        paren_number(&col.column_type.to_ascii_lowercase())
+            .map_or(PG_TEXT_CHARS, |n| n.min(PG_TEXT_CHARS))
     };
     match pg_type(col).as_str() {
         "smallint" => KeyPart::Fixed(2),
@@ -752,8 +765,24 @@ pub(crate) fn key_part(col: &MvCol) -> KeyPart {
             per_char: 4,
             must_prefix: false,
         },
-        "text" => text(4),
-        "bytea" => text(1),
+        "text"
+            if matches!(
+                col.data_type.as_str(),
+                "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext"
+            ) =>
+        {
+            KeyPart::Str {
+                len: declared(),
+                per_char: 4,
+                must_prefix: true,
+            }
+        }
+        // The bytea types are MySQL's binary and blob family, where a prefix is legal too.
+        "bytea" => KeyPart::Str {
+            len: declared(),
+            per_char: 1,
+            must_prefix: true,
+        },
         _ => KeyPart::None,
     }
 }
@@ -1479,6 +1508,7 @@ fn parse_time_text(text: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::datum::Datum;
+    use crate::target::PG_KEY_BYTES;
 
     fn col(name: &str, data_type: &str, column_type: &str) -> MvCol {
         MvCol {

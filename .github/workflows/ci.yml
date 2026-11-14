@@ -267,6 +267,81 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  integration-pg:
+    # A MySQL-family source maintained into PostgreSQL (issue #56). One blocking job on the
+    # supported baseline major; the other majors come in a later PR. The source is a normal
+    # matrix flavor; PostgreSQL is only ever a target (LAZYVIEW_TEST_PG_DSNS).
+    name: integration (postgres target, mysql84 + pg16)
+    if: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      COMPOSE_FILE: docker-compose.test.yml
+      SERVICES: mysql84 pg16
+    steps:  # identical to integration-multi: start servers, rust, rust-cache (shared-key
+            # integration, save-if false), build --test targets, wait, print versions, then
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start the servers (in the background)
+        run: |
+          read -ra services <<<"$SERVICES"
+          docker compose up -d --quiet-pull "${services[@]}"
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache (its mysql84 job writes it).
+          shared-key: integration
+          save-if: false
+      - name: build the targets tests
+        run: cargo test --locked --test targets --no-run
+      - name: wait for the servers
+        run: |
+          read -ra services <<<"$SERVICES"
+          docker compose up -d --wait --wait-timeout 300 "${services[@]}"
+      - name: server versions
+        run: |
+          echo "mysql84: $(docker compose exec -T mysql84 sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"')"
+          echo "PGVERSION: $(docker compose exec -T pg16 psql -U lv -d lvtest -Atc 'select version()')"
+      - name: postgres target tests
+        env:
+          LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
+          LAZYVIEW_TEST_PG_DSNS: pg16=postgres://lv:lv@127.0.0.1:35432/lvtest
+          LAZYVIEW_HEALTH_ADDR: "off"
+          LAZYVIEW_TEST_REQUIRE_PG: "1"
+          LAZYVIEW_TEST_REQUIRE_MULTI: "1"
+        run: |
+          cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
+            | tee pg-target-tests.log
+          for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
+                   targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others; do
+            grep -q "^test $t \.\.\. ok$" pg-target-tests.log || { echo "::error::$t did not run and pass"; exit 1; }
+          done
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          for s in $SERVICES; do
+            docker compose logs --no-color --timestamps "$s" > "server-logs/$s.log" 2>&1 || true
+          done
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-logs-pg-server
+          path: |
+            server-logs/
+            tmp/out/test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the servers
+        if: always()
+        run: docker compose down -v
+
   e2e:
     name: image smoke + end-to-end
     runs-on: ubuntu-24.04

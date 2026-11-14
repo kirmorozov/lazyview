@@ -418,6 +418,68 @@ pub async fn check_views_targets(
     Ok(())
 }
 
+/// Like [`check_views_targets`], for the PostgreSQL targets (issue #56, PR C1): the oracle is
+/// read from the source with the existing [`fetch`], the MV from PostgreSQL with
+/// [`super::pg::fetch`], and both go through the existing [`diff_tables`] as multisets of byte
+/// cells after the per-type normalization of the PostgreSQL column types (floats as `f64` bit
+/// patterns, `jsonb` reparsed, `bytea` hex-decoded, `timestamptz` stripped of its constant
+/// `+00`). Zero dates (D5): in a NOT NULL date column a source zero date compares as NULL on
+/// both sides; a nullable date column holding one is skipped and the row count is asserted
+/// instead ([`super::pg::align`]). Collects all mismatches into one error.
+pub async fn check_views_pg_targets(
+    src: &Db,
+    pg_targets: &HashMap<String, super::pg::PgDb>,
+    specs: &[ViewSpec],
+) -> Result<()> {
+    if pg_targets.is_empty() {
+        return Ok(());
+    }
+    let mut sc = src.conn().await?;
+    let mut failures = String::new();
+    let mut n_bad = 0;
+    for spec in specs {
+        for t in spec.target_names() {
+            if t == "source" {
+                continue;
+            }
+            let Some(pgdb) = pg_targets.get(&t) else {
+                continue;
+            };
+            let client = pgdb.client().await?;
+            let cols = super::pg::columns(&client, &pgdb.schema, &spec.name).await?;
+            let diff = if cols.is_empty() {
+                Some(format!(
+                    "  MV table `{}` does not exist in schema `{}` on PostgreSQL target {t}\n",
+                    spec.name, pgdb.schema
+                ))
+            } else {
+                ensure_oracle(&mut sc, &src.name, spec, false).await?;
+                let expected = fetch_oracle(&mut sc, &src.name, spec).await?;
+                let actual = super::pg::fetch(&client, &pgdb.schema, &spec.name).await?;
+                let (e, a, extra) = super::pg::align(&cols, expected, actual);
+                diff_tables(&e, &a, 15).or(extra)
+            };
+            drop(client);
+            if let Some(d) = diff {
+                n_bad += 1;
+                let _ = write!(
+                    failures,
+                    "\nview `{}` on PostgreSQL target {t} ({:?}) differs from oracle:\n  definition: {}\n{d}",
+                    spec.name, spec.kind, spec.definition
+                );
+            }
+        }
+    }
+    sc.disconnect().await.ok();
+    if n_bad > 0 {
+        bail!(
+            "{n_bad} view(s) differ from their oracle on a PostgreSQL target (schema {}):{failures}",
+            src.name
+        );
+    }
+    Ok(())
+}
+
 /// Order-independent content fingerprint of a table (row count + sorted-row hash), via SQL text.
 pub async fn fingerprint(conn: &mut Conn, table: &str) -> Result<(usize, u64)> {
     let t = fetch(conn, &format!("SELECT * FROM {}", ident(table))).await?;
