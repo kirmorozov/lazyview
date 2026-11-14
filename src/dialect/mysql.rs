@@ -1,9 +1,10 @@
 //! The MySQL family's answers on the dialect seam: the identifier quoting, the function
-//! vocabularies, the parameter and coercion renderings and the parse profile (how a definition's
+//! vocabularies, the parameter and coercion renderings, the parse profile (how a definition's
 //! text is tokenized and handed to the query parser, and how a rendered select item loses its
-//! alias), moved verbatim from `crate::analyze::vocab`, `crate::analyze::columns`,
-//! `crate::analyze::expr`, `crate::analyze::parse` and `crate::mv`. `std`, `sqlparser` and
-//! `anyhow` only — no host code.
+//! alias) and the source-read renderings (the `UNIX_TIMESTAMP` epoch `SELECT`, its read list and
+//! the epoch-to-datetime reading back), moved verbatim from `crate::analyze::vocab`,
+//! `crate::analyze::columns`, `crate::analyze::expr`, `crate::analyze::parse` and `crate::mv`.
+//! `std`, `sqlparser`, `anyhow` and `mysql_async`'s `Value` only — no host code.
 //!
 //! Copy set: lazy-wire-fire copies this file together with `src/dialect/mod.rs` (its parent,
 //! the [`Family`](super::Family) discriminator) verbatim, as a pair, so the quoting answers and
@@ -11,6 +12,7 @@
 //! compile standalone.
 
 use anyhow::anyhow;
+use mysql_async::Value;
 use sqlparser::ast::Ident;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -411,6 +413,142 @@ pub(crate) fn item_expr(item: &str) -> &str {
     } else {
         item
     }
+}
+
+// The source-read renderings: reading TIMESTAMP columns as epoch seconds is the MySQL family's
+// answer (`UNIX_TIMESTAMP()` yields the epoch in the session zone, which is what carries a DST
+// fold through the round trip). The caller (`crate::mv`'s `Layout`) hands these its rendered data
+// and keeps no rendering of its own; the PostgreSQL forms arrive beside these, not as a
+// server-name branch at the call site.
+
+/// The source `SELECT` for the plan's already-rendered `SELECT`: `UNIX_TIMESTAMP(<expr>)`
+/// as `_lv_ts{k}` of each epoch column in front of the select list. (Applied to the
+/// expressions themselves: over the column of a derived table MySQL converts through the
+/// session's local time and loses the DST fold.) Returns `sql` unchanged when there are no
+/// epoch columns or it does not start with `SELECT ` (checked by `probe`: the SELECT of an
+/// incremental plan starts like this).
+pub(crate) fn source_select(sql: &str, epoch: &[(usize, String)]) -> String {
+    if epoch.is_empty() {
+        return sql.to_string();
+    }
+    let Some(rest) = sql.strip_prefix("SELECT ") else {
+        return sql.to_string();
+    };
+    let extra: Vec<String> = epoch
+        .iter()
+        .enumerate()
+        .map(|(k, (_, e))| format!("UNIX_TIMESTAMP({e}) AS `_lv_ts{k}`"))
+        .collect();
+    format!("SELECT {}, {rest}", extra.join(", "))
+}
+
+/// Column list that reads a materialized table: every name backtick-quoted, except the
+/// column positions in `epoch` (the TIMESTAMP columns read through [`source_select`]), which
+/// come back as `UNIX_TIMESTAMP(name)`.
+pub(crate) fn read_list(names: &[String], epoch: &[usize]) -> String {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if epoch.contains(&i) {
+                format!("UNIX_TIMESTAMP({})", quote_ident(name))
+            } else {
+                quote_ident(name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The TIMESTAMP columns of a probed plan with the expressions that compute them: `ts` holds
+/// the positions of the TIMESTAMP columns in the materialized layout (the caller's own
+/// type test), `projection` and `unit_exprs` are the plan's rendered items split by
+/// `n_visible` and `hidden`. Empty unless the plan is incremental, its SELECT starts with
+/// `SELECT `, and every TIMESTAMP column has a known expression (all-or-nothing: a layout
+/// without epochs reads none through [`source_select`]).
+pub(crate) fn epoch_prefix(
+    incremental: bool,
+    select_sql: &str,
+    projection: &[String],
+    unit_exprs: &[String],
+    ts: &[usize],
+    n_visible: usize,
+    hidden: &[usize],
+) -> Vec<(usize, String)> {
+    if !incremental || !select_sql.starts_with("SELECT ") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &i in ts {
+        let expr = if i < n_visible {
+            projection.get(i).cloned()
+        } else {
+            hidden
+                .get(i - n_visible)
+                .and_then(|&u| unit_exprs.get(u).cloned())
+        };
+        match expr {
+            Some(e) => out.push((i, e)),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// A `UNIX_TIMESTAMP()` result (`<seconds>[.<fraction>]`) as the UTC datetime; 0 is the zero
+/// TIMESTAMP. Other values are returned unchanged.
+pub(crate) fn epoch_to_utc(v: Value) -> Value {
+    let (secs, micros) = match &v {
+        Value::Int(s) => (*s, 0),
+        Value::UInt(s) => match i64::try_from(*s) {
+            Ok(s) => (s, 0),
+            Err(_) => return v,
+        },
+        Value::Bytes(b) => match parse_epoch(b) {
+            Some(e) => e,
+            None => return v,
+        },
+        _ => return v,
+    };
+    if secs == 0 && micros == 0 {
+        return Value::Date(0, 0, 0, 0, 0, 0, 0);
+    }
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let t = secs.rem_euclid(86_400);
+    let Ok(y) = u16::try_from(y) else { return v };
+    Value::Date(
+        y,
+        m,
+        d,
+        (t / 3600) as u8,
+        (t % 3600 / 60) as u8,
+        (t % 60) as u8,
+        micros,
+    )
+}
+
+pub(crate) fn parse_epoch(b: &[u8]) -> Option<(i64, u32)> {
+    let s = std::str::from_utf8(b).ok()?;
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    if !frac.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let frac = format!("{:0<6}", &frac[..frac.len().min(6)]);
+    Some((int.parse().ok()?, frac.parse().ok()?))
+}
+
+/// Proleptic Gregorian (year, month, day) of a day number counted from 1970-01-01.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
 }
 
 #[cfg(test)]

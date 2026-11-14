@@ -4,8 +4,9 @@
 //!
 //! The answers so far are the identifier quoting, the function vocabularies, the parameter and
 //! coercion renderings (the placeholder, how a JSON value binds, how a `?` takes a character set)
-//! and the parse profile (how a definition's text is tokenized and handed to the query parser):
-//! all of them [`mysql`]'s, since MySQL family is the only one with answers here. A new family adds
+//! the parse profile (how a definition's text is tokenized and handed to the query parser) and
+//! the source-read renderings (how a TIMESTAMP epoch is read and read back): all of them
+//! [`mysql`]'s, since MySQL family is the only one with answers here. A new family adds
 //! its own answers next to these rather than branching on a server name at the call site.
 //!
 //! Copy set: lazy-wire-fire copies `src/dialect/mod.rs` and `src/dialect/mysql.rs` verbatim,

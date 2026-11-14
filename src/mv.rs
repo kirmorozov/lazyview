@@ -144,41 +144,19 @@ impl Layout {
     }
 
     /// The SELECT that reads the source rows (filtered by a unit predicate): the plan's SELECT
-    /// with `UNIX_TIMESTAMP(<expression>)` of each TIMESTAMP column in front of its select list.
-    /// (Applied to the expressions themselves: over the column of a derived table MySQL converts
-    /// through the session's local time and loses the DST fold.)
+    /// with the epoch columns of [`crate::dialect::mysql::source_select`] in front of its select
+    /// list.
     pub fn source_sql(&self, plan: &ViewPlan, filter: Option<&str>) -> String {
         let sql = plan.select_sql(&self.hidden, filter);
-        if !self.epoch_timestamps() {
-            return sql;
-        }
-        // (Checked by `probe`: the SELECT of an incremental plan starts like this.)
-        let Some(rest) = sql.strip_prefix("SELECT ") else {
-            return sql;
-        };
-        let extra: Vec<String> = self
-            .epoch
-            .iter()
-            .enumerate()
-            .map(|(k, (_, e))| format!("UNIX_TIMESTAMP({e}) AS `_lv_ts{k}`"))
-            .collect();
-        format!("SELECT {}, {rest}", extra.join(", "))
+        crate::dialect::mysql::source_select(&sql, &self.epoch)
     }
 
-    /// Column list that reads a materialized table (TIMESTAMP columns as `UNIX_TIMESTAMP`).
+    /// Column list that reads a materialized table (TIMESTAMP columns as epochs,
+    /// [`crate::dialect::mysql::read_list`]).
     fn read_list(&self) -> String {
-        self.cols
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                if self.epoch.iter().any(|(p, _)| *p == i) {
-                    format!("UNIX_TIMESTAMP({})", q(&c.name))
-                } else {
-                    q(&c.name)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        let names: Vec<String> = self.cols.iter().map(|c| c.name.clone()).collect();
+        let epoch: Vec<usize> = self.epoch.iter().map(|(p, _)| *p).collect();
+        crate::dialect::mysql::read_list(&names, &epoch)
     }
 
     /// Brings a row read with [`Layout::source_sql`] into the form of [`Layout::normalize`]:
@@ -214,7 +192,7 @@ impl Layout {
         }
         for (p, _) in &self.epoch {
             if let Some(v) = row.get_mut(*p) {
-                *v = epoch_to_utc(std::mem::replace(v, Value::NULL));
+                *v = crate::dialect::mysql::epoch_to_utc(std::mem::replace(v, Value::NULL));
             }
         }
         row
@@ -277,92 +255,35 @@ fn lineage_keys(cols: &[MvCol], from: usize) -> Option<Vec<Vec<usize>>> {
 }
 
 /// The TIMESTAMP columns of a probed layout with the expressions that compute them (see
-/// [`Layout::epoch`]); empty unless every one has a known expression.
+/// [`Layout::epoch`]); empty unless every one has a known expression. The rule is the
+/// dialect's ([`crate::dialect::mysql::epoch_prefix`]): this adapts the probe's types to it
+/// (the alias cut stays here until `dialect-call-sites` moves `item_expr`).
 fn epoch_exprs(
     plan: &ViewPlan,
     cols: &[MvCol],
     n_visible: usize,
     hidden: &[usize],
 ) -> Vec<(usize, String)> {
-    if matches!(plan.mode, Mode::Full(_)) || !plan.select_sql(hidden, None).starts_with("SELECT ") {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for (i, c) in cols.iter().enumerate() {
-        if c.data_type != "timestamp" {
-            continue;
-        }
-        let expr = if i < n_visible {
-            plan.projection
-                .get(i)
-                .map(|s| crate::dialect::mysql::item_expr(s).to_string())
-        } else {
-            hidden
-                .get(i - n_visible)
-                .and_then(|&u| plan.unit_exprs.get(u).cloned())
-        };
-        match expr {
-            Some(e) => out.push((i, e)),
-            None => return Vec::new(),
-        }
-    }
-    out
-}
-
-/// A `UNIX_TIMESTAMP()` result (`<seconds>[.<fraction>]`) as the UTC datetime; 0 is the zero
-/// TIMESTAMP. Other values are returned unchanged.
-fn epoch_to_utc(v: Value) -> Value {
-    let (secs, micros) = match &v {
-        Value::Int(s) => (*s, 0),
-        Value::UInt(s) => match i64::try_from(*s) {
-            Ok(s) => (s, 0),
-            Err(_) => return v,
-        },
-        Value::Bytes(b) => match parse_epoch(b) {
-            Some(e) => e,
-            None => return v,
-        },
-        _ => return v,
-    };
-    if secs == 0 && micros == 0 {
-        return Value::Date(0, 0, 0, 0, 0, 0, 0);
-    }
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
-    let t = secs.rem_euclid(86_400);
-    let Ok(y) = u16::try_from(y) else { return v };
-    Value::Date(
-        y,
-        m,
-        d,
-        (t / 3600) as u8,
-        (t % 3600 / 60) as u8,
-        (t % 60) as u8,
-        micros,
+    let ts: Vec<usize> = cols
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.data_type == "timestamp")
+        .map(|(i, _)| i)
+        .collect();
+    let projection: Vec<String> = plan
+        .projection
+        .iter()
+        .map(|s| crate::dialect::mysql::item_expr(s).to_string())
+        .collect();
+    crate::dialect::mysql::epoch_prefix(
+        !matches!(plan.mode, Mode::Full(_)),
+        &plan.select_sql(hidden, None),
+        &projection,
+        &plan.unit_exprs,
+        &ts,
+        n_visible,
+        hidden,
     )
-}
-
-fn parse_epoch(b: &[u8]) -> Option<(i64, u32)> {
-    let s = std::str::from_utf8(b).ok()?;
-    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
-    if !frac.bytes().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let frac = format!("{:0<6}", &frac[..frac.len().min(6)]);
-    Some((int.parse().ok()?, frac.parse().ok()?))
-}
-
-/// Proleptic Gregorian (year, month, day) of a day number counted from 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, u8, u8) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    (y, m, d)
 }
 
 /// Session settings for every connection the service opens (the target module renders them:
