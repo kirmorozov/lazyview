@@ -6,6 +6,8 @@
 #                                                 start only what you test, see Memory)
 #   scripts/test-servers.sh compose up mysql2610  # one flavor
 #   scripts/test-servers.sh compose up --pre      # plus the advisory pre-releases (2 more)
+#   scripts/test-servers.sh compose up --chaos toxiproxy
+#                                                 # plus the chaos proxy (profile `chaos`)
 #   scripts/test-servers.sh dsns                  # LAZYVIEW_TEST_DSNS for the servers that are up
 #   scripts/test-servers.sh compose down          # stop; `compose clean` also drops the data
 #
@@ -13,6 +15,7 @@
 #
 #   docker compose -f docker-compose.test.yml up -d --wait mysql84
 #   docker compose -f docker-compose.test.yml --profile prerelease up -d --wait
+#   docker compose -f docker-compose.test.yml --profile chaos up -d --wait toxiproxy
 #   LAZYVIEW_TEST_DSNS=mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest cargo test --test '*' -- --test-threads=1
 #   docker compose -f docker-compose.test.yml --profile prerelease down -v
 #
@@ -366,6 +369,35 @@ services:
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - mariadb132-pre:/var/lib/mysql
+
+  # ---- chaos: Toxiproxy (profile `chaos`; nothing in the default stack depends on it) ----------
+  # Network-layer faults for tests/chaos.rs (docs/development.md "Chaos tests"). The engine and the
+  # targets are reached through proxies the tests create and delete over the API; the harness itself
+  # never starts a container. One daemon for the whole host (the upstream's own recommendation):
+  # every test's proxies are named lv_<schema>_<role> and removed on Drop.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.13.0      # 2026-10-14; newest release (F1)
+    profiles: [chaos]
+    # API on loopback only (the API can proxy to any upstream, D5) + the fixed band the harness
+    # allocates proxy listen ports from. Published, not `network_mode: host`: the test binary runs
+    # on the host and the servers are reachable by service name on this compose network.
+    ports:
+      - "127.0.0.1:18474:8474"
+      - "127.0.0.1:17100-17199:17100-17199"
+    # so upstream `host.docker.internal:<host port>` also works: the tarball mode of
+    # scripts/test-servers.sh runs servers on the host, not on this network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    restart: "no"
 
 volumes:
   mysql80:

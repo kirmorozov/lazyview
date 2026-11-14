@@ -17,7 +17,8 @@
 #   compose up [--pre] [flavor...]   start containers and wait until healthy (default: the
 #                                    12 blocking servers, which a developer host cannot hold at
 #                                    once: name the ones you test; --pre adds the advisory
-#                                    pre-releases)
+#                                    pre-releases; --chaos activates the `chaos` profile, so
+#                                    `compose up --chaos toxiproxy` starts the chaos proxy)
 #   compose down [flavor...]         stop and remove containers (data volumes are kept)
 #   compose clean [flavor...]        down, and drop the data volumes
 #   compose logs <flavor>            server log
@@ -406,13 +407,16 @@ compose_local() {
 
 # `docker compose` on docker-compose.test.yml (+ docker-compose.local.yml) with both profiles
 # active (so that every verb sees the pre-release services; `compose_up` names the services it
-# starts).
+# starts). A leading `--chaos` activates the `chaos` profile too (the toxiproxy service of
+# tests/chaos.rs); it is consumed here and never reaches docker compose, so the default stack of
+# every verb stays exactly the two profiles above.
 compose() {
-  local files=(-f "$COMPOSE_FILE_PATH")
+  local files=(-f "$COMPOSE_FILE_PATH") profiles=(--profile prerelease)
   if compose_local; then files+=(-f "$COMPOSE_LOCAL_PATH"); fi
+  if [[ ${1:-} == --chaos ]]; then profiles+=(--profile chaos); shift; fi
   (
     close_inherited_fds
-    exec docker compose "${files[@]}" --profile prerelease "$@"
+    exec docker compose "${files[@]}" "${profiles[@]}" "$@"
   )
 }
 
@@ -433,14 +437,18 @@ compose_version() {
 }
 
 compose_up() {
-  local pre=0 f
+  local pre=0 chaos=0 f
   if [[ ${1:-} == --pre ]]; then pre=1; shift; fi
+  if [[ ${1:-} == --chaos ]]; then chaos=1; shift; fi
   local flavors=("$@")
   if [[ ${#flavors[@]} -eq 0 ]]; then
     flavors=("${BLOCKING_FLAVORS[@]}")
     (( pre )) && flavors+=("${PRE_FLAVORS[@]}")
   fi
   for f in "${flavors[@]}"; do
+    # toxiproxy is the one non-server service of the `chaos` profile: no port of the flavor table,
+    # no tarball instance, nothing to wait for beyond its own healthcheck.
+    if (( chaos )) && [[ $f == toxiproxy ]]; then continue; fi
     has_compose_service "$f" || { echo "[$f] has no service in docker-compose.test.yml (tarball mode only: $0 start $f)" >&2; return 1; }
     if pid_alive "$f"; then
       echo "[$f] a tarball instance (pid $(cat "$(pidfile_of "$f")")) holds port $(port_of "$f"); stop it first: $0 stop $f" >&2
@@ -452,8 +460,14 @@ compose_up() {
   else
     echo "CI configuration (durable defaults; docker-compose.local.yml left out)"
   fi
-  compose up -d --wait --wait-timeout "$START_TIMEOUT" "${flavors[@]}"
-  for f in "${flavors[@]}"; do echo "[$f] ready on 127.0.0.1:$(port_of "$f"), $(compose_version "$f")"; done
+  compose ${chaos:+--chaos} up -d --wait --wait-timeout "$START_TIMEOUT" "${flavors[@]}"
+  for f in "${flavors[@]}"; do
+    if (( chaos )) && [[ $f == toxiproxy ]]; then
+      echo "[toxiproxy] ready on 127.0.0.1:18474 (API), proxy ports 127.0.0.1:17100-17199"
+    else
+      echo "[$f] ready on 127.0.0.1:$(port_of "$f"), $(compose_version "$f")"
+    fi
+  done
 }
 
 compose_down() {
@@ -519,7 +533,7 @@ dsns() {
 }
 
 usage() {
-  echo "usage: $0 compose up [--pre] [flavor...] | compose down|clean [flavor...] | compose logs <flavor>" >&2
+  echo "usage: $0 compose up [--pre] [--chaos] [flavor...] | compose down|clean [flavor...] | compose logs <flavor>" >&2
   echo "       $0 fetch|start|stop|status|dsns [flavor...] | libs" >&2
   exit 2
 }
