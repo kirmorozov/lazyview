@@ -423,7 +423,7 @@ pub(crate) async fn drop_table(
 /// once per pooled connection (never per statement).
 pub(crate) fn session_setup(kind: Kind, sql_mode: &str, lock_wait_s: u64) -> Vec<String> {
     match kind {
-        Kind::Mysql => Vec::from(mysql::session_setup(sql_mode, lock_wait_s)),
+        Kind::Mysql => Vec::from(crate::dialect::mysql::session_setup(sql_mode, lock_wait_s)),
         Kind::Postgres => postgres::session_setup(lock_wait_s),
     }
 }
@@ -773,9 +773,10 @@ pub(crate) fn partial_indexes(layout: &Layout, plan: &KeyPlan) -> Vec<(String, S
 // --- Statements of the source, which is always MySQL-family ([`Kind`]): `crate::mv` names no
 // family for them, so the family is chosen here, once (T3 closes S4's staged wrappers).
 
-/// The statements that give a source pool connection the service's session settings.
+/// The statements that give a source pool connection the service's session settings (the dialect
+/// renders them: [`crate::dialect::mysql::session_setup]).
 pub(crate) fn source_session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
-    mysql::session_setup(sql_mode, lock_wait_s)
+    crate::dialect::mysql::session_setup(sql_mode, lock_wait_s)
 }
 
 /// Applies the session settings of a source connection to a fresh direct connection.
@@ -787,9 +788,9 @@ pub(crate) async fn init_source_session(
 }
 
 /// `mode` without the flags that reject values the source holds and the flags that change how SQL
-/// text is parsed.
+/// text is parsed (the dialect renders it: [`crate::dialect::mysql::permissive_sql_mode]).
 pub(crate) fn permissive_sql_mode(mode: &str) -> String {
-    mysql::permissive_sql_mode(mode)
+    crate::dialect::mysql::permissive_sql_mode(mode)
 }
 
 /// Session time zone in which TIMESTAMPs are written (a MySQL-family session, which is what a
