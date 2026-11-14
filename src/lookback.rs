@@ -82,13 +82,13 @@ impl Lookback {
     /// The combinations to look up for the new `images` (per alias) of the lookup tables
     /// `aliases`. Only those with at least one new image: the others were looked up before.
     pub fn combinations(&self, aliases: &[usize], images: &[KeySet]) -> Combinations {
+        // Same-plan alias validity is the caller's invariant: every alias indexes `images`.
+        debug_assert!(aliases.iter().all(|&a| a < images.len()));
         let n = images.len();
-        let fresh = |a: usize| images.get(a).is_some_and(|s| !s.is_empty());
+        let fresh = |a: usize| !images[a].is_empty();
         let mut all: Vec<KeySet> = vec![KeySet::default(); n];
         for &a in aliases {
-            if let Some(s) = images.get(a) {
-                all[a].extend(s.iter().cloned());
-            }
+            all[a].extend(images[a].iter().cloned());
             for h in &self.held {
                 if let Some(s) = h.images.get(a) {
                     all[a].extend(s.iter().cloned());
@@ -118,11 +118,11 @@ impl Lookback {
         aliases: &[usize],
         images: &[KeySet],
     ) {
+        // Same-plan alias validity is the caller's invariant: every alias indexes `images`.
+        debug_assert!(aliases.iter().all(|&a| a < images.len()));
         let mut kept = vec![KeySet::default(); images.len()];
         for &a in aliases {
-            if let Some(s) = images.get(a) {
-                kept[a] = s.clone();
-            }
+            kept[a] = images[a].clone();
         }
         if kept.iter().any(|s| !s.is_empty()) {
             self.held.push(Held {

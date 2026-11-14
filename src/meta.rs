@@ -374,11 +374,9 @@ pub async fn delete_stale_state(
     Ok(())
 }
 
-/// Bumps `refreshed_at` of views that were refreshed incrementally.
+/// Bumps `refreshed_at` of views that were refreshed incrementally. `names` is never empty:
+/// the only caller (the engine's flush loop) skips the batch when nothing was refreshed.
 pub async fn touch_refreshed(conn: &mut Conn, names: &[String]) -> Result<()> {
-    if names.is_empty() {
-        return Ok(());
-    }
     let marks = vec!["?"; names.len()].join(",");
     conn.exec_drop(
         format!("UPDATE `_lazyview_state` SET `refreshed_at` = CURRENT_TIMESTAMP(3) WHERE `state` = 'ready' AND `name` IN ({marks})"),

@@ -62,12 +62,13 @@ async fn run_engine(
     metrics: Arc<Metrics>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let user = binlog::replica_opts(&cfg.dsn)
-        .ok()
+    let opts = binlog::replica_opts(&cfg.dsn).ok();
+    let user = opts
+        .as_ref()
         .and_then(|o| o.user().map(str::to_string))
         .unwrap_or_else(|| "lazyview".into());
-    let schema = binlog::replica_opts(&cfg.dsn)
-        .ok()
+    let schema = opts
+        .as_ref()
         .and_then(|o| o.db_name().map(str::to_string))
         .unwrap_or_default();
     let r = async {
@@ -2214,10 +2215,9 @@ impl Engine {
     /// target fails fast until its backoff expires.
     async fn target_conn(&mut self, t: &str) -> Result<&mut target::Conn> {
         let metrics = self.metrics.clone();
-        let target = self
-            .targets
-            .get_mut(t)
-            .ok_or_else(|| anyhow!("unknown target {t}"))?;
+        // Every caller resolved `t` through the plan's alias resolution; the neighbours below
+        // (and `prepare_refresh`, `apply_target`) already index the map directly.
+        let target = self.targets.get_mut(t).unwrap();
         if target.conn.is_none() {
             if let Some(at) = target.retry_at.filter(|at| *at > Instant::now()) {
                 bail!(
@@ -3246,11 +3246,9 @@ impl Engine {
                 {
                     self.txn_foreign = true;
                 }
-                if key.0 == self.schema && key.1 == meta::DEFS {
-                    self.table_ids.insert(table_id, (key, None));
-                    return Ok(());
-                }
-                if key.0 == self.schema && key.1 == fence::table() {
+                // The definitions table and the commit fence's table are ours: no view reads
+                // them, both are remembered without a route.
+                if key.0 == self.schema && (key.1 == meta::DEFS || key.1 == fence::table()) {
                     self.table_ids.insert(table_id, (key, None));
                     return Ok(());
                 }
@@ -4111,8 +4109,7 @@ impl Engine {
             }
             if together && !self.slots.is_empty() {
                 let t1 = Instant::now();
-                let all: Vec<usize> = (0..self.slots.len()).collect();
-                self.refresh_all_live(&all).await;
+                self.refresh_all_live().await;
                 slow.push((t1.elapsed(), "refresh (all views, from)", 0));
             }
         }
@@ -5379,11 +5376,11 @@ impl Engine {
         Ok(p)
     }
 
-    /// The live refreshes of `slots` at once (supervised): each view's lookups in turn, then
+    /// The live refreshes of every slot at once (supervised): each view's lookups in turn, then
     /// every view's chunk reads and writes together on the shared pools, then each result.
-    async fn refresh_all_live(&mut self, slots: &[usize]) {
+    async fn refresh_all_live(&mut self) {
         let mut started = Vec::new();
-        for &i in slots {
+        for i in 0..self.slots.len() {
             let Some(mut st) = self.live_begin(i).await else {
                 continue;
             };
@@ -5772,11 +5769,10 @@ impl Engine {
     /// Saves the position replay must restart from: never past a change still pending (see
     /// [`Self::pending_floor`]) or an open prepared XA transaction (its rows must be re-read
     /// after a restart to be applied at XA COMMIT), unless that one stayed unresolved for
-    /// longer than [`XA_PIN_MAX`].
+    /// longer than [`XA_PIN_MAX`]. The boundary is a real binlog start (`find_start_position`
+    /// only returns `Ok` with a non-empty file), so it needs no guard here; [`meta::load_position`]
+    /// is the one place that reads an empty file as no position (a state row of an older build).
     async fn persist_position(&mut self, force: bool) -> Result<()> {
-        if self.boundary.file.is_empty() {
-            return Ok(());
-        }
         let mut pos = self.pending_floor(true);
         for (xid, xa) in self.xa_pending.iter_mut() {
             if xa.start.file.is_empty() {
