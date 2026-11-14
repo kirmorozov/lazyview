@@ -103,6 +103,25 @@ fn soak_hours() -> u32 {
         .unwrap_or(48)
 }
 
+/// `LAZYVIEW_TEST_SOAK_MINUTES=<5..=4320>`: the long run's length in minutes, overriding
+/// `soak_hours() * 60` — the seeded replay drill (two same-seed runs, same toxic sequence)
+/// runs a short window. The smoke keeps its own `SMOKE_MINUTES` either way.
+fn soak_minutes() -> Option<u32> {
+    std::env::var("LAZYVIEW_TEST_SOAK_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| (5..=72 * 60).contains(v))
+}
+
+/// `LAZYVIEW_TEST_SOAK_TOXI=1` (T7, default off): draw the `Chaos::NetworkFault` kind into the
+/// **long** mode's schedule. The smoke never draws it (D6 there), and the kind also needs the
+/// host's toxiproxy daemon (`LAZYVIEW_TEST_TOXI`, `common/toxi.rs`).
+fn soak_toxi() -> bool {
+    std::env::var("LAZYVIEW_TEST_SOAK_TOXI")
+        .ok()
+        .is_some_and(|v| v.trim() == "1")
+}
+
 /// `LAZYVIEW_TEST_SOAK=smoke` runs the smoke, `=long` the long run; anything else skips both with
 /// a counted note (the opt-in shape of `reg_saved_position_purged_while_down`).
 #[test]
@@ -130,7 +149,7 @@ fn soak_mode(mode: &'static str) {
     } else {
         let hours = soak_hours();
         (
-            hours.saturating_mul(60),
+            soak_minutes().unwrap_or_else(|| hours.saturating_mul(60)),
             soak_chaos_per_h(),
             Sizes::scaled(),
             soak_check_s(),
@@ -171,6 +190,9 @@ fn soak_mode(mode: &'static str) {
             per_hour,
             dir.display()
         ));
+        // T7: the random toxic joins the schedule only in the long mode, only when the run
+        // opted in, and only when the host's daemon is there to serve it (D6: never the smoke).
+        let network = !smoke && soak_toxi() && toxi::endpoint().is_some();
         let out = soak_run(
             &ctx,
             seed,
@@ -178,6 +200,7 @@ fn soak_mode(mode: &'static str) {
             per_hour,
             check_s,
             sizes,
+            network,
             &mut report,
             &mut logs,
         )
@@ -219,6 +242,7 @@ async fn soak_run(
     per_hour: u32,
     check_s: u64,
     sizes: Sizes,
+    network: bool,
     report: &mut Report,
     logs: &mut Vec<PathBuf>,
 ) -> Result<()> {
@@ -247,7 +271,7 @@ async fn soak_run(
     let mut writers = start_writers(&db, &ids, seed, n_writers, per_writer);
     let began = Instant::now();
     let deadline = began + Duration::from_secs(u64::from(minutes) * 60);
-    let events = plan(seed, minutes, per_hour);
+    let events = plan(seed, minutes, per_hour, network);
     let mut next_check = began + Duration::from_secs(check_s);
     let mut window = Window::now(&eng);
     // The approved-rebuild ledger of the per-view F5 rule (S3.3/Q3): chaos events fill it, the
@@ -278,6 +302,8 @@ async fn soak_run(
                 ov: &ov,
                 logs,
                 approved: &mut approved,
+                seed,
+                toxi_i: done - 1,
             };
             let (row, next) = run_event(&mut run, eng, kind, at).await?;
             eng = next;

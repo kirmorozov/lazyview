@@ -46,15 +46,22 @@ pub enum Chaos {
     TargetDown,
     SourcePause,
     SourceDdl,
+    /// A random toxic on one source role's link (T7): the event's engine reaches every source
+    /// role through its own proxy and the toxic comes from the bounded table below. Drawn only
+    /// in the long mode with `LAZYVIEW_TEST_SOAK_TOXI` — the smoke never draws it (D6).
+    NetworkFault,
 }
 
 /// Every kind, in the order `plan` guarantees them when the window allows one event per kind.
-const KINDS: [Chaos; 5] = [
+/// `NetworkFault` is last so the kinds a run may draw (D6: never the network kind in the smoke)
+/// are a prefix of this table.
+const KINDS: [Chaos; 6] = [
     Chaos::EngineCrash,
     Chaos::EngineStop,
     Chaos::TargetDown,
     Chaos::SourcePause,
     Chaos::SourceDdl,
+    Chaos::NetworkFault,
 ];
 
 impl Chaos {
@@ -66,6 +73,7 @@ impl Chaos {
             Chaos::TargetDown => "target_down",
             Chaos::SourcePause => "source_pause",
             Chaos::SourceDdl => "source_ddl",
+            Chaos::NetworkFault => "network_fault",
         }
     }
 }
@@ -84,21 +92,29 @@ pub fn soak_chaos_per_h() -> u32 {
 /// one of every kind when the window allows it (with fewer events than kinds they are still all
 /// different). Times and kinds come from [`derive_seed`] (`mod.rs:142`), so the same seed replays
 /// the same chaos — the like-for-like diff of §6 needs the schedule to be part of the seed.
-pub fn plan(seed: u64, minutes: u32, per_hour: u32) -> Vec<(Duration, Chaos)> {
+pub fn plan(seed: u64, minutes: u32, per_hour: u32, network: bool) -> Vec<(Duration, Chaos)> {
+    // D6: the smoke has no proxy and no container control, so it draws only the five kinds of
+    // §3; the network kind joins the draw in the long mode when the run opted in (T7). It is
+    // the last entry of `KINDS`, so the permitted set is always a prefix.
+    let kinds: &[Chaos] = if network {
+        &KINDS
+    } else {
+        &KINDS[..KINDS.len() - 1]
+    };
     let minutes = u64::from(minutes.max(1));
     let window = (minutes * 60).max(2);
     let wanted = (((u64::from(per_hour.max(1))) * minutes) / 60).clamp(1, 512) as usize;
-    let first = derive_seed(seed, "chaos-first") % KINDS.len() as u64;
+    let first = derive_seed(seed, "chaos-first") % kinds.len() as u64;
     let mut taken: Vec<u64> = Vec::with_capacity(wanted);
     let mut out: Vec<(Duration, Chaos)> = Vec::with_capacity(wanted);
     for i in 0..wanted {
         let draw = derive_seed(seed, &format!("chaos{i}"));
-        // The first `KINDS.len()` events are one of each kind (in a seeded order); the rest are
+        // The first `kinds.len()` events are one of each kind (in a seeded order); the rest are
         // drawn independently.
-        let kind = if i < KINDS.len() {
-            KINDS[((i as u64 + first) as usize) % KINDS.len()]
+        let kind = if i < kinds.len() {
+            kinds[((i as u64 + first) as usize) % kinds.len()]
         } else {
-            KINDS[(derive_seed(draw, "kind") % KINDS.len() as u64) as usize]
+            kinds[(derive_seed(draw, "kind") % kinds.len() as u64) as usize]
         };
         // one event per second at most: a collision moves to the next free second
         let mut at = draw % window;
@@ -110,6 +126,158 @@ pub fn plan(seed: u64, minutes: u32, per_hour: u32) -> Vec<(Duration, Chaos)> {
     }
     out.sort_by_key(|(at, _)| *at);
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// The random toxic of `Chaos::NetworkFault` (T7, §5)
+// ---------------------------------------------------------------------------------------------
+
+/// The three source roles the T3 hooks route (`LAZYVIEW_TEST_{BINLOG,QUERY,META}_DSN`): the
+/// event puts one proxy per role and aims the drawn toxic at one of them.
+const ROLES: [&str; 3] = ["binlog", "query", "meta"];
+
+/// The fixed toxic table (type × direction): the six types of F2 **plus `slow_close`**, which
+/// decision Q6 admits to the random mix (a half-open connection is this plan's fault class);
+/// `packet_loss` is Q6's rejection (a % loss on a shared runner is an unreproducible finding).
+/// Every parameter is drawn inside its row's bounded range, and the event lifts the fault
+/// before its `quiesce_and_check`, so nothing here can wedge a shared server past the engine's
+/// own bounds (F5) — in particular no row uses `timeout: 0`, the never-closing black hole (F2).
+const TOXI_ROWS: u64 = 11;
+
+/// The event's toxic, drawn from `derive_seed(seed, "toxi<i>")` alone: the same seed replays
+/// the same sequence (the acceptance's two-run comparison). Returns the report label, the
+/// index into [`ROLES`] and the toxic to arm (named so the API read-back can identify it).
+fn draw_toxic(seed: u64, i: usize) -> (String, usize, toxi::Toxic) {
+    let d = derive_seed(seed, &format!("toxi{i}"));
+    let p = derive_seed(d, "toxic-param");
+    let q = derive_seed(p, "toxic-param-2");
+    let role = (derive_seed(d, "toxic-role") % ROLES.len() as u64) as usize;
+    let (t, what) = match (d % TOXI_ROWS) as usize {
+        0 | 1 => {
+            let (l, j) = (40 + p % 161, q % 41);
+            let dir = if d.is_multiple_of(2) {
+                toxi::Dir::Downstream
+            } else {
+                toxi::Dir::Upstream
+            };
+            (
+                toxi::Toxic::latency(l, j, dir),
+                format!("latency {l}±{j}ms {}", dir.as_str()),
+            )
+        }
+        2 | 3 => {
+            let r = 1024 + p % 7168;
+            let dir = if d.is_multiple_of(2) {
+                toxi::Dir::Downstream
+            } else {
+                toxi::Dir::Upstream
+            };
+            (
+                toxi::Toxic::bandwidth(r, dir),
+                format!("bandwidth {r}KB/s {}", dir.as_str()),
+            )
+        }
+        4 | 5 => {
+            let (a, v, dl) = (200 + p % 1801, q % 101, 10 + q % 191);
+            let dir = if d.is_multiple_of(2) {
+                toxi::Dir::Downstream
+            } else {
+                toxi::Dir::Upstream
+            };
+            (
+                toxi::Toxic::slicer(a, v, dl, dir),
+                format!("slicer {a}±{v}B every {dl}us {}", dir.as_str()),
+            )
+        }
+        6 => {
+            let t = p % 2001;
+            (
+                toxi::Toxic::reset_peer(t),
+                format!("reset_peer after {t}ms"),
+            )
+        }
+        7 => {
+            let t = 1000 + p % 2001;
+            (toxi::Toxic::timeout(t), format!("timeout {t}ms (never 0)"))
+        }
+        8 | 9 => {
+            // ≥ 64 KiB: the handshake and the login survive, the cut lands mid-result-set.
+            let b = 65536 + p % 196608;
+            let dir = if d.is_multiple_of(2) {
+                toxi::Dir::Downstream
+            } else {
+                toxi::Dir::Upstream
+            };
+            (
+                toxi::Toxic::limit_data(b, dir),
+                format!("limit_data {b}B {}", dir.as_str()),
+            )
+        }
+        _ => {
+            let dl = 500 + p % 2501;
+            (slow_close(dl), format!("slow_close {dl}ms"))
+        }
+    };
+    (what, role, t.named("soak_fault"))
+}
+
+/// `slow_close{delay}` (F2): the one toxic of the mix the `toxi.rs` scenario builders do not
+/// offer (D7 kept it out of the deterministic scenarios), so the soak builds it from the
+/// public fields.
+fn slow_close(delay_ms: u64) -> toxi::Toxic {
+    let mut attributes = serde_json::Map::new();
+    attributes.insert("delay".to_string(), delay_ms.into());
+    toxi::Toxic {
+        name: format!("slow_close_{delay_ms}"),
+        kind: "slow_close".to_string(),
+        stream: toxi::Dir::Downstream.as_str().to_string(),
+        toxicity: 1.0,
+        attributes,
+    }
+}
+
+/// The host:port a proxy dials for this schema's server: the DSN's own authority with a
+/// loopback host rewritten to the name the toxiproxy container uses for the host (the chaos
+/// profile's `host.docker.internal` extra-host; `LAZYVIEW_TEST_TOXI_HOST` overrides). Set
+/// `LAZYVIEW_TEST_TOXI_UPSTREAM=<host:port>` (the same hook as [`toxi::upstream`]) to dial it
+/// verbatim: a compose-mode shared server publishes on the host loopback only, so from the
+/// daemon its docker DNS name and container port are the only reachable upstream, not the
+/// published host port.
+fn link_upstream(dsn: &str) -> Result<String> {
+    if let Some(u) = std::env::var("LAZYVIEW_TEST_TOXI_UPSTREAM")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return Ok(u);
+    }
+    let rest = dsn
+        .split_once("://")
+        .with_context(|| format!("not a DSN: {dsn}"))?
+        .1;
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = hostport
+        .split_once(':')
+        .with_context(|| format!("DSN authority without a port: {hostport}"))?;
+    let host = match host {
+        "127.0.0.1" | "localhost" | "::1" => std::env::var("LAZYVIEW_TEST_TOXI_HOST")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "host.docker.internal".to_string()),
+        h => h.to_string(),
+    };
+    Ok(format!("{host}:{port}"))
+}
+
+/// The DSN the harness hands the engine (`mod.rs:801 start_engine`): `db.dsn`, switched to
+/// `LAZYVIEW_TEST_ENGINE_USER` when set. The proxied role DSNs derive from it so the engine's
+/// least-privilege user crosses the proxies too (Q4).
+fn engine_dsn(db: &Db) -> String {
+    match std::env::var("LAZYVIEW_TEST_ENGINE_USER") {
+        Ok(u) if !u.trim().is_empty() => dsn_with_user(&db.dsn, u.trim()),
+        _ => db.dsn.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -198,6 +366,10 @@ pub struct ChaosRun<'a> {
     pub ov: &'a [(&'a str, &'a str)],
     pub logs: &'a mut Vec<PathBuf>,
     pub approved: &'a mut HashMap<String, u64>,
+    /// The run's base seed: `NetworkFault` draws its toxic from this and [`Self::toxi_i`].
+    pub seed: u64,
+    /// The event's index in the seeded schedule (`toxi{i}` labels, T7).
+    pub toxi_i: usize,
 }
 
 impl ChaosRun<'_> {
@@ -569,6 +741,99 @@ pub async fn run_event(
                 counter(&all, "full_rebuilds"),
                 d.definition_reloads,
             ));
+        }
+        // The random toxic of T7 (§5, D7/Q6): the event's engine reaches every source role
+        // through its own proxy (the T3 hooks), one toxic from the bounded table of
+        // [`draw_toxic`] is armed on one of them while the writers keep going, and every proxy
+        // goes through the same `Drop` guard the chaos scenarios use (§2.2) **before** the
+        // event's `quiesce_and_check`. Writers and oracle stay on direct connections (Q8).
+        // The smoke never draws this kind (D6) and the long run draws it only with the
+        // `LAZYVIEW_TEST_SOAK_TOXI` flag (`tests/soak.rs`).
+        Chaos::NetworkFault => {
+            if toxi::endpoint().is_none() {
+                extra.push(
+                    "no LAZYVIEW_TEST_TOXI: the links stay whole (the daemon is not on this \
+                     host, reported skipped)"
+                        .to_string(),
+                );
+            } else {
+                // No `toxi::exclusive()` here: its guard is a `std` guard and `scenario()`
+                // requires a `Send` future. Isolation still holds: nothing on this path calls
+                // the global `POST /reset` (only the chaos self-tests do, another binary), the
+                // proxy names and the `Drop` guard are scoped to this schema, the port band is
+                // an atomic, and the suite runs one binary at a time under the heavy-suite lock.
+                {
+                    let tx = toxi::Toxi::open(ctx).await?;
+                    let _guard = tx.for_schema(&run.src.name);
+                    let up = link_upstream(&run.src.dsn)?;
+                    let mut proxies = Vec::with_capacity(ROLES.len());
+                    for role in ROLES {
+                        let p = tx
+                            .proxy(&run.src.name, &format!("soak_{role}"), &up)
+                            .await?;
+                        tx.wait_listening(&p).await?;
+                        proxies.push(p);
+                    }
+                    // The event's engine, every source role through its proxy.
+                    eng.stop().await?;
+                    let base = engine_dsn(run.src);
+                    let dsns: Vec<String> = proxies
+                        .iter()
+                        .map(|p| toxi::dsn_via_proxy(&base, p.listen))
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut ev = run.start_engine_with(&[
+                        ("LAZYVIEW_TEST_BINLOG_DSN", dsns[0].as_str()),
+                        ("LAZYVIEW_TEST_QUERY_DSN", dsns[1].as_str()),
+                        ("LAZYVIEW_TEST_META_DSN", dsns[2].as_str()),
+                    ])?;
+                    let mut c = run.src.conn().await?;
+                    wait_ready(&mut c, &mut ev, &names(run.specs), t_ready()).await?;
+                    c.disconnect().await.ok();
+                    let (drawn, role, toxic) = draw_toxic(run.seed, run.toxi_i);
+                    tx.toxic(&proxies[role], &toxic).await?;
+                    let armed = tx
+                        .toxics(&proxies[role])
+                        .await?
+                        .iter()
+                        .any(|t| t.name == toxic.name);
+                    if !armed {
+                        problems.push(format!(
+                            "the drawn toxic ({drawn}) is not armed on {}",
+                            proxies[role].name
+                        ));
+                    }
+                    // Hold the fault while the writers keep producing: bounded on the engine's own
+                    // counters (at most 10 s for any counter to move, no sleep). A severing toxic
+                    // legitimately freezes them, so this is the report's line, not an assertion —
+                    // the exactness check below is the assertion.
+                    let since = ev.snapshot();
+                    let moved = wait_until(
+                        "a counter to move on the event's engine under the fault",
+                        Duration::from_secs(10),
+                        || async { Ok(counters(&ev, &since).iter().any(|(_, v)| *v > 0)) },
+                    )
+                    .await
+                    .is_ok();
+                    extra.push(format!(
+                        "{drawn} on the {} link: {}",
+                        ROLES[role],
+                        if moved {
+                            "counters moved under the fault"
+                        } else {
+                            "no counter moved during the bounded fault phase (reported)"
+                        }
+                    ));
+                    // Lift before the check: deleting the proxies deletes their toxics too (§1),
+                    // which is what the `Drop` guard does — done explicitly here so the fresh
+                    // engine's direct connections never race the cleanup.
+                    tx.remove_all_for(&run.src.name).await?;
+                    ev.stop().await?;
+                    eng = run.start_engine()?;
+                    let mut c = run.src.conn().await?;
+                    wait_ready(&mut c, &mut eng, &names(run.specs), t_ready()).await?;
+                    c.disconnect().await.ok();
+                }
+            }
         }
     }
 
