@@ -10,6 +10,8 @@
 #                                                 # plus the chaos proxy (profile `chaos`)
 #   scripts/test-servers.sh dsns                  # LAZYVIEW_TEST_DSNS for the servers that are up
 #   scripts/test-servers.sh compose down          # stop; `compose clean` also drops the data
+#   pg16 (PostgreSQL 16, a *target* service outside the matrix: the harness reads it from
+#   LAZYVIEW_TEST_PG_DSNS): docker compose -f docker-compose.test.yml up -d --wait pg16
 #
 # or plain compose:
 #
@@ -271,6 +273,29 @@ services:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - mariadb114:/var/lib/mysql
 
+  # PostgreSQL as a target (issue #56) and, later, as a source (issue #57, logical
+  # replication): a MySQL-family source maintains tables here, and the source tests stream
+  # from this same service (logical WAL). Not in scripts/test-servers.sh's matrix: the
+  # harness reads it from LAZYVIEW_TEST_PG_DSNS, never from LAZYVIEW_TEST_DSNS. Pin the
+  # exact patch build, as the MySQL services above do; lv-devops keeps the pin.
+  pg16:
+    image: postgres:16.16
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10"]
+    ports: ["127.0.0.1:35432:5432"]
+    environment:
+      POSTGRES_USER: lv
+      POSTGRES_PASSWORD: lv
+      POSTGRES_DB: lvtest
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lv -d lvtest -h 127.0.0.1"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+    shm_size: 128mb
+    mem_limit: 1g
+    volumes:
+      - pg16:/var/lib/postgresql/data
+
   mariadb118:
     <<: *mariadb-common
     image: mariadb:11.8.9
@@ -414,3 +439,4 @@ volumes:
   mariadb130:
   mariadb131-rc:
   mariadb132-pre:
+  pg16:

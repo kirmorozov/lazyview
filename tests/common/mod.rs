@@ -9,6 +9,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod oracle;
+pub mod pg;
 // The analyzer's test-only renamer (one implementation for unit and integration tests).
 #[path = "../../src/analyzer/rename.rs"]
 pub mod rename;
@@ -1166,11 +1167,48 @@ pub async fn verify(
     specs: &[ViewSpec],
     what: &str,
 ) -> Result<()> {
-    verify_targets(ctx, engine, src, &HashMap::new(), specs, what).await
+    verify_targets(
+        ctx,
+        engine,
+        src,
+        &HashMap::new(),
+        &HashMap::new(),
+        specs,
+        what,
+    )
+    .await
 }
 
-/// Like [`verify`], also comparing MVs on the given targets (target name → schema).
+/// Like [`verify`], also comparing MVs on the given targets (target name → schema) and on the
+/// given PostgreSQL targets (target name → its own schema on the PostgreSQL server, issue #56;
+/// exactly parallel to the MySQL map).
 pub async fn verify_targets(
+    ctx: &Ctx,
+    engine: &mut Engine,
+    src: &Db,
+    targets: &HashMap<String, Db>,
+    pg_targets: &HashMap<String, pg::PgDb>,
+    specs: &[ViewSpec],
+    what: &str,
+) -> Result<()> {
+    verify_targets_mysql(ctx, engine, src, targets, specs, what).await?;
+    if !pg_targets.is_empty() {
+        let mut sc = src.conn().await?;
+        engine
+            .wait_caught_up(&mut sc, t_catchup())
+            .await
+            .with_context(|| format!("catch-up before the PostgreSQL check '{what}'"))?;
+        sc.disconnect().await.ok();
+        oracle::check_views_pg_targets(src, pg_targets, specs)
+            .await
+            .with_context(|| format!("check '{what}' (PostgreSQL targets)"))?;
+    }
+    Ok(())
+}
+
+/// The MySQL half of [`verify_targets`]: catch-up, the oracle comparison with the cadence
+/// allowance, and the re-check on mismatch.
+async fn verify_targets_mysql(
     ctx: &Ctx,
     engine: &mut Engine,
     src: &Db,

@@ -337,7 +337,16 @@ fn sup_two_targets_one_slowed() {
         ]);
         let (mut eng, _) = start_with_views(&ctx, &src, &specs, &ov).await?;
         let tmap: HashMap<String, Db> = [("b".to_string(), tb.clone())].into();
-        verify_targets(&ctx, &mut eng, &src, &tmap, &specs, "initial").await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &HashMap::new(),
+            &specs,
+            "initial",
+        )
+        .await?;
         load(
             &ctx,
             &src,
@@ -347,7 +356,16 @@ fn sup_two_targets_one_slowed() {
             "slowed target b",
         )
         .await?;
-        verify_targets(&ctx, &mut eng, &src, &tmap, &specs, "after the load").await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &HashMap::new(),
+            &specs,
+            "after the load",
+        )
+        .await?;
         let caps: HashMap<String, u64> = eng
             .metrics
             .pool_gauges()
