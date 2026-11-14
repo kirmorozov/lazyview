@@ -5211,6 +5211,40 @@ impl Engine {
                 work,
             });
         }
+        if dirty.all {
+            // A unit-based view the gap window left untraceable (`accumulate::mark_all`, #167):
+            // the children a parent delete took with it are gone from the source and the cache,
+            // so no lookup can name the units they left. The generic remedy, as the Global
+            // branch above: read the whole view once and apply it in place, which deletes the
+            // vanished rows. One read per window, at most once per view per window; a refresh,
+            // not a rebuild, and the other buffered units are subsumed by it, so the buffer
+            // clears with it (a failed target is retried as a whole refresh by `retry_lag`).
+            let fresh = self.caps.fresh_snapshot;
+            let rows =
+                mv::read_source(&mut self.src, plan, layout, None, &self.metrics, fresh).await?;
+            work.source_queries += 1;
+            Metrics::add(&self.metrics.units_refreshed, 1);
+            for t in targets {
+                match self.apply_target(t, table, layout, None, &rows).await {
+                    Ok(a) => work.rows.applied(&a),
+                    Err(e) => failed.push((t.clone(), e)),
+                }
+            }
+            let n = dirty.images.len();
+            let rebuild = dirty.rebuild;
+            *dirty = ViewDirty {
+                images: vec![KeySet::default(); n],
+                rebuild,
+                ..Default::default()
+            };
+            return Ok(Refreshed {
+                units: UnitSet::default(),
+                partial: Vec::new(),
+                all: true,
+                failed,
+                work,
+            });
+        }
         // `dirty` is only cleared once everything succeeded, so a failure can be retried.
         let mut units = dirty.units.clone();
         let rebuild = dirty.rebuild;
@@ -5319,6 +5353,13 @@ impl Engine {
                 p.idle = true;
                 return Ok(p);
             }
+            Metrics::add(&self.metrics.units_refreshed, 1);
+        } else if dirty.all {
+            // The supervised form of the whole-view refresh of a unit-based view (see
+            // `refresh`): the read of the whole view and the in-place apply subsume every
+            // buffered unit, so no lookups run and the job has no unit filter (`units`
+            // stays None: all rows).
+            p.whole = true;
             Metrics::add(&self.metrics.units_refreshed, 1);
         } else {
             // `dirty` is only cleared once everything succeeded, so a failure can be retried.
@@ -5923,6 +5964,9 @@ struct PendingRefresh {
     /// Partial unit keys, per set of the plan's partial units.
     partial: Vec<UnitSet>,
     global: bool,
+    /// A unit-based view refreshed as a whole (gap window, `accumulate::mark_all`): the job
+    /// reads and applies the whole view; the run clears the buffer (see `finish_refresh`).
+    whole: bool,
     /// A global view without changes: nothing to do.
     idle: bool,
     rebuild: bool,
@@ -5972,6 +6016,24 @@ fn finish_refresh(
     work.rows = out.rows;
     if p.global {
         dirty.all = false;
+        return Ok(Refreshed {
+            units: UnitSet::default(),
+            partial: Vec::new(),
+            all: true,
+            failed,
+            work,
+        });
+    }
+    if p.whole {
+        // The whole-view read and apply of the run covered every buffered unit, so the
+        // buffer clears with it (a failed target is retried as a whole refresh by
+        // `retry_lag`); a pending rebuild survives, as on the unit path.
+        let n = dirty.images.len();
+        *dirty = ViewDirty {
+            images: vec![KeySet::default(); n],
+            rebuild: p.rebuild,
+            ..Default::default()
+        };
         return Ok(Refreshed {
             units: UnitSet::default(),
             partial: Vec::new(),

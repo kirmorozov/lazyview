@@ -769,9 +769,19 @@ fn feed_mapped_cascade(
         // version must hold this change's position until then.
         None => Fed::Recorded,
         // No kept child row under `old` (none exists) nor under `new` (a gap healed by the
-        // read above): no unit can change. Recorded would pin the version's replay position
-        // with nothing left to refresh it.
-        Some(rows) if rows.is_empty() && moved.is_empty() => Fed::Skipped,
+        // read above): no unit can change, and Recorded would pin the version's replay position
+        // with nothing left to refresh it. Inside a gap window one case is not healable at all:
+        // a vanished child (a delete, or SET NULL / SET DEFAULT) is gone from the source and from
+        // the cache, so its units cannot be named from either. Mark the whole view: one refresh of
+        // it per window (`all` coalesces), not a rebuild.
+        Some(rows) if rows.is_empty() && moved.is_empty() => {
+            if dirty.cache.gap && children_vanish(new.as_ref()) {
+                dirty.mark_all(plan);
+                Fed::Recorded
+            } else {
+                Fed::Skipped
+            }
+        }
         Some(rows) => {
             let mut fed = if rows.is_empty() {
                 Fed::Skipped
@@ -784,6 +794,15 @@ fn feed_mapped_cascade(
             fed
         }
     }
+}
+
+/// Whether the children of a parent change have vanished from where the cascade map keeps them:
+/// `new` is their new FK (`None`: the rows are deleted; all NULLs: SET NULL, and SET DEFAULT,
+/// which parses as SET NULL), so no row is kept under either key and no lookup can name the
+/// units they left behind. A CASCADE key update is not: [`kept_under_new`] reads its children
+/// under `new`.
+fn children_vanish(new: Option<&Key>) -> bool {
+    new.is_none_or(|n| n.iter().all(Datum::is_null))
 }
 
 /// The kept rows of route `ci` under the parent's NEW key `new`, as [`expand`] wants them: clones
@@ -972,7 +991,18 @@ pub fn drain(plan: &ViewPlan, dirty: &mut ViewDirty, log: Vec<cascade::Logged>) 
                     _ => Vec::new(),
                 };
                 if let Some(rows) = dirty.cache.parent(route, &old, new.as_ref()) {
-                    expand(plan, route, rows, new.as_ref(), dirty);
+                    if rows.is_empty()
+                        && moved.is_empty()
+                        && dirty.cache.gap
+                        && children_vanish(new.as_ref())
+                    {
+                        // A gap window, as in `feed_mapped_cascade`: the children are gone from
+                        // the source and the cache, so their units cannot be named; the whole
+                        // view is refreshed once for the window.
+                        dirty.mark_all(plan);
+                    } else {
+                        expand(plan, route, rows, new.as_ref(), dirty);
+                    }
                 }
                 if !moved.is_empty() {
                     expand(plan, route, moved, new.as_ref(), dirty);
@@ -1952,16 +1982,30 @@ mod tests {
             Fed::Skipped
         );
         assert!(!d.rebuild && d.cache.rows(to_attrs).unwrap().rows.is_empty());
-        // A gap: a parent delete is counted, marks nothing, does not rebuild, and is skipped
-        // (Recorded would hold the view's replay position with nothing to refresh).
+        // A gap: a parent delete whose children went with it is counted, rebuilds nothing, and
+        // marks the whole view once for the window (no kept child names the units it left, so a
+        // refresh of the view is the only generic remedy) and holds the view's replay position
+        // until that refresh. Further deletes in the same window coalesce into the one mark;
+        // outside a gap window the same delete holds nothing.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         d.cache.gap = true;
+        assert_eq!(
+            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
+            Fed::Recorded
+        );
+        assert!(d.all && !d.rebuild && d.units.is_empty());
+        assert_eq!(d.tally.cascade_gaps, 1);
+        assert_eq!(
+            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[11])), None),
+            Fed::Recorded
+        );
+        assert!(d.all && d.tally.cascade_gaps == 2);
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
             feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
             Fed::Skipped
         );
         assert!(d.is_empty() && d.cache.rows(to_attrs).is_none());
-        assert_eq!(d.tally.cascade_gaps, 1);
         // While seeding (a build's cache), the parent is logged for `drain`: recorded.
         let mut s = ViewDirty::for_aliases(p.aliases.len());
         s.cache = crate::cascade::Cache::seeding();

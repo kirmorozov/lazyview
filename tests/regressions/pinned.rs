@@ -993,9 +993,10 @@ fn reg_cascades_through_the_map() {
 }
 
 /// Restart gap: with a cached route, a parent deleted while the engine is stopped is
-/// replayed from before the startup seed, and the cache counts it as a gap. The gap does
-/// not force a refresh (no whole-view refresh, no full rebuild): the groups it left stale heal
-/// when a row under each changes, and the view is then exact.
+/// replayed from before the startup seed, and the cache counts it as a gap. The children the
+/// delete took with it cannot be named from the cache, the plan or the binlog, so the gap marks
+/// the whole view: at most one whole-view refresh per view per window, and no full rebuild.
+/// Outside a gap window such a replay never refreshes the whole view.
 #[test]
 fn reg_cascade_restart_gap() {
     scenario("reg_casc_gap", |ctx| async move {
@@ -1053,12 +1054,15 @@ fn reg_cascade_restart_gap() {
         };
         let d = eng.snapshot().since(&f0);
         ensure!(
-            s.cascade_gaps >= 1 && s.whole_view_refreshes == 0 && d.full_rebuilds == 0,
-            "the pre-seed delete was not counted, or forced a refresh: {s:?} {}",
+            s.cascade_gaps >= 1 && s.whole_view_refreshes <= 1 && d.full_rebuilds == 0,
+            "the pre-seed delete was not counted, or refreshed the whole view more than once / \
+             rebuilt: {s:?} {}",
             fmt_snapshot(&d)
         );
-        // No recovery (breakdown §2 "Restart gap"): groups 1 and 3 keep ent 5's rows until a
-        // row under each changes.
+        // The window's whole-view refresh is what healed the groups the delete left stale (they
+        // cannot be named from the cache): the writes under each of them only show that a later
+        // change is still absorbed incrementally, with no whole-view refresh outside the window.
+        let in_window = s.whole_view_refreshes;
         exec_all(
             &mut sc,
             &[
@@ -1078,8 +1082,9 @@ fn reg_cascade_restart_gap() {
         let s = eng.stats_of(&db, "r_gap_hop1")?;
         let d = eng.snapshot().since(&f0);
         ensure!(
-            s.cascade_gaps >= 1 && s.whole_view_refreshes == 0 && d.full_rebuilds == 0,
-            "the write under the stale id was not absorbed incrementally: {s:?} {}",
+            s.cascade_gaps >= 1 && s.whole_view_refreshes == in_window && d.full_rebuilds == 0,
+            "the write under the refreshed id was not absorbed incrementally, or cost another \
+             whole-view refresh: {s:?} {}",
             fmt_snapshot(&d)
         );
         ctx.log(format!("restart gap: {s:?} {}", fmt_snapshot(&d)));
@@ -1166,6 +1171,93 @@ fn reg_cascade_window_parent_update() {
             fmt_snapshot(&d)
         );
         ctx.log(format!("gap-window key update: {s:?} {}", fmt_snapshot(&d)));
+        eng.stop().await
+    });
+}
+
+/// Restart gap, a CASCADE delete (issue #167): the parent is deleted while the engine is stopped,
+/// so the resume replays it from before the startup seed and the cache counts a gap. The storage
+/// engine deleted the children with it, so the lookup under the parent's key hits nothing and no
+/// other key holds them: their units cannot be named from the cache, the plan or the binlog. The
+/// whole view is refreshed once for the window (`mark_all`, a refresh and not a rebuild), so the
+/// row of the group the deleted parent was the only member of is gone at once.
+///
+/// A MAP route, as in [`reg_cascade_window_parent_update`]: `entities` is the cascade's parent, is
+/// not an alias of the view (an alias of it would trace the delete itself and be immune), and its
+/// key gives no unit (the group is `l.gid`, which only a child row of `links` carries); the FK
+/// value is not a view column, so only the cache knows the row is gone.
+#[test]
+fn reg_cascade_window_parent_delete() {
+    scenario("reg_casc_win_del", |ctx| async move {
+        let mut ddl: Vec<String> = vec![
+            "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)"
+                .into(),
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (gid, eid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))"
+                .into(),
+        ];
+        ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into());
+        ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into());
+        ddl.push("INSERT INTO links VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into());
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![ViewSpec::new(
+            "r_win_del",
+            Kind::Incremental,
+            "SELECT l.gid, COUNT(*) AS n, SUM(l.pos) AS s FROM links l GROUP BY l.gid",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_casc_win_del", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // Group 3 has one row, under entity 6: deleting that parent empties the group.
+        eng.stop().await?;
+        // Both the parent delete and the ON DELETE CASCADE that removed links (3, 6) sit inside
+        // the replay window: the startup seed read the row already gone.
+        exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 6"]).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        let f0 = eng.snapshot();
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // /stats is published at the end of a flush, and the whole-view refresh of the window is
+        // applied by that same flush; nothing else writes after the resume, so wait for the
+        // periodic flush (position save, 5 s) to publish both the gap and the refresh.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let _s = loop {
+            if let Some(s) = eng.view_stats(&db, "r_win_del") {
+                if s.cascade_gaps >= 1 {
+                    break s;
+                }
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "the replayed parent delete was never counted as a gap in /stats within 15 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        // Nothing was written since the resume: the group the deleted parent was the only member
+        // of is gone at once, and the other two are exact.
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the group the replayed parent delete emptied",
+        )
+        .await?;
+        let s = eng.stats_of(&db, "r_win_del")?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            s.cascade_gaps >= 1 && s.whole_view_refreshes <= 1 && d.full_rebuilds == 0,
+            "the replayed parent delete was not counted as a gap, or refreshed the whole view \
+             more than once, or rebuilt: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!(
+            "gap-window parent delete: {s:?} {}",
+            fmt_snapshot(&d)
+        ));
         eng.stop().await
     });
 }
