@@ -914,7 +914,7 @@ async fn server_identity(
         bail!("injected identity failure");
     }
     let sql = match flavor {
-        Flavor::MySql => "SELECT CAST(@@server_uuid AS CHAR)",
+        Flavor::MySql | Flavor::Percona => "SELECT CAST(@@server_uuid AS CHAR)",
         Flavor::MariaDb => "SELECT CAST(CONCAT(@@server_id, ':', @@gtid_domain_id) AS CHAR)",
     };
     let v: Option<Option<String>> = conn.query_first(sql).await?;
@@ -4216,7 +4216,7 @@ impl Engine {
     /// Waits until the transactions read from the binlog are visible to readers: binlog events
     /// are shipped before the engine commit completes.
     fn exact_fence(&self) -> bool {
-        (self.flavor == Flavor::MySql && self.last_gtid.is_some())
+        (self.flavor.is_mysql_family() && self.last_gtid.is_some())
             || self.snapshot_fence == Some(true)
             || self.commit_fence == Some(true)
     }
@@ -4231,7 +4231,7 @@ impl Engine {
     /// (`commit_fence`) when the server commits in binlog order. Otherwise:
     /// `LAZYVIEW_VISIBILITY_DELAY_MS`.
     async fn fence(&mut self) -> bool {
-        if self.flavor == Flavor::MySql {
+        if self.flavor.is_mysql_family() {
             if let Some(g) = self.last_gtid.clone() {
                 let r: Result<Option<Option<i64>>, _> = self
                     .src

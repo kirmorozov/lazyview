@@ -175,12 +175,19 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     let log_bin = value_str(row.as_ref(1));
     let format = value_str(row.as_ref(2));
     let image = value_str(row.as_ref(3));
-    let flavor = Flavor::from_version(&version);
+    let mut flavor = Flavor::from_version(&version);
     let mut compress: Option<String> = None;
     let mut storage_engine: Option<String> = None;
     if flavor == Flavor::MariaDb {
         // The MariaDB preflight probes are flavor code: [`crate::source::maria::probes`].
         (compress, storage_engine) = crate::source::maria::probes(conn).await?;
+    } else {
+        // Percona's `VERSION()` is a plain MySQL version string, so its product name comes from
+        // `@@GLOBAL.version_comment`; only a MySQL-looking server has to ask. The probe is here
+        // (it is the network edge); reading the value is the flavor's own answer,
+        // [`crate::source::percona::is_this`].
+        let comment = probe_var_retry(conn, "version_comment").await?;
+        flavor = Flavor::from_version_comment(&version, comment.as_deref().unwrap_or(""));
     }
     let mut problems = requirement_problems(
         flavor,
@@ -190,12 +197,19 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
         compress.as_deref().unwrap_or(""),
         storage_engine.as_deref().unwrap_or(""),
     );
-    if flavor == Flavor::MySql {
+    if flavor.is_mysql_family() {
         // Partial JSON row images carry diffs instead of values; lazyview needs full values.
         // The probe is here (it is the network edge); the check and its message are the
-        // MySQL family's: [`crate::source::mysql::preflight`].
+        // MySQL family's: [`crate::source::mysql::preflight`], which Percona reaches through
+        // [`crate::source::percona`] — a call into `mysql.rs`, never a copy of it.
         let opts = probe_var_retry(conn, "binlog_row_value_options").await?;
-        problems.extend(crate::source::mysql::preflight(opts.as_deref()));
+        let partial_json = match flavor {
+            Flavor::MySql => crate::source::mysql::preflight(opts.as_deref()),
+            Flavor::Percona => crate::source::percona::preflight(opts.as_deref()),
+            // Reached only through the guard above: MariaDB has no partial-JSON row images.
+            Flavor::MariaDb => None,
+        };
+        problems.extend(partial_json);
     }
     if !problems.is_empty() {
         bail!(unmet_requirements(&version, &problems));

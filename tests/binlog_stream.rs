@@ -764,7 +764,7 @@ async fn check_gtids(w: &mut Conn, wl: &Workload, groups: &[Group]) -> Result<()
             "GTIDs {got:?} != @@last_gtid values {:?}",
             wl.gtids
         ),
-        Flavor::MySql => {
+        Flavor::MySql | Flavor::Percona => {
             let mut prev = 0u64;
             for g in &got {
                 let (uuid, gno) = g.rsplit_once(':').ok_or_else(|| anyhow!("bad GTID {g}"))?;
@@ -901,8 +901,8 @@ async fn stream_scenario(dsn: String) -> Result<()> {
     }
     r.close().await?;
 
-    // MySQL: the compressed transaction really was a Transaction_payload.
-    if wl.flavor == Flavor::MySql {
+    // MySQL family: the compressed transaction really was a Transaction_payload.
+    if wl.flavor.is_mysql_family() {
         let evs: Vec<Row> = w
             .query(format!(
                 "SHOW BINLOG EVENTS IN '{}' FROM {}",
@@ -1000,6 +1000,9 @@ async fn stream_server_checks_and_missing_binlog() {
             let info = server_info(&mut c).await?;
             let want = if name.starts_with("mariadb") {
                 Flavor::MariaDb
+            } else if name.starts_with("percona") {
+                // Percona's own flavor, named by its version_comment.
+                Flavor::Percona
             } else {
                 Flavor::MySql
             };
