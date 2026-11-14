@@ -743,10 +743,13 @@ fn targets_pg_incremental_never_rebuilds() {
         )
         .await?;
             ensure_lazyview_table(&mut c).await?;
+            // items drives and entities is joined on ITS PK (the u_items shape, tests/upsert.rs):
+            // that is what gives the layout a row key (`_lv_row`) — joined on the FK instead
+            // (the u_cat_lines shape) there is no lineage key and even MySQL keeps no unique index.
             let spec = ViewSpec::new(
             "links",
             Kind::Incremental,
-            "SELECT i.id AS id, e.name AS name, i.amount AS amount FROM entities e JOIN items i ON i.entity_id = e.id",
+            "SELECT i.id AS id, e.name AS name, i.amount AS amount FROM items i JOIN entities e ON e.id = i.entity_id",
         )
         .with_targets("pg");
             add_views(&mut c, std::slice::from_ref(&spec)).await?;
