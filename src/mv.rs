@@ -17,6 +17,10 @@ use crate::datum::{Datum, Key};
 use crate::metrics::Metrics;
 use crate::target::Kind;
 
+// The JSON canonical form is the dialect's answer (A4); the forwarder keeps the old path (the ADDED
+// rule for the files in flight), `crate::dialect::mysql` is the owner.
+pub use crate::dialect::mysql::json_canonical;
+
 /// Maximum placeholders per statement (server limit is 65535). `Kind::Postgres` has a hard
 /// ceiling of 65535; this cap is below it for both families.
 pub(crate) const MAX_PARAMS: usize = 60_000;
@@ -74,7 +78,7 @@ impl Layout {
     pub fn col_list(&self) -> String {
         self.cols
             .iter()
-            .map(|c| q(&c.name))
+            .map(|c| crate::dialect::mysql::quote_ident(&c.name))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -82,7 +86,7 @@ impl Layout {
     pub fn unit_cols(&self) -> Vec<String> {
         self.unit_pos
             .iter()
-            .map(|&p| q(&self.cols[p].name))
+            .map(|&p| crate::dialect::mysql::quote_ident(&self.cols[p].name))
             .collect()
     }
 
@@ -159,42 +163,31 @@ impl Layout {
         crate::dialect::mysql::read_list(&names, &epoch)
     }
 
-    /// Brings a row read with [`Layout::source_sql`] into the form of [`Layout::normalize`]:
-    /// the leading epochs replace the TIMESTAMP values.
-    pub fn normalize_source(&self, mut row: Vec<Value>) -> Vec<Value> {
-        if self.epoch_timestamps() && row.len() == self.cols.len() + self.epoch.len() {
-            let epochs: Vec<Value> = row.drain(..self.epoch.len()).collect();
-            for ((p, _), e) in self.epoch.iter().zip(epochs) {
-                row[*p] = e;
-            }
-        }
+    /// Brings a row read with [`Layout::source_sql`] into the form of [`Layout::normalize`]: the
+    /// leading epochs replace the TIMESTAMP values (the dialect's answer,
+    /// [`crate::dialect::mysql::normalize_source_row`]).
+    pub fn normalize_source(&self, row: Vec<Value>) -> Vec<Value> {
+        let row = crate::dialect::mysql::normalize_source_row(
+            self.epoch.iter().map(|(p, _)| *p),
+            self.epoch.len(),
+            self.cols.len(),
+            self.epoch_timestamps(),
+            row,
+        );
         self.normalize(row)
     }
 
     /// Brings a row read with [`Layout::read_list`] (or [`Layout::normalize_source`]) into the
-    /// form that is compared and written back: BIT values as unsigned integers (bound as strings
-    /// the server stores 0 for `b'11111111'`), TIME values in the form every server accepts as a
-    /// parameter (see [`crate::datum::time_param`]), TIMESTAMP epochs as UTC datetimes.
+    /// form that is compared and written back: the dialect's [`crate::dialect::mysql::normalize_row`]
+    /// with this layout's column types and TIMESTAMP columns, the epochs through
+    /// [`crate::dialect::mysql::epoch_to_utc`].
     pub fn normalize(&self, mut row: Vec<Value>) -> Vec<Value> {
-        for (c, v) in self.cols.iter().zip(row.iter_mut()) {
-            match (c.data_type.as_str(), &*v) {
-                ("bit", Value::Bytes(b)) => {
-                    *v = Value::UInt(b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64));
-                }
-                // TIME values MySQL >= 9.0 rejects as binary parameters go as text (both the
-                // rows read from the source and those read back from the table, so they
-                // still compare equal).
-                ("time", Value::Time(..)) => {
-                    *v = crate::datum::time_param(std::mem::replace(v, Value::NULL));
-                }
-                _ => {}
-            }
-        }
-        for (p, _) in &self.epoch {
-            if let Some(v) = row.get_mut(*p) {
-                *v = crate::dialect::mysql::epoch_to_utc(std::mem::replace(v, Value::NULL));
-            }
-        }
+        crate::dialect::mysql::normalize_row(
+            self.cols.iter().map(|c| c.data_type.as_str()),
+            self.epoch.iter().map(|(p, _)| *p),
+            &mut row,
+            crate::dialect::mysql::epoch_to_utc,
+        );
         row
     }
 
@@ -753,21 +746,6 @@ fn to_datums(layout: &Layout, r: &[Value]) -> Vec<Datum> {
             v => Datum::from_value(v.clone()),
         })
         .collect()
-}
-
-/// A JSON text in the form the server stores it, for comparisons. MySQL parses JSON text into
-/// its binary format: integers stay integers, every other number becomes a DOUBLE, object keys
-/// are sorted and the last of duplicate keys wins. So a DECIMAL inside a JSON value the view
-/// computes (`JSON_ARRAYAGG(amount)` gives `[10.00, 20.50]`) is stored as `[10.0, 20.5]`: no
-/// client can write it back as a DECIMAL. Two texts get the same result here when the server
-/// stores the same value for them (numbers parsed with correct rounding, like the server's
-/// parser); the result is JSON-equal to the input, so it also binds as a `CAST(? AS JSON)`
-/// unit key. Text that does not parse is kept as it is.
-pub fn json_canonical(text: &[u8]) -> Vec<u8> {
-    serde_json::from_slice::<serde_json::Value>(text)
-        .ok()
-        .and_then(|v| serde_json::to_vec(&v).ok())
-        .unwrap_or_else(|| text.to_vec())
 }
 
 /// Rows of one or more units, grouped by unit key: `(datums, original values)` per row.
@@ -1385,40 +1363,6 @@ mod tests {
             "JSON units get no index"
         );
         assert!(!l.has_unit_index());
-    }
-
-    /// JSON texts compare as the server stores them: a DECIMAL's scale and the formatting are
-    /// lost, integers and doubles stay apart.
-    #[test]
-    fn json_texts_compare_as_stored() {
-        let c = |s: &str| String::from_utf8(json_canonical(s.as_bytes())).unwrap();
-        // The text a view computes vs. what the MV table returns for it (measured, MySQL 8.4).
-        for (computed, stored) in [
-            ("[10.00, 20.50]", "[10.0, 20.5]"),
-            (r#"{"amt": 1.50}"#, r#"{"amt": 1.5}"#),
-            ("100.000", "100.0"),
-            ("0.000000150", "0.00000015"),
-            ("12345678901234567890.1234567890", "1.2345678901234567e19"),
-            ("18446744073709551616", "1.8446744073709552e19"),
-            (
-                r#"{"b":1,"a":2,"aa":3,"a":4}"#,
-                r#"{"a": 4, "b": 1, "aa": 3}"#,
-            ),
-            ("[0.30000000000000004, 1e20]", "[0.30000000000000004, 1e20]"),
-        ] {
-            assert_eq!(c(computed), c(stored), "{computed} vs {stored}");
-            assert_eq!(c(&c(stored)), c(stored), "canonical text is stable");
-        }
-        // Integers and doubles are different values in the server's format (`1` vs `1.0`).
-        assert_ne!(c("[1]"), c("[1.0]"));
-        assert_ne!(c(r#"{"a": 10}"#), c(r#"{"a": 10.0}"#));
-        assert_eq!(
-            c("[18446744073709551615, -9223372036854775808]"),
-            "[18446744073709551615,-9223372036854775808]"
-        );
-        assert_ne!(c("[10.00]"), c("[10.01]"));
-        assert_ne!(c(r#"["10.00"]"#), c(r#"["10.0"]"#), "strings stay exact");
-        assert_eq!(c("not json"), "not json");
     }
 
     /// The diff compares JSON columns as stored: a DECIMAL computed into JSON is rewritten
