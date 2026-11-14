@@ -925,13 +925,23 @@ async fn snapshot_position(
         .await?;
     conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
         .await?;
-    let rows: Result<Vec<(String, String)>, _> = conn
-        .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
-        .await;
     // The commit must run whatever the status read did: an open snapshot would poison the session.
+    let read = snapshot_status(conn).await;
     let committed = conn.query_drop("COMMIT").await;
-    let rows = rows.context("reading the binlog snapshot position")?;
+    let pos = read?;
     committed.context("committing the snapshot fence transaction")?;
+    Ok(pos)
+}
+
+/// The binlog coordinates the session's consistent-snapshot transaction includes, as the two
+/// `binlog_snapshot_%` status variables report them: `None` when the server reports no position
+/// (an empty file counts as none). The caller owns the transaction: this reads, it does not
+/// open or close one.
+async fn snapshot_status(conn: &mut Conn) -> Result<Option<Position>> {
+    let rows: Vec<(String, String)> = conn
+        .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
+        .await
+        .context("reading the binlog snapshot position")?;
     let mut file = None;
     let mut pos = None;
     for (k, v) in rows {
@@ -2340,11 +2350,18 @@ impl Engine {
         if resumed.is_empty() {
             return Ok(targets);
         }
-        // Seed the in-memory cascade cache on the source, then remember where the log stands:
-        // a cascade parent replayed from before that position is a gap until its child rows
-        // move again (the Cascade arm of feed_rows clears gap_until once the log passes it).
-        let mut cache = seed_cache(&mut self.src, plan).await?;
-        cache.gap_until = Some(binlog::current_position(&mut self.src).await?);
+        // Seed the in-memory cascade cache on the source, and end the gap window at the position
+        // that same consistent read includes: a parent replayed from before it is a gap (the seed
+        // read saw its children already moved), one replayed from at or after it was seen by no
+        // seed read and expands correctly from its own images. The position read is the one extra
+        // statement of a resume; where the server reports no snapshot position the window keeps
+        // the wider shape of the position read after the seed. (The Cascade arm of feed_rows
+        // clears gap_until once the log passes it.)
+        let (mut cache, seed_pos) = seed_cache_at_snapshot(&mut self.src, plan).await?;
+        cache.gap_until = Some(match seed_pos {
+            Some(p) => p,
+            None => binlog::current_position(&mut self.src).await?,
+        });
         let rest: Vec<String> = targets
             .iter()
             .filter(|t| !resumed.contains(t))
@@ -6257,6 +6274,43 @@ async fn prepare_target(
 /// Seeds this build's in-memory cascade cache from the source before the table is filled: a
 /// cascade after this read is in the binlog this version replays, so none falls between the
 /// two reads.
+/// The startup seed of the cascade cache together with the binlog position its own consistent
+/// read includes (issue #167): the seed queries and the position read are ONE transaction, so the
+/// parent changes that read never saw are exactly the ones from before that position, and a change
+/// committed while the seed was reading replays from its own images instead of counting as a gap.
+/// `None` is the server reporting no snapshot position (`snapshot_position`), where the caller
+/// keeps the wider window of the position read after the seed.
+async fn seed_cache_at_snapshot(
+    conn: &mut Conn,
+    plan: &ViewPlan,
+) -> Result<(cascade::Cache, Option<Position>)> {
+    // The session reads with READ COMMITTED; the snapshot needs REPEATABLE READ.
+    conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        .await?;
+    // The commit must run whatever the seed or the position read did: an open snapshot would
+    // poison the session for every later read the engine makes on it.
+    let cache = match seed_cache(conn, plan).await {
+        Ok(cache) => cache,
+        Err(e) => {
+            let _ = conn.query_drop("COMMIT").await;
+            return Err(e);
+        }
+    };
+    let pos = match snapshot_status(conn).await {
+        Ok(pos) => pos,
+        Err(e) => {
+            let _ = conn.query_drop("COMMIT").await;
+            return Err(e);
+        }
+    };
+    conn.query_drop("COMMIT")
+        .await
+        .context("committing the cascade seed transaction")?;
+    Ok((cache, pos))
+}
+
 async fn seed_cache(conn: &mut Conn, plan: &ViewPlan) -> Result<cascade::Cache> {
     let mut cache = cascade::Cache::default();
     for (ci, c) in plan.cascades.iter().enumerate() {

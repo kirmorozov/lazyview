@@ -1262,6 +1262,238 @@ fn reg_cascade_window_parent_delete() {
     });
 }
 
+/// The sessions of `db` whose running statement is the startup seed read of the cascade cache:
+/// one SELECT of every kept child row of a cascade (`cascade::seed_sql`), schema-qualified and
+/// filtered on the child's own FK columns.
+async fn seed_reads(conn: &mut mysql_async::Conn, db: &Db) -> Result<usize> {
+    // The engine's own session: a prepared statement, so the list reports it as `Execute`.
+    let filter = format!(
+        "DB = '{}' AND INFO LIKE 'SELECT%FROM `{}`.`links`%WHERE%IS NOT NULL%'",
+        db.name, db.name
+    );
+    Ok(session_ids(conn, &filter).await?.len())
+}
+
+/// Whether this server reports the binlog position of a consistent snapshot at all: the same read
+/// `engine::snapshot_position` makes. Without it the gap window falls back to the position read
+/// after the seed, which is the wider (over-counting) shape.
+async fn snapshot_reported(conn: &mut mysql_async::Conn) -> Result<bool> {
+    exec(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
+    exec(conn, "START TRANSACTION WITH CONSISTENT SNAPSHOT").await?;
+    let read = common::rows(conn, "SHOW SESSION STATUS LIKE 'binlog_snapshot_%'").await;
+    exec(conn, "COMMIT").await?;
+    Ok(read?.iter().any(|r| {
+        r.first().and_then(|k| k.as_ref()).is_some_and(|k| {
+            k.eq_ignore_ascii_case("binlog_snapshot_file")
+                && r.get(1)
+                    .and_then(|v| v.as_ref())
+                    .is_some_and(|v| !v.trim().is_empty())
+        })
+    }))
+}
+
+/// Restart gap, where the window ENDS (issue #167): the startup seed of the cascade cache and the
+/// position that closes the gap window are one consistent read of the source, so the window stops
+/// where the seed stopped rather than where the seed finished. A parent key update that commits
+/// while the seed is reading was seen by no seed query: the cache still holds its children under
+/// the old key, the replay expands them from its own images, and it is NOT a gap (the old shape of
+/// the window counted it as one, over the range that replays correctly). A parent key update from
+/// BEFORE that read still is a gap: the seed read the children already moved, so the lookup under
+/// the old key hits nothing and only the window's remedy reaches them.
+///
+/// A MAP route as in [`reg_cascade_window_parent_update`]: `entities` is the cascade's parent, is
+/// not an alias of the view, and its key gives no unit. The bulk of `links` under one group is what
+/// makes the seed's read long enough to commit a change inside it; the test waits for that read in
+/// the process list and requires it to still be running when the change committed, so the timing is
+/// observed rather than hoped for. `cascade_rows` proves the replay reached the cache either way.
+#[test]
+fn reg_cascade_window_ends_at_seed() {
+    scenario("reg_casc_seed_pos", |ctx| async move {
+        let mut ddl: Vec<String> = vec![
+            "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)"
+                .into(),
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, tag VARCHAR(120) NOT NULL DEFAULT '', PRIMARY KEY (gid, eid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))"
+                .into(),
+        ];
+        ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3'), (100, 'i100')".into());
+        ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6'), (1001, 'ebulk')".into());
+        ddl.push(
+            "INSERT INTO links VALUES (1, 5, 10, 'ta'), (2, 5, 20, 'tb'), (3, 6, 30, 'tc')".into(),
+        );
+        // 262144 kept child rows of one unit: the seed reads every one of them, and its projection
+        // is the map's key and FK columns (the unit column `tag` is one of them), which is what
+        // makes the seed's consistent read long enough to commit a change inside it.
+        let mut off = 1u32;
+        for _ in 0..18 {
+            ddl.push(format!(
+                "INSERT INTO entities (eid, label) SELECT eid + {off}, 'ebulk' FROM entities \
+                 WHERE eid >= 1001"
+            ));
+            off *= 2;
+        }
+        ddl.push(
+            "INSERT INTO links (gid, eid, pos, tag) SELECT 100, eid, 1, REPEAT('t', 120) \
+             FROM entities WHERE eid >= 1001"
+                .into(),
+        );
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![ViewSpec::new(
+            "r_seed_pos",
+            Kind::Incremental,
+            "SELECT l.gid, l.tag, COUNT(*) AS n, SUM(l.pos) AS s, MAX(l.eid) AS k FROM links l \
+             GROUP BY l.gid, l.tag",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_casc_seed_pos", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let reports = snapshot_reported(&mut sc).await?;
+        eng.stop().await?;
+
+        // (1) The parent key update of the rows that will move (the units (1,'ta') and (2,'tb'))
+        // commits WHILE the seed of this restart is reading.
+        let mut eng = ctx.start_engine(&db, &[])?;
+        let began = std::time::Instant::now();
+        let mut seen = false;
+        while began.elapsed() < std::time::Duration::from_secs(30) {
+            if seed_reads(&mut sc, &db).await? > 0 {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        if !seen {
+            let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+            for line in log
+                .lines()
+                .filter(|l| l.contains("resum") || l.contains("cascade"))
+                .take(10)
+            {
+                ctx.log(format!("engine: {line}"));
+            }
+        }
+        ensure!(
+            seen,
+            "the startup seed of the cascade cache was never seen in the process list"
+        );
+        ctx.log(format!(
+            "seed read sighted {} ms after the restart",
+            began.elapsed().as_millis()
+        ));
+        exec_all(&mut sc, &["UPDATE entities SET eid = 9 WHERE eid = 5"]).await?;
+        let wrote = std::time::Instant::now();
+        let mut open_after = false;
+        while wrote.elapsed() < std::time::Duration::from_secs(10) {
+            if seed_reads(&mut sc, &db).await? > 0 {
+                open_after = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        ensure!(
+            open_after,
+            "the seed read had already ended when the parent change committed: the change missed \
+             the window this test is about"
+        );
+        ctx.log(format!(
+            "seed read open {} ms after the restart and still open after the write",
+            began.elapsed().as_millis()
+        ));
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        let f0 = eng.snapshot();
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let s = eng.stats_of(&db, "r_seed_pos")?;
+        let d = eng.snapshot().since(&f0);
+        // The replay reached the cache (2 kept rows of the moved key) either way; only the tally
+        // differs: the seed's snapshot ends the window where the server reports one.
+        let want = if reports { 0 } else { 1 };
+        ensure!(
+            s.cascade_rows >= 2
+                && s.cascade_gaps == want
+                && s.whole_view_refreshes == 0
+                && d.full_rebuilds == 0,
+            "the parent change the seed never saw was replayed wrong, counted as {} gap(s) \
+             (a server without a snapshot position counts one), refreshed the whole view or \
+             rebuilt: {s:?} {}",
+            s.cascade_gaps,
+            fmt_snapshot(&d)
+        );
+        // The two groups it moved are exact at once: the replay of a change the seed did not see
+        // needs no window remedy.
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the groups the change made during the seed read moved",
+        )
+        .await?;
+        ctx.log(format!(
+            "in-window key update (snapshot reported: {reports}): {s:?} {}",
+            fmt_snapshot(&d)
+        ));
+        eng.stop().await?;
+
+        // (2) The lower bound: a parent key update from BEFORE the seed's read still opens a gap
+        // (the filler keeps the log moving past it, so the window cannot end at the change itself).
+        exec_all(
+            &mut sc,
+            &[
+                "UPDATE entities SET eid = 8 WHERE eid = 6",
+                "INSERT INTO items VALUES (200, 'i200')",
+            ],
+        )
+        .await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        let f0 = eng.snapshot();
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // /stats is published at the end of a flush and nothing else writes after the replay, so
+        // wait for the periodic flush (position save, 5 s) to publish the gap of the replay.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let _s = loop {
+            if let Some(s) = eng.view_stats(&db, "r_seed_pos") {
+                if s.cascade_gaps >= 1 {
+                    break s;
+                }
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "the parent change from before the seed read was never counted as a gap in /stats"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the group the pre-seed key update moved",
+        )
+        .await?;
+        let s = eng.stats_of(&db, "r_seed_pos")?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            s.cascade_rows >= 1
+                && s.cascade_gaps == 1
+                && s.whole_view_refreshes == 0
+                && d.full_rebuilds == 0,
+            "the parent change from before the seed read did not open exactly one gap, or the \
+             view was refreshed as a whole / rebuilt: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!(
+            "pre-seed key update still a gap: {s:?} {}",
+            fmt_snapshot(&d)
+        ));
+        eng.stop().await
+    });
+}
+
 /// Per-key delete cases (lazywf §12 / §9.4): a delete through 1 / 2 / 3 hops, an item and
 /// its links in one transaction, an explicit ON DELETE CASCADE, a SET NULL, a key move, and
 /// a delete + re-insert in one window. Each case is oracle-exact, refreshes no whole view,
