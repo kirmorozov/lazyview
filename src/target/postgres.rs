@@ -741,10 +741,16 @@ const PG_TEXT_CHARS: u64 = PG_KEY_BYTES / 4;
 /// can never be taken whole - and a PostgreSQL index carries no prefix (T3.2), so not at all;
 /// `jsonb` has no b-tree operator class and a type the map does not size cannot be planned.
 pub(crate) fn key_part(col: &MvCol) -> KeyPart {
-    let text = |per_char| KeyPart::Str {
-        len: PG_TEXT_CHARS,
-        per_char,
-        must_prefix: true,
+    // The `must_prefix` parts are read by the MySQL family's `fit_key` too: a view that also has
+    // a PostgreSQL target is planned with *these* widths for both tables (§0.5), so a prefix they
+    // render must be one MySQL accepts - `col(n)` only on its string and binary types (a prefix
+    // of an enum or a TIME is ERROR 1089), and never longer than the column itself (`category`
+    // is a varchar(32); the old 676-character width of the unsized `text` spelled a shadow table
+    // MySQL rejected, which held the whole build of such a view). `paren_number` is the source
+    // column's own declared length; what it does not declare stays the unsized cap.
+    let declared = || {
+        paren_number(&col.column_type.to_ascii_lowercase())
+            .map_or(PG_TEXT_CHARS, |n| n.min(PG_TEXT_CHARS))
     };
     match pg_type(col).as_str() {
         "smallint" => KeyPart::Fixed(2),
@@ -759,8 +765,24 @@ pub(crate) fn key_part(col: &MvCol) -> KeyPart {
             per_char: 4,
             must_prefix: false,
         },
-        "text" => text(4),
-        "bytea" => text(1),
+        "text"
+            if matches!(
+                col.data_type.as_str(),
+                "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext"
+            ) =>
+        {
+            KeyPart::Str {
+                len: declared(),
+                per_char: 4,
+                must_prefix: true,
+            }
+        }
+        // The bytea types are MySQL's binary and blob family, where a prefix is legal too.
+        "bytea" => KeyPart::Str {
+            len: declared(),
+            per_char: 1,
+            must_prefix: true,
+        },
         _ => KeyPart::None,
     }
 }
@@ -1486,6 +1508,7 @@ fn parse_time_text(text: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::datum::Datum;
+    use crate::target::PG_KEY_BYTES;
 
     fn col(name: &str, data_type: &str, column_type: &str) -> MvCol {
         MvCol {
