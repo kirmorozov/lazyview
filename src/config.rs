@@ -131,6 +131,17 @@ pub struct Config {
     /// reads of a fence fail (see `engine::snapshot_position`), the stand-in for a transient
     /// source error there (not a connection-class one).
     pub test_fail_snapshot: Option<usize>,
+    /// Test hook `LAZYVIEW_TEST_BINLOG_DSN=<dsn>`: the DSN of the binlog dump connection
+    /// alone (`BinlogReader::connect`), so a network test can cut the stream without touching
+    /// the reads. Unset ⇒ `Config::dsn`: the same endpoint, nothing extra opened.
+    pub test_binlog_dsn: Option<String>,
+    /// Test hook `LAZYVIEW_TEST_QUERY_DSN=<dsn>`: the DSN of the source-read connection
+    /// (`Engine::src`: lookups, refresh SELECTs, catalog), of the supervised source reads and
+    /// of the per-build source reads. Unset ⇒ `Config::dsn`.
+    pub test_query_dsn: Option<String>,
+    /// Test hook `LAZYVIEW_TEST_META_DSN=<dsn>`: the DSN of the metadata connection (the
+    /// catalog writes, the fencing epoch, the leadership lock). Unset ⇒ `Config::dsn`.
+    pub test_meta_dsn: Option<String>,
     /// Test hook `LAZYVIEW_TEST_LOCK_WAIT_S=<s>` (default 60): how long at most a session the
     /// engine opens waits for a table lock (`SET SESSION lock_wait_timeout`, the third statement
     /// of `crate::target::source_session_setup`); a refresh blocked longer fails and is retried with backoff.
@@ -289,6 +300,22 @@ impl Config {
                 .with_context(|| format!("{k} must be <marker>:<ms>"))?;
             Ok(Some((marker.to_string(), Duration::from_millis(ms))))
         };
+        // The three source roles of the network tests (chaos plan F4): the binlog dump, the
+        // reads and the metadata connection each take their own endpoint when the hook is set,
+        // read through `connection` so `mariadb://`, the TLS modes and the encoding are exactly
+        // LAZYVIEW_DSN's. Unset ⇒ `dsn`, so a run without the hooks never leaves LAZYVIEW_DSN.
+        let role_dsn = |prefix: &str| -> Result<Option<String>> {
+            let v = connection(&get, prefix, false)?;
+            if let Some(v) = &v {
+                // Same rule as the source DSN above: a role's DSN is a source DSN, so a
+                // `postgres://` one is refused here with the "not supported yet" message.
+                crate::dialect::Family::from_source_dsn(v)?;
+            }
+            Ok(v.or_else(|| Some(dsn.clone())))
+        };
+        let test_binlog_dsn = role_dsn("LAZYVIEW_TEST_BINLOG")?;
+        let test_query_dsn = role_dsn("LAZYVIEW_TEST_QUERY")?;
+        let test_meta_dsn = role_dsn("LAZYVIEW_TEST_META")?;
         Ok(Config {
             dsn,
             source_family,
@@ -324,6 +351,9 @@ impl Config {
                 .filter(|&n| n > 0),
             test_fail_snapshot: Some(num("LAZYVIEW_TEST_FAIL_SNAPSHOT", 0)? as usize)
                 .filter(|&n| n > 0),
+            test_binlog_dsn,
+            test_query_dsn,
+            test_meta_dsn,
             lock_wait_s: num("LAZYVIEW_TEST_LOCK_WAIT_S", DEFAULT_LOCK_WAIT_S)?.max(1),
             heartbeat: Duration::from_millis(num("LAZYVIEW_HEARTBEAT_MS", 5_000)?.max(100)),
             visibility_delay: Duration::from_millis(num("LAZYVIEW_VISIBILITY_DELAY_MS", 20)?),
@@ -621,6 +651,62 @@ mod tests {
                 e.to_string(),
                 "PostgreSQL sources are not supported yet (postgres:// LAZYVIEW_DSN)",
                 "{dsn}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_source_dsns_default_to_the_service_dsn() {
+        // Unset ⇒ every role stays on LAZYVIEW_DSN: the isolation of the network tests costs
+        // nothing when the hooks are absent, and no second endpoint is ever opened.
+        let c = cfg(&[("LAZYVIEW_DSN", "mysql://lv:p@h:3306/db")]).unwrap();
+        assert_eq!(c.test_binlog_dsn.as_deref(), Some("mysql://lv:p@h:3306/db"));
+        assert_eq!(c.test_query_dsn.as_deref(), Some("mysql://lv:p@h:3306/db"));
+        assert_eq!(c.test_meta_dsn.as_deref(), Some("mysql://lv:p@h:3306/db"));
+        // Set ⇒ one endpoint per role, read exactly the way LAZYVIEW_DSN is read: `mariadb://`
+        // is the alias there, `<PREFIX>_TLS` that hook's TLS mode, the parts an alternative.
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "mysql://lv:p@h:3306/db"),
+            (
+                "LAZYVIEW_TEST_BINLOG_DSN",
+                "mariadb://lv:p@127.0.0.1:3307/db",
+            ),
+            ("LAZYVIEW_TEST_QUERY_DSN", "mysql://lv:p@127.0.0.1:3308/db"),
+            ("LAZYVIEW_TEST_QUERY_TLS", "required"),
+            ("LAZYVIEW_TEST_META_HOST", "127.0.0.1"),
+            ("LAZYVIEW_TEST_META_PORT", "3309"),
+            ("LAZYVIEW_TEST_META_USER", "lv"),
+            ("LAZYVIEW_TEST_META_PASSWORD", "p"),
+            ("LAZYVIEW_TEST_META_DATABASE", "db"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.test_binlog_dsn.as_deref(),
+            Some("mysql://lv:p@127.0.0.1:3307/db"),
+            "mariadb:// is the alias here too"
+        );
+        assert_eq!(
+            c.test_query_dsn.as_deref(),
+            Some("mysql://lv:p@127.0.0.1:3308/db?require_ssl=true&verify_ca=false&verify_identity=false"),
+            "LAZYVIEW_TEST_QUERY_TLS is that role's TLS mode"
+        );
+        assert_eq!(
+            c.test_meta_dsn.as_deref(),
+            Some("mysql://lv:p@127.0.0.1:3309/db"),
+            "the parts assemble the same way"
+        );
+        assert_eq!(c.dsn, "mysql://lv:p@h:3306/db", "the others stay put");
+        // A role's DSN is a source DSN: postgres:// is refused with LAZYVIEW_DSN's own message.
+        for k in [
+            "LAZYVIEW_TEST_BINLOG_DSN",
+            "LAZYVIEW_TEST_QUERY_DSN",
+            "LAZYVIEW_TEST_META_DSN",
+        ] {
+            let e = cfg(&[("LAZYVIEW_DSN", "x"), (k, "postgres://a@b/d")]).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "PostgreSQL sources are not supported yet (postgres:// LAZYVIEW_DSN)",
+                "{k}"
             );
         }
     }

@@ -655,7 +655,12 @@ struct BuildDone {
 struct Engine {
     cfg: Config,
     metrics: Arc<Metrics>,
-    src_opts: Opts,
+    /// The source-read role: `Engine::src`, the supervised source reads, the per-build reads.
+    query_opts: Opts,
+    /// The metadata role: the catalog writes, the fencing epoch, the leadership lock.
+    meta_opts: Opts,
+    /// The binlog dump role: the one connection that reads the stream.
+    binlog_opts: Opts,
     schema: String,
     flavor: Flavor,
     /// Source capabilities, detected from the flavor once at connect.
@@ -864,6 +869,14 @@ async fn connect_target(
     kind.connect(opts, lock_wait_s).await
 }
 
+/// The Opts of one source role (`LAZYVIEW_TEST_{BINLOG,QUERY,META}_DSN` of `Config`): the
+/// role's own DSN when the network test sets one, `LAZYVIEW_DSN` otherwise. The hooks default
+/// to `Config::dsn` in `config::Config::from_lookup`, so an unset hook leaves every role on the
+/// service's single source endpoint; the `unwrap_or` only covers a hand-built `Config`.
+fn role_opts(role: Option<&str>, dsn: &str) -> Result<Opts> {
+    binlog::replica_opts(role.unwrap_or(dsn))
+}
+
 /// Opens a *source* connection (always MySQL-family, §0.2) with the service's
 /// session settings of the MySQL target family.
 async fn connect_source(opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
@@ -983,9 +996,15 @@ impl Engine {
     ) -> Result<Option<(Engine, Option<Position>)>> {
         Metrics::set(&metrics.gauges.starting, 1);
         let src_opts = binlog::replica_opts(&cfg.dsn)?;
+        // The three source roles each connect on their own DSN (the chaos plan's F4). Unset,
+        // every one of them is LAZYVIEW_DSN, so a run without the hooks opens exactly what it
+        // opened before: one endpoint, three connections to it.
+        let query_opts = role_opts(cfg.test_query_dsn.as_deref(), &cfg.dsn)?;
+        let meta_opts = role_opts(cfg.test_meta_dsn.as_deref(), &cfg.dsn)?;
+        let binlog_opts = role_opts(cfg.test_binlog_dsn.as_deref(), &cfg.dsn)?;
         let schema = target::mysql::schema_of(&src_opts, "LAZYVIEW_DSN")?;
         let Some(mut src) = connect_wait(
-            &src_opts,
+            &query_opts,
             "source database",
             &metrics,
             shutdown,
@@ -999,13 +1018,13 @@ impl Engine {
         info!(
             "connected to {} at {}:{}, schema `{schema}`",
             info.version,
-            src_opts.ip_or_hostname(),
-            src_opts.tcp_port()
+            query_opts.ip_or_hostname(),
+            query_opts.tcp_port()
         );
         managed_service_checks(&mut src).await;
-        binlog_filter_checks(&mut src, &schema, src_opts.db_name()).await;
+        binlog_filter_checks(&mut src, &schema, query_opts.db_name()).await;
         let Some(mut meta_conn) = connect_wait(
-            &src_opts,
+            &meta_opts,
             "source database",
             &metrics,
             shutdown,
@@ -1018,7 +1037,7 @@ impl Engine {
         meta::ensure(&mut meta_conn, &schema).await?;
         let Some(leader) = coord::acquire(
             &mut meta_conn,
-            &src_opts,
+            &meta_opts,
             &schema,
             &cfg.instance_id,
             &metrics,
@@ -1071,7 +1090,7 @@ impl Engine {
         let cfg_build_concurrency = cfg.build_concurrency;
         let sup = Supervisor::new(
             &cfg.supervisor,
-            &src_opts,
+            &query_opts,
             &session_sql_mode(&mut src).await?,
             cfg.lock_wait_s,
             metrics.clone(),
@@ -1106,7 +1125,9 @@ impl Engine {
         let mut e = Engine {
             cfg,
             metrics,
-            src_opts,
+            query_opts,
+            meta_opts,
+            binlog_opts,
             schema,
             flavor: info.flavor,
             caps: info.flavor.detect(),
@@ -1241,7 +1262,7 @@ impl Engine {
             &e.metrics,
             "reading the server identity",
             &mut e.src,
-            &e.src_opts,
+            &e.query_opts,
             e.cfg.lock_wait_s,
             |try_no, src| Box::pin(server_identity(src, id_flavor, id_fail, try_no)),
         )
@@ -1776,7 +1797,7 @@ impl Engine {
 
     /// Re-establishes the source-read connection after a connection-class error.
     async fn heal_src(&mut self) {
-        match connect_source(&self.src_opts, self.cfg.lock_wait_s).await {
+        match connect_source(&self.query_opts, self.cfg.lock_wait_s).await {
             Ok(c) => {
                 self.src = c;
                 // The new connection probes the commit order again (and re-creates a dropped
@@ -1798,7 +1819,7 @@ impl Engine {
     /// another instance took over meanwhile this one stops (`Err`). `Ok(false)`: still
     /// unreachable, try again later.
     async fn heal_meta(&mut self) -> Result<bool> {
-        let conn = connect_source(&self.src_opts, self.cfg.lock_wait_s).await;
+        let conn = connect_source(&self.meta_opts, self.cfg.lock_wait_s).await;
         self.metrics.beat();
         let mut conn = match conn {
             Ok(c) => c,
@@ -2460,7 +2481,7 @@ impl Engine {
             .filter(|(marker, _)| self.slots[idx].definition.contains(marker.as_str()))
             .map(|(_, d)| *d);
         let task = tokio::spawn(build_task(
-            self.src_opts.clone(),
+            self.query_opts.clone(),
             self.schema.clone(),
             specs,
             plan.clone(),
@@ -2886,7 +2907,7 @@ impl Engine {
             let connected = tokio::time::timeout(
                 BINLOG_CONNECT_TIMEOUT,
                 BinlogReader::connect(
-                    self.src_opts.clone(),
+                    self.binlog_opts.clone(),
                     self.cfg.server_id,
                     self.flavor,
                     &pos,
@@ -4357,7 +4378,7 @@ impl Engine {
             &self.metrics,
             "reading the binlog snapshot position",
             &mut self.src,
-            &self.src_opts,
+            &self.query_opts,
             self.cfg.lock_wait_s,
             |try_no, src| Box::pin(snapshot_position(src, fail, try_no)),
         )
@@ -6258,6 +6279,38 @@ async fn build_task(
         generation,
         result,
     });
+}
+
+#[cfg(test)]
+mod role_dsn_tests {
+    use super::*;
+
+    /// The three source roles the network tests aim a fault at (chaos plan F4): unset ⇒ the
+    /// service's own endpoint (a run without the hooks opens nothing new), set ⇒ that role's
+    /// endpoint alone (a Toxiproxy listener in front of the same server).
+    #[test]
+    fn each_source_role_connects_where_its_hook_points() {
+        let dsn = "mysql://lv:p@db:3306/app";
+        for role in [None, Some(dsn)] {
+            let o = role_opts(role, dsn).unwrap();
+            assert_eq!((o.ip_or_hostname(), o.tcp_port()), ("db", 3306));
+            assert_eq!(
+                o.user(),
+                Some("lv"),
+                "the role keeps the service's credentials"
+            );
+        }
+        let o = role_opts(Some("mysql://lv:p@127.0.0.1:3307/app"), dsn).unwrap();
+        assert_eq!(
+            (o.ip_or_hostname(), o.tcp_port()),
+            ("127.0.0.1", 3307),
+            "only the role whose hook is set moves"
+        );
+        // A role's DSN goes through the MySQL-only replica parser, as LAZYVIEW_DSN's does:
+        // `Config` refuses a `postgres://` one earlier, with its own message.
+        assert!(role_opts(Some("not a dsn"), dsn).is_err());
+        assert!(role_opts(Some("postgres://a@b/d"), dsn).is_err());
+    }
 }
 
 #[cfg(test)]
