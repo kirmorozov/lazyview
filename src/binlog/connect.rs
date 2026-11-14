@@ -140,7 +140,7 @@ pub(super) fn probe_var_is_absent(err: &mysql_async::Error) -> bool {
 /// `SELECT` is idempotent, so a repeat is a re-read. This file is copy set, so it owns its small
 /// loop: no metrics and no logging — the heartbeat is the engine's job, and the engine's startup
 /// path already retries the whole [`server_info`] call through `connect_wait`.
-async fn probe_var_retry(conn: &mut Conn, var: &str) -> Result<Option<String>> {
+pub(crate) async fn probe_var_retry(conn: &mut Conn, var: &str) -> Result<Option<String>> {
     let mut attempt = 1;
     loop {
         match probe_var(conn, var).await {
@@ -179,10 +179,8 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     let mut compress: Option<String> = None;
     let mut storage_engine: Option<String> = None;
     if flavor == Flavor::MariaDb {
-        // Variables missing on older servers (binlog_storage_engine before 12.3) come back `None`:
-        // nothing to check. A probe that only failed is an error, never "absent".
-        compress = probe_var_retry(conn, "log_bin_compress").await?;
-        storage_engine = probe_var_retry(conn, "binlog_storage_engine").await?;
+        // The MariaDB preflight probes are flavor code: [`crate::source::maria::probes`].
+        (compress, storage_engine) = crate::source::maria::probes(conn).await?;
     }
     let mut problems = requirement_problems(
         flavor,

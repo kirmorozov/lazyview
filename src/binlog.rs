@@ -72,17 +72,22 @@ pub use crate::source::{
     is_access_denied, is_duplicate_server_id, is_missing_binlog, Flavor, Item, MissingBinlog,
     Position, RowsKind, ServerInfo,
 };
+// Shared with [`crate::source::maria`] while the F-series settles the seam: the probe retry
+// loop (MariaDB's preflight probes run through it) and the XA xid formatter (MariaDB's GTID
+// event carries XA ids in the MySQL format).
+pub(crate) use self::connect::probe_var_retry;
+pub(crate) use self::query::xid_string;
 
 #[cfg(test)]
 use self::connect::{product, requirement_problems, split_ca_params, unmet_requirements};
 #[cfg(test)]
 use self::probe::{status_statements, with_hint};
 #[cfg(test)]
-use self::query::{
-    classify_query, format_uuid, mariadb_gtid, mysql_gtid, xa_prepare_event, QueryKind,
-};
+use self::query::{classify_query, format_uuid, mysql_gtid, xa_prepare_event, QueryKind};
 #[cfg(test)]
 use self::stream::{crc32, ty, Tracker, ARTIFICIAL_FLAG, DUMMY_TABLE_ID};
+#[cfg(test)]
+use crate::source::maria::gtid as mariadb_gtid;
 
 #[cfg(test)]
 mod tests;

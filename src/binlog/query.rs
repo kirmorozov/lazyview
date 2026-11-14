@@ -53,7 +53,7 @@ fn split_word(s: &str) -> (&str, &str) {
 
 /// Canonical XA transaction id: `X'<gtrid hex>',X'<bqual hex>',<formatID>` (lowercase hex),
 /// the form the servers log it in.
-fn xid_string(format_id: i64, gtrid: &[u8], bqual: &[u8]) -> String {
+pub(crate) fn xid_string(format_id: i64, gtrid: &[u8], bqual: &[u8]) -> String {
     let mut s = String::with_capacity(16 + 2 * (gtrid.len() + bqual.len()));
     s.push_str("X'");
     for b in gtrid {
@@ -186,42 +186,4 @@ pub(super) fn mysql_gtid(ge: &GtidEvent) -> String {
         Some(tag) => format!("{uuid}:{tag}:{}", ge.gno()),
         None => format!("{uuid}:{}", ge.gno()),
     }
-}
-
-/// MariaDB GTID_EVENT body (little endian): seq_no u64, domain_id u32, flags2 u8,
-/// [commit_id u64 if FL_GROUP_COMMIT_ID], [formatID u32, gtrid_len u8, bqual_len u8, ids if
-/// FL_PREPARED_XA / FL_COMPLETED_XA], …. Returns the GTID and, for the GTID that opens a
-/// prepared XA transaction, its xid.
-pub(super) fn mariadb_gtid(server_id: u32, data: &[u8]) -> Result<(String, Option<String>)> {
-    const FL_GROUP_COMMIT_ID: u8 = 0x02;
-    const FL_PREPARED_XA: u8 = 0x40;
-    const FL_COMPLETED_XA: u8 = 0x80;
-    if data.len() < 12 {
-        bail!("MariaDB GTID event too short ({} bytes)", data.len());
-    }
-    let seq = u64::from_le_bytes(data[0..8].try_into().expect("8 bytes"));
-    let domain = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-    let gtid = format!("{domain}-{server_id}-{seq}");
-    let flags = data.get(12).copied().unwrap_or(0);
-    if flags & (FL_PREPARED_XA | FL_COMPLETED_XA) == 0 {
-        return Ok((gtid, None));
-    }
-    let mut i = 13
-        + if flags & FL_GROUP_COMMIT_ID != 0 {
-            8
-        } else {
-            0
-        };
-    let bad = || anyhow!("malformed XA id in MariaDB GTID event {gtid}");
-    let format_id = data.get(i..i + 4).ok_or_else(bad)?;
-    let format_id = i32::from_le_bytes(format_id.try_into().expect("4 bytes"));
-    let (g, q) = (
-        *data.get(i + 4).ok_or_else(bad)? as usize,
-        *data.get(i + 5).ok_or_else(bad)? as usize,
-    );
-    i += 6;
-    let ids = data.get(i..i + g + q).ok_or_else(bad)?;
-    let xid = xid_string(i64::from(format_id), &ids[..g], &ids[g..]);
-    // Only the prepare opens the transaction; the completing GTID precedes XA COMMIT/ROLLBACK.
-    Ok((gtid, (flags & FL_PREPARED_XA != 0).then_some(xid)))
 }

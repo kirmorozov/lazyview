@@ -12,7 +12,9 @@
 
 use std::cmp::Ordering;
 
-use mysql_async::binlog::events::Event;
+use mysql_async::binlog::events::{BinlogEventHeader, Event};
+
+pub(crate) mod maria;
 
 /// A binlog coordinate. `pos` is the offset of the next event to read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -101,6 +103,31 @@ impl From<bool> for SourceCaps {
             Flavor::MySql
         })
         .detect()
+    }
+}
+
+/// What one event whose header carries `log_pos = 0` does to the tracked file offset: the
+/// value [`crate::binlog::stream`]'s `Tracker::advance` gets from [`position_rule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The event is not part of the file layout: the position does not move.
+    Keep,
+    /// The event is contiguous in the file: add `size` to the position; `exact` = false means
+    /// the offset stops being trustworthy as a resume point inside a transaction from here on
+    /// (an event with a real `log_pos` trusts it again).
+    Advance { size: u64, exact: bool },
+}
+
+/// The one place the per-flavor `log_pos = 0` position rule lives: `Tracker::advance` calls
+/// this for such an event, after excluding the FORMAT_DESCRIPTION re-send and ROTATE (whose
+/// zero `log_pos` never means "inside a transaction"). MySQL's arm is trivial — its
+/// `log_pos = 0` events are the decompressed inner events of a `TRANSACTION_PAYLOAD`, which
+/// `advance` consumes before the hook. MariaDB's rule lives in
+/// [`maria::position_rule`](maria::position_rule).
+pub(crate) fn position_rule(flavor: Flavor, header: BinlogEventHeader) -> Step {
+    match flavor {
+        Flavor::MySql => Step::Keep,
+        Flavor::MariaDb => maria::position_rule(header),
     }
 }
 

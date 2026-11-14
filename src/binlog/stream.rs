@@ -1,8 +1,11 @@
 use super::*;
 
 use crate::binlog::connect::product;
-use crate::binlog::query::{classify_query, mariadb_gtid, mysql_gtid, xa_prepare_event, QueryKind};
-use crate::source::{is_duplicate_server_id_error, missing_binlog_message, ACCESS_DENIED_CODES};
+use crate::binlog::query::{classify_query, mysql_gtid, xa_prepare_event, QueryKind};
+use crate::source::{
+    is_duplicate_server_id_error, maria, missing_binlog_message, position_rule, Step,
+    ACCESS_DENIED_CODES,
+};
 
 // Raw event type codes (MariaDB's are not in mysql_common's `EventType`).
 pub(super) mod ty {
@@ -27,11 +30,11 @@ pub(super) mod ty {
     pub const TRANSACTION_PAYLOAD: u8 = 0x28;
     pub const HEARTBEAT_V2: u8 = 0x29;
     pub const GTID_TAGGED: u8 = 0x2a;
-    // MariaDB
-    pub const MARIA_GTID: u8 = 162;
-    pub const MARIA_QUERY_COMPRESSED: u8 = 165;
-    pub const MARIA_DELETE_ROWS_COMPRESSED: u8 = 171;
-    pub const MARIA_PARTIAL_ROWS: u8 = 172;
+    // MariaDB: the codes live with the flavor, in [`crate::source::maria`]; re-exported so the
+    // (flavor, code) arms below read like the generic codes.
+    pub use crate::source::maria::{
+        MARIA_DELETE_ROWS_COMPRESSED, MARIA_GTID, MARIA_PARTIAL_ROWS, MARIA_QUERY_COMPRESSED,
+    };
 }
 
 /// Table id of the dummy rows event that only carries the end-of-statement flag.
@@ -46,17 +49,6 @@ pub(super) struct Payload {
     remaining: u64,
 }
 
-/// A rows event being reassembled from MariaDB `Partial_rows` fragments.
-#[derive(Debug)]
-struct Partial {
-    total: u32,
-    /// Sequence number of the next fragment (they start at 1).
-    next: u32,
-    /// Length of the whole rows event, from the first fragment.
-    len: u64,
-    buf: Vec<u8>,
-}
-
 /// Position bookkeeping and event → [`Item`] mapping, independent of the connection.
 pub(super) struct Tracker {
     flavor: Flavor,
@@ -69,7 +61,7 @@ pub(super) struct Tracker {
     /// Position of the last `Commit` / `Statement` (or the start position).
     boundary: Position,
     pub(super) payload: Option<Payload>,
-    partial: Option<Partial>,
+    partial: Option<maria::Partial>,
     /// Table maps by id, tagged with the file generation they were seen in. Entries survive one
     /// ROTATE (unlike mysql_common's map), so rows buffered across a rotate still decode.
     tables: HashMap<u64, (u64, TableMapEvent<'static>, Option<Time2Twin>)>,
@@ -126,11 +118,7 @@ impl BinlogReader {
             .await
             .context("opening the binlog connection")?;
         if flavor == Flavor::MariaDb {
-            // MARIA_SLAVE_CAPABILITY_GTID: we understand GTID / GTID_LIST / BINLOG_CHECKPOINT
-            // events (otherwise the server rewrites them into dummy events).
-            conn.query_drop("SET @mariadb_slave_capability = 4")
-                .await
-                .context("SET @mariadb_slave_capability")?;
+            maria::prepare_connection(&mut conn).await?;
         }
         if !heartbeat.is_zero() {
             // Nanoseconds; MySQL >= 8.0.26 reads source_*, older MySQL and MariaDB master_*.
@@ -544,71 +532,6 @@ impl Tracker {
         })
     }
 
-    /// Adds a MariaDB `Partial_rows` fragment (type 172, MariaDB >= 12.3); returns the rows event
-    /// once its last fragment is in.
-    ///
-    /// Body: fragment count u32, sequence number u32 (from 1), flags u8; the first fragment then
-    /// has the length of the whole rows event u64. The fragments follow each other and their
-    /// payloads concatenate to the rows event (header and body, without its checksum, although
-    /// its header counts one).
-    pub(super) fn partial_rows(&mut self, ev: &Event) -> Result<Option<Event>> {
-        let data = ev.data();
-        let at = &self.pos;
-        let bad = || {
-            anyhow!(
-                "malformed MariaDB Partial_rows event at {at} ({} bytes)",
-                data.len()
-            )
-        };
-        let u32_at = |i: usize| {
-            data.get(i..i + 4)
-                .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
-        };
-        let total = u32_at(0).ok_or_else(bad)?;
-        let seq = u32_at(4).ok_or_else(bad)?;
-        let mut payload = data.get(9..).ok_or_else(bad)?;
-        if seq == 1 {
-            let len = payload
-                .get(..8)
-                .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
-                .ok_or_else(bad)?;
-            payload = &payload[8..];
-            self.partial = Some(Partial {
-                total,
-                next: 1,
-                len,
-                buf: Vec::new(),
-            });
-        }
-        let Some(p) = self
-            .partial
-            .as_mut()
-            .filter(|p| p.next == seq && p.total == total)
-        else {
-            bail!("MariaDB Partial_rows fragment {seq} of {total} at {at} does not continue a rows event");
-        };
-        p.buf.extend_from_slice(payload);
-        p.next += 1;
-        if seq < total {
-            return Ok(None);
-        }
-        let Partial { len, mut buf, .. } = self.partial.take().expect("checked above");
-        if buf.len() as u64 != len || buf.len() < 19 {
-            bail!(
-                "MariaDB Partial_rows fragments ending at {at} hold {} bytes, the rows event has {len}",
-                buf.len()
-            );
-        }
-        let size = u32::try_from(buf.len()).context("reassembled rows event over 4 GiB")?;
-        buf[9..13].copy_from_slice(&size.to_le_bytes());
-        let mut footer = ev.fde().footer();
-        footer.set_checksum_enabled(false);
-        let fde = ev.fde().clone().with_footer(footer);
-        let rows = Event::read(&fde, &buf[..])
-            .with_context(|| format!("reading the rows event reassembled at {at}"))?;
-        Ok(Some(rows))
-    }
-
     /// Updates the position bookkeeping for one event: consumes bytes of an open transaction
     /// payload (`TRANSACTION_PAYLOAD`) and advances `pos` by the header unless the event is
     /// inner, artificial or a heartbeat.
@@ -643,12 +566,16 @@ impl Tracker {
                 self.pos.pos = log_pos;
                 self.pos_exact = true;
             } else if !matches!(et, ty::FORMAT_DESCRIPTION | ty::ROTATE) {
-                // MariaDB >= 11.4 (binlog_legacy_event_pos=OFF) writes log_pos = 0 for events
-                // inside a transaction; they are contiguous in the file, so advance by size.
                 // (A FORMAT_DESCRIPTION with log_pos 0 is the copy re-sent at stream start.)
-                self.pos.pos += u64::from(header.event_size());
-                if et == ty::TABLE_MAP {
-                    self.pos_exact = false;
+                // The flavor decides where a log_pos = 0 event leaves the offset.
+                match position_rule(self.flavor, header) {
+                    Step::Keep => {}
+                    Step::Advance { size, exact } => {
+                        self.pos.pos += size;
+                        if !exact {
+                            self.pos_exact = false;
+                        }
+                    }
                 }
             }
         }
@@ -734,32 +661,46 @@ impl Tracker {
             | ty::UPDATE_ROWS
             | ty::DELETE_ROWS
             | ty::PARTIAL_UPDATE_ROWS => self.rows_item(ev)?,
-            ty::MARIA_PARTIAL_ROWS => match self.partial_rows(&ev)? {
-                Some(rows) => self.rows_item(rows)?,
-                None => Item::Other,
-            },
+            // (flavor, code) dispatch: MariaDB's codes 165–172 mean nothing on another flavor,
+            // so there those events fall through to `Other` like any unknown code.
+            ty::MARIA_PARTIAL_ROWS if self.flavor == Flavor::MariaDb => {
+                match maria::partial_rows(&mut self.partial, &ev, &self.pos)? {
+                    Some(rows) => self.rows_item(rows)?,
+                    None => Item::Other,
+                }
+            }
             ty::PRE_GA_WRITE_ROWS..=ty::PRE_GA_DELETE_ROWS => {
                 bail!("unsupported pre-GA rows event (type {et}) at {}", self.pos)
             }
-            ty::XID => Item::Commit { pos: self.boundary_here() },
+            ty::XID => Item::Commit {
+                pos: self.boundary_here(),
+            },
             ty::XA_PREPARE => match xa_prepare_event(ev.data())? {
-                (true, _) => Item::Commit { pos: self.boundary_here() }, // XA COMMIT … ONE PHASE
-                (false, xid) => Item::XaPrepare { xid, pos: self.boundary_here() },
+                (true, _) => Item::Commit {
+                    pos: self.boundary_here(),
+                }, // XA COMMIT … ONE PHASE
+                (false, xid) => Item::XaPrepare {
+                    xid,
+                    pos: self.boundary_here(),
+                },
             },
             ty::QUERY => self.on_query(&ev)?,
             ty::GTID | ty::GTID_TAGGED => {
                 let ge: GtidEvent = ev.read_event().context("parsing GTID event")?;
-                Item::Gtid { gtid: mysql_gtid(&ge) }
+                Item::Gtid {
+                    gtid: mysql_gtid(&ge),
+                }
             }
             ty::MARIA_GTID => {
-                let (gtid, xa) = mariadb_gtid(header.server_id(), ev.data())?;
+                let (gtid, xa) = maria::gtid(header.server_id(), ev.data())?;
                 self.queued = xa.map(|xid| Item::XaStart { xid });
                 Item::Gtid { gtid }
             }
             ty::HEARTBEAT | ty::HEARTBEAT_V2 => Item::Heartbeat,
             ty::TRANSACTION_PAYLOAD => {
-                let tpe: TransactionPayloadEvent<'_> =
-                    ev.read_event().context("parsing TRANSACTION_PAYLOAD event")?;
+                let tpe: TransactionPayloadEvent<'_> = ev
+                    .read_event()
+                    .context("parsing TRANSACTION_PAYLOAD event")?;
                 // Uncompressed payloads (algorithm NONE) carry no uncompressed size.
                 let size = match tpe.uncompressed_size() {
                     0 => tpe.payload_raw().len() as u64,
@@ -770,11 +711,11 @@ impl Tracker {
                 }
                 Item::Other
             }
-            ty::MARIA_QUERY_COMPRESSED..=ty::MARIA_DELETE_ROWS_COMPRESSED => bail!(
-                "MariaDB compressed binlog event (type {et}) at {} is not supported; \
-                 set log_bin_compress=OFF on the server (events already written compressed cannot be read)",
-                self.pos
-            ),
+            ty::MARIA_QUERY_COMPRESSED..=ty::MARIA_DELETE_ROWS_COMPRESSED
+                if self.flavor == Flavor::MariaDb =>
+            {
+                return Err(maria::compressed_event_error(et, &self.pos));
+            }
             ty::INCIDENT => Item::Incident {
                 pos: self.pos.clone(),
             },
