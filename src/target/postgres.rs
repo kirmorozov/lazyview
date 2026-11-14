@@ -184,6 +184,13 @@ fn filter_bind(
         let types: Vec<&MvCol> = at.iter().filter_map(|&u| types.get(u).copied()).collect();
         return filter_bind(c, &cols, &[], &types);
     }
+    if cols.is_empty() {
+        // A view with no unit columns - the global aggregate, one unit: the whole table. An empty
+        // column list would render `() IN (())`, a syntax error here, so the filter matches every
+        // row: the same semantics as the MySQL family's empty-unit arm of `write_tx_mysql`
+        // (`src/mv.rs:1122-1125`), whose `TRUE` this is.
+        return ("TRUE".to_string(), Vec::new());
+    }
     let exprs: Vec<String> = cols.iter().map(|e| format!("({e})")).collect();
     let mut params: Vec<Option<String>> = Vec::new();
     // One key as `((c)) = $n` per column, and one key as the `($1,$2)` row of an `IN` list.
