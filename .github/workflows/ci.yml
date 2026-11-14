@@ -427,7 +427,8 @@ jobs:
           cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
             | tee pg-target-tests.log
           for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
-                   targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others; do
+                   targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others \
+                   targets_pg_group_by_unindexable_key; do
             grep -q "^test $t \.\.\. ok$" pg-target-tests.log || { echo "::error::$t did not run and pass"; exit 1; }
           done
       - name: collect server logs

@@ -2343,4 +2343,108 @@ mod tests {
             "connection 4242 still listed 5s after pg_terminate_backend"
         );
     }
+
+    /// The width / prefix rule of [`key_part`], one column per family the type map can land a key
+    /// column in. The positive side: a declared string or binary column keeps its OWN declared
+    /// length (the cap is the budget, reached only by an unsized `text`/`bytea`), a numeric travels
+    /// its 40 digits unprefixed, and the fixed types are taken whole. The negative side, which is
+    /// the rule's point: the types MySQL forbids a `col(n)` prefix on - `enum`, `set`, `TIME`, and
+    /// a type lazyview does not know - are no key part at all, so they can neither be prefixed on
+    /// the MySQL shadow table (ERROR 1089) nor indexed here (T3.2 stores no prefix).
+    /// [`KeyPart::full_bytes`] is the question the planner asks of each part: `None` is what leaves
+    /// a layout with no unique row key.
+    #[test]
+    fn key_part_families_and_the_prefix_rule() {
+        let cases: &[(&str, &str, &str, KeyPart)] = &[
+            // The string family: `len` is the column's own declared length, capped at the budget.
+            (
+                "c_varchar32",
+                "varchar",
+                "varchar(32)",
+                KeyPart::Str {
+                    len: 32,
+                    per_char: 4,
+                    must_prefix: true,
+                },
+            ),
+            (
+                "c_varchar_wide",
+                "varchar",
+                "varchar(4000)",
+                KeyPart::Str {
+                    len: PG_TEXT_CHARS,
+                    per_char: 4,
+                    must_prefix: true,
+                },
+            ),
+            (
+                "c_text_unsized",
+                "text",
+                "text",
+                KeyPart::Str {
+                    len: PG_TEXT_CHARS,
+                    per_char: 4,
+                    must_prefix: true,
+                },
+            ),
+            // The binary family: one byte per character, the same cap and the same prefix rule.
+            (
+                "c_varbinary16",
+                "varbinary",
+                "varbinary(16)",
+                KeyPart::Str {
+                    len: 16,
+                    per_char: 1,
+                    must_prefix: true,
+                },
+            ),
+            (
+                "c_blob",
+                "blob",
+                "blob",
+                KeyPart::Str {
+                    len: PG_TEXT_CHARS,
+                    per_char: 1,
+                    must_prefix: true,
+                },
+            ),
+            // Whole parts: the group keys a row key is built from.
+            ("c_int", "int", "int(11)", KeyPart::Fixed(4)),
+            ("c_bigint", "bigint", "bigint(20)", KeyPart::Fixed(8)),
+            ("c_date", "date", "date", KeyPart::Fixed(4)),
+            ("c_datetime6", "datetime", "datetime(6)", KeyPart::Fixed(8)),
+            (
+                "c_decimal",
+                "decimal",
+                "decimal(20,4)",
+                KeyPart::Str {
+                    len: 40,
+                    per_char: 4,
+                    must_prefix: false,
+                },
+            ),
+            // No key part: `text` here, but a prefix of these is ERROR 1089 in MySQL and a
+            // PostgreSQL b-tree holds no prefix, so the column cannot be a key at all.
+            ("c_enum", "enum", "enum('a','b')", KeyPart::None),
+            ("c_set", "set", "set('a','b','c')", KeyPart::None),
+            ("c_time", "time", "time(6)", KeyPart::None),
+            ("c_unknown", "geometry", "geometry", KeyPart::None),
+        ];
+        for (name, dt, ct, want) in cases {
+            let got = key_part(&col(name, dt, ct));
+            assert_eq!(&got, want, "{name}: {dt} {ct}");
+            assert_eq!(
+                got.full_bytes().is_some(),
+                matches!(
+                    want,
+                    KeyPart::Fixed(_)
+                        | KeyPart::Str {
+                            must_prefix: false,
+                            ..
+                        }
+                ),
+                "{name}: {dt} {ct} indexable whole"
+            );
+        }
+    }
 }

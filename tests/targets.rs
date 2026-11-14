@@ -807,6 +807,157 @@ fn targets_pg_incremental_never_rebuilds() {
     });
 }
 
+/// A MySQL `time` value reaches a write as the datum's own text (`8:30:00.000000`: the hour is not
+/// padded and the fraction is always six digits) while MySQL prints `08:30:00`, so a `time` key is
+/// compared as a value: hour padded, trailing fraction zeros (and the dot) removed - the rule
+/// `pg::normalize_pg`'s `strip_frac_zeros` applies to the timestamp family.
+fn time_key(text: &str) -> String {
+    let (hms, frac) = text.split_once('.').unwrap_or((text, ""));
+    let frac = frac.trim_end_matches('0');
+    let mut p = hms.split(':').map(|d| d.pad_start(2, '0'));
+    let (h, m, s) = (
+        p.next().unwrap_or_default(),
+        p.next().unwrap_or_default(),
+        p.next().unwrap_or_default(),
+    );
+    if frac.is_empty() {
+        format!("{h}:{m}:{s}")
+    } else {
+        format!("{h}:{m}:{s}.{frac}")
+    }
+}
+
+/// The `KeyPart::None` arm of the plan end to end: a grouped view whose group key is a column the
+/// type map cannot size (`items.attr` is a `time`, which is `text` here with no declared length and
+/// no MySQL prefix, so `key_part` refuses it - the lib test `key_part_families_and_the_prefix_rule`
+/// pins the part itself). Three things follow and all are asserted: the layout keeps **no** unique
+/// row key (`_lv_row`, T3.2's only unique index) because that column cannot be taken whole, the
+/// group keys still travel through the write path (the hidden unit column holds them and every
+/// delete is a filter on it), and the rows stay equal to the oracle - groups gain and lose members
+/// and one group disappears entirely - with no key for `ON CONFLICT` to name.
+#[test]
+fn targets_pg_group_by_unindexable_key() {
+    let Some(pgs) = pg::servers_or_skip("targets_pg_group_by_unindexable_key") else {
+        return;
+    };
+    scenario("tg_pgnone", move |ctx| {
+        let pgs1 = pgs.clone();
+        async move {
+            let src = ctx.new_db("tg_pgno_src").await?;
+            let pgdb = pg::new_pg_db(&pgs1[0], "tg_pgno").await?;
+            let mut c = src.conn().await?;
+            exec_all(
+                &mut c,
+                &[
+                    "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL)",
+                    "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL, attr TIME NOT NULL)",
+                    "INSERT INTO entities VALUES (1,'alpha'),(2,'beta')",
+                    "INSERT INTO items VALUES (1,1,10.50,'08:30:00'),(2,1,20.25,'08:30:00'),(3,2,5.00,'12:00:00')",
+                ],
+            )
+            .await?;
+            ensure_lazyview_table(&mut c).await?;
+            // The group key is the view's unit: every write of a grouped view is a delete by that
+            // key plus an insert, so this is the None arm of the planner *and* of the writer.
+            let spec = ViewSpec::new(
+                "grp",
+                Kind::Incremental,
+                "SELECT COUNT(*) AS n, SUM(i.amount) AS total FROM items i GROUP BY i.attr",
+            )
+            .with_targets("pg");
+            add_views(&mut c, std::slice::from_ref(&spec)).await?;
+            let env = target_env(&[("pg", &pgdb.dsn)]);
+            let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+            wait_ready(&mut c, &mut eng, &["grp"], t_ready()).await?;
+            let client = pgdb.client().await?;
+            ensure!(
+                !pg::has_row_index(&client, &pgdb.schema, "grp").await?,
+                "grp took a unique row-key index over a TIME group key key_part refuses"
+            );
+            drop(client);
+            // Four group keys travel through the write path: two new ones arrive, one row moves
+            // from one group to another (both units are touched), and one group loses its only row
+            // - its rows must go with it, with no key for the writer to name.
+            exec(&mut c, "INSERT INTO items VALUES (4,2,7.75,'08:30:00')").await?;
+            exec(&mut c, "INSERT INTO items VALUES (5,1,7.75,'18:45:00')").await?;
+            exec(&mut c, "INSERT INTO items VALUES (6,2,1.25,'23:15:00')").await?;
+            exec(&mut c, "UPDATE items SET attr = '12:00:00' WHERE id = 1").await?;
+            exec(&mut c, "DELETE FROM items WHERE id = 3").await?;
+            exec(&mut c, "DELETE FROM items WHERE id = 6").await?;
+            eng.wait_caught_up(&mut c, t_catchup()).await?;
+            let vs = eng.stats_of(&src, "grp")?;
+            ensure!(
+                vs.whole_view_refreshes == 0,
+                "grp took {} whole-view refreshes, expected none (incremental without a row key)",
+                vs.whole_view_refreshes
+            );
+            let client = pgdb.client().await?;
+            let rows = pg::fetch(&client, &pgdb.schema, "grp").await?;
+            ensure!(
+                rows.rows.len() == 3,
+                "grp holds {} rows on the target, expected the three groups (the '23:15:00' group \
+                 went with its row)",
+                rows.rows.len()
+            );
+            ensure!(
+                !pg::has_row_index(&client, &pgdb.schema, "grp").await?,
+                "grp gained a unique row-key index during the load"
+            );
+            drop(client);
+            // The refused column is still the unit, and its four values are the four TIMEs the load
+            // wrote - the vanished group included, since its delete found it by that key. Read by
+            // name from the catalog: the hidden unit column's spelling is the planner's business.
+            let names = pg_exec(
+                &pgdb.dsn,
+                &[],
+                Some(&format!(
+                    "SELECT column_name FROM information_schema.columns \
+                     WHERE table_schema = '{}' AND table_name = 'grp' \
+                       AND column_name LIKE '\\_lv\\_u%' ORDER BY 1",
+                    pgdb.schema
+                )),
+            )
+            .await?;
+            let Some(unit) = names.first().and_then(|r| r.first()).cloned() else {
+                bail!("grp has no hidden unit column: {names:?}");
+            };
+            let mut units = pg_exec(
+                &pgdb.dsn,
+                &[],
+                Some(&format!(
+                    "SELECT \"{}\"::text FROM \"{}\".\"grp\"",
+                    unit, pgdb.schema
+                )),
+            )
+            .await?
+            .into_iter()
+            .filter_map(|r| r.into_iter().next())
+            .map(|t| time_key(&t))
+            .collect::<Vec<_>>();
+            units.sort();
+            ensure!(
+                units == ["08:30:00", "12:00:00", "18:45:00", "23:15:00"],
+                "grp's unit key values are {units:?}"
+            );
+            ctx.log("grouped by an unindexable key: no unique index, incremental, four unit keys");
+            let tmap: HashMap<String, Db> = HashMap::new();
+            let pgmap: HashMap<String, pg::PgDb> = [("pg".to_string(), pgdb.clone())].into();
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &pgmap,
+                std::slice::from_ref(&spec),
+                "grouped rows, no row key",
+            )
+            .await?;
+            eng.stop().await?;
+            pg::drop_dbs(std::slice::from_ref(&pgdb)).await?;
+            Ok(())
+        }
+    });
+}
 /// The transactional swap under a reader: while a reader holds the MV table open, a definition
 /// edit forces a whole-view rebuild and its swap — which must either complete or fail with a
 /// lock_timeout and retry, never leaving `links__lv_new` behind ([`wait_exists`]'s rule).
