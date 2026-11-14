@@ -63,17 +63,20 @@ async fn run_engine(
     metrics: Arc<Metrics>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let opts = binlog::replica_opts(&cfg.dsn).ok();
-    let user = opts
+    let replica = binlog::replica_opts(&cfg.dsn);
+    let user = replica
         .as_ref()
+        .ok()
         .and_then(|o| o.user().map(str::to_string))
         .unwrap_or_else(|| "lazyview".into());
-    let schema = opts
+    let schema = replica
         .as_ref()
+        .ok()
         .and_then(|o| o.db_name().map(str::to_string))
         .unwrap_or_default();
     let r = async {
-        let Some((mut engine, start)) = Engine::start(cfg, metrics, shutdown).await? else {
+        let Some((mut engine, start)) = Engine::start(cfg, metrics, shutdown, replica).await?
+        else {
             return Ok(());
         };
         let Some(start) = start else {
@@ -174,32 +177,6 @@ async fn managed_service_checks(conn: &mut Conn) {
     }
 }
 
-/// Server errors that mean this connection, or the server itself, is going away: the statement
-/// is retried on a new connection (a clean server restart answers 1053 to statements that land in
-/// its shutdown window).
-const CONN_GONE_CODES: &[u16] = &[
-    1053, // ER_SERVER_SHUTDOWN: "Server shutdown in progress"
-    1927, // MariaDB ER_CONNECTION_KILLED: "Connection was killed"
-    3169, // MySQL ER_SESSION_WAS_KILLED: "Session was killed"
-    4031, // MySQL ER_CLIENT_INTERACTION_TIMEOUT: disconnected for inactivity
-    2006, // CR_SERVER_GONE_ERROR, when it arrives as a server error (proxies)
-    2013, // CR_SERVER_LOST, likewise
-];
-
-/// Connection-class failures (socket closed, reset, timeouts, the server or session going away,
-/// see [`CONN_GONE_CODES`]): retry after reconnecting.
-fn is_conn_error(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| match c.downcast_ref::<mysql_async::Error>() {
-            Some(mysql_async::Error::Io(_)) => true,
-            Some(mysql_async::Error::Driver(d)) => {
-                matches!(d, mysql_async::DriverError::ConnectionClosed)
-            }
-            Some(mysql_async::Error::Server(se)) => CONN_GONE_CODES.contains(&se.code),
-            _ => false,
-        })
-}
-
 fn is_tls_error(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         matches!(
@@ -243,12 +220,21 @@ async fn connect_wait(
     shutdown: &mut watch::Receiver<bool>,
     lock_wait_s: u64,
 ) -> Result<Option<Conn>> {
-    let mut backoff = Duration::from_secs(1);
     let mut waited = false;
     loop {
         // A source connection: a source is always MySQL-family (`postgres://` is rejected for
-        // `LAZYVIEW_DSN` in `crate::config`).
-        match connect_source(opts, lock_wait_s).await {
+        // `LAZYVIEW_DSN` in `crate::config`). The one helper retries transient connect failures
+        // with Policy::CONNECT (jittered, `metrics.beat()` between tries); errors it does not
+        // classify as transient come back here, where the fatal set
+        // (`!is_transient && !is_tls_error`) still ends the wait.
+        match supervisor::retrying(
+            metrics,
+            &format!("waiting for {what}"),
+            supervisor::Policy::CONNECT,
+            || connect_source(opts, lock_wait_s, metrics),
+        )
+        .await
+        {
             Ok(c) => {
                 if waited {
                     info!(
@@ -272,20 +258,20 @@ async fn connect_wait(
             }
             Err(e) => {
                 warn!(
-                    "waiting for {what} at {}:{}: {}; retrying in {backoff:?}",
+                    "waiting for {what} at {}:{}: {}; retrying in {:?}",
                     opts.ip_or_hostname(),
                     opts.tcp_port(),
-                    e.root_cause()
+                    e.root_cause(),
+                    supervisor::Policy::CONNECT.cap
                 );
                 waited = true;
             }
         }
-        metrics.beat();
+        // Still unreachable after a whole policy run: wait one cap, shutdown-aware.
         tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(supervisor::Policy::CONNECT.cap) => {}
             _ = shutdown.changed() => if *shutdown.borrow() { return Ok(None) },
         }
-        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -327,8 +313,8 @@ where
             err.root_cause()
         );
         metrics.beat();
-        if is_conn_error(&err) {
-            match connect_source(opts, lock_wait_s).await {
+        if binlog::is_transient(&err) {
+            match connect_source(opts, lock_wait_s, metrics).await {
                 Ok(c) => *src = c,
                 Err(e) => warn!(
                     "{what}: source database still unreachable: {}",
@@ -358,13 +344,16 @@ struct Target {
     failures: u32,
 }
 
-/// Retry delay after `n` consecutive failures of one target (1 s doubling, at most 30 s).
-fn target_backoff(n: u32) -> Duration {
-    Duration::from_secs(1u64 << n.saturating_sub(1).min(5)).min(Duration::from_secs(30))
-}
-
 /// One connect attempt to a target (TCP + handshake), well inside the liveness window.
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Retry delay after `n` consecutive failures of one target: the shared backoff of the one
+/// helper (supervisor), the `Policy::CONNECT` shape (1 s doubling to its 30 s cap, jittered).
+/// The `retry_at` parking of the target is the engine's own.
+fn connect_retry_delay(n: u32) -> Duration {
+    let p = supervisor::Policy::CONNECT;
+    supervisor::backoff(n, p.base, p.cap, p.jitter)
+}
 
 /// Consecutive failed refreshes of a live view after which its state rows show the error (it is
 /// retried with backoff all the same, never re-planned or rebuilt).
@@ -743,10 +732,6 @@ struct Engine {
     dedup: crate::exec::Dedup,
 }
 
-/// One connection attempt (TCP, TLS and handshake) is bounded well inside the liveness window:
-/// an unreachable host would otherwise hold the loop for the OS's SYN retries (~130 s).
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Binlog dump connections: connect, register as a replica and request the stream.
 const BINLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -864,9 +849,10 @@ async fn connect_target(
     opts: &target::Opts,
     kind: target::Kind,
     lock_wait_s: u64,
+    metrics: &Metrics,
 ) -> Result<target::Conn> {
     // One dispatch per connection: the family is chosen there, once.
-    kind.connect(opts, lock_wait_s).await
+    kind.connect(opts, lock_wait_s, metrics).await
 }
 
 /// The Opts of one source role (`LAZYVIEW_TEST_{BINLOG,QUERY,META}_DSN` of `Config`): the
@@ -879,16 +865,18 @@ fn role_opts(role: Option<&str>, dsn: &str) -> Result<Opts> {
 
 /// Opens a *source* connection (always MySQL-family, §0.2) with the service's
 /// session settings of the MySQL target family.
-async fn connect_source(opts: &Opts, lock_wait_s: u64) -> Result<Conn> {
-    let mut c = match tokio::time::timeout(CONNECT_TIMEOUT, Conn::new(opts.clone())).await {
-        Ok(r) => r?,
-        Err(_) => bail!(
-            "connecting to {}:{}: timed out after {CONNECT_TIMEOUT:?}",
-            opts.ip_or_hostname(),
-            opts.tcp_port()
-        ),
-    };
-    target::init_session(&mut c, target::Kind::Mysql, lock_wait_s).await?;
+async fn connect_source(opts: &Opts, lock_wait_s: u64, metrics: &Metrics) -> Result<Conn> {
+    let mut c =
+        match tokio::time::timeout(supervisor::CONNECT_TIMEOUT, Conn::new(opts.clone())).await {
+            Ok(r) => r?,
+            Err(_) => bail!(
+                "connecting to {}:{}: timed out after {:?}",
+                opts.ip_or_hostname(),
+                opts.tcp_port(),
+                supervisor::CONNECT_TIMEOUT,
+            ),
+        };
+    target::init_session(&mut c, target::Kind::Mysql, lock_wait_s, metrics).await?;
     Ok(c)
 }
 
@@ -993,9 +981,11 @@ impl Engine {
         cfg: Config,
         metrics: Arc<Metrics>,
         shutdown: &mut watch::Receiver<bool>,
+        replica: Result<Opts>,
     ) -> Result<Option<(Engine, Option<Position>)>> {
         Metrics::set(&metrics.gauges.starting, 1);
-        let src_opts = binlog::replica_opts(&cfg.dsn)?;
+        // B7: the one `replica_opts` parse (engine B7); the Result arrives from `run_engine`.
+        let src_opts = replica?;
         // The three source roles each connect on their own DSN (the chaos plan's F4). Unset,
         // every one of them is LAZYVIEW_DSN, so a run without the hooks opens exactly what it
         // opened before: one endpoint, three connections to it.
@@ -1758,7 +1748,9 @@ impl Engine {
         let delay = if retry {
             let n = self.failures.entry(def_id).or_insert(0);
             *n += 1;
-            Duration::from_secs((1u64 << (*n).min(8)).min(300))
+            // The one backoff maths; the definition is parsed once per plan (plan_bounded),
+            // planning being a pure function of it.
+            supervisor::backoff(*n, Duration::from_secs(1), Duration::from_secs(300), false)
         } else {
             Duration::ZERO
         };
@@ -1797,7 +1789,7 @@ impl Engine {
 
     /// Re-establishes the source-read connection after a connection-class error.
     async fn heal_src(&mut self) {
-        match connect_source(&self.query_opts, self.cfg.lock_wait_s).await {
+        match connect_source(&self.query_opts, self.cfg.lock_wait_s, &self.metrics).await {
             Ok(c) => {
                 self.src = c;
                 // The new connection probes the commit order again (and re-creates a dropped
@@ -1819,7 +1811,7 @@ impl Engine {
     /// another instance took over meanwhile this one stops (`Err`). `Ok(false)`: still
     /// unreachable, try again later.
     async fn heal_meta(&mut self) -> Result<bool> {
-        let conn = connect_source(&self.meta_opts, self.cfg.lock_wait_s).await;
+        let conn = connect_source(&self.meta_opts, self.cfg.lock_wait_s, &self.metrics).await;
         self.metrics.beat();
         let mut conn = match conn {
             Ok(c) => c,
@@ -1834,7 +1826,7 @@ impl Engine {
                 info!("metadata connection re-established; still the active instance");
                 Ok(true)
             }
-            Err(e) if is_conn_error(&e) => Ok(false),
+            Err(e) if binlog::is_transient(&e) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -1842,7 +1834,7 @@ impl Engine {
     /// A failed metadata statement: connection-class errors heal the connection and are
     /// retried later; anything else (lost leadership, a changed epoch) is fatal.
     async fn meta_failed(&mut self, e: anyhow::Error, what: &str) -> Result<()> {
-        if !is_conn_error(&e) {
+        if !binlog::is_transient(&e) {
             return Err(e.context(what.to_string()));
         }
         warn!("{what}: {}; reconnecting", e.root_cause());
@@ -2169,9 +2161,14 @@ impl Engine {
                     continue;
                 }
                 info!(table = %table, "removing a table lazyview created for a definition that no longer exists");
-                if let Err(e) =
-                    target::drop_table(&mut self.meta, target::Kind::Mysql, &self.schema, &table)
-                        .await
+                if let Err(e) = target::drop_table(
+                    &mut self.meta,
+                    target::Kind::Mysql,
+                    &self.schema,
+                    &table,
+                    &self.metrics,
+                )
+                .await
                 {
                     warn!("dropping {table}: {e:#}");
                 }
@@ -2250,10 +2247,12 @@ impl Engine {
             }
             let (rows, bytes) = (self.cfg.write_batch_rows, self.cfg.write_batch_bytes);
             let r = match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, async {
-                let mut c = connect_target(&target.opts, target.kind, self.cfg.lock_wait_s).await?;
+                let mut c =
+                    connect_target(&target.opts, target.kind, self.cfg.lock_wait_s, &metrics)
+                        .await?;
                 let w = match &mut c {
                     target::Conn::Mysql(c) => {
-                        target::write_opts(c, target.kind, rows, bytes).await?
+                        target::write_opts_with(c, target.kind, rows, bytes, &metrics).await?
                     }
                     target::Conn::Postgres(c) => c.write_opts(target.kind, rows, bytes).await?,
                 };
@@ -2283,7 +2282,7 @@ impl Engine {
                 }
                 Err(e) => {
                     target.failures += 1;
-                    target.retry_at = Some(Instant::now() + target_backoff(target.failures));
+                    target.retry_at = Some(Instant::now() + connect_retry_delay(target.failures));
                     return Err(e);
                 }
             }
@@ -2395,7 +2394,14 @@ impl Engine {
         let kind = self.targets[t].kind;
         if let Ok(c) = self.target_conn(t).await {
             if let Ok(c) = c.mysql() {
-                let _ = target::drop_table(c, kind, &ts, &target::shadow_name(name)).await;
+                let _ = target::drop_table(
+                    c,
+                    kind,
+                    &ts,
+                    &target::shadow_name(name),
+                    &Metrics::default(),
+                )
+                .await;
             }
         }
     }
@@ -2702,7 +2708,9 @@ impl Engine {
                 match self.target_conn(target).await {
                     Ok(c) => {
                         if let Ok(c) = c.mysql() {
-                            if let Err(e) = target::drop_table(c, kind, &ts, name).await {
+                            if let Err(e) =
+                                target::drop_table(c, kind, &ts, name, &Metrics::default()).await
+                            {
                                 warn!("dropping {name}@{target}: {e:#}");
                             }
                         }
@@ -2898,24 +2906,34 @@ impl Engine {
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<()> {
         let mut build_rx = self.build_rx.take().expect("stream runs once");
-        let mut backoff = Duration::from_millis(500);
         let mut pos = start;
         // Not even the server's heartbeats for this long: the connection is dead (half-open).
         let silence = (self.cfg.heartbeat * 3).max(Duration::from_secs(15));
         'reconnect: loop {
             self.metrics.beat();
-            let connected = tokio::time::timeout(
-                BINLOG_CONNECT_TIMEOUT,
-                BinlogReader::connect(
-                    self.binlog_opts.clone(),
-                    self.cfg.server_id,
-                    self.flavor,
-                    &pos,
-                    self.cfg.heartbeat,
-                ),
+            // A connect is a repeat (the reader resumes from `boundary`, and delete-before-
+            // insert tolerates re-applied events): the one helper with Policy::CONNECT, and no
+            // nested retry inside BinlogReader::connect.
+            let connected = supervisor::retrying(
+                &self.metrics,
+                "connecting the binlog stream",
+                supervisor::Policy::CONNECT,
+                || async {
+                    tokio::time::timeout(
+                        BINLOG_CONNECT_TIMEOUT,
+                        BinlogReader::connect(
+                            self.binlog_opts.clone(),
+                            self.cfg.server_id,
+                            self.flavor,
+                            &pos,
+                            self.cfg.heartbeat,
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("timed out after {BINLOG_CONNECT_TIMEOUT:?}")))
+                },
             )
-            .await
-            .unwrap_or_else(|_| Err(anyhow!("timed out after {BINLOG_CONNECT_TIMEOUT:?}")));
+            .await;
             self.metrics.beat();
             let mut reader = match connected {
                 Ok(r) => r,
@@ -2928,13 +2946,12 @@ impl Engine {
                     if binlog::is_duplicate_server_id(&e) && self.reroll_server_id() {
                         continue 'reconnect;
                     }
-                    warn!("binlog connect failed: {e:#}; retrying in {backoff:?}");
-                    // Short waits keep the liveness heartbeat going through a long outage.
+                    warn!("binlog connect failed: {e:#}; retrying with the shared policy");
+                    // Still unreachable after a whole policy run: wait one cap, shutdown-aware.
                     tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
+                        _ = tokio::time::sleep(supervisor::Policy::CONNECT.cap) => {}
                         _ = shutdown.changed() => if *shutdown.borrow() { break 'reconnect; },
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue 'reconnect;
                 }
             };
@@ -2984,7 +3001,6 @@ impl Engine {
                     Some(Ok(Some(item))) => {
                         if !delivered {
                             delivered = true;
-                            backoff = Duration::from_millis(500);
                         }
                         Metrics::add(&self.metrics.events, 1);
                         if let Err(e) = self.on_item(&reader, item).await {
@@ -3052,9 +3068,7 @@ impl Engine {
             let pause = if delivered {
                 Duration::from_millis(200)
             } else {
-                let p = backoff;
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-                p
+                supervisor::Policy::CONNECT.cap
             };
             self.metrics.beat();
             tokio::select! {
@@ -4248,7 +4262,7 @@ impl Engine {
                     Ok(_) => debug!("gtid fence returned NULL"),
                     Err(e) => {
                         debug!("gtid fence unavailable: {e}");
-                        if is_conn_error(&anyhow!(e)) {
+                        if binlog::is_transient(&anyhow!(e)) {
                             self.heal_src().await;
                             return false;
                         }
@@ -4281,7 +4295,7 @@ impl Engine {
                     }
                     Err(e) => {
                         debug!("snapshot fence unavailable: {e:#}");
-                        if is_conn_error(&e) {
+                        if binlog::is_transient(&e) {
                             self.heal_src().await;
                             return false;
                         }
@@ -4318,7 +4332,7 @@ impl Engine {
                     self.warn_fence(format!("binlog_order_commits is OFF: lazyview cannot prove a change is visible before reading the sources and {wait}, which is not exact under load; fix: SET PERSIST binlog_order_commits=ON (Amazon RDS/Aurora: the DB parameter group) or turn on GTIDs"));
                 }
                 Err(e) => {
-                    if is_conn_error(&e) {
+                    if binlog::is_transient(&e) {
                         self.heal_src().await;
                         return Some(false);
                     }
@@ -4340,7 +4354,7 @@ impl Engine {
                 Some(true)
             }
             Err(e) => {
-                if is_conn_error(&e) {
+                if binlog::is_transient(&e) {
                     self.heal_src().await;
                     return Some(false);
                 }
@@ -4457,7 +4471,7 @@ impl Engine {
             retry_at: Instant::now(),
         });
         d.failures += 1;
-        let delay = target_backoff(d.failures);
+        let delay = connect_retry_delay(d.failures);
         d.retry_at = Instant::now() + delay;
         let msg = format!("{e:#}");
         warn!(view = %name, target = %t, "{msg}; retrying in {delay:?}");
@@ -4604,7 +4618,7 @@ impl Engine {
                     }
                 }
                 Err(e) => {
-                    if is_conn_error(&e) {
+                    if binlog::is_transient(&e) {
                         self.heal_src().await;
                     }
                     n.dirty.merge(dirty);
@@ -4649,6 +4663,8 @@ impl Engine {
                     layout,
                     self.build_tx.clone(),
                     (self.slots[i].def_id, n.generation),
+                    self.cfg.lock_wait_s,
+                    self.metrics.clone(),
                 ));
                 n.swapping = true;
                 if !dirty.is_empty() {
@@ -4690,9 +4706,15 @@ impl Engine {
                 }
             }
             let timeout = self.cfg.target_timeout;
+            let (lock_wait, m) = (self.cfg.lock_wait_s, self.metrics.clone());
             let r = match self.target_conn(&t).await {
                 Ok(c) => {
-                    match tokio::time::timeout(timeout, target::swap(c, kind, &ts, &n.name)).await {
+                    match tokio::time::timeout(
+                        timeout,
+                        target::swap(c, kind, &ts, &n.name, lock_wait, &m),
+                    )
+                    .await
+                    {
                         Ok(r) => r,
                         Err(_) => Err(anyhow!("timed out after {timeout:?}")),
                     }
@@ -4968,7 +4990,7 @@ impl Engine {
                 all: false,
                 since: floor.clone(),
                 failures: 1,
-                retry_at: Instant::now() + target_backoff(1),
+                retry_at: Instant::now() + connect_retry_delay(1),
                 down: false,
             });
         }
@@ -5002,7 +5024,7 @@ impl Engine {
         }
         match r {
             Err(e) => {
-                if is_conn_error(&e) {
+                if binlog::is_transient(&e) {
                     self.heal_src().await;
                 }
                 // Keep the changes for the next attempt, after a backoff, however often it fails: a
@@ -5014,7 +5036,14 @@ impl Engine {
                 }
                 s.refresh_failures += 1;
                 let n = s.refresh_failures;
-                let delay = Duration::from_millis(250 << n.min(7)).min(Duration::from_secs(30));
+                // The shared backoff, READS shape with a 30 s cap and jitter (the multi-instance
+                // case: instances must not retry in lockstep).
+                let delay = supervisor::backoff(
+                    n,
+                    supervisor::Policy::READS.base,
+                    Duration::from_secs(30),
+                    true,
+                );
                 s.retry_at = Some(Instant::now() + delay);
                 Metrics::add(&self.metrics.refresh_errors, 1);
                 warn!(view = %name, attempt = n, "refresh failed: {e:#}; retrying in {delay:?}");
@@ -5146,7 +5175,7 @@ impl Engine {
                         self.target_down(i, &name, &t, Some(&plan), &e).await;
                         self.rebuild_routes();
                     }
-                    g.retry_at = Instant::now() + target_backoff(g.failures);
+                    g.retry_at = Instant::now() + connect_retry_delay(g.failures);
                     // The keys go back into the lag map last: `l` borrows the slot, and
                     // `target_down` and `rebuild_routes` above need `self` to itself.
                     if let Some(l) = self.slots[i].live.as_mut() {
@@ -5701,7 +5730,7 @@ impl Engine {
             Metrics::add(&self.metrics.mv_queries, 1);
             match r {
                 Ok(rows) => return Ok(rows),
-                Err(e) if server_code(&e).is_some() && !is_conn_error(&e) => {
+                Err(e) if server_code(&e).is_some() && !binlog::is_transient(&e) => {
                     return Err(e.context(format!("reading the materialized table on target {t}")))
                 }
                 Err(e) => {
@@ -6116,13 +6145,15 @@ async fn swap_task(
     layout: Layout,
     tx: mpsc::UnboundedSender<BuildDone>,
     (def_id, generation): (u64, u64),
+    lock_wait_s: u64,
+    metrics: Arc<Metrics>,
 ) {
     let mut swapped = Vec::new();
     for (t, opts, schema, kind, check) in targets {
         let r = async {
             let mut c = match tokio::time::timeout(
                 TARGET_CONNECT_TIMEOUT * 3,
-                connect_target(&opts, kind, crate::config::DEFAULT_LOCK_WAIT_S),
+                connect_target(&opts, kind, lock_wait_s, &metrics),
             )
             .await
             {
@@ -6135,17 +6166,10 @@ async fn swap_task(
                     bail!("a table `{name}` appeared during the build");
                 }
             }
-            // A reader holding the old table's metadata lock: wait for it a while.
-            let mut attempts = 0;
-            let r = loop {
-                match target::swap(&mut c, kind, &schema, &name).await {
-                    Err(e) if server_code(&e) == Some(1205) && attempts < 12 => {
-                        attempts += 1;
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                    r => break r,
-                }
-            };
+            // A reader holding the old table's metadata lock: swap sets lock_wait_timeout to
+            // the one knob and the shared helper (STATEMENTS) retries the transient 1205; swap's
+            // "already swapped" check makes a repeat a no-op (no second loop here).
+            let r = target::swap(&mut c, kind, &schema, &name, lock_wait_s, &metrics).await;
             let _ = c.disconnect().await;
             r
         }
@@ -6180,11 +6204,17 @@ async fn prepare_target(
     name: &str,
     layout: &Layout,
     (batch_rows, batch_bytes): (usize, usize),
+    metrics: &Metrics,
 ) -> Result<(target::Conn, mv::WriteOpts)> {
     let (t, ts) = (&spec.target, &spec.schema);
     let mut c = match tokio::time::timeout(
         TARGET_CONNECT_TIMEOUT * 3,
-        connect_target(&spec.opts, spec.kind, crate::config::DEFAULT_LOCK_WAIT_S),
+        connect_target(
+            &spec.opts,
+            spec.kind,
+            crate::config::DEFAULT_LOCK_WAIT_S,
+            metrics,
+        ),
     )
     .await
     {
@@ -6194,7 +6224,9 @@ async fn prepare_target(
     // The batch limits come from the family's own connection (engine.rs:2232's pattern): the
     // MySQL `max_packet/2` cap or PostgreSQL's rows-and-bytes-only batching (T1.5).
     let w = match &mut c {
-        target::Conn::Mysql(mc) => target::write_opts(mc, spec.kind, batch_rows, batch_bytes).await,
+        target::Conn::Mysql(mc) => {
+            target::write_opts_with(mc, spec.kind, batch_rows, batch_bytes, metrics).await
+        }
         target::Conn::Postgres(pc) => pc.write_opts(spec.kind, batch_rows, batch_bytes).await,
     }
     .with_context(|| format!("target {t}"))?;
@@ -6216,7 +6248,7 @@ async fn prepare_target(
             }
         }
     }
-    target::create_shadow_marked(&mut c, spec.kind, ts, name, layout, &spec.marker)
+    target::create_shadow_marked(&mut c, spec.kind, ts, name, layout, &spec.marker, metrics)
         .await
         .with_context(|| format!("creating the shadow table on target {t}"))?;
     Ok((c, w))
@@ -6265,7 +6297,7 @@ async fn build_task(
         if let Some(d) = test_delay {
             tokio::time::sleep(d).await;
         }
-        let mut src = connect_source(&src_opts, lock_wait_s).await?;
+        let mut src = connect_source(&src_opts, lock_wait_s, &metrics).await?;
         let mut layout = mv::probe(&mut src, &src_schema, &plan).await?;
         // The index budget of this view's tables: the tightest of the targets it is built into
         // (T3.1); a MySQL-only view keeps the 3072 bytes every build used before PostgreSQL targets.
@@ -6277,7 +6309,7 @@ async fn build_task(
         let mut conns = Vec::new();
         let mut failed = Vec::new();
         for spec in &targets {
-            match prepare_target(spec, &name, &layout, batch).await {
+            match prepare_target(spec, &name, &layout, batch, &metrics).await {
                 Ok((c, w)) => conns.push((c, spec.schema.clone(), w)),
                 Err(e) => failed.push((spec.target.clone(), e)),
             }
@@ -6309,7 +6341,7 @@ async fn build_task(
                 debug!(view = %name, target = %spec.target, "swap left to the engine: a table appeared during the build");
                 continue;
             }
-            match target::swap(c, spec.kind, ts, &name).await {
+            match target::swap(c, spec.kind, ts, &name, lock_wait_s, &metrics).await {
                 Ok(()) => swapped.push(spec.target.clone()),
                 Err(e) => {
                     debug!(view = %name, target = %spec.target, "swap left to the engine: {e:#}")
@@ -6511,16 +6543,18 @@ mod tests {
     /// not exit. Other server errors (lost leadership, SQL errors) stay fatal.
     #[test]
     fn server_going_away_is_a_connection_error() {
-        for code in [1053, 1927, 3169, 4031, 2006, 2013] {
-            assert!(is_conn_error(&server(code)), "{code}");
+        // The one classifier (binlog::is_transient): the going-away codes and the lock-wait /
+        // deadlock codes are transient; privilege, SQL and unknown-table errors stay fatal.
+        for code in [1053, 1927, 3169, 4031, 2006, 2013, 1205, 1213] {
+            assert!(binlog::is_transient(&server(code)), "{code}");
         }
-        for code in [1045, 1062, 1146, 1205, 1213, 1236] {
-            assert!(!is_conn_error(&server(code)), "{code}");
+        for code in [1045, 1062, 1146, 1236] {
+            assert!(!binlog::is_transient(&server(code)), "{code}");
         }
         let closed = anyhow::Error::new(mysql_async::Error::Driver(
             mysql_async::DriverError::ConnectionClosed,
         ));
-        assert!(is_conn_error(&closed));
+        assert!(binlog::is_transient(&closed));
     }
 
     #[test]

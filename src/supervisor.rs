@@ -86,7 +86,10 @@ pub const INACTIVE_TTL: Duration = Duration::from_secs(30);
 /// How long a killed connection may take to leave the server's process list (the fence of
 /// `target::mysql::kill_and_wait`).
 pub(crate) const FENCE_WAIT: Duration = Duration::from_secs(5);
-/// Getting a pooled connection (connect + session setup when a new one is needed).
+/// One connection attempt (TCP, TLS and handshake) is bounded well inside the liveness window:
+/// an unreachable host would otherwise hold the loop for the OS's SYN retries (~130 s). The one
+/// 10 s timeout, shared by the pooled connections, the engine's source and metadata connections
+/// and `coord`'s standby.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An op exceeded `LAZYVIEW_TARGET_TIMEOUT_MS` (an overload error).
@@ -139,7 +142,8 @@ fn lost_backend(e: &anyhow::Error) -> bool {
 }
 
 /// Retry delay `base · 2^(attempt-1)`, capped at `cap`, with ± 50 % jitter when `jitter`.
-fn backoff(attempt: u32, base: Duration, cap: Duration, jitter: bool) -> Duration {
+/// Also the engine's delay maths for `retry_at` parking (engine R3): the one shape.
+pub(crate) fn backoff(attempt: u32, base: Duration, cap: Duration, jitter: bool) -> Duration {
     let d = (base * (1u32 << attempt.saturating_sub(1).min(6))).min(cap);
     if !jitter {
         return d;
@@ -295,7 +299,7 @@ impl Endpoint {
     async fn fence(&self, id: u32, metrics: &Metrics) -> Result<()> {
         Metrics::add(&metrics.supervisor_zombie_kills, 1);
         let mut pending = self.zombies.lock().await;
-        let r = crate::target::fence(self.kind, &self.opts, id).await;
+        let r = crate::target::fence(self.kind, &self.opts, id, metrics).await;
         if let Err(e) = &r {
             warn!(endpoint = %self.name, connection = id, "could not confirm that a timed-out write is gone: {e:#}; no writes to this target until it is");
             pending.push(id);
@@ -309,7 +313,9 @@ impl Endpoint {
         let mut err = None;
         let mut left = Vec::new();
         for &id in pending.iter() {
-            if let Err(e) = crate::target::fence(self.kind, &self.opts, id).await {
+            if let Err(e) =
+                crate::target::fence(self.kind, &self.opts, id, &Metrics::default()).await
+            {
                 left.push(id);
                 err.get_or_insert(e);
             }
@@ -637,6 +643,41 @@ where
     let mut attempt = 0;
     loop {
         match op().await {
+            Err(e) if is_overload(&e) => {
+                Metrics::add(&metrics.supervisor_overload_errors, 1);
+                if attempt >= policy.attempts {
+                    return Err(e);
+                }
+                attempt += 1;
+                Metrics::add(&metrics.supervisor_retries, 1);
+                debug!("{what}: {e:#}; retry {attempt} of {}", policy.attempts);
+                metrics.beat();
+                tokio::time::sleep(backoff(attempt, policy.base, policy.cap, policy.jitter)).await;
+            }
+            r => return r,
+        }
+    }
+}
+
+/// [`retrying`] for ops that need exclusive use of one value: the helper hands `state` to every
+/// try, so the future borrows the caller's value (a `&mut Conn`) and not the closure — the
+/// `retry_src` argument pattern (R4.2). `op` must be idempotent (see each call site's note).
+pub(crate) async fn retrying_mut<T, S, F>(
+    metrics: &Metrics,
+    what: &str,
+    policy: Policy,
+    state: &mut S,
+    mut op: F,
+) -> Result<T>
+where
+    F: for<'a> FnMut(
+        &'a mut S,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>,
+{
+    let mut attempt = 0;
+    loop {
+        match op(&mut *state).await {
             Err(e) if is_overload(&e) => {
                 Metrics::add(&metrics.supervisor_overload_errors, 1);
                 if attempt >= policy.attempts {

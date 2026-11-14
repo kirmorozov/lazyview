@@ -94,8 +94,6 @@ pub struct BinlogReader {
     stream: BinlogStream,
     t: Tracker,
     server_id: u32,
-    /// Without any event (heartbeats included) for this long the connection is presumed dead.
-    idle_timeout: Option<Duration>,
     /// First event read by `connect` (the stream is validated there) when it is not a rotate.
     pending: Option<Event>,
 }
@@ -105,8 +103,9 @@ impl BinlogReader {
     ///
     /// The first event is awaited here, so a purged/missing binlog fails `connect` with an error
     /// for which [`crate::source::is_missing_binlog`] is true. With a non-zero `heartbeat` the server sends a
-    /// heartbeat after that much idle time, and [`next`](Self::next) fails if nothing at all
-    /// arrives for `3 × heartbeat + 10 s`.
+    /// heartbeat after that much idle time. The reader never times an idle stream out
+    /// itself: dead-stream detection is the engine's silence arm (which also drives the
+    /// liveness beat and shutdown).
     pub async fn connect(
         opts: Opts,
         server_id: u32,
@@ -140,12 +139,10 @@ impl BinlogReader {
                 format!("requesting the binlog stream from {from} as server_id {server_id}")
             })?;
 
-        let idle_timeout = (!heartbeat.is_zero()).then(|| heartbeat * 3 + Duration::from_secs(10));
         let mut reader = BinlogReader {
             stream,
             t: Tracker::new(flavor, from),
             server_id,
-            idle_timeout,
             pending: None,
         };
         // Validate the request: the server answers with a fake ROTATE or an error (e.g. 1236).
@@ -193,13 +190,7 @@ impl BinlogReader {
         let ev = match self.pending.take() {
             Some(ev) => ev,
             None => {
-                let next = self.stream.next();
-                let res = match self.idle_timeout {
-                    Some(t) => tokio::time::timeout(t, next).await.map_err(|_| {
-                        anyhow!("no binlog event or heartbeat received for {}s at {}; connection presumed dead", t.as_secs(), self.t.pos)
-                    })?,
-                    None => next.await,
-                };
+                let res = self.stream.next().await;
                 match res {
                     None => return Ok(None),
                     Some(Ok(ev)) => ev,

@@ -56,7 +56,12 @@ pub async fn acquire(
             Err(e) if matches!(e, mysql_async::Error::Io(_) | mysql_async::Error::Driver(_)) => {
                 warn!("standby: metadata connection lost ({e}); reconnecting");
                 metrics.beat();
-                match tokio::time::timeout(CONNECT_TIMEOUT, Conn::new(opts.clone())).await {
+                match tokio::time::timeout(
+                    crate::supervisor::CONNECT_TIMEOUT,
+                    Conn::new(opts.clone()),
+                )
+                .await
+                {
                     Ok(Ok(c)) => *conn = c,
                     _ => {
                         tokio::time::sleep(wait).await;
@@ -100,9 +105,6 @@ pub async fn acquire(
         epoch: epoch.unwrap_or(1),
     }))
 }
-
-/// One connection attempt while standing by (well inside the liveness window).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Takes the lock again on a new metadata connection after the previous one was lost (the
 /// server released the lock with it). Fails if another instance holds it now, or took over
