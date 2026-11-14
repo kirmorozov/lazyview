@@ -814,7 +814,7 @@ fn targets_pg_incremental_never_rebuilds() {
 fn time_key(text: &str) -> String {
     let (hms, frac) = text.split_once('.').unwrap_or((text, ""));
     let frac = frac.trim_end_matches('0');
-    let mut p = hms.split(':').map(|d| d.pad_start(2, '0'));
+    let mut p = hms.split(':').map(|d| format!("{d:>02}"));
     let (h, m, s) = (
         p.next().unwrap_or_default(),
         p.next().unwrap_or_default(),
