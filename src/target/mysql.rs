@@ -390,71 +390,24 @@ pub(crate) const UTC_SESSION: &str = "SESSION time_zone = '+00:00'";
 /// Session settings for every connection the service opens: non-locking reads, an sql_mode
 /// in which values are stored as they were read (zero dates, no strict-mode rejections), and a
 /// bounded table-lock wait (`lock_wait_s`) so a session blocked by a `LOCK TABLES` fails with
-/// 1205 instead of waiting out the server default (a year).
+/// 1205 instead of waiting out the server default (a year). The two renderings it runs are the
+/// dialect's ([`crate::dialect::mysql::session_setup`] and
+/// [`crate::dialect::mysql::permissive_sql_mode`]); what stays here is the wire: read the current
+/// mode, apply only what differs.
 pub(crate) async fn init_session(conn: &mut Conn, lock_wait_s: u64) -> Result<()> {
     let mode: Option<String> = conn
         .query_first("SELECT CAST(@@SESSION.sql_mode AS CHAR)")
         .await?;
     let mode = mode.unwrap_or_default();
-    let permissive = permissive_sql_mode(&mode);
-    let [isolation, set_mode, lock_wait] = session_setup(&permissive, lock_wait_s);
+    let permissive = crate::dialect::mysql::permissive_sql_mode(&mode);
+    let [isolation, set_mode, lock_wait] =
+        crate::dialect::mysql::session_setup(&permissive, lock_wait_s);
     conn.query_drop(isolation).await?;
     if permissive != mode {
         conn.query_drop(set_mode).await?;
     }
     conn.query_drop(lock_wait).await?;
     Ok(())
-}
-
-/// The statements that give a connection the service's session settings with `sql_mode` (a mode
-/// [`permissive_sql_mode`] returned) and a table-lock wait of at most `lock_wait_s` seconds:
-/// [`init_session`] runs them on a direct connection, the supervisor's pools
-/// (src/supervisor.rs) on every new pooled connection.
-pub(crate) fn session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
-    [
-        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
-        format!("SET SESSION sql_mode = '{}'", sql_mode.replace('\'', "")),
-        format!("SET SESSION lock_wait_timeout = {lock_wait_s}"),
-    ]
-}
-
-/// `mode` without the flags that reject values the source holds (strict mode, zero dates) and
-/// without the flags that change how SQL text is parsed (`ANSI_QUOTES`, `PIPES_AS_CONCAT`,
-/// `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES`, `IGNORE_SPACE`): lazyview parses definitions
-/// and writes its SQL in the default mode, so under `ANSI_QUOTES` a `"paid"` the analyzer
-/// traced as a string would be a column for the server. The combination modes (`ANSI`,
-/// `TRADITIONAL`, `ORACLE`, ...) imply some of them and go too: the server lists their member
-/// flags individually, so nothing else is lost.
-pub(crate) fn permissive_sql_mode(mode: &str) -> String {
-    mode.split(',')
-        .map(str::trim)
-        .filter(|m| {
-            !m.is_empty()
-                && m.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
-                && !matches!(
-                    m.to_ascii_uppercase().as_str(),
-                    "STRICT_TRANS_TABLES"
-                        | "STRICT_ALL_TABLES"
-                        | "NO_ZERO_DATE"
-                        | "NO_ZERO_IN_DATE"
-                        | "ANSI_QUOTES"
-                        | "PIPES_AS_CONCAT"
-                        | "HIGH_NOT_PRECEDENCE"
-                        | "NO_BACKSLASH_ESCAPES"
-                        | "IGNORE_SPACE"
-                        | "TRADITIONAL"
-                        | "ANSI"
-                        | "DB2"
-                        | "MAXDB"
-                        | "MSSQL"
-                        | "ORACLE"
-                        | "POSTGRESQL"
-                        | "MYSQL323"
-                        | "MYSQL40"
-                )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// [`WriteOpts`] for the server `conn` is connected to.
@@ -612,10 +565,10 @@ mod tests {
         }
     }
 
-    /// The ownership marker text, the quoting of the table comment and the SQL modes the
-    /// service drops when it reads a source (moved here with the items they test).
+    /// The ownership marker text and the quoting of the table comment (moved here with the items
+    /// they test; the session renderings' own tests went with them to `crate::dialect::mysql`).
     #[test]
-    fn markers_and_sql_modes() {
+    fn markers_and_table_comment() {
         assert_eq!(crate::target::marker("v", 7), "lazyview:v1 view=v def=7");
         assert_eq!(
             crate::target::marker("a b'c%", 1),
@@ -624,37 +577,5 @@ mod tests {
         let l = layout(vec![col("v", "int", "int")], 1, vec![], false);
         assert!(create_sql_marked(&l, "s", "t", Some("it's"))
             .ends_with("DEFAULT CHARSET=utf8mb4 COMMENT='it''s'"));
-        assert_eq!(
-            permissive_sql_mode(
-                "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-            ),
-            "ONLY_FULL_GROUP_BY,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-        );
-        // Parser flags and the combination modes implying them go too (the server lists the
-        // members of a combination mode individually, so `ANSI` keeps `REAL_AS_FLOAT`).
-        assert_eq!(permissive_sql_mode("TRADITIONAL,ANSI_QUOTES"), "");
-        assert_eq!(
-            permissive_sql_mode(
-                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI,\
-                 NO_BACKSLASH_ESCAPES,HIGH_NOT_PRECEDENCE,NO_ENGINE_SUBSTITUTION"
-            ),
-            "REAL_AS_FLOAT,ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"
-        );
-    }
-
-    /// The three statements a source session gets (moved here with the item it tests).
-    #[test]
-    fn session_setup_statements() {
-        assert_eq!(
-            session_setup("ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION", 60),
-            [
-                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
-                "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'".to_string(),
-                "SET SESSION lock_wait_timeout = 60".to_string(),
-            ]
-        );
-        // A quote cannot end the string literal early.
-        assert_eq!(session_setup("A'B", 2)[1], "SET SESSION sql_mode = 'AB'");
-        assert_eq!(session_setup("", 2)[2], "SET SESSION lock_wait_timeout = 2");
     }
 }

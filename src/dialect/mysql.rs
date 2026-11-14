@@ -1,10 +1,12 @@
 //! The MySQL family's answers on the dialect seam: the identifier quoting, the function
-//! vocabularies, the parameter and coercion renderings, the parse profile (how a definition's
+//! vocabularies, the parameter and coercion renderings, the session renderings (the statements a
+//! session is set up with and the `sql_mode` they carry), the parse profile (how a definition's
 //! text is tokenized and handed to the query parser, and how a rendered select item loses its
 //! alias) and the source-read renderings (the `UNIX_TIMESTAMP` epoch `SELECT`, its read list and
 //! the epoch-to-datetime reading back), moved verbatim from `crate::analyze::vocab`,
-//! `crate::analyze::columns`, `crate::analyze::expr`, `crate::analyze::parse` and `crate::mv`.
-//! `std`, `sqlparser`, `anyhow` and `mysql_async`'s `Value` only — no host code.
+//! `crate::analyze::columns`, `crate::analyze::expr`, `crate::analyze::parse`, `crate::mv` and
+//! `crate::target::mysql`. `std`, `sqlparser`, `anyhow` and `mysql_async`'s `Value` only — no
+//! host code.
 //!
 //! Copy set: lazy-wire-fire copies this file together with `src/dialect/mod.rs` (its parent,
 //! the [`Family`](super::Family) discriminator) verbatim, as a pair, so the quoting answers and
@@ -71,6 +73,63 @@ pub(crate) fn charset_coercion(cs: &str, n: Option<u64>) -> String {
         Some(n) => format!("LEFT(CONVERT(? USING {cs}), {n})"),
         None => format!("CONVERT(? USING {cs})"),
     }
+}
+
+// The session renderings, moved verbatim from `crate::target::mysql` (`init_session`'s two SQL
+// builders): what a family's session statements and its permissive `sql_mode` are written as
+// belongs to the family, and both are pure text — no connection, no IO — so the host module that
+// runs them over the wire asks these instead of owning them. The PostgreSQL forms come with the
+// PostgreSQL family's answers.
+
+/// The statements that give a connection the service's session settings with `sql_mode` (a mode
+/// [`permissive_sql_mode`] returned) and a table-lock wait of at most `lock_wait_s` seconds:
+/// `init_session` (`src/target/mysql.rs`) runs them on a direct connection, the supervisor's pools
+/// (`src/supervisor.rs`) on every new pooled connection.
+pub(crate) fn session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
+    [
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+        format!("SET SESSION sql_mode = '{}'", sql_mode.replace('\'', "")),
+        format!("SET SESSION lock_wait_timeout = {lock_wait_s}"),
+    ]
+}
+
+/// `mode` without the flags that reject values the source holds (strict mode, zero dates) and
+/// without the flags that change how SQL text is parsed (`ANSI_QUOTES`, `PIPES_AS_CONCAT`,
+/// `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES`, `IGNORE_SPACE`): lazyview parses definitions
+/// and writes its SQL in the default mode, so under `ANSI_QUOTES` a `"paid"` the analyzer
+/// traced as a string would be a column for the server. The combination modes (`ANSI`,
+/// `TRADITIONAL`, `ORACLE`, ...) imply some of them and go too: the server lists their member
+/// flags individually, so nothing else is lost.
+pub(crate) fn permissive_sql_mode(mode: &str) -> String {
+    mode.split(',')
+        .map(str::trim)
+        .filter(|m| {
+            !m.is_empty()
+                && m.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && !matches!(
+                    m.to_ascii_uppercase().as_str(),
+                    "STRICT_TRANS_TABLES"
+                        | "STRICT_ALL_TABLES"
+                        | "NO_ZERO_DATE"
+                        | "NO_ZERO_IN_DATE"
+                        | "ANSI_QUOTES"
+                        | "PIPES_AS_CONCAT"
+                        | "HIGH_NOT_PRECEDENCE"
+                        | "NO_BACKSLASH_ESCAPES"
+                        | "IGNORE_SPACE"
+                        | "TRADITIONAL"
+                        | "ANSI"
+                        | "DB2"
+                        | "MAXDB"
+                        | "MSSQL"
+                        | "ORACLE"
+                        | "POSTGRESQL"
+                        | "MYSQL323"
+                        | "MYSQL40"
+                )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // The function vocabularies, moved verbatim from `crate::analyze` (`vocab.rs`, `columns.rs`,
@@ -583,5 +642,38 @@ mod tests {
         assert_eq!(item_expr("'a AS b'"), "'a AS b'");
         assert_eq!(item_expr("`ev`.`ts`"), "`ev`.`ts`");
         assert_eq!(item_expr("x AS `a` + 1"), "x AS `a` + 1");
+    }
+
+    /// The three statements a session gets and the SQL modes the service drops when it reads a
+    /// source (moved verbatim with the items they test from `crate::target::mysql`).
+    #[test]
+    fn session_setup_statements() {
+        assert_eq!(
+            session_setup("ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION", 60),
+            [
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'".to_string(),
+                "SET SESSION lock_wait_timeout = 60".to_string(),
+            ]
+        );
+        // A quote cannot end the string literal early.
+        assert_eq!(session_setup("A'B", 2)[1], "SET SESSION sql_mode = 'AB'");
+        assert_eq!(session_setup("", 2)[2], "SET SESSION lock_wait_timeout = 2");
+        assert_eq!(
+            permissive_sql_mode(
+                "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+            ),
+            "ONLY_FULL_GROUP_BY,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+        );
+        // Parser flags and the combination modes implying them go too (the server lists the
+        // members of a combination mode individually, so `ANSI` keeps `REAL_AS_FLOAT`).
+        assert_eq!(permissive_sql_mode("TRADITIONAL,ANSI_QUOTES"), "");
+        assert_eq!(
+            permissive_sql_mode(
+                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI,\
+                 NO_BACKSLASH_ESCAPES,HIGH_NOT_PRECEDENCE,NO_ENGINE_SUBSTITUTION"
+            ),
+            "REAL_AS_FLOAT,ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"
+        );
     }
 }
