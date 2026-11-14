@@ -108,6 +108,7 @@ fn targets_fan_out_and_retarget() {
             &mut eng,
             &src,
             &tmap,
+            &HashMap::new(),
             &specs,
             "initial build on all targets",
         )
@@ -122,6 +123,7 @@ fn targets_fan_out_and_retarget() {
                 &mut eng,
                 &src,
                 &tmap,
+                &HashMap::new(),
                 &specs,
                 &format!("phase {phase} ({n} txns)"),
             )
@@ -164,7 +166,16 @@ fn targets_fan_out_and_retarget() {
             wait_ready_tolerant(&mut c, &mut eng, &[name.as_str()], t_ready()).await?;
             ctx.log(format!("retargeted {name}: {old:?} → {new:?}"));
         }
-        verify_targets(&ctx, &mut eng, &src, &tmap, &specs, "after retargeting").await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &src,
+            &tmap,
+            &HashMap::new(),
+            &specs,
+            "after retargeting",
+        )
+        .await?;
         check_placement(&src, &tmap, &specs).await?;
         eng.stop().await?;
         Ok(())
@@ -221,6 +232,7 @@ fn targets_invalid_configurations_error() {
             &mut eng,
             &src,
             &tmap,
+            &HashMap::new(),
             &checked,
             "valid views next to invalid ones",
         )
@@ -509,6 +521,440 @@ fn targets_pg_first_build() {
                 got == want,
                 "rows differ:\nsource: {want:?}\ntarget: {got:?}"
             );
+            Ok(())
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// PostgreSQL target (PR C1): the harness scenarios. The source stays MySQL-family; PostgreSQL
+// is only ever a target (LAZYVIEW_TEST_PG_DSNS). The new objects are neutral: pg_a / pg_b and
+// entities / items / links.
+// ---------------------------------------------------------------------------------------------
+
+async fn exists_on_pg(pgdb: &pg::PgDb, table: &str) -> Result<bool> {
+    let c = pg::connect(&pgdb.dsn).await?;
+    let e = pg::table_exists(&c, &pgdb.schema, table).await?;
+    drop(c);
+    Ok(e)
+}
+
+/// [`wait_exists`] for a PostgreSQL target table.
+async fn wait_exists_pg(
+    eng: &mut Engine,
+    pgdb: &pg::PgDb,
+    table: &str,
+    exists: bool,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + t_ready();
+    loop {
+        eng.check_alive()?;
+        if exists_on_pg(pgdb, table).await? == exists {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            bail!(
+                "{table} on {} ({}) : expected exists={exists}",
+                pgdb.flavor,
+                pgdb.schema
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The fan-out pattern of [`targets_fan_out_and_retarget`] with one MySQL target **and** one
+/// PostgreSQL target side by side: the same `Prepared`/`Diff` feeds both engines. Includes a
+/// retarget (`source,b,pg`) and `verify_targets` after each phase, and D5's zero-date coverage:
+/// a view over a `datetime` column holding `'0000-00-00 00:00:00'`, asserted NULL on the target.
+#[test]
+fn targets_pg_fan_out_and_retarget() {
+    let Some(pgs) = pg::servers_or_skip("targets_pg_fan_out_and_retarget") else {
+        return;
+    };
+    scenario("tg_pgfout", move |ctx| {
+        let pgs1 = pgs.clone();
+        async move {
+            let src = ctx.new_db("tg_pgf_src").await?;
+            let tb = ctx.new_db("tg_pgf_b").await?;
+            let pgdb = pg::new_pg_db(&pgs1[0], "tg_pgf").await?;
+            let ids = setup_ecommerce(&src, ctx.sub_seed("seed"), Sizes::scaled()).await?;
+            let mut c = src.conn().await?;
+            // D5 coverage: a DATETIME NOT NULL column holding '0000-00-00 00:00:00' (the session
+            // allows zero dates, like values_zero_dates) plus a nullable twin holding one — that
+            // column is skipped by the PostgreSQL comparison and the row count is asserted below.
+            exec_all(
+            &mut c,
+            &[
+                "SET SESSION sql_mode = ''",
+                "CREATE TABLE pg_a (id INT PRIMARY KEY, dt DATETIME NOT NULL, dt_opt DATETIME NULL)",
+                "INSERT INTO pg_a VALUES (1, '0000-00-00 00:00:00', '2024-02-29 23:59:58'), \
+                 (2, '2024-02-29 23:59:58', '0000-00-00 00:00:00'), (3, '2024-03-01 07:08:09', NULL)",
+            ],
+        )
+        .await?;
+            let mut specs = Vec::new();
+            for v in ecommerce_views() {
+                specs.push(match v.name.as_str() {
+                    // upstream of the chained views must live on the source (and on both targets)
+                    "v_customer_stats" => v.with_targets("source,b,pg"),
+                    "v_vip_stats" => v.with_targets("pg"),
+                    "v_tier_revenue" => v.with_targets("source,b"),
+                    _ => v.with_targets("b,pg"),
+                });
+            }
+            specs.push(
+                ViewSpec::new("pg_b", Kind::Incremental, "SELECT id, dt, dt_opt FROM pg_a")
+                    .with_targets("pg"),
+            );
+            let tmap: HashMap<String, Db> = [("b".to_string(), tb.clone())].into();
+            let pgmap: HashMap<String, pg::PgDb> = [("pg".to_string(), pgdb.clone())].into();
+            let env = target_env(&[("b", &tb.dsn), ("pg", &pgdb.dsn)]);
+            let (mut eng, idmap) = start_with_views(&ctx, &src, &specs, &ov_refs(&env)).await?;
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &pgmap,
+                &specs,
+                "initial build on the MySQL and the PostgreSQL target",
+            )
+            .await?;
+            let mut wl = Workload::new(ctx.sub_seed("wl"), ids.clone());
+            for phase in 1..=2 {
+                let n = run_batches(&mut c, &mut wl, scaled(40)).await?;
+                verify_targets(
+                    &ctx,
+                    &mut eng,
+                    &src,
+                    &tmap,
+                    &pgmap,
+                    &specs,
+                    &format!("phase {phase} ({n} txns)"),
+                )
+                .await?;
+            }
+            // D5: the zero date reads as NULL on the target; the nullable zero-date column was
+            // skipped by the comparison, so the row count is asserted here.
+            let client = pgdb.client().await?;
+            let t = pg::fetch(&client, &pgdb.schema, "pg_b").await?;
+            drop(client);
+            ensure!(
+                t.rows.len() == 3,
+                "pg_b on the target has {} rows, expected 3",
+                t.rows.len()
+            );
+            let zero = t
+                .rows
+                .iter()
+                .find(|r| r.first().is_some_and(|cell| cell.as_deref() == Some(b"1")))
+                .context("pg_b row id 1")?;
+
+            ensure!(
+                zero[1].is_none(),
+                "the zero date is {:?} on the target, expected NULL",
+                zero[1]
+            );
+            ctx.log("D5: zero date is NULL on the PostgreSQL target (3 rows)");
+            // Online retargeting across both engines: drop b, then take the source copy back too.
+            let find = |specs: &Vec<ViewSpec>, t: &str| {
+                specs
+                    .iter()
+                    .position(|s| {
+                        s.targets.as_deref() == Some(t)
+                            && s.kind != Kind::Chained
+                            && s.name != "pg_b"
+                    })
+                    .context("pattern")
+            };
+            let changes = [
+                (find(&specs, "b,pg")?, "pg"),
+                (find(&specs, "b,pg")?, "source,b,pg"),
+            ];
+            for (i, new_t) in changes {
+                let name = specs[i].name.clone();
+                let old = specs[i].target_names();
+                exec(
+                    &mut c,
+                    &format!(
+                        "UPDATE _lazyview SET targets = {} WHERE id = {}",
+                        q(new_t),
+                        idmap[&name]
+                    ),
+                )
+                .await?;
+                specs[i].targets = Some(new_t.to_string());
+                let new = specs[i].target_names();
+                for t in old.iter().chain(new.iter()) {
+                    let r = if t == "source" {
+                        wait_exists(&mut eng, &src, &name, new.contains(t)).await
+                    } else if t == "pg" {
+                        wait_exists_pg(&mut eng, &pgdb, &name, new.contains(t)).await
+                    } else {
+                        wait_exists(&mut eng, &tmap[t], &name, new.contains(t)).await
+                    };
+                    r.with_context(|| format!("retarget {name} {old:?} → {new:?} (on {t})"))?;
+                }
+                run_batches(&mut c, &mut wl, scaled(15)).await?;
+                wait_ready_tolerant(&mut c, &mut eng, &[name.as_str()], t_ready()).await?;
+                ctx.log(format!("retargeted {name}: {old:?} → {new:?}"));
+            }
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &pgmap,
+                &specs,
+                "after retargeting",
+            )
+            .await?;
+            eng.stop().await?;
+            pg::drop_dbs(std::slice::from_ref(&pgdb)).await?;
+            Ok(())
+        }
+    });
+}
+
+/// Issue #56's acceptance: after the load, no incremental view was ever rebuilt whole (the
+/// engine's `whole_view_refreshes` counter via `Engine::stats_of`), and the row key is
+/// exercised — upserts, not delete-by-unit — by asserting the unique row-key index exists
+/// (`has_row_index` through the PG client).
+#[test]
+fn targets_pg_incremental_never_rebuilds() {
+    let Some(pgs) = pg::servers_or_skip("targets_pg_incremental_never_rebuilds") else {
+        return;
+    };
+    scenario("tg_pgnorebuild", move |ctx| {
+        let pgs1 = pgs.clone();
+        async move {
+            let src = ctx.new_db("tg_pgn_src").await?;
+            let pgdb = pg::new_pg_db(&pgs1[0], "tg_pgn").await?;
+            let mut c = src.conn().await?;
+            exec_all(
+            &mut c,
+            &[
+                "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL)",
+                "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL)",
+                "INSERT INTO entities VALUES (1,'alpha'),(2,'beta'),(3,'gamma')",
+                "INSERT INTO items VALUES (1,1,10.50),(2,2,5.00),(3,3,7.75)",
+            ],
+        )
+        .await?;
+            ensure_lazyview_table(&mut c).await?;
+            let spec = ViewSpec::new(
+            "links",
+            Kind::Incremental,
+            "SELECT i.id AS id, e.name AS name, i.amount AS amount FROM entities e JOIN items i ON i.entity_id = e.id",
+        )
+        .with_targets("pg");
+            add_views(&mut c, std::slice::from_ref(&spec)).await?;
+            let env = target_env(&[("pg", &pgdb.dsn)]);
+            let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+            wait_ready(&mut c, &mut eng, &["links"], t_ready()).await?;
+            for k in 1..=3 {
+                exec(
+                    &mut c,
+                    &format!(
+                        "INSERT INTO items VALUES ({}, {}, {}.25)",
+                        10 + k,
+                        (k % 3) + 1,
+                        k
+                    ),
+                )
+                .await?;
+                exec(
+                    &mut c,
+                    &format!("UPDATE items SET amount = amount + 1 WHERE id = {k}"),
+                )
+                .await?;
+                exec(&mut c, &format!("DELETE FROM items WHERE id = {}", 10 + k)).await?;
+                eng.wait_caught_up(&mut c, t_catchup()).await?;
+            }
+            let vs = eng.stats_of(&src, "links")?;
+            ensure!(
+                vs.whole_view_refreshes == 0,
+                "links took {} whole-view refreshes, expected none (incremental)",
+                vs.whole_view_refreshes
+            );
+            let client = pgdb.client().await?;
+            ensure!(
+                pg::has_row_index(&client, &pgdb.schema, "links").await?,
+                "links has no unique row-key index on the PostgreSQL target"
+            );
+            drop(client);
+            ctx.log("incremental: 0 whole-view refreshes, row-key index present");
+            let tmap: HashMap<String, Db> = HashMap::new();
+            let pgmap: HashMap<String, pg::PgDb> = [("pg".to_string(), pgdb.clone())].into();
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &pgmap,
+                std::slice::from_ref(&spec),
+                "incremental rows",
+            )
+            .await?;
+            eng.stop().await?;
+            pg::drop_dbs(std::slice::from_ref(&pgdb)).await?;
+            Ok(())
+        }
+    });
+}
+
+/// The transactional swap under a reader: while a reader holds the MV table open, a definition
+/// edit forces a whole-view rebuild and its swap — which must either complete or fail with a
+/// lock_timeout and retry, never leaving `links__lv_new` behind ([`wait_exists`]'s rule).
+#[test]
+fn targets_pg_swap_keeps_readers() {
+    let Some(pgs) = pg::servers_or_skip("targets_pg_swap_keeps_readers") else {
+        return;
+    };
+    scenario("tg_pgsubswap", move |ctx| {
+        let pgs1 = pgs.clone();
+        async move {
+            let src = ctx.new_db("tg_pgs_src").await?;
+            let pgdb = pg::new_pg_db(&pgs1[0], "tg_pgs").await?;
+            let mut c = src.conn().await?;
+            exec_all(
+            &mut c,
+            &[
+                "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL)",
+                "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL)",
+                "INSERT INTO entities VALUES (1,'alpha'),(2,'beta')",
+                "INSERT INTO items VALUES (1,1,10.50),(2,2,5.00)",
+            ],
+        )
+        .await?;
+            ensure_lazyview_table(&mut c).await?;
+            let spec = ViewSpec::new(
+            "links",
+            Kind::Incremental,
+            "SELECT i.id AS id, e.name AS name, i.amount AS amount FROM entities e JOIN items i ON i.entity_id = e.id",
+        )
+        .with_targets("pg");
+            let ids = add_views(&mut c, std::slice::from_ref(&spec)).await?;
+            let env = target_env(&[("pg", &pgdb.dsn)]);
+            let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+            wait_ready(&mut c, &mut eng, &["links"], t_ready()).await?;
+            // The reader: an open transaction on the MV table (ACCESS SHARE) the swap must wait for.
+            let reader = pgdb.client().await?;
+            reader.batch_execute("BEGIN").await?;
+            let rows = reader.query("SELECT count(*) FROM \"links\"", &[]).await?;
+            let n: i64 = rows.first().context("count row")?.get(0);
+            exec(
+            &mut c,
+            &format!(
+                "UPDATE _lazyview SET definition = {} WHERE id = {}",
+                q("CREATE VIEW links AS SELECT i.id AS id, e.name AS name, i.amount AS amount FROM entities e JOIN items i ON i.entity_id = e.id WHERE i.id >= 1"),
+                ids["links"]
+            ),
+        )
+        .await?;
+            // The swap meets the reader's lock (T5's lock_timeout makes it fail and retry); the
+            // reader then rolls back and the retry completes.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            drop(reader);
+            wait_ready(&mut c, &mut eng, &["links"], t_ready()).await?;
+            wait_exists_pg(&mut eng, &pgdb, "links__lv_new", false)
+                .await
+                .context("the swap left a shadow table behind")?;
+            ensure!(
+                exists_on_pg(&pgdb, "links").await?,
+                "links is gone after the swap"
+            );
+            ctx.log(format!(
+                "swap completed around a reader holding {n} rows, no shadow left"
+            ));
+            let tmap: HashMap<String, Db> = HashMap::new();
+            let pgmap: HashMap<String, pg::PgDb> = [("pg".to_string(), pgdb.clone())].into();
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &pgmap,
+                std::slice::from_ref(&spec),
+                "after the swap",
+            )
+            .await?;
+            eng.stop().await?;
+            pg::drop_dbs(std::slice::from_ref(&pgdb)).await?;
+            Ok(())
+        }
+    });
+}
+
+/// The mirror of [`targets_one_target_down`] with the PostgreSQL target unreachable (port 1):
+/// the MySQL target keeps up and `GET /stats` keeps advancing.
+#[test]
+fn targets_pg_target_down_does_not_hold_the_others() {
+    let Some(pgs) = pg::servers_or_skip("targets_pg_target_down_does_not_hold_the_others") else {
+        return;
+    };
+    scenario("tg_pgdown", move |ctx| {
+        let pgs1 = pgs.clone();
+        async move {
+            let src = ctx.new_db("tg_pgd_src").await?;
+            let tb = ctx.new_db("tg_pgd_b").await?;
+            let ids = setup_ecommerce(&src, ctx.sub_seed("seed"), Sizes::scaled()).await?;
+            let all = ecommerce_views();
+            let get = |n: &str| all.iter().find(|v| v.name == n).unwrap().clone();
+            let healthy = vec![
+                get("v_order_lines").with_targets("b"),
+                get("v_status_counts").with_targets("source,b"),
+            ];
+            let with_down = vec![
+                get("v_paid_orders").with_targets("b,down"),
+                get("v_category_sales").with_targets("b,down"),
+            ];
+            let mut c = src.conn().await?;
+            ensure_lazyview_table(&mut c).await?;
+            add_views(&mut c, &healthy).await?;
+            add_views(&mut c, &with_down).await?;
+            let tmap: HashMap<String, Db> = [("b".to_string(), tb.clone())].into();
+            // Port 1 on localhost: connection refused (the dead target is the PostgreSQL one).
+            ctx.log(format!(
+                "unreachable PostgreSQL target ({} pinned to port 1)",
+                pgs1[0].flavor
+            ));
+            let dead = "postgres://lv:lv@127.0.0.1:1/nowhere";
+            let env = target_env(&[("b", &tb.dsn), ("down", dead)]);
+            let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+            let converge = Duration::from_secs_f64(300.0 * scale().max(1.0));
+            let checked: Vec<ViewSpec> = healthy.iter().chain(with_down.iter()).cloned().collect();
+            eventually_equal(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &checked,
+                converge,
+                "MySQL targets keep up with the PostgreSQL target down",
+            )
+            .await?;
+            let before = format!("{:?}", eng.snapshot());
+            let mut wl = Workload::new(ctx.sub_seed("wl"), ids.clone());
+            run_batches(&mut c, &mut wl, scaled(50)).await?;
+            eventually_equal(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &checked,
+                converge,
+                "after writes, the PostgreSQL target still down",
+            )
+            .await?;
+            let after = format!("{:?}", eng.snapshot());
+            ensure!(
+                before != after,
+                "GET /stats did not advance with the PostgreSQL target down"
+            );
+            eng.check_alive()?;
+            drop(eng); // kill: a graceful stop may legitimately wait for the dead target
             Ok(())
         }
     });
