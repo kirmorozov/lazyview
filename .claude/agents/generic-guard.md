@@ -31,7 +31,9 @@ The caller gives you either
 - Another tool copies these files VERBATIM: src/binlog.rs, src/datum.rs, src/catalog.rs, src/analyze.rs,
   src/access.rs (the AccessPlan, the analyzer's public per-source-table output), src/analyzer/*,
   src/fence.rs (the commit-order visibility fence, #28), src/intset.rs (the shared
-integer set), src/cascade.rs (the in-memory cascade cache), and the dedup core files
+integer set), src/cascade.rs (the in-memory cascade cache), src/source/mod.rs (the flavor-neutral
+  source types the binlog re-exports: `Position`, `Flavor`, `SourceCaps`, `ServerInfo`, `Item`,
+  `RowsKind`; its header keeps the copy-set contract), and the dedup core files
   (src/dedup.rs, src/dedup/**, or whatever files the change declares as the core). Together they form
   the COPY SET.
 
