@@ -1,37 +1,13 @@
 use super::*;
 
 use crate::binlog::connect::value_str;
-use crate::source::{server_errors, ACCESS_DENIED_CODES};
+use crate::source::{mysql::status_statements, server_errors, ACCESS_DENIED_CODES};
 
 pub(super) fn show(v: &str) -> &str {
     if v.is_empty() {
         "NULL"
     } else {
         v
-    }
-}
-
-/// The two spellings of the binlog status statement, the one the server is expected to know
-/// first (the other is tried on a parse error).
-///
-/// The flavor follows from the version the handshake reports: MySQL and Percona are 8.x, 9.x
-/// and, since 26.7, calendar versions (`YY.M`); MariaDB is 10.x to 13.x (mysql_async strips its
-/// `5.5.5-` prefix). `SHOW BINARY LOG STATUS` exists on MySQL >= 8.2 (`SHOW MASTER STATUS` was
-/// removed in 8.4) and on MariaDB >= 13.0, which still accepts `SHOW MASTER STATUS` as well.
-pub(super) fn status_statements(major: u16, minor: u16) -> [&'static str; 2] {
-    const NEW: &str = "SHOW BINARY LOG STATUS";
-    const OLD: &str = "SHOW MASTER STATUS";
-    let new_first = match major {
-        8 => minor >= 2,
-        9 => true,
-        // MariaDB; version numbers up to 25 cannot be a calendar MySQL version.
-        10..=25 => false,
-        _ => major >= 26,
-    };
-    if new_first {
-        [NEW, OLD]
-    } else {
-        [OLD, NEW]
     }
 }
 
