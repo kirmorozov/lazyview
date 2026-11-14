@@ -10,12 +10,16 @@
 //! Copy set: `std` + `anyhow` + `mysql_async` only, no `crate::` beyond the copy set, no
 //! environment variables (a knob is a parameter the caller passes), no logging.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+
 use anyhow::{anyhow, bail, Context, Result};
 use mysql_async::binlog::events::{BinlogEventHeader, Event};
 use mysql_async::prelude::Queryable;
 use mysql_async::Conn;
 
-use crate::source::{Position, Step};
+use crate::catalog::TableInfo;
+use crate::source::{mysql, Position, SourceCaps, Step};
 
 /// MariaDB `GTID_EVENT`: `domain-server-seq`, with the XA flags [`gtid`] reads.
 pub const MARIA_GTID: u8 = 162;
@@ -190,4 +194,74 @@ pub(crate) fn position_rule(header: BinlogEventHeader) -> Step {
         size: u64::from(header.event_size()),
         exact: header.event_type_raw() != TABLE_MAP,
     }
+}
+
+// ---- The catalog loader (F6): MariaDB's answer to the five `information_schema` reads. The
+// reads themselves are shared with `mysql.rs` (called into, never copied); MariaDB's own are
+// how the rows are answered: plain-SQL generation expressions, and the default collation of a
+// charset under `character_set_collations`.
+
+/// The MariaDB table metadata: the shared `information_schema` reads, with
+/// [`unescape_generation_expression`] as the generated-expression spelling and
+/// [`default_collation`] as the collation probe.
+pub(crate) async fn load_table(
+    conn: &mut Conn,
+    schema: &str,
+    name: &str,
+    caps: SourceCaps,
+    default_collations: &mut HashMap<String, Option<String>>,
+) -> Result<Option<TableInfo>> {
+    let Some(rows) = mysql::read_columns(conn, schema, name).await? else {
+        return Ok(None);
+    };
+    for (_, _, _, cs, ..) in &rows {
+        if let Some(cs) = cs.as_deref().map(str::to_ascii_lowercase) {
+            if let Entry::Vacant(e) = default_collations.entry(cs) {
+                let co = default_collation(conn, e.key()).await?;
+                e.insert(co);
+            }
+        }
+    }
+    let columns = mysql::columns_from_rows(
+        rows,
+        caps,
+        default_collations,
+        unescape_generation_expression,
+    );
+    Ok(Some(
+        mysql::finish_table(conn, schema, name, columns).await?,
+    ))
+}
+
+/// MariaDB prints `GENERATION_EXPRESSION` as plain SQL, not string-escaped the way MySQL /
+/// Percona print it: the text it gets is the SQL text it stands for (the identity that undoes
+/// [`mysql::unescape_generation_expression`]).
+pub(crate) fn unescape_generation_expression(text: &str) -> String {
+    text.to_string()
+}
+
+/// How a JSON value binds as a parameter on MariaDB: it has no JSON cast type, so the JSON
+/// text binds as a plain string (the MySQL family's answer, the cast, is in `mysql.rs`).
+pub(crate) fn json_param() -> String {
+    "?".to_string()
+}
+
+/// The collation `CONVERT(... USING charset)` yields on a MariaDB server: its
+/// `character_set_collations` variable (a charset -> collation map) overrides the charset
+/// default, and asking the server carries that override into the answer. None if unknown.
+pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<Option<String>> {
+    if charset.is_empty()
+        || !charset
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Ok(None);
+    }
+    let v = conn
+        .query_first::<Option<String>, _>(format!(
+            "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
+        ))
+        .await
+        .with_context(|| format!("default collation of character set {charset}"))?;
+    Ok(v.flatten().map(|c| c.to_ascii_lowercase()))
 }

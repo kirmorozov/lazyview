@@ -1,12 +1,13 @@
 //! Table metadata from `information_schema`, needed to resolve columns and decode binlog rows.
+//! The generic records and the cache live here; the loaders that read the server are per
+//! flavor ([`crate::source::mysql`] and [`crate::source::maria`], chosen by the connect-time
+//! [`SourceCaps`]).
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::source::SourceCaps;
-use anyhow::{bail, Context, Result};
-use mysql_async::prelude::*;
+use anyhow::Result;
 use mysql_async::Conn;
 
 /// How a binlog value of this column must be normalized / bound back as a parameter.
@@ -126,7 +127,10 @@ impl Column {
                 None => "CAST(? AS BINARY)".to_string(),
             },
             (ColKind::Binary, _) => "CAST(? AS BINARY)".to_string(),
-            (ColKind::Json, _) if caps.json_cast => "CAST(? AS JSON)".to_string(),
+            // The JSON param answer belongs to the flavor (F6): the MySQL family renders the
+            // cast, MariaDB (whose caps say no JSON cast) binds the JSON text as a plain string.
+            (ColKind::Json, _) if caps.json_cast => crate::source::mysql::json_param(),
+            (ColKind::Json, _) => crate::source::maria::json_param(),
             (
                 ColKind::Plain,
                 "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext",
@@ -248,7 +252,7 @@ pub enum FkAction {
 }
 
 impl FkAction {
-    fn parse(rule: &str) -> FkAction {
+    pub(crate) fn parse(rule: &str) -> FkAction {
         match rule.to_ascii_uppercase().as_str() {
             "CASCADE" => FkAction::Cascade,
             "SET NULL" | "SET DEFAULT" => FkAction::SetNull,
@@ -325,359 +329,25 @@ impl Catalog {
         if let Some(t) = self.tables.get(&key) {
             return Ok(Some(t.clone()));
         }
-        let Some(t) = load_table(
-            conn,
-            schema,
-            name,
-            caps.into(),
-            &mut self.default_collations,
-        )
-        .await?
-        else {
+        let caps = caps.into();
+        // The per-flavor catalog loaders (F6), chosen by the caps picked at connect: MariaDB
+        // answers `GENERATION_EXPRESSION` as plain SQL and its `character_set_collations`
+        // overrides the default collation of a charset; the MySQL family prints the expression
+        // string-escaped and probes `COLLATION(CONVERT(...))` per charset.
+        let loaded = if caps.sql_generation_expressions {
+            crate::source::maria::load_table(conn, schema, name, caps, &mut self.default_collations)
+                .await?
+        } else {
+            crate::source::mysql::load_table(conn, schema, name, caps, &mut self.default_collations)
+                .await?
+        };
+        let Some(t) = loaded else {
             return Ok(None);
         };
         let t = Arc::new(t);
         self.tables.insert(key, t.clone());
         Ok(Some(t))
     }
-}
-
-async fn load_table(
-    conn: &mut Conn,
-    schema: &str,
-    name: &str,
-    caps: SourceCaps,
-    default_collations: &mut HashMap<String, Option<String>>,
-) -> Result<Option<TableInfo>> {
-    let Some(columns) = load_columns(conn, schema, name, caps, default_collations).await? else {
-        return Ok(None);
-    };
-    let (pk, unique_keys) = load_keys(conn, schema, name, &columns).await?;
-    let cascades = load_foreign_keys(conn, schema, name, &columns).await?;
-    let (is_view, view_bases) = load_view_bases(conn, schema, name).await?;
-    Ok(Some(TableInfo {
-        schema: schema.to_string(),
-        name: name.to_string(),
-        columns,
-        pk,
-        unique_keys,
-        cascades,
-        is_view,
-        view_bases,
-    }))
-}
-
-/// Columns from `information_schema.COLUMNS` in `ORDINAL_POSITION` order
-/// (`None`: the table does not exist), remembering each charset's collation of
-/// `CONVERT(... USING charset)` in `default_collations`.
-async fn load_columns(
-    conn: &mut Conn,
-    schema: &str,
-    name: &str,
-    caps: SourceCaps,
-    default_collations: &mut HashMap<String, Option<String>>,
-) -> Result<Option<Vec<Column>>> {
-    type ColRow = (
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        Option<u64>,
-        String,
-        Option<String>,
-    );
-    let rows: Vec<ColRow> = conn
-        .exec(
-            "SELECT CAST(COLUMN_NAME AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(COLUMN_TYPE AS CHAR), \
-             CAST(CHARACTER_SET_NAME AS CHAR), CAST(COLLATION_NAME AS CHAR), CAST(EXTRA AS CHAR), \
-             CHARACTER_OCTET_LENGTH, CAST(IS_NULLABLE AS CHAR), CAST(GENERATION_EXPRESSION AS CHAR) \
-             FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-            (schema, name),
-        )
-        .await?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    for (_, _, _, cs, ..) in &rows {
-        if let Some(cs) = cs.as_deref().map(str::to_ascii_lowercase) {
-            if let Entry::Vacant(e) = default_collations.entry(cs) {
-                let co = default_collation(conn, e.key()).await?;
-                e.insert(co);
-            }
-        }
-    }
-    let mut columns: Vec<Column> = rows
-        .into_iter()
-        .map(
-            |(name, data_type, column_type, cs, co, extra, octets, nullable, gen)| {
-                let default = cs
-                    .as_deref()
-                    .and_then(|c| default_collations.get(&c.to_ascii_lowercase()))
-                    .and_then(|d| d.as_deref());
-                let extra_uc = extra.to_ascii_uppercase();
-                let generated = gen
-                    .filter(|g| !g.trim().is_empty() && extra_uc.contains("GENERATED"))
-                    .map(|expr| Generated {
-                        // MariaDB prints it as plain SQL; MySQL / Percona print it string-escaped.
-                        expr: if caps.sql_generation_expressions {
-                            expr
-                        } else {
-                            unescape_generation_expression(&expr)
-                        },
-                        stored: extra_uc.contains("STORED"),
-                        deps: None,
-                    });
-                Column {
-                    invisible: extra_uc.contains("INVISIBLE"),
-                    nullable: nullable.eq_ignore_ascii_case("YES"),
-                    generated,
-                    ..Column::new(
-                        &name,
-                        &data_type,
-                        &column_type,
-                        cs.as_deref(),
-                        co.as_deref(),
-                        octets,
-                        caps,
-                    )
-                    .with_default_collation(default)
-                }
-            },
-        )
-        .collect();
-    // Base columns of the generated columns (the expression names them, quoted).
-    let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-    for c in &mut columns {
-        if let Some(g) = &mut c.generated {
-            g.deps = generated_deps(&g.expr, &names);
-        }
-    }
-    Ok(Some(columns))
-}
-
-/// The PRIMARY key ordinals and the other keys that identify a row, from one
-/// `information_schema.STATISTICS` read (the PK is the `PRIMARY` group; PK columns are
-/// always whole and NOT NULL on every flavor, so the filters that reject a prefix,
-/// functional or nullable column cannot drop one).
-async fn load_keys(
-    conn: &mut Conn,
-    schema: &str,
-    name: &str,
-    columns: &[Column],
-) -> Result<(Vec<usize>, Vec<Vec<usize>>)> {
-    type KeyRow = (String, u64, Option<String>, Option<u64>, String);
-    let key_rows: Vec<KeyRow> = conn
-        .exec(
-            "SELECT CAST(INDEX_NAME AS CHAR), SEQ_IN_INDEX, CAST(COLUMN_NAME AS CHAR), SUB_PART, \
-             CAST(COALESCE(NULLABLE, '') AS CHAR) \
-             FROM information_schema.STATISTICS \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0 \
-             ORDER BY INDEX_NAME, SEQ_IN_INDEX",
-            (schema, name),
-        )
-        .await?;
-    keys_from(name, &key_rows, columns)
-}
-
-/// Foreign keys of this (child) table that change child rows, grouped by constraint name from
-/// `information_schema.KEY_COLUMN_USAGE` joined with `REFERENTIAL_CONSTRAINTS`.
-async fn load_foreign_keys(
-    conn: &mut Conn,
-    schema: &str,
-    name: &str,
-    columns: &[Column],
-) -> Result<Vec<ForeignKey>> {
-    let fk_rows: Vec<(String, String, String, String, String, String, String)> = conn
-        .exec(
-            "SELECT CAST(k.CONSTRAINT_NAME AS CHAR), CAST(k.COLUMN_NAME AS CHAR), CAST(k.REFERENCED_TABLE_SCHEMA AS CHAR), \
-             CAST(k.REFERENCED_TABLE_NAME AS CHAR), CAST(k.REFERENCED_COLUMN_NAME AS CHAR), \
-             CAST(r.DELETE_RULE AS CHAR), CAST(r.UPDATE_RULE AS CHAR) \
-             FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r \
-               ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.TABLE_NAME = k.TABLE_NAME \
-             WHERE k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL \
-             ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
-            (schema, name),
-        )
-        .await?;
-    let mut cascades: Vec<ForeignKey> = Vec::new();
-    let mut last: Option<String> = None;
-    for (cname, col, ps, pt, pc, del, upd) in fk_rows {
-        let (on_delete, on_update) = (FkAction::parse(&del), FkAction::parse(&upd));
-        if on_delete == FkAction::Restrict && on_update == FkAction::Restrict {
-            continue;
-        }
-        let Some(ci) = columns.iter().position(|c| c.name == col) else {
-            // The FK rows and COLUMNS come from this connection's `information_schema` for the
-            // same (schema, table): a missing column is broken metadata, never a lost cascade.
-            bail!("internal: FK `{cname}` of table `{name}` names column `{col}`, which the table does not have");
-        };
-        if last.as_deref() != Some(cname.as_str()) {
-            cascades.push(ForeignKey {
-                parent: (ps, pt),
-                child_cols: Vec::new(),
-                parent_cols: Vec::new(),
-                on_delete,
-                on_update,
-            });
-            last = Some(cname);
-        }
-        let fk = cascades.last_mut().unwrap();
-        fk.child_cols.push(ci);
-        fk.parent_cols.push(pc);
-    }
-    Ok(cascades)
-}
-
-/// Whether the table is a SQL VIEW and its base tables. They come from the stored definition
-/// (VIEW_TABLE_USAGE is missing on MariaDB and MySQL < 8.0.13, so parse VIEWS.VIEW_DEFINITION
-/// instead).
-async fn load_view_bases(
-    conn: &mut Conn,
-    schema: &str,
-    name: &str,
-) -> Result<(bool, Vec<TableRef>)> {
-    let view_def: Option<Option<String>> = conn
-        .exec_first(
-            "SELECT CAST(VIEW_DEFINITION AS CHAR) FROM information_schema.VIEWS \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-            (schema, name),
-        )
-        .await?;
-    Ok(match view_def {
-        Some(def) => (
-            true,
-            def.as_deref()
-                .map(|d| crate::analyze::select_tables(d, schema))
-                .unwrap_or_default(),
-        ),
-        None => (false, Vec::new()),
-    })
-}
-
-/// The PRIMARY key ordinals and the other UNIQUE keys usable as row keys: whole columns only
-/// (no prefix `SUB_PART`, no functional part, which has no column name), every column NOT NULL
-/// (a nullable unique column admits several NULL rows). Rows come ordered by index name and
-/// sequence. An index column the table does not have is broken metadata: a loud error naming
-/// table and column, never a silently shorter key (`TableInfo::row_key` feeds the dedup key).
-fn keys_from(
-    table: &str,
-    rows: &[(String, u64, Option<String>, Option<u64>, String)],
-    columns: &[Column],
-) -> Result<(Vec<usize>, Vec<Vec<usize>>)> {
-    let mut pk: Vec<usize> = Vec::new();
-    let mut out: Vec<Vec<usize>> = Vec::new();
-    let mut current: Option<(String, Option<Vec<usize>>)> = None;
-    let flush = |cur: &mut Option<(String, Option<Vec<usize>>)>,
-                 pk: &mut Vec<usize>,
-                 out: &mut Vec<Vec<usize>>| {
-        if let Some((index, Some(k))) = cur.take() {
-            if !k.is_empty() {
-                if index == "PRIMARY" {
-                    *pk = k;
-                } else {
-                    out.push(k);
-                }
-            }
-        }
-    };
-    for (index, _, col, sub_part, _) in rows {
-        if current.as_ref().map(|(n, _)| n != index).unwrap_or(true) {
-            flush(&mut current, &mut pk, &mut out);
-            current = Some((index.clone(), Some(Vec::new())));
-        }
-        let Some((_, key)) = &mut current else {
-            continue;
-        };
-        let ci = match col.as_deref() {
-            Some(c) => match columns.iter().position(|x| x.name == c) {
-                Some(ci) => Some(ci),
-                None => bail!(
-                    "internal: index `{index}` of table `{table}` names column `{c}`, which the table does not have"
-                ),
-            },
-            None => None,
-        };
-        match (ci, sub_part) {
-            (Some(ci), None) if !columns[ci].nullable => {
-                if let Some(k) = key {
-                    k.push(ci);
-                }
-            }
-            _ if index == "PRIMARY" => bail!(
-                "internal: table `{table}` has an unusable PRIMARY column ({}: functional, prefix or nullable)",
-                col.as_deref().unwrap_or("(functional)")
-            ),
-            _ => *key = None,
-        }
-    }
-    flush(&mut current, &mut pk, &mut out);
-    Ok((pk, out))
-}
-
-/// Ordinals of the columns a generated column's expression reads (parsed with the MySQL
-/// dialect; `None` if the text does not parse).
-/// MySQL's `GENERATION_EXPRESSION` is the expression escaped like a string literal's content
-/// (`\'` for a quote, `\\` for a backslash): the SQL text it stands for.
-fn unescape_generation_expression(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => out.extend(chars.next()),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn generated_deps(expr: &str, names: &[String]) -> Option<Vec<usize>> {
-    use sqlparser::ast::{visit_expressions, Expr};
-    use sqlparser::dialect::MySqlDialect;
-    use sqlparser::parser::Parser;
-    use std::ops::ControlFlow;
-    let e = Parser::new(&MySqlDialect {})
-        .try_with_sql(expr)
-        .ok()?
-        .parse_expr()
-        .ok()?;
-    let mut deps = Vec::new();
-    let _ = visit_expressions(&e, |x: &Expr| {
-        let id = match x {
-            Expr::Identifier(i) => Some(i),
-            Expr::CompoundIdentifier(parts) => parts.last(),
-            _ => None,
-        };
-        if let Some(i) = id {
-            if let Some(c) = names.iter().position(|n| n.eq_ignore_ascii_case(&i.value)) {
-                if !deps.contains(&c) {
-                    deps.push(c);
-                }
-            }
-        }
-        ControlFlow::<()>::Continue(())
-    });
-    Some(deps)
-}
-
-/// The collation `CONVERT(... USING charset)` yields on this server (its default for the
-/// charset, which MariaDB's `character_set_collations` can override). None if unknown.
-async fn default_collation(conn: &mut Conn, charset: &str) -> Result<Option<String>> {
-    if charset.is_empty()
-        || !charset
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Ok(None);
-    }
-    let v = conn
-        .query_first::<Option<String>, _>(format!(
-            "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
-        ))
-        .await
-        .with_context(|| format!("default collation of character set {charset}"))?;
-    Ok(v.flatten().map(|c| c.to_ascii_lowercase()))
 }
 
 pub fn col_kind(data_type: &str, column_type: &str) -> ColKind {
@@ -744,6 +414,11 @@ fn parse_labels(column_type: &str) -> Vec<String> {
     }
     out
 }
+
+// The loaders' MySQL-shaped helpers moved to `source::mysql` with the loaders (F6); the tests
+// keep reaching them by these names.
+#[cfg(test)]
+use crate::source::mysql::{generated_deps, keys_from, unescape_generation_expression};
 
 #[cfg(test)]
 mod tests;
