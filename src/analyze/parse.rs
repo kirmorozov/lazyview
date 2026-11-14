@@ -29,16 +29,10 @@ pub fn definition_hash(def: &str) -> String {
 /// Parses `CREATE [OR REPLACE] [ALGORITHM=..] [DEFINER=..] [SQL SECURITY ..] VIEW name [(cols)] AS
 /// SELECT ... [WITH [CASCADED|LOCAL] CHECK OPTION]`.
 pub fn parse_definition(def: &str) -> Result<ParsedDef> {
-    // MySQL and MariaDB execute the content of `/*! ... */`, `/*!NNNNN ... */` and `/*M! ... */`: sqlparser expands
-    // the first two unconditionally (whatever the version gate says) and ignores the third, so what lazyview plans
-    // could differ from what the server runs. Refuse them anywhere in the text (also inside a string literal: no
-    // quote-aware scan that could disagree with the server's escape rules).
-    if def.contains("/*!") || def.to_ascii_uppercase().contains("/*M!") {
-        bail!("the definition contains an executable comment (`/*!` or `/*M!`): the server would run its content; write the SQL without it");
-    }
-
-    let dialect = MySqlDialect {};
-    let tokens = tokenize(def)?;
+    // The parse profile (executable-comment refusal, tokenizer, parser) is the dialect's answer;
+    // the definitions parsed here are MySQL-family (a `postgres://` source is refused at connect)
+    // and the PostgreSQL profile arrives with `pgsrc-parse-profile`.
+    let tokens = crate::dialect::tokenize_view(crate::dialect::Family::Mysql, def)?;
     // Indexes of the non-whitespace tokens.
     let words: Vec<usize> = (0..tokens.len())
         .filter(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
@@ -121,7 +115,7 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
     if statements > 1 {
         bail!("the definition contains {statements} statements: {SINGLE_SELECT}");
     }
-    let mut parser = Parser::new(&dialect).with_tokens_with_locations(rest.to_vec());
+    let mut parser = crate::dialect::new_parser(crate::dialect::Family::Mysql, rest.to_vec())?;
     let query = parser.parse_query().context("parse SELECT")?;
     // The servers refuse variables in a view (ERROR 1351) and their values change without a
     // source change.

@@ -276,31 +276,6 @@ fn lineage_keys(cols: &[MvCol], from: usize) -> Option<Vec<Vec<usize>>> {
     Some(keys.into_iter().map(|(_, k)| k).collect())
 }
 
-/// The expression of a rendered select item: without its trailing `AS <alias>`, if any.
-fn item_expr(item: &str) -> &str {
-    let Some((expr, alias)) = item.rsplit_once(" AS ") else {
-        return item;
-    };
-    let alias = alias.trim();
-    let quoted = |o: char, c: char| {
-        alias.len() >= 2
-            && alias.starts_with(o)
-            && alias.ends_with(c)
-            && !alias[1..alias.len() - 1]
-                .replace(&format!("{c}{c}"), "")
-                .contains(c)
-    };
-    let bare = !alias.is_empty()
-        && alias
-            .chars()
-            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$');
-    if quoted('`', '`') || quoted('"', '"') || bare {
-        expr
-    } else {
-        item
-    }
-}
-
 /// The TIMESTAMP columns of a probed layout with the expressions that compute them (see
 /// [`Layout::epoch`]); empty unless every one has a known expression.
 fn epoch_exprs(
@@ -318,7 +293,9 @@ fn epoch_exprs(
             continue;
         }
         let expr = if i < n_visible {
-            plan.projection.get(i).map(|s| item_expr(s).to_string())
+            plan.projection
+                .get(i)
+                .map(|s| crate::dialect::mysql::item_expr(s).to_string())
         } else {
             hidden
                 .get(i - n_visible)
@@ -1314,18 +1291,6 @@ mod tests {
         plan(&parse_definition(sql).unwrap(), "db", &tables).unwrap()
     }
 
-    #[test]
-    fn select_item_expressions() {
-        assert_eq!(item_expr("MAX(ts) AS mx"), "MAX(ts)");
-        assert_eq!(item_expr("MAX(`e`.`ts`) AS `m x`"), "MAX(`e`.`ts`)");
-        assert_eq!(item_expr("x AS `a``b`"), "x");
-        assert_eq!(item_expr("x AS \"q\""), "x");
-        assert_eq!(item_expr("CAST(x AS SIGNED)"), "CAST(x AS SIGNED)");
-        assert_eq!(item_expr("'a AS b'"), "'a AS b'");
-        assert_eq!(item_expr("`ev`.`ts`"), "`ev`.`ts`");
-        assert_eq!(item_expr("x AS `a` + 1"), "x AS `a` + 1");
-    }
-
     /// TIMESTAMP columns are read as `UNIX_TIMESTAMP` of their own expressions, in front of the
     /// plan's select list (never through a derived table), and the epochs replace the values.
     #[test]
@@ -1338,7 +1303,13 @@ mod tests {
             col("n", "bigint", "bigint", None),
         ];
         let epoch = epoch_exprs(&p, &cols, 3, &[]);
-        assert_eq!(epoch, vec![(1, item_expr(&p.projection[1]).to_string())]);
+        assert_eq!(
+            epoch,
+            vec![(
+                1,
+                crate::dialect::mysql::item_expr(&p.projection[1]).to_string()
+            )]
+        );
         assert!(epoch[0].1.starts_with("MAX(") && !epoch[0].1.contains(" AS "));
         let mut l = layout(cols, 3, vec![0], true);
         l.epoch = epoch;

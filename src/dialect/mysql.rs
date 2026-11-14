@@ -1,13 +1,20 @@
-//! The MySQL family's answers on the dialect seam: the identifier quoting and the function
-//! vocabularies, moved verbatim from `crate::analyze::vocab`, `crate::analyze::columns` and
-//! `crate::analyze::expr`. `std` and `sqlparser` only — no host code.
+//! The MySQL family's answers on the dialect seam: the identifier quoting, the function
+//! vocabularies, the parameter and coercion renderings and the parse profile (how a definition's
+//! text is tokenized and handed to the query parser, and how a rendered select item loses its
+//! alias), moved verbatim from `crate::analyze::vocab`, `crate::analyze::columns`,
+//! `crate::analyze::expr`, `crate::analyze::parse` and `crate::mv`. `std`, `sqlparser` and
+//! `anyhow` only — no host code.
 //!
 //! Copy set: lazy-wire-fire copies this file together with `src/dialect/mod.rs` (its parent,
 //! the [`Family`](super::Family) discriminator) verbatim, as a pair, so the quoting answers and
 //! the function name lists the copy-set forwarders in `crate::analyze::vocab` delegate to
 //! compile standalone.
 
+use anyhow::anyhow;
 use sqlparser::ast::Ident;
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{TokenWithSpan, Tokenizer};
 
 /// The name a (raw-tokenized) identifier stands for: a doubled quote character inside a quoted
 /// identifier is one character of the name. The owner of both readings of a name, shared with
@@ -347,6 +354,65 @@ pub(crate) const JSON_FIRST_ARG_FUNCTIONS: &[&str] = &["NULLIF"];
 /// first argument is the condition).
 pub(crate) const JSON_TAIL_ARG_FUNCTIONS: &[&str] = &["IF"];
 
+// The parse profile, moved verbatim from `crate::analyze::parse::parse_definition`: how the
+// definition text is read belongs to the family. `crate::dialect` dispatches on it; the
+// PostgreSQL profile (sqlparser's `PostgreSqlDialect`, no MySQL comment expansion) arrives with
+// `pgsrc-parse-profile`.
+
+/// The MySQL-family parse profile, one instance shared by [`tokenize_view`] and [`new_parser`].
+static PROFILE: MySqlDialect = MySqlDialect {};
+
+/// Tokens of a definition with locations (no unescaping: literals keep their escapes). MySQL and
+/// MariaDB execute the content of `/*! ... */`, `/*!NNNNN ... */` and `/*M! ... */`: sqlparser
+/// expands the first two unconditionally (whatever the version gate says) and ignores the third,
+/// so what lazyview plans could differ from what the server runs. Refuse them anywhere in the
+/// text (also inside a string literal: no quote-aware scan that could disagree with the server's
+/// escape rules).
+pub(crate) fn tokenize_view(sql: &str) -> anyhow::Result<Vec<TokenWithSpan>> {
+    if sql.contains("/*!") || sql.to_ascii_uppercase().contains("/*M!") {
+        return Err(anyhow!(
+            "the definition contains an executable comment (`/*!` or `/*M!`): the server would run its content; write the SQL without it"
+        ));
+    }
+    Tokenizer::new(&PROFILE, sql)
+        .with_unescape(false)
+        .tokenize_with_location()
+        .map_err(|_| anyhow!("tokenize: the text does not tokenize"))
+}
+
+/// A query parser over tokens with locations on the MySQL-family profile: the
+/// `Parser::new(&MySqlDialect {})` of the definition parser, so the profile has one home.
+pub(crate) fn new_parser(tokens: Vec<TokenWithSpan>) -> Parser<'static> {
+    Parser::new(&PROFILE).with_tokens_with_locations(tokens)
+}
+
+/// The expression of a rendered select item: without its trailing `AS <alias>`, if any. The
+/// backtick/double-quote/bare-alias rule is the family's answer (moved verbatim from
+/// `crate::mv`); PostgreSQL's alias forms arrive with `pgsrc-parse-profile`.
+pub(crate) fn item_expr(item: &str) -> &str {
+    let Some((expr, alias)) = item.rsplit_once(" AS ") else {
+        return item;
+    };
+    let alias = alias.trim();
+    let quoted = |o: char, c: char| {
+        alias.len() >= 2
+            && alias.starts_with(o)
+            && alias.ends_with(c)
+            && !alias[1..alias.len() - 1]
+                .replace(&format!("{c}{c}"), "")
+                .contains(c)
+    };
+    let bare = !alias.is_empty()
+        && alias
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$');
+    if quoted('`', '`') || quoted('"', '"') || bare {
+        expr
+    } else {
+        item
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +431,19 @@ mod tests {
             charset_coercion("utf8mb4", Some(12)),
             "LEFT(CONVERT(? USING utf8mb4), 12)"
         );
+    }
+
+    /// The expression of a rendered select item: the trailing alias comes off only where it
+    /// really is one (moved verbatim with [`item_expr`] from `crate::mv`).
+    #[test]
+    fn select_item_expressions() {
+        assert_eq!(item_expr("MAX(ts) AS mx"), "MAX(ts)");
+        assert_eq!(item_expr("MAX(`e`.`ts`) AS `m x`"), "MAX(`e`.`ts`)");
+        assert_eq!(item_expr("x AS `a``b`"), "x");
+        assert_eq!(item_expr("x AS \"q\""), "x");
+        assert_eq!(item_expr("CAST(x AS SIGNED)"), "CAST(x AS SIGNED)");
+        assert_eq!(item_expr("'a AS b'"), "'a AS b'");
+        assert_eq!(item_expr("`ev`.`ts`"), "`ev`.`ts`");
+        assert_eq!(item_expr("x AS `a` + 1"), "x AS `a` + 1");
     }
 }
