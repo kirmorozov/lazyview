@@ -828,7 +828,7 @@ async fn held_rows(db: &Db, n: u64) -> Result<()> {
 
 /// The highest position any row of `_lazyview_status` holds (the engine saves it every 50 ms with
 /// the harness defaults, `regressions/lifecycle.rs:310`).
-async fn saved_position(db: &Db) -> Result<Position> {
+pub async fn saved_position(db: &Db) -> Result<Position> {
     let mut c = db.conn().await?;
     let rows = rows(
         &mut c,
@@ -856,7 +856,7 @@ async fn saved_position(db: &Db) -> Result<Position> {
 }
 
 /// The first log line containing `needle` (`None` when the log has none): the XA check of D5.
-fn grep_log(path: &PathBuf, needle: &str) -> Result<Option<String>> {
+pub fn grep_log(path: &PathBuf, needle: &str) -> Result<Option<String>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -896,7 +896,7 @@ async fn wait_flushed(eng: &Engine, src: &Db, specs: &[ViewSpec]) -> Result<()> 
 
 /// Waits until the engine is connected to the binlog stream again (`streaming == 1`,
 /// `src/metrics.rs:97`).
-async fn wait_streaming(eng: &mut Engine) -> Result<()> {
+pub async fn wait_streaming(eng: &mut Engine) -> Result<()> {
     let m = eng.metrics.clone();
     wait_until("the engine streaming again", t_catchup(), || async {
         Ok(m.gauges.streaming.load(Ordering::Relaxed) == 1)
