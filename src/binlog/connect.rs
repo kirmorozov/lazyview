@@ -192,18 +192,10 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     );
     if flavor == Flavor::MySql {
         // Partial JSON row images carry diffs instead of values; lazyview needs full values.
+        // The probe is here (it is the network edge); the check and its message are the
+        // MySQL family's: [`crate::source::mysql::preflight`].
         let opts = probe_var_retry(conn, "binlog_row_value_options").await?;
-        if opts
-            .unwrap_or_default()
-            .to_ascii_uppercase()
-            .contains("PARTIAL_JSON")
-        {
-            problems.push(
-                "binlog_row_value_options is PARTIAL_JSON (must be empty); fix: SET PERSIST \
-                 binlog_row_value_options='' (Amazon RDS/Aurora: set it in the DB parameter group)"
-                    .into(),
-            );
-        }
+        problems.extend(crate::source::mysql::preflight(opts.as_deref()));
     }
     if !problems.is_empty() {
         bail!(unmet_requirements(&version, &problems));

@@ -10,6 +10,11 @@
 //! Copy set: `std` + `anyhow` + `mysql_async` only, no `crate::` beyond the copy set, no
 //! environment variables (a knob is a parameter the caller passes), no logging.
 
+/// The MySQL-family side (MySQL and Percona run the same server): preflight, the status
+/// statement spelling, GTID text, transaction payloads, the QUERY/XA classifications and the
+/// TIME(1)/(2) decode twin. MariaDB reaches what it shares through it, never by copy.
+pub mod mysql;
+
 use std::cmp::Ordering;
 
 use mysql_async::binlog::events::{BinlogEventHeader, Event};

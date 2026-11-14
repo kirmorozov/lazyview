@@ -38,26 +38,22 @@
 //!   (default 1 GiB) into `Partial_rows` events; they are reassembled into the rows event.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use mysql_async::binlog::events::{
-    Event, EventData, FormatDescriptionEvent, GtidEvent, QueryEvent, TableMapEvent,
-    TransactionPayloadEvent,
+    Event, EventData, GtidEvent, QueryEvent, TableMapEvent, TransactionPayloadEvent,
 };
 use mysql_async::binlog::row::BinlogRow;
-use mysql_async::binlog::value::BinlogValue;
-use mysql_async::binlog::{BinlogVersion, EventType};
-use mysql_async::consts::ColumnType;
 use mysql_async::prelude::Queryable;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Opts, OptsBuilder, Row, Value};
 
 mod connect;
 mod probe;
-mod query;
+// `query` is gone: its MySQL-family code (query kinds, the xid formatter, GTID spellings)
+// lives in [`crate::source::mysql`] and its MariaDB side in [`crate::source::maria`].
 mod stream;
 
 // The flavor-neutral types below live in [`crate::source`] now. Embedder seam: they stay
@@ -74,20 +70,22 @@ pub use crate::source::{
 };
 // Shared with [`crate::source::maria`] while the F-series settles the seam: the probe retry
 // loop (MariaDB's preflight probes run through it) and the XA xid formatter (MariaDB's GTID
-// event carries XA ids in the MySQL format).
+// event carries XA ids in the MySQL format, so it lives with the MySQL-family code).
 pub(crate) use self::connect::probe_var_retry;
-pub(crate) use self::query::xid_string;
+pub(crate) use crate::source::mysql::xid_string;
 
 #[cfg(test)]
 use self::connect::{product, requirement_problems, split_ca_params, unmet_requirements};
 #[cfg(test)]
-use self::probe::{status_statements, with_hint};
-#[cfg(test)]
-use self::query::{classify_query, format_uuid, mysql_gtid, xa_prepare_event, QueryKind};
+use self::probe::with_hint;
 #[cfg(test)]
 use self::stream::{crc32, ty, Tracker, ARTIFICIAL_FLAG, DUMMY_TABLE_ID};
 #[cfg(test)]
 use crate::source::maria::gtid as mariadb_gtid;
+#[cfg(test)]
+use crate::source::mysql::{
+    classify_query, format_uuid, mysql_gtid, status_statements, xa_prepare_event, QueryKind,
+};
 
 #[cfg(test)]
 mod tests;

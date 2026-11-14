@@ -1,5 +1,7 @@
 use super::*;
 
+use mysql_async::binlog::value::BinlogValue;
+
 #[test]
 fn query_classification() {
     use QueryKind::*;
