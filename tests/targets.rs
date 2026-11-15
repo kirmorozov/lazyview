@@ -814,8 +814,10 @@ fn targets_pg_incremental_never_rebuilds() {
 fn time_key(text: &str) -> String {
     let (hms, frac) = text.split_once('.').unwrap_or((text, ""));
     let frac = frac.trim_end_matches('0');
-    // PostgreSQL prints a one-digit hour right-aligned (" 8:30:00"), so trim before padding.
-    let mut p = hms.split(':').map(|d| format!("{:>02}", d.trim()));
+    // The unit column is `text`, so it holds the TIME as the engine wrote it - `8:30:00`, the hour
+    // without its leading zero (a right-aligned " 8:30:00" reads the same way). Trim, then pad with
+    // `{:0>2}`: as the `0` *flag* (`{:>02}`) it does not pad a string, it fills with spaces.
+    let mut p = hms.split(':').map(|d| format!("{:0>2}", d.trim()));
     let (h, m, s) = (
         p.next().unwrap_or_default(),
         p.next().unwrap_or_default(),
@@ -905,8 +907,9 @@ fn targets_pg_group_by_unindexable_key() {
                 "grp gained a unique row-key index during the load"
             );
             drop(client);
-            // The refused column is still the unit, and its four values are the four TIMEs the load
-            // wrote - the vanished group included, since its delete found it by that key. Read by
+            // The refused column is still the unit: every surviving row carries its own group key, so
+            // the values are the three TIMEs that still have rows - the '23:15:00' group left with its
+            // row, which is the delete the unit key found (the row count above pins that). Read by
             // name from the catalog: the hidden unit column's spelling is the planner's business.
             let names = pg_exec(
                 &pgdb.dsn,
@@ -937,10 +940,10 @@ fn targets_pg_group_by_unindexable_key() {
             .collect::<Vec<_>>();
             units.sort();
             ensure!(
-                units == ["08:30:00", "12:00:00", "18:45:00", "23:15:00"],
+                units == ["08:30:00", "12:00:00", "18:45:00"],
                 "grp's unit key values are {units:?}"
             );
-            ctx.log("grouped by an unindexable key: no unique index, incremental, four unit keys");
+            ctx.log("grouped by an unindexable key: no unique index, incremental, three unit keys");
             let tmap: HashMap<String, Db> = HashMap::new();
             let pgmap: HashMap<String, pg::PgDb> = [("pg".to_string(), pgdb.clone())].into();
             verify_targets(
@@ -1086,7 +1089,9 @@ fn targets_pg_swap_keeps_readers() {
             // The reader: an open transaction on the MV table (ACCESS SHARE) the swap must wait for.
             let reader = pgdb.client().await?;
             reader.batch_execute("BEGIN").await?;
-            let rows = reader.query("SELECT count(*) FROM \"links\"", &[]).await?;
+            // (Unquoted on purpose: in MySQL's default sql_mode a double-quoted name is a string,
+            // so the renamer that round-trips every statement here would find no table to rename.)
+            let rows = reader.query("SELECT count(*) FROM links", &[]).await?;
             let n: i64 = rows.first().context("count row")?.get(0);
             exec(
             &mut c,
