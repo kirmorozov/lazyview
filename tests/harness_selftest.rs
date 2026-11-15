@@ -485,3 +485,73 @@ fn selftest_warn_bucketing() {
         "a panic fails the run"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The harness's own HTTP client (issue #216): no server, no engine.
+// ---------------------------------------------------------------------------------------------
+
+/// Both helpers of `common::engine` decode a `Transfer-Encoding: chunked` answer. The toxiproxy
+/// API answers chunked once a body is large, and a chunk-blind read hands the caller the size
+/// lines as payload (`"200, not JSON: 14de"`), which is how the chaos suite's `Drop` cleanup
+/// leaked proxies into the listen band. A canned listener stands in for the server: chunked on one
+/// connection, plain `Content-Length` on the next (where the decode must be the identity).
+#[tokio::test]
+async fn selftest_http_decodes_chunked_body() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Big enough that the size lines are two hex digits, as the leaked `GET /proxies` answer's
+    // were (`14de` = 5342 bytes) — a decoder that only handled `0`..=`9` would pass a toy body.
+    let payload = format!(
+        "{{\"name\":\"{}\",\"n\":7,\"items\":[1,2,3],\"ok\":true}}",
+        "entity".repeat(8)
+    );
+    let mut chunked: Vec<u8> =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    for part in payload.as_bytes().chunks(23) {
+        chunked.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+        chunked.extend_from_slice(part);
+        chunked.extend_from_slice(b"\r\n");
+    }
+    chunked.extend_from_slice(b"0\r\n\r\n");
+    let plain = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?.to_string();
+    let serve = tokio::spawn(async move {
+        for answer in [chunked, plain.into_bytes()] {
+            // One canned answer per connection: the client asks once and the server closes.
+            let (mut s, _) = listener
+                .accept()
+                .await
+                .expect("the harness client connects");
+            let mut request = [0u8; 512];
+            let got = s.read(&mut request).await.expect("the request arrives");
+            assert!(got > 0, "the client sent its request");
+            s.write_all(&answer).await.expect("the answer goes out");
+            s.shutdown().await.expect("the answer is the whole body");
+        }
+    });
+
+    let (status, v) = http_json(&addr, "POST", "/proxies", "{}").await?;
+    assert_eq!(status, 200, "the chunked answer's status");
+    assert_eq!(v["name"].as_str(), Some("entity".repeat(8).as_str()));
+    assert_eq!(v["n"].as_i64(), Some(7));
+    assert_eq!(v["items"].as_array().map(|a| a.len()), Some(3));
+
+    let r = request(&addr, "GET", "/stats", "").await?;
+    assert_eq!(r.status, 200, "the plain answer's status");
+    assert_eq!(
+        r.body, payload,
+        "Content-Length body passes through untouched"
+    );
+    assert!(
+        r.head.contains("Content-Length: "),
+        "the head stays raw: {}",
+        r.head
+    );
+    serve.await.expect("the canned server finished");
+    Ok(())
+}

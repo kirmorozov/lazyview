@@ -279,8 +279,55 @@ pub struct Resp {
     pub body: String,
 }
 
+/// Decode a `Transfer-Encoding: chunked` answer (`size\r\nbytes\r\n` repetitions, terminated by
+/// `0\r\n`); the identity when the header is absent. Chunk extensions are not used by the engines
+/// of the harness (the health endpoint, the toxiproxy API), so a size line is parsed as plain hex;
+/// on anything unparsable the function stops with what it has (the caller's JSON parse then fails
+/// loudly, as it must). The single decode of the harness: a Go server (toxiproxy, whose
+/// `GET /proxies` answer is far too large for one write) answers `Transfer-Encoding: chunked`
+/// whenever it does not know the length up front, and reading that body as plain hands the caller
+/// the size lines as if they were payload (issue #216).
+fn decode_chunked(head: &str, answer: &str) -> String {
+    if !head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return answer.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = answer;
+    while let Some((line, tail)) = rest.split_once("\r\n") {
+        let Ok(size) = usize::from_str_radix(line.trim(), 16) else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        let take = size.min(tail.len());
+        out.push_str(&tail[..take]);
+        rest = tail[take..].strip_prefix("\r\n").unwrap_or(&tail[take..]);
+    }
+    out
+}
+
+/// The shared read of one HTTP/1.1 answer, used by both [`request`] and [`http_json`]: status from
+/// the status line, the header block as it came (callers match headers in it), and the body with a
+/// `Transfer-Encoding: chunked` answer decoded by [`decode_chunked`]. `what` labels the exchange in
+/// every failure (`"GET 127.0.0.1:8080/stats"`).
+fn split_response(what: &str, text: &str) -> Result<(u16, String, String)> {
+    let (head, answer) = text
+        .split_once("\r\n\r\n")
+        .with_context(|| format!("{what}: bad HTTP response {text:?}"))?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u16>().ok())
+        .with_context(|| format!("{what}: bad status line {head:?}"))?;
+    Ok((status, head.to_string(), decode_chunked(head, answer)))
+}
+
 /// One HTTP request to an engine's health endpoint (`addr` as given in `LAZYVIEW_HEALTH_ADDR`):
-/// 5 s connect and read timeouts, the response split at `\r\n\r\n`, status from the status line.
+/// 5 s connect and read timeouts, the response read by [`split_response`].
 pub async fn request(addr: &str, method: &str, path: &str, headers: &str) -> Result<Resp> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
@@ -293,19 +340,8 @@ pub async fn request(addr: &str, method: &str, path: &str, headers: &str) -> Res
         .await
         .context("read timeout")??;
     let text = String::from_utf8_lossy(&buf).to_string();
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .with_context(|| format!("bad HTTP response {text:?}"))?;
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .with_context(|| format!("bad status line {head:?}"))?;
-    Ok(Resp {
-        status,
-        head: head.to_string(),
-        body: body.to_string(),
-    })
+    let (status, head, body) = split_response(&format!("{method} {addr}{path}"), &text)?;
+    Ok(Resp { status, head, body })
 }
 
 /// `GET <path>` on an engine's health endpoint (`addr` as given in `LAZYVIEW_HEALTH_ADDR`):
@@ -318,7 +354,8 @@ pub async fn http_get(addr: &str, path: &str) -> Result<(u16, String)> {
 /// One HTTP request **with a JSON body** and the parsed answer, on the same one-shot connection as
 /// [`request`] (the shape chaos plan §2.1 asks for: `Host:`, `Content-Length`, `Connection: close`,
 /// `read_to_end` behind the 5 s timeouts). It does not call [`request`]: `request` sends no body,
-/// so a `POST` there would sit waiting for the bytes its own `Content-Length` promised. A
+/// so a `POST` there would sit waiting for the bytes its own `Content-Length` promised; both do
+/// share [`split_response`], so a chunked answer is decoded here too (issue #216). A
 /// body-less answer (the 204 of toxiproxy's `DELETE` and `POST /reset`) parses as
 /// [`serde_json::Value::Null`]. No new dependency: `serde_json` is already here for [`fetch_stats`].
 pub async fn http_json(
@@ -347,14 +384,7 @@ pub async fn http_json(
         .with_context(|| format!("{method} {addr}{path}: read timeout"))?
         .with_context(|| format!("{method} {addr}{path}: read"))?;
     let text = String::from_utf8_lossy(&buf).to_string();
-    let (head, answer) = text
-        .split_once("\r\n\r\n")
-        .with_context(|| format!("{method} {addr}{path}: bad HTTP response {text:?}"))?;
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|v| v.parse::<u16>().ok())
-        .with_context(|| format!("{method} {addr}{path}: bad status line {head:?}"))?;
+    let (status, _head, answer) = split_response(&format!("{method} {addr}{path}"), &text)?;
     if answer.trim().is_empty() {
         return Ok((status, serde_json::Value::Null));
     }
