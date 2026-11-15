@@ -160,15 +160,35 @@ fn health_probe_transitions() {
             r.status,
             r.body
         );
-        // The connect loop beats (backoff 1, 2, 4, 8 s): the heartbeat age keeps resetting.
+        // The connect loop beats (backoff 1, 2, 4, 8 s, doubling toward the 30 s cap -
+        // `connect_wait` in src/engine.rs): the heartbeat age keeps resetting. What this
+        // pins is the cadence - a beat at least once per backoff step while the engine
+        // waits for the database - so the bound is derived from that schedule in elapsed
+        // time, not from a count against a fixed wall clock a slow runner can miss: the
+        // first sample only seeds the comparison and the watch may open just after a beat,
+        // so counted beat n arrives with the (n+2)th real beat at the latest, which the
+        // schedule places (2^(n+1) - 1) s from the watch opening. A saturated runner
+        // stretches every sleep and GET, so the schedule time is scaled by SLACK and the
+        // window is widened by the measured poll round trips (a GET slower than the beat
+        // interval is what hides a reset from the age samples). The live liveness pin is
+        // unchanged: every sample must still find the age under the stall limit.
+        const BEATS: u32 = 3;
+        const SLACK: u32 = 4;
         let (mut beats, mut last_age) = (0, u64::MAX);
         let watch = Instant::now();
-        while beats < 3 {
+        let mut cycle = Duration::ZERO; // the worst /livez round trip seen so far
+        while beats < BEATS {
+            let due = Duration::from_secs((1u64 << (beats + 2)) - 1) * SLACK + cycle * BEATS;
             ensure!(
-                watch.elapsed() < Duration::from_secs(25),
-                "only {beats} heartbeat(s) in 25 s while waiting for the database"
+                watch.elapsed() < due,
+                "only {beats}/{BEATS} heartbeat(s) {}s into the watch: beat {} is overdue \
+                 against its {due:?} bound (connect backoff schedule x{SLACK} for runner slack)",
+                watch.elapsed().as_secs_f64(),
+                beats + 1,
             );
+            let t0 = Instant::now();
             let r = get(&w, "/livez?format=json").await?;
+            cycle = cycle.max(t0.elapsed());
             ensure!(
                 r.status == 200,
                 "/livez while waiting for the database: {}",
