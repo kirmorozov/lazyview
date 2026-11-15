@@ -375,6 +375,11 @@ struct Version {
     /// Targets whose writes failed: units still to apply there, retried with backoff while the
     /// other targets are maintained as usual.
     lag: BTreeMap<String, Lag>,
+    /// Targets answered but took every write of the last flush slower than the budget of the
+    /// changes kept for targets that are behind (`mark_behind_targets`, #215): excluded from the
+    /// refresh like a lagging one, and their units handed to a `lag` entry at the next refresh
+    /// (`note_refresh`) or when the retry time in the value arrives (`retry_lag`).
+    behind: BTreeMap<String, Instant>,
     /// Remembered images of lookup tables without lineage (see [`Lookback`]).
     recent: Lookback,
     /// Server binlog position right after the catalog read its plan was made from (see
@@ -717,6 +722,9 @@ struct Engine {
     /// emitted: one warn and one count per crossing of `LAG_HOLD_BYTES`, not per housekeeping
     /// tick (re-armed when the estimate falls back within the budget).
     lag_budget_warned: bool,
+    /// (slot, targets written) of every live refresh of the flush in progress (`note_refresh`
+    /// fills it, `flush_draining` reads it once when the flush is through, #215).
+    flush_wrote: Vec<(usize, Vec<String>)>,
     /// Live views refreshed since `refreshed_at` was last bumped.
     refreshed: HashSet<String>,
     last_touch: Instant,
@@ -1170,6 +1178,7 @@ impl Engine {
             leader,
             ready_logged: false,
             lag_budget_warned: false,
+            flush_wrote: Vec::new(),
             refreshed: HashSet::new(),
             last_touch: Instant::now(),
             last_stats: (Instant::now(), Default::default()),
@@ -2399,6 +2408,7 @@ impl Engine {
             frozen: false,
             since: None,
             lag: BTreeMap::new(),
+            behind: BTreeMap::new(),
             recent: Lookback::default(),
             catalog_head,
             table_heads: HashMap::new(),
@@ -3145,27 +3155,83 @@ impl Engine {
             .unwrap_or_else(|| reader.position().file.clone());
         let (mut read_any, mut full) = (false, false);
         let metrics = self.metrics.clone();
-        let flush = self.flush();
-        tokio::pin!(flush);
-        loop {
-            if !full && drained.full() {
-                full = true;
-                Metrics::add(&metrics.binlog_backpressure, 1);
-            }
-            let open = drained.open() && reader.position().file == file;
-            tokio::select! {
-                biased;
-                r = &mut flush => {
-                    if read_any {
-                        Metrics::add(&metrics.flushes_overlapped, 1);
+        // Everything fed so far (the binlog read position) is what this flush applies: the
+        // position the targets will have applied when it is through (#215, see below).
+        let applied = self.boundary.clone();
+        let r = {
+            let flush = self.flush();
+            tokio::pin!(flush);
+            loop {
+                if !full && drained.full() {
+                    full = true;
+                    Metrics::add(&metrics.binlog_backpressure, 1);
+                }
+                let open = drained.open() && reader.position().file == file;
+                tokio::select! {
+                    biased;
+                    r = &mut flush => {
+                        if read_any {
+                            Metrics::add(&metrics.flushes_overlapped, 1);
+                        }
+                        break r;
                     }
-                    return r;
+                    read = reader.next(), if open => {
+                        *last_event = Instant::now();
+                        drained.push(read, &file);
+                        read_any = true;
+                    }
                 }
-                read = reader.next(), if open => {
-                    *last_event = Instant::now();
-                    drained.push(read, &file);
-                    read_any = true;
+            }
+        };
+        // A flush that outran its writes: while it ran the stream moved past what it applied by
+        // more than the budget of the changes kept for targets that are behind — the targets
+        // answered every write, yet demonstrably fall behind (a starved link; #215). Reported
+        // and accounted as lagging, the same way a target that failed its writes is. Decided
+        // from the applied position against the budget, never from error text. Cost (guard R3):
+        // one position compare and one pass over the (view, target) pairs per flush; the event
+        // path is untouched (the reader's position is read once, here, not per event).
+        if r.is_ok() && read_any {
+            self.mark_behind_targets(&applied, reader.position(), drained.bytes);
+        }
+        r
+    }
+
+    /// Flags the targets the flush just wrote as behind: the flush applied everything up to
+    /// `applied`, while the stream was read up to `read` (events worth `drained_bytes` are
+    /// queued behind that position). Past the [`LAG_HOLD_BYTES`] budget
+    /// (`LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests) every target that took this flush's writes is
+    /// flagged in [`Version::behind`]: the next refresh skips it and hands it its changes
+    /// through a `lag` entry (`note_refresh`), or the entry is made when the flag's retry time
+    /// arrives (`retry_lag`) — either way the accounting from there is the one a target whose
+    /// writes failed gets: kept keys, the budget warning, `retry_lag` catching it up and
+    /// counting the catch-up. Nothing is rebuilt or dropped; a target that keeps up again
+    /// simply never gets flagged (only a written target of a slow flush is).
+    fn mark_behind_targets(&mut self, applied: &Position, read: &Position, drained_bytes: usize) {
+        let budget = self.cfg.test_lag_hold_bytes.unwrap_or(LAG_HOLD_BYTES);
+        // Bytes between the two positions: an offset difference in one binlog file; across a
+        // rotation the size of the files between is unknown, so the queue alone decides.
+        let behind = if read.file == applied.file {
+            read.pos.saturating_sub(applied.pos) > budget as u64
+        } else {
+            drained_bytes > budget
+        };
+        if !behind {
+            return;
+        }
+        let retry_at = Instant::now() + connect_retry_delay(1);
+        for (i, targets) in &self.flush_wrote {
+            let Some(l) = self.slots[*i].live.as_mut().filter(|l| !l.frozen) else {
+                continue;
+            };
+            for t in targets {
+                if l.lag.contains_key(t.as_str()) || l.behind.contains_key(t.as_str()) {
+                    continue; // already behind through a failure or an earlier flush
                 }
+                l.behind.insert(t.clone(), retry_at);
+                warn!(view = %l.name, target = %t,
+                    "writes to this target are behind: the stream has moved {drained_bytes} \
+                     bytes of changes past the position this flush applied, over the {budget} \
+                     byte budget; the target is accounted as lagging until it catches up");
             }
         }
     }
@@ -4045,6 +4111,7 @@ impl Engine {
                 due.push(t);
             }
             due.extend(l.lag.values().map(|g| g.retry_at));
+            due.extend(l.behind.values().copied());
         }
         let urgent = due.into_iter().min();
         let batch = self.first_dirty.map(|t| t + self.cfg.batch_window);
@@ -4070,6 +4137,8 @@ impl Engine {
 
     async fn flush(&mut self) -> Result<()> {
         let started = Instant::now();
+        // (re)filled by `note_refresh` as this flush's refreshes complete (#215).
+        self.flush_wrote.clear();
         // (duration, step, slot) of the per-view steps, for the slow-flush log.
         let mut slow: Vec<(Duration, &str, usize)> = Vec::new();
         // Failures below re-arm it.
@@ -4126,7 +4195,10 @@ impl Engine {
             || self.slots.iter().any(|s| {
                 s.live
                     .as_ref()
-                    .map(|l| !l.frozen && (!l.dirty.is_empty() || !l.lag.is_empty()))
+                    .map(|l| {
+                        !l.frozen
+                            && (!l.dirty.is_empty() || !l.lag.is_empty() || !l.behind.is_empty())
+                    })
                     .unwrap_or(false)
                     || s.next.as_ref().map(|n| n.done.is_some()).unwrap_or(false)
                     || (s.next.is_none() && s.down.values().any(|d| d.retry_at <= now))
@@ -4882,6 +4954,7 @@ impl Engine {
                     frozen: false,
                     since: if empty { None } else { since },
                     lag: BTreeMap::new(),
+                    behind: BTreeMap::new(),
                     recent,
                     catalog_head: n.catalog_head,
                     table_heads: HashMap::new(),
@@ -4941,7 +5014,7 @@ impl Engine {
         }
         let dirty = l.dirty.take();
         let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
-        let lagging: Vec<String> = l.lag.keys().cloned().collect();
+        let lagging: Vec<String> = l.lag.keys().chain(l.behind.keys()).cloned().collect();
         let targets: Vec<String> = l
             .targets
             .iter()
@@ -4986,7 +5059,9 @@ impl Engine {
 
     /// After a successful refresh of slot `i`'s live version (from `live_end`; executor (a) too): targets whose
     /// writes failed start lagging at `floor` and get the refreshed units later, lagging targets get them too,
-    /// and the view's statistics count the refresh.
+    /// and the view's statistics count the refresh. A target flagged behind (see
+    /// [`Self::mark_behind_targets`]) gets its lag entry here, as one of the `lagging`. The
+    /// targets this refresh wrote are recorded in [`Engine::flush_wrote`] for the behind check.
     fn note_refresh(
         &mut self,
         i: usize,
@@ -4994,14 +5069,17 @@ impl Engine {
         r: Refreshed,
         lagging: &[String],
         floor: Position,
+        targets: &[String],
     ) {
         let s = &mut self.slots[i];
         let Some(l) = s.live.as_mut() else {
             return;
         };
+        self.flush_wrote.push((i, targets.to_vec()));
         // Targets that missed this refresh (or earlier ones) get the units later.
         for (t, e) in &r.failed {
             warn!(view = %name, target = %t, "write failed: {e:#}; retrying");
+            l.behind.remove(t.as_str());
             l.lag.entry(t.clone()).or_insert(Lag {
                 units: UnitSet::default(),
                 partial: Vec::new(),
@@ -5011,6 +5089,27 @@ impl Engine {
                 retry_at: Instant::now() + connect_retry_delay(1),
                 down: false,
             });
+        }
+        // A target flagged behind (`mark_behind_targets`) that this refresh applied to none of:
+        // what it is owed is exactly what was fed since the flag, i.e. what this refresh
+        // carried. It becomes the lag entry the failed path above gives (#215): from here the
+        // accounting is the one a down target gets — kept keys over the budget reported, the
+        // saved position waiting, `retry_lag` catching it up and counting the catch-up.
+        for t in lagging {
+            if l.behind.remove(t.as_str()).is_some() && !l.lag.contains_key(t.as_str()) {
+                l.lag.insert(
+                    t.clone(),
+                    Lag {
+                        units: UnitSet::default(),
+                        partial: Vec::new(),
+                        all: false,
+                        since: floor.clone(),
+                        failures: 0,
+                        retry_at: Instant::now() + connect_retry_delay(1),
+                        down: false,
+                    },
+                );
+            }
         }
         for t in r.failed.iter().map(|(t, _)| t).chain(lagging) {
             if let Some(g) = l.lag.get_mut(t) {
@@ -5029,7 +5128,7 @@ impl Engine {
             layout: _,
             name,
             dirty,
-            targets: _,
+            targets,
             lagging,
             recent,
             since: _,
@@ -5089,7 +5188,7 @@ impl Engine {
                     return;
                 };
                 let floor = l.since.clone().unwrap_or_else(|| self.boundary.clone());
-                self.note_refresh(i, &name, r, &lagging, floor);
+                self.note_refresh(i, &name, r, &lagging, floor, &targets);
                 let s = &mut self.slots[i];
                 let Some(l) = s.live.as_mut() else {
                     return;
@@ -5119,6 +5218,36 @@ impl Engine {
     /// rebuilt once it answers again).
     async fn retry_lag(&mut self, i: usize) {
         let now = Instant::now();
+        // Behind flags whose retry time came without a refresh handing them their units (a
+        // one-target view: the skipped refresh has no target left to read the materialized
+        // table from) become lag entries on their own (#215): the changes buffered now are
+        // what the target is owed, so the entry seeds itself from them and the pass below
+        // catches it up. A flagged target that owes nothing (buffer empty) just drops the
+        // flag — it never missed a change, so there is no catch-up to count either.
+        if let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
+            let flagged: Vec<String> = l
+                .behind
+                .iter()
+                .filter(|(_, at)| **at <= now)
+                .map(|(t, _)| t.clone())
+                .collect();
+            for t in flagged {
+                l.behind.remove(&t);
+                if l.dirty.units.is_empty() && l.dirty.partial.is_empty() && !l.dirty.all {
+                    continue;
+                }
+                let seed = Lag {
+                    units: l.dirty.units.clone(),
+                    partial: l.dirty.partial.clone(),
+                    all: l.dirty.all,
+                    since: l.since.clone().unwrap_or_else(|| self.boundary.clone()),
+                    failures: 0,
+                    retry_at: now,
+                    down: false,
+                };
+                l.lag.entry(t).or_insert(seed);
+            }
+        }
         let due: Vec<String> = match self.slots[i].live.as_ref().filter(|l| !l.frozen) {
             Some(l) => l
                 .lag
