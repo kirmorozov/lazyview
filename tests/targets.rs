@@ -814,7 +814,8 @@ fn targets_pg_incremental_never_rebuilds() {
 fn time_key(text: &str) -> String {
     let (hms, frac) = text.split_once('.').unwrap_or((text, ""));
     let frac = frac.trim_end_matches('0');
-    let mut p = hms.split(':').map(|d| format!("{d:>02}"));
+    // PostgreSQL prints a one-digit hour right-aligned (" 8:30:00"), so trim before padding.
+    let mut p = hms.split(':').map(|d| format!("{:>02}", d.trim()));
     let (h, m, s) = (
         p.next().unwrap_or_default(),
         p.next().unwrap_or_default(),
