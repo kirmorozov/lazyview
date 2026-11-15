@@ -268,10 +268,22 @@ async fn connect_wait(
                 waited = true;
             }
         }
-        // Still unreachable after a whole policy run: wait one cap, shutdown-aware.
-        tokio::select! {
-            _ = tokio::time::sleep(supervisor::Policy::CONNECT.cap) => {}
-            _ = shutdown.changed() => if *shutdown.borrow() { return Ok(None) },
+        // Still unreachable after a whole policy run: wait one cap, shutdown-aware. Beat
+        // every second meanwhile (as `hold_for_builds` does): the cap equals the stall
+        // limit, so an un-beaten wait of a whole cap would let `/livez` see a heartbeat as
+        // old as the limit says the loop beats - and it does not (health_probe_transitions
+        // samples the age while the database is unreachable). The wake every second is the
+        // same cost the loop already pays between `retrying` rounds.
+        let mut left = supervisor::Policy::CONNECT.cap;
+        while !left.is_zero() {
+            metrics.beat();
+            let step = left.min(Duration::from_secs(1));
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => if *shutdown.borrow() { return Ok(None) },
+                _ = tokio::time::sleep(step) => {}
+            }
+            left -= step;
         }
     }
 }
