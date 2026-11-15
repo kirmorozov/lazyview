@@ -35,6 +35,89 @@ use crate::source::SourceCaps;
 /// flavor-side caller.
 pub use crate::fence::{commit, ordered, probe, table};
 
+/// The MySQL family's GTID visibility wait: `WAIT_FOR_EXECUTED_GTID_SET` for `gtid`, capped at
+/// 5 s by the server itself. `Ok(Some(Some(0)))`: visible; `Ok(Some(Some(_)))`: timed out; the
+/// caller owns the meaning (see [`crate::source::fence`]).
+pub(crate) async fn gtid_wait(conn: &mut Conn, gtid: &str) -> Result<Option<Option<i64>>> {
+    Ok(conn
+        .exec_first(
+            "SELECT WAIT_FOR_EXECUTED_GTID_SET(?, 5)",
+            (gtid.to_string(),),
+        )
+        .await?)
+}
+
+/// What the commit-order fence step concluded (see [`commit_order`]).
+pub(crate) enum CommitStep {
+    /// The fence write landed: every transaction read up to the boundary is visible.
+    Written,
+    /// The commit-order fence is not available here: the caller falls back to its delay.
+    RuledOut,
+}
+
+/// The commit-order fence step: probes the commit order once per connection ([`probe`], the
+/// variable and Aurora's enhanced binlog through [`ordered`]) and then commits one row of our
+/// own ([`commit`]), both through `src/fence.rs` — this file is that file's only caller
+/// (Percona reaches it through here; per issue #57 it must never reach PostgreSQL). The caches
+/// ([`crate::source::FenceState`]) belong to the engine; the WARN texts name the caller's
+/// `fallback` wait. `Err` is a transient connection failure (the caller heals and retries); a
+/// ruled-out fence caches why and answers [`CommitStep::RuledOut`].
+pub(crate) async fn commit_order(
+    conn: &mut Conn,
+    boundary: &crate::source::Position,
+    instance_id: &str,
+    fallback: &str,
+    state: &mut crate::source::FenceState,
+    report: &mut crate::source::FenceReport,
+    beat: &mut dyn FnMut(),
+) -> Result<CommitStep> {
+    if state.committed.as_ref() == Some(boundary) {
+        return Ok(CommitStep::Written);
+    }
+    if state.commit_order.is_none() {
+        // Once per connection.
+        match probe(conn).await {
+            Ok(true) => state.commit_order = Some(true),
+            Ok(false) => {
+                state.commit_order = Some(false);
+                report.fence_warn = Some(format!(
+                    "binlog_order_commits is OFF: lazyview cannot prove a change is visible before reading the sources and {fallback}, which is not exact under load; fix: SET PERSIST binlog_order_commits=ON (Amazon RDS/Aurora: the DB parameter group) or turn on GTIDs"
+                ));
+            }
+            Err(e) => {
+                if crate::source::is_transient(&e) {
+                    return Err(e);
+                }
+                state.commit_order = Some(false);
+                report.fence_warn = Some(format!(
+                    "commit fence unavailable ({e:#}); {fallback}, which is not exact under load"
+                ));
+            }
+        }
+    }
+    if state.commit_order != Some(true) {
+        return Ok(CommitStep::RuledOut);
+    }
+    match commit(conn, instance_id).await {
+        Ok(()) => {
+            state.committed = Some(boundary.clone());
+            beat();
+            Ok(CommitStep::Written)
+        }
+        Err(e) => {
+            if crate::source::is_transient(&e) {
+                return Err(e);
+            }
+            state.commit_order = Some(false);
+            report.fence_warn = Some(format!(
+                "commit fence write to {} failed ({e:#}); {fallback}, which is not exact under load",
+                table()
+            ));
+            Ok(CommitStep::RuledOut)
+        }
+    }
+}
+
 /// The MySQL-family preflight on the already-read value of `binlog_row_value_options` (the
 /// probe is the caller's: it is the network edge). One problem message when the server runs
 /// with PARTIAL_JSON, `None` when it does not. Partial JSON row images carry diffs instead of

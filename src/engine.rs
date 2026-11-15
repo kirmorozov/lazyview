@@ -29,14 +29,12 @@ use crate::catalog::{Catalog, TableInfo, TableRef};
 use crate::config::{Config, MissingBinlog, StartMode};
 use crate::coord;
 use crate::datum::{Datum, Key};
-use crate::fence;
 use crate::lookback::Lookback;
 use crate::meta::{self, StateUpdate, SOURCE_TARGET};
 use crate::metrics::Metrics;
 use crate::mv::{self, BuildTarget, Layout};
 use crate::plan_swap;
-use crate::source::SourceCaps;
-use crate::source::{self, Cursor};
+use crate::source::{self, mysql, Cursor, FenceState, SourceCaps};
 use crate::supervisor::{self, Supervisor};
 use crate::target;
 use mysql_async::binlog::row::BinlogRow;
@@ -930,54 +928,6 @@ async fn server_identity(
     };
     let v: Option<Option<String>> = conn.query_first(sql).await?;
     Ok(v.flatten().unwrap_or_default())
-}
-
-/// The position the source session's consistent snapshot includes: one transaction read at
-/// REPEATABLE READ, committed whatever the status read did. `fail_first`/`try_no` are the
-/// `LAZYVIEW_TEST_FAIL_SNAPSHOT` hook (decision 4): a transient, non-connection failure.
-async fn snapshot_position(
-    conn: &mut Conn,
-    fail_first: Option<usize>,
-    try_no: usize,
-) -> Result<Option<Position>> {
-    if fail_first.is_some_and(|n| try_no <= n) {
-        bail!("injected snapshot fence failure");
-    }
-    // The session reads with READ COMMITTED; the snapshot needs REPEATABLE READ.
-    conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        .await?;
-    conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-        .await?;
-    // The commit must run whatever the status read did: an open snapshot would poison the session.
-    let read = snapshot_status(conn).await;
-    let committed = conn.query_drop("COMMIT").await;
-    let pos = read?;
-    committed.context("committing the snapshot fence transaction")?;
-    Ok(pos)
-}
-
-/// The binlog coordinates the session's consistent-snapshot transaction includes, as the two
-/// `binlog_snapshot_%` status variables report them: `None` when the server reports no position
-/// (an empty file counts as none). The caller owns the transaction: this reads, it does not
-/// open or close one.
-async fn snapshot_status(conn: &mut Conn) -> Result<Option<Position>> {
-    let rows: Vec<(String, String)> = conn
-        .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
-        .await
-        .context("reading the binlog snapshot position")?;
-    let mut file = None;
-    let mut pos = None;
-    for (k, v) in rows {
-        match k.to_ascii_lowercase().as_str() {
-            "binlog_snapshot_file" => file = Some(v),
-            "binlog_snapshot_position" => pos = v.trim().parse::<u64>().ok(),
-            _ => {}
-        }
-    }
-    Ok(match (file, pos) {
-        (Some(file), Some(pos)) if !file.is_empty() => Some(Position { file, pos }),
-        _ => None,
-    })
 }
 
 /// Whether an UPDATE changed any column marked in `cols`. Images that are not full rows
@@ -3391,13 +3341,13 @@ impl Engine {
                 // Our own tables: the commit fence's rows are not a foreign change, and no view
                 // reads them.
                 if !(key.0 == self.schema
-                    && (key.1 == meta::STATUS || key.1 == meta::STATE || key.1 == fence::table()))
+                    && (key.1 == meta::STATUS || key.1 == meta::STATE || key.1 == mysql::table()))
                 {
                     self.txn_foreign = true;
                 }
                 // The definitions table and the commit fence's table are ours: no view reads
                 // them, both are remembered without a route.
-                if key.0 == self.schema && (key.1 == meta::DEFS || key.1 == fence::table()) {
+                if key.0 == self.schema && (key.1 == meta::DEFS || key.1 == mysql::table()) {
                     self.table_ids.insert(table_id, (key, None));
                     return Ok(());
                 }
@@ -3430,7 +3380,7 @@ impl Engine {
                     return Ok(());
                 }
                 let own =
-                    key.0 == self.schema && (key.1 == meta::STATUS || key.1 == fence::table());
+                    key.0 == self.schema && (key.1 == meta::STATUS || key.1 == mysql::table());
                 let keep_unrouted = !own
                     && self
                         .xa_current
@@ -4357,34 +4307,30 @@ impl Engine {
             || self.commit_fence == Some(true)
     }
 
-    /// `false`: the last transaction read is not visible yet (the GTID or snapshot wait timed
-    /// out), so nothing may be read from the sources now.
+    /// `false`: the last transaction read is not visible yet (a wait timed out), so nothing
+    /// may be read from the sources now.
     ///
-    /// MySQL / Percona with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET`. MariaDB and Percona Server
-    /// commit in binlog order and report the binlog position a consistent snapshot includes
-    /// (`Binlog_snapshot_file` / `_position`): once it reaches the position read, every
-    /// transaction read is visible. Oracle MySQL without GTIDs: a commit of our own
-    /// (`commit_fence`) when the server commits in binlog order. Otherwise:
-    /// `LAZYVIEW_VISIBILITY_DELAY_MS`.
+    /// The mechanisms are the flavor's (`mysql::gtid_wait`, `maria::snapshot_position`,
+    /// `mysql::commit_order`); the engine keeps only the caches (`snapshot_fence`,
+    /// `commit_fence`, `commit_fenced`), the retry policy (`retry_src`) and the
+    /// `LAZYVIEW_VISIBILITY_DELAY_MS` fallback.
     async fn fence(&mut self) -> bool {
+        // MySQL / Percona with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET` (see `mysql::gtid_wait`).
         if self.flavor.is_mysql_family() {
             if let Some(g) = self.last_gtid.clone() {
-                let r: Result<Option<Option<i64>>, _> = self
-                    .src
-                    .exec_first("SELECT WAIT_FOR_EXECUTED_GTID_SET(?, 5)", (g.clone(),))
-                    .await;
+                let r = mysql::gtid_wait(&mut self.src, &g).await;
                 self.metrics.beat();
                 match r {
                     // 0: executed; 1: timed out.
                     Ok(Some(Some(0))) => return true,
                     Ok(Some(Some(_))) => {
-                        warn!(gtid = %g, "transaction not visible after 5 s (WAIT_FOR_EXECUTED_GTID_SET timed out); retrying");
+                        warn!("transaction not visible after 5 s (WAIT_FOR_EXECUTED_GTID_SET timed out); retrying");
                         return false;
                     }
                     Ok(_) => debug!("gtid fence returned NULL"),
                     Err(e) => {
                         debug!("gtid fence unavailable: {e}");
-                        if binlog::is_transient(&anyhow!(e)) {
+                        if binlog::is_transient(&e) {
                             self.heal_src().await;
                             return false;
                         }
@@ -4392,6 +4338,9 @@ impl Engine {
                 }
             }
         }
+        // The consistent-snapshot wait (`maria::snapshot_position` behind `visible_upto`):
+        // MariaDB's and Percona Server's fence, tried on every flavor because the server rules
+        // itself out by reporting no position (e.g. MySQL Community).
         if self.snapshot_fence != Some(false) && self.boundary.is_some() {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut pause = Duration::from_millis(1);
@@ -4403,7 +4352,7 @@ impl Engine {
                             return true;
                         }
                         if Instant::now() >= deadline {
-                            warn!(visible = %p, read = %self.boundary, "transaction not visible after 5 s (consistent snapshot behind the binlog position read); retrying");
+                            warn!("transaction not visible after 5 s (consistent snapshot behind the binlog position read); retrying");
                             return false;
                         }
                         self.metrics.beat();
@@ -4426,9 +4375,48 @@ impl Engine {
                 }
             }
         }
+        // The commit-order fence (`mysql::commit_order`, through `src/fence.rs` which only that
+        // file calls): one row of our own, committed after every transaction read. The engine
+        // keeps only the caches and the `LAZYVIEW_VISIBILITY_DELAY_MS` fallback.
         if self.snapshot_fence == Some(false) && self.boundary.is_some() {
-            if let Some(visible) = self.commit_fence().await {
-                return visible;
+            let mut state = FenceState {
+                snapshot: self.snapshot_fence,
+                commit_order: self.commit_fence,
+                committed: self.commit_fenced.clone(),
+            };
+            let fallback = self.fallback_wait();
+            let mut report = crate::source::FenceReport::default();
+            match mysql::commit_order(
+                &mut self.src,
+                &self.boundary.to_position(),
+                &self.cfg.instance_id,
+                &fallback,
+                &mut state,
+                &mut report,
+                &mut || self.metrics.beat(),
+            )
+            .await
+            {
+                Ok(mysql::CommitStep::Written) => {
+                    self.keep_fence_state(state);
+                    if let Some(w) = report.fence_warn {
+                        self.warn_fence(w);
+                    }
+                    return true;
+                }
+                Ok(mysql::CommitStep::RuledOut) => {
+                    self.keep_fence_state(state);
+                    if let Some(w) = report.fence_warn {
+                        self.warn_fence(w);
+                    }
+                }
+                Err(e) => {
+                    self.keep_fence_state(state);
+                    if binlog::is_transient(&e) {
+                        self.heal_src().await;
+                    }
+                    return false;
+                }
             }
         }
         if !self.cfg.visibility_delay.is_zero() {
@@ -4437,55 +4425,30 @@ impl Engine {
         true
     }
 
-    /// The commit fence: one row change of our own, committed after every transaction read
-    /// (the server commits in binlog order, see `fence::ordered`). `Some(visible)` is the answer
-    /// of `fence`; `None`: not available here, so the caller waits `LAZYVIEW_VISIBILITY_DELAY_MS`.
-    async fn commit_fence(&mut self) -> Option<bool> {
-        if self.commit_fenced.as_ref() == Some(&self.boundary.to_position()) {
-            return Some(true);
-        }
-        if self.commit_fence.is_none() {
-            // Once per connection.
-            match fence::probe(&mut self.src).await {
-                Ok(true) => self.commit_fence = Some(true),
-                Ok(false) => {
-                    self.commit_fence = Some(false);
-                    let wait = self.fallback_wait();
-                    self.warn_fence(format!("binlog_order_commits is OFF: lazyview cannot prove a change is visible before reading the sources and {wait}, which is not exact under load; fix: SET PERSIST binlog_order_commits=ON (Amazon RDS/Aurora: the DB parameter group) or turn on GTIDs"));
-                }
-                Err(e) => {
-                    if binlog::is_transient(&e) {
-                        self.heal_src().await;
-                        return Some(false);
-                    }
-                    self.commit_fence = Some(false);
-                    let wait = self.fallback_wait();
-                    self.warn_fence(format!(
-                        "commit fence unavailable ({e:#}); {wait}, which is not exact under load"
-                    ));
-                }
-            }
-        }
-        if self.commit_fence != Some(true) {
-            return None;
-        }
-        match fence::commit(&mut self.src, &self.cfg.instance_id).await {
-            Ok(()) => {
-                self.commit_fenced = Some(self.boundary.to_position());
-                self.metrics.beat();
-                Some(true)
-            }
-            Err(e) => {
-                if binlog::is_transient(&e) {
-                    self.heal_src().await;
-                    return Some(false);
-                }
-                self.commit_fence = Some(false);
-                let wait = self.fallback_wait();
-                self.warn_fence(format!("commit fence write to {} failed ({e:#}); {wait}, which is not exact under load", fence::table()));
-                None
-            }
-        }
+    /// The binlog position up to which every transaction is visible, from a consistent
+    /// snapshot (`None`: the server does not report one, e.g. MySQL Community).
+    async fn visible_upto(&mut self) -> Result<Option<Position>> {
+        // A transient failure here used to end the flush's exact fence: repeat the whole read
+        // (the boundary shape of `retry_src`), and let the caller fall back to the visibility
+        // delay only once the tries are spent.
+        let fail = self.cfg.test_fail_snapshot;
+        retry_src(
+            &self.metrics,
+            "reading the binlog snapshot position",
+            &mut self.src,
+            &self.query_opts,
+            self.cfg.lock_wait_s,
+            |try_no, src| Box::pin(crate::source::maria::snapshot_position(src, fail, try_no)),
+        )
+        .await
+    }
+
+    /// Writes the commit-order caches back after one wait: the engine owns
+    /// them, the source only reads and updates them for one wait.
+    fn keep_fence_state(&mut self, state: FenceState) {
+        self.snapshot_fence = state.snapshot;
+        self.commit_fence = state.commit_order;
+        self.commit_fenced = state.committed;
     }
 
     /// The fallback wait as the WARN names it: the configured `LAZYVIEW_VISIBILITY_DELAY_MS`.
@@ -4501,24 +4464,6 @@ impl Engine {
         if !std::mem::replace(&mut self.fence_warned, true) {
             warn!("{what}");
         }
-    }
-
-    /// The binlog position up to which every transaction is visible, from a consistent snapshot
-    /// (`None`: the server does not report one, e.g. MySQL Community).
-    async fn visible_upto(&mut self) -> Result<Option<Position>> {
-        // A transient failure here used to end the flush's exact fence: repeat the whole read
-        // (the boundary shape of `retry_src`), and let the caller fall back to the visibility
-        // delay only once the tries are spent.
-        let fail = self.cfg.test_fail_snapshot;
-        retry_src(
-            &self.metrics,
-            "reading the binlog snapshot position",
-            &mut self.src,
-            &self.query_opts,
-            self.cfg.lock_wait_s,
-            |try_no, src| Box::pin(snapshot_position(src, fail, try_no)),
-        )
-        .await
     }
 
     async fn replan_slot(&mut self, i: usize, freeze: bool) {
@@ -6457,7 +6402,7 @@ async fn prepare_target(
 /// read includes (issue #167): the seed queries and the position read are ONE transaction, so the
 /// parent changes that read never saw are exactly the ones from before that position, and a change
 /// committed while the seed was reading replays from its own images instead of counting as a gap.
-/// `None` is the server reporting no snapshot position (`snapshot_position`), where the caller
+/// `None` is the server reporting no snapshot position (`source::maria::snapshot_position`), where the caller
 /// keeps the wider window of the position read after the seed.
 async fn seed_cache_at_snapshot(
     conn: &mut Conn,
@@ -6477,7 +6422,7 @@ async fn seed_cache_at_snapshot(
             return Err(e);
         }
     };
-    let pos = match snapshot_status(conn).await {
+    let pos = match crate::source::maria::snapshot_status(conn).await {
         Ok(pos) => pos,
         Err(e) => {
             let _ = conn.query_drop("COMMIT").await;

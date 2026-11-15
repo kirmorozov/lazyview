@@ -204,6 +204,57 @@ pub(crate) fn position_rule(header: BinlogEventHeader) -> Step {
 /// The MariaDB table metadata: the shared `information_schema` reads, with
 /// [`unescape_generation_expression`] as the generated-expression spelling and
 /// [`default_collation`] as the collation probe.
+/// The position the source session's consistent snapshot includes: one transaction read at
+/// REPEATABLE READ, committed whatever the status read did. `fail_first`/`try_no` are the
+/// engine's snapshot-failure test hook (decision 4): a transient, non-connection failure.
+/// MariaDB's and Percona Server's fence ([`crate::source::fence`]); `Ok(None)`: the server
+/// reports no position, so it rules itself out (e.g. MySQL Community).
+pub(crate) async fn snapshot_position(
+    conn: &mut Conn,
+    fail_first: Option<usize>,
+    try_no: usize,
+) -> Result<Option<Position>> {
+    if fail_first.is_some_and(|n| try_no <= n) {
+        bail!("injected snapshot fence failure");
+    }
+    // The session reads with READ COMMITTED; the snapshot needs REPEATABLE READ.
+    conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        .await?;
+    // The commit must run whatever the status read did: an open snapshot would poison the session.
+    let read = snapshot_status(conn).await;
+    let committed = conn.query_drop("COMMIT").await;
+    let pos = read?;
+    committed.context("committing the snapshot fence transaction")?;
+    Ok(pos)
+}
+
+/// The binlog coordinates the session's consistent-snapshot transaction includes, as the two
+/// `binlog_snapshot_%` status variables report them: `None` when the server reports no position
+/// (an empty file counts as none). The caller owns the transaction: this reads, it does not
+/// open or close one. (Also the position read of the engine's cascade seed, which owns its own
+/// transaction.)
+pub(crate) async fn snapshot_status(conn: &mut Conn) -> Result<Option<Position>> {
+    let rows: Vec<(String, String)> = conn
+        .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
+        .await
+        .context("reading the binlog snapshot position")?;
+    let mut file = None;
+    let mut pos = None;
+    for (k, v) in rows {
+        match k.to_ascii_lowercase().as_str() {
+            "binlog_snapshot_file" => file = Some(v),
+            "binlog_snapshot_position" => pos = v.trim().parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    Ok(match (file, pos) {
+        (Some(file), Some(pos)) if !file.is_empty() => Some(Position { file, pos }),
+        _ => None,
+    })
+}
+
 pub(crate) async fn load_table(
     conn: &mut Conn,
     schema: &str,

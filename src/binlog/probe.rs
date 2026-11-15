@@ -109,35 +109,6 @@ pub async fn binlog_exists(conn: &mut Conn, file: &str) -> Result<bool> {
 
 const ER_PARSE_ERROR: u16 = 1064;
 
-/// Transient: this connection, or the server, is going away — repeat an idempotent call.
-/// Classification is by server error code and `io::ErrorKind` only. The one documented exception
-/// is the TLS pre-handshake case, which has no code and stays in `engine::is_tls_error`.
-pub fn is_transient(e: &anyhow::Error) -> bool {
-    const TRANSIENT_CODES: [u16; 14] = [
-        1040, 1053, 1203, 1205, 1213, 1290, 1317, 1927, 1969, 2006, 2013, 3024, 3169, 4031,
-    ];
-    fn transient_io(io: &std::io::Error) -> bool {
-        matches!(
-            io.kind(),
-            std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::UnexpectedEof
-        )
-    }
-    server_errors(e).any(|se| TRANSIENT_CODES.contains(&se.code))
-        || e.chain().any(|c| {
-            (match c.downcast_ref::<mysql_async::Error>() {
-                Some(mysql_async::Error::Io(mysql_async::IoError::Io(io))) => transient_io(io),
-                Some(mysql_async::Error::Driver(mysql_async::DriverError::ConnectionClosed)) => {
-                    true
-                }
-                _ => false,
-            }) || c.downcast_ref::<std::io::Error>().is_some_and(transient_io)
-        })
-}
-
 /// Adds a "how to fix" line to privilege errors of replication statements.
 pub(super) fn with_hint(err: anyhow::Error) -> anyhow::Error {
     let Some(se) = server_errors(&err).find(|se| ACCESS_DENIED_CODES.contains(&se.code)) else {

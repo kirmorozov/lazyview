@@ -294,6 +294,73 @@ pub(crate) fn position_rule(flavor: Flavor, header: BinlogEventHeader) -> Step {
     }
 }
 
+/// The verdict of a visibility-fence wait (the engine's `fence`, per flavor). Binlog events ship before the
+/// committing transaction ends, so the engine must not read the sources until the transactions
+/// it read from the binlog are visible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FenceVerdict {
+    /// Every transaction read up to the boundary is visible: read the sources now.
+    Exact,
+    /// The wait timed out: the last transaction is not visible yet, read the binlog again.
+    NotYet,
+    /// No fence is available on this server: the caller waits its fallback delay, which is
+    /// not exact under load.
+    #[default]
+    Unknown,
+}
+
+/// The caches the commit-order seam reads and updates. The engine owns them (they lived there before the
+/// source seam); the source only asks the server what a cache has not settled yet.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FenceState {
+    /// `Some(true)`: the server reports the binlog position of a consistent snapshot;
+    /// `Some(false)`: it does not (the wait is skipped); `None`: not tried on this connection.
+    pub(crate) snapshot: Option<bool>,
+    /// `Some(true)`: the server commits in binlog order and the fence table exists;
+    /// `Some(false)`: the commit-order fence is ruled out; `None`: not probed on this connection.
+    pub(crate) commit_order: Option<bool>,
+    /// The boundary the last successful commit-order fence write covered: no new event since,
+    /// no new write.
+    pub(crate) committed: Option<Position>,
+}
+
+/// What the commit-order seam ([`mysql::commit_order`]) reports for the engine to log (the
+/// copy set does not log) once per process.
+#[derive(Debug, Default)]
+pub(crate) struct FenceReport {
+    /// A WARN to log once per process (the fence ruled out; the engine's `warn_fence`).
+    pub(crate) fence_warn: Option<String>,
+}
+
+/// Transient: this connection, or the server, is going away — repeat an idempotent call.
+/// Classification is by server error code and `io::ErrorKind` only. The one documented exception
+/// is the TLS pre-handshake case, which has no code and stays in `engine::is_tls_error`.
+pub fn is_transient(e: &anyhow::Error) -> bool {
+    const TRANSIENT_CODES: [u16; 14] = [
+        1040, 1053, 1203, 1205, 1213, 1290, 1317, 1927, 1969, 2006, 2013, 3024, 3169, 4031,
+    ];
+    fn transient_io(io: &std::io::Error) -> bool {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    }
+    server_errors(e).any(|se| TRANSIENT_CODES.contains(&se.code))
+        || e.chain().any(|c| {
+            (match c.downcast_ref::<mysql_async::Error>() {
+                Some(mysql_async::Error::Io(mysql_async::IoError::Io(io))) => transient_io(io),
+                Some(mysql_async::Error::Driver(mysql_async::DriverError::ConnectionClosed)) => {
+                    true
+                }
+                _ => false,
+            }) || c.downcast_ref::<std::io::Error>().is_some_and(transient_io)
+        })
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     pub flavor: Flavor,

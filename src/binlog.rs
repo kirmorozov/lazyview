@@ -60,13 +60,11 @@ mod stream;
 // reachable from `crate::binlog` for one release, so an embedder that names them here keeps
 // compiling; new code names them in `crate::source`.
 pub use self::connect::{replica_opts, server_info, set_product};
-pub use self::probe::{
-    binlog_exists, binlog_filters, current_position, is_transient, schema_filtered,
-};
+pub use self::probe::{binlog_exists, binlog_filters, current_position, schema_filtered};
 pub use self::stream::BinlogReader;
 pub use crate::source::{
-    is_access_denied, is_duplicate_server_id, is_missing_binlog, Flavor, Item, MissingBinlog,
-    Position, RowsKind, ServerInfo,
+    is_access_denied, is_duplicate_server_id, is_missing_binlog, is_transient, Flavor, Item,
+    MissingBinlog, Position, RowsKind, ServerInfo,
 };
 // Shared with [`crate::source::maria`] while the F-series settles the seam: the probe retry
 // loop (MariaDB's preflight probes run through it) and the XA xid formatter (MariaDB's GTID

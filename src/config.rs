@@ -128,7 +128,7 @@ pub struct Config {
     /// start fail (see `engine::server_identity`), the stand-in for a connection blip there.
     pub test_fail_identity: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_FAIL_SNAPSHOT=<n>`: the first `n` consistent-snapshot position
-    /// reads of a fence fail (see `engine::snapshot_position`), the stand-in for a transient
+    /// reads of a fence fail (see `source::maria::snapshot_position`), the stand-in for a transient
     /// source error there (not a connection-class one).
     pub test_fail_snapshot: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_BINLOG_DSN=<dsn>`: the DSN of the binlog dump connection
