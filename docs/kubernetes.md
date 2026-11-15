@@ -50,12 +50,59 @@ kubectl -n lazyview logs -l app.kubernetes.io/name=lazyview --prefix | grep -E '
 * With `components/network-policy`, set the namespace your Prometheus runs in (the example overlay
   shows the patch), or scraping stops.
 * The Secret may hold `LAZYVIEW_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `_DATABASE` or `LAZYVIEW_DSN`
-  (values used verbatim), plus `LAZYVIEW_TLS` and target settings.
+  (values used verbatim), plus `LAZYVIEW_TLS` and target settings. A password can also come from a
+  file the pod mounts, so it never appears in the environment of a `kubectl describe pod`:
+  `LAZYVIEW_PASSWORD_FILE=/run/secrets/lazyview_password`, `LAZYVIEW_DSN` with a percent-encoded
+  `file:///run/secrets/…` password, or (in a build with the `aws-secrets` feature) an
+  `aws-secret://…` reference. All of them: [Secrets](configuration.md#secrets).
+* `LAZYVIEW_HEALTH_TOKEN` gates `/metrics` and `/stats` behind `Authorization: Bearer <token>`.
+  Set it whenever the endpoint is reachable beyond the pod: the metrics name your views, tables and
+  error counts. The three probes ignore it, so kubelet keeps working, and so does
+  `lazyview healthcheck`.
 * The Secret is read when the container starts. Run
   `kubectl -n lazyview rollout restart deployment/lazyview` after you change it.
 * Non-secret settings go into `base/config.env`, or are merged in the overlay with a
   `configMapGenerator` (`behavior: merge`). The ConfigMap name carries a content hash, so a change
   rolls the Deployment. All variables: [configuration](configuration.md).
+
+Mount the Secret as files instead of variables and point the two `_FILE` variables at them. Values
+that are not read by `envFrom` never enter the container's environment:
+
+```yaml
+# overlays/prod/patch-files.yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: lazyview
+          volumeMounts:
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+          env:
+            - name: LAZYVIEW_PASSWORD_FILE
+              value: /run/secrets/lazyview_password
+            - name: LAZYVIEW_HEALTH_TOKEN_FILE
+              value: /run/secrets/lazyview_health_token
+      volumes:
+        - name: secrets
+          projected:
+            sources:
+              - secret:
+                  name: lazyview-files
+                  defaultMode: 0400
+```
+
+```sh
+kubectl -n lazyview create secret generic lazyview-files \
+  --from-file=lazyview_password=./password.txt \
+  --from-file=lazyview_health_token=$(openssl rand -hex 24)
+```
+
+The pod runs as uid 65532, so `defaultMode: 0400` leaves the files readable by lazyview alone. Both
+files are read at container start: after
+`kubectl -n lazyview create secret … --dry-run=client -o yaml | kubectl apply -f -`, run
+`kubectl -n lazyview rollout restart deployment/lazyview`.
 
 ## Probes
 
@@ -92,6 +139,10 @@ kubectl -n lazyview logs -l app.kubernetes.io/name=lazyview --prefix | grep -E '
   `kubectl -n lazyview exec deploy/lazyview -- /lazyview healthcheck`.
   To look at the endpoints, run `kubectl -n lazyview port-forward deploy/lazyview 8080`, then
   `curl 'localhost:8080/readyz?verbose'`.
+* With `LAZYVIEW_HEALTH_TOKEN` set, the probes still answer without a header: kubelet cannot sign a
+  request, and a probe that needs a secret is a probe that fails closed. Only `/metrics` and
+  `/stats` require `Authorization: Bearer <token>`; a missing or wrong one is `401` with
+  `WWW-Authenticate: Bearer realm="lazyview"`.
 
 ## Rollouts, drains and standby
 
@@ -142,8 +193,40 @@ kubectl -n lazyview logs -l app.kubernetes.io/name=lazyview --prefix | grep -E '
 * Security: UID/GID 65532, read-only root filesystem, all capabilities dropped,
   `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`, no service account token. This
   meets the `restricted` Pod Security Standard.
-* An unspecified `LAZYVIEW_HEALTH_ADDR` (`0.0.0.0:8080`, the default, or `[::]:8080`) listens on
-  IPv4 and IPv6, so probes work in IPv6-only and dual-stack clusters.
+* The base pins `LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080` in `base/config.env` (the binary default is
+  loopback), and an unspecified address (`0.0.0.0` or `[::]:8080`) listens on IPv4 and IPv6, so
+  probes work in IPv6-only and dual-stack clusters.
+
+## AWS Secrets Manager (opt-in)
+
+`LAZYVIEW_PASSWORD=aws-secret://prod/lazyview#password` reads the password from Secrets Manager
+with the default credential chain, so it is in neither the Secret nor the ConfigMap nor the
+environment. Two things are needed, both deliberate:
+
+* an image built with the cargo feature: `cargo build --release --features aws-secrets` (the
+  published image does not have it, and without it the reference fails at startup instead of being
+  used as a password);
+* a pod identity: EKS Pod Identity (the agent, no token mount) or IRSA. IRSA needs the service
+  account token projected, which the base turns off because lazyview never calls the Kubernetes
+  API, so opt in in your overlay:
+
+  ```yaml
+  # overlays/prod/patch-irsa.yaml
+  spec:
+    template:
+      metadata:
+        annotations:
+          eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/lazyview-secrets
+      spec:
+        automountServiceAccountToken: true
+  ```
+
+  The role needs `secretsmanager:GetSecretValue` on that one secret ARN and nothing else.
+
+The secret is fetched at startup, once per password reference; a rotation therefore needs
+`kubectl -n lazyview rollout restart deployment/lazyview`. No lazyview variable selects AWS
+credentials, so no `AWS_*` variable in the ConfigMap can point the pod at someone else's account
+beyond what the node identity already allows.
 
 ## Metrics
 
@@ -181,3 +264,30 @@ Validate changed manifests offline:
 ```sh
 kustomize build deploy/k8s/overlays/example | kubeconform -strict -summary
 ```
+
+A gated `/metrics` needs the token in the ServiceMonitor; the base manifest has no `authorization:`
+block, so add one in your overlay (or in `components/prometheus/servicemonitor.yaml`):
+
+```yaml
+spec:
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      authorization:
+        type: Bearer
+        credentials:
+          name: lazyview-scrape-token
+          key: token
+```
+
+```sh
+kubectl -n <prometheus-namespace> create secret generic lazyview-scrape-token \
+  --from-literal=token="$(kubectl -n lazyview get secret lazyview-files \
+     -o jsonpath='{.data.lazyview_health_token}' | base64 -d)"
+```
+
+The NetworkPolicy in `components/network-policy` already allows the Prometheus namespace to reach
+8080; the token changes nothing about it. Keep `/metrics` gated even though the policy limits who
+can connect: a policy is a network fact, a token is an identity.

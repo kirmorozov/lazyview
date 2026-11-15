@@ -27,20 +27,69 @@ default target for views. Set either the separate variables or a DSN.
 | `LAZYVIEW_HOST` | — | source host name or IP address (IPv6 without brackets is fine) |
 | `LAZYVIEW_PORT` | `3306` | source port |
 | `LAZYVIEW_USER` | `root` | user name |
-| `LAZYVIEW_PASSWORD` | none | password |
+| `LAZYVIEW_PASSWORD` | none | password; may hold a [reference](#secrets) instead of the value |
+| `LAZYVIEW_PASSWORD_FILE` | — | read the password from that file instead of the environment: the file's content, one trailing newline trimmed (see [Secrets](#secrets)) |
 | `LAZYVIEW_DATABASE` | required with `LAZYVIEW_HOST` | the schema lazyview works in: it holds `_lazyview`, the other metadata tables and the views |
 | `LAZYVIEW_DSN` | — | alternative to the five above: `mysql://user:pass@host:3306/app` (`mariadb://` is accepted too). Takes precedence when set |
 | `LAZYVIEW_TLS` | `disabled` | `disabled`, `required`, `verify-ca`, `verify-full` (see [TLS](#tls)) |
 | `LAZYVIEW_TLS_CA` | — | PEM file with the CA certificates to trust; implies `verify-full` when `LAZYVIEW_TLS` is not set |
 
 * The separate variables are used verbatim. Special characters in the password need no escaping.
-  In `LAZYVIEW_DSN`, URL-encode them (`p@ss` becomes `p%40ss`).
+  In `LAZYVIEW_DSN`, URL-encode them (`p@ss` becomes `p%40ss`). One exception: a password written as
+  `file://…` or `aws-secret://…` is a [reference](#secrets), not a value; a password that really
+  starts that way is written `plain://p@ss`.
 * Empty values count as unset.
 * With neither `LAZYVIEW_HOST` nor `LAZYVIEW_DSN` set, lazyview exits with code `2` and
   `no database configured`.
 * The DSN may carry extra driver parameters after `?`. For example, `?prefer_socket=false` keeps
   a connection to `localhost` / `127.0.0.1` on TCP. By default the driver switches such
   connections to the server's unix socket.
+
+## Secrets
+
+A password never has to be an environment value. Each password input accepts two variables, and the
+password field of a DSN accepts a reference too:
+
+| variable | meaning |
+|---|---|
+| `LAZYVIEW_PASSWORD` | the value itself, or a reference below |
+| `LAZYVIEW_PASSWORD_FILE` | a file to read: its content is the value, or a reference below |
+| `LAZYVIEW_DSN` password field | the same references, percent-encoded like any other DSN character |
+
+Targets use the same pair with their own prefix (`LAZYVIEW_TARGET_<NAME>_PASSWORD[_FILE]`), and so
+does the health token (`LAZYVIEW_HEALTH_TOKEN[_FILE]`, see [Health and logging](#health-and-logging)).
+
+| reference | resolved to |
+|---|---|
+| `file:///run/secrets/lazyview_password` | the contents of that file, one trailing newline trimmed |
+| `aws-secret://prod/lazyview` | AWS Secrets Manager `GetSecretValue`, the whole secret string |
+| `aws-secret://prod/lazyview#password` | the `password` field of that JSON secret |
+| `plain://file:///etc/pw` | the literal text after `plain://`: the escape hatch for a password that starts with a scheme |
+
+* A file (or a `_FILE` variable) may itself hold a reference, so an indirection layer stays out of
+  the environment. Up to eight levels; more is refused as a configuration error.
+* Absolute paths only, the file must be a regular file, and at most 1 MiB.
+* Setting both `LAZYVIEW_PASSWORD` and `LAZYVIEW_PASSWORD_FILE` is an error, not a precedence rule:
+  one place to look, one place to fix.
+* An unknown scheme (`vault://…`) is an error that lists the known ones. `aws-secret://` in a build
+  without the cargo feature `aws-secrets` is an error naming the feature. In either case nothing is
+  tried and the text is never used as a password.
+* A resolved value is held in a buffer that is zeroized when it is last used, and it is never
+  logged: an error names the variable and the secret id, never the value. `Debug` of the resolved
+  type prints `Secret(***)`. (The environment's own copy of an unread reference, and the copy inside
+  a DSN, are not ours to clear.)
+* `aws-secret://` uses the default AWS credential chain: the environment, an EKS pod identity, an
+  instance profile. No lazyview variable selects credentials, so none can be pointed at the wrong
+  account. Build with `cargo build --features aws-secrets`; the published image does not include it.
+* A secret file is read at startup, so a rotation needs a restart (`kill -HUP` is not watched):
+  `kubectl rollout restart`, `docker restart`, `systemctl restart`.
+
+```sh
+# Kubernetes mounts a Secret as files; nothing else has to change
+LAZYVIEW_PASSWORD_FILE=/run/secrets/lazyview_password
+# Docker: -v ./secrets:/run/secrets:ro with a 0400 file owned by uid 65532
+LAZYVIEW_PASSWORD=file:///run/secrets/lazyview_password   # a _FILE variable also takes the bare path
+```
 
 ## Targets
 
@@ -138,7 +187,9 @@ the source plus 1 + `LAZYVIEW_MAX_TARGET_CONCURRENCY` on each other target, besi
 
 | variable | default | meaning |
 |---|---|---|
-| `LAZYVIEW_HEALTH_ADDR` | `0.0.0.0:8080` | listen address of the health and metrics endpoint (also `/stats`, see [operations.md](operations.md#per-view-update-statistics)). `off` (or empty) disables it. An unspecified address (`0.0.0.0` or `[::]`) listens on IPv4 and IPv6 |
+| `LAZYVIEW_HEALTH_ADDR` | `127.0.0.1:8080` | listen address of the health and metrics endpoint (also `/stats`, see [operations.md](operations.md#per-view-update-statistics)). `off` (or empty) disables it. Loopback by default, so a container or a pod that must be scraped from outside sets `0.0.0.0:8080` explicitly. An unspecified address (`0.0.0.0` or `[::]`) listens on IPv4 and IPv6 |
+| `LAZYVIEW_HEALTH_TOKEN` | — | with it set, `/metrics` and `/stats` answer only to `Authorization: Bearer <token>`; `/livez`, `/healthz`, `/startupz`, `/readyz` and `/` stay open |
+| `LAZYVIEW_HEALTH_TOKEN_FILE` | — | read the token from that file instead (see [Secrets](#secrets)) |
 | `LAZYVIEW_LIVENESS_STALL_SECS` | `120` | `/livez` fails after this many seconds without engine progress. At least `30`, and at least 2 × the heartbeat in seconds + 10 (an idle source only wakes the engine with binlog heartbeats). With a warning, a value below 30 falls back to the default and a value below the heartbeat minimum is raised to it. The default also rises to that minimum when `LAZYVIEW_HEARTBEAT_MS` is above 55000 |
 | `LAZYVIEW_LIVENESS_BOOT_STALL_SECS` | `900` | `/livez` limit while the engine boots (before the first binlog connect, also after a standby takes over); never lower than `LAZYVIEW_LIVENESS_STALL_SECS` |
 | `LAZYVIEW_READY_DISCONNECT_GRACE_SECS` | `30` | `/readyz` tolerates a disconnected binlog stream this long |
@@ -148,6 +199,15 @@ the source plus 1 + `LAZYVIEW_MAX_TARGET_CONCURRENCY` on each other target, besi
 | `NO_COLOR` | — | set to anything to disable colored output (colors are only used on a terminal anyway) |
 
 The endpoints are described in [operations](operations.md#health-endpoints).
+
+* The token is compared without an early exit on the first differing byte, so a scraper cannot learn
+  it one character at a time. A refusal is `401` with `WWW-Authenticate: Bearer realm="lazyview"`,
+  and its body does not repeat the token. Set it when `/metrics` is reachable from outside the host:
+  the metrics name your views, tables and error counts.
+
+Before 0.1.0 the default was `0.0.0.0:8080`. An endpoint that describes the workload should not be
+published by default, so it now binds loopback. Anything that scraped it from outside the container
+or the pod must set `LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080` (the manifests in `deploy/k8s` already do).
 
 ## TLS
 
@@ -178,6 +238,18 @@ for every target.
   `caching_sha2_password_auto_generate_rsa_keys=ON`, the server default.
 * MariaDB 10.11 offers no TLS unless certificates are configured on the server
   (`have_ssl=DISABLED`).
+* A connection whose TLS is off and whose server is not on this host logs one `WARN` at startup, per
+  endpoint, naming the variable that turns TLS on:
+
+  ```
+  WARN source: db.example.com connects without TLS; set LAZYVIEW_TLS=required (or verify-full) to keep credentials and data off the wire
+  ```
+
+  (A target's line starts `target analytics: …` and names `LAZYVIEW_TARGET_ANALYTICS_TLS`.)
+  Loopback and unix-socket endpoints are silent (nothing crosses the wire), and one line per endpoint
+  per start, never per reconnect: an internal network is a legitimate choice, so this informs and
+  changes nothing else. `LAZYVIEW_TEST_*` role DSNs are not warned about; they point at the same
+  server as the source.
 
 ### Managed databases (RDS, Aurora, Azure, Cloud SQL)
 

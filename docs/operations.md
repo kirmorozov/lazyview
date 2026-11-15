@@ -15,7 +15,23 @@ docker run -d --name lazyview --restart unless-stopped \
   Docker takes the values literally: no quotes, no `$` expansion.
 * The image runs as `65532:65532` and writes no files, so `--read-only`, `--cap-drop ALL` and
   `--security-opt no-new-privileges` work.
-* `-p 8080:8080` publishes `/metrics`, `/stats`, `/livez`, `/readyz` and `/startupz` outside the container.
+* The endpoint binds `127.0.0.1:8080` inside the container, which is not the host: `-p 8080:8080`
+  publishes `/metrics`, `/stats`, `/livez`, `/readyz` and `/startupz` only together with
+  `LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080` in `lazyview.env`. Before 0.1.0 the default was
+  `0.0.0.0:8080`, so an upgrade that scraped `/metrics` from the host has to add that line once.
+  The image's own `HEALTHCHECK` and `docker exec lazyview /lazyview healthcheck` need nothing: they
+  run inside the container.
+* A password can stay out of the environment: `LAZYVIEW_PASSWORD_FILE` names a file the container
+  reads at startup. With `-v ./secrets:/run/secrets:ro`:
+
+  ```sh
+  echo 'change-me' > secrets/lazyview_password    # 0400, readable by uid 65532
+  echo 'LAZYVIEW_PASSWORD_FILE=/run/secrets/lazyview_password' >> lazyview.env
+  ```
+
+  `LAZYVIEW_PASSWORD=file:///run/secrets/lazyview_password` does the same; a variable that holds a
+  `file://`, `aws-secret://` or `plain://` prefix is a reference, everything else is the value
+  ([Secrets](configuration.md#secrets)).
 * For a database on the Docker host itself, add `--add-host=host.docker.internal:host-gateway`
   and set `LAZYVIEW_HOST=host.docker.internal`.
 * The image has no shell, so there is nothing to `docker exec` into. Use
@@ -81,16 +97,23 @@ also run the container with `--no-healthcheck`.
 
 ## Health endpoints
 
-Served on `LAZYVIEW_HEALTH_ADDR` (default `0.0.0.0:8080`). A failed bind is retried every 5 s and
-never stops the engine.
+Served on `LAZYVIEW_HEALTH_ADDR` (default `127.0.0.1:8080`; `off` disables it). A container or a pod
+that has to be scraped from outside sets `0.0.0.0:8080` explicitly. A failed bind is retried every
+5 s and never stops the engine.
+
+With `LAZYVIEW_HEALTH_TOKEN` (or `LAZYVIEW_HEALTH_TOKEN_FILE`, see
+[Secrets](configuration.md#secrets)) set, `/metrics` and `/stats` answer only to
+`Authorization: Bearer <token>`; a request without it gets `401` with
+`WWW-Authenticate: Bearer realm="lazyview"`. The probes do not look at the token, so kubelet,
+Docker's `HEALTHCHECK` and `lazyview healthcheck` keep working unchanged.
 
 | endpoint | `200` when | `503` when | never fails because of |
 |---|---|---|---|
 | `/livez` (alias `/healthz`) | the engine loop made progress within `LAZYVIEW_LIVENESS_STALL_SECS` (120), or `LAZYVIEW_LIVENESS_BOOT_STALL_SECS` (900) while booting | the process is wedged; a restart fixes it | long builds or flushes, database outages, binlog lag, hot standby, views in error |
 | `/startupz` | the engine loop makes progress (the same verdict as `/livez`, with the boot limit while booting); `?verbose` shows the boot phase (booting, hot standby, binlog stream connected) | only when the engine is stalled | waiting for the database, migrating metadata, acquiring the lock |
 | `/readyz` | this instance is active, streams the binlog and every view has a live table | starting; hot standby (unless `?standby=ok`); binlog disconnected longer than `LAZYVIEW_READY_DISCONNECT_GRACE_SECS` (30); a view without a live table yet (first build; unless `?building=ok`); engine stalled; a view in error, only with `LAZYVIEW_READY_REQUIRE_ALL=true` | a view rebuilding behind its live table, short reconnects |
-| `/metrics` | always (Prometheus text format) | — | — |
-| `/stats` | always (JSON, [per-view update statistics](#per-view-update-statistics)) | — | — |
+| `/metrics` | always (Prometheus text format); with `LAZYVIEW_HEALTH_TOKEN` set, only for `Authorization: Bearer <token>` | — | — |
+| `/stats` | always (JSON, [per-view update statistics](#per-view-update-statistics)); with `LAZYVIEW_HEALTH_TOKEN` set, only for `Authorization: Bearer <token>` | — | — |
 
 * `?verbose` lists the individual checks. `?format=json` or `Accept: application/json` returns
   JSON. `?require_all=1` (or `=0`) overrides `LAZYVIEW_READY_REQUIRE_ALL` for one request.
@@ -104,11 +127,30 @@ never stops the engine.
 ```sh
 curl -s 'localhost:8080/readyz?verbose'
 curl -s 'localhost:8080/readyz?format=json'
+curl -s -H "Authorization: Bearer $(cat /run/secrets/lazyview_health_token)" \
+  'localhost:8080/metrics' | head
+# without the header, when a token is set:
+#   HTTP/1.1 401 Unauthorized
+#   WWW-Authenticate: Bearer realm="lazyview"
 ```
 
 ## Metrics
 
-`/metrics` in Prometheus format.
+`/metrics` in Prometheus format. With `LAZYVIEW_HEALTH_TOKEN` set, Prometheus needs the same token:
+
+```yaml
+scrape_configs:
+  - job_name: lazyview
+    metrics_path: /metrics
+    authorization:
+      # the file's content, trailing newline trimmed
+      credentials_file: /etc/prometheus/lazyview_token
+    static_configs:
+      - targets: ["lazyview:8080"]
+```
+
+Keep the probes unauthenticated (they are, by design) and gate only what describes the workload:
+`/metrics` and `/stats` name your views, their tables, error counts and row volumes.
 
 Counters (`lazyview_<name>_total`): `events` (binlog events), `rows_seen`, `rows_skipped` (rows
 no view needed), `flushes`, `units_refreshed`, `units_changed`, `lookup_queries`,
@@ -371,3 +413,10 @@ schema: each would maintain the same views.
    (view, target), `access same`, `access changed (stored X, now Y)` or `access new (no state)`.
    A change is not an error — the new binary may plan better — but `access changed` lists the
    views whose routes or traced columns differ from what the running instance stored.
+6. The health and metrics endpoint now binds `127.0.0.1:8080` by default (it used to listen on
+   `0.0.0.0:8080`). A deployment that scrapes `/metrics` from another host must set
+   `LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080` explicitly — and once the endpoint is reachable beyond the
+   host, set `LAZYVIEW_HEALTH_TOKEN` (or `LAZYVIEW_HEALTH_TOKEN_FILE`) so `/metrics` and `/stats`
+   answer only to `Authorization: Bearer <token>`; the probes stay open. Details:
+   [Health and logging](configuration.md#health-and-logging),
+   [Secrets](configuration.md#secrets).
