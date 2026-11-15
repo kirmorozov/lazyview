@@ -959,6 +959,95 @@ fn targets_pg_group_by_unindexable_key() {
         }
     });
 }
+/// The no-unit-column arm of the PostgreSQL writer (`filter_bind`, `src/target/postgres.rs`): a
+/// view without a `GROUP BY` has no unit columns and exactly one unit — the whole table — so every
+/// write's delete names no column at all. An empty list would render `() IN (())`, a syntax error,
+/// so the arm renders `TRUE` instead (the MySQL family's `write_tx_mysql` renders the same `TRUE`);
+/// this pins it on the PostgreSQL side, where at BASE such a view died on that syntax error.
+/// A global aggregate over the workload's `payments` table drives it through inserts, amount
+/// updates and deletes: the target holds **one** row for the whole run, it equals the oracle after
+/// every phase, and no write ever fell back to a whole-view rebuild — a filter that matched nothing
+/// would leave the stale row behind, a write that errored would show up as a refresh.
+#[test]
+fn targets_pg_global_aggregate() {
+    let Some(pgs) = pg::servers_or_skip("targets_pg_global_aggregate") else {
+        return;
+    };
+    scenario("tg_pgagg", move |ctx| {
+        let pgs1 = pgs.clone();
+        async move {
+            let src = ctx.new_db("tg_pga_src").await?;
+            let pgdb = pg::new_pg_db(&pgs1[0], "tg_pga").await?;
+            let ids = setup_ecommerce(&src, ctx.sub_seed("seed"), Sizes::scaled()).await?;
+            let mut c = src.conn().await?;
+            // No GROUP BY, so no unit column: the one unit is the whole table.
+            let specs = vec![ViewSpec::new(
+                "tot",
+                Kind::Incremental,
+                "SELECT COUNT(*) AS n, SUM(p.amount) AS total FROM payments p",
+            )
+            .with_targets("pg")];
+            let env = target_env(&[("pg", &pgdb.dsn)]);
+            let (mut eng, _) = start_with_views(&ctx, &src, &specs, &ov_refs(&env)).await?;
+            let tmap: HashMap<String, Db> = HashMap::new();
+            let pgmap: HashMap<String, pg::PgDb> = [("pg".to_string(), pgdb.clone())].into();
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &pgmap,
+                &specs,
+                "initial build of the global aggregate",
+            )
+            .await?;
+            let client = pgdb.client().await?;
+            let rows = pg::fetch(&client, &pgdb.schema, "tot").await?;
+            drop(client);
+            ensure!(
+                rows.rows.len() == 1,
+                "tot holds {} rows on the target, expected the single row of a global aggregate",
+                rows.rows.len()
+            );
+            // The load is the arm's real coverage: payments gain rows, lose them, and their amounts
+            // move, so the one row's delete-by-no-column and its insert repeat on every batch.
+            let mut wl = Workload::new(ctx.sub_seed("wl"), ids.clone());
+            for phase in 1..=2 {
+                let n = run_batches(&mut c, &mut wl, scaled(40)).await?;
+                verify_targets(
+                    &ctx,
+                    &mut eng,
+                    &src,
+                    &tmap,
+                    &pgmap,
+                    &specs,
+                    &format!("phase {phase} ({n} txns)"),
+                )
+                .await?;
+            }
+            let client = pgdb.client().await?;
+            let rows = pg::fetch(&client, &pgdb.schema, "tot").await?;
+            drop(client);
+            ensure!(
+                rows.rows.len() == 1,
+                "after the load tot holds {} rows on the target, expected still the one row \
+                 (the whole-table unit never splits)",
+                rows.rows.len()
+            );
+            let vs = eng.stats_of(&src, "tot")?;
+            ensure!(
+                vs.whole_view_refreshes == 0,
+                "tot took {} whole-view refreshes, expected none (incremental over one unit)",
+                vs.whole_view_refreshes
+            );
+            ctx.log("global aggregate: one row through the load, 0 whole-view refreshes");
+            eng.stop().await?;
+            pg::drop_dbs(std::slice::from_ref(&pgdb)).await?;
+            Ok(())
+        }
+    });
+}
+
 /// The transactional swap under a reader: while a reader holds the MV table open, a definition
 /// edit forces a whole-view rebuild and its swap — which must either complete or fail with a
 /// lock_timeout and retry, never leaving `links__lv_new` behind ([`wait_exists`]'s rule).
