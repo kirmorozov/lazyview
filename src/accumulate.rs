@@ -1021,7 +1021,7 @@ fn warn_due(last: u64) -> Option<u64> {
 }
 
 /// Runs `warn` at most once a minute on the process-wide clock `last` (see [`warn_due`]).
-fn warn_throttled(last: &AtomicU64, warn: impl FnOnce()) {
+pub(crate) fn warn_throttled(last: &AtomicU64, warn: impl FnOnce()) {
     if let Some(now) = warn_due(last.load(Ordering::Relaxed)) {
         last.store(now, Ordering::Relaxed);
         warn();

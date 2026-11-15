@@ -14,10 +14,11 @@ use std::time::Instant;
 use anyhow::Result;
 use mysql_async::Conn;
 
-use crate::access::{AccessPlan, Hop, Path, Route};
+use crate::access::{AccessPlan, Hop, Path, Route, Via};
 use crate::accumulate::{UnitChunk, UnitSet, ViewDirty};
 use crate::analyze::ViewPlan;
 use crate::binlog::Position;
+
 use crate::cascade::Cache;
 use crate::datum::{Datum, Key as Tuple};
 use crate::dedup::{
@@ -37,6 +38,19 @@ pub struct Entry {
 pub struct Synced {
     /// Definitions with a new core target (the caller moves the version's cascade cache in).
     pub added: Vec<u64>,
+    /// Definitions whose target was replaced in place (a re-plan: DDL, TRUNCATE, replan, and
+    /// every rebuild/swap). `replace_target` keeps the OLD target's cascade caches, so the
+    /// caller moves the version's freshly built cache in for these too.
+    pub replaced: Vec<u64>,
+    /// Definitions whose target `sync` held back for removal (a refused plan whose queue still
+    /// held rows only the core had seen) and `advance_replacements` has now removed.
+    pub removed: Vec<u64>,
+    /// Definitions whose core target `sync` (immediate) or `advance_replacements` (a refusal
+    /// held until its queue drained) removed, with the cascade cache taken back out of it
+    /// (`move_core_caches` had moved the version's one in): the caller restores it into the
+    /// live version's `ViewDirty`, so executor (b) continues with the real map - an
+    /// incremental view never falls back to a full rebuild (owner rule).
+    pub lost_cache: Vec<(u64, Cache)>,
     /// Definitions the core refused, with the reason: they stay on the `RouteT` path.
     pub refused: Vec<(u64, String)>,
 }
@@ -50,6 +64,32 @@ pub struct Dedup {
     gaps: HashMap<u64, Position>,
     /// Consecutive job failures per definition (the backoff of `backoff`).
     failures: HashMap<u64, u32>,
+    /// Definitions whose plan the core refused: they keep their `RouteT` routes and warn once,
+    /// not on every `rebuild_routes` (retried each sync, warned the first time only).
+    refused: std::collections::HashSet<u64>,
+    /// Definitions whose live version's cache was still seeding when its target was added or
+    /// replaced: the target is held (fed nothing) until `deliver_cache` moves the ready cache
+    /// in, at the version's install/drain.
+    waiting: std::collections::HashSet<u64>,
+    /// Replans held back by `sync`: `replace_target` re-registers the target's hops (their ids
+    /// are never reused), so items still buffered under the old plan would name dead hops. The
+    /// replace runs when the target's queue has drained (`advance_replacements`).
+    pending_replace: HashMap<u64, Arc<ViewPlan>>,
+    /// Refused definitions whose target still holds buffered items: `remove_target` would hand
+    /// those back drained and lost (their rows went to the core only), so the removal waits for
+    /// the queue to drain too (`advance_replacements`).
+    pending_remove: std::collections::HashSet<u64>,
+    /// Rows fed to the core since its jobs last drained (guard R3): the engine's flush trigger
+    /// reads this O(1) count per binlog event; `wake` is the earliest retry hold of a busy lane,
+    /// recomputed by [`Self::drained`] once per flush, never per event.
+    fed: u64,
+    wake: Option<Instant>,
+    /// Definitions held by `pending_replace` whose registered plan is the SAME shape as the
+    /// patched one while the consumer skips occurrences by column count: the registered source
+    /// was built for the other column layout, so core-fed rows would be silently dropped. The
+    /// engine keeps the (b) cache authoritative for these until `move_core_caches` moves the
+    /// patched cache in.
+    shape_stale: std::collections::HashSet<u64>,
 }
 
 impl Dedup {
@@ -67,12 +107,58 @@ impl Dedup {
             schedule: Schedule::immediate(chunk_ids, chunk_items),
             gaps: HashMap::new(),
             failures: HashMap::new(),
+            refused: std::collections::HashSet::new(),
+            waiting: std::collections::HashSet::new(),
+            pending_replace: HashMap::new(),
+            pending_remove: std::collections::HashSet::new(),
+            fed: 0,
+            wake: None,
+            shape_stale: std::collections::HashSet::new(),
         }
     }
 
     /// Whether `plan` runs on the core: its static route is Dedup.
     pub fn routed(plan: &ViewPlan) -> bool {
         AccessPlan::of(plan).route == Route::Dedup
+    }
+
+    /// Why `plan` must keep the viewplan executor although its static route is Dedup, if so:
+    /// a `Via::Traced` cascade compiles to no consumer route (the core follows a parent's change
+    /// with hop queries on the live source, which cannot see children an FK cascade already
+    /// removed server side), and no cascade route at all has the core yet — it lacks #167's
+    /// replay-window fixes (the whole-view refresh on a cascade-cache gap), so a mapped
+    /// cascade's kept child rows could go stale (D-6T-cascades; cascade-gap-core lifts this).
+    /// Meanwhile the viewplan executor marks them on the materialized table itself
+    /// (`ViewDirty::marks`). Refusing it is the engine's policy, not the core's.
+    fn core_refusal(plan: &ViewPlan) -> Option<String> {
+        let access = AccessPlan::of(plan);
+        if let Some(why) = access.cascades.iter().find_map(|c| match c.via {
+            Via::Traced => Some(format!(
+                "cascade `{}` -> `{}` is traced, the core cannot follow its parent's changes",
+                c.parent.1, c.child.1
+            )),
+            _ => None,
+        }) {
+            return Some(why);
+        }
+        if let Some(c) = access.cascades.first() {
+            return Some(format!(
+                "cascade `{}` -> `{}` keeps the executor: the core does not have #167's \
+                 replay-window fixes yet, so a gap in the cascade cache would leave kept rows stale",
+                c.parent.1, c.child.1
+            ));
+        }
+        // The hop answer cache cannot see changes that land in the same window as the link
+        // values they answer (see tmp/out/lvs-step6/6t/hops-followup.md): hop plans keep the
+        // executor, which joins the images against the source at every refresh.
+        access.occurrences.iter().find_map(|o| match &o.path {
+            Path::Hop(_) => Some(format!(
+                "alias `{}` resolves its units through a hop, the core answers hops from a cache \
+                 that a same-window partner change cannot invalidate",
+                o.alias
+            )),
+            _ => None,
+        })
     }
 
     /// Mirrors `live` (definition id, plan) onto core targets: a routed plan gets a target (added, or
@@ -85,7 +171,46 @@ impl Dedup {
             if !Self::routed(plan) {
                 continue;
             }
+            if let Some(why) = Self::core_refusal(plan) {
+                // Keep its id (an added-then-refused target is removed here, not by the stale
+                // sweep, so the `refused` marker below survives the sweep's `retain`).
+                keep.insert(*id);
+                let had_entry = self.entries.contains_key(id);
+                let hold = had_entry
+                    && self.entries.get(id).is_some_and(|e| {
+                        self.core.pending(e.target) > 0 || self.core.busy(e.target)
+                    });
+                if hold {
+                    // `remove_target` hands buffered items back drained, and these rows went to
+                    // the core only: keep the target until it has applied them, and keep the
+                    // entry (its plan Arc no longer matches, so `rebuild_routes` builds the
+                    // `RouteT` the executor needs meanwhile). `advance_replacements` removes it,
+                    // taking its cascade cache out then (the draining jobs still expand from it).
+                    self.pending_remove.insert(*id);
+                } else if let Some(e) = self.entries.remove(id) {
+                    // The version's cascade cache went into the target (`move_core_caches`):
+                    // take it back out before dropping the target (the live version keeps its
+                    // `plan`, executor (b) continues with the real map - no rebuild).
+                    let cache = self
+                        .core
+                        .cache_mut(e.target, 0)
+                        .map(std::mem::take)
+                        .unwrap_or_default();
+                    self.core.remove_target(e.target);
+                    self.gaps.remove(id);
+                    self.failures.remove(id);
+                    self.waiting.remove(id);
+                    self.pending_remove.remove(id);
+                    out.lost_cache.push((*id, cache));
+                }
+                self.pending_replace.remove(id);
+                if self.refused.insert(*id) {
+                    out.refused.push((*id, why));
+                }
+                continue;
+            }
             keep.insert(*id);
+            self.pending_remove.remove(id);
             let spec = TargetSpec {
                 plans: vec![plan.clone()],
                 labels: vec![],
@@ -100,22 +225,36 @@ impl Dedup {
             let mut add = true;
             if let Some((t, kept)) = &old {
                 if Arc::ptr_eq(kept, plan) {
+                    self.pending_replace.remove(id);
+                    self.refused.remove(id);
                     continue;
                 }
                 if kept.unit_exprs == plan.unit_exprs && kept.partial.sets == plan.partial.sets {
-                    match self.core.replace_target(*t, spec.clone()) {
-                        Ok(t) => {
-                            self.entries.insert(
-                                *id,
-                                Entry {
-                                    target: t,
-                                    plan: plan.clone(),
-                                },
-                            );
-                            add = false;
-                        }
-                        Err(_) => {
-                            self.core.remove_target(*t);
+                    // `replace_target` re-registers the hops (their ids are never reused):
+                    // items still buffered under the old plan would name dead hops. Hold the
+                    // replace until the target's queue has drained (`advance_replacements`).
+                    if self.core.pending(*t) > 0 || self.core.busy(*t) {
+                        self.pending_replace.insert(*id, plan.clone());
+                        self.refused.remove(id);
+                        add = false;
+                    } else {
+                        match self.core.replace_target(*t, spec.clone()) {
+                            Ok(t) => {
+                                self.entries.insert(
+                                    *id,
+                                    Entry {
+                                        target: t,
+                                        plan: plan.clone(),
+                                    },
+                                );
+                                self.pending_replace.remove(id);
+                                self.refused.remove(id);
+                                out.replaced.push(*id);
+                                add = false;
+                            }
+                            Err(_) => {
+                                self.core.remove_target(*t);
+                            }
                         }
                     }
                 } else {
@@ -133,8 +272,14 @@ impl Dedup {
                             },
                         );
                         out.added.push(*id);
+                        self.refused.remove(id);
+                        self.pending_replace.remove(id);
                     }
-                    Err(why) => out.refused.push((*id, why)),
+                    Err(why) => {
+                        if self.refused.insert(*id) {
+                            out.refused.push((*id, why));
+                        }
+                    }
                 }
             }
         }
@@ -149,12 +294,203 @@ impl Dedup {
             self.core.remove_target(e.target);
             self.gaps.remove(&id);
             self.failures.remove(&id);
+            self.waiting.remove(&id);
+            self.pending_replace.remove(&id);
+            self.pending_remove.remove(&id);
+        }
+        self.refused.retain(|id| keep.contains(id));
+        out
+    }
+
+    /// Replaces `id`'s target with `plan` in place, or rebuilds it (remove and add) when the
+    /// core refuses the replace (different spaces). `false`: the core refused the plan itself.
+    fn apply_replace(&mut self, id: u64, plan: &Arc<ViewPlan>) -> bool {
+        let spec = TargetSpec {
+            plans: vec![plan.clone()],
+            labels: vec![],
+            start: Position {
+                file: String::new(),
+                pos: 0,
+            },
+            schedule: self.schedule,
+            needs: TargetNeeds::default(),
+        };
+        let t = match self.entries.get(&id) {
+            Some(e) => e.target,
+            None => {
+                return match self.core.add_target(spec) {
+                    Ok(t) => {
+                        self.entries.insert(
+                            id,
+                            Entry {
+                                target: t,
+                                plan: plan.clone(),
+                            },
+                        );
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        };
+        match self.core.replace_target(t, spec.clone()) {
+            Ok(t) => {
+                self.entries.insert(
+                    id,
+                    Entry {
+                        target: t,
+                        plan: plan.clone(),
+                    },
+                );
+                true
+            }
+            Err(_) => {
+                self.core.remove_target(t);
+                match self.core.add_target(spec) {
+                    Ok(t) => {
+                        self.entries.insert(
+                            id,
+                            Entry {
+                                target: t,
+                                plan: plan.clone(),
+                            },
+                        );
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        }
+    }
+
+    /// The replans `sync` held back (a target with buffered items cannot be replaced: its items
+    /// would name the old plan's dead hops), once their targets have drained; and the removals
+    /// of refused targets `sync` held back (`remove_target` would drop their buffered items,
+    /// which only the core had seen). Like `sync`, it reports the definitions whose target is
+    /// new, replaced, or finally removed: the caller moves the version's cascade cache in for
+    /// each new one, takes it back out of each removed one (`Synced::lost_cache`), and rebuilds
+    /// routes when one is gone.
+    pub fn advance_replacements(&mut self) -> Synced {
+        let mut out = Synced::default();
+        let todo: Vec<(u64, Arc<ViewPlan>)> = self
+            .pending_replace
+            .iter()
+            .map(|(id, plan)| (*id, plan.clone()))
+            .collect();
+        for (id, plan) in todo {
+            match self.entries.get(&id) {
+                None => {
+                    self.pending_replace.remove(&id);
+                }
+                Some(e) if self.core.pending(e.target) > 0 || self.core.busy(e.target) => {}
+                Some(_) => {
+                    self.pending_replace.remove(&id);
+                    if self.apply_replace(id, &plan) {
+                        out.replaced.push(id);
+                    }
+                }
+            }
+        }
+        let gone: Vec<u64> = self.pending_remove.iter().copied().collect();
+        for id in gone {
+            match self.entries.get(&id) {
+                None => {
+                    self.pending_remove.remove(&id);
+                }
+                Some(e) if self.core.pending(e.target) > 0 || self.core.busy(e.target) => {}
+                Some(e) => {
+                    let t = e.target;
+                    // The queue drained: take the version's cascade cache out before dropping
+                    // the target (see `sync`), so executor (b) keeps the real map - no rebuild.
+                    let cache = self
+                        .core
+                        .cache_mut(t, 0)
+                        .map(std::mem::take)
+                        .unwrap_or_default();
+                    self.entries.remove(&id);
+                    self.core.remove_target(t);
+                    self.gaps.remove(&id);
+                    self.failures.remove(&id);
+                    self.waiting.remove(&id);
+                    self.pending_remove.remove(&id);
+                    out.removed.push(id);
+                    out.lost_cache.push((id, cache));
+                }
+            }
         }
         out
     }
 
     pub fn entry(&self, def_id: u64) -> Option<&Entry> {
         self.entries.get(&def_id)
+    }
+
+    /// Whether the plan last synced for `def_id` was refused (by `core_refusal` or the core
+    /// itself): its rows must keep the `RouteT` path even while a held-back target lingers.
+    pub fn is_refused(&self, def_id: u64) -> bool {
+        self.refused.contains(&def_id)
+    }
+
+    /// Whether a replace of `def_id`'s target waits for its queue to drain (`sync`): the plans
+    /// are equal in shape (same unit expressions and partial sets), so the running target is
+    /// still the authority - the version's rows keep going to the core meanwhile.
+    pub fn replacing(&self, def_id: u64) -> bool {
+        self.pending_replace.contains_key(&def_id)
+    }
+
+    /// Whether the core runs `plan` for `def_id`: pointer-equal to the registered plan, or an
+    /// equal-shape replace held back by `sync` (`replacing`: the running target reads the same
+    /// way) that is not marked shape-stale - while marked, the registered source was built for
+    /// another column layout and would silently drop the occurrences it skips by column count.
+    pub fn plan_matches(&self, def_id: u64, plan: &Arc<ViewPlan>) -> bool {
+        self.entries.get(&def_id).is_some_and(|e| {
+            Arc::ptr_eq(&e.plan, plan)
+                || (self.replacing(def_id) && !self.shape_stale.contains(&def_id))
+        })
+    }
+
+    /// Whether `def_id`'s held replace is marked shape-stale (see [`Self::plan_matches`]).
+    pub fn core_shape_stale(&self, def_id: u64) -> bool {
+        self.shape_stale.contains(&def_id)
+    }
+
+    /// The engine saw a TABLE_MAP this version's registered source skips while an equal-shape
+    /// replace is held back: core-fed rows would vanish. Returns whether the mark is new.
+    pub(crate) fn mark_shape_stale(&mut self, def_id: u64) -> bool {
+        self.shape_stale.insert(def_id)
+    }
+
+    /// The patched cache reached the core (`move_core_caches`): the source reads the live
+    /// layout again and the (a) authority returns.
+    pub(crate) fn clear_shape_stale(&mut self, def_id: u64) {
+        self.shape_stale.remove(&def_id);
+    }
+
+    /// `feed_core` fed `n` rows to the core: its targets have work (O(1), guard R3).
+    pub fn note_rows(&mut self, n: usize) {
+        self.fed += n as u64;
+    }
+
+    /// When the engine's flush must wake for the core targets (guard R3: two field reads
+    /// per binlog event, never a pass over the core): the earliest retry hold cached by
+    /// [`Self::drained`]. Rows fed to the core need no extra wake here: `feed_core` marks the
+    /// version dirty, and the batch-window deadline of executor (b) covers them - waking per
+    /// transaction would refresh a unit once per binlog event. A feed left over by an
+    /// interrupted flush wakes through [`Self::rows_pending`] in the engine.
+    pub fn trigger(&self, _now: Instant) -> Option<Instant> {
+        self.wake
+    }
+
+    /// Rows are buffered in the core and no flush has taken them yet.
+    pub fn rows_pending(&self) -> bool {
+        self.fed > 0
+    }
+
+    /// The flush took the rows (`flush_dedup` ended): reset the running count and cache the
+    /// core's earliest retry hold (`next_retry` is O(targets): per flush, never per event).
+    pub fn drained(&mut self) {
+        self.fed = 0;
+        self.wake = self.core.next_retry();
     }
 
     pub fn def_of(&self, t: TargetId) -> Option<u64> {
@@ -173,6 +509,31 @@ impl Dedup {
             self.gaps.insert(def_id, until);
         }
         self.core.set_cache(t, 0, cache);
+    }
+
+    /// A target added or replaced while its version's cache still seeds: held (fed nothing, no
+    /// job started, position pinned) until [`Self::deliver_cache`] moves the ready cache in.
+    pub fn hold_for_cache(&mut self, def_id: u64) {
+        if let Some(t) = self.entries.get(&def_id).map(|e| e.target) {
+            self.core.hold(t, true);
+            self.waiting.insert(def_id);
+        }
+    }
+
+    /// The definitions held by [`Self::hold_for_cache`], waiting for their version's install/drain.
+    pub fn waiting_cache(&self) -> Vec<u64> {
+        self.waiting.iter().copied().collect()
+    }
+
+    /// The version's install/drain completed: its ready cache goes to the target and the hold lifts.
+    pub fn deliver_cache(&mut self, def_id: u64, cache: Cache) {
+        if !self.waiting.remove(&def_id) {
+            return;
+        }
+        if let Some(t) = self.entries.get(&def_id).map(|e| e.target) {
+            self.core.hold(t, false);
+        }
+        self.set_cache(def_id, cache);
     }
 
     /// A transaction boundary at `at`: the core's, and the restart gaps that end there.
@@ -251,23 +612,47 @@ impl Dedup {
     }
 
     /// One hop statement: `hop.select` and the key filter on the partner columns for `links`.
+    /// Numeric links go as one statement. Any other link (text, date, JSON) goes as one branch
+    /// per link, labeled with its index: the server matches under the column's collation and
+    /// may answer with a different spelling than the item queried (`= 'ABC'` finds 'abc '),
+    /// while `complete` groups the pairs by the item's link with Rust equality — an unlabeled
+    /// row would name the answered spelling, leaving the item's entry cached empty.
     pub fn hop_sql(hop: &Hop, links: &[Tuple]) -> (String, Vec<mysql_async::Value>) {
-        let chunk = if links.iter().all(|l| matches!(&**l, [Datum::Int(_)])) {
-            let mut v: Vec<i64> = links
-                .iter()
-                .map(|l| match &**l {
-                    [Datum::Int(i)] => *i,
-                    _ => unreachable!("checked above"),
-                })
-                .collect();
-            v.sort_unstable();
-            v.dedup();
-            UnitChunk::Ints(v)
-        } else {
-            UnitChunk::Keys(links.to_vec())
-        };
-        let (f, params) = chunk.filter(&hop.partner);
-        (format!("{} AND {f}", hop.select), params)
+        if links
+            .iter()
+            .all(|l| l.iter().all(|d| matches!(d, Datum::Int(_))))
+        {
+            let chunk = if links.iter().all(|l| matches!(&**l, [Datum::Int(_)])) {
+                let mut v: Vec<i64> = links
+                    .iter()
+                    .map(|l| match &**l {
+                        [Datum::Int(i)] => *i,
+                        _ => unreachable!("checked above"),
+                    })
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                UnitChunk::Ints(v)
+            } else {
+                UnitChunk::Keys(links.to_vec())
+            };
+            let (f, params) = chunk.filter(&hop.partner);
+            return (format!("{} AND {f}", hop.select), params);
+        }
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        for (i, l) in links.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" UNION ALL ");
+            }
+            let (f, p) = UnitChunk::Keys(vec![l.clone()]).filter(&hop.partner);
+            sql.push_str(&format!(
+                "SELECT {i} AS `__lnk`, `t{i}`.* FROM ({} AND ({f})) AS `t{i}`",
+                hop.select
+            ));
+            params.extend(p);
+        }
+        (sql, params)
     }
 
     /// Runs the hop statements for `links` on `conn`, at most `chunk` links per statement: the answers
@@ -293,16 +678,35 @@ impl Dedup {
             let mut answers = Vec::new();
             for c in ls.chunks(chunk.max(1)) {
                 let (sql, params) = Self::hop_sql(hop, c);
+                let labeled = c
+                    .iter()
+                    .any(|l| !l.iter().all(|d| matches!(d, Datum::Int(_))));
                 for row in
                     crate::mv::exec_source::<mysql_async::Row>(conn, sql, params, fresh).await?
                 {
                     let vals: Vec<Datum> =
                         row.unwrap().into_iter().map(Datum::from_value).collect();
-                    let (link, rest) = vals.split_at(n);
-                    answers.push((
-                        link.to_vec().into_boxed_slice(),
-                        Key::from_parts(rest.to_vec().into_boxed_slice()),
-                    ));
+                    // A labeled statement puts the link's index in the chunk first: the pair
+                    // carries the item's own link bytes (`complete` groups by those).
+                    let (link, rest): (Tuple, &[Datum]) = if labeled {
+                        let i = match vals.first() {
+                            Some(Datum::Int(i)) if (0..c.len()).contains(&(*i as usize)) => {
+                                *i as usize
+                            }
+                            _ => continue,
+                        };
+                        if vals.len() < 1 + n {
+                            continue;
+                        }
+                        (c[i].clone(), &vals[1 + n..])
+                    } else {
+                        if vals.len() < n {
+                            continue;
+                        }
+                        let (a, b) = vals.split_at(n);
+                        (a.to_vec().into_boxed_slice(), b)
+                    };
+                    answers.push((link, Key::from_parts(rest.to_vec().into_boxed_slice())));
                 }
                 stmts += 1;
             }
@@ -373,6 +777,7 @@ impl Dedup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::test_catalog::typed;
     use crate::catalog::TableRef;
     use crate::dedup::{
         testkit::{plan, row},
@@ -400,6 +805,8 @@ mod tests {
 
     const ONE_HOP: &str = "SELECT i.id, l.child_id FROM items i JOIN item_links l ON \
                            l.parent_id = i.kind_id";
+    /// Routed with no hop: its images carry the unit positions themselves.
+    const DIRECT: &str = "SELECT i.id, i.kind_id FROM items i";
     const TWO_PARTIALS: &str = "SELECT l.parent_id, i.id, MAX(v1.val) AS a, MAX(v2.val) AS b \
                                 FROM item_links l JOIN items i ON i.id = l.child_id JOIN \
                                 item_values v1 ON v1.item_id = i.id AND v1.key_id = 7 JOIN \
@@ -415,7 +822,7 @@ mod tests {
     #[test]
     fn sync_adds_replaces_and_removes() {
         let mut d = dedup();
-        let p = plan(ONE_HOP);
+        let p = plan(DIRECT);
         let s = d.sync(&[(1, p.clone())]);
         assert_eq!(s.added, vec![1], "{:?}", s.refused);
         let t0 = d.entry(1).unwrap().target;
@@ -434,13 +841,329 @@ mod tests {
     #[test]
     fn sync_re_adds_a_target_whose_id_changed() {
         let mut d = dedup();
-        let old = d.sync(&[(1, plan(ONE_HOP))]);
+        let old = d.sync(&[(1, plan(DIRECT))]);
         assert_eq!(old.added, vec![1]);
         let t0 = d.entry(1).unwrap().target;
         let s = d.sync(&[(1, plan(TWO_PARTIALS))]);
         assert_eq!(s.added, vec![1], "{:?}", s.refused);
         assert!(d.def_of(t0).is_none(), "the old target is gone");
         assert_ne!(d.entry(1).unwrap().target, t0);
+    }
+
+    /// Cascade fixtures (mirroring the analyze planner's cascade tests): `kind` -> `realm` and
+    /// `obj_attr` -> (`obj`, `kind`) always cascade; `map_shape` also gives `link` its cascading
+    /// FK to `obj` (and `note` to `obj`), the map-cascade catalog.
+    fn fk_catalog(map_shape: bool) -> HashMap<TableRef, Arc<crate::catalog::TableInfo>> {
+        use crate::catalog::{Column, FkAction, ForeignKey};
+        let int = |n: &str, ct: &str| {
+            Column::new(
+                n,
+                ct.split(' ').next().unwrap(),
+                ct,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let fk = |parent: &str, child_col: usize, parent_col: &str| ForeignKey {
+            parent: ("db".into(), parent.into()),
+            child_cols: vec![child_col],
+            parent_cols: vec![parent_col.into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        };
+        let with_fk = |t: (TableRef, Arc<crate::catalog::TableInfo>), f: Vec<ForeignKey>| {
+            let mut i = (*t.1).clone();
+            i.cascades = f;
+            (t.0, Arc::new(i))
+        };
+        let link = typed(
+            "link",
+            vec![
+                int("gid", "int unsigned"),
+                int("oid", "int unsigned"),
+                int("pos", "int"),
+            ],
+            &[0, 1],
+        );
+        let note = typed(
+            "note",
+            vec![int("oid", "int unsigned"), int("w", "int")],
+            &[],
+        );
+        [
+            typed("realm", vec![int("rid", "int unsigned")], &[0]),
+            with_fk(
+                typed(
+                    "kind",
+                    vec![int("kid", "smallint unsigned"), int("rid", "int unsigned")],
+                    &[0],
+                ),
+                vec![fk("realm", 1, "rid")],
+            ),
+            typed("grp", vec![int("gid", "int unsigned")], &[0]),
+            typed("obj", vec![int("oid", "int unsigned")], &[0]),
+            if map_shape {
+                with_fk(link, vec![fk("obj", 1, "oid")])
+            } else {
+                link
+            },
+            with_fk(
+                typed(
+                    "obj_attr",
+                    vec![
+                        int("id", "bigint unsigned"),
+                        int("oid", "int unsigned"),
+                        int("aid", "smallint unsigned"),
+                        int("val", "int"),
+                    ],
+                    &[0],
+                ),
+                vec![fk("obj", 1, "oid"), fk("kind", 2, "kid")],
+            ),
+            if map_shape {
+                with_fk(note, vec![fk("obj", 0, "oid")])
+            } else {
+                note
+            },
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn plan_in(
+        sql: &str,
+        cat: &HashMap<TableRef, Arc<crate::catalog::TableInfo>>,
+    ) -> Arc<ViewPlan> {
+        let d = crate::analyze::parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        Arc::new(crate::analyzer::plan(&d, "db", cat).unwrap())
+    }
+
+    /// Closes the staged units (a transaction boundary) and runs the queued jobs to empty
+    /// (everything done).
+    fn drain(d: &mut Dedup, t: TargetId) {
+        for _ in 0..64 {
+            d.boundary(&pos(9), Instant::now());
+            let jobs = d.core.due(Instant::now());
+            if jobs.is_empty() {
+                assert_eq!(d.core.pending(t), 0, "still queued");
+                assert!(!d.core.busy(t), "still in flight");
+                return;
+            }
+            for j in jobs {
+                d.core.complete(j.id, crate::dedup::JobResult::ok());
+            }
+        }
+        panic!("the queue never drained");
+    }
+
+    /// A re-plan while the target's queue holds items cannot go through (the buffered items
+    /// belong to the plan being replaced): `sync` holds it, the entry
+    /// keeps the old plan, and the sweep replaces once the queue has drained.
+    #[test]
+    fn sync_holds_a_replan_until_the_target_drains() {
+        let mut d = dedup();
+        let p = plan(DIRECT);
+        d.sync(&[(1, p.clone())]);
+        let t0 = d.entry(1).unwrap().target;
+        let items = d
+            .core
+            .source(&table_ref("items"), Some(3))
+            .expect("watched");
+        d.core
+            .row(&items, None, Some(&row(&[Some(3), Some(7), Some(0)])));
+        assert!(
+            d.core.pending(t0) > 0 || d.core.busy(t0),
+            "the fed rows are work in flight"
+        );
+
+        let q = plan(DIRECT); // a fresh plan object: a re-plan of the same shape
+        let s = d.sync(&[(1, q.clone())]);
+        assert!(s.replaced.is_empty() && s.added.is_empty(), "{s:?}");
+        assert_eq!(
+            d.entry(1).unwrap().target,
+            t0,
+            "the old target serves meanwhile"
+        );
+        assert!(Arc::ptr_eq(&d.entry(1).unwrap().plan, &p));
+        drain(&mut d, t0);
+
+        let s = d.advance_replacements();
+        assert_eq!(s.replaced, vec![1]);
+        assert_ne!(
+            d.entry(1).unwrap().target,
+            t0,
+            "the core got a fresh target"
+        );
+        assert!(Arc::ptr_eq(&d.entry(1).unwrap().plan, &q));
+    }
+
+    #[test]
+    fn sync_replaces_a_target_when_idle() {
+        let mut d = dedup();
+        let p = plan(DIRECT);
+        d.sync(&[(1, p.clone())]);
+        let t0 = d.entry(1).unwrap().target;
+        let q = plan(DIRECT);
+        let s = d.sync(&[(1, q.clone())]);
+        assert_eq!(s.replaced, vec![1], "{s:?}");
+        assert_ne!(d.entry(1).unwrap().target, t0);
+        assert!(Arc::ptr_eq(&d.entry(1).unwrap().plan, &q));
+    }
+
+    // The parent read through a partial alias: `obj`'s cascade is traced. MySQL logs no
+    // FK-cascaded child rows, so the core could not find the units the parent's change moved
+    // out from under it; such a plan stays on the viewplan executor (which marks the
+    // materialized table itself), refused by plan property, never by table or view names.
+    #[test]
+    fn sync_refuses_a_traced_cascade() {
+        let p = plan_in(
+            "SELECT c.gid, o.oid, MAX(a.val) AS x, MAX(b.val) AS y FROM link c \
+             JOIN obj o ON o.oid = c.oid JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 \
+             LEFT JOIN obj_attr b ON b.oid = o.oid AND b.aid IN (8, 9) GROUP BY c.gid, o.oid",
+            &fk_catalog(false),
+        );
+        assert!(
+            matches!(Dedup::core_refusal(&p), Some(why) if why.contains("traced")),
+            "{:?}",
+            AccessPlan::of(&p).cascades
+        );
+        let mut d = dedup();
+        let s = d.sync(&[(7, p.clone())]);
+        assert!(s.added.is_empty(), "{:?}", s.added);
+        assert_eq!(s.refused.len(), 1, "{:?}", s.refused);
+        assert_eq!(s.refused[0].0, 7);
+        assert!(
+            d.entry(7).is_none(),
+            "no core target: executor (b) keeps it"
+        );
+        let s = d.sync(&[(7, p)]);
+        assert!(
+            s.refused.is_empty() && d.entry(7).is_none(),
+            "{:?}, refused warns once",
+            s.refused
+        );
+    }
+
+    /// Hop plans keep the executor. Their units come from the core's hop answer cache, which a
+    /// change to the partner table in the same window cannot invalidate (the three cases in
+    /// `tmp/out/lvs-step6/6t/hops-followup.md`), so `sync` refuses them the way it refuses a
+    /// traced cascade — once per plan — while a direct plan over the same tables is accepted.
+    #[test]
+    fn sync_refuses_a_hop_plan_and_accepts_a_direct_one() {
+        let p = plan(ONE_HOP);
+        assert!(
+            matches!(Dedup::core_refusal(&p), Some(why) if why.contains("hop")),
+            "{:?}",
+            AccessPlan::of(&p).occurrences
+        );
+        assert!(Dedup::core_refusal(&plan(DIRECT)).is_none());
+        let mut d = dedup();
+        let s = d.sync(&[(4, p.clone()), (5, plan(DIRECT))]);
+        assert_eq!(s.added, vec![5], "{:?}", s.refused);
+        assert_eq!(s.refused.len(), 1, "{:?}", s.refused);
+        assert_eq!(s.refused[0].0, 4);
+        assert!(
+            d.entry(4).is_none(),
+            "no core target: executor (b) keeps the hop view"
+        );
+        assert!(d.entry(5).is_some());
+        let s = d.sync(&[(4, p), (5, plan(DIRECT))]);
+        assert!(
+            s.refused.is_empty() && d.entry(4).is_none() && d.entry(5).is_some(),
+            "{:?}, refused warns once",
+            s.refused
+        );
+    }
+
+    /// A plan refused while its target's queue still holds rows only the core had seen: the
+    /// removal waits for the drain (removing early would drop those rows), the executor's
+    /// routes take over meanwhile, and the sweep reports the target as removed.
+    #[test]
+    fn sync_holds_a_refused_target_until_it_drains() {
+        let mut d = dedup();
+        add_hop_plan(&mut d, 7, plan(ONE_HOP));
+        let t0 = d.entry(7).unwrap().target;
+        let items = d
+            .core
+            .source(&table_ref("items"), Some(3))
+            .expect("watched");
+        d.core
+            .row(&items, None, Some(&row(&[Some(3), Some(7), Some(0)])));
+        let p = plan_in(
+            "SELECT c.gid, o.oid, MAX(a.val) AS x, MAX(b.val) AS y FROM link c \
+             JOIN obj o ON o.oid = c.oid JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 \
+             LEFT JOIN obj_attr b ON b.oid = o.oid AND b.aid IN (8, 9) GROUP BY c.gid, o.oid",
+            &fk_catalog(false),
+        );
+        let s = d.sync(&[(7, p.clone())]);
+        assert_eq!(s.refused.len(), 1, "{:?}", s.refused);
+        assert!(
+            s.lost_cache.is_empty(),
+            "the target drains first: it still needs its cascade cache to expand the queued rows"
+        );
+        assert!(
+            d.entry(7).is_some(),
+            "the target drains first: its rows are only in the core"
+        );
+        drain(&mut d, t0);
+        let s = d.advance_replacements();
+        assert_eq!(s.removed, vec![7]);
+        assert_eq!(
+            s.lost_cache.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![7],
+            "the version's cascade cache is taken back out of the removed target"
+        );
+        assert!(d.entry(7).is_none(), "the target and entry are gone");
+        let s = d.sync(&[(7, p)]);
+        assert!(
+            s.refused.is_empty() && d.entry(7).is_none(),
+            "{:?}, refused warns once",
+            s.refused
+        );
+    }
+
+    // The untraced route over `link` maps the parent's change through the cascade cache, but
+    // the core lacks #167's replay-window fixes (D-6T-cascades): the plan is refused by plan
+    // property, warned once, no core target — while a direct plan over the plain catalog is
+    // accepted. cascade-gap-core moves map cascades onto the core once its tests pass there.
+    #[test]
+    fn sync_refuses_a_map_cascade_and_accepts_a_direct_one() {
+        let p = plan_in(
+            "SELECT o.oid, MAX(a.val) AS x FROM obj o \
+             JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 GROUP BY o.oid",
+            &fk_catalog(true),
+        );
+        let cas = AccessPlan::of(&p).cascades;
+        assert!(
+            cas.iter().any(|c| matches!(c.via, Via::Map { .. })),
+            "want a map cascade: {cas:?}"
+        );
+        assert!(
+            matches!(Dedup::core_refusal(&p), Some(why) if why.contains("cascade")),
+            "{cas:?}"
+        );
+        assert!(
+            Dedup::core_refusal(&plan(DIRECT)).is_none(),
+            "a direct plan is accepted"
+        );
+        let mut d = dedup();
+        let s = d.sync(&[(7, p.clone()), (8, plan(DIRECT))]);
+        assert_eq!(s.added, vec![8], "{:?}", s.refused);
+        assert_eq!(s.refused.len(), 1, "{:?}", s.refused);
+        assert_eq!(s.refused[0].0, 7);
+        assert!(
+            d.entry(7).is_none(),
+            "no core target: executor (b) keeps the map-cascade view"
+        );
+        assert!(d.entry(8).is_some(), "the core took the direct plan");
+        let s = d.sync(&[(7, p), (8, plan(DIRECT))]);
+        assert!(
+            s.refused.is_empty() && d.entry(7).is_none() && d.entry(8).is_some(),
+            "{:?}, refused warns once",
+            s.refused
+        );
     }
 
     #[test]
@@ -491,6 +1214,25 @@ mod tests {
         let (sql2, params2) = Dedup::hop_sql(&hop2, &two);
         assert!(sql2.ends_with("IN ((?,?))"), "{sql2}");
         assert_eq!(params2.len(), 2);
+        // A text link is answered per branch, labeled with the link's index: the column's
+        // collation may answer a different spelling, and `complete` groups by the item's bytes.
+        let hop3 = Hop {
+            partner: vec!["`l`.`note`".into()],
+            ..hop.clone()
+        };
+        let texts: Vec<Tuple> = vec![
+            Box::new([Datum::Bytes(b"abc".to_vec())]),
+            Box::new([Datum::Bytes(b"ABC".to_vec())]),
+        ];
+        let (sql3, params3) = Dedup::hop_sql(&hop3, &texts);
+        assert_eq!(sql3.matches(" UNION ALL ").count(), 1, "{sql3}");
+        assert!(
+            sql3.contains("SELECT 0 AS `__lnk`") && sql3.contains("SELECT 1 AS `__lnk`"),
+            "{sql3}"
+        );
+        assert_eq!(params3.len(), 2, "{params3:?}"); // one bound parameter per branch
+                                                     // An all-numeric multi-column link keeps the single unlabeled statement.
+        assert!(!sql2.contains("__lnk"), "{sql2}");
     }
 
     /// The only hop of the single synced target.
@@ -501,11 +1243,33 @@ mod tests {
             .expect("the view has one hop")
     }
 
+    /// A core target for a plan `sync` refuses because its access needs hop items (see
+    /// `sync_refuses_a_hop_plan_and_accepts_a_direct_one`): the tests of the core's hop
+    /// machinery need such a target, so they install it with the same call `sync` makes when
+    /// it accepts a plan, without the plan check.
+    fn add_hop_plan(d: &mut Dedup, id: u64, plan: Arc<ViewPlan>) -> TargetId {
+        let t = d
+            .core
+            .add_target(TargetSpec {
+                plans: vec![plan.clone()],
+                labels: vec![],
+                start: Position {
+                    file: String::new(),
+                    pos: 0,
+                },
+                schedule: d.schedule,
+                needs: TargetNeeds::default(),
+            })
+            .expect("table names are unique");
+        d.entries.insert(id, Entry { target: t, plan });
+        t
+    }
+
     #[test]
     fn answers_land_in_the_hop_space() {
         // A hop that reaches every unit position gives units.
         let mut d = dedup();
-        d.sync(&[(1, plan(ONE_HOP))]);
+        add_hop_plan(&mut d, 1, plan(ONE_HOP));
         let h = the_hop(&d);
         let mut dirty = ViewDirty::for_aliases(1);
         let n = d.add_answers(
@@ -571,8 +1335,7 @@ mod tests {
             p.partial.sets
         );
         let mut d = dedup();
-        let s = d.sync(&[(1, p.clone())]);
-        assert_eq!(s.added, vec![1], "{:?}", s.refused);
+        add_hop_plan(&mut d, 1, p.clone());
         let h = the_hop(&d);
         let (plan, hop) = d.hop(h).unwrap();
         assert_eq!(hop.positions, vec![0], "{hop:?}");
@@ -593,7 +1356,7 @@ mod tests {
     #[test]
     fn tally_maps_items_to_images() {
         let mut d = dedup();
-        d.sync(&[(1, plan(ONE_HOP))]);
+        add_hop_plan(&mut d, 1, plan(ONE_HOP));
         let items = d
             .core
             .source(&table_ref("items"), Some(3))

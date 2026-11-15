@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,9 @@ use crate::supervisor::{self, Supervisor};
 use crate::target;
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
+
+/// The once-a-minute clocks of the `Engine::core_events` warnings (guard R1 c; one per warning).
+static LAST_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 
 /// Runs the service until `shutdown` turns true (or, for `once` / `sync=false`, until done).
 pub async fn run(
@@ -686,7 +690,14 @@ struct Engine {
     routes: HashMap<TableRef, Arc<Vec<RouteT>>>,
     /// TABLE_MAP ids of the current transaction (re-sent for every transaction; cleared at
     /// each boundary so table id churn cannot grow it).
-    table_ids: HashMap<u64, (TableRef, Option<Arc<Vec<RouteT>>>)>,
+    table_ids: HashMap<
+        u64,
+        (
+            TableRef,
+            Option<Arc<Vec<RouteT>>>,
+            Option<crate::dedup::Source>,
+        ),
+    >,
     /// (table, binlog column count) → column count of the table's current definition.
     shapes: HashMap<(TableRef, u64), Option<usize>>,
     /// XA transaction being read: (xid, position before it, rows of routed tables).
@@ -713,6 +724,9 @@ struct Engine {
     txn_foreign: bool,
     persist_needed: bool,
     first_dirty: Option<Instant>,
+    /// A version was marked `Dedup::mark_shape_stale` while draining: executor (b) takes its
+    /// rows over, which `rebuild_routes` wires up; the flush below runs it once.
+    core_shape_routes: bool,
     last_gtid: Option<String>,
     /// The server reports the binlog position of a consistent snapshot (see `fence`); `None`
     /// until tried.
@@ -1130,6 +1144,7 @@ impl Engine {
             txn_foreign: false,
             persist_needed: false,
             first_dirty: None,
+            core_shape_routes: false,
             last_gtid: None,
             snapshot_fence: None,
             commit_fence: None,
@@ -2731,14 +2746,32 @@ impl Engine {
                     .map(|l| (s.def_id, l.plan.clone()))
             })
             .collect();
-        let synced = self.dedup.sync(&live);
+        let mut synced = self.dedup.sync(&live);
         for (id, why) in &synced.refused {
+            let name = self
+                .slots
+                .iter()
+                .find(|s| s.def_id == *id)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
             warn!(
+                view = %name,
                 definition = id,
                 "the dedup core refused the view's plan, it keeps the viewplan executor: {why}"
             );
         }
+        // A refused definition whose target held the version's cascade cache comes back with it
+        // (`sync`/`advance_replacements` took it out before `remove_target`): restore it into the
+        // live version, so executor (b) continues with the real map - no rebuild (owner rule).
+        self.restore_lost_caches(&mut synced);
+        // A new or replaced core target runs with the live version's cascade cache (its rows
+        // arrive via `Source`, its hop queries read the source with it): `replace_target`
+        // keeps the OLD target's caches, so a re-plan (DDL, TRUNCATE, replan, every rebuild
+        // and swap) needs the version's freshly built one moved in too. A cache that still
+        // seeds keeps its target held (fed nothing) until its install/drain delivers it.
+        self.move_core_caches(&synced);
         let mut routes: HashMap<TableRef, Vec<RouteT>> = HashMap::new();
+        let mut stolen_cache: Vec<usize> = Vec::new();
         for (si, s) in self.slots.iter().enumerate() {
             let versions = [
                 s.live
@@ -2748,6 +2781,22 @@ impl Engine {
                 s.next.as_ref().map(|n| (true, &n.plan)),
             ];
             for (next, plan) in versions.into_iter().flatten() {
+                let on_core = !next
+                    && self.dedup.plan_matches(s.def_id, plan)
+                    && !self.dedup.is_refused(s.def_id);
+                if on_core {
+                    // A live version on the core: its rows go to the core's consumer, not to a
+                    // `RouteT` fan-out (a refused plan keeps its routes, draining entry or not).
+                    continue;
+                }
+                if !next && !self.dedup.is_refused(s.def_id) && self.dedup.entry(s.def_id).is_some()
+                {
+                    // The executor takes the rows while the core still runs the old plan (a
+                    // re-plan waits for the queue to drain): the version's cascade cache went
+                    // into the target, so the view must rebuild (the rebuild reads the source
+                    // and seeds the map afresh).
+                    stolen_cache.push(si);
+                }
                 if plan.is_incremental() || matches!(plan.mode, Mode::Global) {
                     for (ai, a) in plan.aliases.iter().enumerate() {
                         routes
@@ -2794,6 +2843,15 @@ impl Engine {
                         next,
                         kind: RouteKind::MapChild(ci),
                     });
+                }
+            }
+        }
+        for si in stolen_cache {
+            if let Some(l) = self.slots[si].live.as_mut().filter(|l| !l.frozen) {
+                l.dirty.rebuild = true;
+                if l.since.is_none() {
+                    let b = self.boundary.to_position();
+                    l.since = Some(b);
                 }
             }
         }
@@ -2853,21 +2911,7 @@ impl Engine {
         }) {
             return routes;
         }
-        let current = match self.shapes.get(&(key.clone(), columns)) {
-            Some(n) => *n,
-            None => {
-                // One fresh read per (table, shape) until the next DDL clears the cache.
-                self.catalog.invalidate(key);
-                let n = self
-                    .table_info(key)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|i| i.columns.len());
-                self.shapes.insert((key.clone(), columns), n);
-                n
-            }
-        };
+        let current = self.current_columns(key, columns).await;
         let mut kept = Vec::with_capacity(routes.len());
         let mut outdated = Vec::new();
         for r in routes.iter() {
@@ -2893,6 +2937,124 @@ impl Engine {
         Arc::new(kept)
     }
 
+    /// New or replaced core targets (`synced`) run with the live version's cascade cache (their
+    /// rows arrive via `Source`, their hop queries read the source with it): `replace_target`
+    /// keeps the OLD target's caches, so the version's freshly built one moves in. A cache that
+    /// still seeds holds its target (fed nothing) until its install/drain delivers it.
+    /// B2 (owner rule: incremental views never fall back to a full rebuild): a refused
+    /// definition's cascade cache comes back out of its removed core target
+    /// (`Synced::lost_cache`, taken by `exec::Dedup::sync` / `advance_replacements` before
+    /// `remove_target`) - restore it into the live version, so executor (b) keeps resolving
+    /// cascaded and mapped child rows from the real map. Rows the core had already applied sit
+    /// at or after `boundary` (a target that is behind holds it back, see `lag_floor`), so no
+    /// replay floor is lowered for them; a version whose own cache is seeding keeps its
+    /// in-flight seed (the build's `deliver_cache` moves the fresh one in).
+    fn restore_lost_caches(&mut self, synced: &mut crate::exec::Synced) {
+        for (id, cache) in synced.lost_cache.drain(..) {
+            let Some(i) = self.idx_of(id) else {
+                continue;
+            };
+            if let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
+                if !l.dirty.cache.is_seeding() {
+                    l.dirty.cache = cache;
+                }
+            }
+        }
+    }
+
+    fn move_core_caches(&mut self, synced: &crate::exec::Synced) {
+        for id in self.dedup.waiting_cache() {
+            let cache = self
+                .slots
+                .iter_mut()
+                .find(|s| s.def_id == id)
+                .and_then(|s| s.live.as_mut())
+                .filter(|l| !l.frozen && !l.dirty.cache.is_seeding())
+                .map(|l| std::mem::take(&mut l.dirty.cache));
+            if let Some(cache) = cache {
+                self.dedup.deliver_cache(id, cache);
+            }
+        }
+        for id in synced.added.iter().chain(synced.replaced.iter()) {
+            let slot = self.slots.iter_mut().find(|s| s.def_id == *id);
+            let live = slot.and_then(|s| s.live.as_mut()).filter(|l| !l.frozen);
+            if let Some(l) = live {
+                // The core runs the new (patched) plan from here on: its source reads the live
+                // column layout again, so (a) takes the view back (see `Dedup::plan_matches`) -
+                // which means its `RouteT` must go (a route that outlives the mark would feed
+                // the view twice), so `rebuild_routes` runs at this flush.
+                if self.dedup.core_shape_stale(*id) {
+                    self.core_shape_routes = true;
+                }
+                self.dedup.clear_shape_stale(*id);
+                if l.dirty.cache.is_seeding() {
+                    self.dedup.hold_for_cache(*id);
+                } else if l.dirty.cache.routes.iter().any(|r| !r.rows.is_empty()) {
+                    // Only a cache with rows goes over: a live version whose rows went to the
+                    // core all along never fed its own map, and `replace_target` kept the old
+                    // target's rows - taking an empty cache would erase them (the consumer then
+                    // expands a parent's change to nothing).
+                    let cache = std::mem::take(&mut l.dirty.cache);
+                    self.dedup.set_cache(*id, cache);
+                }
+            }
+        }
+    }
+
+    /// A build seeds a fresh cascade cache (`build_task`'s `seed_cache`, installed by
+    /// [`Self::finish_next`]): a live version on the core must run its target with it, or the
+    /// consumer expands cascades from a cache that no longer has the rows. The hold lifts as
+    /// soon as the cache is in (the binlog loop feeds no rows in between).
+    fn reseed_core_cache(&mut self, def_id: u64) {
+        if !self.on_core(def_id) {
+            return;
+        }
+        let seeding = self
+            .slots
+            .iter()
+            .find(|s| s.def_id == def_id)
+            .and_then(|s| s.live.as_ref())
+            .map(|l| l.dirty.cache.is_seeding())
+            .unwrap_or(true);
+        if seeding {
+            // The build has not finished seeding: the flush's `move_core_caches` delivers it
+            // once it has (the target is fed nothing meanwhile).
+            self.dedup.hold_for_cache(def_id);
+            return;
+        }
+        let cache = self
+            .slots
+            .iter_mut()
+            .find(|s| s.def_id == def_id)
+            .and_then(|s| s.live.as_mut())
+            .filter(|l| l.dirty.cache.routes.iter().any(|r| !r.rows.is_empty()))
+            .map(|l| std::mem::take(&mut l.dirty.cache));
+        if let Some(cache) = cache {
+            self.dedup.hold_for_cache(def_id);
+            self.dedup.deliver_cache(def_id, cache);
+        }
+    }
+
+    /// The column count `key` really has now (the `current` of [`Self::check_shapes`], read
+    /// once per (table, TABLE_MAP shape) until the next DDL clears the cache).
+    async fn current_columns(&mut self, key: &TableRef, columns: u64) -> Option<usize> {
+        match self.shapes.get(&(key.clone(), columns)) {
+            Some(n) => *n,
+            None => {
+                // One fresh read per (table, shape) until the next DDL clears the cache.
+                self.catalog.invalidate(key);
+                let n = self
+                    .table_info(key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|i| i.columns.len());
+                self.shapes.insert((key.clone(), columns), n);
+                n
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- streaming
 
     async fn stream(
@@ -2905,6 +3067,10 @@ impl Engine {
         // Not even the server's heartbeats for this long: the connection is dead (half-open).
         let silence = (self.cfg.heartbeat * 3).max(Duration::from_secs(15));
         'reconnect: loop {
+            // The core's boundary is where reading starts: on the first connect the resume
+            // position, on a reconnect the last boundary. Buffered ids then pin real positions,
+            // never the empty one that `pending_floor` ignores.
+            self.dedup.core.rewound(pos.clone());
             self.metrics.beat();
             // A connect is a repeat (the reader resumes from `boundary`, and delete-before-
             // insert tolerates re-applied events): the one helper with Policy::CONNECT, and no
@@ -3348,14 +3514,141 @@ impl Engine {
                 // The definitions table and the commit fence's table are ours: no view reads
                 // them, both are remembered without a route.
                 if key.0 == self.schema && (key.1 == meta::DEFS || key.1 == mysql::table()) {
-                    self.table_ids.insert(table_id, (key, None));
+                    self.table_ids.insert(table_id, (key, None, None));
                     return Ok(());
                 }
                 let route = match self.routes.get(&key).cloned() {
                     Some(r) => Some(self.check_shapes(&key, r, columns).await),
                     None => None,
                 };
-                self.table_ids.insert(table_id, (key, route));
+                // Core targets: this table as the core's consumer sees it; an occurrence
+                // planned for another column count re-plans its view (as `check_shapes` does
+                // for outdated plans on routes).
+                let probe = self.dedup.core.source(&key, Some(columns as usize));
+                let mut src = probe.clone();
+                if let Some(s) = &probe {
+                    let mut keep_a = false;
+                    let mut delivered = false;
+                    for t in self.dedup.core.mismatched(s) {
+                        let Some(id) = self.dedup.def_of(t) else {
+                            continue;
+                        };
+                        let p = self
+                            .slots
+                            .iter()
+                            .find(|sl| sl.def_id == id)
+                            .and_then(|sl| sl.live.as_ref())
+                            .filter(|l| !l.frozen)
+                            .map(|l| l.plan.clone());
+                        let Some(p) = p else {
+                            continue;
+                        };
+                        let want = p
+                            .aliases
+                            .iter()
+                            .find(|a| a.table.schema == key.0 && a.table.name == key.1)
+                            .map(|a| a.table.columns.len())
+                            .or_else(|| {
+                                p.cascades
+                                    .iter()
+                                    .find(|c| c.parent.schema == key.0 && c.parent.name == key.1)
+                                    .map(|c| c.parent.columns.len())
+                            })
+                            .or_else(|| {
+                                p.cascades
+                                    .iter()
+                                    .find(|c| c.child == key)
+                                    .map(|c| c.child_table.columns.len())
+                            })
+                            .or_else(|| {
+                                p.tables
+                                    .iter()
+                                    .position(|t| *t == key)
+                                    .and_then(|ti| p.table_columns[ti].as_ref().map(Vec::len))
+                            });
+                        let current = self.current_columns(&key, columns).await;
+                        if want.is_some_and(|n| Some(n) != current)
+                            && !self.replan.contains_key(&id)
+                        {
+                            warn!(table = %key.1, "table definition differs from the view's plan; re-planning");
+                            self.schedule_replan(id, true, false);
+                        }
+                        if self.dedup.replacing(id) {
+                            let prefix = self.core_hold_prefix(id);
+                            if prefix {
+                                // A held equal-shape replace whose registered occurrences,
+                                // cascades and maps all read a positional prefix of the live
+                                // layout (columns added or dropped outside the reads): the old
+                                // registered reads still land on the same columns of this map's
+                                // rows, so (a) keeps the view - fed through a source with no
+                                // column-count skip (`None`: any shape).
+                                keep_a = true;
+                            } else if self.in_txn {
+                                // Mid-transaction the queue may hold this transaction's own
+                                // items: only a fenced flush may apply them. The (b) cache
+                                // takes the view over until the shape settles, and it is
+                                // rebuilt from the source.
+                                if self.dedup.mark_shape_stale(id) {
+                                    self.core_shape_routes = true;
+                                    if let Some(l) = self
+                                        .slots
+                                        .iter_mut()
+                                        .find(|sl| sl.def_id == id)
+                                        .and_then(|sl| sl.live.as_mut())
+                                        .filter(|l| !l.frozen)
+                                    {
+                                        l.dirty.rebuild = true;
+                                        if l.since.is_none() {
+                                            let b = self.boundary.to_position();
+                                            l.since = Some(b);
+                                        }
+                                    }
+                                }
+                            } else {
+                                // The registered reads would index moved columns: this map's
+                                // rows must not go to the core until the replace is delivered.
+                                // The queue holds only rows fed before the DDL - applicable
+                                // under the old plan - so run the jobs and deliver now (the
+                                // drain loop feeds no rows meanwhile), then this map's rows
+                                // flow to the core under the new registration. Nothing is
+                                // lost, so no rebuild.
+                                self.flush_dedup().await;
+                                let mut synced = self.dedup.advance_replacements();
+                                self.restore_lost_caches(&mut synced);
+                                self.move_core_caches(&synced);
+                                delivered = !synced.replaced.is_empty();
+                                if self.dedup.replacing(id) {
+                                    // Jobs in retry hold keep the queue: the rows would skip
+                                    // both writers - (b) takes the view over and it is rebuilt
+                                    // from the source.
+                                    if self.dedup.mark_shape_stale(id) {
+                                        self.core_shape_routes = true;
+                                        if let Some(l) = self
+                                            .slots
+                                            .iter_mut()
+                                            .find(|sl| sl.def_id == id)
+                                            .and_then(|sl| sl.live.as_mut())
+                                            .filter(|l| !l.frozen)
+                                        {
+                                            l.dirty.rebuild = true;
+                                            if l.since.is_none() {
+                                                let b = self.boundary.to_position();
+                                                l.since = Some(b);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if keep_a {
+                        src = self.dedup.core.source(&key, None);
+                    } else if delivered {
+                        // The replace landed: this map's count is the registered one now.
+                        src = self.dedup.core.source(&key, Some(columns as usize));
+                    }
+                }
+                self.table_ids.insert(table_id, (key, route, src));
             }
             Item::Rows {
                 table_id,
@@ -3363,7 +3656,7 @@ impl Engine {
                 event,
             } => {
                 self.in_txn = true;
-                let Some((key, route)) = self.table_ids.get(&table_id).cloned() else {
+                let Some((key, route, src)) = self.table_ids.get(&table_id).cloned() else {
                     return Ok(());
                 };
                 if key.0 == self.schema && key.1 == meta::DEFS {
@@ -3386,7 +3679,7 @@ impl Engine {
                         .xa_current
                         .as_ref()
                         .is_some_and(|(_, xa)| xa.bytes <= XA_HOLD_BYTES);
-                let Some(route) = route else {
+                if route.is_none() && src.is_none() {
                     // No view reads it now; one defined while this transaction is prepared may.
                     // Keep its rows so `xa_committed` can feed that view instead of rebuilding it
                     // (owner rule), up to one prepared transaction's budget of kept rows.
@@ -3401,16 +3694,26 @@ impl Engine {
                         }
                     }
                     return Ok(());
-                };
+                }
                 let since = self.boundary.to_position();
-                self.mark_any(&route, &since);
-                let need_rows =
-                    self.xa_current.is_some() || route.iter().any(|r| r.kind != RouteKind::Any);
+                if let Some(route) = &route {
+                    self.mark_any(route, &since);
+                }
+                let need_rows = self.xa_current.is_some()
+                    || src.is_some()
+                    || route
+                        .as_ref()
+                        .is_some_and(|rt| rt.iter().any(|r| r.kind != RouteKind::Any));
                 if !need_rows {
                     return Ok(());
                 }
                 let rows = reader.rows(table_id, &event)?;
-                self.feed_rows(&route, &rows, &since);
+                if let Some(route) = &route {
+                    self.feed_rows(route, &rows, &since);
+                }
+                if let Some(s) = &src {
+                    self.feed_core(s, &rows, None, route.is_none());
+                }
                 if let Some((_, xa)) = self.xa_current.as_mut() {
                     xa.rows
                         .extend(rows.into_iter().map(|(b, a)| (key.clone(), b, a)));
@@ -3509,6 +3812,7 @@ impl Engine {
                     && Cursor::from_position(self.flavor, p) > self.boundary
                 {
                     self.boundary = Cursor::from_position(self.flavor, p);
+                    self.dedup.boundary(p, Instant::now());
                     self.persist_needed = true;
                     self.after_boundary();
                 }
@@ -3526,6 +3830,7 @@ impl Engine {
     fn end_txn(&mut self, pos: Position) -> Position {
         self.in_txn = false;
         self.table_ids.clear();
+        self.dedup.boundary(&pos, Instant::now());
         std::mem::replace(&mut self.boundary, Cursor::from_position(self.flavor, &pos))
             .to_position()
     }
@@ -3543,6 +3848,14 @@ impl Engine {
             if let Some(route) = self.routes.get(&t).cloned() {
                 self.mark_any(&route, &xa.start.to_position());
                 self.feed_rows(&route, &rows, &xa.start.to_position());
+            }
+            if let Some(s) = self.dedup.core.source(&t, None) {
+                self.feed_core(
+                    &s,
+                    &rows,
+                    Some(&xa.start.to_position()),
+                    !self.routes.contains_key(&t),
+                );
             }
         }
         // Only the tables whose rows were dropped (past `XA_HOLD_BYTES`) still cost a view a
@@ -3669,9 +3982,21 @@ impl Engine {
         since: &Position,
     ) {
         let (mut seen, mut skipped) = (0u64, 0u64);
+        // A live version whose cascade cache went into a core target it does not run (a re-plan
+        // `sync` holds back, or a refusal still draining, see `rebuild_routes`): its kept child
+        // rows are gone, so a cascaded or mapped child row cannot be resolved from the parent -
+        // such a change marks the view for a rebuild instead (the rebuild reads the source and
+        // seeds the map afresh) rather than being applied blind.
+        let blind: Vec<bool> = route
+            .iter()
+            .map(|r| {
+                matches!(r.kind, RouteKind::Cascade(_) | RouteKind::MapChild(_))
+                    && self.cache_with_core(r.slot, r.next)
+            })
+            .collect();
         for (before, after) in rows {
             seen += 1;
-            for r in route {
+            for (ri, r) in route.iter().enumerate() {
                 let Some((plan, dirty, ver_since)) = self.version_of(*r) else {
                     continue;
                 };
@@ -3685,10 +4010,22 @@ impl Engine {
                                 dirty.cache.gap_until = None;
                             }
                         }
-                        feed_cascade(plan, c, dirty, before.as_ref(), after.as_ref())
+                        if !blind[ri] {
+                            feed_cascade(plan, c, dirty, before.as_ref(), after.as_ref())
+                        } else {
+                            dirty.rebuild = true;
+                            ver_since.get_or_insert_with(|| since.clone());
+                            Fed::Recorded
+                        }
                     }
                     RouteKind::MapChild(c) => {
-                        feed_map(plan, c, dirty, before.as_ref(), after.as_ref())
+                        if !blind[ri] {
+                            feed_map(plan, c, dirty, before.as_ref(), after.as_ref())
+                        } else {
+                            dirty.rebuild = true;
+                            ver_since.get_or_insert_with(|| since.clone());
+                            Fed::Recorded
+                        }
                     }
                     RouteKind::All(ti) => match (before, after, &plan.table_columns[ti]) {
                         (Some(b), Some(a), Some(cols)) if !columns_changed(b, a, cols) => {
@@ -3713,6 +4050,168 @@ impl Engine {
         self.first_dirty.get_or_insert_with(Instant::now);
         Metrics::add(&self.metrics.rows_seen, seen);
         Metrics::add(&self.metrics.rows_skipped, skipped);
+    }
+
+    /// Hot path, executor (a): the rows of a source table to the dedup core, whose consumer replaces the
+    /// `RouteT` fan-out of live Dedup-route versions (same per-row work, no image kept). `origin`: the replay
+    /// position of rows kept until now (an XA transaction's, at its XA COMMIT); `count`: no `RouteT` counted
+    /// them in `rows_seen`.
+    fn feed_core(
+        &mut self,
+        s: &crate::dedup::Source,
+        rows: &[(Option<BinlogRow>, Option<BinlogRow>)],
+        origin: Option<&Position>,
+        count: bool,
+    ) {
+        for (b, a) in rows {
+            match origin {
+                Some(o) => self.dedup.core.row_at(o, s, b.as_ref(), a.as_ref()),
+                None => self.dedup.core.row(s, b.as_ref(), a.as_ref()),
+            }
+        }
+        if count {
+            Metrics::add(&self.metrics.rows_seen, rows.len() as u64);
+        }
+        self.dedup.note_rows(rows.len());
+        self.first_dirty.get_or_insert_with(Instant::now);
+        self.core_events();
+    }
+
+    /// Exactly one authority writes a view: executor (a) while its live version runs with the
+    /// plan its core target was registered under - including while a replace of equal shape
+    /// waits for the queue to drain (`Dedup::plan_matches`: the running target reads the same
+    /// way, unless its registered source reads another column layout, which drops the rows it
+    /// skips). A refused plan, and a refused target still draining, leave the view to executor
+    /// (b), which has their `RouteT`s.
+    /// (b) hot path: `cache_with_core` asks this once per row event for each cascaded/mapped
+    /// route, so the def's slot goes through the existing def→slot index (`idx_of`).
+    fn on_core(&self, def_id: u64) -> bool {
+        let Some(i) = self.idx_of(def_id) else {
+            return false;
+        };
+        match self.slots[i].live.as_ref().filter(|l| !l.frozen) {
+            Some(l) => !self.dedup.is_refused(def_id) && self.dedup.plan_matches(def_id, &l.plan),
+            None => false,
+        }
+    }
+
+    /// Column equality (`catalog::Column` carries no `PartialEq`): every field, so a
+    /// same-name-same-place column with another type or nullability is not "the same".
+    fn same_column(x: &crate::catalog::Column, y: &crate::catalog::Column) -> bool {
+        x.name == y.name
+            && x.kind == y.kind
+            && x.param == y.param
+            && x.exact == y.exact
+            && x.invisible == y.invisible
+            && x.data_type == y.data_type
+            && x.column_type == y.column_type
+            && x.charset == y.charset
+            && x.collation == y.collation
+            && x.octet_len == y.octet_len
+            && x.nullable == y.nullable
+            && match (&x.generated, &y.generated) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.expr == b.expr && a.stored == b.stored && a.deps == b.deps,
+                _ => false,
+            }
+    }
+
+    /// A held equal-shape replace (`Dedup::replacing`) may keep executor (a) while the table
+    /// already logs another column count: true when every shape the core registered for
+    /// `def_id` - each alias table, cascade parent and map child - is a positional prefix of
+    /// the live plan's shape of the same table (an ALTER added columns after the reads, or
+    /// dropped unread ones), so the registered positional reads still name the same columns
+    /// of the new layout and the rows may be fed without the consumer's column-count skip.
+    /// Anything else (a column moved or dropped inside a read) returns false: the caller
+    /// marks the version shape-stale, executor (b) takes the rows and the view is rebuilt.
+    fn core_hold_prefix(&self, def_id: u64) -> bool {
+        let (Some(e), Some(l)) = (
+            self.dedup.entry(def_id),
+            self.slots
+                .iter()
+                .find(|s| s.def_id == def_id)
+                .and_then(|s| s.live.as_ref())
+                .filter(|l| !l.frozen),
+        ) else {
+            return false;
+        };
+        if e.plan.table_columns != l.plan.table_columns
+            || e.plan.aliases.len() != l.plan.aliases.len()
+            || e.plan.cascades.len() != l.plan.cascades.len()
+        {
+            return false;
+        }
+        let prefix = |a: &[crate::catalog::Column], b: &[crate::catalog::Column]| -> bool {
+            a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| Self::same_column(x, y))
+        };
+        e.plan
+            .aliases
+            .iter()
+            .zip(&l.plan.aliases)
+            .all(|(x, y)| prefix(&x.table.columns, &y.table.columns))
+            && e.plan.cascades.iter().zip(&l.plan.cascades).all(|(x, y)| {
+                x.parent.schema == y.parent.schema
+                    && x.parent.name == y.parent.name
+                    && prefix(&x.parent.columns, &y.parent.columns)
+                    && x.child_table.schema == y.child_table.schema
+                    && x.child_table.name == y.child_table.name
+                    && prefix(&x.child_table.columns, &y.child_table.columns)
+            })
+    }
+
+    /// `true`: the live version of `slot` does not run the core target that holds its cascade
+    /// cache (a refusal still drains the target), so executor (b) must not resolve cascaded or
+    /// mapped child rows from a cache it no longer has.
+    fn cache_with_core(&self, slot: usize, next: bool) -> bool {
+        if next {
+            return false;
+        }
+        let Some(s) = self.slots.get(slot) else {
+            return false;
+        };
+        match s.live.as_ref().filter(|l| !l.frozen) {
+            Some(_) => self.dedup.entry(s.def_id).is_some() && !self.on_core(s.def_id),
+            None => false,
+        }
+    }
+
+    /// What the dedup core reported: changes with unknown ids take the documented safety net of their
+    /// version (a rebuild, warned at most once a minute, guard R1 c). A cascade-cache gap cannot
+    /// be reported yet: no cascade plan reaches the core (D-6T-cascades), the host's
+    /// `CoreEvent::CascadeGap` handling lives in `tmp/out/lvs-step6/6t/cg-core-partial.patch`
+    /// until cascade-gap-core moves map cascades onto the core.
+    fn core_events(&mut self) {
+        for ev in self.dedup.core.events() {
+            // lazyview does not stage XA in the core (F7); other events have no host action.
+            if let crate::dedup::CoreEvent::Unknown { target, why } = ev {
+                let Some(i) = self.dedup.def_of(target).and_then(|id| self.idx_of(id)) else {
+                    continue;
+                };
+                if !self.on_core(self.slots[i].def_id) {
+                    // (b) is the authority: its own apply path reports unknown rows.
+                    continue;
+                }
+                let Some(name) = self
+                    .slots
+                    .get(i)
+                    .filter(|s| s.live.as_ref().is_some_and(|l| !l.frozen))
+                    .map(|s| s.name.clone())
+                else {
+                    continue;
+                };
+                if let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
+                    l.dirty.rebuild = true;
+                    if l.since.is_none() {
+                        let b = self.boundary.to_position();
+                        l.since = Some(b);
+                    }
+                }
+                crate::accumulate::warn_throttled(
+                    &LAST_UNKNOWN,
+                    || warn!(view = %name, why, "ids unknown, rebuilding the view"),
+                );
+            }
+        }
     }
 
     /// Oldest replay position of a change not yet applied to a maintained table: a restart from
@@ -3895,6 +4394,15 @@ impl Engine {
         }
         held.retain(|t, _| !touched.contains(t));
         let (def, targets) = (s.definition.clone(), s.targets.clone());
+        // A core-owned version's queued rows predate this DDL: drain them here, between
+        // transactions, while (a) is still the authority and `l.plan` is not swapped yet (a job
+        // of a version the executor has taken over only drains the queue and answers empty, so
+        // draining after the swap would lose those rows). With the queue empty, `sync` below
+        // replaces the target in place instead of holding it: a held equal-shape replace leaves
+        // `on_core` false and executor (b) takes the view over with a rebuild.
+        if !self.in_txn && self.on_core(id) {
+            self.flush_dedup().await;
+        }
         // The catalog read below must see the DDL.
         if !self.fence().await {
             return false;
@@ -4095,6 +4603,17 @@ impl Engine {
             due.extend(l.lag.values().map(|g| g.retry_at));
             due.extend(l.behind.values().copied());
         }
+        // Core targets (guard R3, lead 2026-11-13): the flush trigger is the running row count
+        // in exec::Dedup that `feed_core` bumps, plus the retry hold `drained` cached at the
+        // last flush: O(1) per binlog event, never a pass over the core or the slots. Fed rows
+        // ride the batch deadline below (`feed_core` marks the version dirty); only rows left
+        // by an interrupted flush, with no batch window armed, wake the flush themselves.
+        if self.dedup.rows_pending() && self.first_dirty.is_none() {
+            due.push(now);
+        }
+        if let Some(t) = self.dedup.trigger(now) {
+            due.push(t);
+        }
         let urgent = due.into_iter().min();
         let batch = self.first_dirty.map(|t| t + self.cfg.batch_window);
         let persist = self
@@ -4174,6 +4693,7 @@ impl Engine {
         // rebuild); past their byte budget the reader waits instead (see `hold_for_builds`).
         // Builds, refreshes and lookups below must see every transaction read so far.
         let has_reads = !ready.is_empty()
+            || self.dedup.core.pending_any()
             || self.slots.iter().any(|s| {
                 s.live
                     .as_ref()
@@ -4221,6 +4741,24 @@ impl Engine {
                 self.refresh_all_live().await;
                 slow.push((t1.elapsed(), "refresh (all views, from)", 0));
             }
+            let t1 = Instant::now();
+            self.flush_dedup().await;
+            self.dedup.drained();
+            // The jobs just ran: drain their reports too (`feed_core` drains the rest on the
+            // next event; a gap noted by the last queued job would else wait for a row that
+            // may never come).
+            self.core_events();
+            // Replans `sync` held back (items in flight): the queue has drained now.
+            let mut synced = self.dedup.advance_replacements();
+            self.restore_lost_caches(&mut synced);
+            self.move_core_caches(&synced);
+            if !synced.removed.is_empty() || std::mem::take(&mut self.core_shape_routes) {
+                // A refused version's target is finally gone, or a held equal-shape replace was
+                // marked shape-stale: the rows come back to (are taken over by) the `RouteT`
+                // path, which `rebuild_routes` rewires (its `sync` delivers the replace too).
+                self.rebuild_routes();
+            }
+            slow.push((t1.elapsed(), "refresh (dedup core)", 0));
         }
         if let Err(e) = self.persist_position(false).await {
             self.meta_failed(e, "saving the binlog position").await?;
@@ -4269,20 +4807,28 @@ impl Engine {
                     .or(s.last_plan.as_ref());
                 let mode = plan.map(|p| mode_name(p).0).unwrap_or("unknown");
                 let (tally, pending, cached) = match s.live.as_mut() {
-                    Some(l) => (
-                        {
-                            let mut t = std::mem::take(&mut l.dirty.tally);
-                            t.add(&self.dedup.tally(s.def_id));
-                            t
-                        },
-                        pending_ids(&l.dirty, &l.plan) + self.dedup.pending(s.def_id),
-                        l.dirty
-                            .cache
-                            .routes
-                            .iter()
-                            .map(|r| r.rows.len() as u64)
-                            .sum(),
-                    ),
+                    Some(l) => {
+                        let mut t = std::mem::take(&mut l.dirty.tally);
+                        // Rows the core's consumer skipped are not counted by `feed_rows`
+                        // (that is executor (b)'s path): lift them into the engine's counter
+                        // as this tally takes them.
+                        let core_t = self.dedup.tally(s.def_id);
+                        crate::metrics::Metrics::add(
+                            &self.metrics.rows_skipped,
+                            core_t.rows_skipped,
+                        );
+                        t.add(&core_t);
+                        (
+                            t,
+                            pending_ids(&l.dirty, &l.plan) + self.dedup.pending(s.def_id),
+                            l.dirty
+                                .cache
+                                .routes
+                                .iter()
+                                .map(|r| r.rows.len() as u64)
+                                .sum(),
+                        )
+                    }
                     None => Default::default(),
                 };
                 crate::metrics::Metrics::add(&self.metrics.cascade_rows, tally.cascade_rows);
@@ -4939,6 +5485,8 @@ impl Engine {
             }
         }
         self.slots[i].stats.carried(carried.0, carried.1);
+        // The build seeded a cascade cache for this version: a target on the core runs with it.
+        self.reseed_core_cache(def_id);
         if replan_after {
             // The upstream data changed during this build: build once more from a new plan.
             self.schedule_replan(def_id, false, false);
@@ -5647,6 +6195,201 @@ impl Engine {
                 (Ok(_), None) => unreachable!("every prepared refresh ran"),
             };
             self.live_end(i, st, r).await;
+        }
+    }
+
+    /// Executor (a): the dedup core's due jobs until none is due (a failed job's lane holds it
+    /// back, so the loop ends). One job at a time; each job's refresh runs its chunks
+    /// concurrently when supervised.
+    async fn flush_dedup(&mut self) {
+        loop {
+            let jobs = self.dedup.core.due(Instant::now());
+            if jobs.is_empty() {
+                return;
+            }
+            for job in jobs {
+                self.run_dedup_job(job).await;
+            }
+        }
+    }
+
+    /// One job: its hop items answered on the source (the flush's fence covers `Chunk::high`),
+    /// then its ids refreshed on every target database of the version through `refresh`, as
+    /// executor (b) refreshes units.
+    async fn run_dedup_job(
+        &mut self,
+        job: crate::dedup::Job<Position, crate::dedup::NoItem, crate::dedup::NoJob>,
+    ) {
+        let chunk = match job.kind {
+            crate::dedup::JobKind::Flush(c) => c,
+            crate::dedup::JobKind::Executor(n) => match n {},
+        };
+        let fail_early = |s: &mut Self, job_id| {
+            s.dedup.core.complete(
+                job_id,
+                crate::dedup::JobResult::failed(Some(Instant::now() + Duration::from_millis(100))),
+            );
+        };
+        let Some(def_id) = self.dedup.def_of(job.target) else {
+            fail_early(self, job.id);
+            return;
+        };
+        let Some(i) = self.idx_of(def_id) else {
+            fail_early(self, job.id);
+            return;
+        };
+        // One authority per view (see `on_core`): a refused plan never took the rows at all, and
+        // a refused target still draining keeps its entry meanwhile. The core's items are then
+        // its own bookkeeping: its hop queries still run (the queue must drain before the entry
+        // is replaced), nothing is applied. A frozen or swapping version is NOT (b)'s turn: its
+        // items fail early and retry after the swap, never drained unapplied.
+        let taken = self.dedup.entry(def_id).is_some_and(|_| {
+            self.dedup.is_refused(def_id)
+                || self
+                    .slots
+                    .get(i)
+                    .and_then(|s| s.live.as_ref())
+                    .is_some_and(|l| !l.frozen && !self.dedup.plan_matches(def_id, &l.plan))
+        });
+        if taken && self.slots[i].live.is_none() {
+            self.dedup
+                .core
+                .complete(job.id, crate::dedup::JobResult::ok());
+            return;
+        }
+        // The version must still be live and not mid-swap (executor (a) never re-plans, F9 b).
+        if !taken
+            && (!self.slots[i].live.as_ref().is_some_and(|l| !l.frozen)
+                || self.slots[i].next.as_ref().is_some_and(|n| n.swapping))
+        {
+            fail_early(self, job.id);
+            return;
+        }
+        let (plan, layout, name) = {
+            let l = self.slots[i].live.as_ref().expect("live, checked above");
+            (l.plan.clone(), l.layout.clone(), self.slots[i].name.clone())
+        };
+        let floor = chunk.origin.clone();
+        // The chunk's items name the plan the core registered (a held re-plan keeps the old
+        // one): `to_dirty` and the hop lookups use it; the refresh uses the live version.
+        let Some(eplan) = self.dedup.entry(def_id).map(|e| e.plan.clone()) else {
+            fail_early(self, job.id);
+            return;
+        };
+        let (mut dirty, links) = crate::exec::Dedup::to_dirty(&eplan, chunk);
+        let (mut answers, mut queries, mut resolved) = (Vec::new(), 0u64, 0u64);
+        if !links.is_empty() {
+            match self
+                .dedup
+                .hop_answers(
+                    &mut self.src,
+                    &links,
+                    self.cfg.query_chunk,
+                    self.flavor == Flavor::MariaDb,
+                )
+                .await
+            {
+                Ok((a, q)) => {
+                    resolved = self.dedup.add_answers(&mut dirty, &a);
+                    queries = q;
+                    Metrics::add(&self.metrics.lookup_queries, queries);
+                    answers = a;
+                }
+                Err(e) => {
+                    if binlog::is_transient(&e) {
+                        self.heal_src().await;
+                    }
+                    warn!(view = %name, "hop queries failed: {e:#}");
+                    let delay = self.dedup.backoff(def_id, true);
+                    self.dedup.core.complete(
+                        job.id,
+                        crate::dedup::JobResult::failed(Some(Instant::now() + delay)),
+                    );
+                    return;
+                }
+            }
+        }
+        if taken {
+            // Executor (b) wrote these rows with the version's own plan: the core kept only
+            // its hop answers.
+            self.dedup.core.complete(
+                job.id,
+                crate::dedup::JobResult {
+                    hop_answers: answers,
+                    resolved,
+                    ..crate::dedup::JobResult::ok()
+                },
+            );
+            return;
+        }
+        let (lagging, targets) = {
+            let l = self.slots[i].live.as_ref().expect("live, checked above");
+            let lagging: Vec<String> = l.lag.keys().cloned().collect();
+            let targets: Vec<String> = l
+                .targets
+                .iter()
+                .filter(|t| !lagging.contains(t))
+                .cloned()
+                .collect();
+            (lagging, targets)
+        };
+        let r = self
+            .refresh(
+                &plan,
+                &layout,
+                &mut dirty,
+                &targets,
+                &name,
+                &mut Lookback::default(),
+                None,
+            )
+            .await;
+        match r {
+            Ok(mut r) => {
+                r.work.ids_resolved += resolved;
+                r.work.lookup_queries += queries;
+                self.note_refresh(i, &name, r, &lagging, floor, &targets);
+                self.refreshed.insert(name.clone());
+                self.dedup.backoff(def_id, false);
+                let shown = std::mem::take(&mut self.slots[i].refresh_failures)
+                    >= REFRESH_ERROR_SHOWN_AFTER;
+                if shown {
+                    self.show_refresh_error(i, None).await;
+                }
+                self.dedup.core.complete(
+                    job.id,
+                    crate::dedup::JobResult {
+                        hop_answers: answers,
+                        resolved,
+                        ..crate::dedup::JobResult::ok()
+                    },
+                );
+            }
+            Err(e) => {
+                // Never `schedule_replan`, never a rebuild (F9 b: executor (a) retries failed
+                // jobs with backoff). The shared failure counter still shows the error in
+                // `_lazyview_state` after `REFRESH_ERROR_SHOWN_AFTER` attempts, as (b) does.
+                if binlog::is_transient(&e) {
+                    self.heal_src().await;
+                }
+                let delay = self.dedup.backoff(def_id, true);
+                let s = &mut self.slots[i];
+                s.refresh_failures += 1;
+                let n = s.refresh_failures;
+                Metrics::add(&self.metrics.refresh_errors, 1);
+                warn!(view = %name, attempt = n, "refresh failed: {e:#}; retrying in {delay:?}");
+                if n == REFRESH_ERROR_SHOWN_AFTER {
+                    let msg = format!(
+                        "refresh failed {n} times in a row, retrying with backoff (the table is \
+                         stale meanwhile; rebuild = 1 in _lazyview re-plans the view): {e:#}"
+                    );
+                    self.show_refresh_error(i, Some(&msg)).await;
+                }
+                self.dedup.core.complete(
+                    job.id,
+                    crate::dedup::JobResult::failed(Some(Instant::now() + delay)),
+                );
+            }
         }
     }
 
