@@ -73,6 +73,8 @@ that are not read by `envFrom` never enter the container's environment:
 spec:
   template:
     spec:
+      securityContext:
+        fsGroup: 65532
       containers:
         - name: lazyview
           volumeMounts:
@@ -90,17 +92,21 @@ spec:
             sources:
               - secret:
                   name: lazyview-files
-                  defaultMode: 0400
+                  defaultMode: 0440
 ```
 
 ```sh
 kubectl -n lazyview create secret generic lazyview-files \
   --from-file=lazyview_password=./password.txt \
-  --from-file=lazyview_health_token=$(openssl rand -hex 24)
+  --from-literal=lazyview_health_token="$(openssl rand -hex 24)"
 ```
 
-The pod runs as uid 65532, so `defaultMode: 0400` leaves the files readable by lazyview alone. Both
-files are read at container start: after
+The kubelet itself writes Secret volume files, as uid 0 with group `fsGroup`; the container user
+never owns them. That is why the patch adds `fsGroup: 65532` and uses `defaultMode: 0440`: without
+`fsGroup` a `0400` file stays `root:root` and unreadable (lazyview then exits at startup naming the
+unreadable `_FILE` variable), while `fsGroup: 65532` makes the kubelet set the volume's group to
+65532 and `0440` leaves the files readable by lazyview's group and by nothing else. Both files are
+read at container start: after
 `kubectl -n lazyview create secret … --dry-run=client -o yaml | kubectl apply -f -`, run
 `kubectl -n lazyview rollout restart deployment/lazyview`.
 
