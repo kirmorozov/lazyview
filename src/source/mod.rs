@@ -9,6 +9,12 @@
 //!
 //! Copy set: `std` + `anyhow` + `mysql_async` only, no `crate::` beyond the copy set, no
 //! environment variables (a knob is a parameter the caller passes), no logging.
+//!
+//! Host code stays out of this directory entirely (decision D5): nothing under `src/source/` may
+//! use the host's own modules (`target`, `mv`, `engine`, `meta`, `supervisor`), nor *declare* a
+//! module that does — a `mod` declaration is an import too, and an embedder copying these files
+//! verbatim would not compile. Host-side PostgreSQL source code lives in `pgsrc`, declared from
+//! `src/lib.rs`.
 
 /// The MySQL-family side (MySQL and Percona run the same server): preflight, the status
 /// statement spelling, GTID text, transaction payloads, the QUERY/XA classifications and the
@@ -22,10 +28,6 @@ use mysql_async::binlog::events::{BinlogEventHeader, Event};
 
 pub(crate) mod maria;
 pub(crate) mod percona;
-
-/// The PostgreSQL side (issue #57): the `pg_catalog` loader today, the stream and the fence
-/// later. Outside the copy set: it speaks `tokio_postgres` and calls the target's type map.
-pub(crate) mod postgres;
 
 /// A binlog coordinate. `pos` is the offset of the next event to read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
