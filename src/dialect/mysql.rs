@@ -142,11 +142,92 @@ pub(crate) fn normalize_source_row(
 /// stores the same value for them (numbers parsed with correct rounding, like the server's
 /// parser); the result is JSON-equal to the input, so it also binds as a `CAST(? AS JSON)`
 /// unit key. Text that does not parse is kept as it is.
+///
+/// The form is written here, by [`write_canonical`], and not by `serde_json`'s own `Value`
+/// serializer: what that one does with numbers and with the key order of a map depends on the
+/// `serde_json` features the BUILDING crate turned on (`Cargo` unifies them across the tree, and
+/// a crate that copies this file verbatim brings its own), so `to_vec(&value)` kept `10.00` and
+/// the input's key order under `preserve_order` + `arbitrary_precision` and the two sides of a
+/// comparison stopped matching. Parsing with `serde_json` stays (a feature change cannot make
+/// text that is not JSON parse, or change what a number means), only the rendering is ours.
 pub fn json_canonical(text: &[u8]) -> Vec<u8> {
     serde_json::from_slice::<serde_json::Value>(text)
         .ok()
-        .and_then(|v| serde_json::to_vec(&v).ok())
+        .and_then(|v| {
+            let mut out = Vec::new();
+            write_canonical(&mut out, &v).map(|()| out)
+        })
         .unwrap_or_else(|| text.to_vec())
+}
+
+/// One parsed value appended to `out` in that form, or `None` for a number the form has no
+/// rendering for, which makes [`json_canonical`] keep the whole text as it is.
+fn write_canonical(out: &mut Vec<u8>, value: &serde_json::Value) -> Option<()> {
+    use serde_json::Value as Json;
+    match value {
+        Json::Null => out.extend_from_slice(b"null"),
+        Json::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+        // The string serializer is the escaping, which no feature of `serde_json` changes: the
+        // control characters, `"` and `\` come out as the escapes the server's parser reads back
+        // as the same string.
+        Json::String(s) => out.extend_from_slice(&serde_json::to_vec(s.as_str()).ok()?),
+        Json::Number(n) => {
+            // The double every number has, and the check that it is a finite one: a number that
+            // is no double at all (`1e999`) has no rendering that means the same under both
+            // feature sets, so the whole text is kept as it is.
+            let d = n.as_f64().filter(|d| d.is_finite())?;
+            // An integer keeps its integer text (`1` stays `1`, which the server stores in a
+            // different type than `1.0`); `as_i64`/`as_u64` answer from the parsed value under
+            // every feature combination, so a value that came from `10.00` never takes this
+            // branch. A negative zero does not either: `arbitrary_precision` on its own reads
+            // `-0` as the integer 0 where every other set has the double `-0.0`, and the double
+            // is the reading they all agree on. Everything else is the double it parses to,
+            // rendered by `serde_json`'s float formatter, which the features do not touch:
+            // `10.00` becomes `10.0`, `18446744073709551616` keeps its exponent form.
+            let number = if d == 0.0 && d.is_sign_negative() {
+                serde_json::to_vec(&d)
+            } else if let Some(i) = n.as_i64() {
+                serde_json::to_vec(&i)
+            } else if let Some(u) = n.as_u64() {
+                serde_json::to_vec(&u)
+            } else {
+                serde_json::to_vec(&d)
+            }
+            .ok()?;
+            out.extend_from_slice(&number);
+        }
+        Json::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_canonical(out, item)?;
+            }
+            out.push(b']');
+        }
+        Json::Object(fields) => {
+            // Sorted here rather than left to the map's own order: `Value` keeps its keys sorted
+            // only while the map is a `BTreeMap`, and a map that does not keep them sorted hands
+            // two texts the server stores the same way two different results. Byte order is the
+            // order the `BTreeMap` had, which is what the two sides of a comparison need to agree
+            // on (the server sorts the keys its own way again when it parses what we send), and
+            // the last of a duplicated key is the one the parse kept.
+            let mut sorted: Vec<(&String, &serde_json::Value)> = fields.iter().collect();
+            sorted.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+            out.push(b'{');
+            for (i, (key, item)) in sorted.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&serde_json::to_vec(key.as_str()).ok()?);
+                out.push(b':');
+                write_canonical(out, item)?;
+            }
+            out.push(b'}');
+        }
+    }
+    Some(())
 }
 
 // The session renderings, moved verbatim from `crate::target::mysql` (`init_session`'s two SQL
@@ -750,6 +831,47 @@ mod tests {
         assert_ne!(c("[10.00]"), c("[10.01]"));
         assert_ne!(c(r#"["10.00"]"#), c(r#"["10.0"]"#), "strings stay exact");
         assert_eq!(c("not json"), "not json");
+    }
+
+    /// The canonical bytes themselves, pinned: unsorted keys come out sorted, `10.00` comes out
+    /// as the double it parses to, an integer keeps its integer text however wide, and the
+    /// nesting keeps its shape. `serde_json`'s `Value` serializer answers differently for the
+    /// first two under `preserve_order` + `arbitrary_precision` (it would keep the input's key
+    /// order and the text `10.00`), so this is the test that shows the form is written by
+    /// [`write_canonical`] and not by whatever features the building crate turned on.
+    #[test]
+    fn json_canonical_bytes_are_pinned() {
+        let c = |s: &str| String::from_utf8(json_canonical(s.as_bytes())).unwrap();
+        assert_eq!(
+            c(r#"{"z": [1, {"n": 10.00, "b": true}, []], "a": null,
+                    "m": {"k": "a\n\"b", "e": -0.5, "big": 12345678901234567890, "d": 1e20}}"#),
+            r#"{"a":null,"m":{"big":12345678901234567890,"d":1e+20,"e":-0.5,"k":"a\n\"b"},"z":[1,{"b":true,"n":10.0},[]]}"#
+        );
+        // The keys sort by byte, and the last of a duplicated key is the one that stays.
+        assert_eq!(
+            c(r#"{"b":1,"a":2,"aa":3,"a":4}"#),
+            r#"{"a":4,"aa":3,"b":1}"#
+        );
+        assert_eq!(
+            c(r#"{"~":4,"a":2,"A":1,"":0,"aa":3}"#),
+            r#"{"":0,"A":1,"a":2,"aa":3,"~":4}"#
+        );
+        // Integers stay integers up to `u64`; past it the double's own text.
+        assert_eq!(
+            c("[18446744073709551615,-9223372036854775808,0]"),
+            "[18446744073709551615,-9223372036854775808,0]"
+        );
+        // A negative zero is a double, the way the parser hands it over under every feature set.
+        assert_eq!(
+            c("[18446744073709551616,-0]"),
+            "[1.8446744073709552e+19,-0.0]"
+        );
+        // Nesting, and the escaping a string keeps.
+        assert_eq!(c("[[[10.00]]]"), "[[[10.0]]]");
+        assert_eq!(c(r#""\u0001é""#), "\"\\u0001é\"");
+        // A number that is no integer and no finite double has no stable form: the text is kept.
+        assert_eq!(c("1e999"), "1e999");
+        assert_eq!(c("[1,2,]"), "[1,2,]");
     }
 
     /// The three statements a session gets and the SQL modes the service drops when it reads a
