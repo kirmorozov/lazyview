@@ -1272,6 +1272,7 @@ fn chaos_tgt_reset_mid_write_txn() {
             &mut eng,
             &db,
             &tmap(&t1),
+            &HashMap::new(),
             &specs,
             "initial build on t1",
         )
@@ -1335,6 +1336,7 @@ fn chaos_tgt_reset_mid_write_txn() {
             &mut eng,
             &db,
             &tmap(&t1),
+            &HashMap::new(),
             &specs,
             "final after the reset",
         )
@@ -1400,6 +1402,7 @@ fn chaos_tgt_blackhole_during_flush() {
             &mut eng,
             &db,
             &t12,
+            &HashMap::new(),
             &specs,
             "initial build on both targets",
         )
@@ -1449,6 +1452,7 @@ fn chaos_tgt_blackhole_during_flush() {
             &mut eng,
             &db,
             &t12,
+            &HashMap::new(),
             &specs,
             "final after the catch-up",
         )
@@ -1503,6 +1507,7 @@ fn chaos_tgt_bandwidth_starvation() {
             &mut eng,
             &db,
             &tmap(&t1),
+            &HashMap::new(),
             &specs,
             "initial build on t1",
         )
@@ -1569,6 +1574,7 @@ fn chaos_tgt_bandwidth_starvation() {
             &mut eng,
             &db,
             &tmap(&t1),
+            &HashMap::new(),
             &specs,
             "final after the drain",
         )
@@ -1633,6 +1639,7 @@ fn chaos_both_sides_fragmented() {
             &mut eng,
             &db,
             &tmap(&t1),
+            &HashMap::new(),
             &specs,
             "initial build, unfragmented",
         )
@@ -1681,6 +1688,7 @@ fn chaos_both_sides_fragmented() {
             &mut eng,
             &db,
             &tmap(&t1),
+            &HashMap::new(),
             &specs,
             "final under fragmentation",
         )
