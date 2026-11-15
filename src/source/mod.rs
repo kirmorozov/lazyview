@@ -64,7 +64,8 @@ impl std::fmt::Display for Position {
 /// Where the source has got to, as everything outside the flavor modules knows it: an **opaque,
 /// ordered piece of text**. The engine compares, logs and persists this; the metadata tables
 /// store the [`Display`] text. What is behind it — a binlog file and offset for the MySQL family,
-/// the same pair ordered by LSN for MariaDB, later an LSN or xid for PostgreSQL — is the flavor's
+/// the same pair for MariaDB too (its offset restarts at every file, so its rule orders by the
+/// file's place in the index as well), later an LSN or xid for PostgreSQL — is the flavor's
 /// business: [`mysql::cursor_key`] and [`maria::cursor_key`] hold the ordering rules,
 /// [`mysql::parse`] the spelling, and the 4-byte file-header floor that made a raw offset of a
 /// fresh file meaningless (`pos.max(4)`) is [`mysql::floor_offset`]. The generic side gets

@@ -268,11 +268,12 @@ pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<
 
 // --- the cursor's rules: MariaDB's own ordering, the shared MySQL spelling ------------------
 
-/// MariaDB orders cursors by the LSN in `pos`: it grows across files, so the file name never
-/// breaks a tie. (The MySQL file-sequence rule happens to agree, because the file number follows
-/// the LSN; it is not the rule here, and the next flavor will not have files at all.)
+/// MariaDB orders cursors by the file's place in the index, then the offset inside it: `pos` is
+/// a byte offset that restarts at every file (the stream's own [`position_rule`] moves it as
+/// events fill the file), so it cannot order two files, while the file number grows with the
+/// LSN. The rule is the MySQL family's one, reached through `mysql.rs`, never a copy.
 pub(crate) fn cursor_key(p: &crate::source::Position) -> (u64, u64) {
-    (0, p.pos)
+    crate::source::mysql::position_key(p)
 }
 
 /// The text is the MySQL family's (`file:pos`): a call into `mysql.rs`, never a copy.

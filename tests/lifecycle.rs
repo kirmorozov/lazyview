@@ -528,16 +528,28 @@ fn lifecycle_unreadable_position_keeps_ready_rows() {
         let mut eng = ctx.start_engine(&db, &[])?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
         eng.stop().await?;
-        let (pos, identity): (u64, Option<String>) = c
-            .query_first("SELECT binlog_pos, CAST(server_identity AS CHAR) FROM _lazyview_status")
+        // The start reads the saved cursor (`binlog_cursor`, meta::load_position), so an
+        // unreadable saved position has to be simulated in the cursor's own text; the two
+        // pre-cursor columns move with it, as they do with every engine save.
+        let (file, pos, cursor, identity): (String, u64, String, Option<String>) = c
+            .query_first(
+                "SELECT CAST(binlog_file AS CHAR), binlog_pos, CAST(binlog_cursor AS CHAR), \
+                 CAST(server_identity AS CHAR) FROM _lazyview_status",
+            )
             .await?
             .context("no saved position")?;
         ensure!(identity.is_some(), "no saved server identity");
+        ensure!(
+            !cursor.is_empty(),
+            "the engine saved no cursor to make unreadable"
+        );
         for (what, set, expect) in [
             (
                 "a position past the end of its file",
                 format!(
-                    "UPDATE _lazyview_status SET binlog_pos = {}",
+                    "UPDATE _lazyview_status SET binlog_pos = {}, binlog_cursor = '{}:{}'",
+                    pos + 1_000_000_000,
+                    file,
                     pos + 1_000_000_000
                 ),
                 "is no longer available",
@@ -562,8 +574,9 @@ fn lifecycle_unreadable_position_keeps_ready_rows() {
                 "{what}: the state rows changed: {rows:?}"
             );
             c.exec_drop(
-                "UPDATE _lazyview_status SET binlog_pos = ?, server_identity = ?",
-                (pos, identity.clone()),
+                "UPDATE _lazyview_status SET binlog_file = ?, binlog_pos = ?, \
+                 binlog_cursor = ?, server_identity = ?",
+                (&file, pos, &cursor, identity.clone()),
             )
             .await?;
         }
