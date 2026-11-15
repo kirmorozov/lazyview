@@ -1,11 +1,14 @@
 name: ci
 
-# pull_request runs everything: lint, unit, e2e, the integration matrix and integration-multi (19 jobs).
+# pull_request runs everything: lint, unit, e2e, the integration matrix, integration-multi and the
+# advisory chaos job (20 jobs).
 # push to main runs only lint, unit, e2e, image and the integration matrix's mysql84 default-supervisor
 # entry (it is the single writer of the shared `integration` rust-cache that the PR runs restore); the
-# other 14 matrix entries and integration-multi are skipped there because landing is fast-forward only,
-# so the pushed commit is exactly the PR head whose pull_request run just went green on the same tree.
+# other 14 matrix entries, integration-multi and the chaos job are skipped there because landing is
+# fast-forward only, so the pushed commit is exactly the PR head whose pull_request run just went
+# green on the same tree.
 # push v* and workflow_dispatch run the full set (release needs the matrix and integration-multi).
+# The chaos job is advisory (continue-on-error) and in no `needs:` chain of image/release.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
 #   main  -> `image`   (needs lint + unit + e2e; the integration jobs run alongside, not required)
 #   v*    -> `release` (needs lint + unit + e2e + the integration matrix + the multi-server job;
@@ -266,6 +269,113 @@ jobs:
       - name: stop the servers
         if: always()
         run: docker compose down -v
+
+  chaos:
+    # The network-fault suite (tests/chaos.rs) over the Toxiproxy API: one job per server family
+    # (one LTS source of each product), the engine's connections reached through proxies the harness
+    # arms and tears down itself. Advisory while the suite settles (it annotates the run, never
+    # blocks it), and a PR pays exactly one extra job: mariadb1011 runs only on workflow_dispatch
+    # and a v* tag until lv-super calls the suite stable (lead decision Q3).
+    name: chaos (${{ matrix.flavor }}${{ matrix.advisory && ', advisory' || '' }})
+    # Never on the push-to-main leg (that stays at 6 jobs); v* tags and workflow_dispatch run it,
+    # both flavors there.
+    if: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    # 9 scenarios × ~120 s + the build; the scenario step gets its own, smaller, bound so a hung
+    # proxy still leaves room for the log steps below.
+    timeout-minutes: 25
+    continue-on-error: ${{ matrix.advisory }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One flavor per product family (the same service names and host ports as the integration
+        # matrix's two LTS entries). Flip `advisory` to false when lv-super calls the suite stable;
+        # mariadb1011 joins the per-PR leg in the same edit (the second list below).
+        include: >-
+          ${{ fromJSON(
+          (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
+          && '[{"flavor":"mysql84","port":33084,"advisory":true},{"flavor":"mariadb1011","port":33111,"advisory":true}]'
+          || '[{"flavor":"mysql84","port":33084,"advisory":true}]'
+          ) }}
+    env:
+      COMPOSE_FILE: docker-compose.test.yml
+      FLAVOR: ${{ matrix.flavor }}
+      # The daemon's API and the harness's proxy listen band are published on 127.0.0.1 only, with
+      # no token (lead decision Q5); unset, the whole suite prints SKIP instead of running.
+      LAZYVIEW_TEST_TOXI: 127.0.0.1:18474
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start ${{ matrix.flavor }} + toxiproxy (in the background)
+        run: docker compose --profile chaos up -d --quiet-pull "$FLAVOR" toxiproxy
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache (its mysql84 job writes it); never a second writer.
+          shared-key: integration
+          save-if: false
+      - name: build the chaos tests
+        run: cargo test --locked --test chaos --no-run
+      - name: wait for ${{ matrix.flavor }} + toxiproxy
+        run: docker compose --profile chaos up -d --wait --wait-timeout 300 "$FLAVOR" toxiproxy
+      - name: toxiproxy and server version
+        run: |
+          curl -fsS http://127.0.0.1:18474/version
+          docker compose exec -T "$FLAVOR" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
+      - name: chaos tests
+        timeout-minutes: 20
+        env:
+          LAZYVIEW_TEST_DSNS: ${{ matrix.flavor }}=mysql://lv:lv@127.0.0.1:${{ matrix.port }}/lvtest
+          # One server per job: the multi-server scenarios skip (visibly) instead of failing.
+          LAZYVIEW_TEST_REQUIRE_MULTI: "0"
+          # Every engine runs as the account with only the grants of docs/server-setup.md (the RDS /
+          # Aurora privilege model) — through the proxies, which is the point; setup and oracle
+          # queries stay on the admin account (lead decision Q4).
+          LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
+          LAZYVIEW_HEALTH_ADDR: "off"
+        shell: bash
+        # The scenarios all owe "the fault landed", so a run in which they silently skipped (the
+        # daemon down, the opt-in env lost) must not be green: every one of the nine has to show
+        # up as passed, the way the multi-server job checks its own four.
+        run: |
+          cargo test --locked --test chaos -- --test-threads=1 2>&1 | tee chaos-tests.log
+          for t in chaos_src_binlog_reset_mid_txn chaos_src_binlog_blackhole chaos_src_slow_recovers \
+                   chaos_src_limit_data_mid_binlog_event chaos_src_refresh_result_cut \
+                   chaos_tgt_reset_mid_write_txn chaos_tgt_blackhole_during_flush \
+                   chaos_tgt_bandwidth_starvation chaos_both_sides_fragmented; do
+            grep -q "^test $t \.\.\. ok$" chaos-tests.log \
+              || { echo "::error::$t did not run and pass (the toxiproxy daemon is up?)"; exit 1; }
+          done
+      - name: advisory chaos failed
+        if: failure() && matrix.advisory
+        run: |
+          echo "::warning title=chaos suite failed::${FLAVOR} is the advisory network-chaos suite (it does not block this run): see the chaos logs"
+          echo "### :warning: chaos suite failed on ${FLAVOR} (advisory)" >> "$GITHUB_STEP_SUMMARY"
+          echo "A network-fault scenario failed, or did not run at all (that case means the toxiproxy daemon was not reachable). It does not block this run while the suite is advisory." >> "$GITHUB_STEP_SUMMARY"
+      - name: collect proxy and server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          docker compose --profile chaos logs --no-color --timestamps toxiproxy "$FLAVOR" > "server-logs/chaos-${FLAVOR}.log" 2>&1 || true
+          docker compose --profile chaos ps --all > server-logs/compose-ps.txt 2>&1 || true
+          tail -n 40 "server-logs/chaos-${FLAVOR}.log"
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chaos-logs-${{ matrix.flavor }}
+          path: |
+            server-logs/
+            tmp/out/test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop ${{ matrix.flavor }} + toxiproxy
+        if: always()
+        run: docker compose --profile chaos down -v
 
   e2e:
     name: image smoke + end-to-end
