@@ -626,7 +626,16 @@ async fn finish(ctx: &Arc<Ctx>, f: &mut Fix, w: &mut Writers, when: &str) -> Res
     let mut c = f.db.conn().await?;
     f.eng.wait_caught_up(&mut c, t_catchup()).await?;
     c.disconnect().await.ok();
-    verify_targets(ctx, &mut f.eng, &f.db, &f.targets, &f.specs, when).await?;
+    verify_targets(
+        ctx,
+        &mut f.eng,
+        &f.db,
+        &f.targets,
+        &HashMap::new(),
+        &f.specs,
+        when,
+    )
+    .await?;
     // The per-view rule of F6 (soak-plan F5/D5): an `incremental` view never took a whole-view
     // refresh, on any target. A `Chained`/`Full` view is outside the rule by design.
     let rows = view_rows(&f.eng, &f.db, &f.specs).await?;
