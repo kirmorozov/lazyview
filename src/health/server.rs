@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::metrics::{lock, Metrics};
+use crate::secrets::Secret;
 
 use super::probes::{render_json, render_text};
 use super::prometheus::prometheus;
@@ -33,13 +34,33 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const BUSY: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Request {
     head_only: bool,
     method: String,
     path: String,
     query: Vec<(String, String)>,
     accept_json: bool,
+    /// The `Authorization` header, when the client sent one (only `/metrics` and `/stats` look
+    /// at it, and only when `LAZYVIEW_HEALTH_TOKEN` is set).
+    authorization: Option<String>,
+}
+
+/// `Debug` never prints the credential (it ends up in a test failure message otherwise).
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("head_only", &self.head_only)
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("accept_json", &self.accept_json)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl Request {
@@ -109,20 +130,28 @@ fn parse_head(head: &[u8]) -> std::result::Result<Request, u16> {
             (k.to_ascii_lowercase(), v.to_string())
         })
         .collect();
-    let accept_json = lines.any(|h| {
-        h.split_once(':')
-            .map(|(k, v)| {
-                k.trim().eq_ignore_ascii_case("accept")
-                    && v.to_ascii_lowercase().contains("application/json")
-            })
-            .unwrap_or(false)
-    });
+    let mut accept_json = false;
+    let mut authorization: Option<String> = None;
+    for h in lines {
+        let Some((k, v)) = h.split_once(':') else {
+            continue;
+        };
+        let k = k.trim();
+        let v = v.trim();
+        if k.eq_ignore_ascii_case("accept") && v.to_ascii_lowercase().contains("application/json") {
+            accept_json = true;
+        } else if k.eq_ignore_ascii_case("authorization") && authorization.is_none() {
+            // The first header wins: a second one must not smuggle a credential past the check.
+            authorization = Some(v.to_string());
+        }
+    }
     Ok(Request {
         head_only: method == "HEAD",
         method: method.to_string(),
         path: path.to_string(),
         query,
         accept_json,
+        authorization,
     })
 }
 
@@ -130,6 +159,7 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
@@ -149,6 +179,8 @@ struct Response {
     content_type: &'static str,
     body: String,
     allow: bool,
+    /// Sends `WWW-Authenticate: Bearer` (a `401` of the token gate).
+    challenge: bool,
 }
 
 impl Response {
@@ -158,6 +190,7 @@ impl Response {
             content_type: TEXT,
             body: body.into(),
             allow: false,
+            challenge: false,
         }
     }
 
@@ -172,12 +205,42 @@ impl Response {
         if self.allow {
             out.push_str("Allow: GET, HEAD\r\n");
         }
+        if self.challenge {
+            out.push_str("WWW-Authenticate: Bearer realm=\"lazyview\"\r\n");
+        }
         out.push_str("\r\n");
         if !head_only {
             out.push_str(&self.body);
         }
         out.into_bytes()
     }
+}
+
+/// Compares two secrets without a data-dependent early exit: the loop always runs over the
+/// longer of the two, so neither the position of the first difference nor the length of the
+/// expected value leaks through the timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..n {
+        // `get` on both sides: reading past the end of one operand is as quiet as reading inside
+        // it, and the xor of the padded zeros cannot hide a length difference (that is in `diff`).
+        diff |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as usize;
+    }
+    diff == 0
+}
+
+/// True when `header` is exactly `Bearer <token>` (the scheme word is case-insensitive, as HTTP
+/// requires). Nothing here short-circuits on the credential itself.
+fn bearer_ok(header: Option<&str>, token: &str) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let Some((scheme, credential)) = header.split_once(char::is_whitespace) else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && constant_time_eq(credential.trim().as_bytes(), token.as_bytes())
 }
 
 const INDEX: &str = "lazyview health endpoint\n\
@@ -250,10 +313,19 @@ struct Ctx {
     head_timeout: Duration,
     max_conns: usize,
     conns: Mutex<ConnTable>,
+    /// `LAZYVIEW_HEALTH_TOKEN`: when set, `/metrics` and `/stats` need it as a bearer token.
+    /// The probes never look at it.
+    token: Option<Secret>,
 }
 
 impl Ctx {
+    /// A context with no token: used by the tests, which mostly do not care about the gate.
+    #[cfg(test)]
     fn new(metrics: Arc<Metrics>, settings: Settings) -> Ctx {
+        Ctx::with_token(metrics, settings, None)
+    }
+
+    fn with_token(metrics: Arc<Metrics>, settings: Settings, token: Option<Secret>) -> Ctx {
         Ctx {
             metrics,
             settings,
@@ -261,6 +333,7 @@ impl Ctx {
             head_timeout: HEAD_TIMEOUT,
             max_conns: MAX_CONNECTIONS,
             conns: Mutex::new(ConnTable::default()),
+            token,
         }
     }
 
@@ -314,6 +387,23 @@ impl Ctx {
             "/metrics" | "/" | "/stats" => None,
             _ => return Response::text(404, "not found\n"),
         };
+        if let Some(token) = &self.token {
+            // `/metrics` and `/stats` describe the workload and its shape; with
+            // LAZYVIEW_HEALTH_TOKEN set they answer only to `Authorization: Bearer <token>`.
+            // The probes stay open: the kubelet carries no secret and a 401 would evict a
+            // healthy pod. `/` is the endpoint list itself, harmless.
+            if matches!(req.path.as_str(), "/metrics" | "/stats")
+                && !bearer_ok(req.authorization.as_deref(), token.expose())
+            {
+                return Response {
+                    challenge: true,
+                    ..Response::text(
+                        401,
+                        "unauthorized: /metrics and /stats need \"Authorization: Bearer <token>\"\n"
+                    )
+                };
+            }
+        }
         if req.method != "GET" && req.method != "HEAD" {
             return Response {
                 allow: true,
@@ -326,6 +416,7 @@ impl Ctx {
                 content_type: JSON,
                 body: format!("{}\n", self.metrics.view_stats.snapshot().to_json()),
                 allow: false,
+                challenge: false,
             };
         }
         let o = self.tracker.observe(&self.metrics);
@@ -338,6 +429,7 @@ impl Ctx {
                     content_type: PROMETHEUS,
                     body: prometheus(&self.metrics, &o, &self.settings),
                     allow: false,
+                    challenge: false,
                 }
             };
         };
@@ -354,6 +446,7 @@ impl Ctx {
                 content_type: JSON,
                 body: render_json(&r, &o, &self.settings),
                 allow: false,
+                challenge: false,
             }
         } else {
             Response::text(
@@ -517,20 +610,26 @@ async fn bind(addr: SocketAddr) -> io::Result<Vec<TcpListener>> {
     }
 }
 
-/// Serves the endpoint until the future is dropped (policy from the environment; an invalid
-/// variable falls back to its own default and is named in a warning).
-pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) {
+/// Serves the endpoint until the future is dropped (probe policy from the environment; an
+/// invalid variable falls back to its own default and is named in a warning). `token` is
+/// `Config::health_token`: with it set, `/metrics` and `/stats` need it as a bearer token.
+pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>, token: Option<Secret>) {
     let (settings, errors) = Settings::from_lookup_lenient(|k| std::env::var(k).ok());
     for e in errors {
         warn!("health settings: {e}");
     }
-    serve_with(addr, metrics, settings).await
+    serve_with(addr, metrics, settings, token).await
 }
 
 /// Serves the endpoint until the future is dropped. A failed bind is retried every 5 s; it
 /// never stops the engine. Dropping the future stops the listeners and open connections.
-pub async fn serve_with(addr: SocketAddr, metrics: Arc<Metrics>, settings: Settings) {
-    serve_ctx(addr, Arc::new(Ctx::new(metrics, settings))).await
+pub async fn serve_with(
+    addr: SocketAddr,
+    metrics: Arc<Metrics>,
+    settings: Settings,
+    token: Option<Secret>,
+) {
+    serve_ctx(addr, Arc::new(Ctx::with_token(metrics, settings, token))).await
 }
 
 async fn serve_ctx(addr: SocketAddr, ctx: Arc<Ctx>) {

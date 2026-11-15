@@ -73,7 +73,12 @@ services:
       LAZYVIEW_PASSWORD: *password
       LAZYVIEW_DATABASE: *database
       RUST_LOG: info
-    # ports: ["127.0.0.1:8080:8080"]   # /healthz /readyz /metrics from the host
+    # ports: ["127.0.0.1:8080:8080"]   # /healthz /readyz /metrics from the host; needs
+    # LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080 below, because the endpoint binds loopback by default and
+    # loopback inside the container is not the host. The healthcheck below needs nothing: it runs
+    # in the container.
+    # A password can also come from a file (Compose `secrets:`): drop the value
+    # here and set LAZYVIEW_PASSWORD_FILE=/run/secrets/lazyview_password.
     healthcheck:
       # Exec form (the image has no shell); same check as the image HEALTHCHECK, just more often.
       test: ["CMD", "/lazyview", "healthcheck"]

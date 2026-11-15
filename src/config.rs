@@ -155,6 +155,13 @@ pub struct Config {
     pub position_persist_interval: Duration,
     /// HTTP health/metrics endpoint (`/healthz`, `/readyz`, `/metrics`); None = disabled.
     pub health_addr: Option<std::net::SocketAddr>,
+    /// `LAZYVIEW_HEALTH_TOKEN` / `LAZYVIEW_HEALTH_TOKEN_FILE` (a secret reference, see
+    /// [`crate::secrets`]): when set, `/metrics` and `/stats` answer only to
+    /// `Authorization: Bearer <token>`; `/livez`, `/readyz` and `/startupz` stay open.
+    pub health_token: Option<crate::secrets::Secret>,
+    /// The source and the targets that would connect to a non-local server with TLS off.
+    /// The entrypoint (`src/main.rs`) logs one WARN per entry; nothing else changes.
+    pub cleartext: Vec<CleartextEndpoint>,
     /// `LAZYVIEW_SERVER_ID` was set explicitly (otherwise a random id is used and re-rolled on
     /// a collision with another replica).
     pub server_id_fixed: bool,
@@ -181,7 +188,9 @@ impl Config {
     }
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
-        let dsn = connection(&get, "LAZYVIEW", false)?.ok_or_else(|| {
+        // Endpoints reached without TLS, named in a WARN at startup (see CleartextEndpoint).
+        let mut cleartext: Vec<CleartextEndpoint> = Vec::new();
+        let dsn = connection(&get, "LAZYVIEW", false, Some(("source", &mut cleartext)))?.ok_or_else(|| {
             anyhow!("no database configured: set LAZYVIEW_HOST, LAZYVIEW_USER, LAZYVIEW_PASSWORD, LAZYVIEW_DATABASE (or LAZYVIEW_DSN=mysql://user:pass@host:3306/db)")
         })?;
         // The DSN's scheme chooses the source's family once (a `postgres://` source is
@@ -257,8 +266,14 @@ impl Config {
                     "LAZYVIEW_TARGET_{}",
                     name.to_ascii_uppercase().replace('-', "_")
                 );
-                let dsn = connection(&get, &prefix, true)?
-                    .ok_or_else(|| anyhow!("target {name}: set {prefix}_HOST/_USER/_PASSWORD/_DATABASE or {prefix}_DSN"))?;
+                let label = format!("target {name}");
+                let dsn = connection(
+                    &get,
+                    &prefix,
+                    true,
+                    Some((label.as_str(), &mut cleartext)),
+                )?
+                .ok_or_else(|| anyhow!("target {name}: set {prefix}_HOST/_USER/_PASSWORD/_DATABASE or {prefix}_DSN"))?;
                 targets.insert(name.to_string(), dsn);
             }
         }
@@ -305,7 +320,8 @@ impl Config {
         // read through `connection` so `mariadb://`, the TLS modes and the encoding are exactly
         // LAZYVIEW_DSN's. Unset ⇒ `dsn`, so a run without the hooks never leaves LAZYVIEW_DSN.
         let role_dsn = |prefix: &str| -> Result<Option<String>> {
-            let v = connection(&get, prefix, false)?;
+            // No cleartext warning for a test hook: those endpoints exist for the network tests.
+            let v = connection(&get, prefix, false, None)?;
             if let Some(v) = &v {
                 // Same rule as the source DSN above: a role's DSN is a source DSN, so a
                 // `postgres://` one is refused here with the "not supported yet" message.
@@ -361,13 +377,19 @@ impl Config {
                 "LAZYVIEW_POSITION_PERSIST_MS",
                 5_000,
             )?),
+            // Loopback by default (2026-11-15): `/metrics` and `/stats` describe the workload, so
+            // a pod or a host-network process must ask for them on a routable address
+            // (LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080); the container health check still works, it
+            // probes its own loopback.
             health_addr: match get("LAZYVIEW_HEALTH_ADDR").map(|v| v.trim().to_string()) {
-                None => Some(([0, 0, 0, 0], 8080).into()),
+                None => Some(([127, 0, 0, 1], 8080).into()),
                 Some(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => None,
                 Some(v) => Some(v.parse().with_context(|| {
                     format!("LAZYVIEW_HEALTH_ADDR must be host:port or off, got {v}")
                 })?),
             },
+            health_token: crate::secrets::resolve_var(&get, "LAZYVIEW_HEALTH_TOKEN")?,
+            cleartext,
             server_id_fixed,
             supervisor,
         })
@@ -376,10 +398,16 @@ impl Config {
 
 /// `<PREFIX>_DSN`, or a DSN assembled from `<PREFIX>_HOST`, `_PORT`, `_USER`, `_PASSWORD`,
 /// `_DATABASE` (values used verbatim: no URL encoding needed by the user).
+///
+/// The password — the `<PREFIX>_PASSWORD` / `_PASSWORD_FILE` pair, or the password field of
+/// `<PREFIX>_DSN` — goes through [`crate::secrets`], so it can name a file or an AWS Secrets
+/// Manager secret instead of holding the value. With `warn_to`, a non-local endpoint whose TLS is
+/// off is recorded there (see [`CleartextEndpoint`]).
 fn connection(
     get: &impl Fn(&str) -> Option<String>,
     prefix: &str,
     allow_pg: bool,
+    warn_to: Option<(&str, &mut Vec<CleartextEndpoint>)>,
 ) -> Result<Option<String>> {
     let part = |k: &str| get(&format!("{prefix}_{k}")).filter(|v| !v.is_empty());
     let ca = part("TLS_CA").or_else(|| get("LAZYVIEW_TLS_CA").filter(|v| !v.is_empty()));
@@ -389,23 +417,235 @@ fn connection(
     let tls = part("TLS")
         .or_else(|| get("LAZYVIEW_TLS").filter(|v| !v.is_empty()))
         .or_else(|| ca.as_ref().map(|_| "verify-full".to_string()));
+    // Its own error messages already name the variable (or the `_FILE` twin).
+    let password = crate::secrets::resolve_var(get, &format!("{prefix}_PASSWORD"))?;
     let dsn = match part("DSN") {
-        Some(dsn) => Some(dsn),
-        None => assemble(&part, prefix)?,
+        Some(dsn) => Some(resolve_dsn_password(&dsn, &format!("{prefix}_DSN"))?),
+        None => assemble(&part, password.as_ref(), prefix)?,
     };
-    dsn.map(|d| {
-        let mut d = finish_dsn(&d, tls.as_deref(), prefix, allow_pg, ca.as_deref())?;
-        if let Some(ca) = &ca {
-            // finish_pg_dsn mapped a PostgreSQL target's CA onto sslrootcert instead (D11).
-            if !d.starts_with("postgres") {
-                d.push(if d.contains('?') { '&' } else { '?' });
-                d.push_str("tls_ca=");
-                d.push_str(&encode(ca));
-            }
+    let Some(d) = dsn else {
+        return Ok(None);
+    };
+    let mut d = finish_dsn(&d, tls.as_deref(), prefix, allow_pg, ca.as_deref())?;
+    if let Some(ca) = &ca {
+        // finish_pg_dsn mapped a PostgreSQL target's CA onto sslrootcert instead (D11).
+        if !d.starts_with("postgres") {
+            d.push(if d.contains('?') { '&' } else { '?' });
+            d.push_str("tls_ca=");
+            d.push_str(&encode(ca));
         }
-        Ok(d)
+    }
+    if let Some((endpoint, out)) = warn_to {
+        if let Some(host) = cleartext_host(&d) {
+            out.push(CleartextEndpoint {
+                endpoint: endpoint.to_string(),
+                var: format!("{prefix}_TLS"),
+                host,
+            });
+        }
+    }
+    Ok(Some(d))
+}
+
+/// An endpoint (the source or a target) that connects to a server off this host with TLS off:
+/// credentials and data cross the network in the clear. One WARN per entry is logged at startup
+/// (`src/main.rs`); behavior is otherwise unchanged, because `LAZYVIEW_TLS` has always defaulted
+/// to `disabled` and an internal network is a legitimate choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleartextEndpoint {
+    /// `source`, or `target <name>` as it was configured.
+    pub endpoint: String,
+    /// The variable that turns TLS on for it: `LAZYVIEW_TLS` or `LAZYVIEW_TARGET_<NAME>_TLS`.
+    pub var: String,
+    /// The host it connects to (a host is not a secret; it is what the operator has to fix).
+    pub host: String,
+}
+
+/// The pieces of `scheme://[user[:password]@]host[:port]/path[?query]`, as slices of the original
+/// text so a resolved password can be spliced back without touching anything else.
+struct DsnParts<'a> {
+    /// `scheme://`.
+    head: &'a str,
+    /// The user, empty when there is no userinfo.
+    user: &'a str,
+    /// The password exactly as written (percent-encoded when the operator encoded it).
+    password: Option<&'a str>,
+    /// `host[:port]/path`, without the `@`.
+    host: &'a str,
+    /// The `?query` (or `#fragment`) part, empty when there is none.
+    query: &'a str,
+}
+
+impl DsnParts<'_> {
+    /// True when a second `scheme://` sits where the host should be: the password there is an
+    /// unencoded secret reference, which a URL parser cannot separate from the host — the `#` of
+    /// `mysql://lv:aws-secret://id#password@h/db` swallows the host, and
+    /// `mysql://lv:file:///etc/pw` leaves no host at all. A real host, port, path or socket path
+    /// never contains `://`, and a reference that was percent-encoded (the way a DSN password is
+    /// written) keeps its colons encoded, so it does not trip this.
+    fn has_nested_scheme(&self) -> bool {
+        self.host.contains("://")
+    }
+}
+
+/// Splits a DSN. `None` when the text has no `://` at all (a bare `x`, which the tests and the
+/// `mysql_async` URL parser both accept).
+fn dsn_parts(dsn: &str) -> Option<DsnParts<'_>> {
+    let at = dsn.find("://")?;
+    let head = &dsn[..at + 3];
+    let rest = &dsn[at + 3..];
+    // The query and the fragment end the authority; a percent-encoded secret reference may hold
+    // any other character, including `/`, `@` and `#`.
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let region = &rest[..end];
+    // The userinfo runs up to the LAST `@` (what a URL parser does with the encoded `@` of a
+    // password); an unencoded reference that contains `#` never reaches here and is refused.
+    let (userinfo, host) = match region.rfind('@') {
+        Some(i) => (&region[..i], &region[i + 1..]),
+        None => ("", region),
+    };
+    let (user, password) = match userinfo.split_once(':') {
+        Some((u, p)) => (u, Some(p)),
+        None => (userinfo, None),
+    };
+    Some(DsnParts {
+        head,
+        user,
+        password,
+        host,
+        query: &rest[end..],
     })
-    .transpose()
+}
+
+/// The host of a DSN with the port and the brackets gone, percent-decoded (`None` when there is
+/// no `://`). An empty host means the DSN carries no host at all.
+fn dsn_host(dsn: &str) -> Option<(String, String)> {
+    let p = dsn_parts(dsn)?;
+    let host = p.host.split(['/', '?', '#']).next().unwrap_or(p.host);
+    let host = match host.split_once(']') {
+        // `[::1]:3306`
+        Some((bracketed, _)) => bracketed.trim_start_matches('[').to_string(),
+        None => host
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host)
+            .to_string(),
+    };
+    Some((crate::secrets::percent_decode(&host), p.query.to_string()))
+}
+
+/// True when `host` needs no TLS because it cannot be seen on the wire: a loopback address or
+/// name (the engine and the server are the same machine).
+fn is_loopback(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h == "localhost" || h == "ip6-localhost" || h == "ip6-loopback" {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// True when the endpoint is a unix socket rather than a TCP connection: the host is a socket
+/// path, or a `socket=` parameter names one (`prefer_socket` alone is not enough: mysql_async
+/// prefers a socket on loopback anyway).
+fn is_unix_socket(host: &str, query: &str) -> bool {
+    if host.starts_with('/') {
+        return true;
+    }
+    query_params(query).any(|(k, v)| {
+        k.eq_ignore_ascii_case("socket")
+            && !v.is_empty()
+            && !["none", "default", "false", "0", "off"].contains(&v.to_ascii_lowercase().as_str())
+    })
+}
+
+/// The `?a=1&b=2` (or `#a=1`) of a DSN as key/value pairs. The leading delimiter is dropped — the
+/// slice a DSN carries starts with it, and `?require_ssl` is not the parameter `require_ssl`.
+fn query_params(query: &str) -> impl Iterator<Item = (&str, &str)> + '_ {
+    query
+        .trim_start_matches(['?', '#'])
+        .split('&')
+        .map(|kv| kv.split_once('=').unwrap_or((kv, "")))
+}
+
+/// True when the DSN's own parameters put TLS on: `require_ssl=true` (MySQL family, what
+/// [`finish_dsn`] writes) or an `sslmode` that verifies (`postgres`, what [`finish_pg_dsn`]
+/// writes). Anything else — no parameter, `sslmode=prefer` (the tokio-postgres default),
+/// `require_ssl=false` — crosses the network in the clear.
+fn tls_enabled(dsn: &str) -> bool {
+    let Some(p) = dsn_parts(dsn) else {
+        return false;
+    };
+    query_params(p.query).any(|(k, v)| {
+        let k = k.to_ascii_lowercase();
+        let v = v.to_ascii_lowercase();
+        (k == "require_ssl" && ["true", "1", "on", "yes"].contains(&v.as_str()))
+            || (k == "sslmode"
+                && ["require", "verify-ca", "verify-ca-cert", "verify-full"].contains(&v.as_str()))
+    })
+}
+
+/// The host to name in a cleartext warning, or `None` when the endpoint needs no warning: TLS on,
+/// or the server is on this host (loopback / unix socket).
+fn cleartext_host(dsn: &str) -> Option<String> {
+    if tls_enabled(dsn) {
+        return None;
+    }
+    let (host, query) = dsn_host(dsn)?;
+    if host.is_empty() || is_loopback(&host) || is_unix_socket(&host, &query) {
+        return None;
+    }
+    Some(host)
+}
+
+/// Resolves a secret reference in the password field of a DSN
+/// (`mysql://lv:file:///run/secrets/pw@h:3306/app`). The field is percent-decoded first, so the
+/// reference survives the way every other character in a DSN does; the resolved value goes back
+/// URL-encoded. A literal password is returned untouched, and a reference that was written
+/// without percent-encoding (so that its `#` or its second `://` swallowed the host) is refused
+/// instead of being used as a password.
+fn resolve_dsn_password(dsn: &str, var: &str) -> Result<String> {
+    let Some(p) = dsn_parts(dsn) else {
+        return Ok(dsn.to_string());
+    };
+    let Some(raw) = p.password else {
+        if p.has_nested_scheme() {
+            bail!(cleartext_reference_hint(dsn, var));
+        }
+        return Ok(dsn.to_string());
+    };
+    let reference = crate::secrets::percent_decode(raw);
+    match crate::secrets::scheme_of(&reference) {
+        crate::secrets::Scheme::Literal(_) => {
+            if p.has_nested_scheme() {
+                bail!(cleartext_reference_hint(dsn, var));
+            }
+            Ok(dsn.to_string())
+        }
+        _ => {
+            let secret = crate::secrets::resolve_secret(&reference)
+                .with_context(|| format!("{var} password"))?;
+            Ok(format!(
+                "{}{}:{}@{}{}",
+                p.head,
+                p.user,
+                encode(secret.expose()),
+                p.host,
+                p.query
+            ))
+        }
+    }
+}
+
+fn cleartext_reference_hint(dsn: &str, var: &str) -> String {
+    format!(
+        "{var}: {dsn} has a secret reference in its password that is not percent-encoded, so its \
+         `://` or `#` cannot be told apart from the host; write it as \
+         {var}=…:file%3A%2F%2F… / …:aws-secret%3A%2F%2F… (or put the password in \
+         <PREFIX>_PASSWORD / <PREFIX>_PASSWORD_FILE, which needs no encoding)"
+    )
 }
 
 /// Accepts `mariadb://` as an alias and appends TLS parameters for `<PREFIX>_TLS`. With
@@ -484,7 +724,11 @@ fn finish_pg_dsn(dsn: &str, tls: Option<&str>, prefix: &str, ca: Option<&str>) -
     Ok(d)
 }
 
-fn assemble(part: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Option<String>> {
+fn assemble(
+    part: &impl Fn(&str) -> Option<String>,
+    password: Option<&crate::secrets::Secret>,
+    prefix: &str,
+) -> Result<Option<String>> {
     let Some(host) = part("HOST") else {
         return Ok(None);
     };
@@ -498,8 +742,8 @@ fn assemble(part: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Opti
             .with_context(|| format!("{prefix}_PORT must be a port number"))?,
         None => 3306,
     };
-    let auth = match part("PASSWORD") {
-        Some(pw) => format!("{}:{}", encode(&user), encode(&pw)),
+    let auth = match password {
+        Some(pw) => format!("{}:{}", encode(&user), encode(pw.expose())),
         None => encode(&user),
     };
     let host = if host.contains(':') && !host.starts_with('[') {
@@ -513,16 +757,12 @@ fn assemble(part: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Opti
     )))
 }
 
+/// Percent-encode everything a password cannot carry raw, so a secret resolved from a file or a
+/// secret store cannot change where the DSN points. The rule lives with the resolver
+/// ([`crate::secrets::percent_encode`]), which is what makes a value round-trip out of a DSN and
+/// back into one.
 fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    crate::secrets::percent_encode(s)
 }
 
 /// Random replica server id in [2^30, 2^31), away from small hand-assigned ids.
@@ -542,6 +782,7 @@ pub fn random_server_id() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::ErrorChain;
     use std::collections::HashMap;
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config> {
@@ -770,7 +1011,8 @@ mod tests {
         assert_eq!(c.batch_window, Duration::from_millis(200));
         assert!(c.sync && c.drop_removed);
         assert!(c.server_id >= 1 << 30 && !c.server_id_fixed);
-        assert_eq!(c.health_addr, Some(([0, 0, 0, 0], 8080).into()));
+        // loopback by default: an endpoint that describes the workload is not exposed by default
+        assert_eq!(c.health_addr, Some(([127, 0, 0, 1], 8080).into()));
         assert_eq!((c.write_batch_rows, c.write_batch_bytes), (500, 4 << 20));
         let c = cfg(&[
             ("LAZYVIEW_DSN", "x"),
@@ -880,5 +1122,371 @@ mod tests {
         let c = cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_SUPERVISOR", "off")]).unwrap();
         assert_eq!(c.supervisor.mode, SupervisorMode::Off);
         assert!(cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_SUPERVISOR", "fast")]).is_err());
+    }
+
+    /// The password of a DSN as the driver would read it.
+    fn dsn_password(dsn: &str) -> Option<String> {
+        mysql_async::Opts::from_url(dsn)
+            .unwrap()
+            .pass()
+            .map(|p| p.to_string())
+    }
+
+    fn source_pairs<'a>(extra: &'a [(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut v = vec![
+            ("LAZYVIEW_HOST", "db.example.com"),
+            ("LAZYVIEW_USER", "lv"),
+            ("LAZYVIEW_DATABASE", "app"),
+        ];
+        v.extend_from_slice(extra);
+        v
+    }
+
+    #[test]
+    fn health_addr_defaults_to_loopback() {
+        let c = cfg(&[("LAZYVIEW_DSN", "x")]).unwrap();
+        assert_eq!(
+            c.health_addr,
+            Some(([127, 0, 0, 1], 8080).into()),
+            "a metrics endpoint that describes the workload is not exposed by default"
+        );
+        // an explicit address still binds anything: a container serves the pod network on request
+        let cases: &[(&str, Option<std::net::SocketAddr>)] = &[
+            ("0.0.0.0:8080", Some(([0, 0, 0, 0], 8080).into())),
+            ("10.0.0.5:9090", Some(([10, 0, 0, 5], 9090).into())),
+            (" 127.0.0.1:1 ", Some(([127, 0, 0, 1], 1).into())),
+            ("off", None),
+            ("OFF", None),
+            ("", None),
+        ];
+        for (v, want) in cases {
+            assert_eq!(
+                cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_HEALTH_ADDR", v)])
+                    .unwrap()
+                    .health_addr,
+                *want,
+                "{v}"
+            );
+        }
+        assert!(cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_HEALTH_ADDR", "nope")]).is_err());
+    }
+
+    #[test]
+    fn passwords_come_from_files_and_references() {
+        use crate::secrets::tests::TempDir;
+        let d = TempDir::new("config-password");
+        let pw = d.write("password", "file-pw\n");
+        let deep = d.write("deep", &format!("file://{pw}\n"));
+        let plain_deep = d.write("plain-deep", "file://nope\n");
+
+        // the historical behavior: the variable's value, verbatim
+        let c = cfg(&source_pairs(&[("LAZYVIEW_PASSWORD", "p@ss w/rd")])).unwrap();
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some("p@ss w/rd"));
+        // _FILE: the file's content, one trailing newline trimmed
+        let c = cfg(&source_pairs(&[("LAZYVIEW_PASSWORD_FILE", &pw)])).unwrap();
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some("file-pw"));
+        // a value that is a file:// reference
+        let c = cfg(&source_pairs(&[(
+            "LAZYVIEW_PASSWORD",
+            &format!("file://{pw}"),
+        )]))
+        .unwrap();
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some("file-pw"));
+        // double indirection: the _FILE holds a reference
+        let c = cfg(&source_pairs(&[("LAZYVIEW_PASSWORD_FILE", &deep)])).unwrap();
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some("file-pw"));
+        // plain:// forces a literal that looks like a reference
+        let c = cfg(&source_pairs(&[(
+            "LAZYVIEW_PASSWORD",
+            &format!("plain://{plain_deep}"),
+        )]))
+        .unwrap();
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some(plain_deep.as_str()));
+
+        // both set is a configuration error, never a precedence rule
+        let e = cfg(&source_pairs(&[
+            ("LAZYVIEW_PASSWORD", "from-var"),
+            ("LAZYVIEW_PASSWORD_FILE", &pw),
+        ]))
+        .unwrap_err()
+        .full();
+        assert!(
+            e.contains("LAZYVIEW_PASSWORD and LAZYVIEW_PASSWORD_FILE are both set"),
+            "{e}"
+        );
+        // an unknown scheme names the known ones
+        let e = cfg(&source_pairs(&[("LAZYVIEW_PASSWORD", "vault://app/pw")]))
+            .unwrap_err()
+            .full();
+        assert!(
+            e.contains("unknown secret scheme vault://")
+                && e.contains("file:///abs/path")
+                && e.contains("aws-secret://<secret-id>[#<json-field>]"),
+            "{e}"
+        );
+        // aws-secret:// in a build without the feature fails loudly (never the URI as a password).
+        // Only that build: with the feature on, the same reference would reach the SDK and the
+        // default credential chain, and a test must not call AWS. The feature-on path is covered
+        // by the mock client in `src/secrets/tests.rs`.
+        #[cfg(not(feature = "aws-secrets"))]
+        {
+            let e = cfg(&source_pairs(&[(
+                "LAZYVIEW_PASSWORD",
+                "aws-secret://prod/lazyview",
+            )]))
+            .unwrap_err()
+            .full();
+            assert!(e.contains("built without the aws-secrets feature"), "{e}");
+            // and the same through the same DSN: no silent fallback
+            let e = cfg(&[(
+                "LAZYVIEW_DSN",
+                "mysql://lv:aws-secret://prod/lazyview@h:3306/db",
+            )])
+            .unwrap_err()
+            .full();
+            assert!(e.contains("built without the aws-secrets feature"), "{e}");
+        }
+
+        // a target's password goes through the same resolver
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_TARGETS", "analytics"),
+            ("LAZYVIEW_TARGET_ANALYTICS_HOST", "reports.example.com"),
+            ("LAZYVIEW_TARGET_ANALYTICS_DATABASE", "reports"),
+            ("LAZYVIEW_TARGET_ANALYTICS_USER", "lv"),
+            ("LAZYVIEW_TARGET_ANALYTICS_PASSWORD_FILE", &pw),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.targets.get("analytics").map(String::as_str),
+            Some("mysql://lv:file-pw@reports.example.com:3306/reports")
+        );
+    }
+
+    #[test]
+    fn a_dsn_password_can_be_a_reference() {
+        use crate::secrets::tests::TempDir;
+        let d = TempDir::new("config-dsn");
+        let pw = d.write("password", "s3cr3t/p@ss\n");
+
+        // written as it is in a URL: percent-encoded, like every other character of a DSN
+        let c = cfg(&[(
+            "LAZYVIEW_DSN",
+            &format!(
+                "mysql://lv:{}@h:3306/db",
+                crate::secrets::percent_encode(&format!("file://{pw}"))
+            ),
+        )])
+        .unwrap();
+        assert_eq!(c.dsn, "mysql://lv:s3cr3t%2Fp%40ss@h:3306/db");
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some("s3cr3t/p@ss"));
+
+        // written raw: the `/` of the reference is still separable from the host
+        let c = cfg(&[("LAZYVIEW_DSN", &format!("mysql://lv:file://{pw}@h:3306/db"))]).unwrap();
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some("s3cr3t/p@ss"));
+
+        // a `#` that was not encoded would swallow the host: refused, not guessed
+        let e = cfg(&[(
+            "LAZYVIEW_DSN",
+            "mysql://lv:aws-secret://prod/lazyview#password@h:3306/db",
+        )])
+        .unwrap_err()
+        .full();
+        assert!(
+            e.contains("LAZYVIEW_DSN") && e.contains("not percent-encoded"),
+            "{e}"
+        );
+        // the same with no host at all
+        let e = cfg(&[("LAZYVIEW_DSN", "mysql://lv:file:///etc/lazyview/pw")])
+            .unwrap_err()
+            .full();
+        assert!(e.contains("not percent-encoded"), "{e}");
+
+        // a literal password that merely contains `://` keeps working through plain://
+        let c = cfg(&[(
+            "LAZYVIEW_DSN",
+            "mysql://lv:plain%3A%2F%2Fhe%3A%2F%2Fvalue@h:3306/db",
+        )])
+        .unwrap();
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some("he://value"));
+        // …and an ordinary encoded password is untouched
+        let c = cfg(&[("LAZYVIEW_DSN", "mysql://lv:p%40ss%3Aw%2Frd@h:3306/db")]).unwrap();
+        assert_eq!(c.dsn, "mysql://lv:p%40ss%3Aw%2Frd@h:3306/db");
+        assert_eq!(dsn_password(&c.dsn).as_deref(), Some("p@ss:w/rd"));
+
+        // a PostgreSQL target's DSN password resolves the same way (the MySQL driver cannot read
+        // a postgres:// URL, so this asserts the text the PG driver will get)
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_TARGETS", "b"),
+            (
+                "LAZYVIEW_TARGET_B_DSN",
+                &format!("postgres://lv:file://{pw}@h:5432/db"),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.targets.get("b").map(String::as_str),
+            Some("postgres://lv:s3cr3t%2Fp%40ss@h:5432/db"),
+            "resolved, then written back encoded"
+        );
+    }
+
+    #[test]
+    fn health_token_is_a_secret_reference_too() {
+        use crate::secrets::tests::TempDir;
+        let d = TempDir::new("config-token");
+        let f = d.write("token", "tok-from-file\n");
+        let c = cfg(&[("LAZYVIEW_DSN", "x")]).unwrap();
+        assert_eq!(c.health_token, None, "unset means an open metrics endpoint");
+        let c = cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_HEALTH_TOKEN", "tok")]).unwrap();
+        assert_eq!(
+            c.health_token,
+            Some(crate::secrets::resolve_secret("tok").unwrap())
+        );
+        assert_eq!(
+            format!("{:?}", c.health_token.as_ref().unwrap()),
+            "Secret(***)"
+        );
+        let c = cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_HEALTH_TOKEN_FILE", &f)]).unwrap();
+        assert_eq!(
+            c.health_token,
+            Some(crate::secrets::resolve_secret("tok-from-file").unwrap())
+        );
+        let e = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_HEALTH_TOKEN", "tok"),
+            ("LAZYVIEW_HEALTH_TOKEN_FILE", &f),
+        ])
+        .unwrap_err()
+        .full();
+        assert!(
+            e.contains("LAZYVIEW_HEALTH_TOKEN and LAZYVIEW_HEALTH_TOKEN_FILE are both set"),
+            "{e}"
+        );
+        // an unreadable token is a startup error, never a quietly open endpoint
+        let e = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_HEALTH_TOKEN_FILE", "/nonexistent/lazyview-token"),
+        ])
+        .unwrap_err()
+        .full();
+        assert!(e.contains("LAZYVIEW_HEALTH_TOKEN_FILE"), "{e}");
+    }
+
+    #[test]
+    fn cleartext_endpoints_are_listed_for_the_warning() {
+        let w = |pairs: &[(&str, &str)]| cfg(pairs).unwrap().cleartext;
+        // A fn rather than a closure: the pairs are all 'static and inference should not tie
+        // them to the lifetime of the `tls` argument.
+        fn src(tls: Option<&'static str>) -> Vec<(&'static str, &'static str)> {
+            let mut v = vec![("LAZYVIEW_DSN", "mysql://lv:p@db.example.com:3306/app")];
+            if let Some(t) = tls {
+                v.push(("LAZYVIEW_TLS", t));
+            }
+            v
+        }
+        // the source, TLS off (the default): one line naming LAZYVIEW_TLS
+        assert_eq!(
+            w(&src(None)),
+            vec![CleartextEndpoint {
+                endpoint: "source".into(),
+                var: "LAZYVIEW_TLS".into(),
+                host: "db.example.com".into(),
+            }]
+        );
+        // every TLS mode silences it
+        for tls in ["required", "verify-ca", "verify-full", "REQUIRED", "on"] {
+            assert!(w(&src(Some(tls))).is_empty(), "{tls}");
+        }
+        // explicit off, and the other words for off, warn again (`no` is not one of them: the
+        // parser's set is disabled|off|false, and a typo is an error rather than a silent off)
+        for tls in ["disabled", "off", "false", "OFF"] {
+            assert_eq!(w(&src(Some(tls))).len(), 1, "{tls}");
+        }
+        // loopback and a unix socket are not on the wire
+        assert!(w(&[("LAZYVIEW_DSN", "mysql://lv:p@localhost/app")]).is_empty());
+        assert!(w(&[("LAZYVIEW_DSN", "mysql://lv:p@127.0.0.1:3306/app")]).is_empty());
+        assert!(w(&[("LAZYVIEW_DSN", "mysql://lv:p@[::1]:3306/app")]).is_empty());
+        assert!(w(&[(
+            "LAZYVIEW_DSN",
+            "mysql://lv:p@localhost/app?socket=/run/mysqld/mysqld.sock"
+        )])
+        .is_empty());
+        assert!(w(&[("LAZYVIEW_DSN", "mysql://lv:p@/run/mysqld/mysqld.sock/app")]).is_empty());
+        // a non-loopback address with only prefer_socket still warns
+        assert_eq!(
+            w(&[(
+                "LAZYVIEW_DSN",
+                "mysql://lv:p@10.0.0.2/app?prefer_socket=true"
+            )])
+            .len(),
+            1
+        );
+        // a DSN without TLS parameters that carries require_ssl itself is on
+        assert!(w(&[(
+            "LAZYVIEW_DSN",
+            "mysql://lv:p@db.example.com/app?require_ssl=true&verify_ca=false"
+        )])
+        .is_empty());
+        // the parts form, and the CA file (which implies verify-full)
+        assert_eq!(w(&source_pairs(&[("LAZYVIEW_PASSWORD", "p")])).len(), 1);
+        assert!(w(&source_pairs(&[
+            ("LAZYVIEW_PASSWORD", "p"),
+            ("LAZYVIEW_TLS_CA", "/etc/ca.pem")
+        ]))
+        .is_empty());
+        // targets, each naming its own variable, in configuration order
+        let got = w(&[
+            ("LAZYVIEW_HOST", "127.0.0.1"),
+            ("LAZYVIEW_DATABASE", "app"),
+            ("LAZYVIEW_TARGETS", "analytics, reporting"),
+            ("LAZYVIEW_TARGET_ANALYTICS_HOST", "analytics.example.com"),
+            ("LAZYVIEW_TARGET_ANALYTICS_DATABASE", "reports"),
+            ("LAZYVIEW_TARGET_REPORTING_HOST", "10.1.2.3"),
+            ("LAZYVIEW_TARGET_REPORTING_DATABASE", "d"),
+            ("LAZYVIEW_TARGET_REPORTING_TLS", "required"),
+        ]);
+        assert_eq!(
+            got,
+            vec![CleartextEndpoint {
+                endpoint: "target analytics".into(),
+                var: "LAZYVIEW_TARGET_ANALYTICS_TLS".into(),
+                host: "analytics.example.com".into(),
+            }]
+        );
+        // a PostgreSQL target follows its sslmode
+        let pg = |mode: Option<&str>| {
+            let mut v = vec![
+                ("LAZYVIEW_DSN", "x"),
+                ("LAZYVIEW_TARGETS", "b"),
+                (
+                    "LAZYVIEW_TARGET_B_DSN",
+                    "postgres://lv:p@pg.example.com:5432/d",
+                ),
+            ];
+            if let Some(m) = mode {
+                v.push(("LAZYVIEW_TARGET_B_TLS", m));
+            }
+            w(&v)
+        };
+        assert_eq!(
+            pg(None).len(),
+            1,
+            "no sslmode means tokio-postgres prefers, then falls back"
+        );
+        assert!(pg(Some("required")).is_empty());
+        assert!(pg(Some("verify-full")).is_empty());
+        assert_eq!(pg(Some("disabled")).len(), 1);
+        // the test-role hooks are not endpoints the operator configured
+        assert_eq!(
+            w(&[
+                ("LAZYVIEW_DSN", "x"),
+                ("LAZYVIEW_TEST_BINLOG_HOST", "elsewhere.example.com"),
+                ("LAZYVIEW_TEST_BINLOG_DATABASE", "d"),
+            ])
+            .len(),
+            0
+        );
     }
 }

@@ -11,6 +11,16 @@
 //! `?verbose` lists every check (Kubernetes apiserver style), `?format=json` or
 //! `Accept: application/json` returns JSON. `HEAD` is answered like `GET` without a body.
 //!
+//! # Who may look
+//!
+//! `LAZYVIEW_HEALTH_TOKEN` (or `LAZYVIEW_HEALTH_TOKEN_FILE`, a secret reference: see
+//! [`crate::secrets`]) gates `/metrics` and `/stats`: with it set, both answer `401` unless the
+//! request carries `Authorization: Bearer <token>`, compared in constant time. `/livez`,
+//! `/readyz` and `/startupz` stay open — the kubelet carries no secret and a `401` there would
+//! evict a healthy pod — and so does the `/` endpoint list. The token is resolved while the
+//! configuration is read, so an unreadable reference stops the service at startup instead of
+//! quietly leaving the metrics open.
+//!
 //! # Semantics (and why)
 //!
 //! **Liveness** fails only when a restart is the right remedy: the engine loop has not reported

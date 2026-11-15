@@ -99,14 +99,31 @@ All settings are environment variables. The most used ones are listed here. See
 | variable | default | meaning |
 |---|---|---|
 | `LAZYVIEW_HOST`, `LAZYVIEW_PORT` | —, `3306` | source server, the one whose binlog is read |
-| `LAZYVIEW_USER`, `LAZYVIEW_PASSWORD` | `root`, — | credentials, used verbatim (no URL encoding) |
+| `LAZYVIEW_USER`, `LAZYVIEW_PASSWORD` | `root`, — | credentials, used verbatim (no URL encoding); every password also has a `…_FILE` form |
 | `LAZYVIEW_DATABASE` | required with `LAZYVIEW_HOST` | schema holding `_lazyview` and the views |
 | `LAZYVIEW_DSN` | — | instead of the five above: `mysql://user:pass@host:3306/app` |
 | `LAZYVIEW_TLS`, `LAZYVIEW_TLS_CA` | `disabled`, — | `required`, `verify-ca` or `verify-full`; CA bundle for private or managed CAs |
 | `LAZYVIEW_START_MODE` | `resume` | `resume`, `rebuild` (rebuild everything, then stream) or `once` (rebuild every view, exit non-zero if any fails) |
 | `LAZYVIEW_FULL_REFRESH_MS` | `60000` | full-mode views are rebuilt at most once per interval |
-| `LAZYVIEW_HEALTH_ADDR` | `0.0.0.0:8080` | `/livez`, `/readyz`, `/startupz`, `/metrics`, `/stats`; `off` disables |
+| `LAZYVIEW_HEALTH_ADDR` | `127.0.0.1:8080` | `/livez`, `/readyz`, `/startupz`, `/metrics`, `/stats`; `off` disables |
+| `LAZYVIEW_HEALTH_TOKEN` | — | with `…_TOKEN_FILE` as alternatives: `/metrics` and `/stats` then need `Authorization: Bearer <token>`; the probes stay open |
 | `RUST_LOG`, `LAZYVIEW_LOG_FORMAT` | `info`, `text` | log level; `json` for log shippers |
+
+**Secrets.** A password (source, target or the health token) is read from one of two variables and
+never needs to be an environment value: `LAZYVIEW_PASSWORD` holds the value or a reference,
+`LAZYVIEW_PASSWORD_FILE` names a file to read (Kubernetes secrets, Vault agent, `docker --secret`).
+A reference is `file:///abs/path`, or `aws-secret://<secret-id>[#<json-field>]` in a build made with
+`--features aws-secrets` (the default credential chain decides what it can read). Other targets take
+the same two variables, `LAZYVIEW_TARGET_<NAME>_PASSWORD[_FILE]`, and a DSN carries a reference in
+its password field, percent-encoded like any other character there:
+`mysql://lv:file%3A%2F%2F%2Frun%2Fsecrets%2Fpw@db:3306/app`. Setting both variables, an unreadable
+file or an unknown scheme stops startup with the variable named; a resolved value is never logged.
+
+**Health endpoint.** It binds to loopback by default, because it describes the workload
+(`/metrics`, `/stats`). **Upgrading from any earlier release: containers must now set
+`LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080` explicitly** to keep serving it to the host or the pod network
+(the published image and `deploy/k8s` already do). A connection to any server without TLS logs one
+warning naming the variable that turns it on (`LAZYVIEW_TLS`, or the target's own `…_TLS`).
 
 ## Supported servers
 

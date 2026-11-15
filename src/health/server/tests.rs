@@ -329,7 +329,7 @@ async fn tcp_serve_bind_and_probe() {
     // Port in use: serve keeps retrying instead of failing.
     let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = blocker.local_addr().unwrap();
-    let server = tokio::spawn(serve_with(addr, m.clone(), Settings::default()));
+    let server = tokio::spawn(serve_with(addr, m.clone(), Settings::default(), None));
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!server.is_finished());
     drop(blocker);
@@ -355,4 +355,248 @@ async fn tcp_serve_bind_and_probe() {
         !probe(addr).await,
         "listener must stop with the serve future"
     );
+}
+
+// ---------------------------------------------------------------------------- token gate
+
+/// The token, through the same resolver the operator's variable goes through.
+const TOKEN: &str = "s3cr3t-token";
+
+fn token_ctx(token: Option<&str>) -> Ctx {
+    let m = Arc::new(Metrics::default());
+    m.beat();
+    Metrics::set(&m.gauges.starting, 1);
+    Metrics::set(&m.gauges.streaming, 1);
+    Ctx::with_token(
+        m,
+        Settings::default(),
+        token
+            .map(crate::secrets::resolve_secret)
+            .transpose()
+            .expect("a plain token resolves"),
+    )
+}
+
+#[test]
+fn constant_time_compare_is_exact() {
+    let eq = |a: &str, b: &str| constant_time_eq(a.as_bytes(), b.as_bytes());
+    assert!(eq("", ""));
+    assert!(eq("token", "token"));
+    assert!(!eq("token", "TOKEN"));
+    assert!(!eq("token", "tok"));
+    assert!(!eq("tok", "token"));
+    assert!(!eq("token", "tokens"));
+    assert!(!eq("token", "xtoken"));
+    // the first and the last byte matter equally, and a prefix is not a match
+    assert!(!eq("aaaaaaaaa", "aaaaaaaab"));
+    assert!(!eq("aaaaaaaaa", "baaaaaaaa"));
+    assert!(!eq("aaaaaaaaa", "aaaaaaaaab"));
+    assert!(!eq("a", ""));
+    assert!(eq("\0", "\0"));
+    // the comparison itself: one function, no early return on the content (the length is folded
+    // into the accumulator, so a short-circuit on length would break these too)
+    assert!(!constant_time_eq(b"abc", b"abcd"));
+    assert!(!constant_time_eq(b"abcd", b"abc"));
+    assert!(constant_time_eq(b"abcd", b"abcd"));
+}
+
+#[test]
+fn bearer_header_must_carry_the_token() {
+    let ok = |h: Option<&str>| bearer_ok(h, TOKEN);
+    assert!(ok(Some("Bearer s3cr3t-token")));
+    assert!(
+        ok(Some("bearer s3cr3t-token")),
+        "the scheme word is case-insensitive"
+    );
+    assert!(
+        ok(Some("BEARER  s3cr3t-token ")),
+        "the credential is trimmed"
+    );
+    assert!(!ok(None), "no header is no credential");
+    assert!(!ok(Some("s3cr3t-token")), "the scheme is required");
+    assert!(!ok(Some("Basic s3cr3t-token")), "only Bearer");
+    assert!(!ok(Some("Bearer wrong-token")));
+    assert!(
+        !ok(Some("Bearer s3cr3t-toke")),
+        "a prefix of the token is not the token"
+    );
+    assert!(!ok(Some("Bearer s3cr3t-token!")));
+    assert!(!ok(Some("Bearer")), "a scheme without a credential");
+    assert!(!ok(Some("Bearer ")), "an empty credential");
+    assert!(!ok(Some("")), "an empty header");
+    assert!(!ok(Some("s3cr3t-token Bearer")), "the scheme comes first");
+    // More than one space between the scheme and the credential, and stray spaces around the
+    // credential: accepted, because the trim is what the resolver applied to the token too.
+    assert!(ok(Some("Bearer  s3cr3t-token")));
+    assert!(ok(Some("Bearer\t s3cr3t-token ")));
+}
+
+#[tokio::test]
+async fn metrics_and_stats_answer_only_to_the_token() {
+    let ctx = token_ctx(Some(TOKEN));
+    // without the token: the gated endpoints refuse, the probes do not care
+    for path in ["/metrics", "/stats"] {
+        let r = exchange(
+            &ctx,
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+        )
+        .await;
+        assert_eq!(status(&r), 401, "{path}");
+        assert!(r.contains("WWW-Authenticate: Bearer"), "{path}: {r}");
+        assert!(
+            !r.contains(TOKEN),
+            "a refusal must not repeat the token: {r}"
+        );
+    }
+    for path in ["/livez", "/healthz", "/readyz", "/startupz", "/"] {
+        assert_eq!(
+            status(
+                &exchange(
+                    &ctx,
+                    format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()
+                )
+                .await
+            ),
+            if path == "/readyz" { 503 } else { 200 },
+            "{path} must stay open"
+        );
+    }
+    // with the token: both answer, HEAD like GET without a body
+    let auth = format!("Authorization: Bearer {TOKEN}\r\n");
+    let r = exchange(
+        &ctx,
+        format!("GET /metrics HTTP/1.1\r\nHost: x\r\n{auth}\r\n").as_bytes(),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(body(&r).contains("lazyview_"), "{r}");
+    let r = exchange(
+        &ctx,
+        format!("GET /stats HTTP/1.1\r\nHost: x\r\n{auth}\r\n").as_bytes(),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(
+        r.contains("Content-Type: application/json"),
+        "the answer is the real body: {r}"
+    );
+    let r = exchange(
+        &ctx,
+        format!("HEAD /metrics HTTP/1.1\r\nHost: x\r\n{auth}\r\n").as_bytes(),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(r.ends_with("\r\n\r\n"), "HEAD has no body: {r}");
+    // wrong credential, in every shape
+    for header in [
+        "Authorization: Bearer wrong\r\n",
+        "Authorization: bearer s3cr3t-toke\r\n",
+        "Authorization: Basic s3cr3t-token\r\n",
+        "Authorization: s3cr3t-token\r\n",
+        "Authorization: Bearer\r\n",
+        "Authorization: Bearer Bearer s3cr3t-token\r\n",
+    ] {
+        let r = exchange(
+            &ctx,
+            format!("GET /metrics HTTP/1.1\r\nHost: x\r\n{header}\r\n").as_bytes(),
+        )
+        .await;
+        assert_eq!(status(&r), 401, "{header}");
+    }
+    // the first Authorization header is the one that counts
+    let r = exchange(
+        &ctx,
+        format!(
+            "GET /metrics HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nAuthorization: Bearer nope\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let r = exchange(
+        &ctx,
+        format!(
+            "GET /metrics HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status(&r), 401, "{r}");
+    // auth comes before the method check: an unauthenticated POST is not an invitation
+    let r = exchange(&ctx, b"POST /metrics HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await;
+    assert_eq!(status(&r), 401, "{r}");
+    // and a token we do not have still cannot read the probes
+    assert!(probe_path_status(&ctx, "/livez").await);
+}
+
+#[tokio::test]
+async fn without_a_token_everything_stays_open() {
+    let ctx = token_ctx(None);
+    assert_eq!(
+        status(&exchange(&ctx, b"GET /metrics HTTP/1.1\r\n\r\n").await),
+        200
+    );
+    assert_eq!(
+        status(&exchange(&ctx, b"GET /stats HTTP/1.1\r\n\r\n").await),
+        200
+    );
+    // a bearer header is simply ignored
+    assert_eq!(
+        status(
+            &exchange(
+                &ctx,
+                b"GET /metrics HTTP/1.1\r\nAuthorization: Bearer nope\r\n\r\n"
+            )
+            .await
+        ),
+        200
+    );
+}
+
+/// True when `/livez` answers 200 for a context (the probes ignore the token).
+async fn probe_path_status(ctx: &Ctx, path: &str) -> bool {
+    status(&exchange(ctx, format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes()).await) == 200
+}
+
+/// One request over a real socket, response verbatim: the gate has to hold on the wire, where
+/// the header arrives in its own packet, not only in the in-process exchange above.
+async fn wire(addr: SocketAddr, request: &str) -> String {
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(request.as_bytes()).await.unwrap();
+    s.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    String::from_utf8(out).expect("ASCII response")
+}
+
+#[tokio::test]
+async fn the_gate_holds_on_a_real_connection() {
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = blocker.local_addr().unwrap();
+    drop(blocker);
+    let m = Arc::new(Metrics::default());
+    m.beat();
+    let token = crate::secrets::resolve_secret(TOKEN).unwrap();
+    let server = tokio::spawn(serve_with(addr, m, Settings::default(), Some(token)));
+    for _ in 0..100 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let ask = |path: &str, auth: Option<&str>| {
+        let auth = auth
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
+        let head = format!("GET {path} HTTP/1.1\r\nHost: x\r\n{auth}\r\n");
+        async move { wire(addr, &head).await }
+    };
+    assert_eq!(status(&ask("/metrics", None).await), 401);
+    assert_eq!(
+        status(&ask("/metrics", Some(&format!("Bearer {TOKEN}"))).await),
+        200
+    );
+    assert_eq!(status(&ask("/stats", Some("Bearer wrong")).await), 401);
+    assert_eq!(status(&ask("/livez", None).await), 200);
+    server.abort();
 }

@@ -136,7 +136,9 @@ COPY --from=builder --chown=0:0 --chmod=0555 /out/lazyview /lazyview
 # The base sets WORKDIR /home/nonroot and SSL_CERT_FILE (not read by lazyview, see
 # the header).
 USER 65532:65532
-# /livez (alias /healthz) /readyz /startupz /metrics (LAZYVIEW_HEALTH_ADDR, default 0.0.0.0:8080)
+# /livez (alias /healthz) /readyz /startupz /metrics (LAZYVIEW_HEALTH_ADDR, default
+# 127.0.0.1:8080, so nothing is reachable from outside the container until it is set to
+# 0.0.0.0:8080; EXPOSE below is then what a -p mapping publishes)
 EXPOSE 8080
 # Exec form, no shell needed: the binary probes its own /livez (same
 # LAZYVIEW_HEALTH_ADDR). With LAZYVIEW_HEALTH_ADDR=off run with --no-healthcheck.

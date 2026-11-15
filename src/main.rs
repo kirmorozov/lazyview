@@ -18,13 +18,18 @@ CONNECTION (either):
   LAZYVIEW_HOST, LAZYVIEW_PORT (3306), LAZYVIEW_USER, LAZYVIEW_PASSWORD, LAZYVIEW_DATABASE
   LAZYVIEW_DSN=mysql://user:pass@host:3306/database      (mariadb:// accepted)
   LAZYVIEW_TLS=disabled|required|verify-full   LAZYVIEW_TLS_CA=/path/ca.pem (private CA)
+  A password (or the health token below) may be a reference instead of a value:
+  file:///abs/path, aws-secret://<secret-id>[#<json-field>] (with --features aws-secrets),
+  or plain://<value>; <NAME>_FILE names a file to read the reference from.
 
 OTHER TARGETS (optional, one view can be written to several instances):
   LAZYVIEW_TARGET_<NAME>_HOST/_PORT/_USER/_PASSWORD/_DATABASE or LAZYVIEW_TARGET_<NAME>_DSN
 
 COMMON SETTINGS:
   LAZYVIEW_START_MODE=resume|rebuild|once   LAZYVIEW_BATCH_WINDOW_MS=200
-  LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080 (or off) LAZYVIEW_LOG_FORMAT=text|json  RUST_LOG=info
+  LAZYVIEW_HEALTH_ADDR=127.0.0.1:8080 (or off; 0.0.0.0:8080 to serve the pod network)
+  LAZYVIEW_HEALTH_TOKEN=<token> (gates /metrics and /stats)
+  LAZYVIEW_LOG_FORMAT=text|json   RUST_LOG=info
 
 Then: INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW v AS SELECT ...');
 See README.md for everything else.
@@ -99,6 +104,18 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // One WARN per endpoint (source or target) that reaches a server off this host with TLS off.
+    // A warning, not a refusal: `LAZYVIEW_TLS` has always defaulted to `disabled`, and a private
+    // network is a legitimate choice — but it should be one the operator made on purpose.
+    for w in &cfg.cleartext {
+        tracing::warn!(
+            "{}: {} connects without TLS; set {}=required (or verify-full) to keep credentials \
+             and data off the wire",
+            w.endpoint,
+            w.host,
+            w.var
+        );
+    }
     let (tx, rx) = watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;

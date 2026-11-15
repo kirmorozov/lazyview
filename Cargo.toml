@@ -39,7 +39,13 @@ thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# Resolved secret references (`src/secrets.rs`) are cleared when the last handle drops. The
+# crate is already in the tree (rustls, tls_codec), so this names an existing dependency.
+zeroize = "1"
 roaring = { version = "0.12", optional = true }
+# `aws-secrets` only: `aws-secret://` references (src/secrets.rs). Not in the default build.
+aws-config = { version = "1", optional = true }
+aws-sdk-secretsmanager = { version = "1", optional = true }
 foldhash = "0.2"
 
 [features]
@@ -48,6 +54,12 @@ foldhash = "0.2"
 # the only user of the optional `roaring` dependency. lazy-wire-fire declares
 # the same `roaring = ["dep:roaring"]`; the cfg name in src/intset.rs is the contract.
 roaring = ["dep:roaring"]
+# `aws-secrets` enables `aws-secret://<secret-id>[#<json-field>]` secret references
+# (src/secrets.rs) with AWS Secrets Manager GetSecretValue and the DEFAULT AWS credential
+# chain (environment, IRSA, instance profile; never anything from the lazyview
+# configuration). Off by default: a build without it refuses such a reference loudly
+# instead of treating the URI as a password, and pays no aws-config / aws-sdk cost.
+aws-secrets = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
 
 [dev-dependencies]
 rand = "0.10"

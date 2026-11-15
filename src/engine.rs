@@ -48,9 +48,10 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     Metrics::set(&metrics.gauges.heartbeat_unix, crate::metrics::unix_now());
+    let token = cfg.health_token.clone();
     let health = cfg
         .health_addr
-        .map(|addr| tokio::spawn(crate::health::serve(addr, metrics.clone())));
+        .map(|addr| tokio::spawn(crate::health::serve(addr, metrics.clone(), token)));
     let result = run_engine(cfg, metrics, &mut shutdown).await;
     if let Some(h) = health {
         h.abort();
