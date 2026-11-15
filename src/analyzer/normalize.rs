@@ -180,38 +180,53 @@ pub(crate) fn blocker(b: &Block) -> Option<String> {
     None
 }
 
-/// Rename-invariance key for an expression: identifiers are rewritten by the
-/// server's rules, then the result is rendered. A column identifier or alias
-/// (`Expr::Identifier` and the last part of an `Expr::CompoundIdentifier`)
-/// and a function name are case-insensitive, and quoting does not change an
-/// identifier; the other parts of a compound identifier keep their case;
-/// string literals and everything else keep their exact text.
+/// Rename-invariance key for an expression of a MySQL-family plan: [`expr_key_for`] with the one
+/// family the analyzer plans today.
 pub(crate) fn expr_key(e: &Expr) -> String {
+    expr_key_for(crate::dialect::Family::Mysql, e)
+}
+
+/// Rename-invariance key for an expression of a `family`'s plan: identifiers are rewritten by the
+/// server's rules, then the result is rendered. Which rules an identifier follows — its case and
+/// whether quoting says anything about it — is the dialect's answer
+/// ([`crate::dialect::ident_key`]): the MySQL family folds every name and drops its quotes, save
+/// the parts before the column of a qualified name, whose case its servers do keep; PostgreSQL
+/// folds an unquoted name as its resolver does and keeps a double-quoted one exactly, so a
+/// `"Foo"` keys apart from `Foo`. String literals and everything else keep their exact text.
+pub(crate) fn expr_key_for(family: crate::dialect::Family, e: &Expr) -> String {
     use sqlparser::ast::{VisitMut, VisitorMut};
 
-    struct Keyer;
+    struct Keyer {
+        family: crate::dialect::Family,
+    }
 
     impl VisitorMut for Keyer {
         type Break = ();
         fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+            let family = self.family;
+            let key = |value: &str, quote_style: Option<char>, qualified: bool| {
+                crate::dialect::ident_key(family, value, quote_style, qualified)
+            };
             match e {
                 Expr::Identifier(i) => {
-                    i.value = i.value.to_lowercase();
-                    i.quote_style = None;
+                    let (value, quote) = key(&i.value, i.quote_style, false);
+                    i.value = value;
+                    i.quote_style = quote;
                 }
                 Expr::CompoundIdentifier(parts) => {
-                    for p in parts.iter_mut() {
-                        p.quote_style = None;
-                    }
-                    if let Some(col) = parts.last_mut() {
-                        col.value = col.value.to_lowercase();
+                    let last = parts.len().saturating_sub(1);
+                    for (n, p) in parts.iter_mut().enumerate() {
+                        let (value, quote) = key(&p.value, p.quote_style, n < last);
+                        p.value = value;
+                        p.quote_style = quote;
                     }
                 }
                 Expr::Function(f) => {
                     for part in &mut f.name.0 {
                         if let ObjectNamePart::Identifier(i) = part {
-                            i.value = i.value.to_lowercase();
-                            i.quote_style = None;
+                            let (value, quote) = key(&i.value, i.quote_style, false);
+                            i.value = value;
+                            i.quote_style = quote;
                         }
                     }
                 }
@@ -222,7 +237,7 @@ pub(crate) fn expr_key(e: &Expr) -> String {
     }
 
     let mut expr = e.clone();
-    let _ = expr.visit(&mut Keyer);
+    let _ = expr.visit(&mut Keyer { family });
     expr.to_string()
 }
 
@@ -2347,4 +2362,65 @@ fn semis_to_joins(b: &mut Block) -> Result<()> {
     b.select.selection = and_all(all);
     b.rewritten = true;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialect::Family;
+
+    /// The first select item's expression of `sql`, read on `family`'s parse profile.
+    fn item(sql: &str, family: Family) -> Expr {
+        let tokens = crate::dialect::tokenize_view(family, sql).unwrap();
+        match crate::dialect::new_parser(family, tokens)
+            .unwrap()
+            .parse_select_item()
+            .unwrap()
+        {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => panic!("wildcard"),
+        }
+    }
+
+    fn key(sql: &str, family: Family) -> String {
+        expr_key_for(family, &item(sql, family))
+    }
+
+    /// The case rule is the dialect's answer: what the MySQL key has always folded, the PostgreSQL
+    /// key folds only where its server folds, and a double-quoted name keys apart from the same
+    /// name written bare.
+    #[test]
+    fn the_case_rule_reads_the_family() {
+        let id = item("id + 1", Family::Mysql);
+        // MySQL: the keys the rename-invariance suites compare, unchanged.
+        assert_eq!(expr_key(&item("ID + 1", Family::Mysql)), expr_key(&id));
+        assert_eq!(expr_key(&item("`ID` + 1", Family::Mysql)), expr_key(&id));
+        assert_eq!(
+            expr_key(&item("ID", Family::Mysql)),
+            key("ID", Family::Mysql)
+        );
+        // The column of a qualified name folds; the parts before it keep their case (the servers
+        // answer the same plan for `t.DB` and `t.db`, not for `T.id` and `t.id`).
+        assert_eq!(key("t.DB", Family::Mysql), "t.db");
+        assert_eq!(key("T.id", Family::Mysql), "T.id");
+        // PostgreSQL: a bare name is the name its server folds to, a quoted one is its own name.
+        assert_eq!(key("ID", Family::Postgres), key("id", Family::Postgres));
+        assert_eq!(key("ID", Family::Postgres), "id");
+        assert_ne!(key("\"ID\"", Family::Postgres), key("id", Family::Postgres));
+        assert_eq!(key("T.ID", Family::Postgres), key("t.id", Family::Postgres));
+        assert_ne!(
+            key("\"T\".id", Family::Postgres),
+            key("t.id", Family::Postgres)
+        );
+        // A function name follows the same rule; a literal keeps its text exactly.
+        assert_eq!(
+            key("COALESCE(ID, 'Aa')", Family::Postgres),
+            "coalesce(id, 'Aa')"
+        );
+        assert_eq!(
+            key("COALESCE(ID, 'Aa')", Family::Mysql),
+            "coalesce(id, 'Aa')"
+        );
+    }
 }

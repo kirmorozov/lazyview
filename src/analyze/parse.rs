@@ -29,9 +29,9 @@ pub fn definition_hash(def: &str) -> String {
 /// Parses `CREATE [OR REPLACE] [ALGORITHM=..] [DEFINER=..] [SQL SECURITY ..] VIEW name [(cols)] AS
 /// SELECT ... [WITH [CASCADED|LOCAL] CHECK OPTION]`.
 pub fn parse_definition(def: &str) -> Result<ParsedDef> {
-    // The parse profile (executable-comment refusal, tokenizer, parser) is the dialect's answer;
-    // the definitions parsed here are MySQL-family (a `postgres://` source is refused at connect)
-    // and the PostgreSQL profile arrives with `pgsrc-parse-profile`.
+    // The parse profile (its refusals, the tokenizer, the parser) is the dialect's answer, and
+    // both families now have one: the definitions parsed here are still MySQL-family, because a
+    // `postgres://` source is refused at connect until phase S5 starts the PostgreSQL reader.
     let tokens = crate::dialect::tokenize_view(crate::dialect::Family::Mysql, def)?;
     // Indexes of the non-whitespace tokens.
     let words: Vec<usize> = (0..tokens.len())

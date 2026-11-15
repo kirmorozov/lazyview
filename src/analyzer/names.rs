@@ -6,11 +6,15 @@
 //! * a generated name longer than 64 characters or ending in a space → `Name_exp_<position>`;
 //! * flavor-dependent: a comment inside the text (kept by 8.4, stripped by 8.0 and MariaDB) and
 //!   duplicates of generated names (`Name_exp_<x>` vs `My_exp_<x>`).
+//!
+//! The case a name comes back in is the family's answer, not this file's: [`crate::dialect`]
+//! decides whether the server folds an identifier ([`item_name_for`]).
 
 use sqlparser::ast::{Expr, Ident, UnaryOperator, Value};
 use sqlparser::tokenizer::{Token, Whitespace};
 
 use super::source::tokenize;
+use crate::dialect::Family;
 
 /// The name of an identifier has one owner, `crate::analyze` (it reads the same names off the raw
 /// tokens); re-exported here for the analyzer's passes.
@@ -49,10 +53,23 @@ impl Name {
     }
 }
 
-/// Name of a projection item: `alias` (from `AS`), else derived from `expr` and its source text.
+/// Name of a projection item on the MySQL family's name rules: `alias` (from `AS`), else derived
+/// from `expr` and its source text. The analyzer plans the MySQL family today (a `postgres://`
+/// source is refused at connect); [`item_name_for`] takes the family.
 pub(crate) fn item_name(expr: &Expr, alias: Option<&Ident>, text: Option<&str>) -> Name {
+    item_name_for(crate::dialect::Family::Mysql, expr, alias, text)
+}
+
+/// Name of a projection item of a `family`'s view: the same rules, with the case of a name read as
+/// that family's server reads it ([`named`]).
+pub(crate) fn item_name_for(
+    family: Family,
+    expr: &Expr,
+    alias: Option<&Ident>,
+    text: Option<&str>,
+) -> Name {
     if let Some(a) = alias {
-        return Name::new(ident_name(a), NameKind::Alias);
+        return Name::new(named(family, a), NameKind::Alias);
     }
     let mut e = expr;
     while let Expr::Nested(inner) = e {
@@ -70,9 +87,9 @@ pub(crate) fn item_name(expr: &Expr, alias: Option<&Ident>, text: Option<&str>) 
         e = inner;
     }
     match e {
-        Expr::Identifier(id) => return Name::new(ident_name(id), NameKind::Column),
+        Expr::Identifier(id) => return Name::new(named(family, id), NameKind::Column),
         Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
-            return Name::new(ident_name(parts.last().unwrap()), NameKind::Column)
+            return Name::new(named(family, parts.last().unwrap()), NameKind::Column)
         }
         _ => {}
     }
@@ -112,6 +129,12 @@ fn uncertain(expr: &Expr, text: Option<&str>) -> Name {
         text.map(str::to_string).unwrap_or_else(|| expr.to_string()),
         NameKind::Generated { certain: false },
     )
+}
+
+/// The name `family`'s server gives an identifier of a parsed AST: `crate::analyze::ident_name`
+/// reads the name off it and the family decides its case ([`crate::dialect::fold_name`]).
+fn named(family: Family, i: &Ident) -> String {
+    crate::dialect::fold_name(family, ident_name(i), i.quote_style.is_some())
 }
 
 /// Whether SQL text contains a comment token.
@@ -222,5 +245,38 @@ mod tests {
             finish_view_names(&mut cols).is_empty(),
             "the server rejects these itself"
         );
+    }
+
+    /// The case a name comes back in is the family's answer, not this file's: the MySQL family
+    /// answers as written, PostgreSQL folds what its resolver folds.
+    #[test]
+    fn column_names_read_the_family() {
+        let item = |sql: &str, family: Family| {
+            let tokens = crate::dialect::tokenize_view(family, sql).unwrap();
+            match crate::dialect::new_parser(family, tokens)
+                .unwrap()
+                .parse_select_item()
+                .unwrap()
+            {
+                SelectItem::UnnamedExpr(e) => item_name_for(family, &e, None, Some(sql)),
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    item_name_for(family, &expr, Some(&alias), None)
+                }
+                _ => panic!("wildcard"),
+            }
+        };
+        // The measured MySQL behaviour (above): the name as written, quoting stripped.
+        assert_eq!(item("ID", Family::Mysql).text, "ID");
+        assert_eq!(item("`ID`", Family::Mysql).text, "ID");
+        assert_eq!(item("t.DB", Family::Mysql).text, "DB");
+        assert_eq!(item("total * 2 AS Qty", Family::Mysql).text, "Qty");
+        // PostgreSQL: an unquoted name is the name its server folds to; a double-quoted one is
+        // the name that was asked for, case included.
+        assert_eq!(item("ID", Family::Postgres).text, "id");
+        assert_eq!(item("\"ID\"", Family::Postgres).text, "ID");
+        assert_eq!(item("t.DB", Family::Postgres).text, "db");
+        assert_eq!(item("\"t\".\"DB\"", Family::Postgres).text, "DB");
+        assert_eq!(item("total * 2 AS Qty", Family::Postgres).text, "qty");
+        assert_eq!(item("total * 2 AS \"Qty\"", Family::Postgres).text, "Qty");
     }
 }
