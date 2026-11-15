@@ -1305,7 +1305,9 @@ async fn snapshot_reported(conn: &mut mysql_async::Conn) -> Result<bool> {
 /// not an alias of the view, and its key gives no unit. The bulk of `links` under one group is what
 /// makes the seed's read long enough to commit a change inside it; the test waits for that read in
 /// the process list and requires it to still be running when the change committed, so the timing is
-/// observed rather than hoped for. `cascade_rows` proves the replay reached the cache either way.
+/// observed rather than hoped for. What proves the replay reached the cache is the shape of the
+/// source's own log: either the parent's event expands the kept rows (`cascade_rows`) or, on a
+/// source that logs the rows its FK cascade moves, the child rows do; `ids_marked` covers both.
 #[test]
 fn reg_cascade_window_ends_at_seed() {
     scenario("reg_casc_seed_pos", |ctx| async move {
@@ -1408,17 +1410,28 @@ fn reg_cascade_window_ends_at_seed() {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let s = eng.stats_of(&db, "r_seed_pos")?;
         let d = eng.snapshot().since(&f0);
-        // The replay reached the cache (2 kept rows of the moved key) either way; only the tally
-        // differs: the seed's snapshot ends the window where the server reports one.
+        // The replay reached the cache; only the window's tally differs: the seed's own snapshot
+        // ends it where the server reports a position. TWO shapes of source reach it, and the
+        // `rows_seen` of this one transaction says which one this server is. A source that logs
+        // only the parent's own row change (rows_seen 1) is expanded by the parent's event, so it
+        // tallies the 2 kept rows. A source that also logs the rows its own FK cascade moved
+        // (rows_seen 3: the parent's row and the two children's) feeds those child rows FIRST:
+        // `feed_map` moves them out of the old-key bucket, so the parent's event finds it empty
+        // (its remedy, `kept_under_new`, is a gap-window remedy only) and the child rows are what
+        // named the units. Either way the view is exact (`verify` below) and `ids_marked` says the
+        // units of BOTH moved groups were named, so neither shape passes by doing nothing.
         let want = if reports { 0 } else { 1 };
+        let source_logged_cascade_rows = d.rows_seen >= 3;
         ensure!(
-            s.cascade_rows >= 2
+            s.ids_marked >= 2
+                && (s.cascade_rows >= 2 || source_logged_cascade_rows)
                 && s.cascade_gaps == want
                 && s.whole_view_refreshes == 0
                 && d.full_rebuilds == 0,
-            "the parent change the seed never saw was replayed wrong, counted as {} gap(s) \
-             (a server without a snapshot position counts one), refreshed the whole view or \
-             rebuilt: {s:?} {}",
+            "the parent change the seed never saw was replayed wrong: counted as {} gap(s) (a \
+             server without a snapshot position counts one), or it named no unit of the moved key \
+             and reached neither the parent's expansion nor the cascade's own rows, or it \
+             refreshed the whole view or rebuilt: {s:?} {}",
             s.cascade_gaps,
             fmt_snapshot(&d)
         );
