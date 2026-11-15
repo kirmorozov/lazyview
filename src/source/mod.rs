@@ -23,6 +23,10 @@ use mysql_async::binlog::events::{BinlogEventHeader, Event};
 pub(crate) mod maria;
 pub(crate) mod percona;
 
+/// The PostgreSQL side (issue #57): the `pg_catalog` loader today, the stream and the fence
+/// later. Outside the copy set: it speaks `tokio_postgres` and calls the target's type map.
+pub(crate) mod postgres;
+
 /// A binlog coordinate. `pos` is the offset of the next event to read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Position {
