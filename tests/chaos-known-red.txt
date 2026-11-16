@@ -9,4 +9,5 @@
 # when its fix lands — the file is never a place to park a scenario for good. Empty file, strict
 # step: every chaos failure fails the job.
 chaos_tgt_blackhole_during_flush #214
-chaos_src_binlog_reset_mid_txn #229
+chaos_tgt_pg_blackhole_during_flush #214
+chaos_tgt_pg_reset_mid_write_txn #252
