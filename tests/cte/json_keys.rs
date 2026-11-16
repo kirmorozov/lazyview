@@ -117,30 +117,43 @@ const JSON_KEY_STEPS: &[(&str, &[&str])] = &[
 
 /// Why G5 exists, for the log: one-tuple vs two-tuple row IN over JSON-equal spellings (the
 /// MySQL family finds 3 rows, then 1). lazyview must be right either way.
+/// MariaDB has no JSON type (`CAST(… AS JSON)` does not parse): its arm compares the same
+/// spellings as text (LONGTEXT) and asserts the documented count, none, so it runs for real
+/// instead of skipping. If MariaDB ever compared them as JSON, this arm fails and flips to
+/// the MySQL one.
 async fn json_row_in_canary(ctx: &Ctx) -> Result<()> {
-    if ctx.server().is_mariadb() {
-        // (No JSON type: JSON is LONGTEXT, CAST(… AS JSON) does not parse.)
-        ctx.log("JSON row-IN canary: not applicable on MariaDB");
-        return Ok(());
-    }
+    let mariadb = ctx.server().is_mariadb();
     let db = ctx.new_db("cte_json_canary").await?;
     let mut c = db.conn().await?;
-    for s in [
-        "CREATE TABLE jd (id INT PRIMARY KEY, g INT, doc JSON)",
-        r#"INSERT INTO jd VALUES (1, 2, '{"a": 1, "b": 2}'), (2, 2, '{"b":2, "a":1.00}'), (3, 2, '{"a":1,"b":2}')"#,
-    ] {
-        exec(&mut c, s).await?;
+    let doc_ty = if mariadb { "LONGTEXT" } else { "JSON" };
+    exec(
+        &mut c,
+        &format!("CREATE TABLE jd (id INT PRIMARY KEY, g INT, doc {doc_ty})"),
+    )
+    .await?;
+    exec(&mut c, r#"INSERT INTO jd VALUES (1, 2, '{"a": 1, "b": 2}'), (2, 2, '{"b":2, "a":1.00}'), (3, 2, '{"a":1,"b":2}')"#).await?;
+    let (one_sql, two_sql) = if mariadb {
+        (
+            r#"SELECT COUNT(*) FROM jd WHERE (g, doc) IN ((2, '{"a": 1.0, "b": 2}'))"#,
+            r#"SELECT COUNT(*) FROM jd WHERE (g, doc) IN ((2, '{"a": 1.0, "b": 2}'), (3, '{}'))"#,
+        )
+    } else {
+        (
+            r#"SELECT COUNT(*) FROM jd WHERE (g, doc) IN ((2, CAST('{"a": 1.0, "b": 2}' AS JSON)))"#,
+            r#"SELECT COUNT(*) FROM jd WHERE (g, doc) IN ((2, CAST('{"a": 1.0, "b": 2}' AS JSON)), (3, CAST('{}' AS JSON)))"#,
+        )
+    };
+    let one = scalar_i64(&mut c, one_sql).await?;
+    let two = scalar_i64(&mut c, two_sql).await?;
+    if mariadb {
+        // Documented MariaDB behaviour: text equality knows no JSON equality, and no stored
+        // spelling equals the compared literal, so both queries find no row.
+        anyhow::ensure!(
+            one == 0 && two == 0,
+            "MariaDB compares the JSON spellings as text: found {one}/{two} rows, want 0/0 \
+             (the LONGTEXT equality changed, the arm must flip to the MySQL one)"
+        );
     }
-    let one = scalar_i64(
-        &mut c,
-        r#"SELECT COUNT(*) FROM jd WHERE (g, doc) IN ((2, CAST('{"a": 1.0, "b": 2}' AS JSON)))"#,
-    )
-    .await?;
-    let two = scalar_i64(
-        &mut c,
-        r#"SELECT COUNT(*) FROM jd WHERE (g, doc) IN ((2, CAST('{"a": 1.0, "b": 2}' AS JSON)), (3, CAST('{}' AS JSON)))"#,
-    )
-    .await?;
     ctx.log(format!(
         "JSON row-IN canary: one tuple {one} rows, two tuples {two} rows{}",
         if one != two {

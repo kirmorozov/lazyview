@@ -2,8 +2,8 @@
 //! positions, workload generator + all view SQL on every flavor, the oracle (hand-filled table vs
 //! view, mismatch detection and diff formatting).
 //!
-//! The `--ignored` maintenance tools that used to live here (schema cleanup, workload dumping)
-//! are in `tests/tools.rs`.
+//! The maintenance tools that used to live here (schema cleanup, workload dumping) are
+//! examples: `cargo run --example cleanup_test_schemas`, `cargo run --example dump_workload`.
 
 mod common;
 

@@ -1300,8 +1300,18 @@ fn merged(evs: &[Ev]) -> Vec<Ev> {
 }
 
 /// Three statements whose rows events exceed the fragment threshold (one row of the first
-/// stays under it), then the marker; the stream must hold the whole rows.
-async fn partial_rows_workload(dsn: &str, w: &mut Conn, s: &str, start: &Position) -> Result<()> {
+/// stays under it), then the marker; the stream must hold the whole rows. `fragmented` is set
+/// when the caller armed `binlog_row_event_fragment_threshold` (MariaDB >= 12.3): the server
+/// must then really split the events into `Partial_rows`. Without it the same rows run
+/// unfragmented (no threshold: MySQL, Percona, MariaDB < 12.3).
+async fn partial_rows_workload(
+    dsn: &str,
+    w: &mut Conn,
+    s: &str,
+    start: &Position,
+    flavor: Flavor,
+    fragmented: bool,
+) -> Result<()> {
     let row = |id: i64, n: usize, c: char| -> Image {
         Some(vec![Value::Int(id), Value::Bytes(vec![c as u8; n])])
     };
@@ -1345,7 +1355,9 @@ async fn partial_rows_workload(dsn: &str, w: &mut Conn, s: &str, start: &Positio
     w.query_drop(&marker).await?;
     want.push(Ev::Stmt(marker));
 
-    // The server really fragmented them (about 150 KiB of row images per 1 KiB fragment).
+    // Proof the server wrote the workload its own way: at the 1 KiB threshold about 150 KiB of
+    // row images per fragment gives hundreds of `Partial_rows`; on a server without the
+    // threshold no rows event may fragment at all.
     let events: Vec<Row> = w
         .query(format!(
             "SHOW BINLOG EVENTS IN '{}' FROM {}",
@@ -1356,15 +1368,23 @@ async fn partial_rows_workload(dsn: &str, w: &mut Conn, s: &str, start: &Positio
         .iter()
         .filter(|r| r.get::<String, _>(2).as_deref() == Some("Partial_rows"))
         .count();
-    ensure!(
-        fragments >= 200,
-        "{fragments} Partial_rows events after {start}, the workload should produce about 290"
-    );
+    if fragmented {
+        ensure!(
+            fragments >= 200,
+            "{fragments} Partial_rows events after {start}, the workload should produce about 290"
+        );
+    } else {
+        ensure!(
+            fragments == 0,
+            "{fragments} Partial_rows events after {start}: this server has no \
+             binlog_row_event_fragment_threshold, no rows event may fragment"
+        );
+    }
 
     let mut r = BinlogReader::connect(
         replica_opts(dsn)?,
         server_id(),
-        Flavor::MariaDb,
+        flavor,
         start,
         Duration::from_secs(1),
     )
@@ -1389,45 +1409,50 @@ async fn partial_rows_workload(dsn: &str, w: &mut Conn, s: &str, start: &Positio
 /// MariaDB >= 12.3 splits a rows event larger than `binlog_row_event_fragment_threshold` into
 /// `Partial_rows` events (type 172), which the reader reassembles. With the threshold at its
 /// minimum (1 KiB) every rows event of this workload is fragmented (up to 140 fragments).
-/// Other servers, and MariaDB without the variable, skip.
+/// Servers without the variable (MySQL, Percona, MariaDB < 12.3) run the same workload
+/// unfragmented: the reader must reassemble exactly the same rows either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_mariadb_partial_rows_reassembled() {
-    on_all_servers("stream_mariadb_partial_rows_reassembled", |name, dsn| async move {
-        let mut w = connect(&dsn).await?;
-        let info = server_info(&mut w).await?;
-        let threshold: Option<u64> = if info.flavor == Flavor::MariaDb {
-            w.query_first("SELECT @@GLOBAL.binlog_row_event_fragment_threshold")
-                .await
-                .unwrap_or(None)
-        } else {
-            None
-        };
-        if threshold.is_none() {
-            println!(
-                "stream_mariadb_partial_rows_reassembled [{name}]: no binlog_row_event_fragment_threshold on {}, skipping",
-                info.version
-            );
-            return Ok(());
-        }
-        let s = unique_schema("pr");
-        w.query_drop(format!("CREATE DATABASE `{s}`")).await?;
-        w.query_drop(format!(
+    on_all_servers(
+        "stream_mariadb_partial_rows_reassembled",
+        |_name, dsn| async move {
+            let mut w = connect(&dsn).await?;
+            let info = server_info(&mut w).await?;
+            let threshold: Option<u64> = if info.flavor == Flavor::MariaDb {
+                w.query_first("SELECT @@GLOBAL.binlog_row_event_fragment_threshold")
+                    .await
+                    .unwrap_or(None)
+            } else {
+                None
+            };
+            let s = unique_schema("pr");
+            w.query_drop(format!("CREATE DATABASE `{s}`")).await?;
+            w.query_drop(format!(
             "CREATE TABLE `{s}`.f (id INT NOT NULL PRIMARY KEY, d LONGBLOB NOT NULL) ENGINE=InnoDB"
         ))
-        .await?;
-        let start = current_position(&mut w).await?;
-        // The server's setting comes back whatever happened (the schema stays for a failure).
-        let mut globals = common::Globals::set(
-            &mut w,
-            &dsn,
-            &[("binlog_row_event_fragment_threshold", "1024")],
-        )
-        .await?;
-        let res = partial_rows_workload(&dsn, &mut w, &s, &start).await;
-        globals.restore(&mut w).await?;
-        res?;
-        w.query_drop(format!("DROP DATABASE `{s}`")).await?;
-        Ok(())
-    })
+            .await?;
+            let start = current_position(&mut w).await?;
+            let res = match threshold {
+                // The server's setting comes back whatever happened (the schema stays for a failure).
+                Some(_) => {
+                    let mut globals = common::Globals::set(
+                        &mut w,
+                        &dsn,
+                        &[("binlog_row_event_fragment_threshold", "1024")],
+                    )
+                    .await?;
+                    let res =
+                        partial_rows_workload(&dsn, &mut w, &s, &start, info.flavor, true).await;
+                    globals.restore(&mut w).await?;
+                    res
+                }
+                // No fragment threshold on this server: the same rows run unfragmented.
+                None => partial_rows_workload(&dsn, &mut w, &s, &start, info.flavor, false).await,
+            };
+            res?;
+            w.query_drop(format!("DROP DATABASE `{s}`")).await?;
+            Ok(())
+        },
+    )
     .await;
 }
