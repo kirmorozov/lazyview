@@ -29,7 +29,7 @@ tokio-postgres-rustls = { version = "0.14", default-features = false, features =
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "1.0"
-sqlparser = { version = "0.63", features = ["visitor"] }
+sqlparser = { version = "0.64", features = ["visitor"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "net", "io-util"] }
 futures-util = "0.3"
 tracing = "0.1"
