@@ -11,6 +11,7 @@
 //! `finish_run` drops the `lvt_*` schemas and the engine log dir (F12): the run directory is what
 //! survives the run.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
@@ -145,6 +146,11 @@ pub struct ViewRow {
     /// `_lazyview_state.route`: `dedup | viewplan | recompute | full`.
     pub route: String,
     pub whole_view_refreshes: u64,
+    /// `last_whole_view_refresh` of `/stats` (`src/stats.rs:337`): the reason and unix time of the
+    /// last whole-view refresh. The F5 rule reads it (a refresh the engine explains with a
+    /// documented reason no chaos event owns is not a failure), and the report keeps it: it is
+    /// in-memory per engine start, so it is unrecoverable once the run is over.
+    pub last_whole_view_refresh: Option<(String, u64)>,
     pub ids_pending: u64,
     pub cascade_cached_rows: u64,
 }
@@ -393,6 +399,7 @@ impl Report {
             "views": self.views.iter().map(|v| serde_json::json!({
                 "name": v.name, "target": v.target, "mode": v.mode, "route": v.route,
                 "whole_view_refreshes": v.whole_view_refreshes,
+                "last_whole_view_refresh": v.last_whole_view_refresh,
                 "ids_pending": v.ids_pending,
                 "cascade_cached_rows": v.cascade_cached_rows,
             })).collect::<Vec<_>>(),
@@ -425,23 +432,201 @@ pub fn set_writers(writers: &[watch::Sender<bool>], stop: bool) {
     }
 }
 
+/// The whole-view refresh reasons of `/stats` (`last_whole_view_refresh.reason`, the four
+/// strings of `src/engine.rs:2512-2520`) that the docs explain for an **incremental** view and no
+/// chaos event of the soak can own, so the F5 rule of [`check_once`] tolerates them beyond the
+/// ledger:
+///
+/// * `affected ids unknown (cascading foreign key, lookup overflow or untraced change)` — a change
+///   a cascading FK made inside the storage engine, an id lookup that overflowed, or a change the
+///   analyzer cannot trace: the rows the view must recompute are unknown, so the whole table is
+///   rebuilt ("the same limit applies to incremental views that need a rebuild because the affected
+///   rows are unknown: a cascading foreign key", `docs/configuration.md:128`, and the cascade
+///   section of `docs/views.md`). The paced writers delete parent rows at any time, so no event
+///   owns these.
+/// * `build on a target that was down` — a target that came back is rebuilt as a whole
+///   (`docs/operations.md:248`, "a target rebuilt after it was down"); the `TargetDown` event has
+///   restarted the engine by then, and a restart resets the per-view counters and empties the
+///   ledger, so that event cannot have approved it.
+///
+/// The engine's other two strings are not accepted here on their own, so the rule is not loosened
+/// beyond what `docs/views.md:433-436` documents: `full-mode view: the definition is not
+/// maintained incrementally` cannot happen to a view whose `mode` is `incremental` at all, and
+/// `new version: definition, targets or source schema changed, or rebuild requested` is a rebuild
+/// *some event caused* — it passes only through [`WAVE_REASONS`], where an event actually owns it,
+/// or through the bar the event recorded in the ledger. A refresh no event owns and no reason here
+/// explains still FAILS (D5), and `tests/soak_widen.rs` fails if the engine renames one of the
+/// strings below.
+pub const UNOWNED_REASONS: [&str; 2] = [
+    "affected ids unknown (cascading foreign key, lookup overflow or untraced change)",
+    "build on a target that was down",
+];
+
+/// The one reason of `src/engine.rs:2510-2516` that explains a whole-view refresh the run's own
+/// `SourceDdl` event causes, so [`Ledger::in_wave`] accepts it — for a view that event *owns*
+/// (its plan, or a cascading-FK parent of one, is in the DDL's affected set) and only while that
+/// event's rebuild wave is open:
+///
+/// * `new version: definition, targets or source schema changed, or rebuild requested` — the
+///   engine bumps the view's version when the source schema it planned against changed, and the
+///   version bump rebuilds the whole table. `docs/views.md:433` documents this for `ALTER TABLE`
+///   of a source table, including the case that matters here: "…and so does a view whose plan may
+///   already include later changes of the table (**after a restart or while catching up across
+///   several DDLs**)", which is exactly the event's three statements on `items` and `entities`
+///   arriving in one burst behind a restart earlier in the run. `docs/views.md:436` adds the
+///   chained view whose upstream table was swapped in the same wave.
+///
+/// Unlike [`UNOWNED_REASONS`] these are never tolerated on their own: outside the event's owned
+/// set, or after its wave closed, the same string is the failure the CI soak smoke of 2026-11-16
+/// named (`w_chain_a@source = 1`, last reason `new version: …`), and it stays a failure.
+pub const WAVE_REASONS: [&str; 1] =
+    ["new version: definition, targets or source schema changed, or rebuild requested"];
+
+/// `20261116`-style seconds since the epoch, the clock `last_whole_view_refresh.at` is written in
+/// (`src/stats.rs:337`, `src/engine.rs:2536`), so a wave window and a refresh time are comparable.
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The rebuild wave of one `SourceDdl` event: the views its DDL owns, and the wall-clock window in
+/// which that event's rebuilds can still land. Published by `soakchaos::run_event` when the burst
+/// fires (bounded by the ledger's own budget) and narrowed when that ledger has seen the wave end,
+/// so a *scheduled* check that runs beside a live event does not hold a view to a bar the ledger has
+/// not read yet — the f1 class, where `w_chain_a`'s dependent rebuild landed 40 s after the burst,
+/// while the event was still reading its own numbers.
+#[derive(Debug, Clone)]
+pub struct DdlWave {
+    /// The `view@target` keys of the views the event's DDL may rebuild: `soakchaos::plan_stale_of`
+    /// (the `occ` tables **and the cascading-FK parents** of each plan, `src/engine.rs:3800-3807`,
+    /// plus chains). A view outside this set is not the event's, whatever its reason says.
+    pub owned: HashSet<String>,
+    /// The unix seconds the burst fired at.
+    pub since: u64,
+    /// The unix seconds until which the event's wave may still land.
+    pub until: u64,
+}
+
+/// The approved-rebuild ledger of the per-view F5 rule (S3.3/Q3): what the chaos events of a run
+/// have accounted for on the current engine, so a check can tell a rebuild an event owns from one
+/// nothing explains. Emptied whenever the run starts a fresh engine, whose `/stats` counters start
+/// at zero (`ChaosRun::start_engine_with`).
+#[derive(Debug, Default)]
+pub struct Ledger {
+    /// `view@target` → the cumulative `whole_view_refreshes` an event has accounted for. A check
+    /// tolerates a count up to this bar and no higher.
+    bars: HashMap<String, u64>,
+    /// The wave of the `SourceDdl` event in flight, if one is.
+    wave: Option<DdlWave>,
+}
+
+impl Ledger {
+    /// The bar a check holds `key` to: the count the events of the run have accounted for.
+    pub fn bar(&self, key: &str) -> u64 {
+        self.bars.get(key).copied().unwrap_or(0)
+    }
+
+    /// An event accounted for `count` whole-view refreshes of `key`: the bar never goes down.
+    pub fn approve(&mut self, key: &str, count: u64) {
+        let e = self.bars.entry(key.to_string()).or_default();
+        *e = (*e).max(count);
+    }
+
+    /// A fresh engine: its counters start at zero, so every approval earned against the old ones
+    /// is meaningless, and so is any wave the old engine was still landing.
+    pub fn clear(&mut self) {
+        self.bars.clear();
+        self.wave = None;
+    }
+
+    /// The `SourceDdl` event's burst has fired at `since`: from now, a documented whole-view
+    /// refresh of a view in `owned` is attributable to it, until `until` (the caller's bound: the
+    /// ledger's own budget) or until [`Self::close_wave`] confirms the wave ended, whichever is
+    /// sooner.
+    pub fn open_wave(&mut self, owned: HashSet<String>, since: u64, until: u64) {
+        self.wave = Some(DdlWave {
+            owned,
+            since,
+            until,
+        });
+    }
+
+    /// The event's ledger has re-read its bars until the wave stopped moving: from now, a refresh
+    /// beyond a bar is the event's for `tail` more seconds (the race between the ledger's last
+    /// read and the check that follows it) and nobody's after that.
+    pub fn close_wave(&mut self, now: u64, tail: u64) {
+        if let Some(w) = self.wave.as_mut() {
+            w.until = w.until.min(now + tail);
+        }
+    }
+
+    /// Does the event in flight own a whole-view refresh of `key` that happened at `at`, as read
+    /// at `now`? The refresh must post-date the burst (`at >= since`: a reason left over from an
+    /// earlier cause is not this event's) and be read while the window is open. A closed wave
+    /// owns nothing past its tail.
+    pub fn in_wave(&self, key: &str, at: u64, now: u64) -> bool {
+        match self.wave.as_ref() {
+            Some(w) => w.owned.contains(key) && at >= w.since && now <= w.until && now >= w.since,
+            None => false,
+        }
+    }
+
+    /// The F5 verdict for one incremental view: does its counter pass? `Ok` says why (an empty
+    /// `String` is the ordinary at-or-below-the-bar pass); `Err` names the refresh for the report.
+    /// A beyond-bar refresh passes only where the engine explains it with a reason the docs
+    /// document — one no event can own ([`UNOWNED_REASONS`]), or one the event in flight owns
+    /// ([`WAVE_REASONS`], and then the ledger adopts it: the bar rises to the count the event
+    /// owns, so the same refresh is not judged again by the next check).
+    pub fn judge(
+        &mut self,
+        key: &str,
+        count: u64,
+        last: Option<&(String, u64)>,
+        now: u64,
+    ) -> std::result::Result<String, String> {
+        let bar = self.bar(key);
+        if count <= bar {
+            return Ok(String::new());
+        }
+        let counted = format!("{key} = {count}");
+        match last {
+            Some((reason, _)) if UNOWNED_REASONS.contains(&reason.as_str()) => {
+                Ok(format!("{counted} ({reason})"))
+            }
+            Some((reason, at))
+                if WAVE_REASONS.contains(&reason.as_str()) && self.in_wave(key, *at, now) =>
+            {
+                self.approve(key, count);
+                Ok(format!("{counted} ({reason}, the source-ddl wave)"))
+            }
+            other => Err(match other {
+                Some((reason, _)) => format!("{counted} (last reason: {reason})"),
+                None => counted,
+            }),
+        }
+    }
+}
+
 /// One check of §4, in the order the breakdown lists them: pause the writers (and let the rows they
 /// had in flight be written), `wait_caught_up_rounds(_, 3)` (`engine.rs:205`), `check_views_targets`
 /// (`oracle.rs:362`), the per-view rebuild rule (F5), the counter budget, the lag sample, the memory
 /// sample, the engine-log scan — then the writers resume. They resume on the failure path too: a
 /// failed check must never leave the load stopped.
 ///
-/// A check fails on an oracle mismatch, on an incremental view with a whole-view refresh (D5:
-/// the only case that ever passes is a count an event recorded in `approved`), on a WARN
-/// outside [`EXPECTED_WARNS`], on an `ERROR`/panic line, and on any
-/// hard-budget counter rising. `full_rebuilds`, `target_catchups` and `lag_over_budget` are not
-/// checked here: they have the documented cases of F5 and are what a target-down event must
-/// produce (S3.3 asserts those itself).
+/// A check fails on an oracle mismatch, on an incremental view with a whole-view refresh (D5: the
+/// only cases that ever pass are a count an event recorded in the ledger, a refresh the engine
+/// explains with one of [`UNOWNED_REASONS`], and a refresh of a view the `SourceDdl` event in
+/// flight owns while its wave is open — [`Ledger::judge`]), on a WARN outside [`EXPECTED_WARNS`],
+/// on an `ERROR`/panic line, and on any hard-budget counter rising. `full_rebuilds`,
+/// `target_catchups` and `lag_over_budget` are not checked here: they have the documented cases of
+/// F5 and are what a target-down event must produce (S3.3 asserts those itself).
 ///
-/// `approved` maps `view@target` to the cumulative `whole_view_refreshes` a chaos event has
-/// accounted for (S3.3: the source-ddl event approves the views whose plan reads the column it
-/// widens, on the engine it checked). A view above its approved count fails like an unapproved
-/// one; the map empties whenever the run starts a fresh engine, whose counters start at zero.
+/// `ledger` is what the chaos events of the run have accounted for on this engine (S3.3/Q3,
+/// [`Ledger`]): the bars a source-ddl event approved, plus the wave of the event in flight. A view
+/// above its bar and outside both of those tolerations fails like an unapproved one; a fresh
+/// engine empties the ledger, whose bars were earned against counters that no longer exist.
 ///
 /// The counter table is measured against [`Snapshot::default()`], i.e. since the engine started;
 /// between two consecutive checks the caller keeps a [`Window`] and calls [`counters`].
@@ -453,11 +638,11 @@ pub async fn quiesce_and_check(
     targets: &HashMap<String, Db>,
     specs: &[ViewSpec],
     writers: &[watch::Sender<bool>],
-    approved: &HashMap<String, u64>,
+    ledger: &mut Ledger,
     what: &str,
 ) -> Result<CheckRow> {
     set_writers(writers, true);
-    let out = check_once(ctx, eng, src, targets, specs, approved, what).await;
+    let out = check_once(ctx, eng, src, targets, specs, ledger, what).await;
     set_writers(writers, false);
     out
 }
@@ -468,7 +653,7 @@ async fn check_once(
     src: &Db,
     targets: &HashMap<String, Db>,
     specs: &[ViewSpec],
-    approved: &HashMap<String, u64>,
+    ledger: &mut Ledger,
     what: &str,
 ) -> Result<CheckRow> {
     let t = Instant::now();
@@ -502,24 +687,38 @@ async fn check_once(
             });
         }
     }
-    // (4) the per-view rebuild rule (F5): `_lazyview_state.mode` × `whole_view_refreshes`. The
-    // per-view counter is cumulative since the engine started, so a chaos event that legitimately
-    // caused a rebuild (`approved`, recorded by the event's own assertion) raises that view's bar
-    // to the count the event explained — every refresh *beyond* what an event accounted for, and
-    // everything on a view no event touched, still fails and is named (D5).
+    // (4) the per-view rebuild rule (F5): `_lazyview_state.mode` × `whole_view_refreshes`, and the
+    // reason of the last refresh (`last_whole_view_refresh`, `src/stats.rs:337`). The per-view
+    // counter is cumulative since the engine started, so a chaos event that legitimately caused a
+    // rebuild raises that view's bar in the ledger to the count the event explained — every refresh
+    // *beyond* what an event accounted for, and everything on a view no event touched, still fails
+    // and is named (D5). Beyond the bar a refresh passes only where [`Ledger::judge`] says so: a
+    // reason no event of this run can own ([`UNOWNED_REASONS`]), or a reason the `SourceDdl` event
+    // in flight owns for this view while its wave is open ([`WAVE_REASONS`]). A `new version: …`
+    // no event owns, or a moved counter with no refresh behind it to read, is named and fails.
     let views = view_rows(eng, src, specs).await?;
-    let refreshers: Vec<String> = views
-        .iter()
-        .filter(|v| {
-            v.mode.eq_ignore_ascii_case("incremental")
-                && v.whole_view_refreshes
-                    > approved
-                        .get(&format!("{}@{}", v.name, v.target))
-                        .copied()
-                        .unwrap_or(0)
-        })
-        .map(|v| format!("{}@{} = {}", v.name, v.target, v.whole_view_refreshes))
-        .collect();
+    let now = unix_now();
+    let mut refreshers: Vec<String> = Vec::new();
+    let mut explained: Vec<String> = Vec::new();
+    for v in views.iter() {
+        if !v.mode.eq_ignore_ascii_case("incremental") {
+            continue; // the Full/Chained views rebuild by design (F5)
+        }
+        let key = format!("{}@{}", v.name, v.target);
+        match ledger.judge(
+            &key,
+            v.whole_view_refreshes,
+            v.last_whole_view_refresh.as_ref(),
+            now,
+        ) {
+            Ok(note) => {
+                if !note.is_empty() {
+                    explained.push(note);
+                }
+            }
+            Err(named) => refreshers.push(named),
+        }
+    }
     let whole_view_refreshes: u64 = views.iter().map(|v| v.whole_view_refreshes).sum();
     // (5) the counter budget (§4).
     let counters = counters(eng, &Snapshot::default());
@@ -548,13 +747,22 @@ async fn check_once(
             .iter()
             .map(|w| format!("unexpected WARN: {w}")),
     );
+    let explained_note = if explained.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", beyond the ledger but explained by its documented reason: {}",
+            explained.join(", ")
+        )
+    };
     let detail = format!(
-        "{what}: {} view rows, {} recheck(s), full_rebuilds {}, whole_view_refreshes {}, \
+        "{what}: {} view rows, {} recheck(s), full_rebuilds {}, whole_view_refreshes {}{}, \
          lag {:.2}s, RSS {} KiB, inflight {}, {} WARN buckets ({} unexpected), {} ms",
         views.len(),
         rechecks,
         counter(&counters, "full_rebuilds"),
         whole_view_refreshes,
+        explained_note,
         lag.settle_s,
         mem.rss_kib,
         mem.inflight_rows,
@@ -633,6 +841,7 @@ pub async fn view_rows(eng: &Engine, src: &Db, specs: &[ViewSpec]) -> Result<Vec
             mode: r[2].clone().unwrap_or_default(),
             route: r[3].clone().unwrap_or_default(),
             whole_view_refreshes: vs.whole_view_refreshes,
+            last_whole_view_refresh: vs.last_whole_view_refresh.clone(),
             ids_pending: vs.ids_pending,
             cascade_cached_rows: vs.cascade_cached_rows,
         });

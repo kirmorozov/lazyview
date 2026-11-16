@@ -27,7 +27,7 @@ use lazyview::Snapshot;
 use mysql_async::prelude::Queryable;
 
 use super::soakcheck::{
-    counter, counters, quiesce_and_check, view_rows, Check, CheckRow, Lag, MemRow,
+    counter, counters, quiesce_and_check, unix_now, view_rows, Check, CheckRow, Lag, Ledger, MemRow,
 };
 use super::workload::names;
 use super::*;
@@ -354,9 +354,10 @@ pub async fn docker_blocking(args: Vec<String>) -> Result<()> {
 
 /// What an event may use: the run's schema and views, its writers (so the event's check can pause
 /// them), the overrides every engine of the run starts with, the log files collected so far, and
-/// the run's approved-rebuild ledger (`soakcheck::quiesce_and_check`: `view@target` → the
+/// the run's approved-rebuild ledger (`soakcheck::Ledger`: `view@target` → the
 /// cumulative `whole_view_refreshes` an event has accounted for, which the per-view F5 rule then
-/// tolerates; an event that explains a rebuild approves it, everything else fails).
+/// tolerates, plus the wave of the `SourceDdl` event in flight; an event that explains a rebuild
+/// approves it, everything else fails).
 pub struct ChaosRun<'a> {
     pub ctx: &'a Ctx,
     pub src: &'a Db,
@@ -365,7 +366,7 @@ pub struct ChaosRun<'a> {
     pub writers: &'a [watch::Sender<bool>],
     pub ov: &'a [(&'a str, &'a str)],
     pub logs: &'a mut Vec<PathBuf>,
-    pub approved: &'a mut HashMap<String, u64>,
+    pub approved: &'a mut Ledger,
     /// The run's base seed: `NetworkFault` draws its toxic from this and [`Self::toxi_i`].
     pub seed: u64,
     /// The event's index in the seeded schedule (`toxi{i}` labels, T7).
@@ -636,6 +637,16 @@ pub async fn run_event(
                 .into_iter()
                 .map(|v| (format!("{}@{}", v.name, v.target), v.whole_view_refreshes))
                 .collect();
+            // The burst is what a whole-view refresh of one of these views is credited to from now
+            // on (`soakcheck::Ledger::in_wave`), so a scheduled check that runs beside this event
+            // holds an owned view to its bar + the event's own wave and not to a bar the ledger has
+            // not re-read yet. It closes when the loop below has seen the wave end.
+            let burst = unix_now();
+            run.approved.open_wave(
+                stale.clone(),
+                burst,
+                burst + LEDGER_READS as u64 + LEDGER_QUIET_S + WAVE_TAIL_S,
+            );
             let mut c = run.src.conn().await?;
             exec(&mut c, "ALTER TABLE items ADD COLUMN spare INT NULL").await?;
             exec(&mut c, "ALTER TABLE items DROP COLUMN spare").await?;
@@ -686,8 +697,7 @@ pub async fn run_event(
                 }
                 if stale.contains(&key) {
                     approved_rows += 1;
-                    let e = run.approved.entry(key.clone()).or_default();
-                    *e = (*e).max(v.whole_view_refreshes);
+                    run.approved.approve(&key, v.whole_view_refreshes);
                     if delta > 0 {
                         rebuilt.push(format!("{key} +{delta}"));
                         if kind_reading.contains(&key) {
@@ -706,16 +716,49 @@ pub async fn run_event(
                     stray.join(", ")
                 ));
             }
-            // A rebuild of F5 can land while this event reads its numbers: give the plan-referencing
-            // views one more settle before the check below holds them to the ledger.
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            for v in view_rows(&eng, run.src, run.specs).await? {
-                let key = format!("{}@{}", v.name, v.target);
-                if stale.contains(&key) && v.mode.eq_ignore_ascii_case("incremental") {
-                    let e = run.approved.entry(key.clone()).or_default();
-                    *e = (*e).max(v.whole_view_refreshes);
+            // A rebuild of F5 can land while this event reads its numbers: in the f1 run the wave
+            // arrived 1–11 s after `wait_ready` had returned, both of the event's reads had
+            // reported no movement, and every refresh after them was held to that stale bar; in the
+            // mariadb1011 smoke of 2026-11-16 `w_chain_a`'s dependent rebuild landed ~40 s after
+            // the burst, past a ledger that had closed on five equal (all-zero) reads. So the ledger
+            // does not close on quiet alone: it re-reads the bars of the views this event may
+            // rebuild once a second and closes only after the wave has had its floor of time
+            // ([`LEDGER_MIN_WAVE_S`] since the burst) and the engine has then reported no whole-view
+            // refresh of an owned view for [`LEDGER_QUIET_S`] s, on [`LEDGER_STABLE_READS`]
+            // consecutive such reads (at most [`LEDGER_READS`] reads). The last read is the bar the
+            // event's check and the scheduled ones hold them to, and the window in which a check
+            // may still credit this event with a refresh closes with it, plus its tail.
+            let mut prev: Option<HashMap<String, u64>> = None;
+            let mut same = 0usize;
+            for _ in 0..LEDGER_READS {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let now = unix_now();
+                let mut bar: HashMap<String, u64> = HashMap::new();
+                let mut quiet = now.saturating_sub(burst) >= LEDGER_MIN_WAVE_S;
+                for v in view_rows(&eng, run.src, run.specs).await? {
+                    let key = format!("{}@{}", v.name, v.target);
+                    if stale.contains(&key) && v.mode.eq_ignore_ascii_case("incremental") {
+                        bar.insert(key, v.whole_view_refreshes);
+                        // A refresh of an owned view that is still recent: the wave is landing.
+                        if let Some((_, at)) = v.last_whole_view_refresh.as_ref() {
+                            quiet &= now.saturating_sub(*at) >= LEDGER_QUIET_S;
+                        }
+                    }
+                }
+                same = if quiet && prev.as_ref() == Some(&bar) {
+                    same + 1
+                } else {
+                    0
+                };
+                for (key, count) in &bar {
+                    run.approved.approve(key, *count);
+                }
+                prev = Some(bar);
+                if same >= LEDGER_STABLE_READS {
+                    break;
                 }
             }
+            run.approved.close_wave(unix_now(), WAVE_TAIL_S);
             // Which happened is reported, not assumed: the documented rebuild of the plans that
             // read `kind`, or no rebuild at all — the latter is legal (a widening the kept rows
             // survive), and those views are then still held to their oracle by the exactness check
@@ -892,6 +935,35 @@ pub async fn run_event(
 // The event helpers
 // ---------------------------------------------------------------------------------------------
 
+/// How often the `SourceDdl` event re-reads the `/stats` bars while it waits for its own rebuild
+/// wave to settle before it closes the ledger (one read per second, so this is also its budget in
+/// seconds). Reads only agree meaningfully once the wave is over: the 28-view soak rebuilds serially
+/// at ~1.5 s per view (the f1 burst's wave ran ~45 s), and a completion gap of a few seconds lets
+/// seconds-apart reads agree mid-wave — which is how `w_chain_a@source = 1` was still held to a bar
+/// of 0 in the mariadb1011 smoke of 2026-11-16 (its dependent rebuild landed ~40 s after the
+/// burst, past a ledger that had closed on five equal all-zero reads). So the loop wants
+/// [`LEDGER_STABLE_READS`] consecutive reads that are equal *and* [`LEDGER_QUIET_S`] after the last
+/// refresh of an owned view, and never before [`LEDGER_MIN_WAVE_S`] of the burst.
+const LEDGER_READS: usize = 180;
+
+/// Consecutive quiet, equal reads that close the ledger: the last one is the bar.
+const LEDGER_STABLE_READS: usize = 5;
+
+/// The wave's floor: the ledger may not close before this many seconds since the burst. The
+/// rebuilds of a 28-view wave land over tens of seconds, and `wait_ready` returns when the *queued*
+/// work of the DDL is done, not when the last dependent view has been swapped.
+const LEDGER_MIN_WAVE_S: u64 = 20;
+
+/// An owned view counts as quiet once its `last_whole_view_refresh` is this many seconds old: a
+/// refresh more recent than this is the wave still landing (`src/stats.rs:337`).
+const LEDGER_QUIET_S: u64 = 5;
+
+/// How long after the ledger has closed a check may still credit a whole-view refresh to this
+/// event (`soakcheck::Ledger::close_wave`): the race between the ledger's last read and the
+/// exactness check that follows it, plus a refresh landing then and being read by a scheduled check
+/// before the event's own one.
+const WAVE_TAIL_S: u64 = 20;
+
 /// The `(name, target, access)` rows of `_lazyview_state` — the engine's own records
 /// (`src/meta.rs:308`), never view-name patterns.
 async fn state_rows(run: &ChaosRun<'_>) -> Result<Vec<(String, String, String)>> {
@@ -917,7 +989,7 @@ async fn state_rows(run: &ChaosRun<'_>) -> Result<Vec<(String, String, String)>>
 
 /// The tables one `access` text's plan mentions: the `<table>` of every
 /// `occ <alias> <schema>.<table> read <list>` line (`src/access.rs:776`), read lists ignored.
-fn occ_tables(access: &str) -> HashSet<String> {
+pub fn occ_tables(access: &str) -> HashSet<String> {
     access
         .lines()
         .filter_map(|l| l.strip_prefix("occ "))
@@ -926,34 +998,46 @@ fn occ_tables(access: &str) -> HashSet<String> {
         .collect()
 }
 
-/// The `view@target` keys of the views the DDL of the `SourceDdl` event may rebuild (Q3). The
-/// engine decides this at table granularity, not column: `on_tables_changed`
-/// (`src/engine.rs:3670`) replans every slot whose plan mentions a changed table
-/// (`p.tables.iter().any(hit)`, `src/engine.rs:3696`) — whatever the read lists — and rebuilds
-/// without freezing when a chained view's parent table was swapped. So the expected set is the
-/// fixpoint: the views whose plan references one of `seeds`, plus the views whose plan
-/// references an affected view's own table (chains), closed under that rule. A whole-view
-/// refresh of an incremental view outside it is a named failure; inside it the event approves
-/// the refresh into the ledger.
-async fn plan_stale_of(run: &ChaosRun<'_>, seeds: &[&str]) -> Result<HashSet<String>> {
-    let state = state_rows(run).await?;
-    let refs: Vec<(String, String, HashSet<String>)> = state
-        .iter()
-        .map(|(name, target, access)| {
-            (format!("{name}@{target}"), name.clone(), occ_tables(access))
-        })
-        .collect();
+/// The parents of the cascading foreign keys one `access` text records: the `<parent>` of every
+/// `cascade <schema>.<parent> -> <schema>.<child> …` line. A change a cascading FK makes happens
+/// inside the storage engine, with no binlog rows on the child, so the engine counts a DDL of the
+/// parent as affecting this view too: "Tables the view reads, and parents of cascading FKs into
+/// them (their column positions are part of the plan too)", `p.tables.iter().any(hit) ||
+/// p.cascades.iter().any(hit(parent))` (`src/engine.rs:3800-3807`). The `occ` lines never name
+/// such a parent, so a rule that reads only them cannot approve the rebuild the engine owes a
+/// view like `wc_refs_by_city` (its plan reads `entity_refs` alone, whose FK cascades from
+/// `entities`): one legitimate whole refresh of it would be an unavoidable FAIL (the f1 finding).
+pub fn cascade_parents(access: &str) -> HashSet<String> {
+    access
+        .lines()
+        .filter_map(|l| l.strip_prefix("cascade "))
+        .filter_map(|r| r.split_whitespace().next())
+        .map(|tref| tref.rsplit_once('.').map_or(tref, |(_, t)| t).to_string())
+        .collect()
+}
+
+/// The tables of one `access` text the engine counts as the plan's own: the `occ` tables plus the
+/// parents of the cascading FKs into them (`src/engine.rs:3800-3807`). What [`stale_closure`] —
+/// and so [`plan_stale_of`] — matches a DDL's tables against.
+pub fn plan_tables(access: &str) -> HashSet<String> {
+    let mut tables = occ_tables(access);
+    tables.extend(cascade_parents(access));
+    tables
+}
+
+/// The fixpoint [`plan_stale_of`] computes: the `view@target` keys whose plan names one of
+/// `seeds`, closed over "a view whose plan references an affected view's own table" (chains).
+/// `refs` is `(view@target, view name, the tables of its plan)` per view. Public so
+/// `tests/soak_widen.rs` can pin the rule itself against what the engine treats as affected.
+pub fn stale_closure(
+    refs: &[(String, String, HashSet<String>)],
+    seeds: &[&str],
+) -> HashSet<String> {
     let mut stale: HashSet<String> = refs
         .iter()
         .filter(|(_, _, tabs)| tabs.iter().any(|t| seeds.contains(&t.as_str())))
         .map(|(key, _, _)| key.clone())
         .collect();
-    ensure!(
-        !stale.is_empty(),
-        "no view's plan references {}: the access records or the schema changed",
-        seeds.join("/")
-    );
-    // Chains: a view whose plan references an affected view's table is affected too.
     loop {
         let stale_names: HashSet<&str> = stale
             .iter()
@@ -968,10 +1052,40 @@ async fn plan_stale_of(run: &ChaosRun<'_>, seeds: &[&str]) -> Result<HashSet<Str
             .map(|(key, _, _)| key.clone())
             .collect();
         if grown.is_empty() {
-            return Ok(stale);
+            return stale;
         }
         stale.extend(grown);
     }
+}
+
+/// The `view@target` keys of the views the DDL of the `SourceDdl` event may rebuild (Q3). The
+/// engine decides this at table granularity, not column: `on_tables_changed`
+/// (`src/engine.rs:3774`) replans every slot whose plan is affected by a changed table — its
+/// `occ` tables **or the parents of the cascading FKs into them** ([`plan_tables`],
+/// `src/engine.rs:3800-3807`) — whatever the read lists, and rebuilds without freezing when a
+/// chained view's parent table was swapped. So the expected set is the fixpoint: the views whose
+/// plan references one of `seeds`, plus the views whose plan references an affected view's own
+/// table (chains), closed under that rule. A whole-view refresh of an incremental view outside
+/// it is a named failure; inside it the event approves the refresh into the ledger.
+async fn plan_stale_of(run: &ChaosRun<'_>, seeds: &[&str]) -> Result<HashSet<String>> {
+    let state = state_rows(run).await?;
+    let refs: Vec<(String, String, HashSet<String>)> = state
+        .iter()
+        .map(|(name, target, access)| {
+            (
+                format!("{name}@{target}"),
+                name.clone(),
+                plan_tables(access),
+            )
+        })
+        .collect();
+    let stale = stale_closure(&refs, seeds);
+    ensure!(
+        !stale.is_empty(),
+        "no view's plan references {}: the access records or the schema changed",
+        seeds.join("/")
+    );
+    Ok(stale)
 }
 
 /// The `view@target` keys of the views whose *plan* reads column `kind` of `entities`, for the
