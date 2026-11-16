@@ -79,6 +79,19 @@ pub fn upstream(flavor: &str) -> String {
         .unwrap_or_else(|| format!("{flavor}:3306"))
 }
 
+/// The upstream a PostgreSQL target proxy dials (T8, plan §6): the `pg16` service of
+/// `docker-compose.test.yml` (`pg16:5432`) — the same server the PG target harness of C1 reads
+/// from `LAZYVIEW_TEST_PG_DSNS` (`tests/common/pg.rs`), never a second one.
+/// `LAZYVIEW_TEST_TOXI_PG_UPSTREAM=<host:port>` overrides it for a PG server outside the
+/// compose network, in the shape of `LAZYVIEW_TEST_TOXI_UPSTREAM` above.
+pub fn pg_upstream() -> String {
+    std::env::var("LAZYVIEW_TEST_TOXI_PG_UPSTREAM")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "pg16:5432".to_string())
+}
+
 /// One chaos test at a time in this process. They share the host's single daemon: the port band,
 /// and above all the global `POST /reset` (F1), must not interleave with another test's toxic —
 /// one test's reset would clear the other's fault and make it look like it never landed. Held for
