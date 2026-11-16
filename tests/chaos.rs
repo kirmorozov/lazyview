@@ -659,7 +659,12 @@ async fn finish(ctx: &Arc<Ctx>, f: &mut Fix, w: &mut Writers, when: &str) -> Res
 /// allocator, so a writer running at the same time cannot collide with them.
 fn items_txn(ids: &SoakIds, rows: usize) -> (Vec<String>, usize) {
     let entities = ids.seed_entities.max(1);
-    let from = ids.item.fetch_add(rows as i64, Ordering::Relaxed) + 1;
+    // `SoakIds::fresh` hands out the value `fetch_add` *returned*, so the block is
+    // `from ..= from + rows - 1` and the allocator resumes at `from + rows`: reserving `rows` and
+    // starting at `+ 1` left the block's last id inside the range the paced writers are still
+    // handed, and a writer's `INSERT … ON DUPLICATE KEY` took that row first, so the transaction's
+    // last statement died on ERROR 1062 for `items.PRIMARY` (issue #229's second flake).
+    let from = ids.item.fetch_add(rows as i64, Ordering::Relaxed);
     let mut stmts = Vec::new();
     let mut bytes = 0usize;
     let mut done = 0usize;
@@ -710,7 +715,8 @@ fn chaos_src_binlog_reset_mid_txn() {
             &Toxic::slicer(64, 0, 0, Dir::Downstream).named("slice"),
         )
         .await?;
-        let (stmts, bytes) = items_txn(&f.ids, 50_000);
+        const TXN_ROWS: usize = 50_000;
+        let (stmts, bytes) = items_txn(&f.ids, TXN_ROWS);
         let before = f.eng.snapshot();
         // The transaction runs on its own task so the reset goes in *while* it is in flight.
         let db = f.db.clone();
@@ -724,6 +730,14 @@ fn chaos_src_binlog_reset_mid_txn() {
         h.await
             .context("the big transaction task panicked")?
             .context("the big transaction failed")?;
+        // The commit is acknowledged, so the transaction's last row event is in the server's binlog
+        // now: this is the position the engine has to reach before any assertion below means
+        // anything. The *persisted* position cannot serve as the target — it is from before the
+        // transaction and the engine was already past it when the stream died, so a wait on it
+        // returns at once and the check that follows races the reconnected stream (issue #229).
+        let mut c = f.db.conn().await?;
+        let head = server_position(&mut c).await?;
+        c.disconnect().await.ok();
         // The fault landed: the dump link is gone (selftest_toxi_reset_peer: a stream armed with
         // reset_peer ends; on 2.13.0 the RST goes upstream, to the server, and the client sees EOF
         // — so this asserts the engine's stream died, not that the server saw a reset).
@@ -742,21 +756,26 @@ fn chaos_src_binlog_reset_mid_txn() {
         })?;
         f.disarm("binlog", "rst").await?;
         f.disarm("binlog", "slice").await?;
-        // It resumes from the position it had *persisted*, not from the head of the binlog.
+        // It resumes from the position it had *persisted*, not from the head of the binlog: the
+        // read stays here as that evidence (the engine's own reconnect line is checked at the end),
+        // and it is what a resume-from-scratch would have thrown away.
         let saved = soakchaos::saved_position(&f.db).await?;
         f.wait_streaming().await?;
-        f.eng.wait_applied(&saved, t_catchup()).await?;
+        // Not `saved`: the whole transaction, up to the source's position at its commit. Anything
+        // less lets the delta below be taken before the reconnected stream delivered the rows.
+        f.eng.wait_applied(&head, t_catchup()).await?;
         let d = f.eng.snapshot().since(&before);
         ensure!(
-            d.events > 0 && d.rows_seen > 0,
-            "the stream never resumed after the reset: {} events and {} rows applied since the \
-             fault, expected the rest of the transaction (saved position {saved:?})",
+            d.events > 0 && d.rows_seen >= TXN_ROWS as u64,
+            "the stream never carried the whole transaction after the reset: {} events and {} \
+             rows applied since the fault, expected at least the transaction's {TXN_ROWS} rows \
+             (persisted position {saved:?}, waited for the source's {head:?})",
             d.events,
             d.rows_seen
         );
         ctx.log(format!(
-            "reset mid-transaction: {} bytes of row events cut, resumed from {saved:?} (+{} \
-             events, +{} rows)",
+            "reset mid-transaction: {} bytes of row events cut, resumed from {saved:?} and applied \
+             through {head:?} (+{} events, +{} rows)",
             bytes, d.events, d.rows_seen
         ));
         finish(&ctx, &mut f, &mut w, "after the mid-transaction reset").await?;
