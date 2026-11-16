@@ -773,12 +773,33 @@ fn chaos_src_binlog_reset_mid_txn() {
     });
 }
 
+// The engine's own connect bounds, mirrored here because the product keeps them `pub(crate)`:
+// `BINLOG_CONNECT_TIMEOUT` (src/engine.rs) and `Policy::CONNECT` (src/supervisor.rs). Every
+// wait below is sized from these numbers, never from a guess.
+const BH_CONNECT_TIMEOUT: Duration = Duration::from_secs(20); // engine.rs: BINLOG_CONNECT_TIMEOUT
+const BH_CONNECT_ATTEMPTS: u32 = 5; // supervisor.rs: Policy::CONNECT.attempts
+const BH_CONNECT_BASE: Duration = Duration::from_secs(1); // supervisor.rs: Policy::CONNECT.base
+const BH_CONNECT_CAP: Duration = Duration::from_secs(30); // supervisor.rs: Policy::CONNECT.cap
+
+/// The widest the engine's `backoff(n, base, cap, jitter)` (supervisor.rs) gets for retry `n`:
+/// `min(base · 2^(n−1), cap)` times the +50 % top of the CONNECT policy's jitter.
+fn bh_backoff_max(n: u32) -> Duration {
+    (BH_CONNECT_BASE * (1u32 << (n - 1).min(6)))
+        .min(BH_CONNECT_CAP)
+        .mul_f64(1.5)
+}
+
 /// `timeout{timeout:0}` on the dump link never closes it and never delivers anything, so the only
 /// thing that can end the fault is the engine's own bounds (the one place they live now that the
 /// reader has no idle timeout of its own): the stream loop's silence detector,
 /// `(heartbeat × 3).max(15 s)` = 15 s with `LAZYVIEW_HEARTBEAT_MS=200` (F5), and then
-/// `BINLOG_CONNECT_TIMEOUT` on the reconnect attempt. The harness waits for both, removes the
-/// toxic, and the stream comes back from the saved position.
+/// `BINLOG_CONNECT_TIMEOUT` on the reconnect attempt. The harness waits for the silence line,
+/// then for the first `supervisor_retries` tick of the reconnect's `Policy::CONNECT` run (the
+/// attempts log at debug only and the engine's `binlog connect failed` line waits for the whole
+/// run, so the counter is the only in-run evidence of the attempt), removes the toxic, and gives
+/// the recovery the rest of a CONNECT run plus one cap: the engine may be inside a 20 s attempt
+/// or inside the cap wait when the toxic goes away. The stream then comes back from the saved
+/// position.
 #[test]
 fn chaos_src_binlog_blackhole() {
     let _one = toxi::exclusive();
@@ -822,16 +843,54 @@ fn chaos_src_binlog_blackhole() {
                 .unwrap_or_default()
         ));
         // The attempt itself, not the silence line above, is what proves the stream was retried.
-        wait_until("the engine to attempt the reconnect", FAULT, || {
-            let f = &f;
-            async move { Ok(f.log_line("binlog connect failed")?.is_some()) }
+        // Each failed CONNECT attempt counts `supervisor_retries` (src/supervisor.rs) and logs
+        // at debug only, so the counter is the evidence to wait on; the engine's `binlog connect
+        // failed` line appears only after a whole policy run (~attempts × the connect timeout)
+        // and never at all once the toxic is gone before the run ends. One failed attempt plus
+        // the backoff that follows it bounds the wait for the first tick.
+        let m = f.eng.metrics.clone();
+        let started = m.snapshot();
+        let one_attempt = BH_CONNECT_TIMEOUT + bh_backoff_max(1);
+        wait_until("the engine to attempt the reconnect", one_attempt, || {
+            let m = m.clone();
+            async move { Ok(m.snapshot().supervisor_retries > started.supervisor_retries) }
         })
         .await
-        .with_context(|| "the black-holed stream was never retried: no reconnect in the log")?;
+        .with_context(|| {
+            format!(
+                "the black-holed stream was never retried: no supervisor retry within \
+                 {one_attempt:?} (one {BH_CONNECT_TIMEOUT:?} connect attempt plus its backoff) \
+                 after the silence detector fired"
+            )
+        })?;
+        let ticked = m.snapshot().supervisor_retries;
+        ctx.log(format!(
+            "reconnect proved: supervisor_retries {} -> {}",
+            started.supervisor_retries, ticked
+        ));
         let saved = soakchaos::saved_position(&f.db).await?;
         f.disarm("binlog", "black-hole").await?;
-        f.wait_streaming().await?;
-        f.eng.wait_applied(&saved, t_catchup()).await?;
+        // The engine may be anywhere in a CONNECT run when the toxic goes away: inside one
+        // attempt (≤ the connect timeout) or inside the one-cap wait that follows a whole
+        // failed run (src/engine.rs), so the recovery waits cover the rest of a run — every
+        // attempt plus every backoff between attempts — plus one cap, before the run that
+        // connects succeeds.
+        let connect_run =
+            Duration::from_secs(u64::from(BH_CONNECT_ATTEMPTS) * BH_CONNECT_TIMEOUT.as_secs())
+                + (1..BH_CONNECT_ATTEMPTS)
+                    .map(bh_backoff_max)
+                    .sum::<Duration>();
+        let reconnect = connect_run + BH_CONNECT_CAP;
+        wait_until(
+            "the engine streaming again after the black hole",
+            reconnect,
+            || {
+                let f = &f;
+                async move { Ok(f.streaming()) }
+            },
+        )
+        .await?;
+        f.eng.wait_applied(&saved, reconnect).await?;
         let d = f.eng.snapshot().since(&before);
         ensure!(
             d.events > 0,
