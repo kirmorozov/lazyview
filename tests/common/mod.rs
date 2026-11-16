@@ -790,7 +790,7 @@ impl Ctx {
     pub async fn new_db_renamed(&self, tag: &str, names: &SharedNames) -> Result<Db> {
         let db = create_db(&self.servers[0], 0, tag, Some(names)).await?;
         self.log(format!("schema {} (renamed) on {}", db.name, db.flavor));
-        self.dbs.lock().unwrap().push(db.clone());
+        self.register_db(db.clone());
         Ok(db)
     }
 
@@ -798,8 +798,23 @@ impl Ctx {
     pub async fn new_db_on(&self, idx: usize, tag: &str) -> Result<Db> {
         let db = create_db(&self.servers[idx], idx, tag, self.names.as_ref()).await?;
         self.log(format!("schema {} on {}", db.name, db.flavor));
-        self.dbs.lock().unwrap().push(db.clone());
+        self.register_db(db.clone());
         Ok(db)
+    }
+
+    /// Records a schema this run created. Two seats of one group must never share a schema:
+    /// `scenario_multi` puts the same server in several seats when only one is listed, and they
+    /// are still distinct targets, so the same name twice here is a harness bug.
+    fn register_db(&self, db: Db) {
+        let mut dbs = self.dbs.lock().unwrap();
+        assert!(
+            !dbs.iter().any(|d| d.name == db.name),
+            "[{}] schema {} created twice: the {} seats of this group would be one target",
+            self.test,
+            db.name,
+            self.servers.len(),
+        );
+        dbs.push(db);
     }
 
     /// Starts an engine for `db` (the source schema) with test defaults plus `overrides`.
@@ -918,22 +933,27 @@ where
     run_groups(test, groups, f);
 }
 
-/// Runs `f` once per source flavor with `n_peers` other flavors as peers (rotating through the
-/// list: source i gets peers i+1, i+2, …). With fewer than `n_peers + 1` servers listed the
-/// scenario is skipped (see [`skip_multi`]): a visible, counted `SKIP` line, or a failure when
-/// skipping is not allowed (`CI=true` without `LAZYVIEW_TEST_REQUIRE_MULTI=0`, or
-/// `LAZYVIEW_TEST_REQUIRE_MULTI=1`).
+/// Runs `f` once per source flavor with `n_peers` other entries as peers (rotating through the
+/// list: source i gets peers i+1, i+2, …). The list is repeated when it is shorter than
+/// `n_peers + 1`, so a group always has `n_peers + 1` members: the members of such a group are
+/// the same server at different positions, and they are still `n_peers + 1` distinct targets,
+/// because every one of them is a schema of its own ([`Ctx::new_db_on`], and `Ctx::register_db`
+/// asserts the names differ). That is how the single-server CI jobs run these scenarios for real.
+/// Only an empty `LAZYVIEW_TEST_DSNS` skips (see [`skip_multi`]): a visible, counted `SKIP` line,
+/// or a failure when skipping is not allowed (`CI=true` without `LAZYVIEW_TEST_REQUIRE_MULTI=0`,
+/// or `LAZYVIEW_TEST_REQUIRE_MULTI=1`).
 pub fn scenario_multi<F, Fut>(test: &str, n_peers: usize, f: F)
 where
     F: Fn(Arc<Ctx>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    let servers = servers().unwrap_or_default();
-    if servers.len() < n_peers + 1 {
-        skip_multi(test, n_peers + 1, servers.len());
+    let Some(servers) = servers() else {
+        skip_multi(test, n_peers + 1, 0);
         return;
-    }
+    };
     let n = servers.len();
+    // `(i + k) % n` wraps: with `n < n_peers + 1` a server fills several seats of the group, and
+    // each seat is a schema of its own (see `Ctx::register_db`).
     let groups: Vec<Vec<Server>> = (0..n)
         .map(|i| {
             (0..=n_peers)

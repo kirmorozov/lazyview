@@ -207,7 +207,9 @@ fn reg_mapped_cascade_is_logged() {
 }
 
 /// A view whose targets include an unreachable instance must still be built and maintained on
-/// the reachable ones (v_orders_left with targets 'b,down' never appeared on b).
+/// the reachable ones (v_orders_left with targets 'b,down' never appeared on b). With one server
+/// in the job, `b` is a second schema of that server (`scenario_multi` repeats the list), so the
+/// run is real on every flavor; the unreachable target stays a closed port.
 #[test]
 fn reg_multi_target_with_one_down() {
     scenario_multi("reg_target_down", 1, |ctx| async move {

@@ -318,8 +318,9 @@ fn sup_hot_units_converge_without_reordering() {
     });
 }
 
-/// The same with a second server as a target that is slowed by row locks: the source's copy
-/// keeps up meanwhile, and both converge.
+/// The same with a second target that is slowed by row locks: the source's copy keeps up
+/// meanwhile, and both converge. With one server in the job that target is a second schema of it
+/// (`scenario_multi` repeats the list), so the run is real on every flavor.
 #[test]
 fn sup_two_targets_one_slowed() {
     scenario_multi("sup_targets", 1, |ctx| async move {
