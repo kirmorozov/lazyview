@@ -1376,22 +1376,12 @@ impl Engine {
                     .owned
                     .contains_key(&(parsed.name.clone(), SOURCE_TARGET.to_string()))
                     || (marker.is_some()
-                        && target::table_marker(
-                            &mut self.src,
-                            target::Kind::Mysql,
-                            &self.schema,
-                            &parsed.name,
-                        )
-                        .await?
+                        && target::mysql::table_marker(&mut self.src, &self.schema, &parsed.name)
+                            .await?
                             == marker);
                 if !ours {
-                    if let Some(kind) = target::table_kind(
-                        &mut self.src,
-                        target::Kind::Mysql,
-                        &self.schema,
-                        &parsed.name,
-                    )
-                    .await?
+                    if let Some(kind) =
+                        target::mysql::table_kind(&mut self.src, &self.schema, &parsed.name).await?
                     {
                         if targets.iter().any(|t| t == SOURCE_TARGET) {
                             bail!(
@@ -2163,14 +2153,9 @@ impl Engine {
                     continue;
                 }
                 info!(table = %table, "removing a table lazyview created for a definition that no longer exists");
-                if let Err(e) = target::drop_table(
-                    &mut self.meta,
-                    target::Kind::Mysql,
-                    &self.schema,
-                    &table,
-                    &self.metrics,
-                )
-                .await
+                if let Err(e) =
+                    target::mysql::drop_table(&mut self.meta, &self.schema, &table, &self.metrics)
+                        .await
                 {
                     warn!("dropping {table}: {e:#}");
                 }
@@ -2325,12 +2310,11 @@ impl Engine {
             // Columns as the layout's, and the unique index rows are upserted by (tables
             // built before upserts lack `_lv_row`: rebuilt once).
             let fits = match self.target_conn(&t).await {
-                Ok(conn) => match target::table_columns(conn.mysql()?, kind, &ts, &name).await {
-                    Ok(c) if target::layout_matches(kind, &layout, &c) => {
-                        target::has_row_index(conn.mysql()?, kind, &ts, &name, &layout)
-                            .await
-                            .unwrap_or(false)
-                    }
+                Ok(conn) => match conn.table_columns(&ts, &name).await {
+                    Ok(c) if target::layout_matches(kind, &layout, &c) => conn
+                        .has_row_index(&ts, &name, &layout)
+                        .await
+                        .unwrap_or(false),
                     _ => false,
                 },
                 Err(_) => false,
@@ -2401,18 +2385,10 @@ impl Engine {
     /// Drops the shadow table of `name` on target `t` (best effort).
     async fn drop_shadow(&mut self, t: &str, name: &str) {
         let ts = self.targets[t].schema.clone();
-        let kind = self.targets[t].kind;
         if let Ok(c) = self.target_conn(t).await {
-            if let Ok(c) = c.mysql() {
-                let _ = target::drop_table(
-                    c,
-                    kind,
-                    &ts,
-                    &target::shadow_name(name),
-                    &Metrics::default(),
-                )
+            let _ = c
+                .drop_table(&ts, &target::shadow_name(name), &Metrics::default())
                 .await;
-            }
         }
     }
 
@@ -2714,15 +2690,11 @@ impl Engine {
         }
         if self.cfg.drop_removed {
             if let Some(t) = self.targets.get(target) {
-                let (ts, kind) = (t.schema.clone(), t.kind);
+                let ts = t.schema.clone();
                 match self.target_conn(target).await {
                     Ok(c) => {
-                        if let Ok(c) = c.mysql() {
-                            if let Err(e) =
-                                target::drop_table(c, kind, &ts, name, &Metrics::default()).await
-                            {
-                                warn!("dropping {name}@{target}: {e:#}");
-                            }
+                        if let Err(e) = c.drop_table(&ts, name, &Metrics::default()).await {
+                            warn!("dropping {name}@{target}: {e:#}");
                         }
                     }
                     Err(e) => warn!("dropping {name}@{target}: {e:#}"),
@@ -6415,7 +6387,7 @@ impl Engine {
         };
         let r = match tokio::time::timeout(
             timeout,
-            mv::apply_prepared(c.mysql()?, &ts, table, layout, chunk, new, &w, &metrics),
+            mv::apply_prepared_on(c, &ts, table, layout, chunk, new, &w, &metrics),
         )
         .await
         {
@@ -6504,18 +6476,20 @@ impl Engine {
         (targets, table): (&[String], &str),
         units: &mut UnitSet,
     ) -> Result<()> {
-        let unit_cols = layout.unit_cols().join(", ");
         for (k, v) in marks {
-            let filter = plan.presence[*k].marks(v);
-            let sql = |ts: &str| {
-                format!(
-                    "SELECT DISTINCT {unit_cols} FROM {}.{} WHERE {filter}",
-                    analyze::quote_ident(ts),
-                    analyze::quote_ident(table)
+            let rows = self
+                .read_materialized(
+                    targets,
+                    table,
+                    layout,
+                    target::MvFilter::Presence {
+                        p: &plan.presence[*k],
+                        value: v,
+                    },
                 )
-            };
-            for r in self.read_materialized(targets, sql, Vec::new()).await? {
-                units.insert(r.unwrap().into_iter().map(Datum::from_value).collect());
+                .await?;
+            for r in rows {
+                units.insert(r.into_iter().map(Datum::from_value).collect());
             }
         }
         for (k, v) in holds {
@@ -6556,22 +6530,22 @@ impl Engine {
             .query_chunk
             .min(MAX_FILTER_PARAMS / k.cols.len().max(1))
             .max(1);
-        let mv_cols: Vec<String> = k.cols.iter().map(|c| analyze::quote_ident(c)).collect();
-        let unit_cols = layout.unit_cols().join(", ");
         for chunk in set.chunks(per) {
             self.metrics.beat();
             // Old rows: the materialized rows that contain them.
-            let (f, p) = chunk.filter(&mv_cols);
-            let sql = |ts: &str| {
-                format!(
-                    "SELECT DISTINCT {unit_cols} FROM {}.{} WHERE {f}",
-                    analyze::quote_ident(ts),
-                    analyze::quote_ident(table)
+            let rows = self
+                .read_materialized(
+                    targets,
+                    table,
+                    layout,
+                    target::MvFilter::Keys {
+                        chunk: &chunk,
+                        cols: &k.cols,
+                    },
                 )
-            };
-            let rows = self.read_materialized(targets, sql, p).await?;
+                .await?;
             for r in rows {
-                units.insert(r.unwrap().into_iter().map(Datum::from_value).collect());
+                units.insert(r.into_iter().map(Datum::from_value).collect());
             }
             // New rows: the current rows that contain them.
             let (f, p) = chunk.filter(&k.exprs);
@@ -6586,14 +6560,17 @@ impl Engine {
         Ok(())
     }
 
-    /// Runs a read of the materialized table (`sql` for a target schema) on the first target of
-    /// `targets` that answers, `source` first (they hold the same rows).
+    /// Runs a read of the materialized table (see [`target::Conn::read_materialized`]) on the
+    /// first target of `targets` that answers, `source` first (they hold the same rows). Each
+    /// family renders the statement for its own target: the same read, no MySQL-only path
+    /// (M-02). One statement per chunk of the lookup, never per row.
     async fn read_materialized(
         &mut self,
         targets: &[String],
-        sql: impl Fn(&str) -> String,
-        params: Vec<Value>,
-    ) -> Result<Vec<mysql_async::Row>> {
+        table: &str,
+        layout: &Layout,
+        filter: target::MvFilter<'_>,
+    ) -> Result<Vec<Vec<Value>>> {
         let mut order: Vec<&String> = targets.iter().filter(|t| *t == SOURCE_TARGET).collect();
         order.extend(targets.iter().filter(|t| *t != SOURCE_TARGET));
         let mut last = None;
@@ -6602,10 +6579,13 @@ impl Engine {
             let timeout = self.cfg.target_timeout;
             let r = match self.target_conn(t).await {
                 Ok(c) => {
-                    match tokio::time::timeout(timeout, c.mysql()?.exec(sql(&ts), params.clone()))
-                        .await
+                    match tokio::time::timeout(
+                        timeout,
+                        c.read_materialized(&ts, table, layout, filter),
+                    )
+                    .await
                     {
-                        Ok(r) => r.map_err(anyhow::Error::from),
+                        Ok(r) => r,
                         Err(_) => Err(anyhow!("timed out after {timeout:?}")),
                     }
                 }

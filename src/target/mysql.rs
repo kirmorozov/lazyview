@@ -14,7 +14,7 @@ use crate::mv::{Layout, MvCol, Upsert, WriteOpts, ROW_INDEX};
 use crate::supervisor::{Timeout, CONNECT_TIMEOUT, FENCE_WAIT};
 use crate::target::{
     lineage_indexes, old_name, partial_indexes, row_index, shadow_name, unit_index, KeyPart,
-    KeyPlan, Kind, RowIndex, MARKER_PREFIX,
+    KeyPlan, Kind, MvFilter, RowIndex, MARKER_PREFIX,
 };
 
 /// Row alias of upserts (`INSERT ... AS <alias> ON DUPLICATE KEY UPDATE`).
@@ -311,6 +311,37 @@ pub(crate) fn layout_matches(layout: &Layout, existing: &[(String, String)]) -> 
         && layout.cols.iter().zip(existing).all(|(c, (n, t))| {
             c.name.eq_ignore_ascii_case(n) && c.column_type.eq_ignore_ascii_case(t)
         })
+}
+
+/// The lookup paths' read of the materialized table (the MySQL arm of
+/// [`crate::target::Conn::read_materialized`]): the unit columns of the rows a chunk of keys (or
+/// a pinned cascade child's presence column) selects. One statement per chunk of a lookup, never
+/// per row; the SQL text and the returned rows are the only allocation, the ones this read cost
+/// before the family dispatch existed.
+pub(crate) async fn read_materialized(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    filter: MvFilter<'_>,
+) -> Result<Vec<Vec<Value>>> {
+    let list = layout.unit_cols().join(", ");
+    let (f, params) = match filter {
+        MvFilter::Keys { chunk, cols } => {
+            let exprs: Vec<String> = cols.iter().map(|c| q(c)).collect();
+            chunk.filter_typed(&exprs, &[])
+        }
+        MvFilter::Presence { p, value } => (p.marks(value), Vec::new()),
+    };
+    let sql = format!(
+        "SELECT DISTINCT {list} FROM {}.{} WHERE {f}",
+        q(schema),
+        q(table)
+    );
+    let rows: Vec<mysql_async::Row> = conn.exec(sql, params).await?;
+    // `Row::unwrap` as `crate::mv::read_old` does: a row of a `SELECT DISTINCT` of the layout's
+    // own columns has no value that fails to convert.
+    Ok(rows.into_iter().map(|r| r.unwrap()).collect())
 }
 
 /// Creates the shadow table with an ownership marker (see [`crate::target::marker`]) as the

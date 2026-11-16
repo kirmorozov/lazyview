@@ -814,6 +814,186 @@ fn targets_pg_incremental_never_rebuilds() {
     });
 }
 
+/// M-02's resume arm on a PostgreSQL target: a restart brings the view up from the table that is
+/// already on the target (`table_columns` + `has_row_index` on the target's own connection) instead
+/// of failing the resume check, and the table is the *same* table afterwards - its `relfilenode`
+/// cannot survive a rebuild, which creates a shadow and swaps it in. Then a fresh change still
+/// travels incrementally.
+#[test]
+fn targets_pg_resume_reuses_the_table() {
+    let Some(pgs) = pg::servers_or_skip("targets_pg_resume_reuses_the_table") else {
+        return;
+    };
+    scenario("tg_pgresume", move |ctx| {
+        let pgs1 = pgs.clone();
+        async move {
+            let src = ctx.new_db("tg_pgr_src").await?;
+            let pgdb = pg::new_pg_db(&pgs1[0], "tg_pgr").await?;
+            let mut c = src.conn().await?;
+            exec_all(
+                &mut c,
+                &[
+                    "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL)",
+                    "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL)",
+                    "INSERT INTO entities VALUES (1,'alpha'),(2,'beta')",
+                    "INSERT INTO items VALUES (1,1,10.50),(2,2,5.00)",
+                ],
+            )
+            .await?;
+            ensure_lazyview_table(&mut c).await?;
+            let spec = ViewSpec::new(
+                "links",
+                Kind::Incremental,
+                "SELECT i.id AS id, e.name AS name, i.amount AS amount FROM items i JOIN entities e ON e.id = i.entity_id",
+            )
+            .with_targets("pg");
+            add_views(&mut c, std::slice::from_ref(&spec)).await?;
+            let env = target_env(&[("pg", &pgdb.dsn)]);
+            let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+            wait_ready(&mut c, &mut eng, &["links"], t_ready()).await?;
+            exec(&mut c, "INSERT INTO items VALUES (3, 1, 7.25)").await?;
+            eng.wait_caught_up(&mut c, t_catchup()).await?;
+            let client = pgdb.client().await?;
+            let node = pg_filenode(&client, &pgdb.schema, "links").await?;
+            drop(client);
+
+            // Restart: the resume path decides whether the existing table fits the layout. Before
+            // M-02 it asked a MySQL connection and failed, so the view came up rebuilt.
+            eng.stop().await?;
+            let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+            wait_ready(&mut c, &mut eng, &["links"], t_ready()).await?;
+            let client = pgdb.client().await?;
+            ensure!(
+                pg_filenode(&client, &pgdb.schema, "links").await? == node,
+                "links was rebuilt on the PostgreSQL target by the resume"
+            );
+            drop(client);
+
+            // And the resumed view still maintains itself: one write of each kind, then the
+            // statistics the flush publishes (a view listed only after its first flush).
+            exec(&mut c, "UPDATE items SET amount = amount + 1 WHERE id = 2").await?;
+            exec(&mut c, "DELETE FROM items WHERE id = 1").await?;
+            eng.wait_caught_up(&mut c, t_catchup()).await?;
+            let vs = eng.stats_of(&src, "links")?;
+            ensure!(
+                vs.whole_view_refreshes == 0,
+                "links took {} whole-view refreshes after the resume, expected none",
+                vs.whole_view_refreshes
+            );
+            let tmap: HashMap<String, Db> = HashMap::new();
+            let pgmap: HashMap<String, pg::PgDb> = [("pg".to_string(), pgdb.clone())].into();
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &pgmap,
+                std::slice::from_ref(&spec),
+                "rows after the resume",
+            )
+            .await?;
+            eng.stop().await?;
+            pg::drop_dbs(std::slice::from_ref(&pgdb)).await?;
+            Ok(())
+        }
+    });
+}
+
+/// M-02's unsupervised arm (`LAZYVIEW_SUPERVISOR=off`): the refresh writes the chunk itself,
+/// through `mv::apply_prepared_on`, on a PostgreSQL target. Before M-02 that call went to a MySQL
+/// connection and every write of the refresh failed with "PostgreSQL targets land in PRs T2-T5".
+/// The rows must equal the oracle, and an incremental view must still never be rebuilt whole.
+#[test]
+fn targets_pg_unsupervised_refresh() {
+    let Some(pgs) = pg::servers_or_skip("targets_pg_unsupervised_refresh") else {
+        return;
+    };
+    scenario("tg_pgsupoff", move |ctx| {
+        let pgs1 = pgs.clone();
+        async move {
+            let src = ctx.new_db("tg_pgs_src").await?;
+            let pgdb = pg::new_pg_db(&pgs1[0], "tg_pgs").await?;
+            let mut c = src.conn().await?;
+            exec_all(
+                &mut c,
+                &[
+                    "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL)",
+                    "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL)",
+                    "INSERT INTO entities VALUES (1,'alpha'),(2,'beta'),(3,'gamma')",
+                    "INSERT INTO items VALUES (1,1,10.50),(2,2,5.00),(3,3,7.75)",
+                ],
+            )
+            .await?;
+            ensure_lazyview_table(&mut c).await?;
+            let spec = ViewSpec::new(
+                "links",
+                Kind::Incremental,
+                "SELECT i.id AS id, e.name AS name, i.amount AS amount FROM items i JOIN entities e ON e.id = i.entity_id",
+            )
+            .with_targets("pg");
+            add_views(&mut c, std::slice::from_ref(&spec)).await?;
+            let mut env = target_env(&[("pg", &pgdb.dsn)]);
+            env.push(("LAZYVIEW_SUPERVISOR".to_string(), "off".to_string()));
+            let mut eng = ctx.start_engine(&src, &ov_refs(&env))?;
+            wait_ready(&mut c, &mut eng, &["links"], t_ready()).await?;
+            for k in 1..=3 {
+                exec(
+                    &mut c,
+                    &format!(
+                        "INSERT INTO items VALUES ({}, {}, {}.25)",
+                        10 + k,
+                        (k % 3) + 1,
+                        k
+                    ),
+                )
+                .await?;
+                exec(
+                    &mut c,
+                    &format!("UPDATE items SET amount = amount + 1 WHERE id = {k}"),
+                )
+                .await?;
+                exec(&mut c, &format!("DELETE FROM items WHERE id = {}", 10 + k)).await?;
+                eng.wait_caught_up(&mut c, t_catchup()).await?;
+            }
+            let vs = eng.stats_of(&src, "links")?;
+            ensure!(
+                vs.whole_view_refreshes == 0,
+                "links took {} whole-view refreshes with the supervisor off, expected none",
+                vs.whole_view_refreshes
+            );
+            let tmap: HashMap<String, Db> = HashMap::new();
+            let pgmap: HashMap<String, pg::PgDb> = [("pg".to_string(), pgdb.clone())].into();
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &src,
+                &tmap,
+                &pgmap,
+                std::slice::from_ref(&spec),
+                "rows written without the supervisor",
+            )
+            .await?;
+            eng.stop().await?;
+            pg::drop_dbs(std::slice::from_ref(&pgdb)).await?;
+            Ok(())
+        }
+    });
+}
+
+/// `relfilenode` of a table: the bytes of one table, so a rebuild (shadow + swap) changes it and
+/// a resume cannot.
+async fn pg_filenode(client: &tokio_postgres::Client, schema: &str, table: &str) -> Result<i64> {
+    Ok(client
+        .query_one(
+            "SELECT c.relfilenode::bigint FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2",
+            &[&schema.to_string(), &table.to_string()],
+        )
+        .await?
+        .get(0))
+}
+
 /// A MySQL `time` value reaches a write as the datum's own text (`8:30:00.000000`: the hour is not
 /// padded and the fraction is always six digits) while MySQL prints `08:30:00`, so a `time` key is
 /// compared as a value: hour padded, trailing fraction zeros (and the dot) removed - the rule

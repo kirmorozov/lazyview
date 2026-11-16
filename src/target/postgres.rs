@@ -19,12 +19,13 @@ use tokio_postgres::types::{private::BytesMut, Format, IsNull, ToSql, Type};
 use tokio_postgres::GenericClient;
 
 use crate::accumulate::{UnitChunk, UnitKind};
+use crate::analyze::Presence;
 use crate::datum::{Datum, Key};
 use crate::metrics::Metrics;
 use crate::mv::{Applied, Diff, Layout, MvCol, Upsert, WriteOpts};
 use crate::target::{
     lineage_indexes, old_name, partial_indexes, row_index, shadow_name, unit_index, KeyPart,
-    KeyPlan, Kind, RowIndex, MARKER_PREFIX, PG_KEY_BYTES,
+    KeyPlan, Kind, MvFilter, RowIndex, MARKER_PREFIX, PG_KEY_BYTES,
 };
 
 mod connect;
@@ -420,12 +421,32 @@ fn index_renames(schema: &str, name: &str, found: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// `DROP TABLE IF EXISTS` of `crate::target::drop_table`'s PostgreSQL arm, on the target's own
-/// connection ([`PgConn::drop_table`]).
-pub(crate) async fn drop_table(_conn: &mut Conn, _schema: &str, _name: &str) -> Result<()> {
-    unreachable!(
-        "the PostgreSQL DROP TABLE runs on the target's own connection (PgConn::drop_table)"
-    )
+/// The `(quoted names, target columns)` of `names` in `layout.cols`: the columns a lookup's
+/// chunk binds against, whose type decides the text a key is bound as ([`param_text`]).
+fn named_cols<'a>(layout: &'a Layout, names: &[String]) -> Result<(Vec<String>, Vec<&'a MvCol>)> {
+    let mut cols = Vec::with_capacity(names.len());
+    let mut types = Vec::with_capacity(names.len());
+    for n in names {
+        let c = layout
+            .cols
+            .iter()
+            .find(|c| &c.name == n)
+            .with_context(|| format!("internal: no materialized column {n}"))?;
+        cols.push(quote_ident(n));
+        types.push(c);
+    }
+    Ok((cols, types))
+}
+
+/// The predicate of a pinned cascade child's presence column (the PostgreSQL rendering of
+/// `crate::analyze::Presence::marks`, which quotes for the MySQL family because `analyze` is the
+/// copyable seam): the units whose presence column counts the parent's rows, or carries its key.
+fn presence_marks(p: &Presence, value: &Datum) -> String {
+    let name = quote_ident(&p.name);
+    match p.counts {
+        Some(_) => format!("{name} > 0"),
+        None => format!("{name} = {}", crate::analyze::int_sql(value)),
+    }
 }
 
 /// Session settings of every PostgreSQL target connection: values are stored and read back in
@@ -827,7 +848,7 @@ impl PgConn {
 
     /// Visible and hidden columns as `(name, format_type)`, in order: the strings [`pg_type`]
     /// renders for the source types, so [`layout_matches`] compares them verbatim (T3.3).
-    #[allow(dead_code)] // the engine's resume/verify reads are the MySQL-typed dispatch; T6's build path reads only [`table_kind`] / [`table_marker`]
+    /// Reached through `target::Conn::table_columns` (the engine's resume check, M-02).
     pub(crate) async fn table_columns(
         &self,
         schema: &str,
@@ -854,8 +875,8 @@ impl PgConn {
     /// and not by its name (robust to the renames of the swap, D7); true when the layout has no
     /// row key. Like the MySQL family's `_lv_row` it is a plain unique index, so a key holding a
     /// NULL does not conflict there either - which is why the resume guard asks for this index
-    /// instead of assuming one (T3.3).
-    #[allow(dead_code)] // as above
+    /// instead of assuming one (T3.3). Reached through `target::Conn::has_row_index` (the
+    /// engine's resume check, M-02).
     pub(crate) async fn has_row_index(
         &self,
         schema: &str,
@@ -1115,8 +1136,9 @@ impl PgConn {
         Ok(())
     }
 
-    /// `DROP TABLE IF EXISTS` (the analogue of `crate::target::mysql::drop_table`).
-    #[allow(dead_code)] // as above
+    /// `DROP TABLE IF EXISTS` (the analogue of `crate::target::mysql::drop_table`). Reached
+    /// through `target::Conn::drop_table` (a shadow left by an interrupted build, the table of a
+    /// retargeted view, M-02).
     pub(crate) async fn drop_table(&self, schema: &str, name: &str) -> Result<()> {
         self.client
             .execute(
@@ -1129,6 +1151,67 @@ impl PgConn {
             )
             .await?;
         Ok(())
+    }
+
+    /// The lookup paths' read of the materialized table (the PostgreSQL arm of
+    /// [`crate::target::Conn::read_materialized`], T6): the DISTINCT unit columns of the rows a
+    /// chunk of keys, or a pinned cascade child's presence column, selects. Every column comes
+    /// back as `col::text` and [`cell_value`] decodes it, as in [`PgConn::read_old`], so the read
+    /// needs no `with-*` type feature and the values are the ones `crate::mv` compares. One
+    /// statement per chunk of a lookup, never per row; the SQL text, the binds and the rows are
+    /// the allocation this read costs (the MySQL arm's own).
+    pub(crate) async fn read_materialized(
+        &self,
+        schema: &str,
+        table: &str,
+        layout: &Layout,
+        filter: MvFilter<'_>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (cols, _) = unit_cols(layout, &layout.unit_pos);
+        let list = cols
+            .iter()
+            .map(|c| format!("{c}::text"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (f, bound) = match filter {
+            MvFilter::Keys { chunk, cols: names } => {
+                let (fc, ft) = named_cols(layout, names)?;
+                filter_bind(chunk, &fc, &[], &ft)
+            }
+            MvFilter::Presence { p, value } => (presence_marks(p, value), Vec::new()),
+        };
+        let sql = format!(
+            "SELECT DISTINCT {list} FROM {}.{} WHERE {f}",
+            quote_ident(schema),
+            quote_ident(table)
+        );
+        let params: Vec<Param> = bound.into_iter().map(Param).collect();
+        let binds = refs(&params);
+        let rows = self.client.query(sql.as_str(), &binds).await?;
+        // A unit column is NOT NULL exactly where the build put one (T3.2): what tells a NULL
+        // that can only be the zero date from a real one (D5), as in `read_old`.
+        let primary = matches!(
+            unit_index(layout, &KeyPlan::for_layout(layout, Kind::Postgres)),
+            Some((true, _))
+        );
+        Ok(rows
+            .iter()
+            .map(|r| {
+                layout
+                    .unit_pos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &p)| {
+                        let nullable = !(primary && layout.unit_pos.contains(&p));
+                        cell_value(
+                            r.get::<_, Option<String>>(i).as_deref(),
+                            &layout.cols[p],
+                            nullable,
+                        )
+                    })
+                    .collect()
+            })
+            .collect())
     }
 }
 

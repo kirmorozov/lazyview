@@ -4,11 +4,13 @@
 //! on [`Kind`] at its top and calls one function of the family's module. No trait objects,
 //! nothing on a per-row path.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use mysql_async::Value;
 
 use crate::accumulate::{UnitChunk, UnitKind};
 use crate::analyze::quote_ident as q;
+use crate::analyze::Presence;
+use crate::datum::Datum;
 use crate::metrics::Metrics;
 use crate::mv::{Layout, MvCol, Upsert, WriteOpts};
 use crate::supervisor::{Policy, Timeout, CONNECT_TIMEOUT};
@@ -120,18 +122,6 @@ pub enum Conn {
 }
 
 impl Conn {
-    /// The MySQL connection behind this one: the choke point of every statement path that is
-    /// still MySQL-only (the PostgreSQL arms land with T2-T5), so a PostgreSQL target fails
-    /// there with a clear error instead of reaching a stub.
-    pub(crate) fn mysql(&mut self) -> Result<&mut mysql_async::Conn> {
-        match self {
-            Conn::Mysql(c) => Ok(c),
-            Conn::Postgres(_) => Err(anyhow!(
-                "PostgreSQL targets land in PRs T2-T5 (the statements of src/target/postgres.rs)"
-            )),
-        }
-    }
-
     /// The build path's ownership check `table_kind`, dispatched by this connection's family
     /// (T6): the build code holds a `Conn`, so it never names a family below this point.
     pub(crate) async fn table_kind(&mut self, schema: &str, name: &str) -> Result<Option<String>> {
@@ -150,6 +140,66 @@ impl Conn {
         match self {
             Conn::Mysql(c) => mysql::table_marker(c, schema, name).await,
             Conn::Postgres(c) => c.table_marker(schema, name).await,
+        }
+    }
+
+    /// Visible + invisible column names and types of an existing table (the resume check),
+    /// dispatched by family: a PostgreSQL target reads its own catalog on its own connection.
+    pub(crate) async fn table_columns(
+        &mut self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<(String, String)>> {
+        match self {
+            Conn::Mysql(c) => mysql::table_columns(c, schema, name).await,
+            Conn::Postgres(c) => c.table_columns(schema, name).await,
+        }
+    }
+
+    /// Whether an existing table has the unique index its rows are upserted by (see
+    /// [`Layout::row_key`]), dispatched by family (the resume check).
+    pub(crate) async fn has_row_index(
+        &mut self,
+        schema: &str,
+        table: &str,
+        layout: &Layout,
+    ) -> Result<bool> {
+        match self {
+            Conn::Mysql(c) => mysql::has_row_index(c, schema, table, layout).await,
+            Conn::Postgres(c) => c.has_row_index(schema, table, layout).await,
+        }
+    }
+
+    /// `DROP TABLE IF EXISTS` (a shadow left by an interrupted build, a view's table after a
+    /// retarget), dispatched by family. One dispatch per statement.
+    pub(crate) async fn drop_table(
+        &mut self,
+        schema: &str,
+        name: &str,
+        metrics: &Metrics,
+    ) -> Result<()> {
+        match self {
+            Conn::Mysql(c) => mysql::drop_table(c, schema, name, metrics).await,
+            Conn::Postgres(c) => c.drop_table(schema, name).await,
+        }
+    }
+
+    /// The lookup paths' read of a materialized table (M-02's fourth arm): `SELECT DISTINCT`
+    /// over the layout's unit columns, filtered by [`MvFilter`], as the values `crate::mv`
+    /// compares. Dispatched once per statement; each family renders its own SQL, so the MySQL
+    /// quoting of a plan's own predicate never reaches a PostgreSQL target. One statement per
+    /// chunk of the lookup, never per row, and the allocation is the statement's own (the SQL
+    /// text and the rows): the same the MySQL arm already paid before this dispatch existed.
+    pub(crate) async fn read_materialized(
+        &mut self,
+        schema: &str,
+        table: &str,
+        layout: &Layout,
+        filter: MvFilter<'_>,
+    ) -> Result<Vec<Vec<Value>>> {
+        match self {
+            Conn::Mysql(c) => mysql::read_materialized(c, schema, table, layout, filter).await,
+            Conn::Postgres(c) => c.read_materialized(schema, table, layout, filter).await,
         }
     }
 
@@ -336,32 +386,6 @@ pub(crate) fn create_table_sql(
     }
 }
 
-/// `BASE TABLE` / `VIEW` / None. One dispatch per metadata read.
-pub(crate) async fn table_kind(
-    conn: &mut mysql_async::Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-) -> Result<Option<String>> {
-    match kind {
-        Kind::Mysql => mysql::table_kind(conn, schema, name).await,
-        Kind::Postgres => unreachable!("a PostgreSQL metadata read runs on the target's own connection          (PgConn::table_kind); the engine rejects a PostgreSQL build until T4"),
-    }
-}
-
-/// Visible + invisible column names and types of an existing table.
-pub(crate) async fn table_columns(
-    conn: &mut mysql_async::Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-) -> Result<Vec<(String, String)>> {
-    match kind {
-        Kind::Mysql => mysql::table_columns(conn, schema, name).await,
-        Kind::Postgres => unreachable!("a PostgreSQL metadata read runs on the target's own connection          (PgConn::table_columns); the engine rejects a PostgreSQL build until T4"),
-    }
-}
-
 /// Whether an existing table's columns are the layout's.
 pub(crate) fn layout_matches(kind: Kind, layout: &Layout, existing: &[(String, String)]) -> bool {
     match kind {
@@ -370,33 +394,21 @@ pub(crate) fn layout_matches(kind: Kind, layout: &Layout, existing: &[(String, S
     }
 }
 
-/// Whether `table` has the unique index its rows are upserted by (see [`Layout::row_key`]).
-pub(crate) async fn has_row_index(
-    conn: &mut mysql_async::Conn,
-    kind: Kind,
-    schema: &str,
-    table: &str,
-    layout: &Layout,
-) -> Result<bool> {
-    match kind {
-        Kind::Mysql => mysql::has_row_index(conn, schema, table, layout).await,
-        Kind::Postgres => unreachable!(
-            "a PostgreSQL metadata read runs on the target's own connection (PgConn::has_row_index); the engine rejects a PostgreSQL build until T4"
-        ),
-    }
-}
-
-/// The ownership marker (see [`marker`]) of an existing table, if its comment is one.
-pub(crate) async fn table_marker(
-    conn: &mut mysql_async::Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-) -> Result<Option<String>> {
-    match kind {
-        Kind::Mysql => mysql::table_marker(conn, schema, name).await,
-        Kind::Postgres => unreachable!("a PostgreSQL metadata read runs on the target's own connection          (PgConn::table_marker); the engine rejects a PostgreSQL build until T4"),
-    }
+/// The lookup paths read a materialized table for the units its rows hold: a chunk of a lineage
+/// key's columns, or a pinned cascade child's presence column. Each family renders the statement
+/// for its own target (see [`Conn::read_materialized`]).
+#[derive(Clone, Copy)]
+pub(crate) enum MvFilter<'a> {
+    /// `chunk` over `cols`: one bare (unquoted) column name per position of the chunk, as a
+    /// lineage key's columns are (see `crate::accumulate::UnitChunk::filter`).
+    Keys {
+        chunk: &'a UnitChunk,
+        cols: &'a [String],
+    },
+    /// A pinned cascade child's presence column and the parent key it marks (the analogue of
+    /// `crate::analyze::Presence::marks`, which renders the MySQL family's quoting because
+    /// `analyze` is the copyable seam).
+    Presence { p: &'a Presence, value: &'a Datum },
 }
 
 /// Creates the shadow table of `name` with the ownership marker as its comment. One dispatch
@@ -434,19 +446,6 @@ pub(crate) async fn swap(
         (Conn::Mysql(c), Kind::Mysql) => mysql::swap(c, schema, name, lock_wait_s, metrics).await,
         (Conn::Postgres(c), Kind::Postgres) => c.swap(schema, name).await,
         _ => bail!("internal: target connection and family disagree"),
-    }
-}
-
-pub(crate) async fn drop_table(
-    conn: &mut mysql_async::Conn,
-    kind: Kind,
-    schema: &str,
-    name: &str,
-    metrics: &Metrics,
-) -> Result<()> {
-    match kind {
-        Kind::Mysql => mysql::drop_table(conn, schema, name, metrics).await,
-        Kind::Postgres => postgres::drop_table(conn, schema, name).await,
     }
 }
 

@@ -1117,6 +1117,51 @@ pub async fn apply(
     apply_prepared(conn, schema, table, layout, chunk, &new, w, metrics).await
 }
 
+/// [`apply_prepared`] on a target connection of either family (the unsupervised refresh, M-02):
+/// the MySQL arm is [`apply_prepared`] itself; the PostgreSQL arm is the same read-diff-write on
+/// the target's own connection - [`crate::target::postgres::PgConn::read_old`], [`diff`],
+/// [`crate::target::postgres::PgConn::write_tx`] - the shape `supervisor::write_once` already
+/// uses for one op. One dispatch per chunk, never per row; the diff and the batches are the same
+/// allocations the MySQL arm makes, so a PostgreSQL chunk costs what a MySQL one does.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_prepared_on(
+    conn: &mut crate::target::Conn,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    chunk: Option<&UnitChunk>,
+    new: &Prepared,
+    w: &WriteOpts,
+    metrics: &Metrics,
+) -> Result<Applied> {
+    match conn {
+        crate::target::Conn::Mysql(c) => {
+            apply_prepared(c, schema, table, layout, chunk, new, w, metrics).await
+        }
+        crate::target::Conn::Postgres(c) => {
+            let old = c.read_old(schema, table, layout, chunk, metrics).await?;
+            let d = diff(layout, old, new);
+            if d.changed.is_empty() {
+                // Nothing differs: no statement at all, as `write_diff` does for the MySQL family.
+                return Ok(Applied {
+                    unchanged: d.unchanged_rows,
+                    ..Default::default()
+                });
+            }
+            c.write_tx(
+                schema,
+                table,
+                layout,
+                &d,
+                w,
+                metrics,
+                &AtomicBool::new(false),
+            )
+            .await
+        }
+    }
+}
+
 /// Builds a chunk from arbitrary keys (sorted integers when possible).
 pub(crate) fn keys_chunk(keys: &[Key]) -> UnitChunk {
     let ints: Option<Vec<i64>> = keys
