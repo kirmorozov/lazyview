@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use sqlparser::ast::{BinaryOperator, Expr, SetExpr};
+use sqlparser::ast::{BinaryOperator, Expr, InTarget, SetExpr};
 
 use crate::analyze::{
     definition_hash, int_sql, is_create_statement, parse_definition, parse_select, quote_ident,
@@ -208,7 +208,7 @@ fn parsed(sql: &str, id: IdSpec<'_>) -> anyhow::Result<(ParsedDef, Option<Expr>)
         }
     }
     let at = conjuncts.iter().position(|c| {
-        matches!(c, Expr::InList { list, negated: false, .. }
+        matches!(c, Expr::In { target: InTarget::List(list), negated: false, .. }
             if list.len() == 1 && list[0].to_string() == m)
     });
     let Some(at) = at else {
@@ -216,7 +216,7 @@ fn parsed(sql: &str, id: IdSpec<'_>) -> anyhow::Result<(ParsedDef, Option<Expr>)
     };
     let marker = conjuncts.remove(at);
     // The checked expression is the marker's left side, `<expr>` of `<expr> IN (<m>)`.
-    let Expr::InList { expr, .. } = marker else {
+    let Expr::In { expr, .. } = marker else {
         anyhow::bail!("keys marker `{m}` not found as `<expr> IN ({m})` in the WHERE");
     };
     let marker = *expr;

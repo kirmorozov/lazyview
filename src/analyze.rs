@@ -9,8 +9,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
     visit_expressions, visit_expressions_mut, BinaryOperator, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator, NamedWindowExpr,
-    ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
+    FunctionArguments, GroupByExpr, Ident, InTarget, Join, JoinConstraint, JoinOperator,
+    NamedWindowExpr, ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, TableAlias, TableFactor, TableWithJoins,
     UnaryOperator, Value, Visit, Visitor, WindowType,
 };

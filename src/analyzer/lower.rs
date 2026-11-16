@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
-use sqlparser::ast::{Expr, SelectItem};
+use sqlparser::ast::{Expr, InTarget, SelectItem};
 use sqlparser::tokenizer::Token;
 
 use super::ast::{and_all, join_constraint, qident};
@@ -249,7 +249,13 @@ fn attach_semis(
 
 fn semi_kind(s: &Semi) -> &'static str {
     match (&s.predicate, s.negated) {
-        (Expr::InSubquery { .. }, _) => "IN subquery",
+        (
+            Expr::In {
+                target: InTarget::Subquery(..),
+                ..
+            },
+            _,
+        ) => "IN subquery",
         (_, true) => "NOT EXISTS subquery",
         _ => "EXISTS subquery",
     }

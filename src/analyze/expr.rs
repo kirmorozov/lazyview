@@ -175,7 +175,10 @@ pub(crate) fn order_subquery_tables(
         let _ = visit_expressions(&e.expr, |x: &Expr| {
             let q = match x {
                 Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => q,
-                Expr::InSubquery { subquery, .. } => subquery,
+                Expr::In {
+                    target: InTarget::Subquery(subquery),
+                    ..
+                } => subquery,
                 _ => return ControlFlow::<()>::Continue(()),
             };
             let mut n = Names {
@@ -265,10 +268,11 @@ pub(crate) fn equalities(e: &Expr, scope: &Scope) -> Vec<(ColRef, ColRef)> {
                 op: BinaryOperator::Eq,
                 right,
             } => Some((scope.resolve(left)?, scope.resolve(right)?)),
-            Expr::InList {
+            Expr::In {
                 expr,
-                list,
+                target: InTarget::List(list),
                 negated: false,
+                ..
             } if list.len() == 1 => Some((scope.resolve(expr)?, scope.resolve(&list[0])?)),
             _ => None,
         })
@@ -385,9 +389,11 @@ pub(crate) fn null_rejecting(e: &Expr) -> bool {
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
             null_propagating(expr) && null_propagating(pattern)
         }
-        Expr::InList { expr, list, .. } => {
-            null_propagating(expr) && list.iter().all(null_propagating)
-        }
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            ..
+        } => null_propagating(expr) && list.iter().all(null_propagating),
         Expr::Between {
             expr, low, high, ..
         } => null_propagating(expr) && null_propagating(low) && null_propagating(high),
@@ -479,10 +485,11 @@ fn const_filter(e: &Expr, scope: &Scope) -> Option<(ColRef, Vec<Datum>)> {
             Some(_) => (left.as_ref(), vec![right.as_ref()]),
             None => (right.as_ref(), vec![left.as_ref()]),
         },
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated: false,
+            ..
         } => (expr.as_ref(), list.iter().collect()),
         _ => return None,
     };
@@ -677,7 +684,12 @@ pub(crate) fn scan_exprs(select: &Select) -> (Option<String>, bool, Vec<Vec<Expr
     };
     let mut check = |e: &Expr| {
         match e {
-            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+            Expr::Subquery(_)
+            | Expr::Exists { .. }
+            | Expr::In {
+                target: InTarget::Subquery(..),
+                ..
+            } => {
                 reason.get_or_insert_with(|| "subquery".to_string());
             }
             Expr::MatchAgainst { .. } => {

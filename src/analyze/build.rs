@@ -375,7 +375,14 @@ pub fn plan_block(
         let _ = visit_expressions(o, |e: &Expr| {
             // (Not a filter context: no exact NOT EXISTS form, and MariaDB re-uses a stale NOT
             // IN result when the refresh statement is re-executed, F5.)
-            if matches!(e, Expr::InSubquery { negated: true, .. }) {
+            if matches!(
+                e,
+                Expr::In {
+                    target: InTarget::Subquery(..),
+                    negated: true,
+                    ..
+                }
+            ) {
                 why = Some(
                     "NOT IN subquery in the ORDER BY of a top-N view (MariaDB re-executes it with a stale result): write NOT EXISTS"
                         .to_string(),
@@ -1298,7 +1305,8 @@ pub(crate) fn substitute_factor(
         partitions: vec![],
         json_path: None,
         sample: None,
-        index_hints: vec![],
+        index_directives: vec![],
+        inheritance: None,
     };
     match pos {
         (t, None) => from[t].relation = marker,

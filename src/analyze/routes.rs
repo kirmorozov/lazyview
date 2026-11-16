@@ -300,10 +300,11 @@ pub(crate) fn cascade_joined(
                         .resolve(left)
                         .zip(scope.resolve(right))
                         .filter(|(a, b)| scope.same_family(*a, *b)),
-                    Expr::InList {
+                    Expr::In {
                         expr: left,
-                        list,
+                        target: InTarget::List(list),
                         negated: false,
+                        ..
                     } if list.len() == 1 => scope
                         .resolve(left)
                         .zip(scope.resolve(&list[0]))

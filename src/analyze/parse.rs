@@ -275,7 +275,10 @@ pub(crate) fn cte_names(query: &Query) -> Vec<String> {
                 let _ = visit_expressions(&**sel, |e: &Expr| {
                     match e {
                         Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => walk(q, out),
-                        Expr::InSubquery { subquery, .. } => walk(subquery, out),
+                        Expr::In {
+                            target: InTarget::Subquery(q),
+                            ..
+                        } => walk(q, out),
                         _ => {}
                     }
                     ControlFlow::<()>::Continue(())

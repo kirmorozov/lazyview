@@ -14,9 +14,9 @@ use std::ops::ControlFlow;
 use anyhow::{anyhow, bail, Result};
 use sqlparser::ast::{
     visit_expressions, visit_expressions_mut, BinaryOperator, Distinct, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
-    ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
-    UnaryOperator, Value,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, InTarget, Join, JoinConstraint,
+    JoinOperator, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, TableFactor,
+    TableWithJoins, UnaryOperator, Value,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -1565,10 +1565,16 @@ fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
         return Ok(());
     };
     let parts = conjuncts(w);
-    if !parts
-        .iter()
-        .any(|c| matches!(c, Expr::Exists { .. } | Expr::InSubquery { .. }))
-    {
+    if !parts.iter().any(|c| {
+        matches!(
+            c,
+            Expr::Exists { .. }
+                | Expr::In {
+                    target: InTarget::Subquery(..),
+                    ..
+                }
+        )
+    }) {
         return Ok(());
     }
     let outer = Resolver::new(b);
@@ -1674,10 +1680,11 @@ fn semi_shape<'a>(
 ) -> Result<Option<SemiShape<'a>>> {
     let (lhs, subquery, negated) = match c {
         Expr::Exists { subquery, negated } => (None, subquery, *negated),
-        Expr::InSubquery {
+        Expr::In {
             expr,
-            subquery,
+            target: InTarget::Subquery(subquery),
             negated,
+            ..
         } => (Some(&**expr), subquery, *negated),
         _ => return Ok(None),
     };
@@ -2064,14 +2071,15 @@ fn semi(
             subquery: Box::new(query_of(sel)),
             negated: true,
         },
-        Some(_) => Expr::InSubquery {
+        Some(_) => Expr::In {
             expr: Box::new(if lhs_ph.len() == 1 {
                 lhs_ph[0].clone()
             } else {
                 Expr::Tuple(lhs_ph.clone())
             }),
-            subquery: Box::new(query_of(sel)),
+            target: InTarget::Subquery(Box::new(query_of(sel))),
             negated: not_in,
+            global: false,
         },
         None => Expr::Exists {
             subquery: Box::new(query_of(sel)),
@@ -2103,10 +2111,11 @@ fn semi(
 /// 10.11 / 13.0 re-use a stale NOT IN result when a prepared statement is re-executed after the
 /// subquery flips between empty and non-empty (F5); NOT EXISTS is not affected.
 pub(crate) fn not_in_as_not_exists(pred: &Expr) -> Option<Expr> {
-    let Expr::InSubquery {
+    let Expr::In {
         expr,
-        subquery,
+        target: InTarget::Subquery(subquery),
         negated: true,
+        ..
     } = pred
     else {
         return None;
@@ -2186,7 +2195,12 @@ pub(crate) fn semi_renamed(s: &Semi, taken: &HashSet<String>) -> Semi {
         return out;
     }
     rename_refs(&mut out.predicate, &renames);
-    if let Expr::InSubquery { subquery, .. } | Expr::Exists { subquery, .. } = &mut out.predicate {
+    if let Expr::In {
+        target: InTarget::Subquery(subquery),
+        ..
+    }
+    | Expr::Exists { subquery, .. } = &mut out.predicate
+    {
         if let SetExpr::Select(sel) = subquery.body.as_mut() {
             for twj in &mut sel.from {
                 for f in std::iter::once(&mut twj.relation)

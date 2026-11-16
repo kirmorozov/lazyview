@@ -114,7 +114,8 @@ pub(crate) fn table_factor(name: ObjectName, alias: Option<&str>) -> TableFactor
         partitions: vec![],
         json_path: None,
         sample: None,
-        index_hints: vec![],
+        index_directives: vec![],
+        inheritance: None,
     }
 }
 

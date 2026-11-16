@@ -154,11 +154,15 @@ fn walk_set(s: &SetExpr, scope: &Scope, schema: &str, out: &mut BTreeSet<TableRe
         }
         SetExpr::Table(t) => {
             if let Some(name) = &t.table_name {
+                // sqlparser 0.64: `table_name`/`schema_name` are `Option<Ident>` (were `Option<String>`);
+                // `Ident::value` is the same unquoted text the `String` held, so the reference is identical.
+                let name = name.value.clone();
+                let schema_opt = t.schema_name.as_ref().map(|i| i.value.clone());
                 let tref = (
-                    t.schema_name.clone().unwrap_or_else(|| schema.to_string()),
+                    schema_opt.clone().unwrap_or_else(|| schema.to_string()),
                     name.clone(),
                 );
-                if !(t.schema_name.is_none() && scope.lookup(name).is_some()) {
+                if !(schema_opt.is_none() && scope.lookup(&name).is_some()) {
                     out.insert(tref);
                 }
             }
