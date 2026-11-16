@@ -1,0 +1,12 @@
+# Chaos scenarios (tests/chaos.rs) that may still fail without blocking a CI run: one
+# "<test name> #<open issue>" per line, the shape of tmp/out/lvsuper/ci/known-red.txt. Blank lines
+# and `#` comment lines are ignored; the name is the test function, exactly as cargo prints it.
+#
+# scripts/chaos-gate.sh reads this file in the chaos steps of .github/workflows/ci.yml (every
+# integration job, and the postgres-target job for the chaos_tgt_pg_ scenarios): a failure listed
+# here passes the step and is written to the job summary with its issue, an unlisted one fails it.
+# So the list is the only thing between a new chaos regression and a red job, and an entry leaves
+# when its fix lands — the file is never a place to park a scenario for good. Empty file, strict
+# step: every chaos failure fails the job.
+chaos_tgt_blackhole_during_flush #214
+chaos_src_binlog_reset_mid_txn #229

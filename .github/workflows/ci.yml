@@ -4,8 +4,10 @@ name: ci
 # e2e, the integration matrix, integration-multi, integration-pg and integration-pgsrc. Every landed
 # commit therefore shows its own full matrix. The network-chaos suite (tests/chaos.rs) runs inside
 # every integration job: the job's own server family reached through the toxiproxy daemon (compose
-# profile `chaos`), its scenarios advisory (continue-on-error) while the known-red list is open, the
-# toxi self-tests required.
+# profile `chaos`), its scenarios required (scripts/chaos-gate.sh fails the step on any failure
+# tests/chaos-known-red.txt does not list, and prints the listed ones in the job summary), the toxi
+# self-tests required. The chaos_tgt_pg_ scenarios run where a PostgreSQL server is: the
+# postgres-target job.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
 #   main  -> `image`   (needs lint + unit + e2e; the integration jobs run alongside, not required)
 #   v*    -> `release` (needs lint + unit + e2e + the integration matrix + the multi-server job;
@@ -188,11 +190,14 @@ jobs:
         run: cargo test --locked --test chaos -- --test-threads=1 selftest_toxi_
       - name: chaos scenarios
         if: always() && !cancelled()
-        # Advisory while the known-red list is open (tmp/out/lvsuper/ci/known-red.txt: #214 a real
-        # bug, #227 and #229 with fixes in flight), strict so no scenario skips. Flip: when that
-        # file is empty (all three fixes landed), drop `continue-on-error` below and this step
-        # becomes required, like the self-tests above.
-        continue-on-error: true
+        # Required, like the self-tests above: scripts/chaos-gate.sh fails this step on any chaos
+        # test that FAILED and is not listed in tests/chaos-known-red.txt, so a NEW chaos failure on
+        # any flavor turns this job red (it used to be advisory, and a new failure showed nowhere).
+        # A listed failure passes and is written to the job summary with its issue. With that file
+        # empty the step is strict exactly as it stands: every chaos failure fails the job, so
+        # nothing has to be flipped when the last entry leaves the list.
+        # The chaos_tgt_pg_ scenarios are filtered out here: this job has no PostgreSQL server, and
+        # strict would refuse their skip. They run for real in the postgres-target job.
         # 9 scenarios x ~120 s worst case + the tee; same bound the separate chaos job used.
         timeout-minutes: 20
         env:
@@ -202,7 +207,13 @@ jobs:
           LAZYVIEW_TEST_REQUIRE_MULTI: "0"
           LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           LAZYVIEW_HEALTH_ADDR: "off"
-        run: cargo test --locked --test chaos -- --test-threads=1 chaos_
+        # --color never: the gate's greps read these lines as plain text. The exit status of cargo
+        # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
+        run: |
+          set +o pipefail
+          cargo test --locked --test chaos -- --test-threads=1 --color never chaos_ --skip chaos_tgt_pg_ 2>&1 \
+            | tee chaos-scenarios.log
+          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "$FLAVOR" chaos-scenarios.log
       - name: advisory flavor failed
         if: failure() && matrix.advisory
         run: |
@@ -318,12 +329,17 @@ jobs:
     # matrix flavor; PostgreSQL is only ever a target (LAZYVIEW_TEST_PG_DSNS).
     name: integration (postgres target, mysql84 + pg16)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # targets suite + the chaos_tgt_pg_ scenarios (3 x ~120 s worst case) + build/wait.
+    timeout-minutes: 60
     env:
       COMPOSE_FILE: docker-compose.test.yml
-      SERVICES: mysql84 pg16
-    steps:  # identical to integration-multi: start servers, rust, rust-cache (shared-key
-            # integration, save-if false), build --test targets, wait, print versions, then
+      # toxiproxy (compose profile `chaos`) joins the two servers: the chaos step below arms real
+      # network faults on the link to the PostgreSQL target, the same daemon the matrix jobs use.
+      COMPOSE_PROFILES: chaos
+      SERVICES: mysql84 pg16 toxiproxy
+    steps:  # identical to integration-multi: start servers (toxiproxy with them, profile `chaos`),
+            # rust, rust-cache (shared-key integration, save-if false), build --test targets --test
+            # chaos, wait, print versions, then the targets suite and the chaos_tgt_pg_ scenarios
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -340,8 +356,8 @@ jobs:
           # Reads the integration matrix's cache (its mysql84 job writes it).
           shared-key: integration
           save-if: false
-      - name: build the targets tests
-        run: cargo test --locked --test targets --no-run
+      - name: build the targets and chaos tests
+        run: cargo test --locked --test targets --test chaos --no-run
       - name: wait for the servers
         run: |
           read -ra services <<<"$SERVICES"
@@ -350,6 +366,9 @@ jobs:
         run: |
           echo "mysql84: $(docker compose exec -T mysql84 sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"')"
           echo "PGVERSION: $(docker compose exec -T pg16 psql -U lv -d lvtest -Atc 'select version()')"
+          # The daemon the chaos step below arms its faults through; a dead one shows here, not at
+          # the first scenario.
+          curl -fsS http://127.0.0.1:18474/version
       - name: postgres target tests
         env:
           LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
@@ -365,6 +384,36 @@ jobs:
                    targets_pg_group_by_unindexable_key; do
             grep -q "^test $t \.\.\. ok$" pg-target-tests.log || { echo "::error::$t did not run and pass"; exit 1; }
           done
+      # The chaos_tgt_pg_ scenarios of #242 for real, where the PostgreSQL target actually is: the
+      # same faults the matrix jobs arm against their own server, here against pg16 through the
+      # toxiproxy daemon started above (the harness proxies pg16:5432 inside the compose network).
+      # Strict, so a scenario that cannot reach the daemon or the PG server fails instead of
+      # skipping, and required, gated by scripts/chaos-gate.sh on tests/chaos-known-red.txt: these
+      # scenarios used to be filtered out of every job that had a server for them and ran nowhere.
+      # In the 15 MySQL-family jobs they stay filtered out (`--skip chaos_tgt_pg_`): no PostgreSQL
+      # there, so strict would refuse their skip and every one of those jobs would be red.
+      - name: chaos scenarios (postgres target)
+        if: always() && !cancelled()
+        # 3 scenarios x ~120 s worst case + the tee.
+        timeout-minutes: 15
+        env:
+          LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
+          LAZYVIEW_TEST_PG_DSNS: pg16=postgres://lv:lv@127.0.0.1:35432/lvtest
+          LAZYVIEW_HEALTH_ADDR: "off"
+          # The PG target must be there (it is: the step above runs the targets suite against it).
+          LAZYVIEW_TEST_REQUIRE_PG: "1"
+          # One source server here: the multi-server scenarios skip (visibly) instead of failing.
+          LAZYVIEW_TEST_REQUIRE_MULTI: "0"
+          # The daemon's API and the harness's proxy band (compose publishes both on loopback).
+          LAZYVIEW_TEST_TOXI: 127.0.0.1:18474
+          LAZYVIEW_TEST_STRICT: "chaos_tgt_pg_"
+        # --color never: the gate's greps read these lines as plain text. The exit status of cargo
+        # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
+        run: |
+          set +o pipefail
+          cargo test --locked --test chaos -- --test-threads=1 --color never chaos_tgt_pg_ 2>&1 \
+            | tee chaos-pg-target-tests.log
+          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "postgres target" chaos-pg-target-tests.log
       - name: collect server logs
         if: failure()
         run: |
