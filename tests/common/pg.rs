@@ -96,9 +96,9 @@ pub fn servers_or_skip(test: &str) -> Option<Vec<Server>> {
                     "{test}: LAZYVIEW_TEST_REQUIRE_PG=1 but LAZYVIEW_TEST_PG_DSNS lists no server"
                 );
             }
-            println!(
-                "SKIP {test}: no PostgreSQL target (LAZYVIEW_TEST_PG_DSNS unset; \
-                 LAZYVIEW_TEST_REQUIRE_PG=1 fails instead)"
+            super::skip_scenario(
+                test,
+                "no PostgreSQL target (LAZYVIEW_TEST_PG_DSNS unset; LAZYVIEW_TEST_REQUIRE_PG=1 fails instead)",
             );
             None
         }

@@ -128,6 +128,10 @@ jobs:
         timeout-minutes: 75
         env:
           LAZYVIEW_TEST_DSNS: ${{ matrix.flavor }}=mysql://lv:lv@127.0.0.1:${{ matrix.port }}/lvtest
+          # Strict: the MySQL-family target tests must run for real on this one server, never skip.
+          # The targets_pg_* tests need a PostgreSQL server this job does not have: they are skipped
+          # below and run in the postgres-target job only.
+          LAZYVIEW_TEST_STRICT: "targets_"
           LAZYVIEW_HEALTH_ADDR: "off"
           # Suites run one binary at a time here, so the DST test may change GLOBAL time_zone and
           # the MariaDB refusal test GLOBAL log_bin_compress.
@@ -148,7 +152,7 @@ jobs:
           # The exclusive suite (server restarts, killed connections, idle binlog rotation) restarts this job's own disposable server; compose names the container <project>-<service>-1 and the project is the checkout dir (lazyview).
           LAZYVIEW_TEST_EXCLUSIVE: ${{ matrix.flavor }}=lazyview-${{ matrix.flavor }}-1
         # --no-fail-fast: run every suite and report all failures, not just the first.
-        run: cargo test --locked --no-fail-fast --test '*' -- --test-threads=1
+        run: cargo test --locked --no-fail-fast --test '*' -- --test-threads=1 --skip targets_pg_
       - name: advisory flavor failed
         if: failure() && matrix.advisory
         run: |

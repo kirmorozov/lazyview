@@ -772,13 +772,7 @@ impl Ctx {
     /// Reports that this scenario (or a part of it) does not run on this flavor: the line goes to
     /// the real stderr, past the test harness's capture, so it shows for passing tests too.
     pub fn skip(&self, why: &str) {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP {} on {}: {why}",
-            self.test,
-            self.label()
-        );
+        skip_scenario(&self.test, &format!("on {}: {why}", self.label()));
     }
 
     /// Seed for a sub-step, derived from the run seed.
@@ -867,6 +861,45 @@ fn unique_server_id() -> u32 {
     rand::rng().random_range(1_000_000..4_000_000_000u32)
 }
 
+/// The value of `LAZYVIEW_TEST_STRICT`, when set and not empty or `0`.
+fn strict_spec() -> Option<String> {
+    std::env::var("LAZYVIEW_TEST_STRICT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether strict mode `spec` covers `test`: `1` covers every test, otherwise `spec` is a comma
+/// list of test-name prefixes (`targets_`, `targets_fan_out,targets_one_target`).
+pub fn strict_applies(spec: &str, test: &str) -> bool {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .any(|p| p == "1" || test.starts_with(p))
+}
+
+/// The failure message for a skip of `test` under strict mode `spec` (`None` when the skip is
+/// allowed: no strict mode, or strict mode does not cover `test`).
+pub fn skip_failure(spec: Option<&str>, test: &str, why: &str) -> Option<String> {
+    let spec = spec?;
+    strict_applies(spec, test).then(|| {
+        format!(
+            "{test}: SKIP refused by LAZYVIEW_TEST_STRICT={spec} (the test must run here): {why}"
+        )
+    })
+}
+
+/// The one path every skipped scenario takes: prints a visible `SKIP` line on the real stderr
+/// (past the test harness's capture, so it shows for passing tests too), or panics with the
+/// reason when `LAZYVIEW_TEST_STRICT` covers the test, so the skip is a failure.
+pub fn skip_scenario(test: &str, why: &str) {
+    if let Some(msg) = skip_failure(strict_spec().as_deref(), test, why) {
+        panic!("{msg}");
+    }
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "SKIP {test}: {why}");
+}
+
 /// Runs `f` against every flavor in `LAZYVIEW_TEST_DSNS` (in parallel) and panics with a summary
 /// if any flavor failed.
 pub fn scenario<F, Fut>(test: &str, f: F)
@@ -875,7 +908,10 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let Some(servers) = servers() else {
-        println!("SKIP {test}: LAZYVIEW_TEST_DSNS is not set (e.g. export LAZYVIEW_TEST_DSNS=$(scripts/test-servers.sh dsns))");
+        skip_scenario(
+            test,
+            "LAZYVIEW_TEST_DSNS is not set (e.g. export LAZYVIEW_TEST_DSNS=$(scripts/test-servers.sh dsns))",
+        );
         return;
     };
     let groups: Vec<Vec<Server>> = servers.into_iter().map(|s| vec![s]).collect();
@@ -947,6 +983,9 @@ pub fn skip_multi(test: &str, need: usize, have: usize) {
     );
     if !multi_skip_allowed() {
         panic!("{test}: {msg}; multi-server scenarios must run here (CI=true or LAZYVIEW_TEST_REQUIRE_MULTI=1)");
+    }
+    if let Some(f) = skip_failure(strict_spec().as_deref(), test, &msg) {
+        panic!("{f}");
     }
     let n = {
         let mut skipped = MULTI_SKIPPED.lock().unwrap_or_else(|e| e.into_inner());

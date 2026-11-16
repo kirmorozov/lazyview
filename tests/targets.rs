@@ -2,6 +2,10 @@
 //! source; the MV is read from each target. Fan-out (one view → several instances), online
 //! retargeting (add / remove a target), errors (chained view whose upstream is not on the source,
 //! unknown target) and one target being down must not affect the others.
+//!
+//! The MySQL-family scenarios put every target on the one server the job runs (a second schema
+//! per target), so the single-server CI jobs run them for real: a skip there is a failure
+//! (`LAZYVIEW_TEST_STRICT`, see `common::skip_scenario`). A target that is down is a closed port.
 
 mod common;
 
@@ -67,10 +71,10 @@ async fn wait_exists(eng: &mut Engine, db: &Db, table: &str, exists: bool) -> Re
 
 #[test]
 fn targets_fan_out_and_retarget() {
-    scenario_multi("tg_fanout", 2, |ctx| async move {
+    scenario("tg_fanout", |ctx| async move {
         let src = ctx.new_db("tg_src").await?;
-        let tb = ctx.new_db_on(1, "tg_b").await?;
-        let tc = ctx.new_db_on(2, "tg_c").await?;
+        let tb = ctx.new_db("tg_b").await?;
+        let tc = ctx.new_db("tg_c").await?;
         let ids = setup_ecommerce(&src, ctx.sub_seed("seed"), Sizes::scaled()).await?;
         let patterns = [
             None,
@@ -184,9 +188,9 @@ fn targets_fan_out_and_retarget() {
 
 #[test]
 fn targets_invalid_configurations_error() {
-    scenario_multi("tg_errors", 1, |ctx| async move {
+    scenario("tg_errors", |ctx| async move {
         let src = ctx.new_db("tg_err_src").await?;
-        let tb = ctx.new_db_on(1, "tg_err_b").await?;
+        let tb = ctx.new_db("tg_err_b").await?;
         setup_ecommerce(&src, ctx.sub_seed("seed"), Sizes::tiny()).await?;
         let all = ecommerce_views();
         let get = |n: &str| all.iter().find(|v| v.name == n).unwrap().clone();
@@ -244,9 +248,9 @@ fn targets_invalid_configurations_error() {
 
 #[test]
 fn targets_one_target_down() {
-    scenario_multi("tg_down", 1, |ctx| async move {
+    scenario("tg_down", |ctx| async move {
         let src = ctx.new_db("tg_down_src").await?;
-        let tb = ctx.new_db_on(1, "tg_down_b").await?;
+        let tb = ctx.new_db("tg_down_b").await?;
         let ids = setup_ecommerce(&src, ctx.sub_seed("seed"), Sizes::scaled()).await?;
         let all = ecommerce_views();
         let get = |n: &str| all.iter().find(|v| v.name == n).unwrap().clone();
@@ -407,7 +411,10 @@ fn targets_pg_first_build() {
                 .filter(|s| !s.trim().is_empty())
         });
     let Some(base) = base else {
-        println!("SKIP targets_pg_first_build: no PostgreSQL DSN (LAZYVIEW_T6_PG_DSN / LAZYVIEW_TEST_PG_DSNS)");
+        skip_scenario(
+            "targets_pg_first_build",
+            "no PostgreSQL DSN (LAZYVIEW_T6_PG_DSN / LAZYVIEW_TEST_PG_DSNS)",
+        );
         return;
     };
     scenario("tg_pg_build", move |ctx| {

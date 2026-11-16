@@ -555,3 +555,32 @@ async fn selftest_http_decodes_chunked_body() -> anyhow::Result<()> {
     serve.await.expect("the canned server finished");
     Ok(())
 }
+
+/// Strict mode (`LAZYVIEW_TEST_STRICT`): the prefix list decides which tests may not skip, and a
+/// refused skip names the reason. Checked on the pure functions, since the environment is shared
+/// by the parallel tests of this binary.
+#[test]
+fn selftest_strict_skip_rules() {
+    // "1" covers every test; a comma list covers the tests whose name starts with an entry.
+    assert!(strict_applies("1", "tg_fanout"));
+    assert!(strict_applies("targets_", "targets_one_target_down"));
+    assert!(!strict_applies("targets_", "tg_fanout"));
+    assert!(strict_applies(
+        "selftest_x, targets_",
+        "targets_fan_out_and_retarget"
+    ));
+    assert!(!strict_applies("selftest_x, targets_", "soak_run"));
+    assert!(!strict_applies(" , ", "targets_fan_out_and_retarget"));
+    // Strict on and covering the test: the skip is a failure, and the message names the reason.
+    let msg = skip_failure(
+        Some("targets_"),
+        "targets_pg_first_build",
+        "no PostgreSQL DSN",
+    )
+    .expect("a covered skip must fail");
+    assert!(msg.contains("targets_pg_first_build"), "{msg}");
+    assert!(msg.contains("no PostgreSQL DSN"), "{msg}");
+    // Strict off, or not covering the test: the skip stays a visible skip.
+    assert!(skip_failure(None, "targets_pg_first_build", "no PostgreSQL DSN").is_none());
+    assert!(skip_failure(Some("targets_"), "tg_fanout", "no DSN").is_none());
+}
