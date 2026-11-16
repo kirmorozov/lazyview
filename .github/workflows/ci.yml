@@ -388,21 +388,27 @@ jobs:
         run: docker compose down -v
 
   integration-pgsrc:
-    # PostgreSQL maintained as a SOURCE (owner ruling "CI follows the source", phase 1). One
-    # blocking job on pg16, the supported baseline major. The gate is the PG-as-source code
-    # landed so far, run by name and required to pass: the Postgres parse profile (S4b, a
-    # regression to refusal fails the job) and the pg_catalog row mapping (#210). pg16 is up
-    # and pinned as the source with LAZYVIEW_TEST_PG_DSNS + LAZYVIEW_TEST_REQUIRE_PG=1 (the
-    # source-side harness takes the DSN there; no pinned test may skip). The catalog/prepare
-    # smokes that read the live pin arrive with the source connect path (p1b); this leg then
-    # grows into the source mirror of the target matrix (phase 3).
-    name: integration (postgres source, pg16)
+    # PostgreSQL maintained as a SOURCE (owner ruling "CI follows the source", phase 3). The
+    # source-side mirror of the target matrix: pg16 (the supported baseline) + pg15 + pg17 BLOCKING
+    # and pg18 ADVISORY (continue-on-error), folded into ONE job on one runner (the repo is
+    # runner-bound; like integration-multi, versions are folded into a single job rather than one
+    # job per version, so this adds no jobs to the run). The gate has two parts, each required to
+    # pass and checked by name so a skip cannot leave the job green: (1) the PG-as-source code
+    # landed so far — the Postgres parse profile (S4b, a regression to refusal fails) and the
+    # pg_catalog row mapping (#210), the phase-1 named lib tests; (2) the phase-3 logical-replication
+    # smoke, tests/pgsrc_replication.rs: it creates the replication slot + publication on the live
+    # pin, streams a pgoutput INSERT/UPDATE/DELETE out of the slot and decodes it end to end with
+    # the crate's public lazyview::pgoutput decoder, asserting the row images round-trip. Each
+    # version runs against its own server via LAZYVIEW_TEST_PG_DSNS + LAZYVIEW_TEST_REQUIRE_PG=1
+    # (no pinned test may skip). pg18's smoke step is continue-on-error: a 18 failure annotates the
+    # run but does not block it, exactly like the target matrix's advisory pre-release tier.
+    name: integration (postgres source, pg16 + pg15 + pg17 blocking, pg18 advisory)
     needs: integration-pg
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       COMPOSE_FILE: docker-compose.test.yml
-      SERVICES: pg16
+      SERVICES: pg16 pg15 pg17 pg18
     steps:  # identical to integration-pg, on the source side: start servers, rust, rust-cache
             # (shared-key integration, save-if false), build the lib tests, wait, print version
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -421,16 +427,20 @@ jobs:
           # Reads the integration matrix's cache (its mysql84 job writes it).
           shared-key: integration
           save-if: false
-      - name: build the lib tests
-        run: cargo test --locked --lib --no-run
+      - name: build the lib + replication-smoke tests
+        run: cargo test --locked --lib --test pgsrc_replication --no-run
       - name: wait for the servers
         run: |
           read -ra services <<<"$SERVICES"
           docker compose up -d --wait --wait-timeout 300 "${services[@]}"
       - name: server versions
         run: |
-          echo "PGVERSION: $(docker compose exec -T pg16 psql -U lv -d lvtest -Atc 'select version()')"
-      - name: postgres source tests (parse profile + pg_catalog)
+          for s in $SERVICES; do
+            echo "$s: $(docker compose exec -T "$s" psql -U lv -d lvtest -Atc 'select version()')"
+          done
+      # (1) The PG-as-source code landed so far (phase 1): the parse profile (S4b) and the
+      # pg_catalog row mapping (#210). Version-independent unit tests, run once (on the pg16 leg).
+      - name: postgres source code (parse profile + pg_catalog)
         env:
           LAZYVIEW_TEST_PG_DSNS: pg16=postgres://lv:lv@127.0.0.1:35432/lvtest
           LAZYVIEW_HEALTH_ADDR: "off"
@@ -454,6 +464,43 @@ jobs:
                    pgsrc::tests::views_are_refused_naming_replica_identity; do
             grep -q "^test $t \.\.\. ok$" pg-source-tests.log || { echo "::error::$t did not run and pass"; exit 1; }
           done
+      # (2) The phase-3 logical-replication smoke on the live pin, per source major. Each version
+      # gets its own server via LAZYVIEW_TEST_PG_DSNS (its own host port) and LAZYVIEW_TEST_REQUIRE_PG=1,
+      # so a missing/skipped run fails the grep gate. The binaries are already built above; each
+      # version only runs (fast).
+      - name: logical replication smoke (pg16 + pg15 + pg17, blocking)
+        run: |
+          smoke() {
+            local name=$1 port=$2 log="smoke-$1.log"
+            LAZYVIEW_TEST_PG_DSNS="$name=postgres://lv:lv@127.0.0.1:$port/lvtest" \
+            LAZYVIEW_HEALTH_ADDR="off" LAZYVIEW_TEST_REQUIRE_PG="1" \
+              cargo test --locked --no-fail-fast --test pgsrc_replication -- --color never --exact \
+                pgsrc_replication_decodes_insert_update_delete 2>&1 | tee "$log"
+            grep -q "^test pgsrc_replication_decodes_insert_update_delete \.\.\. ok$" "$log" \
+              || { echo "::error::$name: pgsrc_replication_decodes_insert_update_delete did not run and pass"; exit 1; }
+          }
+          smoke pg16 35432
+          smoke pg15 35431
+          smoke pg17 35433
+      # pg18 is the newest major: advisory (continue-on-error) — it annotates the run, never blocks
+      # it, mirroring the target matrix's pre-release tier. Flip `advisory` off (make it a plain
+      # blocking `smoke pg18 35434` above) when lv-super promotes pg18 to the supported set.
+      - name: logical replication smoke (pg18, advisory)
+        id: smoke18
+        continue-on-error: true
+        run: |
+          LAZYVIEW_TEST_PG_DSNS="pg18=postgres://lv:lv@127.0.0.1:35434/lvtest" \
+          LAZYVIEW_HEALTH_ADDR="off" LAZYVIEW_TEST_REQUIRE_PG="1" \
+            cargo test --locked --no-fail-fast --test pgsrc_replication -- --color never --exact \
+              pgsrc_replication_decodes_insert_update_delete 2>&1 | tee smoke-pg18.log
+          grep -q "^test pgsrc_replication_decodes_insert_update_delete \.\.\. ok$" smoke-pg18.log \
+            || { echo "::error::pg18 smoke failed"; exit 1; }
+      - name: advisory pg18 smoke failed
+        if: steps.smoke18.outcome == 'failure'
+        run: |
+          echo "::warning title=advisory source failed::pg18 is the newest PostgreSQL major (advisory, tested but not required for a release): see the pgsrc smoke logs"
+          echo "### :warning: pg18: advisory PostgreSQL source smoke failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "PostgreSQL 18 failed the logical-replication source smoke. It does not block this run; check the logs before the release that promotes pg18 to blocking." >> "$GITHUB_STEP_SUMMARY"
       - name: collect server logs
         if: failure()
         run: |

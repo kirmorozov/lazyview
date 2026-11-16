@@ -10,8 +10,9 @@
 #                                                 # plus the chaos proxy (profile `chaos`)
 #   scripts/test-servers.sh dsns                  # LAZYVIEW_TEST_DSNS for the servers that are up
 #   scripts/test-servers.sh compose down          # stop; `compose clean` also drops the data
-#   pg16 (PostgreSQL 16, a *target* service outside the matrix: the harness reads it from
-#   LAZYVIEW_TEST_PG_DSNS): docker compose -f docker-compose.test.yml up -d --wait pg16
+#   pg16 (PostgreSQL 16, the *source matrix* baseline; also the *target* server of the postgres-
+#   target job, read from LAZYVIEW_TEST_PG_DSNS): docker compose -f docker-compose.test.yml up -d --wait pg16
+#   pg15/pg17/pg18 (the other source majors, pg18 advisory; all four on one CI runner): up -d --wait pg15 pg16 pg17 pg18
 #
 # or plain compose:
 #
@@ -87,6 +88,26 @@ x-mariadb-common: &mariadb-common
       limits:
         memory: 2g
   restart: "no"
+
+# PostgreSQL as a SOURCE (owner ruling "CI follows the source"): the source matrix majors pg15/
+# pg16/pg17 (blocking) and pg18 (advisory) share everything but image tag, host port and data
+# volume; the CI `integration-pgsrc` job starts them by name. `wal_level=logical` is what the
+# logical-replication reader needs (the pgoutput decoder + the gated slot smoke); it is harmless
+# for the pg16 target use (integration-pg) too. pg16 is the supported baseline and also the
+# target server of integration-pg. Start one: docker compose -f docker-compose.test.yml up -d --wait pg16.
+x-pg-common: &pg-common
+  command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10"]
+  environment:
+    POSTGRES_USER: lv
+    POSTGRES_PASSWORD: lv
+    POSTGRES_DB: lvtest
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U lv -d lvtest -h 127.0.0.1"]
+    interval: 3s
+    timeout: 5s
+    retries: 60
+  shm_size: 128mb
+  mem_limit: 1g
 
 services:
   # ---- MySQL: 8.0 (AWS-only), 8.4 LTS, 9.7 LTS, 26.10 Innovation (latest GA) ---------------------
@@ -278,23 +299,40 @@ services:
   # from this same service (logical WAL). Not in scripts/test-servers.sh's matrix: the
   # harness reads it from LAZYVIEW_TEST_PG_DSNS, never from LAZYVIEW_TEST_DSNS. Pin the
   # exact patch build, as the MySQL services above do; lv-devops keeps the pin.
+  # ---- PostgreSQL as a SOURCE: the source matrix (pg15/pg16/pg17 blocking, pg18 advisory) ----------
+  # One template (x-pg-common), four majors differing only by image tag, host port and volume. The
+  # CI `integration-pgsrc` job starts all four on one runner and runs the source gate per version.
+  # Ports: 35431..35434 (pg16 keeps its historic 35432, the target server of integration-pg).
+  pg15:
+    <<: *pg-common
+    image: postgres:15.20
+    ports: ["127.0.0.1:35431:5432"]
+    volumes:
+      - pg15:/var/lib/postgresql/data
+
   pg16:
+    <<: *pg-common
     image: postgres:16.16
-    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10"]
     ports: ["127.0.0.1:35432:5432"]
-    environment:
-      POSTGRES_USER: lv
-      POSTGRES_PASSWORD: lv
-      POSTGRES_DB: lvtest
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U lv -d lvtest -h 127.0.0.1"]
-      interval: 3s
-      timeout: 5s
-      retries: 60
-    shm_size: 128mb
-    mem_limit: 1g
     volumes:
       - pg16:/var/lib/postgresql/data
+
+  pg17:
+    <<: *pg-common
+    image: postgres:17.12
+    ports: ["127.0.0.1:35433:5432"]
+    volumes:
+      - pg17:/var/lib/postgresql/data
+
+  pg18:
+    <<: *pg-common
+    image: postgres:18.7
+    ports: ["127.0.0.1:35434:5432"]
+    # PG18+ moved its data dir under a parent mount (docker-library/postgres#37): it wants a single
+    # mount at /var/lib/postgresql and refuses to start when a volume is mounted at .../data. So this
+    # one major overrides the template's data volume path; every other pg field is inherited.
+    volumes:
+      - pg18:/var/lib/postgresql
 
   mariadb118:
     <<: *mariadb-common
@@ -439,4 +477,7 @@ volumes:
   mariadb130:
   mariadb131-rc:
   mariadb132-pre:
+  pg15:
   pg16:
+  pg17:
+  pg18:
