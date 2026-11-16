@@ -43,7 +43,7 @@ CREATED  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 SOURCE   ?= $(shell git config --get remote.origin.url 2>/dev/null | sed -E -e 's#^git@([^:]+):#https://\1/#' -e 's#\.git$$##')
 
 # Keep in sync with the FROM lines in the Dockerfile.
-BASE_IMAGE_REFS := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
+BASE_IMAGE_REFS := docker.io/library/rust:1.100.0-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
 .PHONY: build test test-integration coverage cross docker docker-smoke image-digests fmt fmt-check lint compose-up compose-down
 

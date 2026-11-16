@@ -30,7 +30,7 @@ permissions:
 
 env:
   # Keep in step with the rust image in the Dockerfile.
-  RUST_TOOLCHAIN: "1.99.1"
+  RUST_TOOLCHAIN: "1.100.0"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
