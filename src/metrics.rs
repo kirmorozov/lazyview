@@ -79,6 +79,11 @@ counters!(
     supervisor_cpu_offloads,
     flushes_overlapped,
     binlog_backpressure,
+    // DML that arrived as a statement-format QUERY event (a session twisted binlog_format away
+    // from ROW): its rows never reach the stream, so the views reading the table stay stale
+    // until a rebuild (review C-03). Counted per event; the WARN line itself is rate-limited to
+    // one per table per interval by `Engine::note_statement_dml`. For the alert work (03-obs-plan).
+    statement_events_ignored,
     // Child rows a mapped cascade changed, replayed from the in-memory cascade cache
     // (src/cascade.rs): the global sum over views, added in publish_stats.
     cascade_rows,

@@ -848,3 +848,99 @@ fn reg_transient_snapshot_failure_keeps_exact_fence() {
         eng.stop().await
     });
 }
+
+/// Review C-03: a session that twists `binlog_format` to STATEMENT logs its DML as QUERY
+/// events, so the rows are not in the stream and the views reading the table stay wrong and
+/// `ready`. The engine must not drop such an event silently: one WARN per table per interval
+/// with kind, schema and binlog position only — never the statement text, which carries the
+/// row values (F2 S-08) — and one `statement_events_ignored` count per statement event.
+#[test]
+fn reg_statement_format_dml_is_warned_not_dropped() {
+    scenario("reg_stmt_dml", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_entities",
+            Kind::Incremental,
+            "SELECT id, grp, status FROM entities",
+        )];
+        let mut ddl: Vec<&str> = ENTITIES.to_vec();
+        ddl.push("CREATE TABLE items (id INT PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)");
+        let (db, mut eng) = setup(&ctx, "reg_stmt_dml", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        wait_ready(&mut c, &mut eng, &["r_entities"], t_ready()).await?;
+        // Three DML statements from one twisted session: two on the view's table (they must
+        // share one WARN line, the interval is far longer than this test), one on another
+        // table (its own line: the rate limit is per table).
+        let mut t = db.conn().await?;
+        exec(&mut t, "SET SESSION binlog_format = STATEMENT").await?;
+        exec_all(
+            &mut t,
+            &[
+                "INSERT INTO entities VALUES (99, 9, 'rv42mark')",
+                "UPDATE entities SET status = 'twstmark' WHERE id = 99",
+                "INSERT INTO items VALUES (7, 1, 70)",
+            ],
+        )
+        .await?;
+        quiesce(&mut eng, &db).await?;
+        // Every statement-format DML event is counted, for the alert work (03-obs-plan).
+        let ignored = eng.snapshot().statement_events_ignored;
+        ensure!(
+            ignored == 3,
+            "want three counted statement-format DML events, got {ignored}: log {}",
+            eng.log_path.display()
+        );
+        // The rows did not reach the view: it stays wrong and `ready` (the ruling — the log
+        // is what tells the operator).
+        let n: Option<i64> =
+            typed_first(&mut c, "SELECT COUNT(*) FROM r_entities WHERE id = 99").await?;
+        ensure!(n == Some(0), "statement-format rows leaked into the view");
+        wait_ready(&mut c, &mut eng, &["r_entities"], t_catchup()).await?;
+        let log_path = eng.log_path.clone();
+        eng.stop().await?;
+        let log = std::fs::read_to_string(&log_path)?;
+        let warned: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("statement format"))
+            .collect();
+        ensure!(
+            warned.len() == 2,
+            "want one WARN line per table, got {}:\n{log}",
+            warned.len()
+        );
+        for line in &warned {
+            ensure!(line.contains("WARN"), "the line is not a WARN: {line}");
+            ensure!(line.contains("kind="), "kind missing: {line}");
+            let at = line
+                .split("at=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("");
+            ensure!(at.contains(':'), "binlog position missing: {line}");
+            let schema = line
+                .split("schema=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("");
+            ensure!(
+                schema.trim_matches('"') == db.name,
+                "schema wrong in {line} (want {})",
+                db.name
+            );
+            ensure!(
+                !line.contains("rv42mark") && !line.contains("twstmark"),
+                "a row value reached the log: {line}"
+            );
+            ensure!(
+                !line.to_ascii_uppercase().contains("INSERT INTO")
+                    && !line.to_ascii_uppercase().contains("UPDATE ENTITIES"),
+                "the statement text reached the log: {line}"
+            );
+        }
+        ensure!(
+            warned.iter().any(|l| l.contains("kind=INSERT")),
+            "no INSERT WARN line:\n{}",
+            warned.join("\n")
+        );
+        Ok(())
+    });
+}

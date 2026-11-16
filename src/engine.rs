@@ -767,6 +767,10 @@ struct Engine {
     /// Executor (a): the dedup core and its targets, one per live version on the Dedup route
     /// (src/exec.rs).
     dedup: crate::exec::Dedup,
+    /// Rate limiting of the statement-format DML warning ([`Engine::note_statement_dml`]):
+    /// per (schema, table) the time of the last line and the events folded into the next one.
+    /// Bounded by the number of tables whose sessions twist `binlog_format`.
+    stmt_dml_last: HashMap<(String, String), (Instant, u64)>,
 }
 
 /// Binlog dump connections: connect, register as a replica and request the stream.
@@ -774,6 +778,11 @@ const BINLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Flushes taking longer are logged (debug) with their slowest steps.
 const SLOW_FLUSH: Duration = Duration::from_secs(1);
+
+/// Minimum time between WARN lines for the same table in [`Engine::note_statement_dml`]: a bulk
+/// job in statement format is one event per statement, so one line per table per interval
+/// carries the count of the rest (review C-03, condition 2).
+const STMT_DML_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// While the binlog stream keeps delivering (a backlog), a due flush waits at most this long.
 const CATCH_UP_BATCH: Duration = Duration::from_millis(100);
@@ -1168,6 +1177,7 @@ impl Engine {
             last_meta_ping: Instant::now(),
             sup,
             dedup,
+            stmt_dml_last: HashMap::new(),
         };
 
         if !e.cfg.sync {
@@ -3777,6 +3787,7 @@ impl Engine {
                 self.after_boundary();
             }
             Item::Statement { schema, query, pos } => {
+                self.note_statement_dml(&schema, &query, &pos);
                 let before = self.end_txn(pos);
                 self.txn_foreign = false;
                 self.persist_needed = true;
@@ -3819,6 +3830,47 @@ impl Engine {
             Item::Other => {}
         }
         Ok(())
+    }
+
+    /// Review C-03: with `binlog_format=ROW` a QUERY event carries DDL and administrative
+    /// statements only; a DML statement here was logged in statement format, because the
+    /// executing session twisted its `binlog_format` (not our problem that server or user does
+    /// twisting of session — owner). Its rows are not in the stream, so the views reading the
+    /// table stay wrong and `ready` until they are rebuilt: the WARN is what tells the operator.
+    /// One line per table per [`STMT_DML_LOG_INTERVAL`] with the count of the rest, and never
+    /// the statement text — in statement format it carries the row values (F2 S-08). Row events
+    /// never reach the caller's arm, so they pay nothing for this check; the rare statement
+    /// event pays a keyword scan and a map entry.
+    fn note_statement_dml(&mut self, schema: &str, query: &str, pos: &Position) {
+        let kw = first_keyword(query);
+        if !["INSERT", "REPLACE", "UPDATE", "DELETE"]
+            .iter()
+            .any(|k| kw.eq_ignore_ascii_case(k))
+        {
+            return;
+        }
+        let kind = kw.to_ascii_uppercase();
+        let table = statement_target_table(query).unwrap_or_else(|| "*".to_owned());
+        Metrics::add(&self.metrics.statement_events_ignored, 1);
+        let now = Instant::now();
+        let e = self
+            .stmt_dml_last
+            .entry((schema.to_owned(), table))
+            .or_insert((now - STMT_DML_LOG_INTERVAL, 0));
+        if now.duration_since(e.0) < STMT_DML_LOG_INTERVAL {
+            e.1 += 1; // folded into the next line for this table
+            return;
+        }
+        warn!(
+            kind = %kind,
+            schema = %schema,
+            at = %pos,
+            count = e.1 + 1,
+            "DML logged in statement format: its rows never reach the stream, the views \
+             reading the table stay stale until they are rebuilt"
+        );
+        e.0 = now;
+        e.1 = 0;
     }
 
     /// A transaction boundary at `pos`; returns the previous one. TABLE_MAP ids are re-sent
@@ -7021,6 +7073,44 @@ fn first_keyword(query: &str) -> &str {
         .find(|c: char| !c.is_ascii_alphabetic())
         .unwrap_or(s.len());
     &s[..end]
+}
+
+/// The table a DML statement names: the first name after the keyword, past `INTO` / `FROM`.
+/// Best effort and never logged — it is only the rate-limit key of
+/// [`Engine::note_statement_dml`], so an approximate read is enough; `None` says the limiter
+/// should key on the schema alone.
+fn statement_target_table(query: &str) -> Option<String> {
+    // Past the leading comments, as `first_keyword` does.
+    let mut s = query.trim_start();
+    loop {
+        if let Some(r) = s
+            .strip_prefix("/*")
+            .filter(|r| !r.starts_with('!') && !r.starts_with("M!"))
+        {
+            let e = r.find("*/")?;
+            s = r[e + 2..].trim_start();
+        } else if s.starts_with("--") || s.starts_with('#') {
+            s = {
+                let e = s.find('\n')?;
+                s[e + 1..].trim_start()
+            };
+        } else {
+            break;
+        }
+    }
+    let mut words = s.split_whitespace();
+    words.next()?; // the DML keyword, checked by the caller
+    let mut w = words.next()?;
+    if w.eq_ignore_ascii_case("INTO") || w.eq_ignore_ascii_case("FROM") {
+        w = words.next()?;
+    }
+    // `t(`, `t;`, `t,` end the name; backticks and quotes are kept off, qualifiers are not read.
+    let name = w
+        .split(['(', ';', ','])
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c| c == '`' || c == '"' || c == '\'');
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Swaps the shadow tables of a routine rebuild or a first build in, off the binlog loop (see
