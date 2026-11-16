@@ -103,9 +103,13 @@ fn soak_hours() -> u32 {
         .unwrap_or(48)
 }
 
-/// `LAZYVIEW_TEST_SOAK_MINUTES=<5..=4320>`: the long run's length in minutes, overriding
-/// `soak_hours() * 60` — the seeded replay drill (two same-seed runs, same toxic sequence)
-/// runs a short window. The smoke keeps its own `SMOKE_MINUTES` either way.
+/// `LAZYVIEW_TEST_SOAK_MINUTES=<5..=4320>`: the run's length in minutes, overriding
+/// `soak_hours() * 60` for the long run — the seeded replay drill (two same-seed runs, same
+/// toxic sequence) runs a short window. For the smoke it overrides `SMOKE_MINUTES`: the pull
+/// request's bounded smoke (CI, 5 minutes) uses it; the nightly smoke keeps the 30 minutes.
+/// The 5-minute bound proves the writers, the views and the checks run and settle for that
+/// window; with the smoke's 10 chaos events per hour it draws one event, so only the 30-minute
+/// smoke proves all five kinds of §3 land.
 fn soak_minutes() -> Option<u32> {
     std::env::var("LAZYVIEW_TEST_SOAK_MINUTES")
         .ok()
@@ -141,7 +145,7 @@ fn soak_mode(mode: &'static str) {
     let smoke = mode == "smoke";
     let (minutes, per_hour, sizes, check_s) = if smoke {
         (
-            SMOKE_MINUTES,
+            soak_minutes().unwrap_or(SMOKE_MINUTES),
             SMOKE_CHAOS_PER_H,
             Sizes::tiny(),
             60.min(soak_check_s()),

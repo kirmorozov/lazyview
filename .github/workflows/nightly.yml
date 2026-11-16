@@ -1,0 +1,39 @@
+name: nightly
+
+# Nightly proof of main HEAD (the default branch at schedule time) of what a push to main does
+# not run: since #236 every push runs the full matrix, multi-server, chaos (both flavors) and
+# the PostgreSQL legs on the landed commit itself, so this schedule adds only the soak:
+#   soak-smoke  the 30-minute smoke on mysql84 and mariadb1011, nightly (02:17 UTC)
+#   soak-long   the 3-hour soak on mysql84, weekly (Sunday 04:37 UTC)
+#   report      a failed nightly opens or updates the one open issue labelled `nightly`
+# Those jobs live in ci.yml (gated to schedule, workflow_call and a manual run, with every
+# regular job skipping there), so a workflow_dispatch of ci.yml on a branch can prove them
+# before merge; this wrapper only owns the schedule and calls ci.yml.
+on:
+  schedule:
+    - cron: "17 2 * * *"   # nightly, 02:17 UTC
+    - cron: "37 4 * * 0"   # weekly, Sunday 04:37 UTC: also the long soak
+  workflow_dispatch:
+    inputs:
+      long_soak:
+        description: "Also run the 3-hour long soak (the weekly schedule always does)"
+        type: boolean
+        default: false
+
+# A nightly run never cancels another one.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  full:
+    name: nightly (ci.yml)
+    uses: ./.github/workflows/ci.yml
+    with:
+      long_soak: ${{ github.event.schedule == '37 4 * * 0' || inputs.long_soak == true }}
+    permissions:
+      contents: read
+      issues: write

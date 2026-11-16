@@ -12,6 +12,14 @@ name: ci
 # chaos_tgt_pg_ scenarios run once, where the PostgreSQL target sits next to a daemon: integration-pg
 # (integration-pg-multi pins that target and rotates the sources, so the faults are not paid for
 # twice; its legs are the targets_pg_ gates).
+# The soak jobs (bottom of the file): `soak-pr`, a bounded 5-minute smoke on mysql84, runs on
+# every pull_request (a check of its own, so its log shows soak_smoke_30m passing for real);
+# `soak-smoke` (30 minutes, mysql84 + mariadb1011) and `soak-long` (3 hours on mysql84, weekly,
+# behind the long_soak input) run only for the nightly and a manual run, and `report` opens or
+# updates the one open issue labelled `nightly` after a failed nightly. The nightly is
+# nightly.yml calling this workflow on the schedule: the schedule event then runs the soak jobs
+# only (every regular job skips), because a push to main has already run the full set on this
+# very commit (#236) and the nightly adds only what that push does not run.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
 #   main  -> `image`   (needs lint + unit + e2e; the integration jobs run alongside, not required)
 #   v*    -> `release` (needs lint + unit + e2e + the integration matrix + the multi-server job;
@@ -24,6 +32,19 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      long_soak:
+        description: "Also run the 3-hour long soak (nightly.yml passes it on the weekly schedule)"
+        type: boolean
+        default: false
+  # Called by nightly.yml (the nightly on main HEAD). Its caller's event is `schedule`, so every
+  # regular job skips and only the soak jobs and report run; workflow_call is listed alongside
+  # schedule in those `if`s so the split holds whichever event name the called workflow sees.
+  workflow_call:
+    inputs:
+      long_soak:
+        type: boolean
+        default: false
 
 # A newer run for the same ref and event cancels the superseded one, except on main: every landed
 # commit keeps its own run (keyed by sha there, so a queued main run is never replaced either).
@@ -44,6 +65,7 @@ env:
 jobs:
   lint:
     name: lint (fmt + clippy)
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -66,6 +88,7 @@ jobs:
 
   unit:
     name: unit tests
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -91,6 +114,7 @@ jobs:
     # when they fail (continue-on-error). The tier is in the job title: LTS, GA, AWS-only or
     # pre-release.
     name: integration (${{ matrix.flavor }}, ${{ matrix.tier }}${{ matrix.supervisor && format(', supervisor {0}', matrix.supervisor) || '' }}${{ matrix.advisory && ', advisory' || '' }})
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     runs-on: ubuntu-24.04
     # The suites below (75) + the toxi self-tests (10) + the chaos scenarios (20) + build/wait.
     timeout-minutes: 120
@@ -254,6 +278,7 @@ jobs:
     # MySQL 8.4 LTS, Percona 9.7 and MariaDB 13.0, whose default utf8mb4_uca1400_ai_ci
     # collation the MySQL targets lack.
     name: integration (multi-server, mysql84 + percona97 + mariadb130)
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -339,6 +364,7 @@ jobs:
     # against its own server on its own host port, with LAZYVIEW_TEST_REQUIRE_PG=1 so no PostgreSQL
     # test may skip. The source is a normal matrix flavor; PostgreSQL is only ever a target here.
     name: integration (postgres target, mysql84 + pg14-pg18 blocking, pg19rc2 advisory)
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     runs-on: ubuntu-24.04
     # 5 blocking target legs + the advisory one + the chaos_tgt_pg_ scenarios (3 x ~120 s worst
     # case) + build/wait.
@@ -516,6 +542,7 @@ jobs:
     # target nor any targets_pg_ scenario may skip — and the five gates must be seen passing in that
     # leg's own log.
     name: integration (postgres target, mysql-family sources + pg16)
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     runs-on: ubuntu-24.04
     # 10 blocking legs + 4 advisory legs + 15 image pulls + build and the server wait.
     timeout-minutes: 45
@@ -674,6 +701,7 @@ jobs:
     # annotates the run but does not block it, exactly like the target matrix's advisory pre-release
     # tier.
     name: integration (postgres source, pg14 + pg15 + pg16 + pg17 + pg18 blocking, pg19rc2 advisory)
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     needs: integration-pg
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -800,6 +828,7 @@ jobs:
 
   e2e:
     name: image smoke + end-to-end
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -949,3 +978,222 @@ jobs:
       attestations: write
       id-token: write
     uses: ./.github/workflows/publish-image.yml
+
+  # ---- Soak jobs (tests/soak.rs). All strict: LAZYVIEW_TEST_STRICT=soak_ is the harness's own
+  # strict mode (tests/common, from the tests-strict-targets PR), so a skipped soak scenario
+  # fails the job instead of printing a green SKIP line. soak-pr runs on every pull request;
+  # soak-smoke and soak-long are the nightly's (nightly.yml calls this workflow on the schedule)
+  # and a manual run of this workflow, so a branch can prove them before merge. ----
+
+  soak-pr:
+    # The bounded soak on pull requests: 5 minutes (LAZYVIEW_TEST_SOAK_MINUTES) on mysql84, as
+    # a job of its own so the PR shows it as a check that runs, and tee+grep makes a run that
+    # never executed the soak impossible: soak_smoke_30m must show as passed in the log. What the
+    # 5-minute bound proves: the writers, the views and the checks run and settle for that
+    # window. The full five kinds of smoke chaos need the nightly's 30-minute smoke (10 events
+    # per hour), and the long soak runs weekly: below.
+    name: soak smoke (mysql84, bounded 5 min)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      COMPOSE_FILE: docker-compose.test.yml
+      FLAVOR: mysql84
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start mysql84 (in the background)
+        run: docker compose up -d --quiet-pull "$FLAVOR"
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache (its mysql84 job writes it); never a second writer.
+          shared-key: integration
+          save-if: false
+      - name: build the soak tests
+        run: cargo test --locked --test soak --no-run
+      - name: wait for mysql84
+        run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"
+      - name: server version
+        run: docker compose exec -T "$FLAVOR" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
+      - name: soak smoke (5 minutes)
+        timeout-minutes: 15
+        env:
+          LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
+          LAZYVIEW_HEALTH_ADDR: "off"
+          LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
+          LAZYVIEW_TEST_SOAK: smoke
+          LAZYVIEW_TEST_SOAK_MINUTES: "5"
+          LAZYVIEW_TEST_STRICT: soak_
+        shell: bash
+        run: |
+          cargo test --locked --test soak -- --test-threads=1 --color never soak_smoke_30m 2>&1 | tee soak-pr.log
+          grep -q "^test soak_smoke_30m \.\.\. ok$" soak-pr.log \
+            || { echo "::error::soak_smoke_30m did not run and pass (the bounded soak skipped?)"; exit 1; }
+      - name: upload the soak report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-pr-mysql84
+          path: tmp/out/lvs-soak/
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: stop mysql84
+        if: always()
+        run: docker compose down -v
+
+  soak-smoke:
+    # Nightly (and a manual run): the 30-minute smoke on both LTS flavors, each on its own
+    # server. The test runs its own clock (tests/soak.rs SMOKE_MINUTES): 30 minutes plus the
+    # test's 30-minute margin, then the build and the server start inside the 75-minute job.
+    name: soak smoke (${{ matrix.flavor }})
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: mysql84
+            port: 33084
+          - flavor: mariadb1011
+            port: 33111
+    env:
+      COMPOSE_FILE: docker-compose.test.yml
+      FLAVOR: ${{ matrix.flavor }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start ${{ matrix.flavor }} (in the background)
+        run: docker compose up -d --quiet-pull "$FLAVOR"
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache; never a writer here.
+          shared-key: integration
+          save-if: false
+      - name: build the soak tests
+        run: cargo test --locked --test soak --no-run
+      - name: wait for ${{ matrix.flavor }}
+        run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"
+      - name: server version
+        run: docker compose exec -T "$FLAVOR" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
+      - name: soak smoke (30 minutes)
+        timeout-minutes: 65
+        env:
+          LAZYVIEW_TEST_DSNS: ${{ matrix.flavor }}=mysql://lv:lv@127.0.0.1:${{ matrix.port }}/lvtest
+          LAZYVIEW_HEALTH_ADDR: "off"
+          LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
+          LAZYVIEW_TEST_SOAK: smoke
+          LAZYVIEW_TEST_STRICT: soak_
+        run: cargo test --locked --test soak -- --test-threads=1 soak_smoke_30m
+      - name: upload the soak report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-smoke-${{ matrix.flavor }}
+          path: tmp/out/lvs-soak/
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: stop ${{ matrix.flavor }}
+        if: always()
+        run: docker compose down -v
+
+  soak-long:
+    # Weekly (nightly.yml passes long_soak on Sunday): 180 minutes of run, the test's margin
+    # (210 min in all), the build and the server start, inside the 6-hour hosted-runner limit.
+    # No container chaos here: LAZYVIEW_TEST_SOAK_CONTAINERS needs a source and a target container.
+    name: soak long (mysql84, 3 hours)
+    if: ${{ inputs.long_soak == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      COMPOSE_FILE: docker-compose.test.yml
+      FLAVOR: mysql84
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start mysql84 (in the background)
+        run: docker compose up -d --quiet-pull "$FLAVOR"
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: integration
+          save-if: false
+      - name: build the soak tests
+        run: cargo test --locked --test soak --no-run
+      - name: wait for mysql84
+        run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"
+      - name: server version
+        run: docker compose exec -T "$FLAVOR" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
+      - name: long soak (180 minutes)
+        timeout-minutes: 220
+        env:
+          LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
+          LAZYVIEW_HEALTH_ADDR: "off"
+          LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
+          LAZYVIEW_TEST_SOAK: long
+          LAZYVIEW_TEST_SOAK_MINUTES: "180"
+          LAZYVIEW_TEST_STRICT: soak_
+        run: cargo test --locked --test soak -- --test-threads=1 soak_long
+      - name: upload the soak report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-long-mysql84
+          path: tmp/out/lvs-soak/
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: stop mysql84
+        if: always()
+        run: docker compose down -v
+
+  report:
+    # The nightly's own reporter (schedule and the nightly call only; a manual run never writes
+    # to the issue tracker): a failed nightly opens or updates the one open issue labelled
+    # `nightly` (GITHUB_TOKEN with issues: write; no secret). Only the soak jobs are in needs:
+    # a scheduled run is the soak (the regular jobs above already ran on the push to main), and the
+    # network-chaos scenarios run inside those integration jobs on the push, so they are not here.
+    name: report failed nightly
+    needs: [soak-smoke, soak-long]
+    if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_call') && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: open or update the nightly issue
+        run: |
+          set -euo pipefail
+          body="Nightly soak run failed on main: $RUN_URL
+
+          Job results (from the run): $RESULTS
+
+          The network-chaos scenarios run inside the integration jobs of the push to main, not here: check their logs in that push's run."
+          gh label create nightly --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Failed nightly run on main" --force
+          num=$(gh issue list --repo "$GITHUB_REPOSITORY" --label nightly --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label nightly \
+              --title "Nightly soak run failed on main" --body "$body"
+          fi
