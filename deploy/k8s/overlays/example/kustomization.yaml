@@ -37,6 +37,21 @@ images:
 #       - op: replace
 #         path: /spec/template/spec/containers/0/resources/limits/memory
 #         value: 1Gi
+#   # Advanced setup: the setup initContainer takes its own credentials (the setup account:
+#   # DDL on lazyview's own tables only, used at install and upgrade), while the service above
+#   # runs as the consumption account (no DDL on them). Create the second Secret out of band:
+#   #   kubectl -n lazyview create secret generic lazyview-setup-db \
+#   #     --from-literal=LAZYVIEW_HOST=db.example.com --from-literal=LAZYVIEW_USER=lazyview_setup \
+#   #     --from-literal=LAZYVIEW_PASSWORD='change-me' --from-literal=LAZYVIEW_DATABASE=app
+#   - target: { kind: Deployment, name: lazyview }
+#     patch: |
+#       - op: replace
+#         path: /spec/template/spec/initContainers/0/envFrom
+#         value:
+#           - configMapRef:
+#               name: lazyview-config
+#           - secretRef:
+#               name: lazyview-setup-db
 #   # Prometheus in another namespace:
 #   - target: { kind: NetworkPolicy, name: lazyview }
 #     patch: |

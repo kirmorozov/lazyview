@@ -100,6 +100,41 @@ spec:
                   matchLabels:
                     app.kubernetes.io/name: lazyview
                     app.kubernetes.io/instance: lazyview
+      # Two runs (owner 2026-11-16): the setup and migration run, before the service. It
+      # creates and migrates lazyview's own tables (definitions, state, status, fence) and
+      # validates every enabled definition; the operations run (the container below) never
+      # issues DDL on those tables — it refuses to start and names `lazyview setup` instead
+      # (exit code 2). Simple setup: the same Secret as the service (one account does both
+      # runs), so `kubectl apply -k` stays one copy-paste step. Advanced setup: give this
+      # container its own setup account (DDL only) and keep the service account DML-only — see
+      # the commented Secret in secret.yaml and the commented patch in kustomization.yaml.
+      # Idempotent, and it runs on every pod start: that is also the upgrade step (a new image
+      # migrates the tables before it serves). A failed setup fails the pod, so a bad upgrade
+      # is reported by the rollout (`kubectl rollout undo deployment/lazyview`).
+      initContainers:
+        - name: setup
+          image: ghcr.io/kirmorozov/lazyview:edge
+          imagePullPolicy: IfNotPresent
+          args: ["setup"]
+          envFrom:
+            - configMapRef:
+                name: lazyview-config
+            - secretRef:
+                name: lazyview-db
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
       containers:
         - name: lazyview
           # Distroless static image, runs as 65532, no shell (see Dockerfile). `edge` is the

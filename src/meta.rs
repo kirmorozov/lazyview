@@ -101,10 +101,146 @@ SELECT d.`id`, COALESCE(d.`name`, s.`name`, CONCAT('#', d.`id`)) AS `name`, s.`t
        s.`detail`, s.`route`, s.`access`, s.`last_error`, s.`refreshed_at`, d.`updated_at` AS `definition_updated_at`, d.`definition`
 FROM `_lazyview` d LEFT JOIN `_lazyview_state` s ON s.`definition_id` = d.`id`";
 
+/// The commit-fence table (`src/fence.rs`) is lazyview's own table too: `setup` creates it and
+/// the operations run only checks for it (`verify` below). The DDL text mirrors the private
+/// `create_sql` in `src/fence.rs`; that file belongs to the copy set and must not change, so
+/// the text is kept in sync here (unit test: `fence_create_sql_matches`).
+fn create_fence() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS `{}` (`id` VARCHAR(64) NOT NULL PRIMARY KEY, \
+         `n` BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        crate::fence::table().replace('`', "``")
+    )
+}
+
+/// Tables and columns the operations run needs before it starts. Keep in sync with the
+/// `CREATE_*` constants and `MIGRATIONS` above and with `create_fence` (enforced by the unit
+/// tests below). The fence table's name is `fence::table()` — checked separately because it is
+/// configurable.
+const REQUIRED: &[(&str, &[&str])] = &[
+    (
+        DEFS,
+        &[
+            "id",
+            "name",
+            "definition",
+            "targets",
+            "enabled",
+            "rebuild",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        STATE,
+        &[
+            "name",
+            "target",
+            "definition_id",
+            "definition_hash",
+            "mode",
+            "detail",
+            "route",
+            "access",
+            "state",
+            "managed",
+            "last_error",
+            "refreshed_at",
+            "updated_at",
+        ],
+    ),
+    (
+        STATUS,
+        &[
+            "instance_id",
+            "binlog_file",
+            "binlog_pos",
+            "binlog_cursor",
+            "epoch",
+            "server_identity",
+            "updated_at",
+        ],
+    ),
+];
+
+/// The operations run refuses to start when its own tables are missing or older than this
+/// build: only `lazyview setup` (the setup account) creates and migrates them. Display names
+/// the fix; `main` maps this error to exit code 2.
+#[derive(Debug)]
+pub struct SetupRequired(pub Vec<String>);
+
+impl std::fmt::Display for SetupRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lazyview's own tables are not ready ({}). Fix: run `lazyview setup` with the \
+             setup account, then start the service again",
+            self.0.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for SetupRequired {}
+
+/// Read-only pre-flight for the operations run: checks through `information_schema` (SELECT
+/// rights only, no DDL) that every table and column this build needs exists. A missing one is
+/// a startup error naming the fix. The convenience view `_lazyview_overview` is not required
+/// (it is a `setup` nicety).
+pub async fn verify(conn: &mut Conn, schema: &str) -> Result<()> {
+    let fence = crate::fence::table();
+    let mut need: Vec<(&str, &[&str])> = REQUIRED.to_vec();
+    need.push((fence, &["id", "n"]));
+    let present: Vec<String> = conn
+        .exec(
+            "SELECT CAST(TABLE_NAME AS CHAR) FROM information_schema.TABLES WHERE \
+             TABLE_SCHEMA = ? AND TABLE_NAME IN (?, ?, ?, ?)",
+            (schema, DEFS, STATE, STATUS, fence),
+        )
+        .await?;
+    let mut missing: Vec<String> = Vec::new();
+    for (table, cols) in &need {
+        if !present.iter().any(|t| t == table) {
+            missing.push(format!("table `{table}` is missing"));
+            continue;
+        }
+        let have: Vec<String> = conn
+            .exec(
+                "SELECT CAST(COLUMN_NAME AS CHAR) FROM information_schema.COLUMNS WHERE \
+                 TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                (schema, *table),
+            )
+            .await?;
+        for col in *cols {
+            if !have.iter().any(|c| c == col) {
+                missing.push(format!("`{table}`.{col} is missing"));
+            }
+        }
+    }
+    // State rows are keyed case-sensitively (`Lz_Case` and `lz_case` are different views):
+    // `ensure` fixes the collation, the operations run only checks it.
+    if present.iter().any(|t| t == STATE) {
+        let collation: Option<Option<String>> = conn
+            .exec_first(
+                "SELECT CAST(COLLATION_NAME AS CHAR) FROM information_schema.COLUMNS WHERE \
+                 TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'name'",
+                (schema, STATE),
+            )
+            .await?;
+        if collation.flatten().as_deref() != Some("utf8mb4_bin") {
+            missing.push(format!("`{STATE}`.name is not utf8mb4_bin"));
+        }
+    }
+    if !missing.is_empty() {
+        return Err(SetupRequired(missing).into());
+    }
+    Ok(())
+}
+
 pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
     for ddl in [CREATE_DEFS, CREATE_STATE, CREATE_STATUS] {
         conn.query_drop(ddl).await?;
     }
+    conn.query_drop(create_fence()).await?;
     for (table, col, def) in MIGRATIONS {
         let n: Option<u64> = conn
             .exec_first(
@@ -505,6 +641,62 @@ pub async fn save_position(conn: &mut Conn, instance: &str, c: &Cursor, epoch: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Column names declared in a `CREATE TABLE` constant: lines whose first token is a
+    /// backticked identifier.
+    fn create_cols(create: &str) -> Vec<String> {
+        create
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('`'))
+            .map(|l| {
+                let l = &l[1..];
+                l[..l.find('`').unwrap()].to_string()
+            })
+            .collect()
+    }
+
+    /// `REQUIRED` covers every column the `CREATE_*` constants and `MIGRATIONS` create, so the
+    /// operations run's `verify` cannot pass on a schema `ensure` would consider migrated.
+    #[test]
+    fn required_covers_create_and_migrations() {
+        let creates = [
+            (DEFS, CREATE_DEFS),
+            (STATE, CREATE_STATE),
+            (STATUS, CREATE_STATUS),
+        ];
+        for (table, cols) in REQUIRED {
+            let create = create_cols(creates.iter().find(|(t, _)| t == table).unwrap().1);
+            for col in *cols {
+                assert!(
+                    MIGRATIONS.iter().any(|(t, c, _)| t == table && c == col)
+                        || create.iter().any(|c| c == col),
+                    "{table}.{col} not created by ensure"
+                );
+            }
+            for (t, col, _) in MIGRATIONS {
+                if t == table {
+                    assert!(
+                        cols.iter().any(|c| c == col),
+                        "MIGRATIONS adds {table}.{col} but REQUIRED does not require it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fence DDL in `create_fence` mirrors `src/fence.rs`'s private `create_sql` (the file
+    /// is copy-set); both texts stay in sync with what `verify` requires.
+    #[test]
+    fn fence_create_sql_matches() {
+        let sql = create_fence();
+        assert!(sql.starts_with(&format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (",
+            crate::fence::table()
+        )));
+        assert!(sql.contains("`id` VARCHAR(64) NOT NULL PRIMARY KEY"));
+        assert!(sql.contains("`n` BIGINT UNSIGNED NOT NULL"));
+    }
 
     #[test]
     fn effective_definition() {

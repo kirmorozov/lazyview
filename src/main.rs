@@ -10,7 +10,13 @@ use tracing_subscriber::EnvFilter;
 const HELP: &str = "lazyview — materialized views for MySQL / MariaDB / Percona, maintained from the binlog
 
 USAGE:
-  lazyview              run the service (configured by environment variables)
+  lazyview              run the service — the operations run (configured by environment
+                        variables; never issues DDL on lazyview's own tables)
+  lazyview run          the same, explicitly
+  lazyview setup        the setup and migration run: create and migrate lazyview's own tables
+                        (definitions, state, status, fence), validate every enabled definition
+                        and log its plan, then exit (0 ready, 1 a definition is invalid).
+                        Run it as the setup account, once at install and once per upgrade.
   lazyview healthcheck  exit 0 if the running service's /healthz answers (for container health checks)
   lazyview --version    print the version
 
@@ -69,6 +75,7 @@ fn init_logging() {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let mut setup_run = false;
     match std::env::args().nth(1).as_deref() {
         Some("--version" | "-V" | "version") => {
             println!("lazyview {}", env!("CARGO_PKG_VERSION"));
@@ -78,6 +85,8 @@ async fn main() -> ExitCode {
             print!("{HELP}");
             return ExitCode::SUCCESS;
         }
+        Some("setup") => setup_run = true,
+        Some("run") => {}
         Some("healthcheck") => {
             let addr = std::env::var("LAZYVIEW_HEALTH_ADDR")
                 .ok()
@@ -97,13 +106,25 @@ async fn main() -> ExitCode {
     }
     init_logging();
 
-    let cfg = match lazyview::Config::from_env() {
+    let mut cfg = match lazyview::Config::from_env() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("configuration error: {}", chain(&e));
             return ExitCode::from(2);
         }
     };
+    // The two runs (owner 2026-11-16): `lazyview setup` is the setup and migration run (it
+    // alone issues DDL on lazyview's own tables); the operations run (no argument, or
+    // `lazyview run`) only checks them and exits 2 naming the setup run when one is missing.
+    if setup_run {
+        cfg.sync = false;
+    } else if !cfg.sync {
+        tracing::warn!(
+            "LAZYVIEW_SYNC=false is deprecated (one release) and now runs `lazyview setup`: \
+             create/migrate lazyview's own tables, validate the definitions, and exit. Run \
+             `lazyview setup` (with the setup account) instead of setting LAZYVIEW_SYNC=false."
+        );
+    }
     // One WARN per endpoint (source or target) that reaches a server off this host with TLS off.
     // A warning, not a refusal: `LAZYVIEW_TLS` has always defaulted to `disabled`, and a private
     // network is a legitimate choice — but it should be one the operator made on purpose.
@@ -126,6 +147,13 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("fatal: {}", chain(&e));
+            // A failed pre-flight of lazyview's own tables is a configuration error: exit 2,
+            // the fix is `lazyview setup` with the setup account (named by the error).
+            if e.chain()
+                .any(|c| c.downcast_ref::<lazyview::meta::SetupRequired>().is_some())
+            {
+                return ExitCode::from(2);
+            }
             ExitCode::FAILURE
         }
     }

@@ -1380,3 +1380,271 @@ fn lifecycle_state_carries_route_and_access() {
         Ok(())
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Two runs (owner 2026-11-16): `lazyview setup` owns the DDL of lazyview's own tables; the
+// operations run only checks them (information_schema, SELECT rights) and refuses to start
+// without them, naming the setup run.
+// ---------------------------------------------------------------------------------------------
+
+/// Neutral sources shared by the two-runs scenarios (no application names).
+const TWO_RUNS_DDL: &[&str] = &[
+    "CREATE TABLE entities (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL)",
+    "CREATE TABLE items (id BIGINT NOT NULL PRIMARY KEY, entity_id BIGINT NOT NULL, price INT NOT NULL)",
+];
+
+/// One named definition, inserted directly: the operations run must never write `_lazyview`,
+/// so the `name` column is filled by the setup account.
+const TWO_RUNS_VIEW_SQL: &str = "SELECT i.id, i.entity_id, i.price FROM items i JOIN \
+    entities e ON e.id = i.entity_id WHERE i.price > 0";
+
+/// One named definition; `fn` so the exact SQL string is shared with the probe-name
+/// computation (the hash is sha256 over the effective definition, src/analyze/parse.rs).
+fn two_runs_def() -> String {
+    format!(
+        "INSERT INTO `_lazyview` (`name`, `definition`, `targets`) VALUES ('items_by_entity', \
+         '{}', 'source')",
+        TWO_RUNS_VIEW_SQL
+    )
+}
+
+/// The name of the planner's temporary probe view for [`TWO_RUNS_VIEW_SQL`].
+fn two_runs_probe_view() -> String {
+    let eff = format!(
+        "CREATE VIEW {} AS {}",
+        lazyview::analyze::quote_ident("items_by_entity"),
+        TWO_RUNS_VIEW_SQL.trim()
+    );
+    format!("_lv_probe_{}", lazyview::analyze::definition_hash(&eff))
+}
+
+#[test]
+fn lifecycle_ops_run_requires_setup() {
+    scenario("lc_setup_required", |ctx| async move {
+        let db = ctx.new_db("lc_setreq").await?;
+        use mysql_async::prelude::Queryable;
+        let mut c = db.conn().await?;
+        exec_all(&mut c, TWO_RUNS_DDL).await?;
+        c.query_drop("INSERT INTO entities (id, name) VALUES (1, 'alpha')")
+            .await?;
+        c.query_drop("INSERT INTO items (id, entity_id, price) VALUES (1, 1, 10), (2, 1, 0)")
+            .await?;
+
+        // The operations run against a fresh schema: nothing lazyview owns exists. It must
+        // refuse to start, name the fix, and create nothing itself.
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_SKIP_SETUP", "1")])?;
+        let exit = tokio::time::timeout(t_ready(), async {
+            loop {
+                if let Some(r) = eng.exited() {
+                    return r.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("operations run on a fresh schema never refused to start")?;
+        let err = exit.as_ref().err().context("operations run did not fail")?;
+        ensure!(
+            err.contains("run `lazyview setup` with the setup account"),
+            "error does not name the fix: {err}"
+        );
+        for table in [
+            "_lazyview",
+            "_lazyview_state",
+            "_lazyview_status",
+            "_lazyview_fence",
+        ] {
+            ensure!(
+                !table_exists(&mut c, table).await?,
+                "the operations run created {table}"
+            );
+        }
+        ctx.log("operations run refused to start on a fresh schema, created nothing");
+
+        // After the setup run, the operations run starts and refreshes the view.
+        setup_run(&db).await?;
+        c.query_drop(two_runs_def()).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &["items_by_entity"], t_ready()).await?;
+        let count_in_view = move || {
+            let dsn = db.dsn.clone();
+            async move {
+                let mut c = connect(&dsn).await?;
+                let n = scalar_i64(&mut c, "SELECT COUNT(*) FROM items_by_entity").await?;
+                c.disconnect().await.ok();
+                Ok::<i64, anyhow::Error>(n)
+            }
+        };
+        let count_is = |want: i64| {
+            let count_in_view = &count_in_view;
+            move || {
+                let f = count_in_view();
+                async move { Ok::<bool, anyhow::Error>(f.await? == want) }
+            }
+        };
+        wait_until("seeded row in items_by_entity", t_catchup(), count_is(1)).await?;
+        c.query_drop("INSERT INTO items (id, entity_id, price) VALUES (3, 2, 5)")
+            .await?;
+        c.query_drop("INSERT INTO entities (id, name) VALUES (2, 'beta')")
+            .await?;
+        wait_until(
+            "incremental row in items_by_entity",
+            t_catchup(),
+            count_is(2),
+        )
+        .await?;
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+#[test]
+fn lifecycle_setup_run_is_idempotent() {
+    scenario("lc_setup_idem", |ctx| async move {
+        let db = ctx.new_db("lc_idem").await?;
+        use mysql_async::prelude::Queryable;
+        let mut c = db.conn().await?;
+        exec_all(&mut c, TWO_RUNS_DDL).await?;
+        setup_run(&db).await?; // first setup run: creates
+        c.query_drop(two_runs_def()).await?;
+        async fn snap(c: &mut mysql_async::Conn) -> Result<(Vec<String>, Vec<String>)> {
+            let tables: Vec<String> = rows(
+                c,
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() \
+                 AND TABLE_NAME LIKE '\\_lazyview%' ORDER BY 1",
+            )
+            .await?
+            .into_iter()
+            .filter_map(|r| r[0].clone())
+            .collect();
+            let cols: Vec<String> = rows(
+                c,
+                "SELECT CONCAT(TABLE_NAME, '.', COLUMN_NAME, ':', COLUMN_TYPE) \
+                 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() \
+                 AND TABLE_NAME LIKE '\\_lazyview%' ORDER BY 1",
+            )
+            .await?
+            .into_iter()
+            .filter_map(|r| r[0].clone())
+            .collect();
+            Ok((tables, cols))
+        }
+        let before = snap(&mut c).await?;
+        ensure!(!before.0.is_empty(), "the first setup run created nothing");
+        setup_run(&db).await?; // second setup run: must change nothing
+        let after = snap(&mut c).await?;
+        ensure!(
+            before == after,
+            "the second setup run changed the metadata:\n before {before:?}\n after {after:?}"
+        );
+        // It writes nothing else: no view tables, no saved position.
+        ensure!(
+            !table_exists(&mut c, "items_by_entity").await?,
+            "setup created a view table"
+        );
+        ensure!(
+            scalar_i64(&mut c, "SELECT COUNT(*) FROM `_lazyview_status`").await? == 0,
+            "setup wrote a saved position"
+        );
+        ctx.log("setup run twice: identical metadata, nothing else written");
+        Ok(())
+    });
+}
+
+#[test]
+fn lifecycle_ops_run_restricted_user() {
+    scenario("lc_restricted", |ctx| async move {
+        let db = ctx.new_db("lc_restr").await?;
+        use mysql_async::prelude::Queryable;
+        let mut c = db.conn().await?;
+        exec_all(&mut c, TWO_RUNS_DDL).await?;
+        c.query_drop("INSERT INTO entities (id, name) VALUES (1, 'alpha')")
+            .await?;
+        c.query_drop("INSERT INTO items (id, entity_id, price) VALUES (1, 1, 10)")
+            .await?;
+        // The setup run (here: the schema owner) creates everything the service needs.
+        setup_run(&db).await?;
+        c.query_drop(two_runs_def()).await?;
+        // MySQL grants table-level privileges only on existing names, so the setup account
+        // pre-creates the planner's probe view (the same name the planner will `CREATE OR
+        // REPLACE` on each validate).
+        c.query_drop(format!(
+            "CREATE OR REPLACE VIEW `{}`.`{}` AS SELECT 1 AS a",
+            db.name,
+            two_runs_probe_view()
+        ))
+        .await?;
+
+        // A restricted account (neutral name, created and dropped by the test): SELECT on the
+        // definitions, DML on lazyview's own status tables, no DDL on any of them; the view
+        // tables are its own (their DDL belongs to the operations run); the probe view of the
+        // planner is granted by name pattern; the binlog needs its replication rights.
+        let user = format!("lvop{:x}", rand::rng().random_range(0..0xFFFF_FFFF_u32));
+        let d = format!("`{}`", db.name);
+        c.query_drop(format!("DROP USER IF EXISTS '{user}'@'%'"))
+            .await?;
+        c.query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"))
+            .await?;
+        for grant in [
+            format!("GRANT SELECT ON {d}.`_lazyview` TO '{user}'@'%'"),
+            format!(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON {d}.`_lazyview_state` TO '{user}'@'%'"
+            ),
+            format!(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON {d}.`_lazyview_status` TO '{user}'@'%'"
+            ),
+            format!("GRANT INSERT, UPDATE ON {d}.`_lazyview_fence` TO '{user}'@'%'"),
+            format!("GRANT SELECT ON {d}.`entities` TO '{user}'@'%'"),
+            format!("GRANT SELECT ON {d}.`items` TO '{user}'@'%'"),
+            format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity` TO '{user}'@'%'"),
+            format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity__lv_new` TO '{user}'@'%'"),
+            format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity__lv_old` TO '{user}'@'%'"),
+            format!(
+                "GRANT SELECT, CREATE VIEW, DROP ON {d}.`{}` TO '{user}'@'%'",
+                two_runs_probe_view()
+            ),
+            format!("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{user}'@'%'"),
+        ] {
+            c.query_drop(&grant)
+                .await
+                .with_context(|| format!("grant: {grant}"))?;
+        }
+
+        // The operations run as that account: it starts (its own tables pass the check) and
+        // refreshes the view.
+        let rdsn = dsn_with_user(&db.dsn, &format!("{user}:pw"));
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_DSN", rdsn.as_str())])?;
+        wait_ready(&mut c, &mut eng, &["items_by_entity"], t_ready()).await?;
+        c.query_drop("INSERT INTO items (id, entity_id, price) VALUES (2, 1, 7)")
+            .await?;
+        let seen = |want: i64| {
+            let dsn = db.dsn.clone();
+            move || {
+                let dsn = dsn.clone();
+                async move {
+                    let mut c = connect(&dsn).await?;
+                    let n = scalar_i64(&mut c, "SELECT COUNT(*) FROM items_by_entity").await?;
+                    c.disconnect().await.ok();
+                    Ok::<bool, anyhow::Error>(n == want)
+                }
+            }
+        };
+        wait_until(
+            "restricted engine applied the new row",
+            t_catchup(),
+            seen(2),
+        )
+        .await?;
+        eng.stop().await?;
+        c.query_drop(format!("DROP USER IF EXISTS '{user}'@'%'"))
+            .await?;
+        c.query_drop(format!(
+            "DROP VIEW IF EXISTS `{}`.`{}`",
+            db.name,
+            two_runs_probe_view()
+        ))
+        .await?;
+        ctx.log("operations run started and refreshed as the restricted account");
+        Ok(())
+    });
+}

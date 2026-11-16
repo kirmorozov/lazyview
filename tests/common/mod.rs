@@ -858,6 +858,15 @@ impl Ctx {
             shown.join(" "),
             log_path.display()
         ));
+        // Two runs (owner 2026-11-16): the operations run no longer creates lazyview's own
+        // tables, it only checks them (`meta::verify`), so the harness performs the setup step
+        // first — the way the k8s initContainer does. It connects as the schema owner
+        // (`db.dsn`, the setup account), never as the engine's (possibly restricted) user.
+        // `LAZYVIEW_TEST_SKIP_SETUP=1` (via `overrides`) leaves the schema untouched: those
+        // tests drive the setup themselves.
+        if env.get("LAZYVIEW_TEST_SKIP_SETUP").map(|v| v.as_str()) != Some("1") {
+            run_setup_step(&db.dsn, &db.name)?;
+        }
         let e = Engine::spawn(cfg, label, log_path)?;
         self.engines
             .lock()
@@ -869,6 +878,40 @@ impl Ctx {
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
+}
+
+/// The setup run's table work: create/migrate lazyview's own tables in `db` (`meta::ensure`,
+/// what `lazyview setup` does) and write nothing else. Tests that need the metadata without
+/// starting an engine call this; `Ctx::start_engine` calls it automatically.
+pub async fn setup_run(db: &Db) -> Result<()> {
+    let mut c = db.conn().await?;
+    lazyview::meta::ensure(&mut c, &db.name).await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// [`setup_run`] from synchronous code: `Ctx::start_engine` is sync and often called from
+/// inside a runtime, so the setup step runs on its own thread with its own runtime.
+fn run_setup_step(dsn: &str, schema: &str) -> Result<()> {
+    let dsn = dsn.to_string();
+    let schema = schema.to_string();
+    std::thread::Builder::new()
+        .name("lv-setup-step".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("setup runtime")?;
+            rt.block_on(async move {
+                let mut c = connect(&dsn).await?;
+                lazyview::meta::ensure(&mut c, &schema).await?;
+                c.disconnect().await.ok();
+                Ok::<(), anyhow::Error>(())
+            })
+        })
+        .context("spawn setup thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("setup thread panicked"))?
 }
 
 fn unique_server_id() -> u32 {

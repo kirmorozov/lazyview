@@ -44,7 +44,9 @@ use mysql_async::binlog::value::BinlogValue;
 /// The once-a-minute clocks of the `Engine::core_events` warnings (guard R1 c; one per warning).
 static LAST_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 
-/// Runs the service until `shutdown` turns true (or, for `once` / `sync=false`, until done).
+/// Run the service until `shutdown` turns true (or, for `once`, until done). With
+/// `cfg.sync == false` this is the setup and migration run (`lazyview setup`): create and
+/// migrate lazyview's own tables, validate every enabled definition, log its plan, and return.
 pub async fn run(
     cfg: Config,
     metrics: Arc<Metrics>,
@@ -1043,7 +1045,17 @@ impl Engine {
         else {
             return Ok(None);
         };
-        meta::ensure(&mut meta_conn, &schema).await?;
+        // Two runs (owner 2026-11-16): the operations run (the default) never issues DDL on
+        // lazyview's own tables — it checks them through information_schema with SELECT rights
+        // and refuses to start with a `SetupRequired` error (exit code 2) naming `lazyview
+        // setup`. The setup and migration run (`lazyview setup`, today's LAZYVIEW_SYNC=false)
+        // owns all DDL on them. View tables in the targets are not lazyview's own tables: their
+        // DDL stays in the operations run.
+        if cfg.sync {
+            meta::verify(&mut meta_conn, &schema).await?;
+        } else {
+            meta::ensure(&mut meta_conn, &schema).await?;
+        }
         let Some(leader) = coord::acquire(
             &mut meta_conn,
             &meta_opts,
@@ -1253,7 +1265,8 @@ impl Engine {
                 bail!("{bad} invalid definition(s)");
             }
             info!(
-                "LAZYVIEW_SYNC=false: metadata ready, {} definition(s) valid, not streaming",
+                "setup run: metadata ready, {} definition(s) valid, not streaming \
+                 (start the operations run with `lazyview run`)",
                 names.len()
             );
             return Ok(Some((e, None)));
