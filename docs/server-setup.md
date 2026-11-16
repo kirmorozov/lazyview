@@ -65,6 +65,25 @@ kept.
 `binlog_transaction_compression=ON` on MySQL is supported. `binlog_format` and `binlog_row_image`
 are dynamic, but sessions that are already connected keep the old value until they reconnect.
 
+### sql_log_bin=0: changes that never reach the binlog
+
+A session that sets `sql_log_bin=0` writes nothing to the binlog — and the binlog
+is all lazyview reads. Every change made in such a session is invisible to it:
+the view tables keep serving rows that no longer match the source, and the views
+stay `ready`, because from lazyview's side nothing happened. Switching
+`sql_log_bin` off takes a privileged account (`SUPER`, or `SYSTEM_VARIABLES_ADMIN`
+on MySQL 8), so this is about who holds such accounts and about tools that run
+with them (dumps and restores, bulk loaders, migrations). With `log_bin=OFF` on
+the server lazyview refuses to start
+([requirements](#requirements)); it cannot see a single session turning its own
+writes off.
+
+A pre-flight check can cover the static server settings of this page: `log_bin`
+on, `binlog_format=ROW`, `binlog_row_image=FULL`, the binlog filters not
+excluding a schema a view reads. What no check can cover is a session changing
+its own settings while lazyview runs. A `preflight` command that runs the static
+checks is planned; no version is promised for it.
+
 ## Supported servers
 
 Every major line a vendor supports is tested on every change and required for a release
@@ -221,6 +240,14 @@ cannot be read. On 12.3 and later leave `binlog_storage_engine` unset (see the c
 
 ## User and grants
 
+Two layouts: a **simple setup** with one account, and an **advanced setup** with
+specially designated separate accounts — the recommended production layout. The
+neutral names below are yours to choose: `app` is the application's schema,
+`lazyview` the control schema of lazyview's own, `other_schema` any schema a
+view reads.
+
+### Simple setup
+
 Run once as an admin. `app` is the schema that holds `_lazyview` (`LAZYVIEW_DATABASE`).
 
 ```sql
@@ -240,6 +267,139 @@ GRANT SELECT ON other_schema.* TO 'lazyview'@'%';
 * On MariaDB 10.5.2 and later, `REPLICATION CLIENT` is an alias of `BINLOG MONITOR`: `SHOW GRANTS`
   prints `GRANT REPLICATION SLAVE, BINLOG MONITOR ON *.*` for the documented `GRANT`. Same
   privilege, nothing to change.
+* The cost of the one account: it holds `CREATE`, `DROP` and `ALTER` on `app`, so it
+  can drop and alter the application's own tables, not only lazyview's. Where that
+  matters, use the [advanced setup](#advanced-setup-recommended-for-production).
+
+### Advanced setup (recommended for production)
+
+The advanced setup is the production layout: lazyview's control tables live in a
+schema of its own, a designated service user runs the process, and a separate
+management user alone may write `_lazyview`, the definitions table. The separate
+control database is optional: when it is set, lazyview documents and supports
+three accounts — **setup**, **management** (control) and **service**
+(consumption). Unset, the simple setup keeps its one account.
+
+Today the control tables live on the source server in `LAZYVIEW_DATABASE`. A
+control store off the source is planned; no version is promised for it.
+
+In the advanced layout the definitions table `_lazyview` eventually lives in a
+schema of its own, apart from the schemas where the service creates and drops
+view tables: MySQL grants `CREATE` and `DROP` per schema, so a service that may
+create its view tables in the same schema could drop the definitions table too.
+The setting that places it there is coming; until it lands, the service's view
+tables on the source are still created in the control schema
+(`LAZYVIEW_DATABASE`), as noted in the script below.
+
+**The accounts and their grants.**
+
+| account | used | grants |
+|---|---|---|
+| setup | install and upgrade only, never at run time | `CREATE`, `ALTER`, `INDEX` on the control database |
+| management (control) | whoever changes definitions | `SELECT` on the control database; `INSERT`, `UPDATE`, `DELETE` on `_lazyview` — it alone changes definitions |
+| service (consumption) | the running process | `SELECT` on `_lazyview`; `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the status tables; no DDL in the control database; its DDL rights are for its view tables, in the schemas that hold them; `REPLICATION SLAVE`, `REPLICATION CLIENT` on `*.*` of the sources it reads the binlog from |
+| monitoring (optional) | dashboards, humans | `SELECT` on `_lazyview_overview` and the status tables |
+
+The status tables are `_lazyview_state` (one row per view and target, upserted),
+`_lazyview_status` (the saved position per instance) and `_lazyview_fence` (the
+visibility-fence counter). Until the definitions table becomes read-only for the
+service (a change in progress), the service also writes two columns of
+`_lazyview`: `name`, filled in from a view's `CREATE VIEW` statement, and
+`rebuild`, cleared when a rebuild request is served. In the advanced layout grant
+it `UPDATE` on those two columns only (column privileges, in the scripts below);
+that grant goes away with the change.
+
+The service must start and run with the consumption grants alone. lazyview
+creates and migrates the control tables under the setup account, by running the
+binary once with `LAZYVIEW_SYNC=false` and its credentials; at run time the
+service creates and alters no control table. Once the startup table check of
+the same change lands, the service issues DDL only when a table or column is
+missing and, with no right to create it, fails at startup with a clear error
+naming the setup step: never a silent skip, and never an error from a
+`CREATE TABLE IF NOT EXISTS` the account had no right to run (MySQL checks the
+`CREATE` privilege even when the table exists). Until that lands the service
+still needs more than the model above: its startup migration runs a
+`CREATE TABLE IF NOT EXISTS`, and its view tables on the source sit in the
+control schema — the extra line marked in the script below carries those
+rights; remove it when the change lands.
+
+Through a view the management user can read whatever the service account can
+read: the view tables are ordinary tables, and the service built them from what
+its own `SELECT` rights allowed. Grant `SELECT` on them deliberately. Note too
+how much the management user holds: disabling or deleting a row of `_lazyview`
+drops the view's table by default
+([changes while running](views.md#changes-while-running)).
+
+**Audit of definition changes.** `_lazyview` records no actor and no history. The
+row-based binlog carries each change and its time, not the account that made it.
+Attribution comes from the database's audit log (MySQL Enterprise Audit, MariaDB
+Audit Plugin): in the advanced layout every change to `_lazyview` comes from the
+management account, so the audit log names it for every definition change — the
+account, not the person behind it; separating the two is a matter of one account
+per person on your side.
+
+**GRANT scripts — separate control database on the source.** Run once as an
+admin. The setup account is used only at install and at upgrade: run the binary
+once with `LAZYVIEW_SYNC=false` and its credentials, then never use it again at
+run time.
+
+```sql
+CREATE DATABASE lazyview;                       -- the control schema
+
+-- setup: install and upgrade only
+CREATE USER 'lazyview_setup'@'%' IDENTIFIED BY 'change-me';
+GRANT CREATE, ALTER, INDEX ON lazyview.* TO 'lazyview_setup'@'%';
+
+-- management: the only account that changes definitions
+CREATE USER 'lazyview_admin'@'%' IDENTIFIED BY 'change-me';
+GRANT SELECT ON lazyview.* TO 'lazyview_admin'@'%';
+GRANT INSERT, UPDATE, DELETE ON lazyview._lazyview TO 'lazyview_admin'@'%';
+
+-- service (consumption): reads definitions, writes its own status tables
+CREATE USER 'lazyview_svc'@'%' IDENTIFIED BY 'change-me';
+-- the grants it holds once the change lands:
+GRANT SELECT ON lazyview._lazyview TO 'lazyview_svc'@'%';
+GRANT UPDATE (name, rebuild) ON lazyview._lazyview TO 'lazyview_svc'@'%';  -- goes away when the definitions table turns read-only
+GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_state TO 'lazyview_svc'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_status TO 'lazyview_svc'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_fence TO 'lazyview_svc'@'%';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lazyview_svc'@'%';
+GRANT SELECT ON app.* TO 'lazyview_svc'@'%';              -- the source tables the views read
+GRANT SELECT ON other_schema.* TO 'lazyview_svc'@'%';     -- every other schema a view reads
+-- until the pending change lands (see above): the service creates and maintains
+-- its view tables on the source in this same schema, so today it also needs:
+GRANT INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, CREATE VIEW, SHOW VIEW
+  ON lazyview.* TO 'lazyview_svc'@'%';                    -- remove this line when the change lands
+
+-- monitoring: optional, read-only
+CREATE USER 'lazyview_monitor'@'%' IDENTIFIED BY 'change-me';
+GRANT SELECT ON lazyview._lazyview_overview TO 'lazyview_monitor'@'%';
+GRANT SELECT ON lazyview._lazyview_state TO 'lazyview_monitor'@'%';
+GRANT SELECT ON lazyview._lazyview_status TO 'lazyview_monitor'@'%';
+GRANT SELECT ON lazyview._lazyview_fence TO 'lazyview_monitor'@'%';
+```
+
+**GRANT script — separate control instance (planned).** When the control store
+runs on an instance of its own instead of the source, the same three accounts
+exist there: the setup and management scripts are unchanged, pointed at the
+control server. The service account gains replication rights there only where
+lazyview reads the control store as another source:
+
+```sql
+-- on the control instance, for the service account only:
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lazyview_svc'@'%';
+```
+
+**GRANT script — target instance.** On each
+[target](views.md#targets-one-source-many-servers), the target's user needs the
+DDL and DML rights on the target schema that holds the view's tables, and no
+replication privileges:
+
+```sql
+CREATE USER 'lazyview_target'@'%' IDENTIFIED BY 'change-me';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, CREATE VIEW, SHOW VIEW
+  ON app.* TO 'lazyview_target'@'%';            -- the target's schema
+```
 
 ## Verify
 

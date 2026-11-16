@@ -366,6 +366,30 @@ A single instance with a restart policy is enough for most setups. A standby onl
 after a failure. Do not run instances with *different* `LAZYVIEW_INSTANCE_ID`s against the same
 schema: each would maintain the same views.
 
+### One instance per target
+
+One instance maintains the views of all its targets under one saved position: a
+target that is down, or a view whose refresh keeps failing while it shows
+`ready`, holds that position and so holds back everything else in the instance.
+When a target that may be down must not hold back the others, run a separate
+lazyview instance per target (per group of targets): each instance has its own
+position, lock and failure domain, so a stuck target delays only its own
+instance.
+
+* Each instance needs its own `LAZYVIEW_DATABASE`. This is the warning above
+  turned into a rule: different instances mean different schemas, never two
+  instance ids on one schema.
+* The costs: one more full binlog stream and connection set on the source per
+  instance, and the instances wake each other with a position write at most
+  every 5 s (`LAZYVIEW_POSITION_PERSIST_MS`).
+* Give each instance the grants of its own schema as usual; with the
+  [advanced setup](server-setup.md#advanced-setup-recommended-for-production),
+  each instance's service account touches only its own control schema.
+
+The pattern isolates target failures. Inside one instance it does not help
+against a `ready` view whose refresh fails on every attempt: it still holds the
+position for the views of its own instance.
+
 ## Troubleshooting
 
 | error or symptom | fix |
