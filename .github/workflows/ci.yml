@@ -1,13 +1,8 @@
 name: ci
 
-# pull_request runs everything: lint, unit, e2e, the integration matrix, integration-multi and the
-# advisory chaos job (20 jobs).
-# push to main runs only lint, unit, e2e, image and the integration matrix's mysql84 default-supervisor
-# entry (it is the single writer of the shared `integration` rust-cache that the PR runs restore); the
-# other 14 matrix entries, integration-multi and the chaos job are skipped there because landing is
-# fast-forward only, so the pushed commit is exactly the PR head whose pull_request run just went
-# green on the same tree.
-# push v* and workflow_dispatch run the full set (release needs the matrix and integration-multi).
+# Every pull_request, push to main, v* tag and workflow_dispatch runs the same full set: lint, unit,
+# e2e, the integration matrix, integration-multi, integration-pg, integration-pgsrc and the advisory
+# chaos job (both flavors). Every landed commit therefore shows its own full matrix.
 # The chaos job is advisory (continue-on-error) and in no `needs:` chain of image/release.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
 #   main  -> `image`   (needs lint + unit + e2e; the integration jobs run alongside, not required)
@@ -22,10 +17,11 @@ on:
   pull_request:
   workflow_dispatch:
 
-# A newer run for the same ref and event cancels the superseded one.
+# A newer run for the same ref and event cancels the superseded one, except on main: every landed
+# commit keeps its own run (keyed by sha there, so a queued main run is never replaced either).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -98,15 +94,9 @@ jobs:
         # in docker-compose.test.yml). The supervisor:"off" entry is the sequential refresh path
         # (LAZYVIEW_SUPERVISOR=off); the other jobs run the default (concurrent) one. The advisory
         # pre-releases (compose profile `prerelease`) are tested, not supported, never required.
-        # A push to main runs only the mysql84 default-supervisor entry: landing is fast-forward
-        # only, so the other 14 entries already ran green on the pull_request of this very commit,
-        # and mysql84 stays because it alone saves the shared `integration` rust-cache (save-if
-        # below) that the PR runs restore.
         include: >-
           ${{ fromJSON(
-          (github.event_name == 'push' && github.ref == 'refs/heads/main')
-          && '[{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false}]'
-          || '[{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false},{"flavor":"mysql97","port":33097,"tier":"LTS","advisory":false},{"flavor":"mysql2610","port":33261,"tier":"GA","advisory":false},{"flavor":"mysql80","port":33080,"tier":"AWS-only","advisory":false},{"flavor":"percona84","port":33184,"tier":"LTS","advisory":false},{"flavor":"percona97","port":33197,"tier":"LTS","advisory":false},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false},{"flavor":"mariadb118","port":33118,"tier":"LTS","advisory":false},{"flavor":"mariadb123","port":33123,"tier":"LTS","advisory":false},{"flavor":"mariadb130","port":33130,"tier":"GA","advisory":false},{"flavor":"mariadb106","port":33106,"tier":"AWS-only","advisory":false},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false,"supervisor":"off"},{"flavor":"mariadb131-rc","port":33131,"tier":"pre-release","advisory":true},{"flavor":"mariadb132-pre","port":33132,"tier":"pre-release","advisory":true}]'
+          '[{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false},{"flavor":"mysql97","port":33097,"tier":"LTS","advisory":false},{"flavor":"mysql2610","port":33261,"tier":"GA","advisory":false},{"flavor":"mysql80","port":33080,"tier":"AWS-only","advisory":false},{"flavor":"percona84","port":33184,"tier":"LTS","advisory":false},{"flavor":"percona97","port":33197,"tier":"LTS","advisory":false},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false},{"flavor":"mariadb118","port":33118,"tier":"LTS","advisory":false},{"flavor":"mariadb123","port":33123,"tier":"LTS","advisory":false},{"flavor":"mariadb130","port":33130,"tier":"GA","advisory":false},{"flavor":"mariadb106","port":33106,"tier":"AWS-only","advisory":false},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false,"supervisor":"off"},{"flavor":"mariadb131-rc","port":33131,"tier":"pre-release","advisory":true},{"flavor":"mariadb132-pre","port":33132,"tier":"pre-release","advisory":true}]'
           ) }}
     env:
       COMPOSE_FILE: docker-compose.test.yml
@@ -194,9 +184,6 @@ jobs:
     # MySQL 8.4 LTS, Percona 9.7 and MariaDB 13.0, whose default utf8mb4_uca1400_ai_ci
     # collation the MySQL targets lack.
     name: integration (multi-server, mysql84 + percona97 + mariadb130)
-    # Skipped on pushes to main: its scenarios already ran green on the pull_request of the very
-    # commit being landed (fast-forward only). v* tags and workflow_dispatch still run it (release needs it).
-    if: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -274,12 +261,9 @@ jobs:
     # The network-fault suite (tests/chaos.rs) over the Toxiproxy API: one job per server family
     # (one LTS source of each product), the engine's connections reached through proxies the harness
     # arms and tears down itself. Advisory while the suite settles (it annotates the run, never
-    # blocks it), and a PR pays exactly one extra job: mariadb1011 runs only on workflow_dispatch
-    # and a v* tag until lv-super calls the suite stable (lead decision Q3).
+    # blocks it). A PR runs the mysql84 flavor only; a push (main or a v* tag) and workflow_dispatch
+    # add mariadb1011 until lv-super calls the suite stable (lead decision Q3).
     name: chaos (${{ matrix.flavor }}${{ matrix.advisory && ', advisory' || '' }})
-    # Never on the push-to-main leg (that stays at 6 jobs); v* tags and workflow_dispatch run it,
-    # both flavors there.
-    if: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     # 9 scenarios × ~120 s + the build; the scenario step gets its own, smaller, bound so a hung
     # proxy still leaves room for the log steps below.
@@ -290,12 +274,12 @@ jobs:
       matrix:
         # One flavor per product family (the same service names and host ports as the integration
         # matrix's two LTS entries). Flip `advisory` to false when lv-super calls the suite stable;
-        # mariadb1011 joins the per-PR leg in the same edit (the second list below).
+        # mariadb1011 joins the PR leg in the same edit (the pull_request branch below).
         include: >-
           ${{ fromJSON(
-          (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
-          && '[{"flavor":"mysql84","port":33084,"advisory":true},{"flavor":"mariadb1011","port":33111,"advisory":true}]'
-          || '[{"flavor":"mysql84","port":33084,"advisory":true}]'
+          (github.event_name == 'pull_request')
+          && '[{"flavor":"mysql84","port":33084,"advisory":true}]'
+          || '[{"flavor":"mysql84","port":33084,"advisory":true},{"flavor":"mariadb1011","port":33111,"advisory":true}]'
           ) }}
     env:
       COMPOSE_FILE: docker-compose.test.yml
@@ -382,7 +366,6 @@ jobs:
     # supported baseline major; the other majors come in a later PR. The source is a normal
     # matrix flavor; PostgreSQL is only ever a target (LAZYVIEW_TEST_PG_DSNS).
     name: integration (postgres target, mysql84 + pg16)
-    if: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -464,7 +447,6 @@ jobs:
     # grows into the source mirror of the target matrix (phase 3).
     name: integration (postgres source, pg16)
     needs: integration-pg
-    if: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
