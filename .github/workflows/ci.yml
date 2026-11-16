@@ -1,12 +1,13 @@
 name: ci
 
 # Every pull_request, push to main, v* tag and workflow_dispatch runs the same full set: lint, unit,
-# e2e, the integration matrix, integration-multi, integration-pg (PostgreSQL as a TARGET: every
-# supported major, on the baseline source mysql84), integration-pg-multi (the same target grid the
-# other way round: every MySQL-family source on the baseline target pg16) and integration-pgsrc
-# (PostgreSQL as a SOURCE, every major). Every landed commit therefore shows its own full matrix.
-# The network-chaos suite (tests/chaos.rs) runs inside every integration job that starts the
-# toxiproxy daemon: the job's own server family reached through it (compose profile `chaos`), its
+# e2e, deny (cargo-deny advisories + licenses), features (the optional cargo features built and
+# tested), scan-image (trivy), the integration matrix, integration-multi, integration-pg (PostgreSQL
+# as a TARGET: every supported major, on the baseline source mysql84), integration-pg-multi (the same
+# target grid the other way round: every MySQL-family source on the baseline target pg16) and
+# integration-pgsrc (PostgreSQL as a SOURCE, every major). Every landed commit therefore shows its own
+# full matrix. The network-chaos suite (tests/chaos.rs) runs inside every integration job that starts
+# the toxiproxy daemon: the job's own server family reached through it (compose profile `chaos`), its
 # scenarios required (scripts/chaos-gate.sh fails the step on any failure tests/chaos-known-red.txt
 # does not list, and prints the listed ones in the job summary), the toxi self-tests required. The
 # chaos_tgt_pg_ scenarios run once, where the PostgreSQL target sits next to a daemon: integration-pg
@@ -20,11 +21,14 @@ name: ci
 # nightly.yml calling this workflow on the schedule: the schedule event then runs the soak jobs
 # only (every regular job skips), because a push to main has already run the full set on this
 # very commit (#236) and the nightly adds only what that push does not run.
+# twice; its legs are the targets_pg_ gates). The jobs that gate image/release (the supply-chain scans,
+# deny + scan-image, and the optional features) are not advisory (S-09): an advisory job gates nothing.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
 #   main  -> `image`   (needs lint + unit + e2e; the integration jobs run alongside, not required)
-#   v*    -> `release` (needs lint + unit + e2e + the integration matrix + the multi-server job;
-#                       the matrix's 12 blocking servers must pass, its 2 advisory pre-release
-#                       entries run with continue-on-error and cannot block it)
+#   v*    -> `release` (needs lint + unit + e2e + the integration matrix + the multi-server job +
+#                       the supply-chain gate: deny + scan-image + features; the matrix's 12 blocking
+#                       servers must pass, its 2 advisory pre-release entries run with
+#                       continue-on-error and cannot block it)
 # Pull requests never get registry credentials and never push.
 on:
   push:
@@ -106,6 +110,58 @@ jobs:
         run: cargo test --locked --lib --bins
       - name: lib tests (feature roaring)
         run: cargo test --locked --lib --features roaring
+
+  deny:
+    name: "supply-chain (cargo-deny: advisories + licenses)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # Pinned supply-chain tools: exact version + sha256, never a floating tag.
+      CARGO_DENY_VERSION: "0.20.2"
+      CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install pinned cargo-deny
+        run: |
+          curl -fsSLo cargo-deny.tar.gz \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${CARGO_DENY_SHA256}  cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf cargo-deny.tar.gz
+          "./cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny" --version
+      - name: cargo-deny check advisories licenses
+        # deny.toml (auto-discovered) scans the whole lockfile with all features
+        # and triages the advisories upstream pins us onto, each with a reason.
+        # Required by `release` (S-09); a vulnerable or unexpectedly-licensed
+        # dependency fails the job, so nothing here is advisory.
+        run: ./cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny check advisories licenses
+
+  features:
+    name: optional features (${{ matrix.features }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every non-default feature in Cargo.toml gets one entry (S-09: the
+        # optional features are the untested part of the lockfile).
+        features: [roaring, aws-secrets]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo test --lib --bins (feature ${{ matrix.features }})
+        # Builds the feature's dependency tree (the aws tree only ever compiles
+        # here) and runs the unit tests against it. Required by `release`.
+        run: cargo test --locked --lib --bins --features "${{ matrix.features }}"
 
   integration:
     # One job per server flavor of docker-compose.test.yml (docs/server-setup.md "Supported
@@ -957,6 +1013,57 @@ jobs:
           test "$(docker image inspect "$ARM64_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
           make docker-smoke IMAGE="$ARM64_IMAGE"
 
+  scan-image:
+    name: image scan (trivy)
+    # Needs e2e so the GHA build cache below is warm: this rebuild is a cache hit.
+    needs: e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Pinned supply-chain tools: exact version + sha256, never a floating tag.
+      TRIVY_VERSION: "0.76.2"
+      TRIVY_SHA256: "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"
+      SCAN_IMAGE: lazyview:ci-scan-amd64
+      # Official sources for the vulnerability DB, tried in order: ghcr.io first
+      # (reachable from GitHub runners, unlike public.ecr.org on some networks:
+      # run 43877158353 dialed public.ecr.org into a blackhole and trivy aborted
+      # without falling through to the next source), then the ECR mirror, so an
+      # anonymous ghcr rate-limit cannot make the gate flaky either.
+      TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db,public.ecr.org/aqua/trivy-db
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build linux/amd64 (cache hit from the e2e job)
+        # The same Dockerfile publish-image.yml publishes, so what is scanned
+        # is what ships (default features, distroless, nonroot).
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.SCAN_IMAGE }}
+          build-args: |
+            REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=image-amd64
+      - name: install pinned trivy
+        run: |
+          curl -fsSLo trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
+          tar -xzf trivy.tar.gz trivy
+          ./trivy --version
+      - name: scan the image
+        # HIGH and CRITICAL fail the job; required by `release` (S-09).
+        # --ignore-unfixed keeps the gate on what a rebuild can actually remove:
+        # an unfixed-upstream finding is a log note, not a permanent red (the
+        # dependency source fixes arrive by bumping the base image / lockfile).
+        run: |
+          ./trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$SCAN_IMAGE"
+
   image:
     name: publish edge
     needs: [lint, unit, e2e]
@@ -970,7 +1077,9 @@ jobs:
 
   release:
     name: publish release
-    needs: [lint, unit, e2e, integration, integration-multi]
+    # The supply-chain gate (deny + scan-image) and the optional-features builds are
+    # required here (S-09): an advisory job gates nothing, so they are hard needs.
+    needs: [lint, unit, e2e, integration, integration-multi, deny, features, scan-image]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read

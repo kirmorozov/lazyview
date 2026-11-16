@@ -1,0 +1,65 @@
+# cargo-deny configuration for the supply-chain gate in .github/workflows/ci.yml
+# (refined production-readiness review S-09, work list #12). The `deny` job runs
+# `cargo-deny check advisories licenses` with a pinned binary and requires the
+# result before the `release` job. An advisory check gates nothing, so nothing
+# here is advisory: a vulnerable dependency or an unexpected licence fails the job.
+
+[graph]
+# Scan every optional dependency tree (`roaring`, `aws-secrets`), not just the
+# default build: the optional features are the part of the lockfile that
+# ordinary builds never resolve, and their crates ship in the released
+# binaries as soon as someone turns a feature on.
+all-features = true
+
+[advisories]
+# RustSec advisory database. A vulnerable dependency is always an error;
+# `unmaintained`/`unsound` are errors across the whole graph (workspace and
+# transitive). Triage an accepted exception by adding it to `ignore` below
+# with a dated comment, never by weakening these lines.
+yanked = "warn"                                # the lockfile is --locked: a later yank must not block a release, the build already pinned it
+unmaintained = "all" # the whole graph, workspace and transitive
+unsound = "all"
+# Triage (2026-11-16). Every entry below is reported in the job log as a note;
+# removing a line must go with a fix, not with a new ignore.
+#
+# The seven CVE ignores hit only the old transitive chain that aws-smithy
+# pins (rustls 0.21.12, rustls-webpki 0.101.7, h2 0.3.27, reached through
+# aws-smithy-http-client -> hyper 0.14). The released artifact is built
+# without the optional `aws-secrets` feature and ships the patched siblings
+# already in the lockfile (rustls 0.23.46, rustls-webpki 0.103.16, h2 0.4.20)
+# which stay gated. Drop these lines when smithy-rs moves off rustls 0.21.
+ignore = [
+  { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 under the aws-only hyper 0.14 client; the shipped h2 is 0.4.20 (patched)" },
+  { id = "RUSTSEC-2026-0346", reason = "rustls 0.21.12 is aws-secrets-only (aws-smithy-http-client pin); the shipped rustls is 0.23.46 (patched)" },
+  { id = "RUSTSEC-2026-0349", reason = "rustls 0.21.12 is aws-secrets-only (aws-smithy-http-client pin); the shipped rustls is 0.23.46 (patched)" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 is aws-secrets-only (under rustls 0.21); the shipped rustls-webpki is 0.103.16 (patched)" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 is aws-secrets-only (under rustls 0.21); the shipped rustls-webpki is 0.103.16 (patched)" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 is aws-secrets-only (under rustls 0.21); the shipped rustls-webpki is 0.103.16 (patched)" },
+  { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101.7 is aws-secrets-only (under rustls 0.21); the shipped rustls-webpki is 0.103.16 (patched)" },
+  # Direct dependency (Cargo.toml, PEM reading for target TLS): upstream is
+  # marked unmaintained with no upgrade path. Small pure parser, pinned in
+  # Cargo.lock; replace the PEM reader rather than un-ignoring blindly.
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0, direct dependency; upstream unmaintained, no safe upgrade available (2026-11-16)" },
+]
+
+[licenses]
+# Every crate must resolve to a licence on this list; anything else (including
+# unknown or ambiguous licences) is an error. Collected from the current
+# lockfile with all features (cargo-deny list-licenses), so the gate is
+# precise rather than permissive.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0", # webpki-roots ships its root-certificate selection under this
+  "ISC",
+  "LGPL-2.1-or-later", # r-efi only: one option among its (MIT OR Apache-2.0 OR LGPL-2.1-or-later) triple
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
