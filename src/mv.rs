@@ -1069,22 +1069,23 @@ async fn write_tx_mysql(
     Ok(out)
 }
 
-/// Brings `table` in line with `new_rows` for the units in `chunk` (all rows when `None`),
-/// writing only units whose rows differ.
+/// Brings `table` in line with the already-converted new rows of a chunk, for the units in
+/// `chunk` (all rows when `None`), writing only units whose rows differ. `new` comes from
+/// [`prepare`] and is immutable ([`diff`] only reads it), so one chunk prepares once and every
+/// target of the chunk shares it (see [`apply`] for rows that are not converted yet).
 #[allow(clippy::too_many_arguments)]
-pub async fn apply(
+pub async fn apply_prepared(
     conn: &mut Conn,
     schema: &str,
     table: &str,
     layout: &Layout,
     chunk: Option<&UnitChunk>,
-    new_rows: &[Vec<Value>],
+    new: &Prepared,
     w: &WriteOpts,
     metrics: &Metrics,
 ) -> Result<Applied> {
     let old = read_old(conn, schema, table, layout, w.kind, chunk, metrics).await?;
-    let new = prepare(layout, new_rows.to_vec());
-    let d = diff(layout, old, &new);
+    let d = diff(layout, old, new);
     write_diff(
         conn,
         schema,
@@ -1096,6 +1097,24 @@ pub async fn apply(
         &AtomicBool::new(false),
     )
     .await
+}
+
+/// [`apply_prepared`] for new rows that still need converting: one copy of `new_rows` for
+/// [`prepare`]. A caller with several targets of the same chunk prepares once and calls
+/// [`apply_prepared`] per target instead.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    chunk: Option<&UnitChunk>,
+    new_rows: &[Vec<Value>],
+    w: &WriteOpts,
+    metrics: &Metrics,
+) -> Result<Applied> {
+    let new = prepare(layout, new_rows.to_vec());
+    apply_prepared(conn, schema, table, layout, chunk, &new, w, metrics).await
 }
 
 /// Builds a chunk from arbitrary keys (sorted integers when possible).

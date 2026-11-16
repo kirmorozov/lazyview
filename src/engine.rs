@@ -5409,9 +5409,12 @@ impl Engine {
             let rows =
                 mv::read_source(&mut self.src, plan, layout, None, &self.metrics, fresh).await?;
             work.source_queries += 1;
+            // Converted once for the chunk and shared by every target of it (`Prepared` is
+            // immutable, `diff` only reads it), as the supervisor's chunk op does.
+            let new = mv::prepare(layout, rows);
             Metrics::add(&self.metrics.units_refreshed, 1);
             for t in targets {
-                match self.apply_target(t, table, layout, None, &rows).await {
+                match self.apply_target(t, table, layout, None, &new).await {
                     Ok(a) => work.rows.applied(&a),
                     Err(e) => failed.push((t.clone(), e)),
                 }
@@ -5437,9 +5440,12 @@ impl Engine {
             let rows =
                 mv::read_source(&mut self.src, plan, layout, None, &self.metrics, fresh).await?;
             work.source_queries += 1;
+            // Converted once for the chunk and shared by every target of it (`Prepared` is
+            // immutable, `diff` only reads it), as the supervisor's chunk op does.
+            let new = mv::prepare(layout, rows);
             Metrics::add(&self.metrics.units_refreshed, 1);
             for t in targets {
-                match self.apply_target(t, table, layout, None, &rows).await {
+                match self.apply_target(t, table, layout, None, &new).await {
                     Ok(a) => work.rows.applied(&a),
                     Err(e) => failed.push((t.clone(), e)),
                 }
@@ -5515,12 +5521,14 @@ impl Engine {
             )
             .await?;
             work.source_queries += 1;
+            // One conversion per chunk, shared by the chunk's targets (see `mv::apply_prepared`).
+            let new = mv::prepare(layout, rows);
             for t in targets {
                 if failed.iter().any(|(f, _)| f == t) {
                     continue;
                 }
                 match self
-                    .apply_target(t, table, layout, Some(&chunk), &rows)
+                    .apply_target(t, table, layout, Some(&chunk), &new)
                     .await
                 {
                     Ok(a) => work.rows.applied(&a),
@@ -5697,14 +5705,15 @@ impl Engine {
         }
     }
 
-    /// Writes the new rows of a chunk (all rows: `None`) to `table` on target `t`.
+    /// Writes the new rows of a chunk (all rows: `None`) to `table` on target `t`. `new` is the
+    /// chunk's rows converted once by [`mv::prepare`], shared by every target of the chunk.
     async fn apply_target(
         &mut self,
         t: &str,
         table: &str,
         layout: &Layout,
         chunk: Option<&UnitChunk>,
-        rows: &[Vec<Value>],
+        new: &mv::Prepared,
     ) -> Result<mv::Applied> {
         let ts = self.targets[t].schema.clone();
         let metrics = self.metrics.clone();
@@ -5718,7 +5727,7 @@ impl Engine {
         };
         let r = match tokio::time::timeout(
             timeout,
-            mv::apply(c.mysql()?, &ts, table, layout, chunk, rows, &w, &metrics),
+            mv::apply_prepared(c.mysql()?, &ts, table, layout, chunk, new, &w, &metrics),
         )
         .await
         {
