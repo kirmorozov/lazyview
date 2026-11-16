@@ -281,6 +281,21 @@ pub(crate) enum Step {
     Advance { size: u64, exact: bool },
 }
 
+/// Why the source refuses an incremental plan that reads `referenced` columns of `table` (the
+/// per-flavor planning rule, asked once per plan by the engine), or `None`. `version` is the
+/// server's `VERSION()`. MariaDB's rule lives in [`maria::plan_refusal`].
+pub(crate) fn plan_refusal(
+    flavor: Flavor,
+    version: &str,
+    table: &crate::catalog::TableInfo,
+    referenced: &[bool],
+) -> Option<String> {
+    match flavor {
+        Flavor::MariaDb => maria::plan_refusal(version, table, referenced),
+        Flavor::MySql | Flavor::Percona => None,
+    }
+}
+
 /// The one place the per-flavor `log_pos = 0` position rule lives: `Tracker::advance` calls
 /// this for such an event, after excluding the FORMAT_DESCRIPTION re-send and ROTATE (whose
 /// zero `log_pos` never means "inside a transaction"). The MySQL family's arm is trivial — its

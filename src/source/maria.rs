@@ -196,6 +196,41 @@ pub(crate) fn position_rule(header: BinlogEventHeader) -> Step {
     }
 }
 
+/// The MariaDB arm of [`crate::source::plan_refusal`] (issue #7): from MariaDB 11.4 on, the
+/// UPDATE and DELETE row images leave generated columns out (VIRTUAL, and STORED too on 13.x),
+/// and the row reader finds columns by table position. Any column at or after the table's
+/// first generated column would be read from the wrong place, so a plan that reads one is
+/// refused until #7 is fixed.
+pub(crate) fn plan_refusal(
+    version: &str,
+    table: &TableInfo,
+    referenced: &[bool],
+) -> Option<String> {
+    if !at_least_11_4(version) {
+        return None;
+    }
+    let first = table.columns.iter().position(|c| c.generated.is_some())?;
+    let read =
+        (first..table.columns.len()).find(|&i| referenced.get(i).copied().unwrap_or(false))?;
+    Some(format!(
+        "view reads column `{}` of `{}`.`{}`, which MariaDB {version} leaves out of the row images after its generated column `{}` (issue #7): the view is refused until #7 is fixed",
+        table.columns[read].name, table.schema, table.name, table.columns[first].name
+    ))
+}
+
+/// Whether a `VERSION()` string is MariaDB 11.4 or later (`11.4.2-MariaDB`, `10.11.14-MariaDB`;
+/// the `5.5.5-` replication prefix is skipped).
+fn at_least_11_4(version: &str) -> bool {
+    let v = version.strip_prefix("5.5.5-").unwrap_or(version);
+    let mut parts = v
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    (major, minor) >= (11, 4)
+}
+
 // ---- The catalog loader (F6): MariaDB's answer to the five `information_schema` reads. The
 // reads themselves are shared with `mysql.rs` (called into, never copied); MariaDB's own are
 // how the rows are answered: plain-SQL generation expressions, and the default collation of a

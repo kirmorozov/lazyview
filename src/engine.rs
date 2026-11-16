@@ -676,6 +676,8 @@ struct Engine {
     flavor: Flavor,
     /// Source capabilities, detected from the flavor once at connect.
     caps: SourceCaps,
+    /// The server's `VERSION()` (the source's planning rules read it, see `refuse_for_source`).
+    server_version: String,
     /// Source reads: lookups, refresh SELECTs, catalog.
     src: Conn,
     /// Metadata writes on the source.
@@ -1118,6 +1120,7 @@ impl Engine {
             schema,
             flavor: info.flavor,
             caps: info.flavor.detect(),
+            server_version: info.version.clone(),
             src,
             meta: meta_conn,
             targets,
@@ -1590,13 +1593,34 @@ impl Engine {
         let r = tokio::time::timeout(self.cfg.plan_timeout, rx).await;
         self.metrics.beat();
         match r {
-            Ok(Ok(plan)) => plan,
+            Ok(Ok(plan)) => {
+                let plan = plan?;
+                self.refuse_for_source(&plan)?;
+                Ok(plan)
+            }
             Ok(Err(_)) => Err(anyhow!("planning failed: the planner panicked")),
             Err(_) => {
                 Metrics::add(&self.metrics.plans_timed_out, 1);
                 Err(PlanTimedOut(self.cfg.plan_timeout).into())
             }
         }
+    }
+
+    /// Refuses an incremental plan that the source cannot maintain from its row images
+    /// ([`source::plan_refusal`], per flavor and server version). Full-refresh plans re-read the
+    /// source and are never refused here.
+    fn refuse_for_source(&self, plan: &ViewPlan) -> Result<()> {
+        if matches!(plan.mode, Mode::Full(_)) {
+            return Ok(());
+        }
+        for a in &plan.aliases {
+            if let Some(why) =
+                source::plan_refusal(self.flavor, &self.server_version, &a.table, &a.referenced)
+            {
+                bail!("{why}");
+            }
+        }
+        Ok(())
     }
 
     async fn set_state(

@@ -151,14 +151,14 @@ fn ddl_rename_away_and_back() {
     });
 }
 
-/// Whether row images carry STORED generated columns here: MariaDB >= 11.4 leaves generated
-/// columns out of row images (issue #7; STORED ones on 13.x too), so keys over them miss row
-/// moves there until that is fixed.
-async fn images_carry_stored(ctx: &Ctx, c: &mut mysql_async::Conn) -> Result<bool> {
+/// Whether this server refuses views that read past a generated column: MariaDB >= 11.4 leaves
+/// generated columns out of row images (issue #7; STORED ones on 13.x too), so the planner
+/// refuses such a view with a reason naming #7 until that is fixed.
+async fn refuses_generated_gaps(ctx: &Ctx, c: &mut mysql_async::Conn) -> Result<bool> {
     if !ctx.server().is_mariadb() {
-        return Ok(true);
+        return Ok(false);
     }
-    Ok(server_version(c).await? < (11, 4))
+    Ok(server_version(c).await? >= (11, 4))
 }
 
 /// STORED generated and INVISIBLE columns in the middle of a table, then reorder ALTERs
@@ -166,24 +166,28 @@ async fn images_carry_stored(ctx: &Ctx, c: &mut mysql_async::Conn) -> Result<boo
 /// followed in the same stream by changes of the columns after the moved ones: row images are
 /// mapped by ordinal, so every ALTER moves the later columns. `SELECT *` leaves invisible
 /// columns out, also after one moves first. STORED keys run where row images carry them
-/// (skipped visibly on MariaDB >= 11.4, issue #7); VIRTUAL columns are issue #7 too.
+/// (MariaDB >= 11.4, issue #7: a view reading past a generated column is asserted refused).
 #[test]
 fn ddl_generated_and_invisible_columns_mid_table() {
     scenario("ddl_mid_columns", |ctx| async move {
         let db = ctx.new_db("ddl_mid_columns").await?;
         let mut c = db.conn().await?;
-        let stored = images_carry_stored(&ctx, &mut c).await?;
-        if !stored {
-            ctx.skip(
-                "STORED part: MariaDB >= 11.4 leaves generated columns out of row images \
-                 (issue #7); the INVISIBLE and reorder parts run",
-            );
-        }
+        // Where the server refuses views past a generated column (issue #7), the STORED part is
+        // not run: a view reading one is asserted refused at planning instead (below).
+        let refused = refuses_generated_gaps(&ctx, &mut c).await?;
+        let stored = !refused;
         let s_col = if stored {
             "s INT AS (a + 1) STORED, "
         } else {
             ""
         };
+        if refused {
+            exec(
+                &mut c,
+                "CREATE TABLE gen_part (id INT PRIMARY KEY, a INT NULL, s INT AS (a + 1) STORED, c INT NULL)",
+            )
+            .await?;
+        }
         exec(
             &mut c,
             &format!(
@@ -256,6 +260,25 @@ fn ddl_generated_and_invisible_columns_mid_table() {
         let (mut eng, _ids) =
             start_with_views(&ctx, &db, &specs, &[("LAZYVIEW_BATCH_WINDOW_MS", "300")]).await?;
         verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+        if refused {
+            // The STORED part, asserted: the view reads the generated column and the column after
+            // it, so the planner refuses it, and the state's reason names issue #7.
+            add_views(
+                &mut c,
+                &[ViewSpec::new(
+                    "v_gen_part",
+                    Kind::Incremental,
+                    "SELECT id, s, c FROM gen_part",
+                )],
+            )
+            .await?;
+            let row = wait_state(&mut c, &mut eng, "v_gen_part", "error", t_ready()).await?;
+            let why = row.last_error.unwrap_or_default();
+            ensure!(
+                why.contains("#7"),
+                "the refusal does not name issue #7: {why}"
+            );
+        }
         // After every step, in the same stream: changes of the columns after the moved ones.
         let later = [
             "UPDATE entity SET c = c + 1 WHERE id % 2 = 0",
