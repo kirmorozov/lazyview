@@ -93,6 +93,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     echo 'fn main() {}' > src/main.rs; \
     : > src/lib.rs; \
     cargo zigbuild --release --locked --target "$(cat /rust-target)"; \
+    # Keep the stub binary: the application layer proves it replaced this one.
+    mkdir -p /stub; \
+    cp "target/$(cat /rust-target)/release/lazyview" /stub/lazyview; \
     rm -rf src
 
 # Application layer.
@@ -101,12 +104,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     set -eux; \
     t="$(cat /rust-target)"; \
-    # The stub build left fresh fingerprints for our own crate whose mtime is
-    # newer than the COPYed sources; drop them so cargo rebuilds lazyview.
-    rm -rf "target/${t}/release/.fingerprint/lazyview-"* \
-           "target/${t}/release/deps/lazyview-"* \
-           "target/${t}/release/deps/liblazyview-"*; \
+    # The stub build left artifacts for our own crate whose fingerprints are newer than the
+    # COPYed sources, so cargo sees them as fresh and would ship the stub (which prints
+    # nothing, which is what `make docker-smoke` caught on the 1.100 bump). Forcing the
+    # rebuild must not depend on how this cargo names its bookkeeping: the old
+    # `rm -rf .../lazyview-*` globs matched nothing on cargo 1.100 (neither .fingerprint/
+    # nor deps/ files carry the package name any more). So ask cargo to drop our package's
+    # own artifacts, and stamp the sources newer than the stub build; deps stay cached.
+    cargo clean -p lazyview --release --target "${t}"; \
+    find src -type f -exec touch {} +; \
     cargo zigbuild --release --locked --target "${t}"; \
+    if cmp -s "target/${t}/release/lazyview" /stub/lazyview; then \
+      echo "lazyview was not rebuilt from src/: the binary is still the stub" >&2; \
+      exit 1; \
+    fi; \
     mkdir -p /out; \
     cp "target/${t}/release/lazyview" /out/lazyview
 
