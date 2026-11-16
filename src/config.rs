@@ -67,6 +67,11 @@ pub const DEFAULT_MAX_TARGET: usize = 2;
 /// Default upper bound (seconds) for one table-lock wait of a session the engine opens
 /// (`LAZYVIEW_TEST_LOCK_WAIT_S`); the server default (a year) would hang a blocked refresh.
 pub const DEFAULT_LOCK_WAIT_S: u64 = 60;
+/// Default upper bound (seconds) for one try of the shadow swap's wait for the view table's
+/// metadata lock (`LAZYVIEW_SWAP_LOCK_WAIT_S`, the released v0.1.0's 5 s). The number of tries
+/// is bounded by `supervisor::Policy::SWAP`; a swap that still cannot get the lock is reported
+/// and left to the next full rebuild (A-05, N-01), never retried on the binlog loop (N-02).
+pub const DEFAULT_SWAP_LOCK_WAIT_S: u64 = 5;
 
 /// `min(4, max(1, cores / 4))`.
 pub fn default_cpu_workers() -> usize {
@@ -146,6 +151,13 @@ pub struct Config {
     /// engine opens waits for a table lock (`SET SESSION lock_wait_timeout`, the third statement
     /// of `crate::target::source_session_setup`); a refresh blocked longer fails and is retried with backoff.
     pub lock_wait_s: u64,
+    /// `LAZYVIEW_SWAP_LOCK_WAIT_S=<s>` (default 5): how long at most one try of the shadow
+    /// swap waits for the view table's metadata lock (MySQL `lock_wait_timeout`, PostgreSQL
+    /// `lock_timeout`, set on the swap's own statements only), a bounded number of tries
+    /// (`supervisor::Policy::SWAP`). A swap that cannot get the lock does not fail the view:
+    /// it is reported at WARN and left to the next full rebuild, and it is never retried on
+    /// the binlog loop. The general `lock_wait_s` stays for every other statement.
+    pub swap_lock_wait_s: u64,
     /// Background builds running at once (each holds 1 + targets connections).
     pub build_concurrency: usize,
     /// Wait before reading sources when no GTID fence is available (binlog events can arrive
@@ -371,6 +383,7 @@ impl Config {
             test_query_dsn,
             test_meta_dsn,
             lock_wait_s: num("LAZYVIEW_TEST_LOCK_WAIT_S", DEFAULT_LOCK_WAIT_S)?.max(1),
+            swap_lock_wait_s: num("LAZYVIEW_SWAP_LOCK_WAIT_S", DEFAULT_SWAP_LOCK_WAIT_S)?.max(1),
             heartbeat: Duration::from_millis(num("LAZYVIEW_HEARTBEAT_MS", 5_000)?.max(100)),
             visibility_delay: Duration::from_millis(num("LAZYVIEW_VISIBILITY_DELAY_MS", 20)?),
             position_persist_interval: Duration::from_millis(num(
@@ -799,6 +812,7 @@ mod tests {
         assert_eq!(c.plan_timeout, Duration::from_secs(10));
         assert_eq!(c.test_plan_delay, None);
         assert_eq!(c.lock_wait_s, DEFAULT_LOCK_WAIT_S);
+        assert_eq!(c.swap_lock_wait_s, DEFAULT_SWAP_LOCK_WAIT_S);
         assert_eq!(
             (
                 c.test_build_delay.clone(),
@@ -815,10 +829,12 @@ mod tests {
             ("LAZYVIEW_TEST_BUILD_HOLD_BYTES", "1700000"),
             ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "32"),
             ("LAZYVIEW_TEST_LOCK_WAIT_S", "2"),
+            ("LAZYVIEW_SWAP_LOCK_WAIT_S", "3"),
         ])
         .unwrap();
         assert_eq!(c.plan_timeout, Duration::from_millis(1500));
         assert_eq!(c.lock_wait_s, 2);
+        assert_eq!(c.swap_lock_wait_s, 3);
         assert_eq!(
             c.test_plan_delay,
             Some(("/*slow:x*/".to_string(), Duration::from_millis(250)))

@@ -1,10 +1,12 @@
 use super::*;
 
 /// The first build of a view (here: rebuilt at startup) swaps its table in off the binlog loop:
-/// an open reader transaction on the old table holds its metadata lock, and the swap waits and
-/// retries for as long as it is open. On the loop, every attempt stalled the engine for up to
-/// `lock_wait_timeout` (5 s), so no other view was refreshed meanwhile (brutal `window_0ms`:
-/// 30 first builds serialized at 5-21 s per swap on slow servers).
+/// an open reader transaction on the old table holds its metadata lock, and the swap waits only
+/// its own bounded wait (`LAZYVIEW_SWAP_LOCK_WAIT_S` × `Policy::SWAP` tries), then retries as a
+/// new build — never on the loop, and never swaps in while the table is locked. On the loop,
+/// every attempt stalled the engine for up to `lock_wait_timeout` (5 s), so no other view was
+/// refreshed meanwhile (brutal `window_0ms`: 30 first builds serialized at 5-21 s per swap on
+/// slow servers).
 #[test]
 fn reg_first_build_swap_does_not_stall_other_views() {
     scenario("reg_swap_bg", |ctx| async move {
@@ -74,7 +76,9 @@ fn reg_first_build_swap_does_not_stall_other_views() {
             )
             .await?;
             ensure!(
-                state.as_deref() == Some("building"),
+                // The swap gave up on its bounded lock wait (and retries as a new build):
+                // the only state a locked table must never reach is `ready`.
+                state.as_deref() != Some("ready"),
                 "r_locked went live although its table is locked: {state:?}"
             );
             Ok(())

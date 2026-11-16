@@ -471,8 +471,10 @@ struct Next {
     hash: String,
     /// Targets already swapped (a swap interrupted on one target is resumed on the rest).
     swapped: HashSet<String>,
-    /// Retry the swap no earlier than this (an MV reader held a metadata lock).
-    not_before: Option<Instant>,
+    /// Targets whose swap gave up on its own bounded lock wait (`swap_lock_wait_s`, a reader
+    /// held the table's metadata lock): the binlog loop never waits for or retries them —
+    /// they are reported and left to the next rebuild (N-02).
+    lock_wait: HashSet<String>,
     /// Position the build started at: it reflects every change up to here.
     started: Position,
     /// Replay position of the oldest change buffered in `dirty`.
@@ -649,11 +651,14 @@ struct ShownState {
 }
 
 /// A finished build: its layout, the targets it could not be built on, those it already
-/// swapped in itself (routine rebuilds of full-mode views) and the cascade cache it seeded.
+/// swapped in itself (routine rebuilds of full-mode views), those whose swap gave up on its
+/// bounded lock wait (they are left to the next rebuild; N-01, N-02) and the cascade cache it
+/// seeded.
 struct Built {
     layout: Layout,
     failed: Vec<(String, anyhow::Error)>,
     swapped: Vec<String>,
+    lock_wait: Vec<String>,
     cache: cascade::Cache,
 }
 
@@ -2521,6 +2526,7 @@ impl Engine {
             name.clone(),
             (self.cfg.write_batch_rows, self.cfg.write_batch_bytes),
             self.cfg.lock_wait_s,
+            self.cfg.swap_lock_wait_s,
             self.metrics.clone(),
             self.build_tx.clone(),
             self.build_slots.clone(),
@@ -2575,7 +2581,7 @@ impl Engine {
             partial,
             hash,
             swapped: HashSet::new(),
-            not_before: None,
+            lock_wait: HashSet::new(),
             started: self.boundary.to_position(),
             since: None,
             recent: Lookback::default(),
@@ -4625,7 +4631,7 @@ impl Engine {
         for s in &self.slots {
             if let Some(n) = &s.next {
                 if n.done.is_some() {
-                    due.push(n.not_before.unwrap_or(now));
+                    due.push(now);
                 }
             } else if s.live.as_ref().is_some_and(|l| !l.frozen)
                 && s.waiting.is_none()
@@ -4768,7 +4774,7 @@ impl Engine {
                 }
             }
             self.retry_down().await;
-            let now = Instant::now();
+            let _now = Instant::now();
             // Supervised: the live views refresh together (below), each after its swap.
             let together = self.sup.is_some();
             for i in 0..self.slots.len() {
@@ -4776,7 +4782,7 @@ impl Engine {
                 if self.slots[i]
                     .next
                     .as_ref()
-                    .map(|n| n.done.is_some() && n.not_before.map(|t| t <= now).unwrap_or(true))
+                    .map(|n| n.done.is_some())
                     .unwrap_or(false)
                 {
                     self.finish_next(i).await;
@@ -5237,6 +5243,7 @@ impl Engine {
             layout,
             failed,
             swapped,
+            lock_wait,
             cache,
         } = match n.done.take().unwrap() {
             Ok(b) => b,
@@ -5248,6 +5255,7 @@ impl Engine {
         let log = n.dirty.cache.install(cache);
         accumulate::drain(&n.plan, &mut n.dirty, log);
         n.swapped.extend(swapped);
+        n.lock_wait.extend(lock_wait);
         // Targets the build could not use are retried later; the view goes live on the rest.
         let mut first_err = None;
         for (t, e) in failed {
@@ -5342,6 +5350,7 @@ impl Engine {
                     self.build_tx.clone(),
                     (self.slots[i].def_id, n.generation),
                     self.cfg.lock_wait_s,
+                    self.cfg.swap_lock_wait_s,
                     self.metrics.clone(),
                 ));
                 n.swapping = true;
@@ -5357,71 +5366,116 @@ impl Engine {
             if n.swapped.contains(&t) {
                 continue;
             }
-            let ts = self.targets[&t].schema.clone();
-            let kind = self.targets[&t].kind;
-            // Someone created a table with this name meanwhile: never replace it.
-            let live_has = self.slots[i]
-                .live
-                .as_ref()
-                .map(|l| l.name == n.name && l.targets.contains(&t))
-                .unwrap_or(false);
-            if !live_has && !self.owned.contains_key(&(n.name.clone(), t.clone())) {
-                let marker = target::marker(&n.name, self.slots[i].def_id);
-                let exists = match self.target_conn(&t).await {
-                    Ok(c) => foreign_table(c, &ts, &n.name, &marker).await,
-                    Err(_) => false,
-                };
-                if exists {
-                    let e = anyhow!(
-                        "refusing to replace `{ts}`.`{}` on target {t}: the table appeared during the build and is not managed by lazyview",
-                        n.name
-                    );
-                    n.targets.retain(|x| *x != t);
-                    let plan = n.plan.clone();
-                    self.target_down(i, &n.name, &t, Some(&plan), &e).await;
-                    first_err.get_or_insert(e);
-                    continue;
-                }
-            }
-            let timeout = self.cfg.target_timeout;
-            let (lock_wait, m) = (self.cfg.lock_wait_s, self.metrics.clone());
-            let r = match self.target_conn(&t).await {
-                Ok(c) => {
-                    match tokio::time::timeout(
-                        timeout,
-                        target::swap(c, kind, &ts, &n.name, lock_wait, &m),
-                    )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(_) => Err(anyhow!("timed out after {timeout:?}")),
+            // The swap waits for the table lock off the binlog loop (N-02): a target whose
+            // off-loop swap (the build task or the swap task) already timed out on the lock
+            // is not tried again here — it goes straight to "left to the next rebuild".
+            let timed_out = n.lock_wait.contains(&t);
+            let r = if timed_out {
+                Err(anyhow!(
+                    "the swap's lock wait timed out off the binlog loop ({} s per try)",
+                    self.cfg.swap_lock_wait_s
+                ))
+            } else {
+                let ts = self.targets[&t].schema.clone();
+                let kind = self.targets[&t].kind;
+                // Someone created a table with this name meanwhile: never replace it.
+                let live_has = self.slots[i]
+                    .live
+                    .as_ref()
+                    .map(|l| l.name == n.name && l.targets.contains(&t))
+                    .unwrap_or(false);
+                if !live_has && !self.owned.contains_key(&(n.name.clone(), t.clone())) {
+                    let marker = target::marker(&n.name, self.slots[i].def_id);
+                    let exists = match self.target_conn(&t).await {
+                        Ok(c) => foreign_table(c, &ts, &n.name, &marker).await,
+                        Err(_) => false,
+                    };
+                    if exists {
+                        let e = anyhow!(
+                            "refusing to replace `{ts}`.`{}` on target {t}: the table appeared during the build and is not managed by lazyview",
+                            n.name
+                        );
+                        n.targets.retain(|x| *x != t);
+                        let plan = n.plan.clone();
+                        self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                        first_err.get_or_insert(e);
+                        continue;
                     }
                 }
-                Err(e) => Err(e),
+                let timeout = self.cfg.target_timeout;
+                let (swap_wait, session_wait, m) = (
+                    self.cfg.swap_lock_wait_s,
+                    self.cfg.lock_wait_s,
+                    self.metrics.clone(),
+                );
+                match self.target_conn(&t).await {
+                    Ok(c) => {
+                        match tokio::time::timeout(
+                            timeout,
+                            target::swap(c, kind, &ts, &n.name, swap_wait, session_wait, &m),
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => Err(anyhow!("timed out after {timeout:?}")),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
             };
             match r {
                 Ok(()) => {
                     n.swapped.insert(t.clone());
                 }
-                Err(e) if server_code(&e) == Some(1205) => {
-                    // An open reader transaction on the old table holds its metadata lock:
-                    // keep maintaining both versions and retry the swap shortly.
-                    debug!(view = %n.name, target = %t, "swap waits for a metadata lock; retrying");
-                    n.dirty.merge(dirty);
-                    n.since = match (since, n.since.take()) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (a, b) => a.or(b),
-                    };
-                    n.done = Some(Ok(Built {
-                        layout,
-                        failed: Vec::new(),
-                        swapped: Vec::new(),
-                        cache: cascade::Cache::default(),
-                    }));
-                    n.not_before = Some(Instant::now() + Duration::from_secs(5));
-                    self.slots[i].next = Some(n);
-                    self.first_dirty.get_or_insert_with(Instant::now);
-                    return;
+                Err(e) if timed_out || target::is_lock_wait_timeout(&e) => {
+                    // A reader's open transaction holds the table's metadata lock and the
+                    // swap spent its own bounded wait on it (N-01). The binlog loop never
+                    // waits for that lock and never retries this swap (N-02): the view is
+                    // reported at the default level and the swap is left to the next rebuild.
+                    n.lock_wait.insert(t.clone());
+                    if self.slots[i].live.is_some() && !n.partial {
+                        warn!(
+                            view = %n.name, target = %t,
+                            "the swap could not get the table lock within {} s per try ({} tries); \
+                             the view keeps its current table: the swap is left to the next rebuild",
+                            self.cfg.swap_lock_wait_s,
+                            crate::supervisor::Policy::SWAP.attempts + 1,
+                        );
+                        // The live version keeps serving; the changes buffered for this
+                        // version go back to it (a full-mode view is dirty again: the
+                        // LAZYVIEW_FULL_REFRESH_MS cadence starts the next rebuild, and that
+                        // one swaps once the reader is gone). Same merge as `next_failed`.
+                        if let Some(l) = self.slots[i].live.as_mut() {
+                            if Arc::ptr_eq(&l.plan, &n.plan) || matches!(l.plan.mode, Mode::Full(_))
+                            {
+                                l.dirty.merge(dirty);
+                                if matches!(l.plan.mode, Mode::Full(_)) {
+                                    l.dirty.all = true;
+                                }
+                                if let Some(p) = since {
+                                    if l.since.as_ref().is_none_or(|s| p < *s) {
+                                        l.since = Some(p);
+                                    }
+                                }
+                            }
+                        }
+                        for t in &n.targets {
+                            if !n.swapped.contains(t) {
+                                self.drop_shadow(t, &n.name).await;
+                            }
+                        }
+                        return; // `n` is dropped: the live version stays as it was.
+                    }
+                    // A first build (no live version yet) or a partial add: there is no
+                    // serving table to keep, so the target fails as for any other swap error
+                    // — but the connection is healthy (a lock timeout is not a connection
+                    // fault) and the retry runs as a new build task, never on the loop.
+                    warn!(view = %n.name, target = %t, "the swap gave up on the table lock: {e:#}");
+                    let e = e.context(format!("swapping in new version on target {t}"));
+                    n.targets.retain(|x| *x != t);
+                    let plan = n.plan.clone();
+                    self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                    first_err.get_or_insert(e);
                 }
                 Err(e) => {
                     self.targets.get_mut(&t).unwrap().conn = None;
@@ -7163,9 +7217,11 @@ async fn swap_task(
     tx: mpsc::UnboundedSender<BuildDone>,
     (def_id, generation): (u64, u64),
     lock_wait_s: u64,
+    swap_lock_wait_s: u64,
     metrics: Arc<Metrics>,
 ) {
     let mut swapped = Vec::new();
+    let mut lock_wait = Vec::new();
     for (t, opts, schema, kind, check) in targets {
         let r = async {
             let mut c = match tokio::time::timeout(
@@ -7183,16 +7239,31 @@ async fn swap_task(
                     bail!("a table `{name}` appeared during the build");
                 }
             }
-            // A reader holding the old table's metadata lock: swap sets lock_wait_timeout to
-            // the one knob and the shared helper (STATEMENTS) retries the transient 1205; swap's
-            // "already swapped" check makes a repeat a no-op (no second loop here).
-            let r = target::swap(&mut c, kind, &schema, &name, lock_wait_s, &metrics).await;
+            // A reader holding the old table's metadata lock: the swap waits for it only its
+            // own operator setting, `swap_lock_wait_s`, a bounded number of tries
+            // (Policy::SWAP, N-01); the "already swapped" check makes a repeat a no-op (no
+            // second loop here). A lock-wait failure is remembered so the binlog loop never
+            // retries this target (N-02): it is left to the next rebuild.
+            let r = target::swap(
+                &mut c,
+                kind,
+                &schema,
+                &name,
+                swap_lock_wait_s,
+                lock_wait_s,
+                &metrics,
+            )
+            .await;
             let _ = c.disconnect().await;
             r
         }
         .await;
         match r {
             Ok(()) => swapped.push(t),
+            Err(e) if target::is_lock_wait_timeout(&e) => {
+                debug!(view = %name, target = %t, "the swap's lock wait timed out; left to the next rebuild");
+                lock_wait.push(t);
+            }
             Err(e) => debug!(view = %name, target = %t, "swap left to the engine: {e:#}"),
         }
     }
@@ -7203,6 +7274,7 @@ async fn swap_task(
             layout,
             failed: Vec::new(),
             swapped,
+            lock_wait,
             cache: cascade::Cache::default(),
         }),
     });
@@ -7339,6 +7411,7 @@ async fn build_task(
     name: String,
     batch: (usize, usize),
     lock_wait_s: u64,
+    swap_lock_wait_s: u64,
     metrics: Arc<Metrics>,
     tx: mpsc::UnboundedSender<BuildDone>,
     slots: Arc<tokio::sync::Semaphore>,
@@ -7383,6 +7456,7 @@ async fn build_task(
         // `swap`: swap the shadow tables in right away. A target where that fails is left to
         // the engine, which swaps (and retries) the rest as for any build.
         let mut swapped = Vec::new();
+        let mut lock_wait = Vec::new();
         for ((c, ts, _), spec) in conns.iter_mut().zip(
             targets
                 .iter()
@@ -7395,8 +7469,15 @@ async fn build_task(
                 debug!(view = %name, target = %spec.target, "swap left to the engine: a table appeared during the build");
                 continue;
             }
-            match target::swap(c, spec.kind, ts, &name, lock_wait_s, &metrics).await {
+            match target::swap(c, spec.kind, ts, &name, swap_lock_wait_s, lock_wait_s, &metrics).await {
                 Ok(()) => swapped.push(spec.target.clone()),
+                Err(e) if target::is_lock_wait_timeout(&e) => {
+                    // The swap's own lock wait ran out (off the binlog loop, bounded):
+                    // remember the target so the loop does not retry it (N-02); the engine
+                    // reports it and leaves the swap to the next rebuild.
+                    debug!(view = %name, target = %spec.target, "the swap's lock wait timed out; left to the next rebuild");
+                    lock_wait.push(spec.target.clone());
+                }
                 Err(e) => {
                     debug!(view = %name, target = %spec.target, "swap left to the engine: {e:#}")
                 }
@@ -7410,6 +7491,7 @@ async fn build_task(
             layout,
             failed,
             swapped,
+            lock_wait,
             cache,
         })
     }

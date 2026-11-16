@@ -376,7 +376,13 @@ fn unit_cols<'a>(layout: &'a Layout, pos: &[usize]) -> (Vec<String>, Vec<&'a MvC
 /// the two MySQL edge cases: a table that does not exist yet is a plain rename; the first (a
 /// shadow already gone) is answered by [`PgConn::swap`] before any statement.
 #[allow(dead_code)] // the swap of PR T5's write path; [`swap_statement_block`] proves the block
-fn swap_block(schema: &str, name: &str, live: bool, renames: &[String]) -> String {
+fn swap_block(
+    schema: &str,
+    name: &str,
+    live: bool,
+    renames: &[String],
+    lock_wait_s: u64,
+) -> String {
     let (s, base) = (quote_ident(schema), quote_ident(name));
     let (shadow, old) = (
         quote_ident(&shadow_name(name)),
@@ -384,7 +390,9 @@ fn swap_block(schema: &str, name: &str, live: bool, renames: &[String]) -> Strin
     );
     let mut stmts = vec![
         "BEGIN;".to_string(),
-        "SET LOCAL lock_timeout = '5s';".to_string(),
+        // The swap's own bounded lock wait (N-01): the operator's `swap_lock_wait_s`, local to
+        // this transaction so the session's general `lock_timeout` covers every other statement.
+        format!("SET LOCAL lock_timeout = '{}s';", lock_wait_s.max(1)),
     ];
     if live {
         stmts.push(format!("ALTER TABLE {s}.{base} RENAME TO {old};"));
@@ -453,8 +461,9 @@ fn presence_marks(p: &Presence, value: &Datum) -> String {
 /// the forms the writer and the reader of this module agree on (`TimeZone='UTC'` so a
 /// `timestamptz` text is an exact UTC datetime, like MySQL's `+00:00` session —
 /// src/mv.rs:1107; `DateStyle='ISO'` and `bytea_output='hex'` and `extra_float_digits=1` so
-/// the text forms are stable even under an `ALTER ROLE ... SET`; `lock_timeout` bounds a
-/// swap behind a reader, the analogue of `lock_wait_timeout` (src/mv.rs:1077).
+/// the text forms are stable even under an `ALTER ROLE ... SET`; `lock_timeout` bounds the
+/// general statement's wait for a table lock, the analogue of MySQL's `lock_wait_timeout` —
+/// the swap itself waits only its own `swap_lock_wait_s`, `SET LOCAL` inside its block.
 pub(crate) fn session_setup(lock_wait_s: u64) -> Vec<String> {
     vec![
         "SET TimeZone = 'UTC'".into(),
@@ -1105,9 +1114,9 @@ impl PgConn {
     /// The transactional swap (T4.6): the shadow becomes `name` and its indexes take the base
     /// table's names, in one `simple_query`. Both edge cases of the MySQL swap are here: a shadow
     /// that is already gone is `Ok(())` (an interrupted build, nothing to do), and a live table
-    /// that does not exist yet is a plain rename. Reached through `target::swap` (the end of a
-    /// build, T6) and the engine's deferred swap.
-    pub(crate) async fn swap(&self, schema: &str, name: &str) -> Result<()> {
+    /// that does not exist yet is a plain rename. `lock_wait_s` is the swap's own bounded lock
+    /// wait (`Config::swap_lock_wait_s`, N-01), applied with `SET LOCAL` inside the block.
+    pub(crate) async fn swap(&self, schema: &str, name: &str, lock_wait_s: u64) -> Result<()> {
         let shadow = shadow_name(name);
         if self.table_kind(schema, &shadow).await?.is_none() {
             return Ok(());
@@ -1131,7 +1140,7 @@ impl PgConn {
             .collect();
         let renames = index_renames(schema, name, &found);
         self.client
-            .simple_query(&swap_block(schema, name, live, &renames))
+            .simple_query(&swap_block(schema, name, live, &renames, lock_wait_s))
             .await?;
         Ok(())
     }
@@ -2297,14 +2306,19 @@ mod tests {
             "COMMIT;",
         ]
         .join("\n");
-        assert_eq!(swap_block("s", "items", true, &renames), expected);
+        assert_eq!(swap_block("s", "items", true, &renames, 5), expected);
         // A first build has no live table to rename away, and its `__lv_old` was never there.
-        let first = swap_block("s", "items", false, &[]);
+        let first = swap_block("s", "items", false, &[], 5);
         assert!(!first.contains("RENAME TO \"items__lv_old\""), "{first}");
         assert_eq!(first.matches("DROP TABLE IF EXISTS").count(), 2, "{first}");
         assert!(
             first.starts_with("BEGIN;") && first.ends_with("COMMIT;"),
             "{first}"
+        );
+        // The lock wait is the caller's setting, not a second hardcoded 5 s (N-01).
+        assert!(
+            swap_block("s", "items", true, &[], 1).contains("SET LOCAL lock_timeout = '1s';"),
+            "swap_block must use the caller's lock wait"
         );
         // The catalog's names become the base table's, under the 63-byte cap and under its
         // `definition_hash` fallback alike; a name that is not the view's is left alone.

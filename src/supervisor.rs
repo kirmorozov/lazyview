@@ -76,6 +76,18 @@ impl Policy {
         cap: Duration::from_secs(30),
         jitter: true,
     };
+    /// The shadow swap (N-01): the lock wait is the operator's own setting
+    /// (`Config::swap_lock_wait_s`), one try per statement group and a single retry for
+    /// connection-class blips — the total wait is bounded by `2 × swap_lock_wait_s` per call.
+    /// A swap that still cannot get the table lock returns the error: the call site reports
+    /// it and leaves the swap to the next rebuild; the engine never retries a swap on the
+    /// binlog loop (N-02).
+    pub(crate) const SWAP: Policy = Policy {
+        attempts: 1,
+        base: Duration::from_millis(50),
+        cap: Duration::from_millis(50),
+        jitter: false,
+    };
 }
 /// Diffs (old + new rows) of at least this many rows run off the async threads...
 pub const OFFLOAD_ROWS: usize = 4096;

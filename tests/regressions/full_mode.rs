@@ -269,3 +269,119 @@ fn reg_failed_full_rebuild_backs_off() {
         eng.stop().await
     });
 }
+
+/// A-05 (N-01, N-02): a reader transaction on the live table of a full-mode view. The swap
+/// waits for the table's metadata lock only its own setting (`LAZYVIEW_SWAP_LOCK_WAIT_S`) and
+/// a bounded number of tries, and it does that off the binlog loop: when the wait runs out the
+/// swap gives up without a crash, reports at WARN naming the view and the wait, and the binlog
+/// loop keeps flowing (the incremental view of the same table advances). The failed swap is
+/// left to the next cadence rebuild, which swaps once the reader is gone.
+#[test]
+fn reg_full_swap_lock_wait_gives_up_warns_and_next_rebuild_swaps() {
+    scenario("reg_swap_lock_wait", |ctx| async move {
+        use std::time::Instant;
+        // A group key on the NULL side of a LEFT JOIN: the planner's Full mode for sure
+        // (DISTINCT over a unit plans as Grouped), so this exercises the cadence-rebuild path.
+        let specs = vec![
+            ViewSpec::new(
+                "items_all",
+                Kind::Full,
+                "SELECT p.id, COUNT(*) AS n FROM orders o LEFT JOIN products p ON p.id = o.customer_id GROUP BY p.id",
+            ),
+            ViewSpec::new(
+                "items_rows",
+                Kind::Incremental,
+                "SELECT id, status FROM orders",
+            ),
+        ];
+        let (db, mut eng) = setup(
+            &ctx,
+            "reg_swap_lock_wait",
+            &[],
+            &specs,
+            &[
+                ("LAZYVIEW_FULL_REFRESH_MS", "3000"),
+                ("LAZYVIEW_SWAP_LOCK_WAIT_S", "1"),
+            ],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        // A reader with an open transaction holds the full view table's metadata lock: every
+        // swap of `items_all` queues behind it and times out after 1 s per try.
+        let mut reader = db.conn().await?;
+        exec(&mut reader, "START TRANSACTION").await?;
+        let _: Option<i64> = typed_first(&mut reader, "SELECT COUNT(*) FROM items_all").await?;
+        // The changes mark the full view dirty: the cadence starts a rebuild whose swap
+        // cannot get the lock. (The product id 7 row can only come from a rebuilt table.)
+        exec(&mut c, "INSERT INTO products VALUES (7, 'g', 7.00, 1)").await?;
+        exec(&mut c, "INSERT INTO orders VALUES (14, 7, 'new')").await?;
+        let r = async {
+            // The swap gives up within its setting (not the 60 s general lock wait times four)
+            // and reports at the default log level, naming the view and the wait.
+            let t = Instant::now();
+            loop {
+                let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+                if log.contains("items_all")
+                    && log.contains("the swap could not get the table lock")
+                {
+                    break;
+                }
+                ensure!(
+                    t.elapsed() < Duration::from_secs(45),
+                    "the swap never reported its lock-wait give-up; metrics {}",
+                    fmt_snapshot(&eng.snapshot())
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // The binlog loop never waited for that lock: the incremental view of the same
+            // source stays current while the full view's swap is left to the next rebuild.
+            exec(&mut c, "INSERT INTO orders VALUES (15, 7, 'paid')").await?;
+            let t = Instant::now();
+            loop {
+                let n: Option<i64> =
+                    typed_first(&mut c, "SELECT COUNT(*) FROM items_rows WHERE id = 15").await?;
+                if n == Some(1) {
+                    break;
+                }
+                ensure!(
+                    t.elapsed() < Duration::from_secs(15),
+                    "the binlog loop stalled behind the swap's lock wait"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // The failed swap is not a view failure: the view reports `ready` on its old
+            // table while the new one waits for the lock.
+            let state: Option<String> = typed_first(
+                &mut c,
+                "SELECT state FROM _lazyview_state WHERE name = 'items_all'",
+            )
+            .await?;
+            ensure!(
+                state.as_deref() == Some("ready"),
+                "the full view left `ready` when its swap gave up: {state:?}"
+            );
+            Ok(())
+        }
+        .await;
+        // With the reader gone, the next cadence rebuild swaps the new rows in.
+        exec(&mut reader, "COMMIT").await?;
+        r?;
+        let t = Instant::now();
+        loop {
+            // The rebuilt table holds the group of the orders written behind the lock.
+            let n: Option<i64> =
+                typed_first(&mut c, "SELECT COUNT(*) FROM items_all WHERE id = 7").await?;
+            if n == Some(1) {
+                break;
+            }
+            ensure!(
+                t.elapsed() < t_ready(),
+                "the next rebuild did not swap the view in after the reader went away; metrics {}",
+                fmt_snapshot(&eng.snapshot())
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        verify(&ctx, &mut eng, &db, &specs, "after the lock wait").await?;
+        eng.stop().await
+    });
+}

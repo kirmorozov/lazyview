@@ -433,20 +433,47 @@ pub(crate) async fn create_shadow_marked(
 
 /// Atomically replaces `name` with its shadow table (or renames the shadow when `name` is new).
 /// One dispatch per swap (T6): the PostgreSQL arm is `PgConn::swap`, the transactional block
-/// of T4.6, on the target's own connection.
+/// of T4.6, on the target's own connection. `swap_lock_wait_s` is the swap's own bounded lock
+/// wait (N-01); `session_lock_wait_s` is the general wait the MySQL session is restored to
+/// after the swap (the connection is shared with the engine's other statements).
 pub(crate) async fn swap(
     conn: &mut Conn,
     kind: Kind,
     schema: &str,
     name: &str,
-    lock_wait_s: u64,
+    swap_lock_wait_s: u64,
+    session_lock_wait_s: u64,
     metrics: &Metrics,
 ) -> Result<()> {
     match (conn, kind) {
-        (Conn::Mysql(c), Kind::Mysql) => mysql::swap(c, schema, name, lock_wait_s, metrics).await,
-        (Conn::Postgres(c), Kind::Postgres) => c.swap(schema, name).await,
+        (Conn::Mysql(c), Kind::Mysql) => {
+            mysql::swap(
+                c,
+                schema,
+                name,
+                swap_lock_wait_s,
+                session_lock_wait_s,
+                metrics,
+            )
+            .await
+        }
+        (Conn::Postgres(c), Kind::Postgres) => c.swap(schema, name, swap_lock_wait_s).await,
         _ => bail!("internal: target connection and family disagree"),
     }
+}
+
+/// Whether `e` is a swap giving up on the table lock: MySQL error 1205 (a `lock_wait_timeout`
+/// expiry), PostgreSQL SQLSTATE 55P03 (`lock_not_available`, its `lock_timeout`). Call sites
+/// report such a swap and leave it to the next rebuild instead of retrying it (N-01, N-02).
+pub(crate) fn is_lock_wait_timeout(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<mysql_async::Error>(),
+            Some(mysql_async::Error::Server(se)) if se.code == 1205
+        ) || c
+            .downcast_ref::<tokio_postgres::Error>()
+            .is_some_and(|e| e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE))
+    })
 }
 
 /// The statements that give a new pooled connection the family's session settings. Dispatched
