@@ -215,6 +215,39 @@ fn lost_backend(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Timeout>()) || is_conn_lost(e)
 }
 
+/// The connect of a target write failed, at the edge where the statement retry runs: the marker
+/// [`write_once`] puts on [`Endpoint::conn`]'s error. A connection has its own retries at the
+/// connect edge (`Policy::CONNECT`, and for a target the engine's lag `retry_at` backoff), so the
+/// statement edge does not repeat it — one retry policy per edge (§4.2). Without the marker an
+/// unreachable target costs `Policy::STATEMENTS` attempts × [`CONNECT_TIMEOUT`] before it is
+/// reported behind (#214); with it, one bounded connect decides. It carries the connect's own
+/// error, so the classifier still sees the [`Timeout`] (or the driver's refusal) underneath.
+#[derive(Debug)]
+pub(crate) struct WriteConnect(anyhow::Error);
+
+impl std::fmt::Display for WriteConnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the write could not connect: {}", self.0)
+    }
+}
+
+impl std::error::Error for WriteConnect {
+    /// The connect's own failure underneath, so the classifiers stay what they are: a connect
+    /// that timed out is still a [`Timeout`] in the chain for [`is_overload`] and [`lost_backend`],
+    /// a refused one still the driver's error for `binlog::is_transient`. Only the statement
+    /// retry's decision changes, by [`is_write_connect`].
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.root_cause())
+    }
+}
+
+/// An error [`retrying`] must not repeat: [`WriteConnect`] says it is the write's connect, whose
+/// retries the connect edge owns; every other failure of a write op is classified by
+/// [`is_overload`] as it always was.
+fn is_write_connect(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<WriteConnect>())
+}
+
 /// Retry delay `base · 2^(attempt-1)`, capped at `cap`, with ± 50 % jitter when `jitter`.
 /// Also the engine's delay maths for `retry_at` parking (engine R3): the one shape.
 pub(crate) fn backoff(attempt: u32, base: Duration, cap: Duration, jitter: bool) -> Duration {
@@ -633,8 +666,9 @@ pub struct Supervisor {
     read: Arc<Endpoint>,
     /// The write pools, one per target, created on first use. Behind a mutex because
     /// [`Supervisor::write_endpoint`] takes `&self`: the supervisor is shared with the lock task,
-    /// which ends its write ops through it (ruling 1). Held for a lookup or an insert, across no
-    /// await, once per target per refresh.
+    /// which ends its write ops through it (ruling 1), and `Arc`-shared with detached lag
+    /// retries that run their writes from a spawned task while the flush tick moves on (#214).
+    /// Held for a lookup or an insert, across no await, once per target per refresh.
     write: Mutex<BTreeMap<String, Arc<Endpoint>>>,
     cpu: Arc<Semaphore>,
     budget: Arc<Budget>,
@@ -963,7 +997,9 @@ where
     let mut attempt = 0;
     loop {
         match op().await {
-            Err(e) if is_overload(&e) => {
+            // Overload errors are retried; a write's failed connect is not one (one retry
+            // policy per edge, see [`is_write_connect`]).
+            Err(e) if is_overload(&e) && !is_write_connect(&e) => {
                 Metrics::add(&metrics.supervisor_overload_errors, 1);
                 if attempt >= policy.attempts {
                     return Err(e);
@@ -1151,7 +1187,15 @@ async fn write_once(
     let began = AtomicBool::new(false);
     // The one match (T5.2): it picks the statement arm and the id the fence must kill
     // (`conn.id()` for MySQL, `PgConn::pid` for PostgreSQL).
-    match target.endpoint.conn().await? {
+    // The connect is not a statement: its failure carries [`WriteConnect`] so the statement
+    // retry of `write_op` does not repeat it, and it never reaches [`fenced`] — `began` is set
+    // only by the write below, so an abandoned connect needs no fence (§4.3).
+    match target
+        .endpoint
+        .conn()
+        .await
+        .map_err(|e| anyhow::Error::new(WriteConnect(e)))?
+    {
         WriteConn::Mysql(mut conn) => {
             let id = conn.id();
             // From here this op is one of the writes "in flight": it is noted so the leadership
@@ -1412,6 +1456,29 @@ mod tests {
         assert!(
             !is_overload(&server_error(1064)),
             "a rejected statement is never overload"
+        );
+    }
+
+    /// One retry policy per edge (§4.2): the marker [`write_once`] puts on a failed connect
+    /// takes that failure out of the statement retry, and out of it only — the same error stays
+    /// overload for the fence of §4.3, and an ordinary write failure is classified as it always
+    /// was. Without the marker an unreachable target pays `Policy::STATEMENTS` × `CONNECT_TIMEOUT`
+    /// before it is reported behind (#214).
+    #[test]
+    fn write_connect_is_not_retried_at_the_statement_edge() {
+        let e = anyhow::Error::new(WriteConnect(anyhow::Error::new(Timeout(CONNECT_TIMEOUT))));
+        assert!(is_overload(&e), "an unreachable target is still overload");
+        assert!(
+            lost_backend(&e),
+            "and the fence still sees the lost backend"
+        );
+        assert!(
+            is_write_connect(&e),
+            "but the statement edge does not repeat a connect"
+        );
+        assert!(
+            !is_write_connect(&server_error(1064)),
+            "a statement failure is unaffected"
         );
     }
 
