@@ -2,7 +2,8 @@
 //! unit expressions that are boolean operators, TIME and TIMESTAMP keys (fractions, negative,
 //! over 24 h, DST fall-back hour), long unit keys, zero dates, ENUM/SET in numeric context,
 //! negative TIME(1)/TIME(2) binlog values, BINARY(n) padding, non-UTF8 character sets (latin1,
-//! sjis) and MariaDB's UUID / INET4 / INET6. Each test runs on every flavor in
+//! sjis) and UUID / INET4 / INET6 values (native where the server has them, the equivalent
+//! BINARY(16) / CHAR(36) / VARBINARY(16) storage elsewhere). Each test runs on every flavor in
 //! `LAZYVIEW_TEST_DSNS`.
 
 mod common;
@@ -1016,25 +1017,51 @@ fn values_non_utf8_charsets() {
     });
 }
 
-/// MariaDB UUID, INET4 and INET6 values as SPJ columns, group keys, join keys and a PK: their
-/// row-image bytes are not what the server compares (UUIDs of version 1 are stored with their
-/// time fields swapped), so views whose rows they select are planned Full (the SPJ view over an
-/// integer key stays incremental). Zero / max values, IPv4-mapped IPv6, upper-case input and
-/// `UUID()`. The other servers have no such types.
+/// UUID, INET4 and INET6 values as SPJ columns, group keys, join keys and a PK — in the
+/// storage each server has for them, so every flavor proves the values it can hold. Where the
+/// native types exist (MariaDB: UUID from 10.7, INET4 / INET6 from 10.10) they are used as
+/// today: their row-image bytes are not what the server compares (UUIDs of version 1 are
+/// stored with their time fields swapped), so views whose rows they select are planned Full
+/// (the SPJ view over an integer key stays incremental). Where they do not (MySQL / Percona,
+/// MariaDB below 10.10) the same columns take the equivalent storage the docs describe —
+/// UUID as `BINARY(16)`, INET4 as `CHAR(36)`, INET6 as `VARBINARY(16)` — and the same
+/// exactness assertions run over it, with the literals converted (`UNHEX` / plain text /
+/// `INET6_ATON`) so both paths share one statement set.
 #[test]
-fn values_mariadb_uuid_inet() {
+fn val_uuid_inet() {
     scenario("val_uuid_inet", |ctx| async move {
-        if !ctx.server().is_mariadb() {
-            ctx.skip("UUID / INET4 / INET6 are MariaDB types");
-            return Ok(());
-        }
         let mut c = connect(&ctx.server().base_dsn).await?;
         let version = server_version(&mut c).await?;
         c.disconnect().await.ok();
-        if version < (10, 10) {
-            ctx.skip("UUID (MariaDB 10.7) and INET4 (10.10) are newer than this server");
-            return Ok(());
-        }
+        let native = ctx.server().is_mariadb() && version >= (10, 10);
+        let (u_t, a_t, b_t) = if native {
+            ("UUID", "INET4", "INET6")
+        } else {
+            ("BINARY(16)", "CHAR(36)", "VARBINARY(16)")
+        };
+        // The literal conversions shared by the DDL and the steps: byte-identical text on the
+        // native path, its exact equivalents elsewhere.
+        let uuid = |s: &str| {
+            if native {
+                format!("'{s}'")
+            } else {
+                format!("UNHEX(REPLACE('{s}', '-', ''))")
+            }
+        };
+        let uuid_v = || {
+            if native {
+                "UUID()".to_string()
+            } else {
+                "UUID_TO_BIN(UUID())".to_string()
+            }
+        };
+        let ip6 = |s: &str| {
+            if native {
+                format!("'{s}'")
+            } else {
+                format!("INET6_ATON('{s}')")
+            }
+        };
         let specs = vec![
             ViewSpec::new(
                 "v_entity",
@@ -1063,25 +1090,52 @@ fn values_mariadb_uuid_inet() {
             ),
             ViewSpec::new("v_item", Kind::Full, "SELECT u, attr FROM item"),
         ];
-        let ddl = [
-            "CREATE TABLE entity (id INT PRIMARY KEY, u UUID NULL, a INET4 NULL, b INET6 NULL, g INT NULL, \
-             KEY k_u (u), KEY k_a (a))",
-            "CREATE TABLE item (u UUID NOT NULL PRIMARY KEY, attr VARCHAR(10) NULL)",
-            "CREATE TABLE link (id INT PRIMARY KEY, b INET6 NULL, attr VARCHAR(10) NULL)",
-            "INSERT INTO entity VALUES \
-             (1, '00000000-0000-0000-0000-000000000000', '0.0.0.0', '::', 1), \
-             (2, 'ffffffff-ffff-ffff-ffff-ffffffffffff', '255.255.255.255', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', 2), \
-             (3, '123e4567-e89b-12d3-a456-426614174000', '10.0.0.1', '::1', 3), \
-             (4, '550e8400-e29b-41d4-a716-446655440000', '10.0.0.1', '::ffff:192.0.2.1', 4), \
-             (5, 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', '192.0.2.1', '2001:db8::1', 5), \
-             (6, UUID(), NULL, NULL, 6), (7, NULL, '10.0.0.1', '::1', 7), \
-             (8, '123e4567-e89b-12d3-a456-426614174000', '192.0.2.1', '::ffff:192.0.2.1', 8)",
-            "INSERT INTO item VALUES ('00000000-0000-0000-0000-000000000000', 'zero'), \
-             ('123e4567-e89b-12d3-a456-426614174000', 'v1'), ('550e8400-e29b-41d4-a716-446655440000', 'v4'), \
-             ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'upper')",
-            "INSERT INTO link VALUES (1, '::1', 'loop'), (2, '::ffff:192.0.2.1', 'mapped'), (3, '::', 'any'), \
-             (4, NULL, 'null'), (5, '2001:db8::2', 'none')",
-        ];
+        let ddl = [format!(
+                "CREATE TABLE entity (id INT PRIMARY KEY, u {u_t} NULL, a {a_t} NULL, b {b_t} NULL, \
+                 g INT NULL, KEY k_u (u), KEY k_a (a))"
+            ),
+            format!("CREATE TABLE item (u {u_t} NOT NULL PRIMARY KEY, attr VARCHAR(10) NULL)"),
+            format!("CREATE TABLE link (id INT PRIMARY KEY, b {b_t} NULL, attr VARCHAR(10) NULL)"),
+            format!(
+                "INSERT INTO entity VALUES \
+                 (1, {}, '0.0.0.0', {}, 1), \
+                 (2, {}, '255.255.255.255', {}, 2), \
+                 (3, {}, '10.0.0.1', {}, 3), \
+                 (4, {}, '10.0.0.1', {}, 4), \
+                 (5, {}, '192.0.2.1', {}, 5), \
+                 (6, {}, NULL, NULL, 6), (7, NULL, '10.0.0.1', {}, 7), \
+                 (8, {}, '192.0.2.1', {}, 8)",
+                uuid("00000000-0000-0000-0000-000000000000"),
+                ip6("::"),
+                uuid("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+                ip6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+                uuid("123e4567-e89b-12d3-a456-426614174000"),
+                ip6("::1"),
+                uuid("550e8400-e29b-41d4-a716-446655440000"),
+                ip6("::ffff:192.0.2.1"),
+                uuid("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"),
+                ip6("2001:db8::1"),
+                uuid_v(),
+                ip6("::1"),
+                uuid("123e4567-e89b-12d3-a456-426614174000"),
+                ip6("::ffff:192.0.2.1"),
+            ),
+            format!(
+                "INSERT INTO item VALUES ({}, 'zero'), ({}, 'v1'), ({}, 'v4'), ({}, 'upper')",
+                uuid("00000000-0000-0000-0000-000000000000"),
+                uuid("123e4567-e89b-12d3-a456-426614174000"),
+                uuid("550e8400-e29b-41d4-a716-446655440000"),
+                uuid("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+            ),
+            format!(
+                "INSERT INTO link VALUES (1, {}, 'loop'), (2, {}, 'mapped'), (3, {}, 'any'), \
+                 (4, NULL, 'null'), (5, {}, 'none')",
+                ip6("::1"),
+                ip6("::ffff:192.0.2.1"),
+                ip6("::"),
+                ip6("2001:db8::2"),
+            )];
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
         let (db, mut eng) = setup_views(
             &ctx,
             "val_uuid_inet",
@@ -1095,47 +1149,74 @@ fn values_mariadb_uuid_inet() {
         .await?;
         let mut c = db.conn().await?;
         ensure_incremental(&mut c, &specs).await?;
-        let steps: &[(&str, &[&str])] = &[
+        let steps: Vec<(&str, Vec<String>)> = vec![
             (
                 "other column changes, keys unchanged",
-                &["UPDATE entity SET g = g + 10 WHERE a = '10.0.0.1'"],
+                vec!["UPDATE entity SET g = g + 10 WHERE a = '10.0.0.1'".to_string()],
             ),
             (
                 "keys move",
-                &[
-                    "UPDATE entity SET u = 'ffffffff-ffff-ffff-ffff-ffffffffffff' WHERE id = 1",
-                    "UPDATE entity SET a = '255.255.255.255' WHERE id = 3",
-                    "UPDATE entity SET b = '::ffff:10.0.0.1' WHERE id = 4",
-                    "UPDATE entity SET u = '550E8400-E29B-41D4-A716-446655440000' WHERE id = 8",
+                vec![
+                    format!(
+                        "UPDATE entity SET u = {} WHERE id = 1",
+                        uuid("ffffffff-ffff-ffff-ffff-ffffffffffff")
+                    ),
+                    "UPDATE entity SET a = '255.255.255.255' WHERE id = 3".to_string(),
+                    format!(
+                        "UPDATE entity SET b = {} WHERE id = 4",
+                        ip6("::ffff:10.0.0.1")
+                    ),
+                    format!(
+                        "UPDATE entity SET u = {} WHERE id = 8",
+                        uuid("550E8400-E29B-41D4-A716-446655440000")
+                    ),
                 ],
             ),
             (
                 "UUID PK: other column, key change, delete",
-                &[
-                    "UPDATE item SET attr = 'zero2' WHERE u = '00000000-0000-0000-0000-000000000000'",
-                    "UPDATE item SET u = UUID() WHERE attr = 'v4'",
-                    "UPDATE item SET u = 'ffffffff-ffff-ffff-ffff-ffffffffffff' WHERE attr = 'upper'",
-                    "DELETE FROM item WHERE u = '123e4567-e89b-12d3-a456-426614174000'",
+                vec![
+                    format!(
+                        "UPDATE item SET attr = 'zero2' WHERE u = {}",
+                        uuid("00000000-0000-0000-0000-000000000000")
+                    ),
+                    format!("UPDATE item SET u = {} WHERE attr = 'v4'", uuid_v()),
+                    format!(
+                        "UPDATE item SET u = {} WHERE attr = 'upper'",
+                        uuid("ffffffff-ffff-ffff-ffff-ffffffffffff")
+                    ),
+                    format!(
+                        "DELETE FROM item WHERE u = {}",
+                        uuid("123e4567-e89b-12d3-a456-426614174000")
+                    ),
                 ],
             ),
             (
                 "join partner moves",
-                &[
-                    "UPDATE link SET b = '::' WHERE id = 1",
-                    "UPDATE link SET b = '2001:db8::1' WHERE id = 5",
+                vec![
+                    format!("UPDATE link SET b = {} WHERE id = 1", ip6("::")),
+                    format!("UPDATE link SET b = {} WHERE id = 5", ip6("2001:db8::1")),
                 ],
             ),
             (
                 "insert / delete by value",
-                &[
-                    "INSERT INTO entity VALUES (9, UUID(), '0.0.0.0', '::', 9), \
-                     (10, '00000000-0000-0000-0000-000000000000', '10.0.0.1', '::1', 10)",
-                    "DELETE FROM entity WHERE b = '::1'",
-                    "INSERT INTO item VALUES ('123e4567-e89b-12d3-a456-426614174000', 'back')",
+                vec![
+                    format!(
+                        "INSERT INTO entity VALUES (9, {}, '0.0.0.0', {}, 9), \
+                         (10, {}, '10.0.0.1', {}, 10)",
+                        uuid_v(),
+                        ip6("::"),
+                        uuid("00000000-0000-0000-0000-000000000000"),
+                        ip6("::1"),
+                    ),
+                    format!("DELETE FROM entity WHERE b = {}", ip6("::1")),
+                    format!(
+                        "INSERT INTO item VALUES ({}, 'back')",
+                        uuid("123e4567-e89b-12d3-a456-426614174000")
+                    ),
                 ],
             ),
         ];
-        for (what, stmts) in steps {
+        for (what, stmts) in &steps {
             exec_all(&mut c, stmts).await?;
             verify(&ctx, &mut eng, &db, &specs, what).await?;
         }

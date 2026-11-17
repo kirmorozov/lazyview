@@ -1,8 +1,8 @@
 //! Lifecycle: bootstrap of metadata tables, live definition changes (insert / update / disable /
 //! re-enable / delete), errors (invalid SQL, missing table, unknown garbage), refusing to clobber
 //! foreign tables, start modes (resume / rebuild / once / LAZYVIEW_SYNC=false), crash
-//! consistency, and binlog compression (MySQL compressed transactions end to end, MariaDB's
-//! `log_bin_compress` refused).
+//! consistency, and binlog compression (each family runs its own: MySQL compressed transactions
+//! end to end, MariaDB's `log_bin_compress` refused and reported mid-stream).
 
 mod common;
 
@@ -46,6 +46,29 @@ async fn wait_table(
                 }
             );
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Polls an engine's log file until a line contains `needle`, returning its text on the first
+/// hit (for a mid-stream condition the test waits to see reported; `chaos.rs` has the same shape).
+async fn wait_log_contains(
+    log: &std::path::Path,
+    needle: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(log) {
+            if text.contains(needle) {
+                return Ok(text);
+            }
+        }
+        ensure!(
+            std::time::Instant::now() <= deadline,
+            "no {needle:?} line in the engine log {} within {timeout:?}",
+            log.display()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -1077,44 +1100,299 @@ fn lifecycle_metadata_upgrade_from_minimal_table() {
     });
 }
 
-/// MySQL `binlog_transaction_compression=ON` (session level) end to end: every transaction of the
-/// writing session arrives as one TRANSACTION_PAYLOAD whose inner events have log_pos 0, so the
-/// saved position must be the payload's end. Compressed transactions alone, interleaved with
+/// Each family's own binlog compression end to end, so no flavor skips.
+///
+/// MySQL / Percona, `binlog_transaction_compression=ON` (session level): every transaction of
+/// the writing session arrives as one TRANSACTION_PAYLOAD whose inner events have log_pos 0, so
+/// the saved position must be the payload's end. Compressed transactions alone, interleaved with
 /// plain ones of another session, one large compressed transaction over several tables with a
 /// binlog rotate right after it, then a resume over compressed transactions written while the
-/// engine was down (no full rebuild) and a restart after a crash. MariaDB has no such setting
-/// (its `log_bin_compress` is refused: `lifecycle_refuses_log_bin_compress`).
+/// engine was down (no full rebuild) and a restart after a crash.
+///
+/// MariaDB has no session setting; its own compression is the GLOBAL `log_bin_compress`: events
+/// written while it is ON are the compressed types 165..171, which this reader cannot decode.
+/// lazyview streams normally before them, reports the documented error on reaching one (it
+/// cannot skip ahead: those events stay unreadable, and starting over while the GLOBAL is ON is
+/// `lifecycle_refuses_log_bin_compress`), and the compressed transaction never reaches a view.
+/// That window changes a GLOBAL every session on the server writes with, so on MariaDB the
+/// scenario is opt-in (`LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1`, which CI sets: one binary and
+/// one test at a time there).
 #[test]
 fn lifecycle_compressed_transactions() {
     scenario("lc_compressed", |ctx| async move {
         if ctx.server().is_mariadb() {
+            // The window needs `SET GLOBAL log_bin_compress`, which every session on the server
+            // writes with: opt-in, as CI sets it (one binary at a time there).
+            if !opted_in("LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS") {
+                ctx.skip(
+                    "changes GLOBAL log_bin_compress; set \
+                     LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1 to run it",
+                );
+                return Ok(());
+            }
+            let db = ctx.new_db("lc_compressed").await?;
+            let ids = setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::scaled()).await?;
+            let specs: Vec<ViewSpec> = views_of(&[Kind::Incremental])
+                .into_iter()
+                .filter(|v| !workload::reads_fk_child(&v.name))
+                .collect();
+            let ov = [
+                ("LAZYVIEW_POSITION_PERSIST_MS", "300"),
+                ("LAZYVIEW_QUERY_CHUNK", "7"),
+            ];
+            let (mut eng, _ids) = start_with_views(&ctx, &db, &specs, &ov).await?;
+            let mut wl = Workload::new(ctx.sub_seed("wl"), ids);
+            let mut c = db.conn().await?;
+            run_batches(&mut c, &mut wl, scaled(40)).await?;
+            verify(&ctx, &mut eng, &db, &specs, "streaming before compression").await?;
+
+            // MariaDB compresses per record: only events whose records are at least
+            // `log_bin_compress_min_len` (256) bytes are written compressed. Widen `note`
+            // (no view reads it) so the window's row images pass that line.
+            exec(&mut c, "ALTER TABLE orders MODIFY note VARCHAR(1000) NULL").await?;
+            verify(&ctx, &mut eng, &db, &specs, "the ALTER before the window").await?;
+            // The compressed window, with the GLOBAL back OFF as fast as possible (a GLOBAL
+            // change on a shared server; the suite holds the heavy-suite lock and CI runs
+            // one test binary at a time).
+            let mut globals = Globals::set(&mut c, &db.dsn, &[("log_bin_compress", "ON")]).await?;
+            exec_all(
+                &mut c,
+                &[
+                    "START TRANSACTION".to_string(),
+                    // The marker's row image is 600 bytes of note: its Write_rows event is
+                    // written compressed.
+                    "INSERT INTO orders (id, customer_id, status, created_at, note) \
+                     VALUES (987654, 1, 'paid', '2026-01-01 00:00:00.000000', REPEAT('m', 600))"
+                        .to_string(),
+                    // Bulk wide images: every row event of this transaction is compressed too.
+                    "UPDATE orders SET note = REPEAT('u', 600) WHERE id <> 987654".to_string(),
+                    "COMMIT".to_string(),
+                ],
+            )
+            .await?;
+            let restored = globals.restore(&mut c).await;
+            restored?;
+
+            // The window really was compressed: the stream that reads past it must report the
+            // unreadable events with the documented fix hint, keep retrying (alive, not dead)
+            // and its position before them.
+            let log = wait_log_contains(
+                &eng.log_path,
+                "MariaDB compressed binlog event (type",
+                Duration::from_secs(60),
+            )
+            .await
+            .with_context(|| format!("engine log {}", eng.log_path.display()))?;
+            ensure!(
+                log.contains("set log_bin_compress=OFF"),
+                "the reported error lacks the documented fix hint — log {}",
+                eng.log_path.display()
+            );
+            eng.check_alive()?;
+            // Nothing half-applied: the marker is in the table but stays out of the view.
+            let mut mc = db.conn().await?;
+            ensure!(
+                scalar_i64(&mut mc, "SELECT COUNT(*) FROM orders WHERE id = 987654").await? == 1,
+                "the compressed marker row was not written to orders"
+            );
+            ensure!(
+                scalar_i64(
+                    &mut mc,
+                    "SELECT COUNT(*) FROM v_paid_orders WHERE order_id = 987654"
+                )
+                .await?
+                    == 0,
+                "a compressed transaction reached v_paid_orders although its events are unreadable"
+            );
+            // The stream cannot pass those events, so the engine ends crashed, not stopped.
+            eng.crash().await
+        } else {
+            let db = ctx.new_db("lc_compressed").await?;
+            let ids = setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::scaled()).await?;
+            // Incrementally maintained views only, so the resume can be checked for full rebuilds
+            // (as in lifecycle_start_modes).
+            let specs: Vec<ViewSpec> = views_of(&[Kind::Incremental])
+                .into_iter()
+                .filter(|v| !workload::reads_fk_child(&v.name))
+                .collect();
+            let ov = [
+                ("LAZYVIEW_POSITION_PERSIST_MS", "300"),
+                ("LAZYVIEW_QUERY_CHUNK", "7"),
+            ];
+            let (mut eng, _ids) = start_with_views(&ctx, &db, &specs, &ov).await?;
+            let mut wl = Workload::new(ctx.sub_seed("wl"), ids);
+            let mut c = db.conn().await?;
+            exec(&mut c, "SET SESSION binlog_transaction_compression = ON").await?;
+            let start = server_position(&mut c).await?;
+            run_batches(&mut c, &mut wl, scaled(40)).await?;
+            // The writes really were compressed.
+            let payloads = rows(
+                &mut c,
+                &format!(
+                    "SHOW BINLOG EVENTS IN {} FROM {} LIMIT 2000",
+                    q(&start.file),
+                    start.pos
+                ),
+            )
+            .await?
+            .iter()
+            .filter(|r| r.get(2).cloned().flatten().as_deref() == Some("Transaction_payload"))
+            .count();
+            ensure!(payloads > 0, "no Transaction_payload event after {start}");
+            verify(&ctx, &mut eng, &db, &specs, "compressed transactions").await?;
+
+            let mut plain = db.conn().await?;
+            for i in 0..scaled(20) {
+                let conn = if i % 2 == 0 { &mut c } else { &mut plain };
+                run_batches(conn, &mut wl, 1).await?;
+            }
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                "compressed and plain interleaved",
+            )
+            .await?;
+
+            exec_all(
+                &mut c,
+                &[
+                    "START TRANSACTION".to_string(),
+                    "UPDATE order_items SET qty = qty + 1".to_string(),
+                    "UPDATE orders SET status = 'paid' WHERE id % 3 = 0".to_string(),
+                    "UPDATE payments SET amount = amount + 1".to_string(),
+                    "COMMIT".to_string(),
+                    "FLUSH BINARY LOGS".to_string(),
+                ],
+            )
+            .await?;
+            run_batches(&mut c, &mut wl, scaled(10)).await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                "large compressed transaction, rotate after it",
+            )
+            .await?;
+            eng.stop().await?;
+
+            run_batches(&mut c, &mut wl, scaled(30)).await?;
+            let mut eng = ctx.start_engine(&db, &ov)?;
+            wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                "resume over compressed transactions",
+            )
+            .await?;
+            let snap = eng.snapshot();
+            ensure!(
+                snap.full_rebuilds == 0,
+                "resume performed {} full rebuild(s); metrics {}",
+                snap.full_rebuilds,
+                fmt_snapshot(&snap)
+            );
+
+            run_batches(&mut c, &mut wl, scaled(10)).await?;
+            eng.crash().await?;
+            run_batches(&mut c, &mut wl, scaled(10)).await?;
+            let mut eng = ctx.start_engine(&db, &ov)?;
+            wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                "restart after a crash amid compressed transactions",
+            )
+            .await?;
+            eng.stop().await
+        }
+    });
+}
+
+/// The GLOBAL-scope binlog compression each family has, and lazyview's behaviour with it, so
+/// no flavor skips.
+///
+/// MariaDB `log_bin_compress=ON`: compressed events cannot be read, so the engine refuses to
+/// start with the documented message (docs/server-setup.md) before it writes anything, and
+/// starts once it is OFF again.
+///
+/// MySQL / Percona have no such variable; their `binlog_transaction_compression` is supported
+/// (docs/server-setup.md), so the same shape runs at GLOBAL scope: sessions opened while it is
+/// ON write TRANSACTION_PAYLOADs, and the engine starts and streams through them and through
+/// plain writes again once the GLOBAL is OFF. Both halves change a GLOBAL that every session on
+/// the server writes with, so the scenario is opt-in (`LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1`,
+/// which CI sets: it runs one test binary at a time); the window itself lasts seconds.
+#[test]
+fn lifecycle_refuses_log_bin_compress() {
+    scenario("lc_bin_compress", |ctx| async move {
+        if !opted_in("LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS") {
             ctx.skip(
-                "binlog_transaction_compression is MySQL / Percona only \
-                 (MariaDB: lifecycle_refuses_log_bin_compress)",
+                "changes GLOBAL binlog compression; set \
+                 LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1 to run it",
             );
             return Ok(());
         }
-        let db = ctx.new_db("lc_compressed").await?;
-        let ids = setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::scaled()).await?;
-        // Incrementally maintained views only, so the resume can be checked for full rebuilds
-        // (as in lifecycle_start_modes).
-        let specs: Vec<ViewSpec> = views_of(&[Kind::Incremental])
-            .into_iter()
-            .filter(|v| !workload::reads_fk_child(&v.name))
-            .collect();
-        let ov = [
-            ("LAZYVIEW_POSITION_PERSIST_MS", "300"),
-            ("LAZYVIEW_QUERY_CHUNK", "7"),
-        ];
-        let (mut eng, _ids) = start_with_views(&ctx, &db, &specs, &ov).await?;
-        let mut wl = Workload::new(ctx.sub_seed("wl"), ids);
+        if ctx.server().is_mariadb() {
+            let db = ctx.new_db("lc_bin_compress").await?;
+            setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::tiny()).await?;
+            let specs = vec![spec_named("v_paid_orders"), spec_named("v_status_counts")];
+            let mut c = db.conn().await?;
+            ensure_lazyview_table(&mut c).await?;
+            add_views(&mut c, &specs).await?;
+            let mut globals = Globals::set(&mut c, &db.dsn, &[("log_bin_compress", "ON")]).await?;
+            let refused = match ctx.start_engine(&db, &[]) {
+                Ok(eng) => eng.wait_finished(Duration::from_secs(60)).await,
+                Err(e) => Err(e),
+            };
+            let restored = globals.restore(&mut c).await;
+            match refused? {
+                Err(e) if e.contains("log_bin_compress is ON") => {}
+                other => bail!("expected a refusal naming log_bin_compress, got {other:?}"),
+            }
+            restored?;
+
+            let mut eng = ctx.start_engine(&db, &[])?;
+            wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+            exec(&mut c, "UPDATE orders SET status = 'paid' WHERE id % 2 = 0").await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                "started once log_bin_compress is OFF",
+            )
+            .await?;
+            eng.stop().await?;
+            return Ok(());
+        }
+
+        // MySQL / Percona: the GLOBAL counterpart of `log_bin_compress` is
+        // `binlog_transaction_compression`, which lazyview supports. Start the engine while
+        // the GLOBAL is ON, prove a fresh session's writes really arrive as payloads, and
+        // stream through them; then OFF again and through plain writes.
+        let db = ctx.new_db("lc_bin_compress").await?;
+        let ids = setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::tiny()).await?;
+        let specs = vec![spec_named("v_paid_orders"), spec_named("v_status_counts")];
         let mut c = db.conn().await?;
-        exec(&mut c, "SET SESSION binlog_transaction_compression = ON").await?;
-        let start = server_position(&mut c).await?;
-        run_batches(&mut c, &mut wl, scaled(40)).await?;
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut globals =
+            Globals::set(&mut c, &db.dsn, &[("binlog_transaction_compression", "ON")]).await?;
+        // A session opened after the change inherits the GLOBAL: its transactions are the
+        // payloads. (One opened before it keeps its own session value until it reconnects.)
+        let mut w = db.conn().await?;
+        let start = server_position(&mut w).await?;
+        let mut wl = Workload::new(ctx.sub_seed("wl"), ids);
+        run_batches(&mut w, &mut wl, scaled(40)).await?;
         // The writes really were compressed.
         let payloads = rows(
-            &mut c,
+            &mut w,
             &format!(
                 "SHOW BINLOG EVENTS IN {} FROM {} LIMIT 2000",
                 q(&start.file),
@@ -1126,127 +1404,27 @@ fn lifecycle_compressed_transactions() {
         .filter(|r| r.get(2).cloned().flatten().as_deref() == Some("Transaction_payload"))
         .count();
         ensure!(payloads > 0, "no Transaction_payload event after {start}");
-        verify(&ctx, &mut eng, &db, &specs, "compressed transactions").await?;
-
-        let mut plain = db.conn().await?;
-        for i in 0..scaled(20) {
-            let conn = if i % 2 == 0 { &mut c } else { &mut plain };
-            run_batches(conn, &mut wl, 1).await?;
-        }
-        verify(
-            &ctx,
-            &mut eng,
-            &db,
-            &specs,
-            "compressed and plain interleaved",
-        )
-        .await?;
-
-        exec_all(
-            &mut c,
-            &[
-                "START TRANSACTION".to_string(),
-                "UPDATE order_items SET qty = qty + 1".to_string(),
-                "UPDATE orders SET status = 'paid' WHERE id % 3 = 0".to_string(),
-                "UPDATE payments SET amount = amount + 1".to_string(),
-                "COMMIT".to_string(),
-                "FLUSH BINARY LOGS".to_string(),
-            ],
-        )
-        .await?;
-        run_batches(&mut c, &mut wl, scaled(10)).await?;
-        verify(
-            &ctx,
-            &mut eng,
-            &db,
-            &specs,
-            "large compressed transaction, rotate after it",
-        )
-        .await?;
-        eng.stop().await?;
-
-        run_batches(&mut c, &mut wl, scaled(30)).await?;
-        let mut eng = ctx.start_engine(&db, &ov)?;
-        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-        verify(
-            &ctx,
-            &mut eng,
-            &db,
-            &specs,
-            "resume over compressed transactions",
-        )
-        .await?;
-        let snap = eng.snapshot();
-        ensure!(
-            snap.full_rebuilds == 0,
-            "resume performed {} full rebuild(s); metrics {}",
-            snap.full_rebuilds,
-            fmt_snapshot(&snap)
-        );
-
-        run_batches(&mut c, &mut wl, scaled(10)).await?;
-        eng.crash().await?;
-        run_batches(&mut c, &mut wl, scaled(10)).await?;
-        let mut eng = ctx.start_engine(&db, &ov)?;
-        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-        verify(
-            &ctx,
-            &mut eng,
-            &db,
-            &specs,
-            "restart after a crash amid compressed transactions",
-        )
-        .await?;
-        eng.stop().await
-    });
-}
-
-/// MariaDB `log_bin_compress=ON`: compressed events cannot be read, so the engine refuses to
-/// start with the documented message (docs/server-setup.md) before it writes anything, and
-/// starts once it is OFF again. Opt-in, as it changes a GLOBAL that every session on the server
-/// writes with: `LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1`.
-#[test]
-fn lifecycle_refuses_log_bin_compress() {
-    scenario("lc_bin_compress", |ctx| async move {
-        if !ctx.server().is_mariadb() {
-            ctx.skip(
-                "log_bin_compress is a MariaDB setting (MySQL: lifecycle_compressed_transactions)",
-            );
-            return Ok(());
-        }
-        if !opted_in("LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS") {
-            ctx.skip(
-                "changes GLOBAL log_bin_compress; set LAZYVIEW_TEST_GLOBAL_BINLOG_COMPRESS=1 to run it",
-            );
-            return Ok(());
-        }
-        let db = ctx.new_db("lc_bin_compress").await?;
-        setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::tiny()).await?;
-        let specs = vec![spec_named("v_paid_orders"), spec_named("v_status_counts")];
-        let mut c = db.conn().await?;
-        ensure_lazyview_table(&mut c).await?;
-        add_views(&mut c, &specs).await?;
-        let mut globals = Globals::set(&mut c, &db.dsn, &[("log_bin_compress", "ON")]).await?;
-        let refused = match ctx.start_engine(&db, &[]) {
-            Ok(eng) => eng.wait_finished(Duration::from_secs(60)).await,
-            Err(e) => Err(e),
-        };
-        let restored = globals.restore(&mut c).await;
-        match refused? {
-            Err(e) if e.contains("log_bin_compress is ON") => {}
-            other => bail!("expected a refusal naming log_bin_compress, got {other:?}"),
-        }
-        restored?;
-
         let mut eng = ctx.start_engine(&db, &[])?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-        exec(&mut c, "UPDATE orders SET status = 'paid' WHERE id % 2 = 0").await?;
         verify(
             &ctx,
             &mut eng,
             &db,
             &specs,
-            "started once log_bin_compress is OFF",
+            "started with GLOBAL compressed transactions",
+        )
+        .await?;
+        let restored = globals.restore(&mut c).await;
+        restored?;
+        // A fresh session now writes plain transactions and they still stream.
+        let mut p = db.conn().await?;
+        run_batches(&mut p, &mut wl, scaled(10)).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "streaming after the GLOBAL is OFF again",
         )
         .await?;
         eng.stop().await
