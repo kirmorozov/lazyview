@@ -1578,73 +1578,119 @@ fn lifecycle_ops_run_restricted_user() {
         // A restricted account (neutral name, created and dropped by the test): SELECT on the
         // definitions, DML on lazyview's own status tables, no DDL on any of them; the view
         // tables are its own (their DDL belongs to the operations run); the probe view of the
-        // planner is granted by name pattern; the binlog needs its replication rights.
+        // planner is granted by name; the binlog needs its replication rights. It runs on its
+        // own connection (`account_conn`), and everything it puts on the server is dropped
+        // again below — whatever the outcome of the run.
         let user = format!("lvop{:x}", rand::rng().random_range(0..0xFFFF_FFFF_u32));
         let d = format!("`{}`", db.name);
-        c.query_drop(format!("DROP USER IF EXISTS '{user}'@'%'"))
-            .await?;
-        c.query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"))
-            .await?;
-        for grant in [
-            format!("GRANT SELECT ON {d}.`_lazyview` TO '{user}'@'%'"),
-            format!(
-                "GRANT SELECT, INSERT, UPDATE, DELETE ON {d}.`_lazyview_state` TO '{user}'@'%'"
-            ),
-            format!(
-                "GRANT SELECT, INSERT, UPDATE, DELETE ON {d}.`_lazyview_status` TO '{user}'@'%'"
-            ),
-            format!("GRANT INSERT, UPDATE ON {d}.`_lazyview_fence` TO '{user}'@'%'"),
-            format!("GRANT SELECT ON {d}.`entities` TO '{user}'@'%'"),
-            format!("GRANT SELECT ON {d}.`items` TO '{user}'@'%'"),
-            format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity` TO '{user}'@'%'"),
-            format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity__lv_new` TO '{user}'@'%'"),
-            format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity__lv_old` TO '{user}'@'%'"),
-            format!(
-                "GRANT SELECT, CREATE VIEW, DROP ON {d}.`{}` TO '{user}'@'%'",
-                two_runs_probe_view()
-            ),
-            format!("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{user}'@'%'"),
-        ] {
-            c.query_drop(&grant)
-                .await
-                .with_context(|| format!("grant: {grant}"))?;
-        }
-
-        // The operations run as that account: it starts (its own tables pass the check) and
-        // refreshes the view.
-        let rdsn = dsn_with_user(&db.dsn, &format!("{user}:pw"));
-        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_DSN", rdsn.as_str())])?;
-        wait_ready(&mut c, &mut eng, &["items_by_entity"], t_ready()).await?;
-        c.query_drop("INSERT INTO items (id, entity_id, price) VALUES (2, 1, 7)")
-            .await?;
-        let seen = |want: i64| {
-            let dsn = db.dsn.clone();
-            move || {
-                let dsn = dsn.clone();
-                async move {
-                    let mut c = connect(&dsn).await?;
-                    let n = scalar_i64(&mut c, "SELECT COUNT(*) FROM items_by_entity").await?;
-                    c.disconnect().await.ok();
-                    Ok::<bool, anyhow::Error>(n == want)
-                }
-            }
-        };
-        wait_until(
-            "restricted engine applied the new row",
-            t_catchup(),
-            seen(2),
+        let probe = two_runs_probe_view();
+        let mut acct = account_conn(&db).await?;
+        account_stmt(&mut acct, &format!("DROP USER IF EXISTS '{user}'@'%'")).await?;
+        account_stmt(
+            &mut acct,
+            &format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"),
         )
         .await?;
-        eng.stop().await?;
-        c.query_drop(format!("DROP USER IF EXISTS '{user}'@'%'"))
+
+        // The grants, then the operations run as that account: it starts (its own tables pass
+        // the check) and refreshes the view.
+        let outcome = async {
+            for grant in [
+                format!("GRANT SELECT ON {d}.`_lazyview` TO '{user}'@'%'"),
+                format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON {d}.`_lazyview_state` TO '{user}'@'%'"
+                ),
+                format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON {d}.`_lazyview_status` TO '{user}'@'%'"
+                ),
+                format!("GRANT INSERT, UPDATE ON {d}.`_lazyview_fence` TO '{user}'@'%'"),
+                format!("GRANT SELECT ON {d}.`entities` TO '{user}'@'%'"),
+                format!("GRANT SELECT ON {d}.`items` TO '{user}'@'%'"),
+                format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity` TO '{user}'@'%'"),
+                format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity__lv_new` TO '{user}'@'%'"),
+                format!("GRANT ALL PRIVILEGES ON {d}.`items_by_entity__lv_old` TO '{user}'@'%'"),
+                format!("GRANT SELECT, CREATE VIEW, DROP ON {d}.`{probe}` TO '{user}'@'%'",),
+                format!("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{user}'@'%'"),
+            ] {
+                account_stmt(&mut acct, &grant)
+                    .await
+                    .with_context(|| format!("grant: {grant}"))?;
+            }
+            let rdsn = dsn_with_user(&db.dsn, &format!("{user}:pw"));
+            let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_DSN", rdsn.as_str())])?;
+            wait_ready(&mut c, &mut eng, &["items_by_entity"], t_ready()).await?;
+            c.query_drop("INSERT INTO items (id, entity_id, price) VALUES (2, 1, 7)")
+                .await?;
+            let seen = |want: i64| {
+                let dsn = db.dsn.clone();
+                move || {
+                    let dsn = dsn.clone();
+                    async move {
+                        let mut c = connect(&dsn).await?;
+                        let n = scalar_i64(&mut c, "SELECT COUNT(*) FROM items_by_entity").await?;
+                        c.disconnect().await.ok();
+                        Ok::<bool, anyhow::Error>(n == want)
+                    }
+                }
+            };
+            wait_until(
+                "restricted engine applied the new row",
+                t_catchup(),
+                seen(2),
+            )
             .await?;
-        c.query_drop(format!(
-            "DROP VIEW IF EXISTS `{}`.`{}`",
-            db.name,
-            two_runs_probe_view()
-        ))
-        .await?;
+            eng.stop().await
+        }
+        .await;
+
+        // Nothing of this test survives it on any path, not only the successful one: the
+        // account (with the server-wide replication grants it needs) goes with it, and so does
+        // the probe view this scenario pre-created. Both are named by this run alone.
+        let mut cleanup = account_conn(&db).await?;
+        for sql in [
+            format!("DROP USER IF EXISTS '{user}'@'%'"),
+            format!("DROP VIEW IF EXISTS {d}.`{probe}`"),
+        ] {
+            account_stmt(&mut cleanup, &sql).await.ok();
+        }
+        cleanup.disconnect().await.ok();
+        acct.disconnect().await.ok();
+        outcome?;
         ctx.log("operations run started and refreshed as the restricted account");
         Ok(())
     });
+}
+
+/// A connection for the account work of [`lifecycle_ops_run_restricted_user`], with
+/// `lock_wait_timeout` bounded: these statements take the server-wide ACL / global DDL lock,
+/// so with the suite's 2 threads one can be queued behind another scenario's DDL, and the
+/// server default (a year) would let that eat the scenario's whole budget.
+async fn account_conn(db: &Db) -> Result<mysql_async::Conn> {
+    let mut c = db.conn().await?;
+    account_stmt(&mut c, "SET SESSION lock_wait_timeout = 120").await?;
+    Ok(c)
+}
+
+/// One account-management statement (`CREATE USER` / `GRANT` / `DROP USER`) or the session
+/// setting that makes waiting for them bounded. A statement queued behind a concurrent
+/// scenario's DDL comes back as a lock-wait timeout (1205) or a deadlock (1213): retried,
+/// with a short backoff. Any other error, or a timeout that survives every attempt, is
+/// returned with the statement in its context.
+async fn account_stmt(c: &mut mysql_async::Conn, sql: &str) -> Result<()> {
+    use mysql_async::prelude::Queryable;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match c.query_drop(sql).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let e = anyhow::Error::from(e);
+                if matches!(server_code(&e), Some(1205 | 1213)) && attempt < 12 {
+                    tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                    continue;
+                }
+                return Err(e).context(format!("account statement: {sql}"));
+            }
+        }
+    }
 }
