@@ -309,19 +309,26 @@ service (a change in progress), the service also writes two columns of
 it `UPDATE` on those two columns only (column privileges, in the scripts below);
 that grant goes away with the change.
 
-The service must start and run with the consumption grants alone. lazyview
-creates and migrates the control tables under the setup account, by running the
-binary once with `LAZYVIEW_SYNC=false` and its credentials; at run time the
-service creates and alters no control table. Once the startup table check of
-the same change lands, the service issues DDL only when a table or column is
-missing and, with no right to create it, fails at startup with a clear error
-naming the setup step: never a silent skip, and never an error from a
-`CREATE TABLE IF NOT EXISTS` the account had no right to run (MySQL checks the
-`CREATE` privilege even when the table exists). Until that lands the service
-still needs more than the model above: its startup migration runs a
-`CREATE TABLE IF NOT EXISTS`, and its view tables on the source sit in the
-control schema — the extra line marked in the script below carries those
-rights; remove it when the change lands.
+The consumption grants are the model for the service, not its requirement
+today: the service runs the metadata migration itself, at every start,
+regardless of `LAZYVIEW_SYNC` — the `CREATE TABLE IF NOT EXISTS` for the
+control tables and the `ALTER`s that migrate them run under the service
+account, so today it needs the extra rights marked in the script below. You
+can still run that migration with separate credentials: run the binary once
+with `LAZYVIEW_SYNC=false` and the setup account's credentials — it creates or
+migrates the metadata tables, validates every definition (a bad one fails the
+run) and exits without streaming — and the next ordinary start of the service
+still runs its own migration. The change that ends this is coming, no version
+promised: a separate setup run (`lazyview setup`, used with the setup account)
+after which the service creates and alters no control table. Once it lands,
+the service issues DDL only when a table or column is missing and, with no
+right to create it, fails at startup with a clear error naming the setup step:
+never a silent skip, and never an error from a `CREATE TABLE IF NOT EXISTS`
+the account had no right to run (MySQL checks the `CREATE` privilege even when
+the table exists). Until it lands the service also keeps needing more than the
+model above for a second reason: its view tables on the source sit in the
+control schema — the extra line marked in the script below carries all of
+those rights; remove it when the change lands.
 
 Through a view the management user can read whatever the service account can
 read: the view tables are ordinary tables, and the service built them from what
@@ -366,8 +373,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_fence TO 'lazyview_sv
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lazyview_svc'@'%';
 GRANT SELECT ON app.* TO 'lazyview_svc'@'%';              -- the source tables the views read
 GRANT SELECT ON other_schema.* TO 'lazyview_svc'@'%';     -- every other schema a view reads
--- until the pending change lands (see above): the service creates and maintains
--- its view tables on the source in this same schema, so today it also needs:
+-- required by the code as it stands today: the service runs the control-table
+-- migration (CREATE TABLE IF NOT EXISTS, ALTER) at every start, and it creates and
+-- maintains its view tables on the source in this same schema, so today it also needs:
 GRANT INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, CREATE VIEW, SHOW VIEW
   ON lazyview.* TO 'lazyview_svc'@'%';                    -- remove this line when the change lands
 
