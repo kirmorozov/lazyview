@@ -140,7 +140,7 @@ jobs:
           # Strict: the MySQL-family target tests must run for real on this one server, never skip.
           # The targets_pg_* tests need a PostgreSQL server this job does not have: they are skipped
           # below and run in the postgres-target job only.
-          LAZYVIEW_TEST_STRICT: "targets_"
+          LAZYVIEW_TEST_STRICT: "targets_,visibility_"
           LAZYVIEW_HEALTH_ADDR: "off"
           # Suites run one binary at a time here, so the DST test may change GLOBAL time_zone and
           # the MariaDB refusal test GLOBAL log_bin_compress.
