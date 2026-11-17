@@ -761,9 +761,22 @@ async fn sql_mode_scenario(ctx: &Ctx, db: &Db) -> Result<()> {
 /// error fell through to `LAZYVIEW_VISIBILITY_DELAY_MS` and nothing re-probed the fence. The whole
 /// read is repeated now (`retry_src`), so with the delay at 0 the rows are still read at the
 /// fenced position — and after `heal_src` (the engine's source sessions killed) the next flush
-/// probes the fence again. The probe is the fence only where the engine has no GTID one, so the
-/// retry assertions run there; every flavor pins the writes exact with the delay at 0, before and
-/// after the reconnect.
+/// probes the fence again. The retry assertions run only where the probe is the fence, which the
+/// flavor answers (`Flavor::snapshot_position_is_watermark`, `src/source/mod.rs`); where it is
+/// not, reaching the probe would be the bug, so that is asserted the other way. Which fence each
+/// flavor gets (the engine's `fence`, `src/engine.rs`):
+///
+/// - MariaDB: the consistent-snapshot position. Its pair is a watermark of committed
+///   transactions and there is no GTID wait, so this is the flavor that probes the snapshot and
+///   reaches `LAZYVIEW_TEST_FAIL_SNAPSHOT`.
+/// - MySQL / Percona with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET`, which comes first, so the snapshot
+///   is never probed.
+/// - MySQL / Percona without GTIDs: the commit-order row (`src/source/mysql.rs`, `src/fence.rs`).
+///   Their `binlog_snapshot_%` pair is the raw binlog write position — it has passed transactions
+///   still in flight that the snapshot cannot read — so it is no watermark and the engine never
+///   probes the snapshot: the hook is not reached.
+///
+/// Every flavor pins the writes exact with the delay at 0, before and after the reconnect.
 #[test]
 fn reg_transient_snapshot_failure_keeps_exact_fence() {
     scenario("reg_snap_fence", |ctx| async move {
@@ -787,14 +800,35 @@ fn reg_transient_snapshot_failure_keeps_exact_fence() {
         };
         let before = eng.snapshot();
         let mut c = db.conn().await?;
-        // MySQL/Percona with GTIDs fence with `WAIT_FOR_EXECUTED_GTID_SET` and never probe the
-        // snapshot; the probe (and so the hook) is the fence only where there is no GTID one.
+        // The engine's `fence` decides the same two things: the flavor's own answer about its
+        // snapshot position, and whether a GTID wait covers the transaction before it. The flavor
+        // comes from the server's version strings, as the engine's connect reads them
+        // (`Flavor::from_version_comment`), so the test follows the engine and names no product.
+        let version = scalar(&mut c, "SELECT VERSION()")
+            .await?
+            .unwrap_or_default();
+        let comment = scalar(&mut c, "SELECT @@version_comment")
+            .await?
+            .unwrap_or_default();
+        let watermark = lazyview::source::Flavor::from_version_comment(&version, &comment)
+            .snapshot_position_is_watermark();
+        // MariaDB has no `gtid_mode`: no answer is no GTID fence.
         let gtid = scalar(&mut c, "SELECT @@gtid_mode")
             .await
             .ok()
             .flatten()
             .unwrap_or_default();
-        let probes_snapshot = !gtid.eq_ignore_ascii_case("ON");
+        let probes_snapshot = watermark && !gtid.eq_ignore_ascii_case("ON");
+        ctx.log(format!(
+            "fence here: {}",
+            if probes_snapshot {
+                "the consistent-snapshot position"
+            } else if gtid.eq_ignore_ascii_case("ON") {
+                "the GTID wait"
+            } else {
+                "the commit-order row"
+            }
+        ));
         exec_all(
             &mut c,
             &[
@@ -808,6 +842,15 @@ fn reg_transient_snapshot_failure_keeps_exact_fence() {
             ensure!(
                 retried(&eng) >= 1,
                 "the injected fence failure was never retried: the flush fell back to the delay — log {}",
+                eng.log_path.display()
+            );
+        } else {
+            // Not this flavor's fence: the read must not happen at all, so the hook stays
+            // untouched and the flush is exact through the GTID wait or the commit-order row.
+            ensure!(
+                retried(&eng) == 0,
+                "the engine probed a snapshot position that is not this flavor's fence: {} probes — log {}",
+                retried(&eng),
                 eng.log_path.display()
             );
         }
@@ -835,6 +878,13 @@ fn reg_transient_snapshot_failure_keeps_exact_fence() {
             ensure!(
                 retried(&eng) > probes,
                 "the snapshot fence was not re-probed after the reconnect: {probes} probes before, log {}",
+                eng.log_path.display()
+            );
+        } else {
+            ensure!(
+                retried(&eng) == probes,
+                "the engine probed a snapshot position after the reconnect that is not this \
+                 flavor's fence: {probes} probes before, log {}",
                 eng.log_path.display()
             );
         }
