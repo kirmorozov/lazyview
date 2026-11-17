@@ -862,7 +862,12 @@ jobs:
             echo "::error::timeout: '$1' returned '${got}', want '$2'"
             return 1
           }
+          # Two runs (quick start): the one-shot lazyview-setup container runs `lazyview setup`,
+          # then the service starts. It must exit 0 — never make the operations run migrate.
           dc up -d --no-build --quiet-pull --wait --wait-timeout 300
+          scid=$(dc ps -aq lazyview-setup)
+          test "$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$scid")" = "exited 0" \
+            || { echo "::error::the lazyview setup run did not exit 0"; dc logs --no-color lazyview-setup; exit 1; }
           cid=$(dc ps -q lazyview)
           test "$(docker inspect -f '{{.State.Health.Status}}' "$cid")" = healthy
           # The service process really runs as 65532 (not just the image config).

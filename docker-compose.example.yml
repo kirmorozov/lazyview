@@ -1,9 +1,13 @@
 # lazyview + MySQL 8.4, ready to run (Docker Compose v2.23.1+ for inline `configs`).
 #
-#   docker compose -f docker-compose.example.yml up -d --build --wait   # until both are healthy
+# Two runs, per the quick start (README "Quickstart"): first `lazyview setup` creates and
+# migrates lazyview's own tables, then the operations run (the service) never issues DDL on
+# them. `lazyview-setup` is the one-shot first run; the service starts once it exits 0.
+#
+#   docker compose -f docker-compose.example.yml up -d --build --wait   # until everything is up
 #   docker compose -f docker-compose.example.yml logs -f lazyview
 #
-# Define a view (the _lazyview table is created by lazyview on startup):
+# Define a view:
 #
 #   docker compose -f docker-compose.example.yml exec mysql \
 #     mysql -ulazyview -plazyview app -e "
@@ -58,6 +62,33 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # The setup run (first of the two runs, quick start): creates/migrates lazyview's own
+  # tables, validates the definitions, and exits (0 ok, non-zero: the service does not start).
+  # One-shot on purpose — the service below must never run it again (owner ruling: two runs).
+  lazyview-setup:
+    image: ${LAZYVIEW_IMAGE:-lazyview:local}
+    build:
+      context: .
+      target: runtime
+    command: ["setup"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      LAZYVIEW_HOST: mysql
+      LAZYVIEW_PORT: "3306"
+      LAZYVIEW_USER: *user
+      LAZYVIEW_PASSWORD: *password
+      LAZYVIEW_DATABASE: *database
+      RUST_LOG: info
+    # One-shot: the image's HEALTHCHECK probes the service's endpoint; it does not apply here.
+    healthcheck:
+      disable: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
   lazyview:
     image: ${LAZYVIEW_IMAGE:-lazyview:local}
     build:
@@ -66,6 +97,10 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      # The operations run (second of the two runs): refuses DDL on lazyview's own tables,
+      # so it starts only once the setup run above has succeeded.
+      lazyview-setup:
+        condition: service_completed_successfully
     environment:
       LAZYVIEW_HOST: mysql
       LAZYVIEW_PORT: "3306"
