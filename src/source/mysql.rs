@@ -35,6 +35,17 @@ use crate::source::SourceCaps;
 /// flavor-side caller.
 pub use crate::fence::{commit, ordered, probe, table};
 
+/// The MySQL family's answer to `Flavor::snapshot_position_is_watermark`: `false`. What its
+/// `binlog_snapshot_%` status variables report is the raw binlog write position, and events are
+/// written before the transaction commits, so the position has already passed transactions still
+/// in flight that the snapshot taken at the same moment cannot read; a wait on it approves a read
+/// of stale rows. Oracle Community reports no pair at all, which answers the same way. The family
+/// is fenced by [`gtid_wait`] when it has GTIDs and by [`commit_order`] otherwise (Percona Server
+/// reaches both through this file, `percona::snapshot_position_is_watermark`).
+pub(crate) fn snapshot_position_is_watermark() -> bool {
+    false
+}
+
 /// The MySQL family's GTID visibility wait: `WAIT_FOR_EXECUTED_GTID_SET` for `gtid`, capped at
 /// 5 s by the server itself. `Ok(Some(Some(0)))`: visible; `Ok(Some(Some(_)))`: timed out; the
 /// caller owns the meaning (see [`crate::source::fence`]).

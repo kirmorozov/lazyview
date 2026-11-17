@@ -245,11 +245,22 @@ fn at_least_11_4(version: &str) -> bool {
 /// The MariaDB table metadata: the shared `information_schema` reads, with
 /// [`unescape_generation_expression`] as the generated-expression spelling and
 /// [`default_collation`] as the collation probe.
+/// MariaDB's answer to `Flavor::snapshot_position_is_watermark`: `true`. The pair names the point
+/// of the binlog stream the snapshot reads as of, so everything at or before it is committed and
+/// readable by that snapshot — waiting for it to reach the position already read from the binlog
+/// is an exact fence (`visibility_snapshot_fence_exact` proves it under the widened commit
+/// window). The MySQL family reports the raw write position instead, which is no watermark
+/// (`mysql::snapshot_position_is_watermark`).
+pub(crate) fn snapshot_position_is_watermark() -> bool {
+    true
+}
+
 /// The position the source session's consistent snapshot includes: one transaction read at
 /// REPEATABLE READ, committed whatever the status read did. `fail_first`/`try_no` are the
 /// engine's snapshot-failure test hook (decision 4): a transient, non-connection failure.
-/// MariaDB's and Percona Server's fence ([`crate::source::fence`]); `Ok(None)`: the server
-/// reports no position, so it rules itself out (e.g. MySQL Community).
+/// The fence of the flavors whose `Flavor::snapshot_position_is_watermark` answers `true`
+/// (MariaDB, [`snapshot_position_is_watermark`] below); `Ok(None)`: the server reports no
+/// position, so it rules itself out (e.g. MySQL Community).
 pub(crate) async fn snapshot_position(
     conn: &mut Conn,
     fail_first: Option<usize>,

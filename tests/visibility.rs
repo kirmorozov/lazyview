@@ -1,13 +1,18 @@
 //! The visibility fences, one test per fence (the commit-order fence: #28; the fence per
 //! flavor: F7 #219). Binlog events ship before the committing transaction ends, so the engine
 //! must prove a change is visible before it reads the sources. Every flavor has a fence, and
-//! the engine dispatches to it in this order (the engine's `fence`):
+//! the engine dispatches to it in this order (the engine's `fence`); which of them is a fence at
+//! all is the flavor's answer, not a branch on product names:
 //!
 //! - the MySQL family with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET` (`src/source/mysql.rs`);
-//! - MariaDB and Percona Server: the binlog position of a consistent snapshot
-//!   (`src/source/maria.rs`), tried on every flavor, the server rules itself out by reporting none;
-//! - Oracle MySQL without GTIDs: one row of our own, committed in binlog order
-//!   (`src/source/mysql.rs`, `src/fence.rs`);
+//! - the flavors whose consistent-snapshot position is a committed-transaction watermark
+//!   (`Flavor::snapshot_position_is_watermark`, `src/source/mod.rs`) — MariaDB: the binlog
+//!   position of a consistent snapshot (`src/source/maria.rs`). The MySQL family answers `false`:
+//!   what its `binlog_snapshot_%` variables report is the raw binlog write position, which has
+//!   already passed transactions still in flight that its snapshot cannot read (#257), so waiting
+//!   on it would approve a stale read;
+//! - the MySQL family without GTIDs, and any flavor the snapshot ruled out: one row of our own,
+//!   committed in binlog order (`src/source/mysql.rs`, `src/fence.rs`);
 //! - no fence available: the `LAZYVIEW_VISIBILITY_DELAY_MS` fallback, not exact under load.
 //!
 //! Each test runs on the flavors where its fence applies; on the others it logs which fence
@@ -26,6 +31,7 @@ use std::sync::Mutex;
 
 use anyhow::{bail, ensure, Context, Result};
 use common::*;
+use lazyview::source::Flavor;
 use mysql_async::prelude::Queryable;
 use mysql_async::Conn;
 
@@ -107,15 +113,30 @@ impl Fences {
         !self.mariadb && self.gtid_on
     }
 
-    /// The consistent-snapshot position: the first fence that answers after the GTID wait.
+    /// The consistent-snapshot position: MariaDB's fence, and its answer alone
+    /// (`Flavor::snapshot_position_is_watermark`): the MySQL family reports the raw binlog write
+    /// position, which covers transactions still in flight, so the engine must not wait on it
+    /// there (#257).
     fn snapshot_fence(&self) -> bool {
-        !self.gtid_fence() && self.snapshot
+        self.mariadb && !self.gtid_fence() && self.snapshot
     }
 
-    /// The commit-order row: Oracle MySQL (not Percona, which the snapshot answers) with neither
-    /// GTIDs nor a reported snapshot position.
+    /// The commit-order row: the MySQL family with neither GTIDs nor a snapshot fence — Oracle
+    /// Community and Percona Server, both through `src/source/mysql.rs`'s commit-order step — and
+    /// MariaDB once its snapshot is ruled out.
     fn commit_fence(&self) -> bool {
-        !self.mariadb && !self.percona && !self.gtid_fence() && !self.snapshot
+        !self.mariadb && !self.gtid_fence() && !self.snapshot_fence()
+    }
+
+    /// The flavor this server is, named the way the engine's connect names it.
+    fn flavor(&self) -> Flavor {
+        if self.mariadb {
+            Flavor::MariaDb
+        } else if self.percona {
+            Flavor::Percona
+        } else {
+            Flavor::MySql
+        }
     }
 
     /// The test that runs for real on this flavor.
@@ -516,6 +537,18 @@ fn visibility_fence_per_flavor() {
         let db = ctx.new_db("vis_flavor").await?;
         let mut admin = db.conn().await?;
         let f = Fences::probe(&mut admin).await?;
+        // The decision is the flavor's (#257), so the server under test must be answered for what
+        // it is: MariaDB's pair is a committed-transaction watermark, the MySQL family's (Oracle's
+        // and Percona Server's) is the raw binlog write position, which covers transactions still
+        // in flight and so cannot be the fence the engine waits on.
+        let watermark = f.flavor().snapshot_position_is_watermark();
+        ensure!(
+            watermark == f.mariadb,
+            "the flavor answer is wrong for {:?}: it says the consistent-snapshot position is{} \
+             a committed-transaction watermark",
+            f.flavor(),
+            if watermark { "" } else { " not" }
+        );
         ctx.log(format!(
             "expected fence here: {}",
             if f.gtid_fence() {
@@ -537,80 +570,4 @@ fn visibility_fence_per_flavor() {
         ensure_exact(&log, &log_path, &f)?;
         Ok(())
     });
-}
-
-/// (h3 temporary diagnostic, not for the PR) What `binlog_snapshot_%` reports on this flavor
-/// while a commit is in flight. If the reported position covers the update's event (it moved
-/// past `before`) while the snapshot transaction still sees the OLD row value, then the pair is
-/// the raw write position, not a committed-transaction watermark: the server reports a position,
-/// but it does not gate on visibility, so it cannot be the exact fence the engine waits on.
-/// Runs only with `LAZYVIEW_TEST_H3_DEBUG=1`. Deliberately not named `visibility_*`: this is a
-/// diagnostic print, not a proof, so `LAZYVIEW_TEST_STRICT` must not turn its early returns into
-/// failures.
-#[test]
-fn h3_snapshot_probe() {
-    if std::env::var("LAZYVIEW_TEST_H3_DEBUG")
-        .map(|v| v != "1")
-        .unwrap_or(true)
-    {
-        return;
-    }
-    let _serial = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
-    scenario("h3_snapshot_probe", |ctx| async move {
-        let db = ctx.new_db("h3probe").await?;
-        let mut admin = db.conn().await?;
-        for s in DDL {
-            exec(&mut admin, s).await?;
-        }
-        let f = Fences::probe(&mut admin).await?;
-        let mut globals = Globals::set(&mut admin, &db.dsn, &widen_for(&f)).await?;
-        // Where the binlog stands before the commit: the update's event lands after this.
-        let before = master_pos(&mut admin).await?;
-        // The commit is in flight between the binlog flush and its end: with the group sync
-        // delay it stays there ~200 ms, so a 60 ms pause lands squarely inside the window.
-        let dsn = db.dsn.clone();
-        let writer = tokio::spawn(async move {
-            let mut c = connect(&dsn).await?;
-            exec(&mut c, "UPDATE t SET v = v + 1 WHERE id = 1").await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        // Read the pair the way the engine's snapshot fence reads it, and ask the snapshot
-        // itself whether the update is visible yet.
-        let mut p = db.conn().await?;
-        p.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            .await?;
-        p.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-            .await?;
-        let status: Vec<(String, String)> = p
-            .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
-            .await?;
-        let v: Option<i64> = p.query_first("SELECT v FROM t WHERE id = 1").await?;
-        let now = master_pos(&mut p).await?;
-        p.query_drop("COMMIT").await?;
-        writer.await??;
-        globals.restore(&mut admin).await?;
-        ctx.log(format!(
-            "in-flight probe: before={before} master_now={now} snapshot_txn_sees_v={v:?} status={status:?}"
-        ));
-        Ok(())
-    });
-}
-
-/// The binlog write position as `File:Position` (raw values: the client types differ per flavor).
-async fn master_pos(c: &mut Conn) -> Result<String> {
-    // 8.4 renamed this; MariaDB still only has the old spelling.
-    let rows: Vec<mysql_async::Row> = match c.query("SHOW BINARY LOG STATUS").await {
-        Ok(r) => r,
-        Err(_) => c.query("SHOW MASTER STATUS").await?,
-    };
-    Ok(match rows.first() {
-        Some(r) => format!(
-            "{:?}",
-            (
-                r.get::<mysql_async::Value, _>(0),
-                r.get::<mysql_async::Value, _>(1)
-            )
-        ),
-        None => "(no binlog)".to_string(),
-    })
 }

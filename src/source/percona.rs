@@ -23,3 +23,13 @@ pub(crate) use crate::source::mysql::preflight;
 pub(crate) fn is_this(version_comment: &str) -> bool {
     version_comment.to_ascii_lowercase().contains("percona")
 }
+
+/// Percona Server's answer to `Flavor::snapshot_position_is_watermark`: MySQL's, `false` — and
+/// this is the flavor the question was asked for, because unlike Oracle Community it *does* report
+/// a pair. Measured on Percona Server 8.4 with GTIDs off (`tmp/out/lvs-skips/h3/probe2/`): with a
+/// commit in flight, `Binlog_snapshot_position` had moved from 1014 to 1338 — past the in-flight
+/// update's events — while that snapshot transaction still read the row's OLD value. So the pair
+/// is the binlog write position, not a committed-transaction watermark, and the engine must not
+/// wait on it: Percona's fence is the GTID wait, then the commit-order row it reaches through
+/// [`crate::source::mysql`].
+pub(crate) use crate::source::mysql::snapshot_position_is_watermark;

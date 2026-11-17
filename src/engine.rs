@@ -733,6 +733,10 @@ struct Engine {
     /// The server reports the binlog position of a consistent snapshot (see `fence`); `None`
     /// until tried.
     snapshot_fence: Option<bool>,
+    /// Whether this flavor's consistent-snapshot position is a committed-transaction watermark
+    /// (`Flavor::snapshot_position_is_watermark`): answered once here, so the fence asks a cached
+    /// value and the hot path stays as it was.
+    snapshot_watermark: bool,
     /// Oracle MySQL without GTIDs: the server commits in binlog order, so a commit of our own
     /// proves visibility (see `fence::probe`). `None` until probed on this connection.
     commit_fence: Option<bool>,
@@ -1161,6 +1165,7 @@ impl Engine {
             core_shape_routes: false,
             last_gtid: None,
             snapshot_fence: None,
+            snapshot_watermark: info.flavor.snapshot_position_is_watermark(),
             commit_fence: None,
             commit_fenced: None,
             fence_warned: false,
@@ -4905,8 +4910,10 @@ impl Engine {
     ///
     /// The mechanisms are the flavor's (`mysql::gtid_wait`, `maria::snapshot_position`,
     /// `mysql::commit_order`); the engine keeps only the caches (`snapshot_fence`,
-    /// `commit_fence`, `commit_fenced`), the retry policy (`retry_src`) and the
-    /// `LAZYVIEW_VISIBILITY_DELAY_MS` fallback.
+    /// `snapshot_watermark`, `commit_fence`, `commit_fenced`), the retry policy (`retry_src`) and
+    /// the `LAZYVIEW_VISIBILITY_DELAY_MS` fallback. Which mechanism is a fence at all is the
+    /// flavor's answer too: `snapshot_watermark` says whether waiting on the consistent-snapshot
+    /// position proves anything (`Flavor::snapshot_position_is_watermark`).
     async fn fence(&mut self) -> bool {
         // MySQL / Percona with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET` (see `mysql::gtid_wait`).
         if self.flavor.is_mysql_family() {
@@ -4931,10 +4938,16 @@ impl Engine {
                 }
             }
         }
-        // The consistent-snapshot wait (`maria::snapshot_position` behind `visible_upto`):
-        // MariaDB's and Percona Server's fence, tried on every flavor because the server rules
-        // itself out by reporting no position (e.g. MySQL Community).
-        if self.snapshot_fence != Some(false) && self.boundary.is_some() {
+        // The consistent-snapshot wait (`maria::snapshot_position` behind `visible_upto`) is a
+        // fence only where the reported position is a committed-transaction watermark
+        // (`snapshot_watermark`, the flavor's answer): MariaDB's is. The MySQL family reports its
+        // raw binlog write position, which has already passed transactions still in flight that
+        // the snapshot itself cannot read (Percona Server 8.4: the position advanced past an
+        // in-flight update whose row the snapshot still showed as old), so waiting on it would
+        // approve a stale read. Those flavors take the GTID wait above and the commit-order row
+        // below; a server that reports no position at all (MySQL Community) rules itself out.
+        if self.snapshot_watermark && self.snapshot_fence != Some(false) && self.boundary.is_some()
+        {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut pause = Duration::from_millis(1);
             loop {
@@ -4969,9 +4982,14 @@ impl Engine {
             }
         }
         // The commit-order fence (`mysql::commit_order`, through `src/fence.rs` which only that
-        // file calls): one row of our own, committed after every transaction read. The engine
-        // keeps only the caches and the `LAZYVIEW_VISIBILITY_DELAY_MS` fallback.
-        if self.snapshot_fence == Some(false) && self.boundary.is_some() {
+        // file calls): one row of our own, committed after every transaction read. It runs
+        // whenever the consistent-snapshot wait is not the fence in force: the flavor says its
+        // position is no watermark (the MySQL family), or the server ruled itself out by
+        // reporting none. The engine keeps only the caches and the
+        // `LAZYVIEW_VISIBILITY_DELAY_MS` fallback.
+        if (self.snapshot_fence == Some(false) || !self.snapshot_watermark)
+            && self.boundary.is_some()
+        {
             let mut state = FenceState {
                 snapshot: self.snapshot_fence,
                 commit_order: self.commit_fence,
