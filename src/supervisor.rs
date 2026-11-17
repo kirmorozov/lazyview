@@ -116,16 +116,37 @@ impl std::fmt::Display for Timeout {
 
 impl std::error::Error for Timeout {}
 
+/// The PostgreSQL family's connection-lost arms for the network-edge retry (added at the caller
+/// site, never in [`crate::binlog::is_transient`], whose list is MySQL-only and whose module is
+/// verbatim-copyable): a `tokio_postgres` error that says the backend is closed, or that carries
+/// an io error — the peer reset the chaos scenario injects mid-write, and the handshake reset
+/// that fails a fresh connect. `tokio-postgres` reports no server codes for these, so without
+/// this arm a lost PostgreSQL write is never retried while the MySQL one is. Scoped to chains
+/// that actually carry a `tokio_postgres::Error` so it never widens the MySQL retry (a local io
+/// failure of a kind `is_transient` does not list stays non-retried there, §4.2).
+fn pg_backend_lost(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<tokio_postgres::Error>().is_some_and(|e| {
+            e.is_closed()
+                || std::error::Error::source(e)
+                    .and_then(|s| s.downcast_ref::<std::io::Error>())
+                    .is_some()
+        })
+    })
+}
+
 /// Errors that mean the server is overloaded or unreachable rather than that the statement is
 /// wrong (§4.2): retried with backoff, and never a reason to rebuild a view. The one list is
 /// [`crate::binlog::is_transient`] (the MySQL server codes and five `io::ErrorKind`s — an IO
 /// error of another kind is a local failure, not a busy server, so it is not retried); this
 /// module's own [`Timeout`] (an op that exceeded `LAZYVIEW_TARGET_TIMEOUT_MS`) is the
 /// caller-side arm. The PostgreSQL family adds no server-code list here (T5.3): tokio-postgres
-/// reports no overload codes and the write pool bounds its own backends (D10). A lost PostgreSQL
-/// backend is connection-class, not overload, and is classified at the fence (§4.3).
+/// reports no overload codes and the write pool bounds its own backends (D10). Its connection-
+/// lost arms — [`pg_backend_lost`] — are added at this caller site, so one network-edge policy
+/// retries a lost write of either family the same way (owner: one retry policy); the same lost
+/// backend is what the zombie fence of §4.3 runs on ([`lost_backend`]).
 pub fn is_overload(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<Timeout>()) || crate::binlog::is_transient(e)
+    e.chain().any(|c| c.is::<Timeout>()) || crate::binlog::is_transient(e) || pg_backend_lost(e)
 }
 
 /// A connection-class failure: the connection is unusable (and a transaction it began may or

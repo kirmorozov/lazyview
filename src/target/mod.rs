@@ -560,7 +560,7 @@ pub(crate) async fn write_opts_with(
 pub(crate) async fn fence(kind: Kind, opts: &Opts, id: u32, metrics: &Metrics) -> Result<()> {
     match (kind, opts) {
         (Kind::Mysql, Opts::Mysql(o)) => mysql::kill_and_wait(o, id, metrics).await,
-        (Kind::Postgres, _) => postgres::fence_and_wait(opts, id).await,
+        (Kind::Postgres, _) => postgres::fence_and_wait(opts, id, metrics).await,
         _ => unreachable!("internal: target family and parsed DSN disagree"),
     }
 }

@@ -546,20 +546,39 @@ const LISTED_SQL: &str = "SELECT 1 FROM pg_stat_activity WHERE pid = $1";
 /// "still listed" error shape, so `settle_zombies` and `write_once`'s `lost && began` rule
 /// work unchanged. `id` is the op's [`PgConn::pid`]: with one dedicated backend per write
 /// (D10) this kills exactly the fenced op.
-pub(crate) async fn fence_and_wait(opts: &crate::target::Opts, id: u32) -> Result<()> {
+pub(crate) async fn fence_and_wait(
+    opts: &crate::target::Opts,
+    id: u32,
+    metrics: &Metrics,
+) -> Result<()> {
     let crate::target::Opts::Postgres(dsn) = opts else {
         unreachable!("internal: the PostgreSQL fence with a MySQL DSN")
     };
     let fut = async {
-        // The two statements take no locks, so this connection needs no session settings
-        // beyond what connect applies — `kill_and_wait`'s bare `Conn::new`, the PG form.
-        let c = PgConn::connect(dsn, 0, crate::supervisor::CONNECT_TIMEOUT).await?;
+        // The connect and the terminate are repeats (R4.2), the shape of `kill_and_wait`:
+        // `pg_terminate_backend` is idempotent (false, not an error, when the backend is already
+        // gone), so a reset that lands on the fence's own connect or terminate is retried under
+        // the one network-edge policy instead of parking the zombie until the next settle. The
+        // `pg_stat_activity` deadline poll below stays a poll.
+        let c = crate::target::with_retry(
+            metrics,
+            "fencing a target backend",
+            crate::supervisor::Policy::STATEMENTS,
+            || async {
+                // The two statements take no locks, so this connection needs no session settings
+                // beyond what connect applies — `kill_and_wait`'s bare `Conn::new`, the PG form.
+                let c = PgConn::connect(dsn, 0, crate::supervisor::CONNECT_TIMEOUT).await?;
+                let pid = id as i32;
+                // false (not an error) when the backend is already gone.
+                c.client
+                    .execute(TERMINATE_SQL, &[&pid])
+                    .await
+                    .with_context(|| format!("terminating target backend {id}"))?;
+                Ok(c)
+            },
+        )
+        .await?;
         let pid = id as i32;
-        // false (not an error) when the backend is already gone.
-        c.client
-            .execute(TERMINATE_SQL, &[&pid])
-            .await
-            .with_context(|| format!("terminating target backend {id}"))?;
         let deadline = tokio::time::Instant::now() + crate::supervisor::FENCE_WAIT;
         loop {
             let rows = c.client.query(LISTED_SQL, &[&pid]).await?;
