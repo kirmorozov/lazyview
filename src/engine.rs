@@ -768,9 +768,11 @@ struct Engine {
     /// (src/exec.rs).
     dedup: crate::exec::Dedup,
     /// Rate limiting of the statement-format DML warning ([`Engine::note_statement_dml`]):
-    /// per (schema, table) the time of the last line and the events folded into the next one.
-    /// Bounded by the number of tables whose sessions twist `binlog_format`.
-    stmt_dml_last: HashMap<(String, String), (Instant, u64)>,
+    /// per (schema, table) the time of the last line — `None` while no line has been logged yet,
+    /// which is how the first event logs at once without any arithmetic on the clock — and the
+    /// events folded into the next line. Bounded by the number of tables whose sessions twist
+    /// `binlog_format`.
+    stmt_dml_last: HashMap<(String, String), (Option<Instant>, u64)>,
 }
 
 /// Binlog dump connections: connect, register as a replica and request the stream.
@@ -3856,21 +3858,18 @@ impl Engine {
         let e = self
             .stmt_dml_last
             .entry((schema.to_owned(), table))
-            .or_insert((now - STMT_DML_LOG_INTERVAL, 0));
-        if now.duration_since(e.0) < STMT_DML_LOG_INTERVAL {
-            e.1 += 1; // folded into the next line for this table
-            return;
-        }
+            .or_insert((None, 0));
+        let Some(count) = stmt_dml_gate(e, now) else {
+            return; // folded into the next line for this table
+        };
         warn!(
             kind = %kind,
             schema = %schema,
             at = %pos,
-            count = e.1 + 1,
+            count,
             "DML logged in statement format: its rows never reach the stream, the views \
              reading the table stay stale until they are rebuilt"
         );
-        e.0 = now;
-        e.1 = 0;
     }
 
     /// A transaction boundary at `pos`; returns the previous one. TABLE_MAP ids are re-sent
@@ -7113,6 +7112,28 @@ fn statement_target_table(query: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+/// The rate limit of [`Engine::note_statement_dml`] for one (schema, table) entry: `Some(count)`
+/// when a line is due, `count` being the events it reports (this one plus those folded since the
+/// last line, which the entry forgets as it reports them), and `None` when the event is folded
+/// into the next line for that table. `None` for the time of the last line means "none logged
+/// yet", so the first event always logs and no arithmetic on the clock is needed to say so:
+/// `now - STMT_DML_LOG_INTERVAL` panics when the result would fall before the monotonic clock's
+/// origin — on Linux the boot, so a host up for less than the interval panicked on its first
+/// statement-format DML (review C-03). Split out of the method so the unit test can drive it
+/// without a live engine.
+fn stmt_dml_gate(slot: &mut (Option<Instant>, u64), now: Instant) -> Option<u64> {
+    if let Some(last) = slot.0 {
+        if now.duration_since(last) < STMT_DML_LOG_INTERVAL {
+            slot.1 += 1; // folded into the next line for this table
+            return None;
+        }
+    }
+    let count = slot.1 + 1;
+    slot.0 = Some(now);
+    slot.1 = 0;
+    Some(count)
+}
+
 /// Swaps the shadow tables of a routine rebuild or a first build in, off the binlog loop (see
 /// `finish_next`); `Some(marker)`: first check that no table lazyview did not create appeared
 /// under the view's name. A target where that fails is left to the engine, which checks again
@@ -7578,6 +7599,44 @@ mod tests {
         assert_eq!(first_keyword("/* x */ drop table t"), "drop");
         assert_eq!(first_keyword("-- c\nDROP TABLE t"), "DROP");
         assert_eq!(first_keyword("/*!40000 DROP */"), "");
+    }
+
+    /// The statement-format DML warning is rate limited per (schema, table): the first event for
+    /// a table logs at once — an entry that has never logged has no time to compare against,
+    /// which is what keeps the clock off the path where subtracting the interval from `now` would
+    /// panic below the clock's origin, a host up for less than the interval (review C-03) — and
+    /// an event inside the interval folds into the line that follows it.
+    #[test]
+    fn the_first_statement_dml_line_logs_at_once() {
+        let t0 = Instant::now();
+        let mut slot = (None, 0u64); // a table never warned about
+        assert_eq!(
+            stmt_dml_gate(&mut slot, t0),
+            Some(1),
+            "the first event logs at once, whatever the host's uptime"
+        );
+        assert_eq!(slot, (Some(t0), 0), "the line stamps its table");
+        assert_eq!(
+            stmt_dml_gate(&mut slot, t0 + Duration::from_secs(59)),
+            None,
+            "an event inside the interval folds instead of logging"
+        );
+        assert_eq!(
+            slot,
+            (Some(t0), 1),
+            "the folded event waits for the next line"
+        );
+        assert_eq!(
+            stmt_dml_gate(&mut slot, t0 + STMT_DML_LOG_INTERVAL),
+            Some(2),
+            "the line that follows carries the folded event too"
+        );
+        assert_eq!(slot, (Some(t0 + STMT_DML_LOG_INTERVAL), 0));
+        assert_eq!(
+            stmt_dml_gate(&mut slot, t0 + STMT_DML_LOG_INTERVAL * 2),
+            Some(1),
+            "a quiet interval reports one event"
+        );
     }
 }
 
