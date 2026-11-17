@@ -1018,45 +1018,58 @@ fn values_non_utf8_charsets() {
 }
 
 /// UUID, INET4 and INET6 values as SPJ columns, group keys, join keys and a PK — in the
-/// storage each server has for them, so every flavor proves the values it can hold. Where the
-/// native types exist (MariaDB: UUID from 10.7, INET4 / INET6 from 10.10) they are used as
-/// today: their row-image bytes are not what the server compares (UUIDs of version 1 are
-/// stored with their time fields swapped), so views whose rows they select are planned Full
-/// (the SPJ view over an integer key stays incremental). Where they do not (MySQL / Percona,
-/// MariaDB below 10.10) the same columns take the equivalent storage the docs describe —
-/// UUID as `BINARY(16)`, INET4 as `CHAR(36)`, INET6 as `VARBINARY(16)` — and the same
-/// exactness assertions run over it, with the literals converted (`UNHEX` / plain text /
-/// `INET6_ATON`) so both paths share one statement set.
+/// storage each server has for them, so every flavor proves the values it can hold. MariaDB
+/// added its three native types in different releases (INET6 in 10.5, UUID in 10.7, INET4 in
+/// 10.10), so each column asks for its own type by the server version, never the whole test by
+/// one flavor flag: 10.6 runs INET6 natively with `BINARY(16)` and `CHAR(36)` next to it.
+/// Where a type is native it is used as today: its row-image bytes are not what the server
+/// compares (UUIDs of version 1 are stored with their time fields swapped), so views whose rows
+/// they select are planned Full (the SPJ view over an integer key stays incremental). Where it
+/// is not (MySQL / Percona, MariaDB below that type's release) the same column takes the
+/// equivalent storage the docs describe — UUID as `BINARY(16)`, INET4 as `CHAR(36)`, INET6 as
+/// `VARBINARY(16)` — and the same exactness assertions run over it, with the literals converted
+/// (`UNHEX` / plain text / `INET6_ATON`) so both forms share one statement set.
 #[test]
 fn val_uuid_inet() {
     scenario("val_uuid_inet", |ctx| async move {
         let mut c = connect(&ctx.server().base_dsn).await?;
         let version = server_version(&mut c).await?;
         c.disconnect().await.ok();
-        let native = ctx.server().is_mariadb() && version >= (10, 10);
-        let (u_t, a_t, b_t) = if native {
-            ("UUID", "INET4", "INET6")
+        // One decision per TYPE, from the server version: MariaDB added INET6 in 10.5, UUID in
+        // 10.7 and INET4 in 10.10, so a 10.6 server has the native INET6 and nothing else, and
+        // the same server runs the three forms side by side.
+        let maria = ctx.server().is_mariadb();
+        let uuid_native = maria && version >= (10, 7);
+        let inet4_native = maria && version >= (10, 10);
+        let inet6_native = maria && version >= (10, 5);
+        let u_t = if uuid_native { "UUID" } else { "BINARY(16)" };
+        let a_t = if inet4_native { "INET4" } else { "CHAR(36)" };
+        let b_t = if inet6_native {
+            "INET6"
         } else {
-            ("BINARY(16)", "CHAR(36)", "VARBINARY(16)")
+            "VARBINARY(16)"
         };
         // The literal conversions shared by the DDL and the steps: byte-identical text on the
         // native path, its exact equivalents elsewhere.
         let uuid = |s: &str| {
-            if native {
+            if uuid_native {
                 format!("'{s}'")
             } else {
                 format!("UNHEX(REPLACE('{s}', '-', ''))")
             }
         };
         let uuid_v = || {
-            if native {
+            if uuid_native {
                 "UUID()".to_string()
             } else {
-                "UUID_TO_BIN(UUID())".to_string()
+                // Not UUID_TO_BIN: that one is MySQL's, and a MariaDB below 10.7 has no UUID
+                // type and no conversion function either. UNHEX of the dashed text is the same
+                // 16 bytes on every server.
+                "UNHEX(REPLACE(UUID(), '-', ''))".to_string()
             }
         };
         let ip6 = |s: &str| {
-            if native {
+            if inet6_native {
                 format!("'{s}'")
             } else {
                 format!("INET6_ATON('{s}')")
