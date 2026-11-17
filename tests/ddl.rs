@@ -151,10 +151,21 @@ fn ddl_rename_away_and_back() {
     });
 }
 
-/// Whether this server refuses views that read past a generated column: MariaDB >= 11.4 leaves
-/// generated columns out of row images (issue #7; STORED ones on 13.x too), so the planner
-/// refuses such a view with a reason naming #7 until that is fixed.
-async fn refuses_generated_gaps(ctx: &Ctx, c: &mut mysql_async::Conn) -> Result<bool> {
+/// Whether row images carry STORED generated columns here: MariaDB >= 11.4 leaves generated
+/// columns out of row images (issue #7; STORED ones on 13.x too), so keys over them miss row
+/// moves there until that is fixed.
+async fn images_carry_stored(ctx: &Ctx, c: &mut mysql_async::Conn) -> Result<bool> {
+    if !ctx.server().is_mariadb() {
+        return Ok(true);
+    }
+    Ok(server_version(c).await? < (11, 4))
+}
+
+/// Whether this server leaves VIRTUAL generated columns out of the row images (issue #7):
+/// MariaDB >= 11.4. There the planner refuses a view that reads a REAL column positioned
+/// after a VIRTUAL one, with a reason naming #7; reading the VIRTUAL column itself is an
+/// expression over real columns, and STORED ones the server writes into the images.
+async fn images_leave_out_virtuals(ctx: &Ctx, c: &mut mysql_async::Conn) -> Result<bool> {
     if !ctx.server().is_mariadb() {
         return Ok(false);
     }
@@ -166,28 +177,41 @@ async fn refuses_generated_gaps(ctx: &Ctx, c: &mut mysql_async::Conn) -> Result<
 /// followed in the same stream by changes of the columns after the moved ones: row images are
 /// mapped by ordinal, so every ALTER moves the later columns. `SELECT *` leaves invisible
 /// columns out, also after one moves first. STORED keys run where row images carry them
-/// (MariaDB >= 11.4, issue #7: a view reading past a generated column is asserted refused).
+/// (skipped visibly on MariaDB >= 11.4, issue #7); VIRTUAL columns are issue #7 too: where
+/// the server leaves them out of the images, a view reading a real column after one is
+/// asserted refused, and elsewhere the same view maintains and is verified.
 #[test]
 fn ddl_generated_and_invisible_columns_mid_table() {
     scenario("ddl_mid_columns", |ctx| async move {
         let db = ctx.new_db("ddl_mid_columns").await?;
         let mut c = db.conn().await?;
-        // Where the server refuses views past a generated column (issue #7), the STORED part is
-        // not run: a view reading one is asserted refused at planning instead (below).
-        let refused = refuses_generated_gaps(&ctx, &mut c).await?;
-        let stored = !refused;
+        let stored = images_carry_stored(&ctx, &mut c).await?;
+        if !stored {
+            ctx.skip(
+                "STORED part: MariaDB >= 11.4 leaves generated columns out of row images \
+                 (issue #7); the INVISIBLE and reorder parts run",
+            );
+        }
+        let virtuals_out = images_leave_out_virtuals(&ctx, &mut c).await?;
         let s_col = if stored {
             "s INT AS (a + 1) STORED, "
         } else {
             ""
         };
-        if refused {
-            exec(
-                &mut c,
-                "CREATE TABLE gen_part (id INT PRIMARY KEY, a INT NULL, s INT AS (a + 1) STORED, c INT NULL)",
-            )
-            .await?;
-        }
+        // The issue #7 layout: the REAL `c` sits after the VIRTUAL `g`. Where the server
+        // leaves VIRTUAL columns out of the row images the view over it is refused at
+        // planning (asserted below); elsewhere it maintains and is verified with the rest.
+        exec(
+            &mut c,
+            "CREATE TABLE gen_part (id INT PRIMARY KEY, a INT NULL, g INT AS (a + 1) VIRTUAL, \
+             c INT NULL)",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "INSERT INTO gen_part (id, a, c) VALUES (1, 1, 10), (2, NULL, 20), (3, 3, NULL)",
+        )
+        .await?;
         exec(
             &mut c,
             &format!(
@@ -237,6 +261,13 @@ fn ddl_generated_and_invisible_columns_mid_table() {
             ),
             ViewSpec::new("v_item", Kind::Incremental, "SELECT * FROM item"),
         ];
+        if !virtuals_out {
+            specs.push(ViewSpec::new(
+                "v_gen_part",
+                Kind::Incremental,
+                "SELECT id, g, c FROM gen_part",
+            ));
+        }
         if stored {
             specs.extend([
                 ViewSpec::new(
@@ -260,15 +291,15 @@ fn ddl_generated_and_invisible_columns_mid_table() {
         let (mut eng, _ids) =
             start_with_views(&ctx, &db, &specs, &[("LAZYVIEW_BATCH_WINDOW_MS", "300")]).await?;
         verify(&ctx, &mut eng, &db, &specs, "initial").await?;
-        if refused {
-            // The STORED part, asserted: the view reads the generated column and the column after
-            // it, so the planner refuses it, and the state's reason names issue #7.
+        if virtuals_out {
+            // The issue #7 case, asserted: the view reads the real `c` after the VIRTUAL `g`,
+            // so the planner refuses it, and the state's reason names issue #7.
             add_views(
                 &mut c,
                 &[ViewSpec::new(
                     "v_gen_part",
                     Kind::Incremental,
-                    "SELECT id, s, c FROM gen_part",
+                    "SELECT id, g, c FROM gen_part",
                 )],
             )
             .await?;
@@ -286,6 +317,7 @@ fn ddl_generated_and_invisible_columns_mid_table() {
             "UPDATE entity SET inv = COALESCE(inv, 0) + 10 WHERE id % 3 = 0",
             "UPDATE entity SET a = COALESCE(a, 0) + 1 WHERE id IN (1, 5)",
             "UPDATE item SET hid = CONCAT(COALESCE(hid, ''), 'h'), attr = 'v' WHERE id = 2",
+            "UPDATE gen_part SET c = COALESCE(c, 0) + 1, a = COALESCE(a, 0) + 1 WHERE id % 2 = 1",
         ];
         let mut steps: Vec<(&str, Vec<&str>)> = vec![
             ("no DDL", vec![]),

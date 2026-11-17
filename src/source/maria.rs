@@ -197,10 +197,12 @@ pub(crate) fn position_rule(header: BinlogEventHeader) -> Step {
 }
 
 /// The MariaDB arm of [`crate::source::plan_refusal`] (issue #7): from MariaDB 11.4 on, the
-/// UPDATE and DELETE row images leave generated columns out (VIRTUAL, and STORED too on 13.x),
-/// and the row reader finds columns by table position. Any column at or after the table's
-/// first generated column would be read from the wrong place, so a plan that reads one is
-/// refused until #7 is fixed.
+/// UPDATE and DELETE row images leave VIRTUAL generated columns out and the row reader finds
+/// columns by table position, so a REAL column positioned after a VIRTUAL one would be read
+/// from the wrong place: a plan that reads one is refused until #7 is fixed. The two cases
+/// the row images do carry are not refused: the VIRTUAL column itself (the planner treats it
+/// as an expression over real columns) and STORED columns (the server writes them into the
+/// images).
 pub(crate) fn plan_refusal(
     version: &str,
     table: &TableInfo,
@@ -209,12 +211,16 @@ pub(crate) fn plan_refusal(
     if !at_least_11_4(version) {
         return None;
     }
-    let first = table.columns.iter().position(|c| c.generated.is_some())?;
-    let read =
-        (first..table.columns.len()).find(|&i| referenced.get(i).copied().unwrap_or(false))?;
+    let first_virtual = table
+        .columns
+        .iter()
+        .position(|c| c.generated.as_ref().is_some_and(|g| !g.stored))?;
+    let read = (first_virtual + 1..table.columns.len()).find(|&i| {
+        table.columns[i].generated.is_none() && referenced.get(i).copied().unwrap_or(false)
+    })?;
     Some(format!(
-        "view reads column `{}` of `{}`.`{}`, which MariaDB {version} leaves out of the row images after its generated column `{}` (issue #7): the view is refused until #7 is fixed",
-        table.columns[read].name, table.schema, table.name, table.columns[first].name
+        "view reads column `{}` of `{}`.`{}`, a real column after its VIRTUAL generated column `{}`, which MariaDB {version} leaves out of the row images (issue #7): the view is refused until #7 is fixed",
+        table.columns[read].name, table.schema, table.name, table.columns[first_virtual].name
     ))
 }
 
