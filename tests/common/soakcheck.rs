@@ -520,6 +520,15 @@ pub struct Ledger {
     bars: HashMap<String, u64>,
     /// The wave of the `SourceDdl` event in flight, if one is.
     wave: Option<DdlWave>,
+    /// `view@target` → the counter and the last record of the last [`Self::judge`] observation.
+    /// A record only credits a refresh when the judge sees it as the witness of a counter that
+    /// moved since the previous observation: one documented `last_whole_view_refresh` explains
+    /// the one refresh it is the record of, never the earlier ones it happened to outlive
+    /// (the guard's R1 finding on the f1 rule).
+    seen: HashMap<String, (u64, Option<(String, u64)>)>,
+    /// `view@target` → the beyond-bar refreshes whose witness record a [`Self::judge`] actually
+    /// read moving. The pass line is `count <= bar + witnessed[key]`.
+    witnessed: HashMap<String, u64>,
 }
 
 impl Ledger {
@@ -539,6 +548,8 @@ impl Ledger {
     pub fn clear(&mut self) {
         self.bars.clear();
         self.wave = None;
+        self.seen.clear();
+        self.witnessed.clear();
     }
 
     /// The `SourceDdl` event's burst has fired at `since`: from now, a documented whole-view
@@ -577,8 +588,12 @@ impl Ledger {
     /// `String` is the ordinary at-or-below-the-bar pass); `Err` names the refresh for the report.
     /// A beyond-bar refresh passes only where the engine explains it with a reason the docs
     /// document — one no event can own ([`UNOWNED_REASONS`]), or one the event in flight owns
-    /// ([`WAVE_REASONS`], and then the ledger adopts it: the bar rises to the count the event
-    /// owns, so the same refresh is not judged again by the next check).
+    /// ([`WAVE_REASONS`], and then the ledger adopts it). Credit is per *observed* refresh, not
+    /// per last record: each documented `last_whole_view_refresh` the judge sees for the first
+    /// time while the counter moves credits exactly one refresh (the guard's R1 finding: one
+    /// documented record must not whitewash every earlier unexplained one), a counter that moves
+    /// with no new record behind it credits nothing, and a wave raises its bar only by the
+    /// refreshes its records actually explain — a counter that jumps past them fails.
     pub fn judge(
         &mut self,
         key: &str,
@@ -586,25 +601,62 @@ impl Ledger {
         last: Option<&(String, u64)>,
         now: u64,
     ) -> std::result::Result<String, String> {
+        // A record is a witness only when the counter moved since the last observation and this
+        // is a record the previous observation did not see (one new record per observation).
+        let observed = self.seen.get(key);
+        let fresh = count > observed.map_or(0, |(c, _)| *c)
+            && last.is_some()
+            && last != observed.and_then(|(_, l)| l.as_ref());
+        let seen_now = (count, last.map(|(r, a)| (r.clone(), *a)));
         let bar = self.bar(key);
-        if count <= bar {
+        if count <= bar + self.witnessed.get(key).copied().unwrap_or(0) {
+            self.seen.insert(key.to_string(), seen_now);
             return Ok(String::new());
         }
         let counted = format!("{key} = {count}");
         match last {
             Some((reason, _)) if UNOWNED_REASONS.contains(&reason.as_str()) => {
-                Ok(format!("{counted} ({reason})"))
+                let credited = self.witnessed.entry(key.to_string()).or_default();
+                if fresh {
+                    *credited += 1;
+                }
+                let credited = *credited;
+                self.seen.insert(key.to_string(), seen_now);
+                if count <= bar + credited {
+                    Ok(format!("{counted} ({reason})"))
+                } else {
+                    Err(format!(
+                        "{counted} ({} refresh(es) no observed record explains, last reason: \
+                         {reason})",
+                        count - bar - credited
+                    ))
+                }
             }
             Some((reason, at))
                 if WAVE_REASONS.contains(&reason.as_str()) && self.in_wave(key, *at, now) =>
             {
-                self.approve(key, count);
-                Ok(format!("{counted} ({reason}, the source-ddl wave)"))
+                if fresh {
+                    self.approve(key, bar + 1);
+                }
+                self.seen.insert(key.to_string(), seen_now);
+                let bar = self.bar(key);
+                if count <= bar {
+                    Ok(format!("{counted} ({reason}, the source-ddl wave)"))
+                } else {
+                    Err(format!(
+                        "{counted} ({} refresh(es) beyond the wave records read, last reason: \
+                         {reason})",
+                        count - bar
+                    ))
+                }
             }
-            other => Err(match other {
-                Some((reason, _)) => format!("{counted} (last reason: {reason})"),
-                None => counted,
-            }),
+            other => {
+                self.seen.insert(key.to_string(), seen_now);
+                Err(match other {
+                    Some((reason, _)) => format!("{counted} (last reason: {reason})"),
+                    None => counted,
+                })
+            }
         }
     }
 }

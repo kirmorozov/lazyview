@@ -34,6 +34,12 @@
 //!   `SourceDdl` event that owns the view (`docs/views.md:433`, the version bump of a source-schema
 //!   change) while its wave is open — and to nobody outside that window, not to a view the DDL does
 //!   not touch, not after the tail, not for any other reason.
+//! * [`the_rule_credits_only_observed_whole_refreshes`] and
+//!   [`the_wave_credits_only_the_refreshes_it_read`] pin the ledger's credit itself (the guard's
+//!   R1 findings on the f1 rule): one documented `last_whole_view_refresh` — unowned or a wave's —
+//!   explains exactly the one refresh it is the record of, a counter that moves with no new record
+//!   behind it credits nothing, and a jump past the records the check read fails rather than being
+//!   adopted into the ledger.
 
 mod common;
 
@@ -48,7 +54,11 @@ use common::*;
 
 /// The tables of the soak's schema ([`common::soakwork::SOAK_DDL`]) that this event's views read,
 /// verbatim: `entity_refs` cascades from `entities` (the cascade case) and `entities.kind` is
-/// `VARCHAR(16) NULL`, the column the event widens.
+/// `VARCHAR(16) NULL`, the column the event widens — plus the FK shapes the set comparison below
+/// is pinned on (the guard's R4 finding): `upd_refs`, whose FK cascades from `entities` on UPDATE
+/// only, `rest_children`, whose FK to `entities` RESTRICTs on both rules and must stay OUT of any
+/// approvable set, and `refs_comp`, cascading from `entities` through a composite FK. Neutral
+/// names, per the owner's rule.
 const DDL: &[&str] = &[
     "CREATE TABLE entities (
        id INT NOT NULL PRIMARY KEY,
@@ -61,6 +71,7 @@ const DDL: &[&str] = &[
        note VARCHAR(255) NULL,
        meta JSON NULL,
        spare_at TIMESTAMP(3) NULL DEFAULT NULL,
+       UNIQUE KEY k_id_grp (id, grp),
        KEY k_grp (grp)
      )",
     "CREATE TABLE items (
@@ -90,17 +101,41 @@ const DDL: &[&str] = &[
        PRIMARY KEY (entity_id, seq),
        CONSTRAINT fk_entity_refs_entity FOREIGN KEY (entity_id) REFERENCES entities (id) ON DELETE CASCADE
      )",
+    "CREATE TABLE upd_refs (
+       entity_id INT NOT NULL PRIMARY KEY,
+       note VARCHAR(24) NULL,
+       CONSTRAINT fk_upd_refs_entity FOREIGN KEY (entity_id) REFERENCES entities (id) ON UPDATE CASCADE
+     )",
+    "CREATE TABLE rest_children (
+       id INT NOT NULL PRIMARY KEY,
+       entity_id INT NOT NULL,
+       KEY k_rest_entity (entity_id),
+       CONSTRAINT fk_rest_entity FOREIGN KEY (entity_id) REFERENCES entities (id) ON DELETE RESTRICT ON UPDATE RESTRICT
+     )",
+    "CREATE TABLE refs_comp (
+       entity_id INT NOT NULL,
+       grp INT NOT NULL,
+       seq INT NOT NULL,
+       PRIMARY KEY (entity_id, grp, seq),
+       CONSTRAINT fk_refs_comp_entity FOREIGN KEY (entity_id, grp) REFERENCES entities (id, grp) ON DELETE CASCADE
+     )",
 ];
 
 /// Deterministic seed: 20 entities, three `items` each (so `w_groups_by_region`'s
 /// `HAVING COUNT(*) > 1` keeps them and their revenue clears `w_chain_a`'s 500), a tag on the two
 /// items per entity with `qty > 3` (so `w_big_entities` is non-empty), four `groups`, and two
-/// `entity_refs` per entity (so `wc_refs_by_city` is non-empty and cascades from `entities`).
+/// `entity_refs` per entity (so `wc_refs_by_city` is non-empty and cascades from `entities`), and
+/// one `upd_refs`, two `rest_children` and one `refs_comp` per entity (the FK shapes the set
+/// comparison is pinned on; `refs_comp.grp` matches the parent row's `grp` so the composite FK
+/// holds).
 fn seed() -> Vec<String> {
     let mut entities = Vec::new();
     let mut items = Vec::new();
     let mut tags = Vec::new();
     let mut refs = Vec::new();
+    let mut upd = Vec::new();
+    let mut rest = Vec::new();
+    let mut comp = Vec::new();
     for e in 1..=20i64 {
         entities.push(format!(
             "({e}, {}, {}, {}.00, {}, {}.5, '2026-01-01 00:00:00.000000')",
@@ -124,6 +159,11 @@ fn seed() -> Vec<String> {
         }
         refs.push(format!("({e}, 1, 'c1')"));
         refs.push(format!("({e}, 2, 'c2')"));
+        upd.push(format!("({e}, 'n{e}')"));
+        for k in 1..=2i64 {
+            rest.push(format!("({}, {e})", 9000 + e * 10 + k));
+        }
+        comp.push(format!("({e}, {}, 1)", e % 4));
     }
     vec![
         format!(
@@ -145,12 +185,27 @@ fn seed() -> Vec<String> {
             "INSERT INTO entity_refs (entity_id, seq, city) VALUES {}",
             refs.join(", ")
         ),
+        format!(
+            "INSERT INTO upd_refs (entity_id, note) VALUES {}",
+            upd.join(", ")
+        ),
+        format!(
+            "INSERT INTO rest_children (id, entity_id) VALUES {}",
+            rest.join(", ")
+        ),
+        format!(
+            "INSERT INTO refs_comp (entity_id, grp, seq) VALUES {}",
+            comp.join(", ")
+        ),
     ]
 }
 
 /// The definitions of the finding, verbatim from the failing run's `_lazyview` (the same SELECTs
 /// the soak builds, `tests/common/soakwork.rs`, here the five they named plus the two upstreams the
-/// chains need). Of these only `w_big_entities` reads `entities.kind`: `w_groups_by_region` reads
+/// chains need), plus the four views that put the new FK shapes into a plan: `wu_upd_note` reads
+/// the update-only-cascade child, `wr_rest` the RESTRICT child that must never be approvable,
+/// `wc_comp` the composite-FK child and `wc_pair` two cascade-parented children in one plan. Of
+/// these only `w_big_entities` reads `entities.kind`: `w_groups_by_region` reads
 /// `entities.grp`, `w_chain_b` reads `entities.state`, `wc_refs_by_city` reads `entity_refs`
 /// (cascading from `entities`) and `w_chain_a` only the table of `w_groups_by_region`.
 fn specs() -> Vec<ViewSpec> {
@@ -185,6 +240,26 @@ fn specs() -> Vec<ViewSpec> {
             "wc_refs_by_city",
             Kind::Incremental,
             "SELECT city, COUNT(*) AS n FROM entity_refs GROUP BY city",
+        ),
+        ViewSpec::new(
+            "wu_upd_note",
+            Kind::Incremental,
+            "SELECT entity_id, note FROM upd_refs",
+        ),
+        ViewSpec::new(
+            "wr_rest",
+            Kind::Incremental,
+            "SELECT entity_id, COUNT(*) AS n FROM rest_children GROUP BY entity_id",
+        ),
+        ViewSpec::new(
+            "wc_comp",
+            Kind::Incremental,
+            "SELECT grp, COUNT(*) AS n FROM refs_comp GROUP BY grp",
+        ),
+        ViewSpec::new(
+            "wc_pair",
+            Kind::Incremental,
+            "SELECT r.entity_id, c.grp FROM entity_refs r JOIN refs_comp c ON c.entity_id = r.entity_id",
         ),
     ]
 }
@@ -465,6 +540,59 @@ fn the_rebuild_rules_set_covers_what_the_engine_treats_as_affected() {
              `SourceDdl` event of {SEEDS:?} may approve: {approvable:?} — the finding this file is \
              the regression test for"
         );
+        // The other direction (the guard's R4 finding): nothing the engine does not treat as
+        // affected may be approvable. A `plan_tables`/`stale_closure` that approved every view in
+        // the run — the failure mode that matters, because the F5 rule then trusts the set — fails
+        // here, not just under-approval.
+        let extra: Vec<&String> = approvable.difference(&affected).collect();
+        ensure!(
+            extra.is_empty(),
+            "the rule approves {} view(s) the engine does not treat as affected by a DDL of \
+             {SEEDS:?}: {} — over-approval: anything in the approvable set beyond the engine's \
+             affected set is a silent whole-refresh allowance the F5 rule would hand out",
+            extra.len(),
+            extra
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        // The FK shapes, named so a schema (or a rule) that lost one fails by name, not by a
+        // vacuously equal pair of sets: an UPDATE-only cascade (the `UPDATE_RULE = 'CASCADE'`
+        // half of the metadata query, previously exercised by no fixture row), a composite FK,
+        // and two cascade-parented children of one plan.
+        for (view, why) in [
+            (
+                "wu_upd_note@source",
+                "plan reads `upd_refs`, whose FK cascades from `entities` on UPDATE only",
+            ),
+            (
+                "wc_comp@source",
+                "plan reads `refs_comp` through a composite FK (`entity_id`, `grp`) cascading from `entities`",
+            ),
+            (
+                "wc_pair@source",
+                "one plan reads two cascade-parented children (`entity_refs` and `refs_comp`)",
+            ),
+        ] {
+            ensure!(
+                approvable.contains(view),
+                "{view} is not approvable for a DDL of {SEEDS:?}: {why} — the engine counts the \
+                 cascade parent as affected (`on_tables_changed`, src/engine.rs), so one \
+                 legitimate whole refresh of it would be an unavoidable soak FAIL"
+            );
+            ensure!(
+                affected.contains(view),
+                "{view} is not engine-affected by a DDL of {SEEDS:?}: {why} — the server's FK \
+                 metadata and the access record's `cascade` lines must keep agreeing on it"
+            );
+        }
+        ensure!(
+            !approvable.contains("wr_rest@source") && !affected.contains("wr_rest@source"),
+            "`wr_rest` (plan: `rest_children`, FK to `entities` RESTRICT on both rules) is in the \
+             approvable or the affected set: a non-cascading FK must not pull a view into a \
+             `SourceDdl` event's allowance — its rows cannot move when the parent is altered"
+        );
         eng.stop().await
     })
 }
@@ -610,4 +738,123 @@ fn the_wave_credits_only_the_event_that_owns_the_view() {
     assert!(l
         .judge(OWNED, 1, Some(&refresh(NEW_VERSION, t + 1)), t + 1)
         .is_err());
+}
+
+/// The guard's R1 finding on the unowned arm of the F5 rule (verdict
+/// `tmp/out/generic-guard/pr259-verdict-796e31c.md`, finding 1): a documented
+/// `last_whole_view_refresh` is the record of ONE refresh, never a standing exemption for the
+/// view. [`Ledger::judge`] credits one refresh per witness record it actually sees the counter
+/// move behind; every `is_err` below is a case the pre-fix rule passed with refreshes nobody
+/// explained (one documented reason whitewashing the earlier ones for the life of the engine).
+#[test]
+fn the_rule_credits_only_observed_whole_refreshes() {
+    const CASCADING: &str =
+        "affected ids unknown (cascading foreign key, lookup overflow or untraced change)";
+    const TARGET_DOWN: &str = "build on a target that was down";
+    let rec = |reason: &str, at: u64| (reason.to_string(), at);
+    const VIEW: &str = "wc_refs_by_city@source";
+    assert!(
+        UNOWNED_REASONS.contains(&CASCADING) && UNOWNED_REASONS.contains(&TARGET_DOWN),
+        "the reason this test pins is no longer exempted by the rule: follow it here"
+    );
+
+    // One observed refresh with its documented record passes, and the same observation again
+    // neither judges nor credits twice.
+    let mut l = Ledger::default();
+    let note = l
+        .judge(VIEW, 1, Some(&rec(CASCADING, 100)), 100)
+        .expect("one observed refresh, one documented record");
+    assert!(
+        note.contains(CASCADING),
+        "the report names the reason: {note}"
+    );
+    assert!(l.judge(VIEW, 1, Some(&rec(CASCADING, 100)), 101).is_ok());
+    // Two refreshes observed one at a time, each with its record: both pass, one credit each.
+    let mut l = Ledger::default();
+    assert!(l.judge(VIEW, 1, Some(&rec(CASCADING, 100)), 100).is_ok());
+    assert!(l.judge(VIEW, 2, Some(&rec(CASCADING, 102)), 102).is_ok());
+    // The counter moved but no new record is behind it: the refresh has no witness, so it
+    // fails — the pre-fix rule let this pass forever once one record was on the view.
+    let mut l = Ledger::default();
+    assert!(l.judge(VIEW, 1, Some(&rec(CASCADING, 100)), 100).is_ok());
+    assert!(
+        l.judge(VIEW, 2, Some(&rec(CASCADING, 100)), 102).is_err(),
+        "a counter that moves with no new record behind it is not explained"
+    );
+    // Two refreshes slipped past between observations and only the last record survived: the
+    // visible one credits its own refresh, not the jump it rode in on.
+    let mut l = Ledger::default();
+    assert!(l.judge(VIEW, 1, Some(&rec(CASCADING, 100)), 100).is_ok());
+    assert!(
+        l.judge(VIEW, 4, Some(&rec(CASCADING, 104)), 104).is_err(),
+        "one record must credit one refresh, not the whole jump"
+    );
+    // A first sight of a counter already at height is not a run of observed refreshes — and the
+    // same count-based bound holds for the other exempted reason.
+    assert!(
+        Ledger::default()
+            .judge(VIEW, 3, Some(&rec(CASCADING, 1)), 1)
+            .is_err(),
+        "three refreshes with one visible record are two refreshes nobody explained"
+    );
+    assert!(
+        Ledger::default()
+            .judge("w_big_entities@source", 2, Some(&rec(TARGET_DOWN, 1)), 1)
+            .is_err(),
+        "`build on a target that was down` is bounded the same way: one record, one refresh"
+    );
+    assert!(
+        Ledger::default()
+            .judge("w_big_entities@source", 1, Some(&rec(TARGET_DOWN, 5)), 5)
+            .is_ok(),
+        "and its documented single refresh still passes"
+    );
+}
+
+/// The guard's R1 finding on the wave arm (verdict finding 2): the check must credit only what
+/// the wave's records account for. Every assertion that `is_err` here passed before the fix,
+/// when one `last_whole_view_refresh` adopted the whole counter jump into the ledger.
+#[test]
+fn the_wave_credits_only_the_refreshes_it_read() {
+    const NEW_VERSION: &str =
+        "new version: definition, targets or source schema changed, or rebuild requested";
+    const OWNED: &str = "w_chain_a@source";
+    let t = 1_700_000_000u64; // the burst
+    let rec = |at: u64| (NEW_VERSION.to_string(), at);
+
+    // A view whose counter jumps 0 -> 5 inside the wave has ONE record to explain it: the wave
+    // credits the one refresh that record is the witness of, and the excess still fails.
+    let mut l = Ledger::default();
+    l.open_wave(HashSet::from([OWNED.to_string()]), t, t + 60);
+    assert!(
+        l.judge(OWNED, 5, Some(&rec(t + 10)), t + 11).is_err(),
+        "a wave must not adopt a counter jump it only partly read"
+    );
+    assert_eq!(
+        l.bar(OWNED),
+        1,
+        "the one refresh the record witnesses is credited to the event"
+    );
+    // The same observation again credits nothing new.
+    assert!(l.judge(OWNED, 5, Some(&rec(t + 10)), t + 12).is_err());
+    // The event's own ledger read the jump (its 1 s polls saw the steps): the count IT observed
+    // is the count it approves, and the check stops judging it.
+    l.approve(OWNED, 5);
+    assert!(l.judge(OWNED, 5, Some(&rec(t + 10)), t + 13).is_ok());
+
+    // Steps the wave really landed one at a time: each record credits its refresh, and an
+    // unobserved surplus beyond them fails.
+    let mut l = Ledger::default();
+    l.open_wave(HashSet::from([OWNED.to_string()]), t, t + 60);
+    assert!(l.judge(OWNED, 1, Some(&rec(t + 1)), t + 2).is_ok());
+    assert!(l.judge(OWNED, 2, Some(&rec(t + 3)), t + 4).is_ok());
+    assert_eq!(
+        l.bar(OWNED),
+        2,
+        "the bar rose only by the two observed records"
+    );
+    assert!(
+        l.judge(OWNED, 4, Some(&rec(t + 5)), t + 6).is_err(),
+        "two refreshes slipped between the reads; one record explains one"
+    );
 }
