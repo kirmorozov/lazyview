@@ -2814,7 +2814,7 @@ impl Engine {
                 .find(|s| s.def_id == *id)
                 .map(|s| s.name.clone())
                 .unwrap_or_default();
-            warn!(
+            info!(
                 view = %name,
                 definition = id,
                 "the dedup core refused the view's plan, it keeps the viewplan executor: {why}"
