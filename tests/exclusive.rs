@@ -249,6 +249,169 @@ fn exclusive_idle_rotation_moves_the_position() {
     });
 }
 
+/// The tables of the compression window below. `note` is read by no view, and its width is what
+/// makes MariaDB compress the row events at all: records under `log_bin_compress_min_len` (256
+/// bytes) are written uncompressed, so without it the window would prove nothing.
+const WIDE_DDL: &[&str] = &[
+    "CREATE TABLE items (id INT PRIMARY KEY, grp INT NOT NULL, status VARCHAR(10) NOT NULL, \
+     note VARCHAR(1000) NULL)",
+    "INSERT INTO items VALUES (10, 1, 'new', NULL), (11, 1, 'paid', NULL), (12, 2, 'new', NULL), \
+     (13, 3, 'paid', NULL)",
+];
+
+/// The view of the compression window: no row has group 9 until the window's own transaction, so
+/// a row for it would mean a compressed transaction had been applied.
+fn wide_spec() -> Vec<ViewSpec> {
+    vec![ViewSpec::new(
+        "x_wide_counts",
+        Kind::Incremental,
+        "SELECT grp, COUNT(*) AS n FROM items GROUP BY grp",
+    )]
+}
+
+/// Polls an engine's log file until a line contains `needle`, returning its text on the first hit
+/// (for a mid-stream condition the test waits to see reported; `chaos.rs` has the same shape).
+async fn wait_log_contains(
+    log: &std::path::Path,
+    needle: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(log) {
+            if text.contains(needle) {
+                return Ok(text);
+            }
+        }
+        ensure!(
+            Instant::now() <= deadline,
+            "no {needle:?} line in the engine log {} within {timeout:?}",
+            log.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// MariaDB's own binlog compression, `log_bin_compress`, on a server this test has to itself.
+///
+/// This is the one compression window that cannot run beside another scenario: the variable has no
+/// session scope (the GLOBAL is the only way to write a compressed event), and the events it writes
+/// are the compressed types 165..171, which this reader can never decode — so an engine that
+/// started before the window stalls on them for good, whatever else it was doing. That is what
+/// "needs a database server of their own" means, so the scenario lives here and runs under the
+/// `LAZYVIEW_TEST_EXCLUSIVE` opt-in. MySQL / Percona compress at session scope and their payloads
+/// are readable, so their window stays in `tests/lifecycle.rs` (`lc_compressed`, which the MariaDB
+/// family runs as the same transaction shapes, uncompressed).
+///
+/// What is proven: lazyview streams normally up to the window; on reaching one of those events it
+/// reports the documented error with the documented fix (docs/server-setup.md: `log_bin_compress`
+/// must be OFF); it stays alive and retries, with its position held before the unreadable events;
+/// and the compressed transaction never reaches a view, so nothing is half-applied. It cannot pass
+/// them: starting over while the GLOBAL is ON is refused at start-up
+/// (`lifecycle_refuses_log_bin_compress`).
+#[test]
+fn exclusive_mariadb_compressed_window_is_unreadable() {
+    scenario("x_lc_compress", |ctx| async move {
+        if !ctx.server().is_mariadb() {
+            ctx.skip(
+                "only MariaDB writes binlog events this reader cannot decode; MySQL's transaction \
+                 compression is session-scoped and readable (tests/lifecycle.rs)",
+            );
+            return Ok(());
+        }
+        if container(&ctx).is_none() {
+            ctx.note("SKIP: needs LAZYVIEW_TEST_EXCLUSIVE=<flavor>=<container>");
+            return Ok(());
+        }
+        let ov = [
+            ("LAZYVIEW_POSITION_PERSIST_MS", "300"),
+            ("LAZYVIEW_QUERY_CHUNK", "7"),
+        ];
+        let specs = wide_spec();
+        let (db, mut eng) = setup_views(&ctx, "x_lc_compress", WIDE_DDL, &specs, &ov).await?;
+        let mut c = db.conn().await?;
+        // Ordinary writes first, so the window opens while the engine is streaming: the mid-stream
+        // path (a start at the current position is the start-up refusal mentioned above).
+        for id in 100..100 + scaled(40) {
+            exec(
+                &mut c,
+                &format!("INSERT INTO items VALUES ({id}, {}, 'new', NULL)", id % 7),
+            )
+            .await?;
+        }
+        verify(&ctx, &mut eng, &db, &specs, "streaming before the window").await?;
+
+        // The window: the GLOBAL every session on this server writes with, back OFF as soon as the
+        // statements that have to land inside it are through.
+        let mut globals = Globals::set(&mut c, &db.dsn, &[("log_bin_compress", "ON")]).await?;
+        exec_all(
+            &mut c,
+            &[
+                "START TRANSACTION".to_string(),
+                // The marker's row image is 600 bytes of note: its Write_rows event is written
+                // compressed.
+                "INSERT INTO items (id, grp, status, note) VALUES (987654, 9, 'paid', \
+                 REPEAT('m', 600))"
+                    .to_string(),
+                // Bulk wide images: every row event of this transaction is compressed too.
+                "UPDATE items SET note = REPEAT('u', 600) WHERE id <> 987654".to_string(),
+                "COMMIT".to_string(),
+            ],
+        )
+        .await?;
+        globals.restore(&mut c).await?;
+        // Where the window's transaction ends on the server. The reader may take the plain events
+        // that precede the compressed ones (MariaDB compresses per record, so the transaction's
+        // GTID, BEGIN and Table_map are written uncompressed) — nothing past here may ever be
+        // applied, and the position must stay before it.
+        let window_end = server_position(&mut c).await?;
+
+        // The window really was compressed: the stream that reads into it reports the unreadable
+        // events with the documented fix hint...
+        let log = wait_log_contains(
+            &eng.log_path,
+            "MariaDB compressed binlog event (type",
+            Duration::from_secs(60),
+        )
+        .await
+        .with_context(|| format!("engine log {}", eng.log_path.display()))?;
+        ensure!(
+            log.contains("set log_bin_compress=OFF"),
+            "the reported error lacks the documented fix hint — log {}",
+            eng.log_path.display()
+        );
+        // ...and it keeps retrying rather than dying. The GLOBAL is OFF again and the writer is
+        // idle, so anything that moved the position would have been the reader passing the events
+        // it cannot decode — that is what the position check below rules out.
+        eng.check_alive()?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut mc = db.conn().await?;
+        let saved: (String, u64) = mc
+            .query_first("SELECT CAST(binlog_file AS CHAR), binlog_pos FROM _lazyview_status")
+            .await?
+            .context("no saved position after the window")?;
+        ensure!(
+            (saved.0.as_str(), saved.1) < (window_end.file.as_str(), window_end.pos),
+            "the reader passed the unreadable events: it saved {}:{} while the window's \
+             transaction ends at {}:{}",
+            saved.0,
+            saved.1,
+            window_end.file,
+            window_end.pos
+        );
+        ensure!(
+            scalar_i64(&mut mc, "SELECT COUNT(*) FROM items WHERE id = 987654").await? == 1,
+            "the compressed marker row was not written to items"
+        );
+        ensure!(
+            scalar_i64(&mut mc, "SELECT COUNT(*) FROM x_wide_counts WHERE grp = 9").await? == 0,
+            "a compressed transaction reached x_wide_counts although its events are unreadable"
+        );
+        // The stream cannot pass those events, so the engine ends crashed, not stopped.
+        eng.crash().await
+    });
+}
+
 /// The engine's connections killed under it (KILL from an admin session, a proxy or a failover
 /// dropping sessions): MariaDB answers the next statement with ER_CONNECTION_KILLED (1927),
 /// which was fatal like 1053. lazyview must reconnect and stay exact.
