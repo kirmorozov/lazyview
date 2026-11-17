@@ -379,9 +379,62 @@ pub(crate) fn cursor_key(p: &crate::source::Position) -> (u64, u64) {
     crate::source::mysql::position_key(p)
 }
 
-/// The text is the MySQL family's (`file:pos`): a call into `mysql.rs`, never a copy.
-pub(crate) fn parse(text: &str) -> Option<crate::source::Position> {
+/// The text is the MySQL family's (`file:pos` and the optional `[g=…]`): a call into `mysql.rs`
+/// for the split, never a copy. The set inside `[g=…]` is returned verbatim and read back by
+/// MariaDB's own [`parse_gtid_set`].
+pub(crate) fn parse(text: &str) -> Option<(crate::source::Position, Option<String>)> {
     crate::source::mysql::parse(text)
+}
+
+/// MariaDB's gtid-list grammar: comma-separated `domain-server-seq` (a high-water mark: every
+/// transaction `1..=seq` for that `domain-server` pair, because MariaDB numbers them sequentially
+/// per pair and `gtid_binlog_state` reports the last one written) or `domain-server-seq1-seq2` (an
+/// explicit window `seq1..=seq2`, the shape `mariadb-binlog -j` / `SET @slave_connect_state` take).
+/// The key is the `domain-server` pair. A token that is not a well-formed list entry is dropped,
+/// never guessed. This is MariaDB's quirk: the MySQL family reads a bare number as one gno
+/// ([`mysql::parse_gtid_set`]), MariaDB reads it as a prefix from 1.
+pub(crate) fn parse_gtid_set(text: &str) -> mysql::GtidSet {
+    let mut set = mysql::GtidSet::new();
+    for tok in text.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let mut f = tok.split('-');
+        let (Some(dom), Some(server), Some(seq)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let (Ok(d), Ok(s)) = (dom.trim().parse::<u32>(), server.trim().parse::<u32>()) else {
+            continue;
+        };
+        let (lo, hi) = match (
+            seq.trim().parse::<u64>(),
+            f.next().map(|r| r.trim().parse::<u64>()),
+        ) {
+            // a single `seq` is the high-water mark: transactions 1..=seq.
+            (Ok(a), None) => (1, a),
+            // `seq1-seq2` is the explicit window seq1..=seq2.
+            (Ok(a), Some(Ok(b))) => (a, b),
+            _ => continue,
+        };
+        let entry = set.entry(format!("{d}-{s}")).or_default();
+        mysql::merge_interval(entry, lo, hi);
+    }
+    set
+}
+
+/// The MariaDB subset question for [`crate::source::gtid_covers`]: does this node's
+/// `@@GLOBAL.gtid_binlog_state` include `saved`? Compared in flavor code over the parsed lists
+/// (MariaDB has no server-side subset function to hand the question to), reusing the shared
+/// interval rule through `mysql.rs`. A cursor with no set covers trivially.
+pub(crate) async fn gtid_covers(conn: &mut Conn, saved: Option<&str>) -> Result<bool> {
+    let Some(saved) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(true);
+    };
+    let saved = parse_gtid_set(saved);
+    let st = crate::binlog::gtid_state(conn).await?;
+    let state = st.binlog_state.unwrap_or_default();
+    Ok(mysql::gtid_subset(&saved, &parse_gtid_set(&state)))
 }
 
 /// The 4-byte header floor is the shared one too.

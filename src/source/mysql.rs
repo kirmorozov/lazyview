@@ -1012,17 +1012,164 @@ pub(crate) fn normalize(p: &crate::source::Position) -> crate::source::Position 
     }
 }
 
-/// The one spelling of a cursor's text (`file:pos`) and its parse: the metadata tables' text
-/// comes back through here, so nothing outside the flavor modules splits it.
-pub(crate) fn parse(text: &str) -> Option<crate::source::Position> {
-    let (file, pos) = text.rsplit_once(':')?;
+/// Splits a cursor's text into its `file:pos` and the optional bracketed GTID set (§ the
+/// resume-by-GTID plan): `file:pos[g=set]` → `("file:pos", Some("set"))`, `file:pos` →
+/// `("file:pos", None)`. Splitting on `[g=` before touching `:` is what lets the set keep its own
+/// colons (`uuid:1-5`) without confusing the `file:pos` split that follows. The set is handed back
+/// verbatim (it is opaque to the generic side); the flavor's own parser is what reads it later.
+fn split_gtid(text: &str) -> (&str, Option<&str>) {
+    if let Some(body) = text.strip_suffix(']') {
+        if let Some(i) = body.find("[g=") {
+            return (&body[..i], Some(&body[i + 3..]));
+        }
+    }
+    (text, None)
+}
+
+/// The one spelling of a cursor's text (`file:pos` and the optional `[g=…]`) and its parse: the
+/// metadata tables' text comes back through here, so nothing outside the flavor modules splits it.
+/// A text with no bracket (every pre-GTID cursor) parses to `(position, None)`, exactly as before.
+pub(crate) fn parse(text: &str) -> Option<(crate::source::Position, Option<String>)> {
+    let (pos_text, g) = split_gtid(text);
+    let (file, pos) = pos_text.rsplit_once(':')?;
     if file.is_empty() {
         return None;
     }
-    Some(crate::source::Position {
-        file: file.to_string(),
-        pos: pos.parse().ok()?,
+    Some((
+        crate::source::Position {
+            file: file.to_string(),
+            pos: pos.parse().ok()?,
+        },
+        g.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    ))
+}
+
+/// A parsed GTID set: every source id (a MySQL/Percona `uuid`, or a MariaDB `domain-server` pair)
+/// mapped to the sorted, disjoint intervals of transaction numbers executed from it. The two
+/// flavors spell the text differently — each `parse_gtid_set` owns its grammar and fills this
+/// shared shape — but the subset question is the same intervals either way, so MariaDB reaches
+/// [`gtid_subset`] through here rather than copying it.
+pub(crate) type GtidSet = std::collections::BTreeMap<String, Vec<(u64, u64)>>;
+
+/// The MySQL/Percona set grammar: comma-separated `uuid:interval[:interval…]` groups (the same
+/// uuid may recur across groups, so its intervals merge), each `interval` a single `n` or a range
+/// `n-m`. Empty text, blank groups and blank intervals contribute nothing (a `uuid:` group is a
+/// uuid with no transactions); a non-numeric interval is dropped, never guessed.
+pub(crate) fn parse_gtid_set(text: &str) -> GtidSet {
+    let mut set = GtidSet::new();
+    for group in text.split(',') {
+        let group = group.trim();
+        if group.is_empty() {
+            continue;
+        }
+        let mut parts = group.split(':');
+        let sid = match parts.next() {
+            Some(s) => s.trim().to_ascii_lowercase(),
+            None => continue,
+        };
+        if sid.is_empty() {
+            continue;
+        }
+        let entry = set.entry(sid).or_default();
+        for iv in parts {
+            if let Some((lo, hi)) = parse_interval(iv) {
+                merge_interval(entry, lo, hi);
+            }
+        }
+    }
+    set
+}
+
+/// `n` → `(n, n)`, `n-m` → `(n, m)` (both inclusive); blank or non-numeric → `None`.
+fn parse_interval(iv: &str) -> Option<(u64, u64)> {
+    let iv = iv.trim();
+    if iv.is_empty() {
+        return None;
+    }
+    match iv.split_once('-') {
+        Some((a, b)) => Some((a.trim().parse().ok()?, b.trim().parse().ok()?)),
+        None => iv.parse::<u64>().ok().map(|n| (n, n)),
+    }
+}
+
+/// Inserts the inclusive range `[lo, hi]` into a sorted, disjoint interval list, coalescing with
+/// any range it overlaps or touches (so consecutive transactions stay one range).
+pub(crate) fn merge_interval(v: &mut Vec<(u64, u64)>, lo: u64, hi: u64) {
+    if lo > hi {
+        return;
+    }
+    let (mut lo, mut hi) = (lo, hi);
+    let mut res: Vec<(u64, u64)> = Vec::with_capacity(v.len() + 1);
+    let mut inserted = false;
+    for &(a, b) in v.iter() {
+        if b.saturating_add(1) < lo {
+            res.push((a, b)); // whole range is below and not adjacent
+        } else if a > hi.saturating_add(1) {
+            if !inserted {
+                res.push((lo, hi));
+                inserted = true;
+            }
+            res.push((a, b)); // whole range is above and not adjacent
+        } else {
+            lo = lo.min(a); // overlaps or is adjacent: absorb
+            hi = hi.max(b);
+        }
+    }
+    if !inserted {
+        res.push((lo, hi));
+    }
+    *v = res;
+}
+
+/// Whether every transaction number in the inclusive range `[lo, hi]` lies in one of `src`'s
+/// (sorted, disjoint) intervals — an interval comparison, so a range of billions costs a walk of
+/// the intervals, not of the numbers. An empty range is covered.
+fn covers_interval(src: &[(u64, u64)], lo: u64, hi: u64) -> bool {
+    if lo > hi {
+        return true;
+    }
+    let mut need = lo;
+    for &(a, b) in src {
+        if b < need {
+            continue; // this interval is below what is still needed
+        }
+        if a > need {
+            return false; // a gap before covering the next needed number
+        }
+        need = b.saturating_add(1);
+        if need > hi {
+            return true;
+        }
+    }
+    need > hi
+}
+
+/// Whether `saved ⊆ source`: every source id `saved` names is present in `source` and every one of
+/// its ranges lies in `source`'s ranges for that id. An empty `saved` is a subset of anything
+/// (a source that has consumed nothing is covered by every server) — the empty-set row of the
+/// subset table.
+pub(crate) fn gtid_subset(saved: &GtidSet, source: &GtidSet) -> bool {
+    saved.iter().all(|(sid, ivals)| {
+        source
+            .get(sid)
+            .is_some_and(|src| ivals.iter().all(|&(lo, hi)| covers_interval(src, lo, hi)))
     })
+}
+
+/// The MySQL/Percona subset question for [`crate::source::gtid_covers`]: does this server's
+/// `@@GLOBAL.gtid_executed` include `saved`? A cursor with no set covers trivially (see
+/// [`crate::source::gtid_covers`]); a `gtid_mode=OFF` server reports an empty `executed`, so a real
+/// set is not covered and the caller stops cleanly rather than resuming somewhere it cannot.
+pub(crate) async fn gtid_covers(conn: &mut Conn, saved: Option<&str>) -> Result<bool> {
+    let Some(saved) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(true);
+    };
+    let saved = parse_gtid_set(saved);
+    let st = crate::binlog::gtid_state(conn).await?;
+    let executed = st.executed.unwrap_or_default();
+    Ok(gtid_subset(&saved, &parse_gtid_set(&executed)))
 }
 
 /// Whether the server still has the file of `at` in its log index — what a lost slot means here.

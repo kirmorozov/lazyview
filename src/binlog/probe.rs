@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::binlog::connect::value_str;
-use crate::source::{mysql::status_statements, server_errors, ACCESS_DENIED_CODES};
+use crate::source::{mysql::status_statements, server_errors, GtidState, ACCESS_DENIED_CODES};
 
 pub(super) fn show(v: &str) -> &str {
     if v.is_empty() {
@@ -105,6 +105,24 @@ pub async fn binlog_exists(conn: &mut Conn, file: &str) -> Result<bool> {
         .await
         .map_err(|e| with_hint(anyhow::Error::new(e).context("SHOW BINARY LOGS failed")))?;
     Ok(rows.iter().any(|r| value_str(r.as_ref(0)) == file))
+}
+
+/// The source's own GTID state, read once at connect for a resume (§ the resume-by-GTID plan):
+/// the `@@GLOBAL` variables MySQL/Percona (`gtid_mode`, `gtid_executed`, `gtid_purged`) and MariaDB
+/// (`gtid_binlog_state`, `gtid_purged`) report about what they have executed and purged. These are
+/// plain `SELECT @@GLOBAL.x` reads through the same retry probe preflight uses: a variable the
+/// server does not have (MariaDB has no `gtid_mode`, MySQL/Percona no `gtid_binlog_state`) comes
+/// back `None`, and any other failure is an error — never a silent empty set, which would turn a
+/// broken read into a false "this server covers me". Interpreting the text and asking the subset
+/// question is the flavor's job (see [`crate::source::gtid_covers`]); this is only the network edge
+/// that reads the server's words.
+pub async fn gtid_state(conn: &mut Conn) -> Result<GtidState> {
+    Ok(GtidState {
+        mode: crate::binlog::probe_var_retry(conn, "gtid_mode").await?,
+        executed: crate::binlog::probe_var_retry(conn, "gtid_executed").await?,
+        purged: crate::binlog::probe_var_retry(conn, "gtid_purged").await?,
+        binlog_state: crate::binlog::probe_var_retry(conn, "gtid_binlog_state").await?,
+    })
 }
 
 const ER_PARSE_ERROR: u16 = 1064;

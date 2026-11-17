@@ -70,6 +70,9 @@ pub use crate::source::{
 // loop (MariaDB's preflight probes run through it) and the XA xid formatter (MariaDB's GTID
 // event carries XA ids in the MySQL format, so it lives with the MySQL-family code).
 pub(crate) use self::connect::probe_var_retry;
+// The GTID state a resume reads, exposed to the flavor modules (which interpret it and ask the
+// subset question in `crate::source`); the network edge stays here, the grammar and rule there.
+pub(crate) use self::probe::gtid_state;
 pub(crate) use crate::source::mysql::xid_string;
 
 #[cfg(test)]

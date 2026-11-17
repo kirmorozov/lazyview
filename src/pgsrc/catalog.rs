@@ -176,6 +176,8 @@ fn pg_caps() -> SourceCaps {
         // expected event here; `Config::on_missing_binlog` decides what it costs (unlike the
         // placeholders above, this one reads from the source on the fail path).
         cursor_purgeable: true,
+        // PostgreSQL has no MySQL-family GTIDs; nothing here resumes by a GTID set.
+        gtid: false,
     }
 }
 

@@ -70,10 +70,18 @@ impl std::fmt::Display for Position {
 /// [`mysql::parse`] the spelling, and the 4-byte file-header floor that made a raw offset of a
 /// fresh file meaningless (`pos.max(4)`) is [`mysql::floor_offset`]. The generic side gets
 /// ordering, equality, `Display` and a parse — never a file name or an offset.
+///
+/// A cursor can also carry the GTID state of the source it came from ([`Cursor::gtid`]): the
+/// canonical set text the flavor module has consumed, appended to the text as `[g=…]` (§ the
+/// resume-by-GTID plan). It is *carried*, never ordered or compared — the ordering coordinate
+/// stays `file:pos` — so the `[g=…]` part is what lets a resume request be answered on another
+/// server whose `file:pos` means nothing here. It is `None` on every cursor a non-GTID source
+/// produces, so the text is byte-for-byte the pre-GTID `file:pos`.
 #[derive(Debug, Clone)]
 pub struct Cursor {
     flavor: Flavor,
     at: Position,
+    gtid: Option<String>,
 }
 
 impl Cursor {
@@ -86,6 +94,7 @@ impl Cursor {
                 Flavor::MySql | Flavor::Percona => mysql::normalize(at),
                 Flavor::MariaDb => maria::normalize(at),
             },
+            gtid: None,
         }
     }
 
@@ -108,6 +117,24 @@ impl Cursor {
     /// The binlog coordinate to open a stream from / to answer the server's own questions with.
     pub fn to_position(&self) -> Position {
         self.at.clone()
+    }
+
+    /// The GTID state this cursor carries, as the flavor's canonical set text (MySQL/Percona:
+    /// `uuid:interval,…`; MariaDB: a `domain-server-seq` list) — the transactions the reader has
+    /// consumed, which is what a resume on another server is checked against. `None` on a cursor
+    /// from a source that reports no GTIDs, and on every cursor built before a GTID source put
+    /// one here. Ordering and equality ignore it (see [`Cursor`]).
+    pub fn gtid(&self) -> Option<&str> {
+        self.gtid.as_deref()
+    }
+
+    /// The same cursor now carrying `gtid` — the set a GTID dump request starts from. Additive
+    /// copy-set API (PR A); the set is the flavor's to canonicalize and the engine's to keep
+    /// merged (it never reaches the per-event path, only the cursor a stream is opened from and
+    /// the status row it is saved to).
+    pub fn with_gtid(mut self, gtid: Option<String>) -> Cursor {
+        self.gtid = gtid;
+        self
     }
 }
 
@@ -151,8 +178,13 @@ impl std::hash::Hash for Cursor {
 impl std::fmt::Display for Cursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The text the metadata tables hold; identical in shape to the position it replaces, so
-        // logs and the saved position read the same across the format bump.
-        write!(f, "{}:{}", self.at.file, self.at.pos)
+        // logs and the saved position read the same across the format bump. The optional `[g=…]`
+        // part carries the GTID state where the source has it (flavor-owned grammar, parsed back
+        // by the flavor's `parse`); its absence is byte-for-byte the pre-GTID text.
+        match self.gtid.as_deref().filter(|g| !g.is_empty()) {
+            Some(g) => write!(f, "{}:{}[g={}]", self.at.file, self.at.pos, g),
+            None => write!(f, "{}:{}", self.at.file, self.at.pos),
+        }
     }
 }
 
@@ -168,6 +200,42 @@ pub async fn can_resume(conn: &mut mysql_async::Conn, cursor: &Cursor) -> anyhow
         Flavor::MySql | Flavor::Percona => mysql::can_resume(conn, &at).await,
         Flavor::MariaDb => maria::can_resume(conn, &at).await,
     }
+}
+
+/// Whether the source on `conn` has executed **every** transaction named by `saved`'s GTID set —
+/// the subset question a resume on another server asks before it trusts a cursor whose `file:pos`
+/// is meaningless there (`saved ⊆ source.gtid_executed`, the safety bar of the resume-by-GTID
+/// plan). A saved cursor with no GTID set is the upgrade case and covers trivially: there is
+/// nothing to check, so the file/pos and identity rules answer for it. Per flavor the read is the
+/// server's own words and the grammar is the flavor's: MySQL/Percona compare against
+/// `@@GLOBAL.gtid_executed`, MariaDB against `@@GLOBAL.gtid_binlog_state`; the interval math is
+/// shared (MariaDB reaches it through `mysql.rs`, never a copy). A failed question is an error,
+/// never a silent `false`.
+pub async fn gtid_covers(conn: &mut mysql_async::Conn, saved: &Cursor) -> anyhow::Result<bool> {
+    match saved.flavor {
+        Flavor::MySql | Flavor::Percona => mysql::gtid_covers(conn, saved.gtid.as_deref()).await,
+        Flavor::MariaDb => maria::gtid_covers(conn, saved.gtid.as_deref()).await,
+    }
+}
+
+/// The GTID state a source reports about itself, read once at connect (the network edge, in
+/// [`crate::binlog`]) and interpreted by the flavor modules. `None` means the server has no such
+/// variable, not that it is empty: MariaDB has no `gtid_mode`, MySQL/Percona no
+/// `gtid_binlog_state`; `gtid_purged` exists on both. `executed` (MySQL) and `binlog_state`
+/// (MariaDB) are what a resume's [`gtid_covers`] compares against; `purged` is the pre-check that
+/// a server has not thrown away the transactions the saved cursor still wants, and `mode` says
+/// whether GTIDs are on at all (`gtid_covers` on a `gtid_mode=OFF` MySQL sees an empty
+/// `executed` and answers `false`, the clean stop).
+#[derive(Debug, Clone, Default)]
+pub struct GtidState {
+    /// `@@GLOBAL.gtid_mode` (MySQL/Percona): `ON` / `OFF` / `ON_PERMISSIVE` …; `None` on MariaDB.
+    pub mode: Option<String>,
+    /// `@@GLOBAL.gtid_executed` (MySQL/Percona): the canonical `uuid:interval,…` set consumed.
+    pub executed: Option<String>,
+    /// `@@GLOBAL.gtid_purged`: the set the server no longer has in its binlog (both flavors).
+    pub purged: Option<String>,
+    /// `@@GLOBAL.gtid_binlog_state` (MariaDB): the `domain-server-seq` list written to the binlog.
+    pub binlog_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +313,11 @@ impl Flavor {
             json_cast: self.is_mysql_family(),
             sql_generation_expressions: self == Flavor::MariaDb,
             cursor_purgeable: true,
+            // Never assumed from the flavor: a source has GTIDs only once the connect probe
+            // (`crate::binlog::gtid_state`) reports the server runs with them, at which point the
+            // caller sets this to `true`. Default `false` is the safe reading — nothing resumes by
+            // GTID on evidence the server never gave (the plan's safety bar).
+            gtid: false,
         }
     }
 
@@ -252,11 +325,11 @@ impl Flavor {
     /// cursor of this flavor. The one way back from text: a cursor that does not parse is an
     /// error the caller raises, not a position to try.
     pub fn parse_cursor(self, text: &str) -> Option<Cursor> {
-        let at = match self {
+        let (at, gtid) = match self {
             Flavor::MySql | Flavor::Percona => mysql::parse(text)?,
             Flavor::MariaDb => maria::parse(text)?,
         };
-        Some(Cursor::from_position(self, &at))
+        Some(Cursor::from_position(self, &at).with_gtid(gtid))
     }
 }
 
@@ -277,6 +350,11 @@ pub struct SourceCaps {
     /// answers for is an expected event, not a broken cursor: `Config::on_missing_binlog` is
     /// what decides what a lost slot costs.
     pub cursor_purgeable: bool,
+    /// The source runs with GTIDs, so [`gtid_covers`] is the resume question and a cursor may
+    /// carry a `[g=…]` set. Set from the connect probe ([`crate::binlog::gtid_state`], which
+    /// reads `gtid_mode` on the MySQL family and `gtid_binlog_state` on MariaDB), not from the
+    /// flavor: `gtid_mode=OFF` keeps the single-server file/pos mode (the plan's Q-O2 default).
+    pub gtid: bool,
 }
 
 impl From<bool> for SourceCaps {
@@ -566,4 +644,114 @@ pub(crate) fn is_duplicate_server_id_error(se: &mysql_async::ServerError) -> boo
     let m = se.message.to_ascii_lowercase();
     se.code == ER_SOURCE_FATAL_ERROR_READING_BINLOG
         && (m.contains("same server_uuid/server_id") || m.contains("same server_id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    use super::{maria, mysql, Cursor, Flavor};
+
+    /// parse → cursor → `Display`: the text the metadata tables would hold again.
+    fn round_trip(flavor: Flavor, text: &str) -> String {
+        flavor.parse_cursor(text).expect("parses").to_string()
+    }
+
+    #[test]
+    fn cursor_text_round_trips_pre_gtid() {
+        // Every pre-GTID `file:pos` text is byte-for-byte unchanged through parse + Display.
+        assert_eq!(
+            round_trip(Flavor::MySql, "binlog.000012:1234"),
+            "binlog.000012:1234"
+        );
+        assert_eq!(
+            round_trip(Flavor::Percona, "binlog.000003:4"),
+            "binlog.000003:4"
+        );
+        assert_eq!(
+            round_trip(Flavor::MariaDb, "mariadb-bin.000003:42"),
+            "mariadb-bin.000003:42"
+        );
+    }
+
+    #[test]
+    fn cursor_text_round_trips_with_gtid() {
+        // The bracketed set survives verbatim — its own colons (uuid:1-5) never disturb the
+        // file:pos split that precedes it.
+        let mysql = "binlog.000012:1234[g=3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5:10,c80aa942-1111-2222-3333-c80aa9429562:3]";
+        assert_eq!(round_trip(Flavor::MySql, mysql), mysql);
+        let maria = "mariadb-bin.000003:42[g=0-1-100,1-2-50-60]";
+        assert_eq!(round_trip(Flavor::MariaDb, maria), maria);
+    }
+
+    #[test]
+    fn cursor_carries_gtid_apart_from_ordering() {
+        // The set is carried, not ordered: two cursors at the same file:pos are equal and tie,
+        // whatever set one of them carries (the ordering coordinate stays file:pos).
+        let a = Cursor::from_parts(Flavor::MySql, "binlog.000001".into(), 100);
+        let b = a.clone().with_gtid(Some("u:1-5".into()));
+        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), Ordering::Equal);
+        assert_eq!(a.gtid(), None);
+        assert_eq!(b.gtid(), Some("u:1-5"));
+        assert_eq!(b.to_string(), "binlog.000001:100[g=u:1-5]");
+        // An empty set is not written: the bare `file:pos` is kept.
+        assert_eq!(
+            a.clone().with_gtid(Some(String::new())).to_string(),
+            "binlog.000001:100"
+        );
+    }
+
+    #[test]
+    fn gtid_subset_table() {
+        let s = |t: &str| mysql::parse_gtid_set(t);
+        // empty saved set is a subset of anything
+        assert!(mysql::gtid_subset(&s(""), &s("u:1-5")));
+        // range within a range
+        assert!(mysql::gtid_subset(&s("u:1-5"), &s("u:1-10")));
+        // a gap (4,5) the source does not cover
+        assert!(!mysql::gtid_subset(&s("u:1-5"), &s("u:1-3:6-9")));
+        // two adjacent intervals cover the range
+        assert!(mysql::gtid_subset(&s("u:1-5"), &s("u:1-3:4-6")));
+        // single-number interval equals itself
+        assert!(mysql::gtid_subset(&s("u:7"), &s("u:7")));
+        assert!(!mysql::gtid_subset(&s("u:8"), &s("u:7")));
+        // multi-sid: a missing sid breaks it, an extra sid in the source does not
+        assert!(!mysql::gtid_subset(&s("u1:1-5,u2:1-2"), &s("u1:1-10")));
+        assert!(mysql::gtid_subset(
+            &s("u1:1-5,u2:1-2"),
+            &s("u1:1-10,u2:1-3")
+        ));
+        assert!(mysql::gtid_subset(&s("u1:1-5"), &s("u1:1-10,u9:1")));
+        // sid is matched case-insensitively (the server prints uuids in upper case)
+        assert!(mysql::gtid_subset(&s("U:1-5"), &s("u:1-5")));
+        // the same uuid recurring across groups merges its intervals
+        assert!(mysql::gtid_subset(&s("u:4-5"), &s("u:1-2,u:3-4,u:5")));
+    }
+
+    #[test]
+    fn gtid_subset_mariadb_lists() {
+        let s = maria::parse_gtid_set;
+        // per (domain, server) coverage of a `domain-server-seq` list
+        assert!(mysql::gtid_subset(&s("0-1-100"), &s("0-1-100")));
+        assert!(mysql::gtid_subset(&s("0-1-50"), &s("0-1-100")));
+        assert!(!mysql::gtid_subset(&s("0-1-101"), &s("0-1-100")));
+        // An explicit window `d-s-lo-hi` is covered by a high-water mark at or past its end; the
+        // single-seq form is a high-water mark (transactions 1..=seq), not a bare point.
+        assert!(mysql::gtid_subset(&s("0-1-40-60"), &s("0-1-100")));
+        assert!(!mysql::gtid_subset(&s("0-1-40-110"), &s("0-1-100")));
+        // a different server is a different key
+        assert!(!mysql::gtid_subset(&s("0-2-50"), &s("0-1-100")));
+        // multiple domains must each be covered
+        assert!(mysql::gtid_subset(
+            &s("0-1-50,1-2-10"),
+            &s("0-1-100,1-2-10")
+        ));
+        assert!(!mysql::gtid_subset(
+            &s("0-1-50,1-2-11"),
+            &s("0-1-100,1-2-10")
+        ));
+        // empty saved set
+        assert!(mysql::gtid_subset(&s(""), &s("0-1-100")));
+    }
 }

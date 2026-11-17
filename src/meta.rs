@@ -48,7 +48,7 @@ const CREATE_STATUS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview_status` (
   `instance_id` VARCHAR(64) NOT NULL PRIMARY KEY,
   `binlog_file` VARCHAR(255) NOT NULL,
   `binlog_pos` BIGINT UNSIGNED NOT NULL,
-  `binlog_cursor` VARCHAR(255) NOT NULL DEFAULT '',
+  `binlog_cursor` TEXT NULL,
   `epoch` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `server_identity` VARCHAR(255) NULL,
   `updated_at` TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
@@ -89,11 +89,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "epoch",
         "BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER `binlog_pos`",
     ),
-    (
-        STATUS,
-        "binlog_cursor",
-        "VARCHAR(255) NOT NULL DEFAULT '' AFTER `binlog_pos`",
-    ),
+    (STATUS, "binlog_cursor", "TEXT NULL AFTER `binlog_pos`"),
     (STATUS, "server_identity", "VARCHAR(255) NULL AFTER `epoch`"),
     (STATE, "route", "VARCHAR(16) NULL AFTER `detail`"),
     (STATE, "access", "TEXT NULL AFTER `route`"),
@@ -120,6 +116,24 @@ pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
             conn.query_drop(format!("ALTER TABLE `{table}` ADD COLUMN `{col}` {def}"))
                 .await?;
         }
+    }
+    // `binlog_cursor` widened to TEXT for the resume-by-GTID plan: the cursor text can now carry a
+    // whole GTID set (`file:pos[g=…]`), which a few thousand writers could push past VARCHAR(255)
+    // and truncate into a wrong resume. It stays NULL-able because a TEXT column takes no DEFAULT
+    // (the status row is first inserted without it, in `coord::claim`, and read back as "no cursor
+    // yet"). The row is still written once per flush on the same cadence — the payload only grows,
+    // from ~30 B to typically <1 KB — so this adds no new writes to the source, and the cursor is
+    // metadata that belongs in the control store (`_lazyview_status`), not the source. Idempotent:
+    // the ALTER runs only while the column is not already TEXT.
+    let cursor_type: Option<Option<String>> = conn
+        .exec_first(
+            "SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_lazyview_status' AND COLUMN_NAME = 'binlog_cursor'",
+            (schema,),
+        )
+        .await?;
+    if cursor_type.flatten().as_deref() != Some("text") {
+        conn.query_drop("ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` TEXT NULL")
+            .await?;
     }
     // State rows are keyed by the view's table name, which the server compares case-sensitively
     // (lower_case_table_names=0): `Lz_Case` and `lz_case` must not share a row.
@@ -418,7 +432,7 @@ pub async fn load_position(
     instance: &str,
     flavor: Flavor,
 ) -> Result<Option<Cursor>> {
-    let row: Option<(String, u64, String)> = conn
+    let row: Option<(String, u64, Option<String>)> = conn
         .exec_first(
             "SELECT `binlog_file`, `binlog_pos`, `binlog_cursor` FROM `_lazyview_status` WHERE `instance_id` = ?",
             (instance,),
@@ -427,6 +441,10 @@ pub async fn load_position(
     let Some((file, pos, text)) = row else {
         return Ok(None);
     };
+    // A NULL cursor (a status row claimed but never saved, or one from before the cursor existed)
+    // is "no cursor yet" — the same reading the pre-cursor empty text had; the file/pos columns
+    // below carry it.
+    let text = text.unwrap_or_default();
     if !text.is_empty() {
         return flavor.parse_cursor(&text).map(Some).with_context(|| {
             format!("the saved position {text:?} is no cursor this source speaks")
