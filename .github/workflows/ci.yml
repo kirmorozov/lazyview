@@ -1,8 +1,8 @@
 name: ci
 
 # Every pull_request, push to main, v* tag and workflow_dispatch runs the same full set: lint, unit,
-# e2e, the integration matrix, integration-multi, integration-pg and integration-pgsrc. Every landed
-# commit therefore shows its own full matrix. The network-chaos suite (tests/chaos.rs) runs inside
+# e2e, the integration matrix, integration-multi, integration-pg (the PostgreSQL target matrix) and
+# integration-pgsrc. Every landed commit therefore shows its own full matrix. The network-chaos suite (tests/chaos.rs) runs inside
 # every integration job: the job's own server family reached through the toxiproxy daemon (compose
 # profile `chaos`), its scenarios required (scripts/chaos-gate.sh fails the step on any failure
 # tests/chaos-known-red.txt does not list, and prints the listed ones in the job summary), the toxi
@@ -324,19 +324,27 @@ jobs:
         run: docker compose down -v
 
   integration-pg:
-    # A MySQL-family source maintained into PostgreSQL (issue #56). One blocking job on the
-    # supported baseline major; the other majors come in a later PR. The source is a normal
-    # matrix flavor; PostgreSQL is only ever a target (LAZYVIEW_TEST_PG_DSNS).
-    name: integration (postgres target, mysql84 + pg16)
+    # A MySQL-family source maintained into PostgreSQL (issue #56): the PostgreSQL TARGET matrix on
+    # the baseline source mysql84 — pg14 (AWS-only tier: community EOL 2026-11-12, still run by
+    # Amazon RDS, the mysql80/mariadb106 precedent), pg15, pg16 (the supported baseline), pg17 and
+    # pg18 (the latest GA) BLOCKING, pg19rc2 ADVISORY (owner's maximum-coverage rule, lead decisions
+    # 2026-11-13 and 2026-11-16). Folded into ONE job on one runner, the way integration-pgsrc folds
+    # the source majors and integration-multi the flavors: the repo is runner-bound, so the extra
+    # majors cost legs, not jobs. Each major runs tests/targets.rs filtered to targets_pg_ — those
+    # five gates only, never the whole corpus (the 12-server matrix shows what a fan-out costs) —
+    # against its own server on its own host port, with LAZYVIEW_TEST_REQUIRE_PG=1 so no PostgreSQL
+    # test may skip. The source is a normal matrix flavor; PostgreSQL is only ever a target here.
+    name: integration (postgres target, mysql84 + pg14-pg18 blocking, pg19rc2 advisory)
     runs-on: ubuntu-24.04
-    # targets suite + the chaos_tgt_pg_ scenarios (3 x ~120 s worst case) + build/wait.
-    timeout-minutes: 60
+    # 5 blocking target legs + the advisory one + the chaos_tgt_pg_ scenarios (3 x ~120 s worst
+    # case) + build/wait.
+    timeout-minutes: 90
     env:
       COMPOSE_FILE: docker-compose.test.yml
-      # toxiproxy (compose profile `chaos`) joins the two servers: the chaos step below arms real
+      # toxiproxy (compose profile `chaos`) joins the servers: the chaos step below arms real
       # network faults on the link to the PostgreSQL target, the same daemon the matrix jobs use.
       COMPOSE_PROFILES: chaos
-      SERVICES: mysql84 pg16 toxiproxy
+      SERVICES: mysql84 pg14 pg15 pg16 pg17 pg18 pg19rc2 toxiproxy
     steps:  # identical to integration-multi: start servers (toxiproxy with them, profile `chaos`),
             # rust, rust-cache (shared-key integration, save-if false), build --test targets --test
             # chaos, wait, print versions, then the targets suite and the chaos_tgt_pg_ scenarios
@@ -365,25 +373,68 @@ jobs:
       - name: server versions
         run: |
           echo "mysql84: $(docker compose exec -T mysql84 sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"')"
-          echo "PGVERSION: $(docker compose exec -T pg16 psql -U lv -d lvtest -Atc 'select version()')"
+          for s in pg14 pg15 pg16 pg17 pg18 pg19rc2; do
+            echo "$s: $(docker compose exec -T "$s" psql -U lv -d lvtest -Atc 'select version()')"
+          done
           # The daemon the chaos step below arms its faults through; a dead one shows here, not at
           # the first scenario.
           curl -fsS http://127.0.0.1:18474/version
-      - name: postgres target tests
+      # The blocking majors, one leg per major against its own server. The binary is built above, so
+      # a leg only runs; each leg's five named gates must be seen passing in its own log, and
+      # LAZYVIEW_TEST_REQUIRE_PG=1 turns any PG skip into a failure (a major that is not up cannot
+      # leave the job green). Ports: pg16 keeps its historic 35432, pg15/pg17/pg18 are the ones
+      # integration-pgsrc uses, pg14 35436 and the pre-release 35437 are C2's.
+      - name: postgres target tests (pg16 + pg15 + pg17 + pg18 + pg14, blocking)
         env:
           LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
-          LAZYVIEW_TEST_PG_DSNS: pg16=postgres://lv:lv@127.0.0.1:35432/lvtest
+          LAZYVIEW_HEALTH_ADDR: "off"
+          LAZYVIEW_TEST_REQUIRE_PG: "1"
+          LAZYVIEW_TEST_REQUIRE_MULTI: "1"
+        run: |
+          pgtarget() {
+            local name=$1 port=$2 log="pg-target-$1.log"
+            LAZYVIEW_TEST_PG_DSNS="$name=postgres://lv:lv@127.0.0.1:$port/lvtest" \
+              cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
+              | tee "$log"
+            for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
+                     targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others \
+                     targets_pg_group_by_unindexable_key; do
+              grep -q "^test $t \.\.\. ok$" "$log" \
+                || { echo "::error::$name: $t did not run and pass"; exit 1; }
+            done
+          }
+          pgtarget pg16 35432
+          pgtarget pg15 35431
+          pgtarget pg17 35433
+          pgtarget pg18 35434
+          pgtarget pg14 35436
+      # pg19rc2 is the current pre-release major: the matrix rule's pre-release tier, so it is
+      # advisory (continue-on-error) — it annotates the run, never blocks it. When 19.0 ships, move
+      # the pin to postgres:19.x and make this a plain `pgtarget pg19 35437` in the step above.
+      - name: postgres target tests (pg19rc2, advisory)
+        id: pg19
+        continue-on-error: true
+        env:
+          LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
+          LAZYVIEW_TEST_PG_DSNS: pg19rc2=postgres://lv:lv@127.0.0.1:35437/lvtest
           LAZYVIEW_HEALTH_ADDR: "off"
           LAZYVIEW_TEST_REQUIRE_PG: "1"
           LAZYVIEW_TEST_REQUIRE_MULTI: "1"
         run: |
           cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
-            | tee pg-target-tests.log
+            | tee pg-target-pg19rc2.log
           for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
                    targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others \
                    targets_pg_group_by_unindexable_key; do
-            grep -q "^test $t \.\.\. ok$" pg-target-tests.log || { echo "::error::$t did not run and pass"; exit 1; }
+            grep -q "^test $t \.\.\. ok$" pg-target-pg19rc2.log \
+              || { echo "::error::pg19rc2: $t did not run and pass"; exit 1; }
           done
+      - name: advisory pg19rc2 target failed
+        if: steps.pg19.outcome == 'failure'
+        run: |
+          echo "::warning title=advisory target failed::pg19rc2 is the pre-release PostgreSQL major (advisory, tested but not required for a release): see the pg-target-pg19rc2 log"
+          echo "### :warning: pg19rc2: advisory PostgreSQL target leg failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "PostgreSQL 19rc2 failed the targets_pg_ scenarios as a target. It does not block this run; check the log before 19.0 ships, when the leg becomes blocking." >> "$GITHUB_STEP_SUMMARY"
       # The chaos_tgt_pg_ scenarios of #242 for real, where the PostgreSQL target actually is: the
       # same faults the matrix jobs arm against their own server, here against pg16 through the
       # toxiproxy daemon started above (the harness proxies pg16:5432 inside the compose network).

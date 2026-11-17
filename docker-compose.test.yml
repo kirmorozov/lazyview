@@ -11,8 +11,10 @@
 #   scripts/test-servers.sh dsns                  # LAZYVIEW_TEST_DSNS for the servers that are up
 #   scripts/test-servers.sh compose down          # stop; `compose clean` also drops the data
 #   pg16 (PostgreSQL 16, the *source matrix* baseline; also the *target* server of the postgres-
-#   target job, read from LAZYVIEW_TEST_PG_DSNS): docker compose -f docker-compose.test.yml up -d --wait pg16
-#   pg15/pg17/pg18 (the other source majors, pg18 advisory; all four on one CI runner): up -d --wait pg15 pg16 pg17 pg18
+#   target jobs, read from LAZYVIEW_TEST_PG_DSNS): docker compose -f docker-compose.test.yml up -d --wait pg16
+#   pg14/pg15/pg17/pg18/pg19rc2 (the other majors, pg14 AWS-only, pg19rc2 the pre-release; all
+#   blocking except the advisory pre-release) — all six on one CI runner per job:
+#   up -d --wait pg14 pg15 pg16 pg17 pg18 pg19rc2
 #
 # or plain compose:
 #
@@ -46,6 +48,12 @@
 #   blocking, latest GA:       mysql2610 mariadb130   (Percona has no Innovation line: 9.7 LTS is its latest)
 #   blocking, AWS-only:        mysql80 mariadb106     (community EOL, still run by RDS / Aurora)
 #   advisory, pre-release:     mariadb131-rc mariadb132-pre   (profile `prerelease`)
+#   PostgreSQL (source+target): pg14 (AWS-only) pg15 pg16 pg17 pg18 blocking, pg19rc2 advisory
+# PostgreSQL images are pinned by digest like the preview images above (tag + @sha256), per the
+# database-matrix rule; lv-devops keeps the pins. These flavors are NOT in scripts/test-servers.sh's
+# MATRIX_FLAVORS (its `dsns` and the default `compose up` list stay MySQL-only): the harness reads
+# PG servers only from LAZYVIEW_TEST_PG_DSNS, so the tags here are shared with CI, not with that
+# script.
 # Percona publishes no pre-release; no registry has a MySQL one (26.10 went GA, no newer EA).
 # The same tags and the preview digest as lazy-wire-fire's docker-compose.test.yml.
 #
@@ -89,12 +97,17 @@ x-mariadb-common: &mariadb-common
         memory: 2g
   restart: "no"
 
-# PostgreSQL as a SOURCE (owner ruling "CI follows the source"): the source matrix majors pg15/
-# pg16/pg17 (blocking) and pg18 (advisory) share everything but image tag, host port and data
-# volume; the CI `integration-pgsrc` job starts them by name. `wal_level=logical` is what the
-# logical-replication reader needs (the pgoutput decoder + the gated slot smoke); it is harmless
-# for the pg16 target use (integration-pg) too. pg16 is the supported baseline and also the
-# target server of integration-pg. Start one: docker compose -f docker-compose.test.yml up -d --wait pg16.
+# PostgreSQL, as a SOURCE and as a TARGET (issues #57/#56). The version matrix (owner's maximum-
+# coverage rule, lead decisions 2026-11-13 and 2026-11-16): pg14 (AWS-only: community EOL
+# 2026-11-12, still run by Amazon RDS — the mysql80/mariadb106 precedent), pg15, pg16 (the
+# supported baseline), pg17 and pg18 (the latest GA) are BLOCKING; pg19rc2 is ADVISORY (Docker
+# Hub has postgres:19rc2, no postgres:19 yet — the pre-release tier, like the MariaDB rc flavors).
+# Majors share everything but image tag (each pinned by digest), host port and data volume; the CI
+# `integration-pg` job uses them as targets (a MySQL-family source, LAZYVIEW_TEST_PG_DSNS) and
+# `integration-pgsrc` runs the source gate on the majors it needs. `wal_level=logical` is what the
+# logical-replication reader needs (the pgoutput decoder + the gated slot smoke); it is harmless for
+# the target use too. Start one:
+# docker compose -f docker-compose.test.yml up -d --wait pg16.
 x-pg-common: &pg-common
   command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10"]
   environment:
@@ -294,45 +307,62 @@ services:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - mariadb114:/var/lib/mysql
 
-  # PostgreSQL as a target (issue #56) and, later, as a source (issue #57, logical
-  # replication): a MySQL-family source maintains tables here, and the source tests stream
-  # from this same service (logical WAL). Not in scripts/test-servers.sh's matrix: the
-  # harness reads it from LAZYVIEW_TEST_PG_DSNS, never from LAZYVIEW_TEST_DSNS. Pin the
-  # exact patch build, as the MySQL services above do; lv-devops keeps the pin.
-  # ---- PostgreSQL as a SOURCE: the source matrix (pg15/pg16/pg17 blocking, pg18 advisory) ----------
-  # One template (x-pg-common), four majors differing only by image tag, host port and volume. The
-  # CI `integration-pgsrc` job starts all four on one runner and runs the source gate per version.
-  # Ports: 35431..35434 (pg16 keeps its historic 35432, the target server of integration-pg).
+  # ---- PostgreSQL: the version matrix, used as a TARGET and as a SOURCE (issues #56/#57) ----------
+  # A MySQL-family source maintains tables here (target, LAZYVIEW_TEST_PG_DSNS) and the source tests
+  # stream from these same services (logical WAL). Not in scripts/test-servers.sh's matrix: the
+  # harness reads them from LAZYVIEW_TEST_PG_DSNS, never from LAZYVIEW_TEST_DSNS. Every image is
+  # pinned by digest (tag + @sha256), as the preview images above; lv-devops keeps the pins.
+  # One template (x-pg-common), six majors differing only by image tag, host port and volume. The
+  # CI jobs (`integration-pg`, `integration-pgsrc`) start them on one runner.
+  # Ports: 35431..35434 + pg14 35436 + pg19rc2 35437 (pg16 keeps its historic 35432).
+  pg14:
+    <<: *pg-common
+    image: postgres:14.25@sha256:c0e9c0e9bac7e4c1834b698217a03ee5c708de30d313c84a506972de0e24b059
+    # AWS-only tier (mysql80/mariadb106 precedent): community EOL 2026-11-12, still run by Amazon RDS.
+    ports: ["127.0.0.1:35436:5432"]
+    volumes:
+      - pg14:/var/lib/postgresql/data
+
   pg15:
     <<: *pg-common
-    image: postgres:15.20
+    image: postgres:15.20@sha256:2663a9f0fde52de94f5dad3603a1942359f49472f1017c1a6d64f66bfedacb40
     ports: ["127.0.0.1:35431:5432"]
     volumes:
       - pg15:/var/lib/postgresql/data
 
   pg16:
     <<: *pg-common
-    image: postgres:16.16
+    image: postgres:16.16@sha256:dd2bf3ce2dc83a81674cf7f217fcfd8a5009a4b325dda5b843bfee82a06cff6f
     ports: ["127.0.0.1:35432:5432"]
     volumes:
       - pg16:/var/lib/postgresql/data
 
   pg17:
     <<: *pg-common
-    image: postgres:17.12
+    image: postgres:17.12@sha256:0d938e975177bef9f1f61f3f9dbcf2e0aa0a139568f66d3415ed8892eb97f6ac
     ports: ["127.0.0.1:35433:5432"]
     volumes:
       - pg17:/var/lib/postgresql/data
 
   pg18:
     <<: *pg-common
-    image: postgres:18.7
+    image: postgres:18.7@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
     ports: ["127.0.0.1:35434:5432"]
     # PG18+ moved its data dir under a parent mount (docker-library/postgres#37): it wants a single
     # mount at /var/lib/postgresql and refuses to start when a volume is mounted at .../data. So this
     # one major overrides the template's data volume path; every other pg field is inherited.
     volumes:
       - pg18:/var/lib/postgresql
+
+  # pg19rc2: the pre-release major (advisory tier — Docker Hub has postgres:19rc2, no postgres:19
+  # yet; when 19.0 ships, move this service to the GA pin and make its CI steps blocking).
+  pg19rc2:
+    <<: *pg-common
+    image: postgres:19rc2@sha256:15924313d5606f326836976643a5f681a64fb30f591e79fcb15e160979323802
+    ports: ["127.0.0.1:35437:5432"]
+    # 19 has the same parent-mount layout as 18 (see the pg18 note above).
+    volumes:
+      - pg19rc2:/var/lib/postgresql
 
   mariadb118:
     <<: *mariadb-common
@@ -477,7 +507,9 @@ volumes:
   mariadb130:
   mariadb131-rc:
   mariadb132-pre:
+  pg14:
   pg15:
   pg16:
   pg17:
   pg18:
+  pg19rc2:
