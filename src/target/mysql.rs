@@ -412,6 +412,7 @@ pub(crate) async fn swap(
     name: &str,
     swap_lock_wait_s: u64,
     session_lock_wait_s: u64,
+    single_try: bool,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
     let shadow = shadow_name(name);
@@ -425,48 +426,53 @@ pub(crate) async fn swap(
     let swap_two = format!("RENAME TABLE {s}.{n} TO {s}.{old_q}, {s}.{shadow_q} TO {s}.{n}");
     let swap_one = format!("RENAME TABLE {s}.{shadow_q} TO {s}.{n}");
     let (schema_t, shadow_t, name_t) = (schema.to_string(), shadow.clone(), name.to_string());
-    super::with_retry_mut(
-        metrics,
-        "swapping the shadow table",
-        crate::supervisor::Policy::SWAP,
-        conn,
-        |conn| {
-            let (set_swap, set_general, drop_old, swap_two, swap_one, schema_t, shadow_t, name_t) = (
-                set_swap.clone(),
-                set_general.clone(),
-                drop_old.clone(),
-                swap_two.clone(),
-                swap_one.clone(),
-                schema_t.clone(),
-                shadow_t.clone(),
-                name_t.clone(),
-            );
-            Box::pin(async move {
-                // Readers with open transactions on the old table hold its metadata lock: the
-                // swap waits for it at most `swap_lock_wait_s` per try (a bounded number of
-                // tries), then reports and the next rebuild retries (N-01, N-02). The general
-                // lock wait is restored for whatever else runs on this session.
-                conn.query_drop(set_swap).await?;
-                let r = async {
-                    if table_kind(conn, &schema_t, &shadow_t).await?.is_none() {
-                        // Already swapped (an earlier attempt was interrupted after the rename).
-                        return Ok(());
-                    }
-                    if table_kind(conn, &schema_t, &name_t).await?.is_some() {
-                        conn.query_drop(drop_old.clone()).await?;
-                        conn.query_drop(swap_two).await?;
-                        conn.query_drop(drop_old).await?;
-                    } else {
-                        conn.query_drop(swap_one).await?;
-                    }
-                    Ok(())
+    // The swap's own bounded wait (N-01), a bounded number of tries. The binlog loop's tail
+    // passes `single_try`: one try with the loop's short wait, so the shared reader never waits
+    // for a lock it cannot get (N-02); the operator's wait is spent in the swap task off the loop.
+    let policy = if single_try {
+        crate::supervisor::Policy {
+            attempts: 0,
+            ..crate::supervisor::Policy::SWAP
+        }
+    } else {
+        crate::supervisor::Policy::SWAP
+    };
+    super::with_retry_mut(metrics, "swapping the shadow table", policy, conn, |conn| {
+        let (set_swap, set_general, drop_old, swap_two, swap_one, schema_t, shadow_t, name_t) = (
+            set_swap.clone(),
+            set_general.clone(),
+            drop_old.clone(),
+            swap_two.clone(),
+            swap_one.clone(),
+            schema_t.clone(),
+            shadow_t.clone(),
+            name_t.clone(),
+        );
+        Box::pin(async move {
+            // Readers with open transactions on the old table hold its metadata lock: the
+            // swap waits for it at most `swap_lock_wait_s` per try (a bounded number of
+            // tries), then reports and the next rebuild retries (N-01, N-02). The general
+            // lock wait is restored for whatever else runs on this session.
+            conn.query_drop(set_swap).await?;
+            let r = async {
+                if table_kind(conn, &schema_t, &shadow_t).await?.is_none() {
+                    // Already swapped (an earlier attempt was interrupted after the rename).
+                    return Ok(());
                 }
-                .await;
-                conn.query_drop(set_general).await?;
-                r
-            })
-        },
-    )
+                if table_kind(conn, &schema_t, &name_t).await?.is_some() {
+                    conn.query_drop(drop_old.clone()).await?;
+                    conn.query_drop(swap_two).await?;
+                    conn.query_drop(drop_old).await?;
+                } else {
+                    conn.query_drop(swap_one).await?;
+                }
+                Ok(())
+            }
+            .await;
+            conn.query_drop(set_general).await?;
+            r
+        })
+    })
     .await
 }
 

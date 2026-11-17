@@ -70,16 +70,48 @@ fn reg_first_build_swap_does_not_stall_other_views() {
                 }
                 tokio::time::sleep(Duration::from_millis(700)).await;
             }
-            let state: Option<String> = typed_first(
-                &mut c,
-                "SELECT state FROM _lazyview_state WHERE name = 'r_locked'",
-            )
-            .await?;
+            // Guard R1 on #254 (findings 1 and 2): a swap that only spent its own bounded wait on
+            // the table's metadata lock is transient contention, not a build failure. The row
+            // keeps the state a view has while it is being built and names the reason; `error` is
+            // the state that tells an operator to act (the stall alerts key on it), so the flap
+            // building -> error -> building is the regression this watches for. The reader stays
+            // open, so the swap gives up again every cycle and writes the state again: the poll
+            // sees every state the row holds, not one lucky snapshot.
+            let mut saw_reason = false;
+            let mut states: Vec<String> = Vec::new();
+            let t = Instant::now();
+            while !(saw_reason && states.last().is_some_and(|s| s == "building"))
+                && t.elapsed() < Duration::from_secs(25)
+            {
+                let (state, last_error) = state_detail(&mut c, "r_locked")
+                    .await?
+                    .map(|(s, _, _, e)| (s, e.unwrap_or_default()))
+                    .unwrap_or_else(|| ("missing".to_string(), String::new()));
+                if !states.last().is_some_and(|last| *last == state) {
+                    states.push(state.clone());
+                }
+                if state == "building" && last_error.contains("lock") {
+                    saw_reason = true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             ensure!(
-                // The swap gave up on its bounded lock wait (and retries as a new build):
-                // the only state a locked table must never reach is `ready`.
-                state.as_deref() != Some("ready"),
-                "r_locked went live although its table is locked: {state:?}"
+                !states.iter().any(|s| s == "error"),
+                "r_locked's state flapped to `error` while its swap only waited for the table \
+                 lock; transient contention keeps the row `building` with the reason: {states:?}"
+            );
+            ensure!(
+                saw_reason,
+                "r_locked never said `building` with the table lock in last_error while its swap \
+                 waited for it: {states:?}"
+            );
+            ensure!(
+                states.last().is_some_and(|s| s == "building"),
+                "r_locked must stay `building` while its swap waits for the table lock: {states:?}"
+            );
+            ensure!(
+                !states.iter().any(|s| s == "ready"),
+                "r_locked went live although its table is locked: {states:?}"
             );
             Ok(())
         }
@@ -88,6 +120,114 @@ fn reg_first_build_swap_does_not_stall_other_views() {
         r?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
         verify(&ctx, &mut eng, &db, &specs, "after the swap").await?;
+        eng.stop().await
+    });
+}
+
+/// Guard R1 (finding 3, PR #254): "left to the next rebuild" has to be a promise the engine
+/// keeps for an INCREMENTAL view too, not only for a full-mode one. A rebuild whose swap cannot
+/// get the table lock (an open reader holds it) leaves the live version serving and refreshing —
+/// the binlog loop never waits for that lock (N-02), and its own tail swap is one short try — and
+/// once the reader lets go, the engine re-arms the abandoned swap on its own: the requested
+/// rebuild lands and `_lazyview.rebuild` is cleared with no further kick. Without the re-arm the
+/// flag stays set forever and the view keeps its old table indefinitely.
+#[test]
+fn reg_swap_bg_abandoned_swap_rearms_the_next_rebuild() {
+    scenario("reg_swap_bg", |ctx| async move {
+        use std::time::Instant;
+        let specs = vec![
+            ViewSpec::new(
+                "r_names",
+                Kind::Incremental,
+                "SELECT id, name FROM customers",
+            ),
+            ViewSpec::new(
+                "r_locked",
+                Kind::Incremental,
+                "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+            ),
+        ];
+        let (db, eng) = setup(&ctx, "reg_swap_bg", &[], &specs, &[]).await?;
+        eng.stop().await?;
+        // An open reader transaction on r_locked's table: its rebuild's swap waits for the
+        // metadata lock, spends its own short bounded wait and gives up (off the loop).
+        let mut reader = db.conn().await?;
+        exec(&mut reader, "START TRANSACTION").await?;
+        let _: Option<i64> = typed_first(&mut reader, "SELECT COUNT(*) FROM r_locked").await?;
+        let mut c = db.conn().await?;
+        let mut eng = ctx.start_engine(
+            &db,
+            &[
+                ("LAZYVIEW_SWAP_LOCK_WAIT_S", "1"),
+                ("LAZYVIEW_FULL_REFRESH_MS", "300"),
+            ],
+        )?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        exec(
+            &mut c,
+            "UPDATE _lazyview SET rebuild = 1 WHERE name = 'r_locked'",
+        )
+        .await?;
+        let r = async {
+            // The swap is waiting, and cannot succeed while the reader is open: the OTHER view is
+            // refreshed promptly all the same. A loop that waits for the table lock stalls these.
+            for k in 0..4 {
+                let id = 300 + k;
+                let t = Instant::now();
+                exec(
+                    &mut c,
+                    &format!("INSERT INTO customers VALUES ({id}, 'm{id}', NULL)"),
+                )
+                .await?;
+                loop {
+                    let n: Option<i64> = typed_first(
+                        &mut c,
+                        format!("SELECT COUNT(*) FROM r_names WHERE id = {id}"),
+                    )
+                    .await?;
+                    if n == Some(1) {
+                        break;
+                    }
+                    ensure!(
+                        t.elapsed() < Duration::from_secs(3),
+                        "insert {k}: r_names was not refreshed within 3 s while r_locked's swap \
+                         waited for its table lock: {}",
+                        fmt_snapshot(&eng.snapshot())
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            // A transient lock wait must not look like an operator's problem (lv-super's note).
+            let (state, last_error) = state_detail(&mut c, "r_locked")
+                .await?
+                .map(|(s, _, _, e)| (s, e.unwrap_or_default()))
+                .unwrap_or_else(|| ("missing".to_string(), String::new()));
+            ensure!(
+                state != "error",
+                "r_locked says {state:?} (last_error {last_error:?}) for a swap that only waited \
+                 on a reader's table lock"
+            );
+            ensure!(
+                rebuild_flag(&mut c, "r_locked").await? != 0,
+                "the rebuild flag was cleared although r_locked's swap never got the table lock"
+            );
+            Ok(())
+        }
+        .await;
+        // The reader lets go of the table. Nothing else touches the view: the engine itself has
+        // to ask for the swap again (the re-armed rebuild), or the flag stays set forever.
+        exec(&mut reader, "COMMIT").await?;
+        r?;
+        wait_rebuild_flag_cleared(&mut c, &mut eng, "r_locked").await?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "after the reader released the table",
+        )
+        .await?;
         eng.stop().await
     });
 }

@@ -435,7 +435,9 @@ pub(crate) async fn create_shadow_marked(
 /// One dispatch per swap (T6): the PostgreSQL arm is `PgConn::swap`, the transactional block
 /// of T4.6, on the target's own connection. `swap_lock_wait_s` is the swap's own bounded lock
 /// wait (N-01); `session_lock_wait_s` is the general wait the MySQL session is restored to
-/// after the swap (the connection is shared with the engine's other statements).
+/// after the swap (the connection is shared with the engine's other statements). `single_try`
+/// runs the block once, without the retry policy: the binlog loop's tail uses it, so the shared
+/// reader never waits for a lock (N-02); the swap task off the loop does not.
 pub(crate) async fn swap(
     conn: &mut Conn,
     kind: Kind,
@@ -443,6 +445,7 @@ pub(crate) async fn swap(
     name: &str,
     swap_lock_wait_s: u64,
     session_lock_wait_s: u64,
+    single_try: bool,
     metrics: &Metrics,
 ) -> Result<()> {
     match (conn, kind) {
@@ -453,6 +456,7 @@ pub(crate) async fn swap(
                 name,
                 swap_lock_wait_s,
                 session_lock_wait_s,
+                single_try,
                 metrics,
             )
             .await
@@ -462,17 +466,43 @@ pub(crate) async fn swap(
     }
 }
 
+/// A swap that gave up on the table's metadata lock after its own bounded wait: the driver's
+/// 1205 / 55P03 from the swap task, or the loop's own tail that does not wait at all. A call
+/// site reports it and leaves the swap to the next rebuild, and [`is_lock_wait_timeout`] names
+/// it a lock wait (not a build failure), so the state row stays `building` (guard R1 on #254).
+#[derive(Debug)]
+pub(crate) struct SwapLockWait {
+    pub per_try_s: u64,
+    pub tries: u32,
+}
+
+impl std::fmt::Display for SwapLockWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the swap's lock wait timed out after {} s per try ({} tries): the table's metadata \
+             lock is held by an open reader",
+            self.per_try_s, self.tries
+        )
+    }
+}
+
+impl std::error::Error for SwapLockWait {}
+
 /// Whether `e` is a swap giving up on the table lock: MySQL error 1205 (a `lock_wait_timeout`
-/// expiry), PostgreSQL SQLSTATE 55P03 (`lock_not_available`, its `lock_timeout`). Call sites
-/// report such a swap and leave it to the next rebuild instead of retrying it (N-01, N-02).
+/// expiry), PostgreSQL SQLSTATE 55P03 (`lock_not_available`, its `lock_timeout`), or a
+/// [`SwapLockWait`] reported by an earlier try. Call sites report such a swap and leave it to the
+/// next rebuild instead of retrying it (N-01, N-02).
 pub(crate) fn is_lock_wait_timeout(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
-        matches!(
-            c.downcast_ref::<mysql_async::Error>(),
-            Some(mysql_async::Error::Server(se)) if se.code == 1205
-        ) || c
-            .downcast_ref::<tokio_postgres::Error>()
-            .is_some_and(|e| e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE))
+        c.downcast_ref::<SwapLockWait>().is_some()
+            || matches!(
+                c.downcast_ref::<mysql_async::Error>(),
+                Some(mysql_async::Error::Server(se)) if se.code == 1205
+            )
+            || c.downcast_ref::<tokio_postgres::Error>().is_some_and(|e| {
+                e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+            })
     })
 }
 
