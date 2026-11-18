@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { blocks, block, listBody, assignment, assertFindable } from "./hcl.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const tfDir = resolve(here, "..");
@@ -28,97 +29,6 @@ const files = {
   mysql: read("mysql.tf"),
   outputs: read("outputs.tf"),
 };
-
-// --- minimal HCL block reader -------------------------------------------------------
-// Enough to walk block bodies with their nesting; no expression evaluation.
-
-function endOfBody(text, openBrace) {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  let inLineComment = false;
-  let inBlockComment = false;
-  for (let i = openBrace; i < text.length; i += 1) {
-    const c = text[i];
-    const next = text[i + 1];
-    if (inLineComment) {
-      if (c === "\n") inLineComment = false;
-      continue;
-    }
-    if (inBlockComment) {
-      if (c === "*" && next === "/") {
-        inBlockComment = false;
-        i += 1;
-      }
-      continue;
-    }
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (c === "\\") escaped = true;
-      else if (c === '"') inString = false;
-      continue;
-    }
-    if (c === "#" || (c === "/" && next === "/")) {
-      inLineComment = true;
-      continue;
-    }
-    if (c === "/" && next === "*") {
-      inBlockComment = true;
-      i += 1;
-      continue;
-    }
-    if (c === '"') inString = true;
-    else if (c === "{") depth += 1;
-    else if (c === "}") {
-      depth -= 1;
-      if (depth === 0) return i;
-    }
-  }
-  throw new Error("unbalanced braces");
-}
-
-// Returns the bodies (text between the braces) of every block whose header matches.
-function blocks(text, header) {
-  const found = [];
-  const re = new RegExp(`^\\s*${header}\\s*(?:"([^"]*)")?[^\\n{]*\\{`, "gm");
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const open = text.indexOf("{", m.index + m[0].length - 1);
-    const close = endOfBody(text, open);
-    found.push({ body: text.slice(open + 1, close), labels: m[1] });
-  }
-  return found;
-}
-
-// Reads `name = [ ... ]` and returns the text between the brackets.
-function listBody(text, name) {
-  const start = text.search(new RegExp(`^\\s*${name}\\s*=\\s*\\[`, "m"));
-  assert.ok(start >= 0, `${name} = [ ... ] not found`);
-  const open = text.indexOf("[", start);
-  let depth = 0;
-  for (let i = open; i < text.length; i += 1) {
-    if (text[i] === "[") depth += 1;
-    else if (text[i] === "]") {
-      depth -= 1;
-      if (depth === 0) return text.slice(open + 1, i);
-    }
-  }
-  throw new Error(`unbalanced brackets in ${name}`);
-}
-
-const block = (text, header) => {
-  const found = blocks(text, header);
-  assert.equal(found.length, 1, `expected exactly one ${header} block`);
-  return found[0].body;
-};
-
-const assignment = (body, name) => {
-  const m = body.match(new RegExp(`^\\s*${name}\\s*=\\s*(.+?)\\s*$`, "m"));
-  if (!m) return undefined;
-  return m[1].replace(/^"(.*)"$/, "$1");
-};
-
-const hasLine = (body, re) => re.test(body);
 
 // --- the toolchain is pinned, and the pin is the same everywhere --------------------
 
@@ -154,37 +64,10 @@ test("every resource carries the managed-by, run-id and expiry labels", () => {
 });
 
 test("everything the run creates is findable by the cleanup job", () => {
-  // Kinds with no labels field in the API. Each is either a child of something
-  // labelled (the peering range belongs to the peering, the database to the instance)
-  // or is found by the name prefix the next assertion pins.
-  const noLabelsField = new Set([
-    "google_compute_network",
-    "google_compute_subnetwork",
-    "google_service_networking_connection",
-    "google_sql_database",
-  ]);
-  const re = /resource\s+"([^"]+)"\s+"([^"]*)"[^\n{]*\{([\s\S]*?)\n\}/g;
-  let resources = 0;
-  for (const [file, text] of Object.entries(files)) {
-    let m;
-    while ((m = re.exec(text)) !== null) {
-      const [, type, name, body] = m;
-      resources += 1;
-      if (noLabelsField.has(type)) {
-        // ...and its name must still say which run it belongs to.
-        const nameArg = assignment(body, "name");
-        if (nameArg !== undefined && type !== "google_sql_database") {
-          assert.match(nameArg, /local\.name_prefix/, `${file}: ${type}.${name} is named outside the run prefix`);
-        }
-        continue;
-      }
-      assert.match(
-        body,
-        /^\s*(user_)?labels\s*=\s*local\.common_labels\s*$/m,
-        `${file}: ${type}.${name} is created without the run labels`,
-      );
-    }
-  }
+  // Kinds with no labels field in the API (the shared set) are either a child of
+  // something labelled — the peering range belongs to the peering, the database to the
+  // instance — or are found by the name prefix the helper asserts.
+  const resources = assertFindable(files);
   assert.equal(resources, 6, "the network, the peering, the runner subnet, the instances and the test schemas");
 });
 
