@@ -331,7 +331,7 @@ fn side_name(name: &str, suffix: &str) -> String {
 /// through this module's own [`postgres::quote_ident`]. One dispatch per plan / per connect,
 /// never per row. The family-local renderers (this module, `crate::fence`,
 /// `crate::analyzer::rename`) fold into this seam when `dialect-call-sites` (#57) closes.
-#[allow(dead_code)] // A3's source SELECT and the PostgreSQL source modules are its first users
+#[allow(dead_code)] // only its own test calls it today; #57's fold-in is the planned first non-test caller
 pub(crate) fn quote_ident(kind: Kind, id: &str) -> String {
     match kind {
         Kind::Mysql => crate::dialect::mysql::quote_ident(id),

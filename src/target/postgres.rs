@@ -315,7 +315,6 @@ fn or_join(parts: Vec<String>) -> String {
 /// runs that type's own input function on the bytes, which is how a value crosses both engines as
 /// text (T2, and why no `with-*` type feature is needed). `None` is a SQL NULL.
 #[derive(Debug)]
-#[allow(dead_code)] // the write path of PR T5 binds these; see [`PgConn::insert_rows`]
 struct Param(Option<String>);
 
 impl ToSql for Param {
@@ -352,14 +351,12 @@ impl ToSql for Param {
 }
 
 /// The driver's parameter slice of a statement: one [`Param`] per `$n`, in statement order.
-#[allow(dead_code)] // as above
 fn refs(params: &[Param]) -> Vec<&(dyn ToSql + Sync)> {
     params.iter().map(|p| p as &(dyn ToSql + Sync)).collect()
 }
 
 /// The quoted predicate expressions of `pos` and the columns behind them: a filter binds its keys
 /// by the target column's type, so the two lists are always built together.
-#[allow(dead_code)] // as above
 fn unit_cols<'a>(layout: &'a Layout, pos: &[usize]) -> (Vec<String>, Vec<&'a MvCol>) {
     (
         pos.iter()
@@ -375,7 +372,6 @@ fn unit_cols<'a>(layout: &'a Layout, pos: &[usize]) -> (Vec<String>, Vec<&'a MvC
 /// timer, as MySQL's deferred swap does — `src/engine.rs:4351`, `:5686`). `live` is the second of
 /// the two MySQL edge cases: a table that does not exist yet is a plain rename; the first (a
 /// shadow already gone) is answered by [`PgConn::swap`] before any statement.
-#[allow(dead_code)] // the swap of PR T5's write path; [`swap_statement_block`] proves the block
 fn swap_block(
     schema: &str,
     name: &str,
@@ -413,7 +409,6 @@ fn swap_block(
 /// name in front of `lv_row` / `lv_unit` / `lv_a<k>` / `lv_p<k>` — also under the 63-byte
 /// `definition_hash` fallback, whose name still ends that way — and the base's own name is the
 /// same [`index_name`] the build used.
-#[allow(dead_code)] // as above
 fn index_renames(schema: &str, name: &str, found: &[String]) -> Vec<String> {
     found
         .iter()
@@ -620,7 +615,6 @@ pub(crate) async fn fence_and_wait(
 /// whole MySQL range (±838:59:59) survives (D1), every string type loses its MySQL collation and
 /// becomes `text` (D2), and an unknown source type lands in `text` too (the `KeyPart::None`
 /// fallback: lazyview stores what the source gives it).
-#[allow(dead_code)] // T3's CREATE TABLE and T4's writer/reader call these; the tests here prove them
 pub(crate) fn pg_type(col: &MvCol) -> String {
     let dt = col.data_type.to_ascii_lowercase();
     let ct = col.column_type.to_ascii_lowercase();
@@ -1008,7 +1002,7 @@ impl PgConn {
     }
 
     /// The DELETEs of `keys` by row key (T4.3), batched like `crate::mv::delete_keys`.
-    #[allow(dead_code)] // as above
+    #[allow(dead_code)] // no caller yet: the flush deletes in-transaction through `write_tx` -> `delete_keys_on`, so only this method's shape mirrors `crate::mv::delete_keys`
     pub(crate) async fn delete_keys(
         &self,
         schema: &str,
@@ -1244,7 +1238,6 @@ impl PgConn {
 }
 
 /// One statement with [`Param`]eters (the unit DELETE of a flush: run inside the transaction).
-#[allow(dead_code)] // reached only through the write path of PR T5
 async fn exec<C: GenericClient>(c: &C, sql: &str, bound: Vec<Option<String>>) -> Result<()> {
     let params: Vec<Param> = bound.into_iter().map(Param).collect();
     let binds = refs(&params);
@@ -1255,7 +1248,7 @@ async fn exec<C: GenericClient>(c: &C, sql: &str, bound: Vec<Option<String>>) ->
 /// The batches of one `insert_rows` (T4.1), on the client or inside a flush's transaction: the
 /// same [`crate::mv::batches`] limits the MySQL writer pays (`src/mv.rs:1289`), one statement per
 /// batch, so the parameters are the rows of that batch in statement order.
-#[allow(dead_code, clippy::too_many_arguments)] // as above
+#[allow(clippy::too_many_arguments)]
 async fn insert_rows_on<C: GenericClient>(
     c: &C,
     schema: &str,
@@ -1292,7 +1285,6 @@ async fn insert_rows_on<C: GenericClient>(
 }
 
 /// The batches of one `delete_keys` (T4.3), on the client or inside a flush's transaction.
-#[allow(dead_code)] // as above
 async fn delete_keys_on<C: GenericClient>(
     c: &C,
     schema: &str,
@@ -1329,7 +1321,6 @@ async fn delete_keys_on<C: GenericClient>(
 /// `extra_float_digits = 1` makes PostgreSQL agree with bit for bit, D4), `Bytes` goes as itself
 /// for `text`/`numeric`/`jsonb` and as `\x`+hex for `bytea` (the session's `bytea_output`), and
 /// the zero date is written NULL (D5, see [`cell_value`]).
-#[allow(dead_code)] // reached only through the write path of PR T5; the tests here prove it
 pub(crate) fn param_text<'a>(v: &'a Value, col: &MvCol) -> Option<Cow<'a, str>> {
     match v {
         Value::NULL => None,
@@ -1379,7 +1370,6 @@ pub(crate) fn param_text<'a>(v: &'a Value, col: &MvCol) -> Option<Cow<'a, str>> 
 /// [`crate::mv::Layout::normalize`] produces, so `diff` compares the two engines' rows with no
 /// change of its own. A cell that does not parse stays `Bytes` - a surprise stays visible instead
 /// of quietly becoming a NULL.
-#[allow(dead_code)] // the diff read of PR T4 calls this; the tests here prove it
 pub(crate) fn cell_value(text: Option<&str>, col: &MvCol, nullable: bool) -> Value {
     let Some(text) = text else {
         // D5: the writer sends NULL for the zero date, so in a NOT NULL date column a NULL can
