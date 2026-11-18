@@ -1435,6 +1435,48 @@ pub async fn eventually_equal(
     }
 }
 
+/// The PostgreSQL half of [`eventually_equal`]: the same poll of the oracle comparison the final
+/// check makes ([`oracle::check_views_pg_targets`] reads the MV rows on the PostgreSQL server and
+/// compares them to the oracle materialized from the source), without relying on `applied()`.
+///
+/// For a PostgreSQL target this is the catch-up check, not a counter: a write the network edge
+/// retries into success never marks the target behind at all (`note_refresh` opens a lag entry
+/// only for a write the retry gave up on), so a counter of completed catch-ups stays flat exactly
+/// when the engine recovered as designed — and a counter can also be moved by an unrelated view
+/// catching up. The rows are what a lost write can actually have cost, so the rows are the check.
+pub async fn eventually_equal_pg(
+    ctx: &Ctx,
+    engine: &mut Engine,
+    src: &Db,
+    pg_targets: &HashMap<String, pg::PgDb>,
+    specs: &[ViewSpec],
+    timeout: Duration,
+    what: &str,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        engine.check_alive()?;
+        match oracle::check_views_pg_targets(src, pg_targets, specs).await {
+            Ok(()) => {
+                ctx.log(format!(
+                    "check '{what}': {} views converged after {:.1}s",
+                    specs.len(),
+                    start.elapsed().as_secs_f64()
+                ));
+                return Ok(());
+            }
+            Err(e) if start.elapsed() > timeout => {
+                return Err(e.context(format!(
+                    "'{what}': the PostgreSQL target's rows did not converge within {timeout:?}; \
+                     metrics {}",
+                    fmt_snapshot(&engine.snapshot())
+                )))
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
 /// Owned env overrides → the borrowed form `Ctx::start_engine` takes.
 pub fn ov_refs(v: &[(String, String)]) -> Vec<(&str, &str)> {
     v.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()

@@ -1441,21 +1441,46 @@ async fn tgt_reset(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -> Re
         ));
     }
     toxi.remove_toxic(&p1, "rst").await?;
+    // Removal is read back, not assumed: `remove_toxic` accepts a 404 (an absent toxic is
+    // already gone), so only the proxy's own list says whether the fault really went away.
+    let tx_read = toxi.clone();
+    let p_read = p1.clone();
+    wait_until(
+        "the reset toxic to be off the proxy (the fault never went away)",
+        Duration::from_secs(10),
+        || {
+            let (toxi, p) = (tx_read.clone(), p_read.clone());
+            async move { Ok(!toxi.toxics(&p).await?.iter().any(|t| t.name == "rst")) }
+        },
+    )
+    .await?;
     stop_writers(ctx, tx, writers).await?;
-    // The target catches up from the kept changes; `eventually_equal` polls the oracle without
-    // trusting `applied()` (built exactly for a target whose catch-up may take a moment). The
-    // PostgreSQL target is polled on the same counter the catch-up moves (`target_catchups`),
-    // the oracle speaking at the final `verify_targets` below.
+    // The target catches up from the kept changes. Both families are polled the same way — the
+    // oracle on the target's own rows, without trusting `applied()` (`eventually_equal` for the
+    // MySQL target, `eventually_equal_pg` for the PostgreSQL one). A counter is not the check:
+    // a write the network edge retries into success never marks the target behind at all
+    // (`note_refresh` opens a lag entry only for a write the retry gave up on), so
+    // `target_catchups` stays flat precisely when the engine recovered as designed, and an
+    // unrelated view's catch-up could move it either way. The rows are what a lost write can
+    // have cost, so the rows are what this waits for; `verify_targets` below says it again.
     if pgdb.is_some() {
-        wait_until(
-            "the PostgreSQL target to catch up after the reset (the fault never went away)",
+        eventually_equal_pg(
+            ctx,
+            &mut eng,
+            &db,
+            &tpg,
+            &specs,
             FAULT_BUDGET,
-            || {
-                let m = eng.metrics.clone();
-                async move { Ok(m.snapshot().target_catchups > before.target_catchups) }
-            },
+            &format!("{tname} after the reset"),
         )
         .await?;
+        // Kept for the finding, not asserted: how the recovery moved.
+        let d = eng.snapshot().since(&before);
+        ctx.log(format!(
+            "{tag}: recovery after the reset — retries {}, refresh errors {}, zombie kills {}, \
+             catch-ups {}",
+            d.supervisor_retries, d.refresh_errors, d.supervisor_zombie_kills, d.target_catchups
+        ));
     } else {
         eventually_equal(
             ctx,

@@ -10,4 +10,3 @@
 # step: every chaos failure fails the job.
 chaos_tgt_blackhole_during_flush #214
 chaos_tgt_pg_blackhole_during_flush #214
-chaos_tgt_pg_reset_mid_write_txn #252
