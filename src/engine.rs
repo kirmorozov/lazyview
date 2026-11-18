@@ -534,6 +534,10 @@ struct Slot {
     plan_timed_out: Option<String>,
     /// Refresh results and builds since the last hand-over to `/stats` (see `publish_stats`).
     stats: crate::stats::Flush,
+    /// The source clock (`BinlogReader::event_ts`) of the newest change this view has applied:
+    /// stamped once per flush that left the view with nothing buffered, never per event. `0`:
+    /// the view has applied nothing since this process started (see [`SourceClock::lag`]).
+    applied_ts: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -766,6 +770,12 @@ struct Engine {
     /// Re-read `_lazyview` once more after this (no exact visibility fence available).
     defs_recheck: Option<Instant>,
     last_src_ping: Instant,
+    /// Freshness: what the reader knows of the source's clock (review O-01, see [`SourceClock`]).
+    clock: SourceClock,
+    /// Last `SELECT UNIX_TIMESTAMP()` of the source (the offset refresh), and the last time the
+    /// per-view statistics were handed to the aggregator outside a flush.
+    last_clock: Instant,
+    last_publish: Instant,
     boundary: Cursor,
     persisted: Cursor,
     last_persist: Instant,
@@ -853,6 +863,11 @@ const STMT_DML_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// While the binlog stream keeps delivering (a backlog), a due flush waits at most this long.
 const CATCH_UP_BATCH: Duration = Duration::from_millis(100);
 
+/// Cadence of the per-view statistics hand-over to the aggregator *outside* a flush (review
+/// O-01): a view that stops advancing has nothing to flush, yet its `source_lag_seconds` has to
+/// move, so housekeeping republishes on this cadence. One batch per interval, never per event.
+const STATS_PUBLISH_INTERVAL: u64 = 15;
+
 /// Binlog read ahead while a flush runs (see `Engine::flush_draining`): at most this many
 /// events, and at most `Config::mem.drain_max_bytes`, are queued; beyond that the stream waits
 /// (backpressure). The event bound is a constant; the byte bound is a value of `Config`, derived
@@ -887,6 +902,224 @@ fn buffer_bytes(d: &ViewDirty) -> usize {
 
 /// A binlog read result as the loop handles it (`Ok(None)`: the server closed the stream).
 type Read = Result<Option<Item>>;
+
+/// What the binlog reader knows about the **source's** clock: the two timestamps the freshness
+/// figure is computed from, plus how the engine came to know the source's clock (review O-01,
+/// ruling 1: "N seconds behind the source" has to hold during a backlog, not only while the
+/// source is idle). Both are the source's own clock — a common-header timestamp and the
+/// source's `UNIX_TIMESTAMP()` — so no host clock and no clock skew enters the number, and an
+/// idle source gives exactly 0.
+///
+/// Cost (owner rule): three integer stores, and only on the rows events of tables a view reads
+/// in [`Engine::on_item`] (the header ts is a field the reader has already parsed), no
+/// allocation, and nothing on every other event; `offset` costs one statement per (re)connect
+/// and per housekeeping tick, never per event.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SourceClock {
+    /// Header ts of the newest change to a table a view reads that this connection has seen
+    /// (`BinlogReader::event_ts` at the routed [`Item::Rows`] in [`Engine::on_item`]); 0:
+    /// nothing read yet. The engine's own pen (its meta and materialized tables) and the
+    /// shape-only events are not a view's business and do not move it. A view that has applied
+    /// this much is caught up with the source.
+    fed_ts: u64,
+    /// Header ts of the *first* change to a table a view reads that this connection has read:
+    /// the oldest change the views may still be missing. A view that has applied nothing since
+    /// the process started (`Slot::applied_ts` 0) is measured against it, so an engine restarted
+    /// over a gap reports the length of the gap rather than the age of the epoch. 0: this
+    /// connection has read nothing.
+    gap_ts: u64,
+    /// The last stamp was a heartbeat (the head-moving stamps are the rows of tables a view
+    /// reads in [`Engine::on_item`]). Only a heartbeat whose payload position is the position
+    /// the views have applied to calls the stream at the head: the server drains its socket to
+    /// the client at once and then heartbeats — a backlog can still sit in the read buffer —
+    /// so the position, not the event type, is what proves the stream caught up with the
+    /// source's binlog.
+    at_head: bool,
+    /// When the server last said its dump was empty (a heartbeat arrived), on the source's
+    /// clock — whether or not that heartbeat proved the stream at the head. A view that has
+    /// applied nothing this connection (and so has no `gap_ts` to age against yet) is measured
+    /// from here, so a stream proven behind before its first routed change reads a number
+    /// growing from the last heartbeat, not the age of the epoch.
+    head_ts: u64,
+    /// The reader is connected and able to deliver: false while reconnecting, and while binlog
+    /// reading is held by a build's byte budget (`hold_for_builds`) — a source that keeps
+    /// writing while nothing is read is a growing lag, not a growing head.
+    reading: bool,
+    /// The queue a flush left draining still holds events the views have not been handed
+    /// (`Drained`): read, so the source is ahead of the views, and not yet counted as fed.
+    pending_read: bool,
+    /// `source UNIX_TIMESTAMP() − local UNIX now`, asked at connect and at the housekeeping
+    /// tick: [`Self::now`] is the source's clock between two of those questions.
+    offset: i64,
+}
+
+impl SourceClock {
+    /// The source's clock, right now: the local clock shifted by the measured offset (so a
+    /// source whose clock differs from the host's by minutes is still measured against itself).
+    fn now(&self) -> u64 {
+        (crate::metrics::unix_now() as i64 + self.offset).max(0) as u64
+    }
+
+    /// The newest change the view has applied, on the source's clock: its own stamp; else the
+    /// oldest change this connection has read (see [`Self::gap_ts`]); else the last heartbeat —
+    /// a view that has read nothing this connection ages from when the server last said its
+    /// dump was empty, never from the epoch.
+    fn applied(&self, applied_ts: u64) -> u64 {
+        if applied_ts != 0 {
+            applied_ts
+        } else if self.gap_ts != 0 {
+            self.gap_ts
+        } else {
+            self.head_ts
+        }
+    }
+
+    /// Seconds `applied_ts` is behind the source, saturating:
+    ///
+    /// * `0` while the stream is at its head (a heartbeat arrived after the last change a view
+    ///   reads), the reader is reading, and the view has applied every change read — an idle
+    ///   source, however long idle, is 0 seconds behind, which is what the old "position age"
+    ///   gauge could not say;
+    /// * otherwise the age of the newest applied change on the source's clock, so a backlog
+    ///   after an outage, a reader held by a build's budget, a reconnecting stream and a view
+    ///   whose refresh keeps failing all show a number that grows with the time the source has
+    ///   been ahead.
+    fn lag(&self, applied_ts: u64) -> u64 {
+        let applied = self.applied(applied_ts);
+        if self.at_head && self.reading && !self.pending_read && applied >= self.fed_ts {
+            0
+        } else {
+            self.now().saturating_sub(applied)
+        }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// Ruling 1, "idle: 0": a stream at its head with a view that has applied everything reads
+    /// 0 seconds behind the source — and stays 0 under a host/source clock skew, because the
+    /// figure is source-clock minus source-clock (the offset never enters the zero branch).
+    #[test]
+    fn idle_is_zero_even_under_clock_skew() {
+        let caught = SourceClock {
+            fed_ts: 2000,
+            gap_ts: 2000,
+            head_ts: 0,
+            at_head: true,
+            reading: true,
+            pending_read: false,
+            offset: 3600, // the source's clock runs an hour ahead of the host's
+        };
+        assert_eq!(caught.lag(2000), 0, "caught up, at head: 0");
+        assert_eq!(
+            caught.lag(0),
+            0,
+            "nothing applied yet, measured against the gap head: 0"
+        );
+    }
+
+    /// Ruling 1, "backlog: the real age": a view that has applied only up to `applied_ts` while
+    /// the source has advanced shows the age of its newest applied change on the source clock.
+    #[test]
+    fn backlog_is_the_real_age() {
+        let now = crate::metrics::unix_now();
+        let applied = now - 30;
+        let c = SourceClock {
+            fed_ts: now,
+            gap_ts: applied,
+            head_ts: 0,
+            at_head: true,
+            reading: true,
+            pending_read: false,
+            offset: 0,
+        };
+        let lag = c.lag(applied);
+        assert!(
+            (29..=32).contains(&lag),
+            "backlog lag {lag} is not ~30s of real age"
+        );
+    }
+
+    /// Ruling 1, "restarted over a gap: about the gap's length": a view that has applied nothing
+    /// since the process started (`applied_ts` 0) is measured against the oldest change this
+    /// connection has read (`gap_ts`), so a backlog that opened while the engine was down reads
+    /// as the gap's length rather than the age of the epoch.
+    #[test]
+    fn restarted_over_a_gap_reports_the_gap() {
+        let now = crate::metrics::unix_now();
+        let gap_start = now - 40;
+        let c = SourceClock {
+            fed_ts: now,
+            gap_ts: gap_start,
+            head_ts: 0,
+            at_head: true,
+            reading: true,
+            pending_read: true, // the queue still holds read-not-applied changes
+            offset: 0,
+        };
+        let lag = c.lag(0);
+        assert!(
+            (38..=44).contains(&lag),
+            "gap lag {lag} is not ~40s (the length of the gap)"
+        );
+    }
+
+    /// Ruling 1, "paused reader: grows": a view caught up on content reads 0 while the reader
+    /// runs, but the same view shows a growing number the moment binlog reading is held — the
+    /// source keeps writing changes nobody is reading.
+    #[test]
+    fn paused_reader_grows() {
+        let now = crate::metrics::unix_now();
+        let applied = now - 5;
+        let caught = SourceClock {
+            fed_ts: applied,
+            gap_ts: applied,
+            head_ts: 0,
+            at_head: true,
+            reading: true,
+            pending_read: false,
+            offset: 0,
+        };
+        assert_eq!(caught.lag(applied), 0, "caught up while reading: 0");
+        let held = SourceClock {
+            reading: false,
+            ..caught
+        };
+        let lag = held.lag(applied);
+        assert!(
+            (4..=8).contains(&lag),
+            "held-reader lag {lag} is not ~5s and growing"
+        );
+    }
+
+    /// Ruling 1's epoch guard: a connection proven behind (a heartbeat whose position was not
+    /// the applied one) before it read a single routed change has no `gap_ts` to age against —
+    /// it ages from the last heartbeat, not from 1970.
+    #[test]
+    fn proven_behind_before_the_first_read_ages_from_the_heartbeat() {
+        let now = crate::metrics::unix_now();
+        let c = SourceClock {
+            fed_ts: 0,
+            gap_ts: 0,
+            head_ts: now - 7,
+            at_head: false,
+            reading: true,
+            pending_read: false,
+            offset: 0,
+        };
+        let lag = c.lag(0);
+        assert!(
+            (5..=10).contains(&lag),
+            "lag {lag} is not ~7s of age since the heartbeat (and never the age of the epoch)"
+        );
+        assert!(
+            lag < 60,
+            "lag {lag} reads the epoch, not the last heartbeat"
+        );
+    }
+}
 
 /// Binlog reads queued while a flush ran (see `Engine::flush_draining`), each with its
 /// approximate memory, and their running total.
@@ -925,6 +1158,12 @@ impl Drained {
         }
         self.bytes += b;
         self.queue.push_back((r, b));
+    }
+
+    /// Whether the queue holds no event the views are still to be handed (see
+    /// [`SourceClock::pending_read`]).
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 
     fn pop(&mut self) -> Option<Read> {
@@ -1594,6 +1833,15 @@ impl Engine {
             failures: HashMap::new(),
             defs_recheck: None,
             last_src_ping: Instant::now(),
+            // Freshness (review O-01): before the first connect the engine is believed at the
+            // head (the first heartbeat proves it either way) and ages from the start instant.
+            clock: SourceClock {
+                at_head: true,
+                head_ts: crate::metrics::unix_now(),
+                ..Default::default()
+            },
+            last_clock: Instant::now(),
+            last_publish: Instant::now(),
             boundary: Cursor::none(info.flavor),
             persisted: Cursor::none(info.flavor),
             last_persist: Instant::now(),
@@ -2737,6 +2985,7 @@ impl Engine {
             rebuild_asked: None,
             plan_timed_out: None,
             stats: Default::default(),
+            applied_ts: 0,
         });
         self.slots.len() - 1
     }
@@ -3659,6 +3908,21 @@ impl Engine {
                 }
             };
             info!(position = %pos, "streaming binlog");
+            // Freshness (review O-01, ruling 1): a connection knows nothing of the source's
+            // clock until it asks, and has read nothing; the timestamps are per connection, so a
+            // reconnect that re-reads from the boundary starts afresh instead of keeping a head
+            // this connection never saw. It starts believed at the head (the first heartbeat
+            // proves it either way within a heartbeat period) and ages from the connect
+            // instant, never from the epoch.
+            let head_ts = self.clock.now();
+            self.clock = SourceClock {
+                offset: self.clock.offset,
+                reading: true,
+                at_head: true,
+                head_ts,
+                ..Default::default()
+            };
+            self.refresh_source_clock().await;
             Metrics::set(&self.metrics.gauges.streaming, 1);
             Metrics::set(&self.metrics.gauges.starting, 0);
             let mut last_event = Instant::now();
@@ -3683,6 +3947,9 @@ impl Engine {
                     deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
                 let mut idle = false;
                 let mut read = drained.pop();
+                // Freshness: what the queue still holds is read but not yet handed to the views,
+                // so the source is ahead of them until the flush applies it (see `SourceClock`).
+                self.clock.pending_read = !drained.is_empty();
                 if read.is_some() && *shutdown.borrow() {
                     break 'reconnect;
                 }
@@ -3846,6 +4113,11 @@ impl Engine {
                 stuck_streak = 0;
             }
             Metrics::set(&self.metrics.gauges.streaming, 0);
+            // Nothing is being read until the next connection is up: a view keeps its last
+            // applied timestamp, so its lag grows from here (review O-01) rather than sticking at
+            // the last published value.
+            self.clock.reading = false;
+            self.clock.at_head = false;
             let _ = reader.close().await;
             // Changes of a partially read transaction are kept: re-applying them is harmless.
             // Its TABLE_MAPs and XA rows are read again from the boundary.
@@ -3939,8 +4211,16 @@ impl Engine {
                     }
                     read = reader.next(), if open => {
                         *last_event = Instant::now();
+                        // Freshness (review O-01): `read_any` — which marks the stream
+                        // not-at-head and the queue as read-not-applied — counts only a real
+                        // item. A heartbeat carries no change and is dropped from the queue;
+                        // claiming it would knock a caught-up view off the zero branch for a
+                        // heartbeat period. Cost: one discriminant test on the item the push
+                        // below matches on anyway.
+                        if !matches!(read, Ok(Some(Item::Heartbeat))) {
+                            read_any = true;
+                        }
                         drained.push(read, &file);
-                        read_any = true;
                     }
                 }
             }
@@ -3952,6 +4232,14 @@ impl Engine {
         // from the applied position against the budget, never from error text. Cost (guard R3):
         // one position compare and one pass over the (view, target) pairs per flush; the event
         // path is untouched (the reader's position is read once, here, not per event).
+        // The flush read past what the views were handed: those queued events are the source
+        // being ahead of the views, so the stream is no longer at its head (the next heartbeat
+        // after the queue drains says it is again) and the queued part counts as read-not-applied
+        // until a flush applies it.
+        if read_any {
+            self.clock.pending_read = true;
+            self.clock.at_head = false;
+        }
         if r.is_ok() && read_any {
             self.mark_behind_targets(&applied, reader.position(), drained.bytes);
         }
@@ -4017,6 +4305,10 @@ impl Engine {
         let held = self.builds_over_budget().unwrap_or(0);
         warn!(buffered_mib = held >> 20, "changes buffered for building views exceed their budget; binlog reading paused until a build is applied");
         let since = Instant::now();
+        // Freshness (review O-01): while the reader is held, the source keeps writing changes
+        // nobody has read, so the stream is not at its head and a view's lag grows from here —
+        // which is the number the "paused reader" alert reads.
+        self.clock.reading = false;
         while self.builds_over_budget().is_some() {
             let tick = Instant::now() + Duration::from_secs(1);
             let wake = self.flush_deadline().map_or(tick, |d| d.min(tick));
@@ -4032,6 +4324,7 @@ impl Engine {
             }
             self.housekeeping().await?;
         }
+        self.clock.reading = true;
         info!(paused = ?since.elapsed(), "binlog reading resumed");
         // Not read meanwhile: the silence check starts afresh.
         *last_event = Instant::now();
@@ -4120,6 +4413,33 @@ impl Engine {
     }
 
     async fn on_item(&mut self, reader: &BinlogReader, item: Item) -> Result<()> {
+        // Freshness (review O-01): the head moves only on rows of a table a view reads (stamped
+        // in the `Rows` arm below, where the routing lookup already happened): the views chase
+        // changes to the tables they read, so everything else — the engine's own pen (its meta
+        // tables, and the materialized tables it writes, which no view reads unless it is
+        // chained and then routes) and the events that only carry shape or boundaries (query,
+        // gtid, commit, XA) — is like the artificial events that open a stream and leaves the
+        // head where the last change a view cares about put it. Stamping every item instead let
+        // the engine's own per-flush `persist_position` put the head at "now": a view caught up
+        // over a stale backlog read 0 (ruling 1 broken during a backlog), and an idle engine
+        // flickered 1 s between its own write and the next heartbeat (acceptance criterion 1
+        // broken). Only a heartbeat calls the stream at the head: the server sends one when its
+        // dump has nothing left to send. Cost (owner rule): two integer stores, and only on
+        // rows events of tables a view reads — strictly fewer than before, no new lookup.
+        if matches!(item, Item::Heartbeat) {
+            // The payload's position is where the server's dump stood; the stream is at its
+            // head only if the views have applied to exactly there, outside a transaction (the
+            // server drains its socket at once, so a backlog may still sit in the read buffer
+            // while it heartbeats). Either way the heartbeat is the last moment the server was
+            // known empty: a view with nothing read yet ages from here, not from the epoch.
+            let head = reader.heartbeat_head();
+            let applied = self.boundary.to_position();
+            self.clock.at_head = head != 0
+                && !self.in_txn
+                && applied.pos == head
+                && applied.file == reader.position().file;
+            self.clock.head_ts = self.clock.now();
+        }
         match item {
             Item::Gtid { gtid } => {
                 self.last_gtid = Some(gtid);
@@ -4331,6 +4651,19 @@ impl Engine {
                     }
                     return Ok(());
                 }
+                // Freshness (review O-01, ruling 1): rows of a table a view reads — as a route
+                // or as the core's consumer, the two `None` arms above returned every other
+                // table. This is the newest change handed to the views and (once) the oldest
+                // this connection has read; the non-zero branch of `lag` ages both against the
+                // source's clock, and only a heartbeat may call the stream at the head again.
+                let ts = u64::from(reader.event_ts());
+                if ts != 0 {
+                    if self.clock.fed_ts == 0 {
+                        self.clock.gap_ts = ts;
+                    }
+                    self.clock.fed_ts = ts;
+                }
+                self.clock.at_head = false;
                 let since = self.boundary.to_position();
                 if let Some(route) = &route {
                     self.mark_any(route, &since);
@@ -4596,6 +4929,33 @@ impl Engine {
         self.ready_logged = all_ready;
     }
 
+    /// Asks the source its own time (`SELECT UNIX_TIMESTAMP()`), once, and keeps the difference
+    /// to the local clock (review O-01, ruling 1): a view's lag is then source clock minus
+    /// source clock, so an engine whose host clock is off by minutes still reports 0 for a view
+    /// that is caught up, and a view that is behind shows the real distance. One statement per
+    /// (re)connect and per housekeeping tick — never per event, and no new write anywhere. A
+    /// failed question keeps the last offset: the figures ride the previous measurement until
+    /// the next tick, which is what an idle source (lag 0 by construction) and a brief source
+    /// hiccup both allow.
+    async fn refresh_source_clock(&mut self) {
+        match self
+            .src
+            .query_first::<i64, _>("SELECT UNIX_TIMESTAMP()")
+            .await
+        {
+            Ok(Some(src_now)) if src_now > 0 => {
+                self.clock.offset = src_now - crate::metrics::unix_now() as i64;
+                self.last_clock = Instant::now();
+            }
+            Ok(_) => {
+                debug!("SELECT UNIX_TIMESTAMP() gave no answer; keeping the source clock offset")
+            }
+            Err(e) => {
+                debug!("asking the source its clock failed: {e:#}; keeping the source clock offset")
+            }
+        }
+    }
+
     /// Periodic one-line activity summary and the keepalives of the connections the loop owns.
     /// Leadership is not checked here any more (review A-06): the lock's own task beats its own
     /// session and this reads, for free, what that task published.
@@ -4616,6 +4976,18 @@ impl Engine {
             if self.src.query_drop("DO 1").await.is_err() {
                 self.heal_src().await;
             }
+        }
+        // Freshness (review O-01): re-measure the source's clock on this cadence (one statement
+        // per tick, next to the ping above, never per event), and hand the per-view counters to
+        // the aggregator even when no flush has run — a view that stops advancing is exactly the
+        // case that has nothing to flush, and its lag has to move (ruling 1: a held reader and a
+        // stuck view show a growing number, not a stale-but-green one).
+        if self.last_clock.elapsed() >= Duration::from_secs(30) {
+            self.refresh_source_clock().await;
+        }
+        if self.last_publish.elapsed() >= Duration::from_secs(STATS_PUBLISH_INTERVAL) {
+            self.last_publish = Instant::now();
+            self.publish_stats();
         }
         // The leadership lock is no longer checked from here (review A-06): the lock's own task
         // beats its own session and publishes what it found, and this is the cheap read of that.
@@ -5543,6 +5915,23 @@ impl Engine {
                     None => Default::default(),
                 };
                 crate::metrics::Metrics::add(&self.metrics.cascade_rows, tally.cascade_rows);
+                // Freshness (review O-01): a view left with nothing buffered has applied every
+                // change it was handed, so its stamp is the head it was fed to — one `u64` store
+                // per flush per view, never per event. A view with work kept, a build in flight,
+                // an error, or one waiting on an upstream or a blocked upstream keeps its older
+                // stamp, and its lag then grows with the time the source has been ahead.
+                let settled = pending == 0
+                    && s.error.is_none()
+                    && s.blocked.is_none()
+                    && s.waiting.is_none()
+                    && s.next.is_none()
+                    && s.live.as_ref().is_some_and(|l| {
+                        !l.frozen && l.dirty.is_empty() && l.lag.is_empty() && l.behind.is_empty()
+                    });
+                if settled && self.clock.fed_ts > s.applied_ts {
+                    s.applied_ts = self.clock.fed_ts;
+                }
+                let source_lag_seconds = self.clock.lag(s.applied_ts);
                 crate::stats::Fold {
                     view: format!("{schema}.{}", s.name),
                     mode,
@@ -5554,6 +5943,7 @@ impl Engine {
                     // no new per-event work (`Slot::refresh_failures` moves only on a refresh
                     // outcome; its zeroing is the success path's `std::mem::take`).
                     refresh_failures: u64::from(s.refresh_failures),
+                    source_lag_seconds,
                 }
             })
             .collect();

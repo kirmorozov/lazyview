@@ -513,6 +513,48 @@ fn rotation_and_table_map_retention() {
     assert_eq!(t.pos, pos("binlog.000003", 4));
 }
 
+#[test]
+fn event_ts_follows_real_events_only() {
+    // Freshness (review O-01): `Tracker::event_ts` is the source-clock timestamp of the last
+    // event that carried a usable one. A real event stamps it; a heartbeat (which a server sends
+    // only when its dump has nothing left to send) and the artificial events that open a stream
+    // (the re-sent FORMAT_DESCRIPTION / fake ROTATE, stamped at the connect instant) never move
+    // it, so the head stands where the last real change put it.
+    fn ev_at(et: u8, log_pos: u32, ts: u32, flags: u16, body: &[u8]) -> Event {
+        let mut b = header(et, 7, 19 + body.len(), log_pos, flags);
+        b[..4].copy_from_slice(&ts.to_le_bytes()); // overwrite the common-header timestamp
+        b.extend_from_slice(body);
+        read(&b)
+    }
+    let mut t = Tracker::new(Flavor::MySql, &pos("binlog.000001", 4));
+    assert_eq!(t.event_ts, 0, "nothing read yet: 0");
+
+    t.map_event(ev_at(ty::XID, 120, 1000, 0, &42u64.to_le_bytes()))
+        .unwrap();
+    assert_eq!(t.event_ts, 1000, "a real event moves the head to its ts");
+
+    t.map_event(ev_at(ty::HEARTBEAT, 9999, 2000, 0, b"binlog.000001"))
+        .unwrap();
+    assert_eq!(t.event_ts, 1000, "a heartbeat must not move the head");
+
+    t.map_event(ev_at(
+        ty::XID,
+        0,
+        3000,
+        ARTIFICIAL_FLAG,
+        &42u64.to_le_bytes(),
+    ))
+    .unwrap();
+    assert_eq!(
+        t.event_ts, 1000,
+        "an artificial event must not move the head"
+    );
+
+    t.map_event(ev_at(ty::XID, 400, 2500, 0, &7u64.to_le_bytes()))
+        .unwrap();
+    assert_eq!(t.event_ts, 2500, "the next real event moves the head again");
+}
+
 // The accessor an embedder uses to read a table's column types / metadata; it delegates to
 // Tracker::table_map, which BinlogReader::table_map is a thin wrapper over.
 #[test]

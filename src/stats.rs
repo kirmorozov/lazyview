@@ -213,6 +213,9 @@ pub struct Fold {
     /// `Slot::refresh_failures`: a counter of the attempt streak, not a tally — every flush
     /// carries the current value, and the next success carries 0).
     pub refresh_failures: u64,
+    /// Seconds this view is behind the source, as the engine computed it when it sent this
+    /// batch (see [`crate::engine`]'s `SourceClock`): a gauge, so the last batch wins.
+    pub source_lag_seconds: u64,
 }
 
 /// The statistics of one view, owned by the aggregator task.
@@ -232,6 +235,7 @@ struct ViewStats {
     /// Consecutive failed refreshes, as the engine last reported them (a successful refresh
     /// reports 0; see [`Fold::refresh_failures`]).
     refresh_failures: u64,
+    source_lag_seconds: u64,
 }
 
 impl ViewStats {
@@ -243,9 +247,12 @@ impl ViewStats {
             pending,
             cascade_cached_rows,
             refresh_failures,
+            source_lag_seconds,
             ..
         } = f;
         self.mode = mode;
+        // A gauge, not a counter: the newest batch's value is the view's freshness.
+        self.source_lag_seconds = source_lag_seconds;
         tally.ids_marked += flush.carried + flush.work.ids_resolved;
         tally.ids_absorbed += flush.carried_absorbed;
         self.tally.add(&tally);
@@ -292,6 +299,7 @@ impl ViewStats {
             flushes: self.refreshes,
             last_flush_unix: self.last_refresh_unix,
             refresh_failures: self.refresh_failures,
+            source_lag_seconds: self.source_lag_seconds,
         }
     }
 }
@@ -365,6 +373,9 @@ macro_rules! view_snapshot_fields {
             /// rebuilds), so this gauge — not `lazyview_views_error` — is its alert signal.
             refresh_failures: u64, json "refresh_failures",
                 series ("refresh_failures", "Failed refreshes in a row (the next success resets it).", false);
+            /// Seconds this view is behind the source's clock (0 once it has applied every change read).
+            source_lag_seconds: u64, json "source_lag_seconds",
+                series ("source_lag_seconds", "Seconds this view is behind the source's clock (0 when caught up).", false);
         }
     };
 }

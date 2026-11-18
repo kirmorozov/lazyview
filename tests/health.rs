@@ -604,3 +604,399 @@ fn health_database_outage() {
         Ok(())
     });
 }
+
+// ── Per-view seconds behind the source (review O-01, ruling 1) ──────────────────────────────
+// The gauge `lazyview_view_source_lag_seconds{view}` (and `/stats` `source_lag_seconds`): 0 while
+// a view has applied every change the reader has seen (an idle source reads exactly 0), the real
+// age during a backlog (an engine restarted over a gap reads the gap's length until it catches up),
+// and growing while binlog reading is held (the "paused reader"). The engine's unit tests pin the
+// formula; these run it against a real server on every flavor.
+
+/// A grouped view over a neutral `entity` table.
+fn lag_view() -> ViewSpec {
+    ViewSpec::new(
+        "vs_lag",
+        Kind::Incremental,
+        "SELECT grp, SUM(val) AS total, COUNT(*) AS n FROM entity GROUP BY grp",
+    )
+}
+
+/// Creates `entity` and seeds `rows` rows into it.
+async fn lag_seed(db: &Db, rows: i64) -> Result<()> {
+    let mut c = db.conn().await?;
+    exec(
+        &mut c,
+        "CREATE TABLE entity (id BIGINT PRIMARY KEY, grp INT NOT NULL, val BIGINT NOT NULL)",
+    )
+    .await?;
+    let vals: Vec<String> = (1..=rows)
+        .map(|i| format!("({i}, {}, {i})", i % 5))
+        .collect();
+    exec(
+        &mut c,
+        &format!(
+            "INSERT INTO entity (id, grp, val) VALUES {}",
+            vals.join(",")
+        ),
+    )
+    .await?;
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// The view's `source_lag_seconds` as served by `/stats`.
+async fn lag_of(addr: &str, key: &str) -> Result<u64> {
+    let j = fetch_stats(addr).await?;
+    let v = j["views"]
+        .get(key)
+        .with_context(|| format!("{key} missing in /stats: {j}"))?;
+    v["source_lag_seconds"]
+        .as_u64()
+        .with_context(|| format!("no source_lag_seconds for {key}: {v}"))
+}
+
+/// Polls until `key` reports 0 s behind the source (the first heartbeat after the load).
+async fn lag_wait_zero(addr: &str, key: &str, budget: Duration) -> Result<()> {
+    let t = Instant::now();
+    loop {
+        if let Ok(l) = lag_of(addr, key).await {
+            if l == 0 {
+                return Ok(());
+            }
+        }
+        ensure!(
+            t.elapsed() < budget,
+            "{key} never reached 0 s behind the source"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Acceptance criterion 1 (review O-01): after a write burst settles, an idle source keeps every
+/// view at exactly 0 s behind it while heartbeats flow — the old position-age gauge could not say
+/// this (it grew while idle). The figure is checked on `/stats` and on `/metrics`.
+#[test]
+fn lag_idle_source_stays_zero() {
+    init_env();
+    scenario("lag_idle", |ctx| async move {
+        let db = ctx.new_db("lag_idle").await?;
+        lag_seed(&db, 200).await?;
+        let addr = free_local_addr()?;
+        let (eng, _) = start_with_views(
+            &ctx,
+            &db,
+            &[lag_view()],
+            &[
+                ("LAZYVIEW_HEALTH_ADDR", addr.as_str()),
+                ("LAZYVIEW_HEARTBEAT_MS", "500"),
+            ],
+        )
+        .await?;
+        let key = format!("{}.vs_lag", db.name);
+        lag_wait_zero(&addr, &key, Duration::from_secs(90)).await?;
+        // Keep the source idle with heartbeats flowing and assert the number stays 0 throughout.
+        let mut samples = 0;
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(30) {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let l = lag_of(&addr, &key).await?;
+            ensure!(l == 0, "an idle source put {key} {l} s behind the source");
+            samples += 1;
+        }
+        ensure!(samples >= 5, "only {samples} idle samples taken");
+        let (status, metrics) = http_get(&addr, "/metrics").await?;
+        ensure!(status == 200, "/metrics status {status}");
+        let series = format!("lazyview_view_source_lag_seconds{{view=\"{key}\"}} 0\n");
+        ensure!(metrics.contains(&series), "/metrics lacks {series:?}");
+        ctx.log(format!(
+            "lag_idle: 0 s behind the source over {samples} idle samples"
+        ));
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// Appends rows `first..=first+count-1` to `entity`, 1000 per statement (the same shape
+/// [`lag_seed`] writes, so the replayed backlog exercises the same decode and refresh path).
+async fn lag_rows(db: &Db, first: i64, count: i64) -> Result<()> {
+    let mut c = db.conn().await?;
+    let last = first + count - 1;
+    let mut id = first;
+    while id <= last {
+        let end = (id + 999).min(last);
+        let vals: Vec<String> = (id..=end)
+            .map(|i| format!("({i}, {}, {i})", i % 5))
+            .collect();
+        exec(
+            &mut c,
+            &format!(
+                "INSERT INTO entity (id, grp, val) VALUES {}",
+                vals.join(",")
+            ),
+        )
+        .await?;
+        id = end + 1;
+    }
+    c.disconnect().await.ok();
+    Ok(())
+}
+
+/// The source's own clock: the gap lengths are measured on the same clock the gauge subtracts
+/// from (ruling 1 keeps the host clock out of the number entirely).
+async fn lag_source_now(db: &Db) -> Result<i64> {
+    let mut c = db.conn().await?;
+    let t = scalar_i64(&mut c, "SELECT UNIX_TIMESTAMP()").await?;
+    c.disconnect().await.ok();
+    Ok(t)
+}
+
+/// The view's gauge as served by `/metrics` (the series an alert reads).
+async fn lag_metric(addr: &str, key: &str) -> Result<u64> {
+    let (status, m) = http_get(addr, "/metrics").await?;
+    ensure!(status == 200, "/metrics status {status}");
+    let prefix = format!("lazyview_view_source_lag_seconds{{view=\"{key}\"}} ");
+    for line in m.lines() {
+        if let Some(v) = line.strip_prefix(&prefix) {
+            let f: f64 = v
+                .trim()
+                .parse()
+                .with_context(|| format!("bad gauge value in {line:?}"))?;
+            return Ok(f as u64);
+        }
+    }
+    bail!("no lazyview_view_source_lag_seconds series for {key} in /metrics")
+}
+
+/// The final `entity` sums vs the `vs_lag` rows: the proof a backlog (or a held reader's queue)
+/// landed in full — the gauge being honest is no substitute for the rows being right.
+async fn lag_rows_match(c: &mut mysql_async::Conn, view: &str) -> Result<()> {
+    let want = rows(
+        c,
+        "SELECT grp, SUM(val), COUNT(*) FROM entity GROUP BY grp ORDER BY grp",
+    )
+    .await?;
+    let got = rows(c, &format!("SELECT grp, total, n FROM {view} ORDER BY grp")).await?;
+    ensure!(
+        want == got,
+        "{view} rows do not match the source:\nwant {want:?}\ngot  {got:?}"
+    );
+    Ok(())
+}
+
+/// Ruling 1's "a paused reader shows a growing lag", against a real server: a second view whose
+/// build sleeps (`LAZYVIEW_TEST_BUILD_DELAY`) queues its incoming changes past the 1-byte
+/// build-hold budget (`LAZYVIEW_TEST_BUILD_HOLD_BYTES`), so the engine holds binlog reading
+/// (`Engine::hold_for_builds`, `SourceClock::reading = false`) until the build is applied. The
+/// building view — the one whose changes sit undelivered behind the hold — reads a number
+/// **above zero and growing** (ruling 1: a held reader is a growing lag, not a stale-but-green
+/// 0); the ready view, which keeps applying everything it is handed, reads its honest 0, and
+/// both read 0 once the reader resumes and the queued changes land in full.
+#[test]
+fn lag_grows_while_the_reader_is_held() {
+    init_env();
+    scenario("lag_reader_held", |ctx| async move {
+        let db = ctx.new_db("lag_reader_held").await?;
+        lag_seed(&db, 200).await?;
+        let addr = free_local_addr()?;
+        let (mut eng, _) = start_with_views(
+            &ctx,
+            &db,
+            &[lag_view()],
+            &[
+                ("LAZYVIEW_HEALTH_ADDR", addr.as_str()),
+                ("LAZYVIEW_HEARTBEAT_MS", "500"),
+                ("LAZYVIEW_TEST_BUILD_HOLD_BYTES", "1"),
+                ("LAZYVIEW_TEST_BUILD_DELAY", "/*hold_reader*/:45000"),
+            ],
+        )
+        .await?;
+        let key = format!("{}.vs_lag", db.name);
+        lag_wait_zero(&addr, &key, Duration::from_secs(90)).await?;
+        // The second view's build sleeps 45 s; every change queued for it during that time sits
+        // past the 1-byte build budget, which is what holds the reader. It is that building
+        // view whose gauge must speak: the changes handed to it wait undelivered, while the
+        // ready view keeps applying what it is handed and reads its honest 0 throughout.
+        let hkey = format!("{}.vs_hold", db.name);
+        let mut c = db.conn().await?;
+        add_views(
+            &mut c,
+            &[ViewSpec::new(
+                "vs_hold",
+                Kind::Incremental,
+                "SELECT grp, MAX(val) AS mx FROM entity WHERE /*hold_reader*/ 1=1 GROUP BY grp",
+            )],
+        )
+        .await?;
+        wait_state(
+            &mut c,
+            &mut eng,
+            "vs_hold",
+            "building",
+            Duration::from_secs(60),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await; // into the build's sleep
+        lag_rows(&db, 1001, 300).await?; // the backlog that queues behind the held reader
+                                         // Above zero while the reader is held (ruling 1: not "green while a backlog sits").
+        let t = Instant::now();
+        let mut g1 = 0;
+        // (Samples before the building view's first publish carry no entry yet and do not count.)
+        loop {
+            if let Ok(g) = lag_of(&addr, &hkey).await {
+                g1 = g;
+                if g1 >= 3 {
+                    break;
+                }
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(45),
+                "{hkey} never went above zero while the reader was held (last {g1} s): \
+                 the build-hold never engaged or the gauge ignores it"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_alive(&addr, "while the reader is held").await?;
+        // And growing: the source keeps writing while the build's queue waits. The number only
+        // moves at publishes (the flush cadence of the hold loop), so the budget is that
+        // cadence plus a margin.
+        let t = Instant::now();
+        let mut grew = false;
+        while !grew {
+            let g = lag_of(&addr, &hkey).await?;
+            ensure!(
+                g >= g1,
+                "{hkey} went backwards ({g1} s to {g} s) while the reader was held"
+            );
+            grew = g >= g1 + 3;
+            ensure!(
+                t.elapsed() < Duration::from_secs(40),
+                "{hkey} did not grow past {g1} s while the reader was held (last {g} s)"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let m = lag_metric(&addr, &hkey).await?;
+        ensure!(m > 0, "/metrics reports {hkey} at {m} s during the hold");
+        ctx.log(format!(
+            "lag_reader_held: the building view at {g1} s and grown past {g1}+3 s while the \
+             reader was held by the build budget; /metrics agrees ({m} s)"
+        ));
+        // The build finishes, the reader resumes, the queue lands and the number reads 0 again.
+        wait_state(
+            &mut c,
+            &mut eng,
+            "vs_hold",
+            "ready",
+            Duration::from_secs(120),
+        )
+        .await?;
+        lag_wait_zero(&addr, &key, Duration::from_secs(120)).await?;
+        lag_wait_zero(
+            &addr,
+            &format!("{}.vs_hold", db.name),
+            Duration::from_secs(120),
+        )
+        .await?;
+        lag_rows_match(&mut c, "vs_lag").await?;
+        c.disconnect().await.ok();
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// Ruling 1's "a stopped engine with writes in the gap, restarted, reports about the gap's
+/// length until it has caught up, then 0" — with a backlog no single flush applies: the engine
+/// stops, 600 000 rows are written while it is down, and the gauge is sampled while the restarted
+/// engine replays the gap. `LAZYVIEW_TEST_LAG_HOLD_BYTES` (256 B, where the constant is 256 MiB)
+/// keeps the view's target accounted as behind while the stream has read past what the flush
+/// applied — the backlog genuinely sits (its keys are kept, the saved position waits) instead of
+/// being swallowed by one catch-up flush. The sampled number is the age of the gap on the
+/// **source's** clock (downtime plus replay), never the idle 0, and it returns to 0 only once the
+/// view has caught up; the rows land in full.
+#[test]
+fn lag_reports_the_gap_after_a_restart() {
+    init_env();
+    scenario("lag_gap_restart", |ctx| async move {
+        let db = ctx.new_db("lag_gap_restart").await?;
+        lag_seed(&db, 200).await?;
+        let addr1 = free_local_addr()?;
+        let (eng, _) = start_with_views(
+            &ctx,
+            &db,
+            &[lag_view()],
+            &[
+                ("LAZYVIEW_HEALTH_ADDR", addr1.as_str()),
+                ("LAZYVIEW_HEARTBEAT_MS", "500"),
+            ],
+        )
+        .await?;
+        let key = format!("{}.vs_lag", db.name);
+        lag_wait_zero(&addr1, &key, Duration::from_secs(90)).await?;
+        eng.stop().await?;
+        // The gap: a backlog written while the engine is down, then time for it to age so "about
+        // the gap's length" is a number no single-flush catch-up can fake. Measured on the
+        // source's own clock.
+        let down_t0 = lag_source_now(&db).await?;
+        lag_rows(&db, 201, 600_000).await?;
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        let down_t1 = lag_source_now(&db).await?;
+        let gap = (down_t1 - down_t0) as u64;
+        ensure!(
+            gap >= 45,
+            "the gap only lasted {gap} s (measured on the source clock)"
+        );
+        ctx.log(format!(
+            "lag_gap_restart: {gap} s of writes in the gap with the engine down; restarting \
+             over it (LAZYVIEW_TEST_LAG_HOLD_BYTES=256)"
+        ));
+        let addr2 = free_local_addr()?;
+        let mut eng = ctx.start_engine(
+            &db,
+            &[
+                ("LAZYVIEW_HEALTH_ADDR", addr2.as_str()),
+                ("LAZYVIEW_HEARTBEAT_MS", "500"),
+                ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "256"),
+            ],
+        )?;
+        let mut c = db.conn().await?;
+        wait_ready(&mut c, &mut eng, &["vs_lag"], t_ready()).await?;
+        // Sample the replay: the figure is the age of the gap, not the idle 0. (Samples that
+        // land before the first publish carry no views yet and do not count.)
+        let (mut samples, mut high, mut maxg) = (0u32, 0u32, 0u64);
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(30) {
+            if let Ok(g) = lag_of(&addr2, &key).await {
+                samples += 1;
+                if g >= gap.saturating_sub(10) {
+                    high += 1;
+                }
+                maxg = maxg.max(g);
+                ensure!(
+                    g <= gap + 180,
+                    "{key} reports {g} s behind the source — no gap of {gap} s explains that"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        ctx.log(format!(
+            "lag_gap_restart: {samples} samples while the backlog sat, {high} at >= \
+             {} s (gap {gap} s, max {maxg} s)",
+            gap.saturating_sub(10)
+        ));
+        ensure!(
+            samples >= 40,
+            "only {samples} /stats samples fell inside the backlog window"
+        );
+        ensure!(
+            high >= 8,
+            "the restarted engine reported the backlog as caught up: only {high} of {samples} \
+             samples showed the gap ({gap} s) instead of the idle 0"
+        );
+        // ... and 0 once it has caught up (ruling 1's full sentence).
+        lag_wait_zero(&addr2, &key, Duration::from_secs(240)).await?;
+        // The replay lost nothing: every row of the gap is summed.
+        lag_rows_match(&mut c, "vs_lag").await?;
+        c.disconnect().await.ok();
+        eng.stop().await?;
+        Ok(())
+    });
+}

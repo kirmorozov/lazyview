@@ -119,6 +119,15 @@ pub(super) struct Tracker {
     generation: u64,
     /// Second item produced by one event (MariaDB XA GTID → `Gtid` + `XaStart`).
     queued: Option<Item>,
+    /// The position a heartbeat's payload carried — where the server's dump stood when it sent
+    /// that heartbeat (it sends one only while it has nothing left to send); 0 until the first
+    /// heartbeat of this connection, and afterwards the last one's (see
+    /// [`BinlogReader::heartbeat_head`]).
+    pub(super) head_pos: u64,
+    /// Common-header timestamp (UNIX seconds on the source's clock) of the last event that
+    /// carried one — a heartbeat and an artificial event carry none — 0 until the first: where
+    /// the stream head stands in the source's clock (see [`BinlogReader::event_ts`]).
+    pub(super) event_ts: u32,
 }
 
 impl Tracker {
@@ -133,6 +142,8 @@ impl Tracker {
             tables: HashMap::new(),
             generation: 0,
             queued: None,
+            head_pos: 0,
+            event_ts: 0,
         }
     }
 
@@ -282,6 +293,31 @@ impl BinlogReader {
     /// points; this one may be inside a transaction.
     pub fn position(&self) -> &Position {
         &self.t.pos
+    }
+
+    /// Where the stream head stands in the **source's** clock: the common-header timestamp
+    /// (UNIX seconds) of the last event read that carried one, 0 until the first event of this
+    /// connection (`connect` starts a fresh [`Tracker`]).
+    ///
+    /// Heartbeats and artificial events carry no timestamp, so they never move it — a caller
+    /// comparing it against its own applied timestamp measures how far the applied changes are
+    /// behind the source's clock without a host clock in the middle (review O-01, freshness).
+    /// Embedder seam: an embedder that publishes "N seconds behind the source" reads it here;
+    /// the cost is one `u32` copy per event, on the header the reader has already parsed.
+    pub fn event_ts(&self) -> u32 {
+        self.t.event_ts
+    }
+
+    /// The position the last heartbeat's payload carried — where the server's dump stood when it
+    /// said "nothing left to send" — 0 until the first heartbeat of this connection, and after
+    /// that the last one's (a heartbeat only ever moves it forward).
+    ///
+    /// Embedder seam: a server drains its socket to the client at once, so a heartbeat proves
+    /// the *client* is caught up only when the position it carries is the one the embedder has
+    /// applied to; comparing it against the embedder's applied position is how "N seconds
+    /// behind the source" avoids calling a backlog sitting in the read buffer "at the head".
+    pub fn heartbeat_head(&self) -> u64 {
+        self.t.head_pos
     }
 
     /// The table map currently known for `table_id` (column types / metadata).
@@ -624,6 +660,19 @@ impl Tracker {
         let et = header.event_type_raw();
 
         self.advance(&ev)?;
+        // Freshness (review O-01): where the stream head stands in the source's clock. One
+        // `u32` copy of a header field the reader has already parsed — no allocation, no
+        // syscall, nothing per event beyond this match. A heartbeat (which a server sends only
+        // when the dump has nothing left to send) and the artificial events that open a stream
+        // (the re-sent FORMAT_DESCRIPTION and the fake ROTATE, both stamped at the connect
+        // instant) carry no position in the source's history the views are chasing, so they are
+        // skipped: they leave the head where the last real event put it, and a stream that reads
+        // only those keeps `event_ts` at 0.
+        let ts = header.timestamp();
+        let artificial = header.flags_raw() & ARTIFICIAL_FLAG != 0;
+        if ts != 0 && !artificial && !matches!(et, ty::HEARTBEAT | ty::HEARTBEAT_V2) {
+            self.event_ts = ts;
+        }
 
         let item = match et {
             ty::ROTATE => self.on_rotate(&ev)?,
@@ -670,7 +719,18 @@ impl Tracker {
                 self.queued = xa.map(|xid| Item::XaStart { xid });
                 Item::Gtid { gtid }
             }
-            ty::HEARTBEAT | ty::HEARTBEAT_V2 => Item::Heartbeat,
+            ty::HEARTBEAT | ty::HEARTBEAT_V2 => {
+                // The payload is the position the server's dump stands at — 8-byte log position
+                // (v2 adds the 4-byte server id). The server sends heartbeats only while it has
+                // nothing left to send, so this is the stream's head as the server sees it; an
+                // embedder that must tell "at the head" from "socket still holds the backlog"
+                // compares it against what it has applied (see [`BinlogReader::heartbeat_head`]).
+                self.head_pos = ev
+                    .data()
+                    .get(..8)
+                    .map_or(0, |p| u64::from_le_bytes(p.try_into().expect("8 bytes")));
+                Item::Heartbeat
+            }
             ty::TRANSACTION_PAYLOAD => {
                 let tpe: TransactionPayloadEvent<'_> = ev
                     .read_event()

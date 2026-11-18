@@ -29,6 +29,7 @@ fn fold(view: &str, tally: Tally, flush: Flush, pending: u64) -> Fold {
         pending,
         cascade_cached_rows: 0,
         refresh_failures: 0,
+        source_lag_seconds: 0,
     }
 }
 
