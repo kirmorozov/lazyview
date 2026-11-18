@@ -1161,6 +1161,59 @@ pub(crate) fn gtid_subset(saved: &GtidSet, source: &GtidSet) -> bool {
     })
 }
 
+/// `xxxxxxxx-xxxx-…` (32 hex digits, hyphens optional, either case) → the 16 wire bytes; `None`
+/// for anything that is not a uuid. std only — the dump request must not drag a uuid crate into
+/// the copy set for one hex decode.
+fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
+    let digits: Option<Vec<u32>> = text
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_digit(16))
+        .collect();
+    let digits = digits?;
+    if digits.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, pair) in digits.chunks(2).enumerate() {
+        out[i] = ((pair[0] << 4) | pair[1]) as u8;
+    }
+    Some(out)
+}
+
+/// The SID blocks of a MySQL-family GTID dump (`COM_BINLOG_DUMP_GTID`) from the cursor's
+/// `[g=…]` text: the set lazyview has **consumed**, sent so the server starts after it.
+/// [`parse_gtid_set`] keeps the one grammar owner; this only flips the interval convention —
+/// the text's intervals are inclusive, the wire's are half-open (`uuid:1-3` goes out as
+/// `(1, 4)`, the server's `UUID_set_compaction` shape), and gno 0 names no transaction, so a
+/// `0` interval contributes nothing.
+///
+/// A text with no usable interval is an `Err`, never an empty set: an empty GTID dump asks the
+/// server for the **start of its oldest binlog**, which is never what a resume meant (the
+/// safety bar: never a silent wrong resume). The caller reports this as a cursor problem.
+pub(crate) fn dump_sids(text: &str) -> Result<Vec<mysql_async::Sid<'static>>> {
+    let set = parse_gtid_set(text);
+    let mut sids = Vec::with_capacity(set.len());
+    for (sid, ranges) in set {
+        let Some(uuid) = uuid_bytes(&sid) else {
+            bail!("the saved GTID set names a source id that is not a uuid: {sid:?}");
+        };
+        let intervals: Vec<mysql_async::GnoInterval> = ranges
+            .iter()
+            .filter(|(lo, _)| *lo > 0)
+            .map(|&(lo, hi)| mysql_async::GnoInterval::new(lo, hi.saturating_add(1)))
+            .collect();
+        if intervals.is_empty() {
+            continue; // a `uuid:` group with no transactions asks for nothing
+        }
+        sids.push(mysql_async::Sid::new(uuid).with_intervals(intervals));
+    }
+    if sids.is_empty() {
+        bail!("the saved GTID set {text:?} leaves no transaction to resume after");
+    }
+    Ok(sids)
+}
+
 /// The MySQL/Percona subset question for [`crate::source::gtid_covers`]: does this server's
 /// `@@GLOBAL.gtid_executed` include `saved`? A cursor with no set covers trivially (see
 /// [`crate::source::gtid_covers`]); a `gtid_mode=OFF` server reports an empty `executed`, so a real

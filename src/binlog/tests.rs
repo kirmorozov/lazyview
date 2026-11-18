@@ -869,3 +869,107 @@ fn transient_classifier_table() {
         mysql_async::Error::Driver(mysql_async::DriverError::ConnectionClosed)
     )));
 }
+
+/// PR B: what the GTID dump's error codes become, and how the cursor's set text reaches the
+/// wire. ER_MISSING_GTID (3082) is the dump's own "position gone": the same typed answer the
+/// MissingBinlog policy already speaks. Purged-worded 1236 keeps flowing through
+/// `missing_binlog_message` (source owns its wording); an unrelated 1236 stays untyped.
+#[test]
+fn gtid_dump_error_mapping() {
+    let se = |code, msg: &str| mysql_async::ServerError {
+        code,
+        message: msg.into(),
+        state: "HY000".into(),
+    };
+    let at = Position {
+        file: "binlog.000007".into(),
+        pos: 4,
+    };
+    let gone = se(
+        3082,
+        "Cannot find the requested GTID 'aaaaaaaa-1111-2222-3333-444444444444:9' in the \
+         binary log",
+    );
+    let e = BinlogReader::map_error(mysql_async::Error::Server(gone), &at, 77);
+    assert!(
+        e.downcast_ref::<MissingBinlog>().is_some(),
+        "3082 not typed as missing: {e:#}"
+    );
+    let purged = se(
+        1236,
+        "Cannot replicate because the source purged required binary logs. Replicate the \
+         missing transactions from elsewhere.",
+    );
+    let e = BinlogReader::map_error(mysql_async::Error::Server(purged), &at, 77);
+    assert!(
+        e.downcast_ref::<MissingBinlog>().is_some(),
+        "purged-worded 1236 not typed as missing: {e:#}"
+    );
+    let other = se(
+        1236,
+        "Misconfigured source: BINLOG_FORMAT is set to STATEMENT.",
+    );
+    let e = BinlogReader::map_error(mysql_async::Error::Server(other), &at, 77);
+    assert!(
+        e.downcast_ref::<MissingBinlog>().is_none(),
+        "unrelated 1236 mistyped as missing: {e:#}"
+    );
+}
+
+/// The cursor's `g=` text → the request's SID blocks: inclusive intervals go out half-open
+/// (the server's `UUID_set_compaction` shape), gno 0 names no transaction, and a set with
+/// nothing usable is an error — never an empty GTID dump, which would mean "from my oldest
+/// binlog" to the server.
+#[test]
+fn gtid_dump_sids_wire_shape() {
+    let sids = crate::source::mysql::dump_sids(
+        "AAAAAAAA-1111-2222-3333-444444444444:1-3:5,bbbbbbbb-1111-2222-3333-444444444444:7",
+    )
+    .unwrap();
+    // A uuid on the wire is its 16 raw bytes, hyphens gone, big-endian as written.
+    let uuid = |n: u8| -> [u8; 16] {
+        [
+            n, n, n, n, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+        ]
+    };
+    assert_eq!(sids.len(), 2);
+    assert_eq!(sids[0].uuid(), uuid(0xaa));
+    assert_eq!(
+        sids[0]
+            .intervals()
+            .iter()
+            .map(|i| (i.start(), i.end()))
+            .collect::<Vec<_>>(),
+        vec![(1, 4), (5, 6)],
+    );
+    assert_eq!(sids[1].uuid(), uuid(0xbb));
+    assert_eq!(
+        sids[1]
+            .intervals()
+            .iter()
+            .map(|i| (i.start(), i.end()))
+            .collect::<Vec<_>>(),
+        vec![(7, 8)],
+    );
+    // Same uuid across groups: merged, one block.
+    let sids = crate::source::mysql::dump_sids(
+        "cccccccc-1111-2222-3333-444444444444:1-2,cccccccc-1111-2222-3333-444444444444:3",
+    )
+    .unwrap();
+    assert_eq!(sids.len(), 1);
+    assert_eq!(sids[0].intervals().len(), 1); // 1-2 and 3 coalesce
+                                              // Nothing usable: refused, not sent.
+    for bad in [
+        "",
+        "   ",
+        "not-a-uuid:1-2",
+        "dddddddd-1111-2222-3333-444444444444:",
+        "dddddddd-1111-2222-3333-444444444444:0",
+        "dddddddd-1111-2222-3333-444444444444:0-0",
+    ] {
+        assert!(
+            crate::source::mysql::dump_sids(bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}

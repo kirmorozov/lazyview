@@ -1085,6 +1085,227 @@ async fn stream_server_checks_and_missing_binlog() {
     .await;
 }
 
+/// PR B: a start carrying `g=` opens a GTID dump on the MySQL family — file and position are
+/// zeroed and the server starts after the set: rows already in the set are not delivered,
+/// rows committed after it are. A blank start keeps the old file/pos path (the GTID-off
+/// world), MariaDB keeps it regardless (its dump is the flavor module's own request, PR C),
+/// and a text with no usable transaction is refused before the request — never answered with
+/// a dump from the start of the oldest binlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_resume_by_gtid() {
+    on_all_servers("stream_resume_by_gtid", |_name, dsn| async move {
+        let mut c = connect(&dsn).await?;
+        let info = server_info(&mut c).await?;
+        let s = unique_schema("gtid");
+        c.query_drop(format!("CREATE DATABASE `{s}`")).await?;
+        c.query_drop(format!(
+            "CREATE TABLE `{s}`.items (id INT PRIMARY KEY, v INT NOT NULL)"
+        ))
+        .await?;
+        c.query_drop(format!("INSERT INTO `{s}`.items VALUES (1,1),(2,2)"))
+            .await?;
+        // The set as the start cursor would carry it: everything consumed so far.
+        let saved: Option<String> = if info.flavor == Flavor::MariaDb {
+            c.query_first("SELECT @@GLOBAL.gtid_binlog_state").await?
+        } else {
+            let mode: Option<String> = c.query_first("SELECT @@GLOBAL.gtid_mode").await?;
+            match mode.unwrap_or_default().to_ascii_uppercase().as_str() {
+                "ON" | "ON_PERMISSIVE" | "OFF_PERMISSIVE" => {
+                    c.query_first("SELECT @@GLOBAL.gtid_executed").await?
+                }
+                // GTIDs off: no set exists, the assertion below is the old path on this server.
+                _ => None,
+            }
+        };
+        c.query_drop(format!("INSERT INTO `{s}`.items VALUES (3,3)"))
+            .await?;
+        c.query_drop(format!("INSERT INTO `{s}`.items VALUES (9,9)"))
+            .await?; // the marker
+
+        // On the GTID path nothing the cursor carries about file/pos may matter, so the start
+        // names no file at all (the request's own position is the server's minimum, which a GTID
+        // dump does not read). On the old path an empty file would be refused, so the start is
+        // the head of the oldest binlog (fresh per run: no purge has happened) and must see every
+        // row of this test.
+        let row: Row = c
+            .query_first("SHOW BINARY LOGS")
+            .await?
+            .ok_or_else(|| anyhow!("SHOW BINARY LOGS is empty"))?;
+        let first: String = row.get(0).ok_or_else(|| anyhow!("no Log_name column"))?;
+        let by_gtid = info.flavor != Flavor::MariaDb && saved.is_some();
+        let from = if by_gtid {
+            Position {
+                file: String::new(),
+                pos: 4,
+            }
+        } else {
+            Position {
+                file: first,
+                pos: 4,
+            }
+        };
+        let mut reader = BinlogReader::connect_gtid(
+            replica_opts(&dsn)?,
+            server_id(),
+            info.flavor,
+            &from,
+            saved.as_deref(),
+            Duration::from_secs(5),
+        )
+        .await?;
+        let mut items: HashMap<u64, String> = HashMap::new();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut cur_gtid: Option<String> = None;
+        let mut our_gtids: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let next = tokio::time::timeout(left, reader.next())
+                .await
+                .map_err(|_| anyhow!("timed out waiting for the marker row; ids {ids:?}"))?;
+            let item = next?.ok_or_else(|| anyhow!("the stream closed before the marker row"))?;
+            match item {
+                Item::Gtid { gtid } => cur_gtid = Some(gtid),
+                Item::TableMap {
+                    table_id,
+                    schema,
+                    table,
+                    ..
+                } if schema == s && table == "items" => {
+                    items.insert(table_id, table);
+                }
+                Item::Rows {
+                    table_id,
+                    kind: RowsKind::Insert,
+                    event,
+                } if items.contains_key(&table_id) => {
+                    if by_gtid {
+                        // The dump delivers our transactions whole: the frozen `Item::Gtid`
+                        // comes before the rows of its transaction, on this path too.
+                        ensure!(cur_gtid.is_some(), "our rows arrived without a GTID event");
+                        if let Some(g) = &cur_gtid {
+                            if !our_gtids.contains(g) {
+                                our_gtids.push(g.clone());
+                            }
+                        }
+                    }
+                    for (_, after) in reader.rows(table_id, &event)? {
+                        let vals = image("items", after)?
+                            .ok_or_else(|| anyhow!("insert without an after image"))?;
+                        let id = match vals.first() {
+                            Some(Value::Int(n)) => *n,
+                            v => bail!("odd id image {v:?} for {s}.items"),
+                        };
+                        ids.push(id);
+                    }
+                    if ids.contains(&9) {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        reader.close().await?;
+        if by_gtid {
+            ensure!(
+                !ids.contains(&1) && !ids.contains(&2),
+                "rows inside the saved set were streamed again: {ids:?}"
+            );
+            ensure!(
+                ids.contains(&3) && ids.contains(&9),
+                "rows after the saved set were not streamed: {ids:?}"
+            );
+        } else {
+            // The old path from the head of the oldest binlog sees every row of this test.
+            ensure!(
+                [1, 2, 3, 9].iter().all(|i| ids.contains(i)),
+                "file/pos start delivered {ids:?}"
+            );
+        }
+        if by_gtid {
+            // The two transactions after the set each arrive as a transaction: the frozen
+            // `Item::Gtid` (shape owned by lazy-wire-fire) leads its own rows group.
+            ensure!(
+                our_gtids.len() >= 2,
+                "the two transactions after the set did not each carry a GTID event: {our_gtids:?}"
+            );
+        }
+        c.query_drop(format!("DROP DATABASE `{s}`")).await?;
+        Ok(())
+    })
+    .await;
+}
+
+/// A GTID text with no usable transaction is refused on the client before any request
+/// leaves: an empty GTID dump means "from my oldest binlog" to the server, and a silent
+/// wrong resume is forbidden. A blank text is "no set at all" and runs the old file/pos path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_gtid_start_refuses_unusable_set() {
+    on_all_servers(
+        "stream_gtid_start_refuses_unusable_set",
+        |_name, dsn| async move {
+            let mut c = connect(&dsn).await?;
+            let info = server_info(&mut c).await?;
+            let pos = current_position(&mut c).await?;
+            // A blank (or blank-after-trim) set is no set: the old path runs, unchanged.
+            let r = BinlogReader::connect_gtid(
+                replica_opts(&dsn)?,
+                server_id(),
+                info.flavor,
+                &pos,
+                Some("   "),
+                Duration::from_secs(5),
+            )
+            .await?;
+            r.close().await?;
+            if info.flavor == Flavor::MariaDb {
+                // MariaDB does not read the set yet (PR C owns its dump): a foreign-shaped text
+                // must not raise the client-side GTID refusal there.
+                match BinlogReader::connect_gtid(
+                    replica_opts(&dsn)?,
+                    server_id(),
+                    info.flavor,
+                    &pos,
+                    Some("1-2-3"),
+                    Duration::from_secs(5),
+                )
+                .await
+                {
+                    Ok(r) => r.close().await?,
+                    Err(e) => ensure!(
+                        !format!("{e:#}").contains("saved GTID set"),
+                        "MariaDB spoke the client-side GTID refusal early: {e:#}"
+                    ),
+                }
+                return Ok(());
+            }
+            for bad in [
+                "not-a-uuid:1-2",
+                "00000000-0000-0000-0000-000000000001:",
+                "00000000-0000-0000-0000-000000000001:0",
+            ] {
+                let e = BinlogReader::connect_gtid(
+                    replica_opts(&dsn)?,
+                    server_id(),
+                    info.flavor,
+                    &pos,
+                    Some(bad),
+                    Duration::from_secs(5),
+                )
+                .await
+                .err()
+                .ok_or_else(|| anyhow!("{bad:?} was accepted"))?;
+                ensure!(
+                    format!("{e:#}").contains("GTID") && !is_missing_binlog(&e),
+                    "{bad:?} refused with the wrong words: {e:#}"
+                );
+            }
+            Ok(())
+        },
+    )
+    .await;
+}
+
 /// Plain TCP (caching_sha2_password full authentication via RSA key exchange), the unix socket
 /// mysql_async switches to for local hosts, and TLS where the server has certificates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
