@@ -1613,10 +1613,10 @@ impl Drained {
     /// Queues `r`, read from binlog file `file`. Heartbeats are dropped: they carry nothing, and
     /// one taken from the queue would move the position to the reader's, past the events queued
     /// behind it (see `Engine::on_item`); the next one read while idle does that instead.
-    fn push(&mut self, r: Read, file: &str) {
+    fn push(&mut self, r: Read, file: &str) -> usize {
         let b = match &r {
             Ok(Some(Item::Rows { event, .. })) => 64 + event.data().len(),
-            Ok(Some(Item::Heartbeat)) => return,
+            Ok(Some(Item::Heartbeat)) => return 0,
             _ => 64,
         };
         if self.queue.is_empty() {
@@ -1624,6 +1624,7 @@ impl Drained {
         }
         self.bytes += b;
         self.queue.push_back((r, b));
+        b
     }
 
     /// Whether the queue holds no event the views are still to be handed (see
@@ -5073,6 +5074,22 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| reader.position().file.clone());
         let (mut read_any, mut full) = (false, false);
+        // The changes this flush read while it ran, and whether any of them is one the targets
+        // owe: rows of a table other than the engine's own bookkeeping (its definitions, state,
+        // status and commit-fence rows — the ones `on_item` filters out where they arrive, so no
+        // target ever applies them). The engine's own rows must not count as the stream moving:
+        // on a flavor whose visibility fence is a *write* rather than a wait — the commit-order
+        // row of the MySQL family without GTIDs (`mysql::commit_order`, `src/fence.rs`), which
+        // the flush commits itself, as Percona Server does with GTIDs off — the flush reads its
+        // own fence row back out of the binlog while it runs, and counting it accounts every
+        // target of every flush as behind on the engine's own account. From there the healthy
+        // targets are skipped by the refresh and their catch-up queues behind the target that is
+        // not answering: independence broken (#214, percona84). A table this run has no map
+        // entry for counts, as before. Cost (guard R3): one `contains` over the (at most four)
+        // ids of our own tables per event read during a flush, and one `String` clone per flush.
+        let (mut owed_bytes, mut owed_changes) = (0usize, false);
+        let mut own_ids: Vec<u64> = Vec::new();
+        let schema = self.schema.clone();
         let metrics = self.metrics.clone();
         // Everything fed so far (the binlog read position) is what this flush applies: the
         // position the targets will have applied when it is through (#215, see below).
@@ -5096,16 +5113,28 @@ impl Engine {
                     }
                     read = reader.next(), if open => {
                         *last_event = Instant::now();
+                        // A table map always precedes the rows events it describes, so the ids of
+                        // our own tables are known by the time their rows are weighed; an id the
+                        // server reused for another table is not ours (it drops out of the list).
+                        let owed = match &read {
+                            Ok(Some(item)) => Self::owed_item(item, schema.as_str(), &mut own_ids),
+                            _ => false,
+                        };
                         // Freshness (review O-01): `read_any` — which marks the stream
                         // not-at-head and the queue as read-not-applied — counts only a real
                         // item. A heartbeat carries no change and is dropped from the queue;
                         // claiming it would knock a caught-up view off the zero branch for a
                         // heartbeat period. Cost: one discriminant test on the item the push
                         // below matches on anyway.
-                        if !matches!(read, Ok(Some(Item::Heartbeat))) {
+                        let real = !matches!(read, Ok(Some(Item::Heartbeat)));
+                        let b = drained.push(read, &file);
+                        if owed {
+                            owed_bytes += b;
+                            owed_changes = true;
+                        }
+                        if real {
                             read_any = true;
                         }
-                        drained.push(read, &file);
                     }
                 }
             }
@@ -5114,9 +5143,11 @@ impl Engine {
         // more than the budget of the changes kept for targets that are behind — the targets
         // answered every write, yet demonstrably fall behind (a starved link; #215). Reported
         // and accounted as lagging, the same way a target that failed its writes is. Decided
-        // from the applied position against the budget, never from error text. Cost (guard R3):
-        // one position compare and one pass over the (view, target) pairs per flush; the event
-        // path is untouched (the reader's position is read once, here, not per event).
+        // from the applied position against the budget, never from error text, and only over
+        // the changes the targets owe (see above: the engine's own bookkeeping rows are not
+        // one, or a flavor that fences with a write flags its own targets behind). Cost (guard
+        // R3): one position compare and one pass over the (view, target) pairs per flush; the
+        // event path is untouched (the reader's position is read once, here, not per event).
         // The flush read past what the views were handed: those queued events are the source
         // being ahead of the views, so the stream is no longer at its head (the next heartbeat
         // after the queue drains says it is again) and the queued part counts as read-not-applied
@@ -5125,15 +5156,50 @@ impl Engine {
             self.clock.pending_read = true;
             self.clock.at_head = false;
         }
-        if r.is_ok() && read_any {
-            self.mark_behind_targets(&applied, reader.position(), drained.bytes);
+        if r.is_ok() && read_any && owed_changes {
+            self.mark_behind_targets(&applied, reader.position(), owed_bytes);
         }
         r
     }
 
+    /// Whether an event read while a flush ran is a change the targets owe: rows of a table
+    /// other than the engine's own bookkeeping, or a statement (DDL changes what the views mean).
+    /// `own_ids` is the table ids the table-map events of this flush named as ours: a map updates
+    /// it (a table map always precedes the rows events it describes), and an id the server reused
+    /// for another table leaves it. A table with no map entry in this flush counts, as before.
+    fn owed_item(item: &Item, schema: &str, own_ids: &mut Vec<u64>) -> bool {
+        match item {
+            Item::TableMap {
+                table_id,
+                schema: s,
+                table,
+                ..
+            } => {
+                if s.as_str() == schema
+                    && (table.as_str() == meta::DEFS
+                        || table.as_str() == meta::STATE
+                        || table.as_str() == meta::STATUS
+                        || table.as_str() == mysql::table())
+                {
+                    if !own_ids.contains(table_id) {
+                        own_ids.push(*table_id);
+                    }
+                } else {
+                    own_ids.retain(|x| *x != *table_id);
+                }
+                false
+            }
+            Item::Rows { table_id, .. } => !own_ids.contains(table_id),
+            Item::Statement { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Flags the targets the flush just wrote as behind: the flush applied everything up to
-    /// `applied`, while the stream was read up to `read` (events worth `drained_bytes` are
-    /// queued behind that position). Past the `Config::mem.lag_hold_bytes` budget
+    /// `applied`, while the stream was read up to `read` (`owed_bytes` of changes the targets
+    /// owe arrived meanwhile: rows of a table other than the engine's own bookkeeping, so a
+    /// flush is never flagged behind by the fence or state row it wrote itself). Past the
+    /// `Config::mem.lag_hold_bytes` budget
     /// (`LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests) every target that took this flush's writes is
     /// flagged in [`Version::behind`]: the next refresh skips it and hands it its changes
     /// through a `lag` entry (`note_refresh`), or the entry is made when the flag's retry time
@@ -5141,14 +5207,14 @@ impl Engine {
     /// writes failed gets: kept keys, the budget warning, `retry_lag` catching it up and
     /// counting the catch-up. Nothing is rebuilt or dropped; a target that keeps up again
     /// simply never gets flagged (only a written target of a slow flush is).
-    fn mark_behind_targets(&mut self, applied: &Position, read: &Position, drained_bytes: usize) {
+    fn mark_behind_targets(&mut self, applied: &Position, read: &Position, owed_bytes: usize) {
         let budget = self.cfg.mem.lag_hold_bytes;
         // Bytes between the two positions: an offset difference in one binlog file; across a
         // rotation the size of the files between is unknown, so the queue alone decides.
         let behind = if read.file == applied.file {
             read.pos.saturating_sub(applied.pos) > budget as u64
         } else {
-            drained_bytes > budget
+            owed_bytes > budget
         };
         if !behind {
             return;
@@ -5164,7 +5230,7 @@ impl Engine {
                 }
                 l.behind.insert(t.clone(), retry_at);
                 warn!(view = %l.name, target = %t,
-                    "writes to this target are behind: the stream has moved {drained_bytes} \
+                    "writes to this target are behind: the stream has moved {owed_bytes} \
                      bytes of changes past the position this flush applied, over the {budget} \
                      byte budget; the target is accounted as lagging until it catches up");
             }
