@@ -8,7 +8,10 @@
 //! old ids, the after-image the new ones; an update that keeps its id marks it once.
 //!
 //! Cost per row and occurrence: the read-column compare, a few integer compares for the filters, a
-//! projection of the id columns and one hash insert per id; no row image is kept.
+//! projection of the id columns and one hash insert per id; no row image is kept. A hop occurrence
+//! adds the hop's cache lookup, and a row of one of its chain tables one projection per image of the
+//! hop's `partner` columns; those columns are carried by the compiled occurrence (`Chain`), so
+//! nothing of the hop's plan is copied per event.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -119,7 +122,19 @@ struct Occ {
     filters: Vec<ConstFilter>,
     way: Way,
     /// The hops whose chain holds this alias: its rows change what those reach.
-    chains: Vec<HopId>,
+    chains: Vec<Chain>,
+}
+
+/// One hop whose chain holds an occurrence's alias, as that occurrence needs it: what of the hop's
+/// cache its rows evict, the entries of the partner values when every partner column sits on that
+/// alias (`Some`: the hop's partner columns, in link order) or the hop's whole entry table (`None`).
+/// Resolved from the hop's plan when the plan compiles (`add`'s pass 2, the same `HopPlan`), so the
+/// row path needs no plan lookup and copies no column list: a chain row costs the projections and
+/// nothing else.
+#[derive(Debug, Clone)]
+struct Chain {
+    hop: HopId,
+    partner: Option<Box<[usize]>>,
 }
 
 /// Every route of one source table.
@@ -285,7 +300,14 @@ impl Consumer {
             compiled[ai].1.way = Way::Hop { hop };
             for (_, o) in compiled.iter_mut() {
                 if p.chain.contains(&o.alias) {
-                    o.chains.push(hop);
+                    // The partner as this occurrence sees it, resolved once here rather than
+                    // cloned from the hop's plan per event. A hop removed meanwhile (`plan` gone)
+                    // evicts nothing either way: its entries and its flight map are empty.
+                    let partner: Option<Box<[usize]>> = match p.partner.as_ref() {
+                        Some((pa, cols)) if *pa == o.alias => Some(cols.iter().copied().collect()),
+                        _ => None,
+                    };
+                    o.chains.push(Chain { hop, partner });
                 }
             }
         }
@@ -423,14 +445,16 @@ impl Consumer {
             // A row of a chain table changes what the hop's link values reach: its partner values'
             // entries go (or all of the hop's when the partner is another alias); answers in flight
             // for them are not cached.
-            for &h in &o.chains {
-                match hops.plan(h).and_then(|p| p.partner.clone()) {
-                    Some((pa, cols)) if pa == o.alias => {
+            // cost: one projected key per image that exists, and no copy of the hop's column list
+            // (`Chain` carries it from the compile).
+            for c in &o.chains {
+                match &c.partner {
+                    Some(cols) => {
                         for r in b.into_iter().chain(a) {
-                            hops.evict(h, &project(o, r, &cols));
+                            hops.evict(c.hop, &project(o, r, cols));
                         }
                     }
-                    _ => hops.clear(h),
+                    None => hops.clear(c.hop),
                 }
             }
         }
@@ -486,14 +510,14 @@ impl Consumer {
                 Way::Partial { space, cols } => ids(o, *space, cols, true, b, a, sink),
                 Way::Hop { hop } => hop_ids(o, *hop, true, b, a, hops, sink),
             }
-            for &h in &o.chains {
-                match hops.plan(h).and_then(|p| p.partner.clone()) {
-                    Some((pa, cols)) if pa == o.alias => {
+            for c in &o.chains {
+                match &c.partner {
+                    Some(cols) => {
                         for r in b.into_iter().chain(a) {
-                            hops.evict(h, &project(o, r, &cols));
+                            hops.evict(c.hop, &project(o, r, cols));
                         }
                     }
-                    _ => hops.clear(h),
+                    None => hops.clear(c.hop),
                 }
             }
         }
@@ -891,8 +915,9 @@ fn hop_ids<U, S: Sink<U>>(
 ) {
     let Some(p) = hops.plan(h) else { return };
     let (t, space) = (o.target, p.space);
-    let link_cols = p.link_cols.clone();
-    let link = |r: &BinlogRow| project(o, r, &link_cols);
+    // cost: the link columns are read where they sit (the hop's plan, borrowed while the shared
+    // cache lookups run), so a hop row costs its projections and nothing else.
+    let link = |r: &BinlogRow| project(o, r, &p.link_cols);
     let new = after.map(link);
     let old = before.map(link).filter(|l| new.as_ref() != Some(l));
     for l in old.into_iter().chain(new) {

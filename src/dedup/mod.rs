@@ -549,10 +549,17 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Sink<U> for Feed<'
             }
             None => {
                 let tg = self.targets[t].as_mut().unwrap();
-                let new = tg.buffer.mark_tuple(s, k.clone(), self.origin);
+                // cost: the facts flag is off for lazyview, so the id moves into the pending set and
+                // nothing is cloned. With the flag on (lazy-wire-fire) the same id is read again by
+                // `note` below, which costs one boxed slice per marked id.
+                let (new, marked) = if tg.spec.needs.facts {
+                    (tg.buffer.mark_tuple(s, k.clone(), self.origin), Some(k))
+                } else {
+                    (tg.buffer.mark_tuple(s, k, self.origin), None)
+                };
                 tg.stats.ids_marked += 1;
                 tg.stats.ids_absorbed += u64::from(!new);
-                if tg.spec.needs.facts {
+                if let Some(k) = marked {
                     tg.buffer.note(s, &Key::Tuple(k), op, cascaded, new);
                 }
             }
@@ -600,6 +607,8 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Sink<U> for Feed<'
             }
             Note::CascadeRows(n) => tg.stats.cascade_rows += n,
             Note::Logged => {
+                // cost: a `P` per target that starts seeding, not per event: `get_or_insert_with`
+                // keeps the first origin and `install_cache` drops the pin.
                 tg.seed_pin.get_or_insert_with(|| self.origin.clone());
             }
         }
@@ -721,6 +730,9 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
     /// A boundary at `end` (COMMIT, or a statement / heartbeat boundary); `settle == false`: a
     /// transaction of the caller's own tables only, the boundary stays.
     pub fn commit(&mut self, end: P, settle: bool, now: Instant) {
+        // cost: one `P` per boundary. `Stage` takes the position by value (it may become the
+        // boundary) and `ended` reads it, so the event's position is held twice; at lazyview's
+        // instantiation `P` is `binlog::Position`, whose `file` name is a `String`.
         if let Some(r) = self.stage.commit(end.clone(), settle) {
             self.release(r, &end, now);
         }
@@ -728,6 +740,7 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
     }
 
     pub fn rollback(&mut self, end: P, now: Instant) {
+        // cost: one `P` per boundary, as in `commit`.
         if let Some(r) = self.stage.rollback(end.clone()) {
             self.release(r, &end, now);
         }
@@ -739,11 +752,14 @@ impl<P: Ord + Clone + Debug, U: Hash + Eq + Clone + Debug, J> Core<P, U, J> {
     }
 
     pub fn xa_prepare(&mut self, xid: &str, end: P, now: Instant) {
+        // cost: one `P` per boundary, as in `commit`.
         self.stage.xa_prepare(xid, end.clone(), now);
         self.ended(&end, now);
     }
 
     pub fn xa_end(&mut self, xid: &str, commit: bool, end: P, now: Instant) {
+        // cost: one `P` per boundary, as in `commit`; the `Unknown` arm adds a second copy of it
+        // and an `xid.to_string()`, on the un-prepared-XA path alone.
         match self.stage.xa_end(xid, commit, end.clone()) {
             stage::XaEnd::Released(r) => self.release(r, &end, now),
             stage::XaEnd::Unknown => self.events.push(CoreEvent::UnknownPrepare {
