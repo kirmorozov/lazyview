@@ -1,0 +1,3 @@
+# The downloaded provider and the working directory are local only: the versions people
+# get are pinned by .terraform-version and by the committed .terraform.lock.hcl.
+.terraform/
