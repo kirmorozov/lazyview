@@ -507,6 +507,28 @@ struct Lag {
     /// keys kept. Its kept keys live only in memory, so the saved position waits for its
     /// `since` (`pending_floor`) and a restart replays the outage rather than losing them.
     down: bool,
+    /// Units `note_refresh` re-fed to this group **since the last claim** (#214). A claimed
+    /// group's detached retry reads the sources at or after its claim, so an unit re-fed after
+    /// the claim may be missing from what that retry writes even when it was in the claim
+    /// snapshot: `lag_subtract` posts it back, and it stays owed until a later retry — whose
+    /// claim cleared this and whose read follows the change — writes it. Without this the
+    /// subtraction removed it (it was in the claim) and a change that arrived after the read
+    /// was lost: the target kept a row the source no longer had.
+    /// Cost (guard R3): one set feed per lagging target per refresh — the same shape as the
+    /// feed above it in `note_refresh`, cleared per claim — never per binlog event.
+    posted: UnitSet,
+    posted_partial: Vec<UnitSet>,
+    posted_all: bool,
+}
+
+impl Lag {
+    /// Forgets the re-fed-since-claim marks: the retry starting now reads the sources from
+    /// here on, so it writes everything fed until now; later feeds post again (`note_refresh`).
+    fn clear_posted(&mut self) {
+        self.posted = UnitSet::default();
+        self.posted_partial = Vec::new();
+        self.posted_all = false;
+    }
 }
 
 /// Lowers `floor` to `p` when that is a known position older than it.
@@ -8286,6 +8308,9 @@ impl Engine {
                 failures: 1,
                 retry_at: Instant::now() + connect_retry_delay(1),
                 down: false,
+                posted: UnitSet::default(),
+                posted_partial: Vec::new(),
+                posted_all: false,
             });
         }
         // A target flagged behind (`mark_behind_targets`) that this refresh applied to none of:
@@ -8305,6 +8330,9 @@ impl Engine {
                         failures: 0,
                         retry_at: Instant::now() + connect_retry_delay(1),
                         down: false,
+                        posted: UnitSet::default(),
+                        posted_partial: Vec::new(),
+                        posted_all: false,
                     },
                 );
             }
@@ -8314,6 +8342,11 @@ impl Engine {
                 g.units.extend(r.units.clone());
                 extend_partial(&mut g.partial, r.partial.clone());
                 g.all |= r.all;
+                // #214: if this target's retry was claimed and runs detached, its write may
+                // predate this refresh; post the units so the fold keeps them owed.
+                g.posted.extend(r.units.clone());
+                extend_partial(&mut g.posted_partial, r.partial.clone());
+                g.posted_all |= r.all;
             }
         }
         s.stats.refreshed(r.units, r.partial, r.all, &r.work);
@@ -8480,6 +8513,9 @@ impl Engine {
                     failures: 0,
                     retry_at: now,
                     down: false,
+                    posted: UnitSet::default(),
+                    posted_partial: Vec::new(),
+                    posted_all: false,
                 };
                 l.lag.entry(t).or_insert(seed);
             }
@@ -8499,7 +8535,17 @@ impl Engine {
                 return out;
             };
             let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
-            let kept = if take { l.lag.remove(&t) } else { None };
+            let kept = if take {
+                // Sequential path: the group leaves the map and its retry runs at once
+                // (`retry_lag`), so nothing feeds it while it runs — the claim's read covers
+                // everything fed until now (#214).
+                l.lag.remove(&t).map(|mut g| {
+                    g.clear_posted();
+                    g
+                })
+            } else {
+                None
+            };
             let Some(g) = kept.as_ref().or_else(|| l.lag.get(&t)) else {
                 continue;
             };
@@ -8551,6 +8597,12 @@ impl Engine {
             set.keys.retain(|k| !c.keys.contains(k));
         }
         g.all &= !claimed_all;
+        // #214: units re-fed since the claim stay owed even though the claim also held them:
+        // this retry's write was computed from a read taken before those changes. The claim
+        // cleared these marks, so they hold exactly what `note_refresh` fed while it ran.
+        g.units.extend(std::mem::take(&mut g.posted));
+        extend_partial(&mut g.partial, std::mem::take(&mut g.posted_partial));
+        g.all |= std::mem::take(&mut g.posted_all);
         g.units.is_empty() && g.partial.iter().all(UnitSet::is_empty) && !g.all
     }
 
@@ -8586,6 +8638,9 @@ impl Engine {
             failures: 0,
             retry_at: Instant::now() + connect_retry_delay(1),
             down: false,
+            posted: UnitSet::default(),
+            posted_partial: Vec::new(),
+            posted_all: false,
         });
         true
     }
@@ -9156,6 +9211,13 @@ impl Engine {
                 let key = (i, g.t.clone());
                 if self.lag_retries.contains_key(&key) {
                     continue;
+                }
+                // The retry starts here: its claim clears the re-fed marks, so what it reads
+                // from now on it writes (#214; feeds after this moment post again).
+                if let Some(lg) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
+                    if let Some(g0) = lg.lag.get_mut(&g.t) {
+                        g0.clear_posted();
+                    }
                 }
                 debug!(view = %g.name, target = %g.t, all = g.claimed_all, "lag refresh claimed");
                 // Prepared here: the lagging target's units are already resolved (its
@@ -11184,6 +11246,9 @@ mod tests {
             failures: 0,
             retry_at: Instant::now(),
             down,
+            posted: UnitSet::default(),
+            posted_partial: Vec::new(),
+            posted_all: false,
         }
     }
 
