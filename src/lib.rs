@@ -18,6 +18,7 @@ pub mod fence;
 pub mod health;
 pub mod intset;
 pub mod lookback;
+pub mod mem;
 pub mod metrics;
 pub mod pgoutput;
 pub(crate) mod pgsrc;

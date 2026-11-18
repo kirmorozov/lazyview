@@ -565,7 +565,7 @@ struct XaTxn {
     start: Cursor,
     rows: Vec<XaRow>,
     /// Estimated memory of `rows` (`KEY_BYTES` per row, see `buffer_bytes`). The rows of
-    /// tables no view read are kept only while this stays under [`XA_HOLD_BYTES`].
+    /// tables no view read are kept only while this stays under `Config::mem.xa_hold_bytes`.
     bytes: usize,
     /// Tables with rows that were not kept (no view read them at the time).
     other_tables: HashSet<TableRef>,
@@ -766,7 +766,8 @@ struct Engine {
     lock_task: LockTask,
     ready_logged: bool,
     /// The warn for the changes kept for targets that are behind passing their budget was
-    /// emitted: one warn and one count per crossing of `LAG_HOLD_BYTES`, not per housekeeping
+    /// emitted: one warn and one count per crossing of the lag budget
+    /// (`Config::mem.lag_hold_bytes`), not per housekeeping
     /// tick (re-armed when the estimate falls back within the budget).
     lag_budget_warned: bool,
     /// (slot, targets written) of every live refresh of the flush in progress (`note_refresh`
@@ -808,33 +809,17 @@ const STMT_DML_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CATCH_UP_BATCH: Duration = Duration::from_millis(100);
 
 /// Binlog read ahead while a flush runs (see `Engine::flush_draining`): at most this many
-/// events and about this many bytes are queued; beyond that the stream waits (backpressure).
+/// events, and at most `Config::mem.drain_max_bytes`, are queued; beyond that the stream waits
+/// (backpressure). The event bound is a constant; the byte bound is a value of `Config`, derived
+/// at startup from the memory the process was given (the total and the rule in [`crate::mem`],
+/// review R-01 / N-06), so the buffers of the engine cannot outgrow the container. A process
+/// with no limit gets the constants the engine carried before: 32 MiB for this queue and 256 MiB
+/// for each of the three holds below (`Config::mem.build_hold_bytes`, `.xa_hold_bytes`,
+/// `.lag_hold_bytes`, documented where they act: `hold_for_builds`, the unrouted rows of a
+/// prepared XA in `on_rows`, and `lag_over_budget`).
 const DRAIN_MAX_EVENTS: usize = 100_000;
-const DRAIN_MAX_BYTES: usize = 32 << 20;
 /// Queue slots kept once a drained queue is empty again (a larger queue is shrunk to this).
 const DRAIN_KEEP_SLOTS: usize = 1024;
-
-/// Byte budget of the changes buffered for building versions, all of them together: a build
-/// cannot take its changes before it is done, so past this the binlog reader waits for the
-/// builds (`Engine::hold_for_builds`) instead of dropping changes. The roadmap's buffer bound
-/// (8 × [`DRAIN_MAX_BYTES`], 256 MiB), a constant.
-const BUILD_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
-
-/// Byte budget of the rows one prepared XA transaction keeps for tables no view read: past it
-/// they are dropped and only a view that was defined while the transaction was prepared and
-/// reads such a table is rebuilt (the rows of a table a view does read are always kept: they
-/// are the transaction's own changes and dropping them would cost every live view a rebuild).
-const XA_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
-
-/// Byte budget of the changes kept for targets that are behind (their unit keys, all views and
-/// targets together; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). A target that is down has nothing
-/// that drains them while it is unreachable, so the reader cannot wait for it — and nothing is
-/// dropped or rebuilt past it either: the keys are sets, bounded by the distinct ids the view
-/// can have, so a down target keeps them until it catches up. Past this budget the engine only
-/// reports (a warn per crossing naming the view, the target and the estimate, and the
-/// `lag_over_budget` counter); the saved position waits for the kept keys
-/// (`Engine::pending_floor`), so a restart replays the outage instead of losing them.
-const LAG_HOLD_BYTES: usize = 8 * DRAIN_MAX_BYTES;
 /// Estimated memory of one buffered integer id, and of any other key, row image or mark (hash
 /// slot, boxed datums and a short value; wide images count low).
 const INT_KEY_BYTES: usize = 16;
@@ -860,15 +845,27 @@ type Read = Result<Option<Item>>;
 
 /// Binlog reads queued while a flush ran (see `Engine::flush_draining`), each with its
 /// approximate memory, and their running total.
-#[derive(Default)]
 struct Drained {
     queue: VecDeque<(Read, usize)>,
     bytes: usize,
     /// Binlog file the oldest queued events were read from (None while the queue is empty).
     file: Option<String>,
+    /// The queue's byte budget (`Config::mem.drain_max_bytes`), carried so the two bounds are
+    /// read from the queue itself on the hot path.
+    max_bytes: usize,
 }
 
 impl Drained {
+    /// An empty queue bounded by `max_bytes` (see `Config::mem`).
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            bytes: 0,
+            file: None,
+            max_bytes,
+        }
+    }
+
     /// Queues `r`, read from binlog file `file`. Heartbeats are dropped: they carry nothing, and
     /// one taken from the queue would move the position to the reader's, past the events queued
     /// behind it (see `Engine::on_item`); the next one read while idle does that instead.
@@ -900,12 +897,12 @@ impl Drained {
     /// Below both bounds, and not ended by an error or the end of the stream.
     fn open(&self) -> bool {
         self.queue.len() < DRAIN_MAX_EVENTS
-            && self.bytes < DRAIN_MAX_BYTES
+            && self.bytes < self.max_bytes
             && !matches!(self.queue.back(), Some((Ok(None) | Err(_), _)))
     }
 
     fn full(&self) -> bool {
-        self.queue.len() >= DRAIN_MAX_EVENTS || self.bytes >= DRAIN_MAX_BYTES
+        self.queue.len() >= DRAIN_MAX_EVENTS || self.bytes >= self.max_bytes
     }
 }
 
@@ -1357,11 +1354,16 @@ impl Engine {
             file: String::new(),
             pos: 0,
         };
+        // The one total every byte budget was derived from, and where it came from (the line an
+        // operator reads when comparing the container's limit with the buffers, review N-06).
+        info!("{}", cfg.mem.summary());
         let dedup = crate::exec::Dedup::new(
             zero.clone(),
             cfg.batch_max_keys.max(1),
             cfg.query_chunk.max(1),
-            8 * DRAIN_MAX_BYTES,
+            // The core's own bound is a share of the same total; above it its caller stops
+            // reading (dedup::over_bound), never allocates past it.
+            cfg.mem.dedup_max_bytes,
         );
         // Detached: the task ends when the engine, owner of its only sender, is dropped.
         let (stats_tx, stats_task) = crate::stats::spawn_aggregator(metrics.view_stats.clone());
@@ -3405,7 +3407,7 @@ impl Engine {
             let mut last_event = Instant::now();
             let mut delivered = false;
             // Read while the last flush ran: processed first, in order (see `flush_draining`).
-            let mut drained = Drained::default();
+            let mut drained = Drained::new(self.cfg.mem.drain_max_bytes);
             loop {
                 Metrics::set(
                     &self.metrics.gauges.heartbeat_unix,
@@ -3617,7 +3619,7 @@ impl Engine {
 
     /// Flags the targets the flush just wrote as behind: the flush applied everything up to
     /// `applied`, while the stream was read up to `read` (events worth `drained_bytes` are
-    /// queued behind that position). Past the [`LAG_HOLD_BYTES`] budget
+    /// queued behind that position). Past the `Config::mem.lag_hold_bytes` budget
     /// (`LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests) every target that took this flush's writes is
     /// flagged in [`Version::behind`]: the next refresh skips it and hands it its changes
     /// through a `lag` entry (`note_refresh`), or the entry is made when the flag's retry time
@@ -3626,7 +3628,7 @@ impl Engine {
     /// counting the catch-up. Nothing is rebuilt or dropped; a target that keeps up again
     /// simply never gets flagged (only a written target of a slow flush is).
     fn mark_behind_targets(&mut self, applied: &Position, read: &Position, drained_bytes: usize) {
-        let budget = self.cfg.test_lag_hold_bytes.unwrap_or(LAG_HOLD_BYTES);
+        let budget = self.cfg.mem.lag_hold_bytes;
         // Bytes between the two positions: an offset difference in one binlog file; across a
         // rotation the size of the files between is unknown, so the queue alone decides.
         let behind = if read.file == applied.file {
@@ -3960,11 +3962,18 @@ impl Engine {
                 }
                 let own =
                     key.0 == self.schema && (key.1 == meta::STATUS || key.1 == mysql::table());
+                // The rows of a table no view reads are kept only while one prepared
+                // transaction's budget of them lasts (`Config::mem.xa_hold_bytes`, a share of
+                // the total of [`crate::mem`], 256 MiB where there is no container limit): past
+                // it they are dropped, and only a view defined while the transaction was
+                // prepared and reads such a table is then rebuilt. The rows of a table a view
+                // does read are always kept: they are the transaction's own changes, and
+                // dropping them would cost every live view a rebuild.
                 let keep_unrouted = !own
                     && self
                         .xa_current
                         .as_ref()
-                        .is_some_and(|(_, xa)| xa.bytes <= XA_HOLD_BYTES);
+                        .is_some_and(|(_, xa)| xa.bytes <= self.cfg.mem.xa_hold_bytes);
                 if route.is_none() && src.is_none() {
                     // No view reads it now; one defined while this transaction is prepared may.
                     // Keep its rows so `xa_committed` can feed that view instead of rebuilding it
@@ -4183,7 +4192,7 @@ impl Engine {
                 );
             }
         }
-        // Only the tables whose rows were dropped (past `XA_HOLD_BYTES`) still cost a view a
+        // Only the tables whose rows were dropped (past `Config::mem.xa_hold_bytes`) still cost a view a
         // rebuild: say so, it is the one case this run could not trace the change.
         if xa.other_tables.is_empty() {
             return;
@@ -4823,10 +4832,10 @@ impl Engine {
     }
 
     /// The estimated bytes buffered for building versions, when they exceed their budget
-    /// ([`BUILD_HOLD_BYTES`]; `LAZYVIEW_TEST_BUILD_HOLD_BYTES` in tests). One pass over the
+    /// (`Config::mem.build_hold_bytes`; `LAZYVIEW_TEST_BUILD_HOLD_BYTES` in tests). One pass over the
     /// slots: evaluated once per flush, never per event.
     fn builds_over_budget(&self) -> Option<usize> {
-        let budget = self.cfg.test_build_hold_bytes.unwrap_or(BUILD_HOLD_BYTES);
+        let budget = self.cfg.mem.build_hold_bytes;
         let held: usize = self
             .slots
             .iter()
@@ -4837,12 +4846,12 @@ impl Engine {
     }
 
     /// The estimated bytes kept for targets that are behind, when they exceed their budget
-    /// ([`LAG_HOLD_BYTES`]; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). One pass over the slots;
+    /// (`Config::mem.lag_hold_bytes`; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). One pass over the slots;
     /// called from `housekeeping`, never per event and never per flush. The budget is a
     /// reporting threshold only: passing it drops nothing and rebuilds nothing (see
     /// [`Self::report_lag_over_budget`]).
     fn lag_over_budget(&self) -> Option<usize> {
-        let budget = self.cfg.test_lag_hold_bytes.unwrap_or(LAG_HOLD_BYTES);
+        let budget = self.cfg.mem.lag_hold_bytes;
         let held: usize = self
             .slots
             .iter()
@@ -4863,7 +4872,7 @@ impl Engine {
     fn report_lag_over_budget(&mut self, held: usize) {
         self.lag_budget_warned = true;
         Metrics::add(&self.metrics.lag_over_budget, 1);
-        let budget = self.cfg.test_lag_hold_bytes.unwrap_or(LAG_HOLD_BYTES);
+        let budget = self.cfg.mem.lag_hold_bytes;
         let mut best: Option<(String, String)> = None;
         let mut oldest: Option<Position> = None;
         for s in self.slots.iter() {
@@ -8156,7 +8165,7 @@ mod tests {
     /// capacity once empty.
     #[test]
     fn drained_queue_accounting() {
-        let mut d = Drained::default();
+        let mut d = Drained::new(crate::mem::MemoryBudget::fallback().drain_max_bytes);
         assert!(d.open() && !d.full() && d.file.is_none() && d.pop().is_none());
         d.push(Ok(Some(Item::Heartbeat)), "binlog.000001");
         assert!(
@@ -8184,6 +8193,15 @@ mod tests {
         assert!(d.full() && !d.open());
         while d.pop().is_some() {}
         assert!(d.queue.capacity() <= DRAIN_KEEP_SLOTS && d.bytes == 0);
+        // The byte bound acts on its own, and it is the value the queue was built with: past
+        // 200 bytes this queue is full with four events (a test makes a budget any size).
+        let mut d = Drained::new(200);
+        for _ in 0..3 {
+            d.push(Ok(Some(Item::Other)), "binlog.000004");
+        }
+        assert!(d.open() && !d.full(), "192 of 200 bytes");
+        d.push(Ok(Some(Item::Other)), "binlog.000004");
+        assert!(d.full() && !d.open(), "256 bytes is over the budget");
     }
 
     /// The memory estimate of a change buffer counts every kind of entry at its size.
@@ -8199,9 +8217,14 @@ mod tests {
         d.partial[0].insert_int(3);
         d.marks.push((0, Datum::Int(1)));
         assert_eq!(buffer_bytes(&d), 3 * INT_KEY_BYTES + 3 * KEY_BYTES);
-        assert_eq!(BUILD_HOLD_BYTES, 256 << 20);
-        assert_eq!(XA_HOLD_BYTES, 256 << 20);
-        assert_eq!(LAG_HOLD_BYTES, 256 << 20);
+        // With no container limit the budgets are the constants the engine carried before the
+        // total existed (the property `crate::mem` exists to keep).
+        let m = crate::mem::MemoryBudget::fallback();
+        assert_eq!(m.drain_max_bytes, 32 << 20);
+        assert_eq!(m.build_hold_bytes, 256 << 20);
+        assert_eq!(m.xa_hold_bytes, 256 << 20);
+        assert_eq!(m.lag_hold_bytes, 256 << 20);
+        assert_eq!(m.dedup_max_bytes, 256 << 20);
     }
 
     fn lag(since: (&str, u64), down: bool) -> Lag {

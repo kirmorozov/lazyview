@@ -133,12 +133,18 @@ pub struct Config {
     /// contains `marker` first sleeps that long, after it took its build slot.
     pub test_build_delay: Option<(String, Duration)>,
     /// Test hook `LAZYVIEW_TEST_BUILD_HOLD_BYTES=<bytes>`: the byte budget of changes buffered
-    /// for building versions instead of the engine's constant (see `Engine::hold_for_builds`).
+    /// for building versions instead of the budget the total gave it (see `Engine::hold_for_builds`).
     pub test_build_hold_bytes: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_LAG_HOLD_BYTES=<bytes>`: the byte budget of the changes kept
-    /// for targets that are behind instead of the engine's constant (see
+    /// for targets that are behind instead of the budget the total gave it (see
     /// `Engine::lag_over_budget`: past it the engine only reports).
     pub test_lag_hold_bytes: Option<usize>,
+    /// The engine's byte budgets — the read-ahead queue, the build hold, the XA hold, the lag
+    /// hold and the dedup core — derived once at startup from `LAZYVIEW_MEMORY_BUDGET_BYTES`,
+    /// the container's cgroup limit, or the historical constants (the rule and the order in
+    /// [`crate::mem`], review R-01 / N-06). The two hooks above override the field they name;
+    /// everything else the engine reads for a byte budget is this.
+    pub mem: crate::mem::MemoryBudget,
     /// Test hook `LAZYVIEW_TEST_FAIL_IDENTITY=<n>`: the first `n` source identity reads of a
     /// start fail (see `engine::server_identity`), the stand-in for a connection blip there.
     pub test_fail_identity: Option<usize>,
@@ -215,6 +221,16 @@ impl Config {
     }
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
+        Self::from_lookup_with_mem_read(get, &mut crate::mem::read_limit)
+    }
+
+    /// `from_lookup` with the cgroup limit files read by `read` (the seam of [`crate::mem`]: it
+    /// is asked for the paths and answers the limit it wants), so a test pins the total without
+    /// a cgroup of its own. `from_lookup` reads the machine's real files.
+    pub fn from_lookup_with_mem_read(
+        get: impl Fn(&str) -> Option<String>,
+        read: &mut dyn FnMut(&std::path::Path) -> Option<u64>,
+    ) -> Result<Config> {
         // Endpoints reached without TLS, named in a WARN at startup (see CleartextEndpoint).
         let mut cleartext: Vec<CleartextEndpoint> = Vec::new();
         let dsn = connection(&get, "LAZYVIEW", false, Some(("source", &mut cleartext)))?.ok_or_else(|| {
@@ -374,6 +390,36 @@ impl Config {
         // "the metadata connection's server", and the engine falls back that way
         // (`test_lock_dsn` ⇒ `test_meta_dsn` ⇒ `dsn`); `None` here says nothing was set.
         let test_lock_dsn = role_dsn_opt("LAZYVIEW_TEST_LOCK")?;
+        // The total memory budget (review R-01 / N-06): resolved once, here, from the setting,
+        // the cgroup limit of the container, or the historical constants, and derived into the
+        // engine's byte budgets by the rule of [`crate::mem`]. Nothing on the hot path asks a
+        // file or recomputes anything: it reads these numbers.
+        let explicit_total = get("LAZYVIEW_MEMORY_BUDGET_BYTES").map_or(Ok(None), |v| {
+            crate::mem::parse_total(&v)
+                .with_context(|| {
+                    "LAZYVIEW_MEMORY_BUDGET_BYTES must be a byte count (e.g. 96Mi or 1073741824)"
+                })
+                .map(Some)
+        })?;
+        if explicit_total == Some(0) {
+            bail!("LAZYVIEW_MEMORY_BUDGET_BYTES must be > 0");
+        }
+        let test_build_hold_bytes =
+            Some(num("LAZYVIEW_TEST_BUILD_HOLD_BYTES", 0)? as usize).filter(|&b| b > 0);
+        let test_lag_hold_bytes =
+            Some(num("LAZYVIEW_TEST_LAG_HOLD_BYTES", 0)? as usize).filter(|&b| b > 0);
+        let mut mem = crate::mem::MemoryBudget::resolve_with(
+            explicit_total,
+            &crate::mem::CgroupPaths::default(),
+            read,
+        );
+        // A test that shrinks one buffer below what the total gives it still can (the hooks).
+        if let Some(b) = test_build_hold_bytes {
+            mem.build_hold_bytes = b;
+        }
+        if let Some(b) = test_lag_hold_bytes {
+            mem.lag_hold_bytes = b;
+        }
         Ok(Config {
             dsn,
             source_family,
@@ -401,10 +447,9 @@ impl Config {
             plan_timeout: Duration::from_millis(num("LAZYVIEW_PLAN_TIMEOUT_MS", 10_000)?.max(1)),
             test_plan_delay: marker_delay("LAZYVIEW_TEST_PLAN_DELAY")?,
             test_build_delay: marker_delay("LAZYVIEW_TEST_BUILD_DELAY")?,
-            test_build_hold_bytes: Some(num("LAZYVIEW_TEST_BUILD_HOLD_BYTES", 0)? as usize)
-                .filter(|&b| b > 0),
-            test_lag_hold_bytes: Some(num("LAZYVIEW_TEST_LAG_HOLD_BYTES", 0)? as usize)
-                .filter(|&b| b > 0),
+            test_build_hold_bytes,
+            test_lag_hold_bytes,
+            mem,
             test_fail_identity: Some(num("LAZYVIEW_TEST_FAIL_IDENTITY", 0)? as usize)
                 .filter(|&n| n > 0),
             test_fail_snapshot: Some(num("LAZYVIEW_TEST_FAIL_SNAPSHOT", 0)? as usize)
@@ -955,6 +1000,62 @@ mod tests {
             );
             assert!(
                 cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_TEST_BUILD_DELAY", bad)]).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The total memory budget (review R-01 / N-06): the cgroup limit becomes every byte
+    /// budget, `LAZYVIEW_MEMORY_BUDGET_BYTES` decides over it, the two hooks still override the
+    /// budget they name, and a size that is not a size is refused like any other setting.
+    #[test]
+    fn total_memory_budget() {
+        use std::path::{Path, PathBuf};
+        let files: HashMap<PathBuf, String> = [(
+            PathBuf::from(crate::mem::CGROUP_V2_LIMIT),
+            "1073741824".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let mut read =
+            |p: &Path| -> Option<u64> { files.get(p).and_then(|v| crate::mem::parse_limit(v)) };
+        let mut with = |pairs: &[(&str, &str)]| -> Result<Config> {
+            let m: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            Config::from_lookup_with_mem_read(|k| m.get(k).cloned(), &mut read)
+        };
+        // Nothing set: the container's limit (1 GiB here) is the total, and every budget is
+        // derived from it (128 MiB kept outside, the queue an eighth of that left, holds a quarter).
+        let c = with(&[("LAZYVIEW_DSN", "x")]).unwrap();
+        assert_eq!(c.mem.source, crate::mem::BudgetSource::CgroupV2);
+        assert_eq!(c.mem.total, 1024 << 20);
+        assert_eq!(c.mem.drain_max_bytes, 28 << 20);
+        assert_eq!(c.mem.build_hold_bytes, 224 << 20);
+        assert_eq!(c.mem.xa_hold_bytes, 224 << 20);
+        assert_eq!(c.mem.lag_hold_bytes, 224 << 20);
+        assert_eq!(c.mem.dedup_max_bytes, 224 << 20);
+        // The setting decides over the limit; a hook changes its own budget and no other.
+        let c = with(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_MEMORY_BUDGET_BYTES", "96Mi"),
+            ("LAZYVIEW_TEST_BUILD_HOLD_BYTES", "1700000"),
+            ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "32"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (c.mem.source, c.mem.total),
+            (crate::mem::BudgetSource::Env, 96 << 20)
+        );
+        assert_eq!(c.mem.drain_max_bytes, 2 << 20);
+        assert_eq!(c.mem.xa_hold_bytes, 16 << 20);
+        assert_eq!(c.mem.dedup_max_bytes, 16 << 20, "untouched by either hook");
+        assert_eq!(c.mem.build_hold_bytes, 1_700_000, "the hook still decides");
+        assert_eq!(c.mem.lag_hold_bytes, 32, "and this one too");
+        for bad in ["", "max", "96 Mis", "0"] {
+            assert!(
+                with(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_MEMORY_BUDGET_BYTES", bad)]).is_err(),
                 "{bad}"
             );
         }
