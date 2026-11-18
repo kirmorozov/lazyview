@@ -105,6 +105,16 @@ pub struct Config {
     pub drop_removed: bool,
     pub on_missing_binlog: MissingBinlog,
     pub heartbeat: Duration,
+    /// `LAZYVIEW_LOCK_HEARTBEAT_MS` (default 5000, floor 1000): how often the leadership lock's
+    /// own session is beaten, and so how fast a lost lock is noticed. Nothing to do with
+    /// `heartbeat` (the binlog heartbeat) but the name, which is kept clear on purpose.
+    pub lock_heartbeat: Duration,
+    /// `LAZYVIEW_LOCK_LEASE_MS` (default 20000, floor 2000): the `wait_timeout` the leadership
+    /// lock session sets for itself, so the server ends it — and the named lock with it — once
+    /// this instance has gone silent (review A-06: the release is the server's, not the client's).
+    /// Validated `>= 4 x lock_heartbeat` by [`crate::coord::Lease::new`], which is why the default
+    /// lease is four beats of the default heartbeat.
+    pub lock_lease: Duration,
     /// Minimum time between two full rebuilds of the same view (views that cannot be maintained
     /// incrementally: DISTINCT, UNION, LIMIT, ...). Changes mark the view stale; it is rebuilt
     /// once per interval at most. 0 = as soon as possible.
@@ -245,6 +255,14 @@ impl Config {
                     _ => bail!("LAZYVIEW_ON_MISSING_BINLOG must be fail|rebuild"),
                 },
             };
+        // The leadership lock's lease (review A-06): the beat period of the lock's own session and
+        // the server-side `wait_timeout` of that session. Checked by `coord::Lease::new`, the same
+        // code that will use them, so a setting cannot pass here and be refused there.
+        let lock_heartbeat =
+            Duration::from_millis(num("LAZYVIEW_LOCK_HEARTBEAT_MS", 5_000)?.max(1_000));
+        let lock_lease = Duration::from_millis(num("LAZYVIEW_LOCK_LEASE_MS", 20_000)?.max(2_000));
+        crate::coord::Lease::new(lock_heartbeat, lock_lease, lock_heartbeat)
+            .context("LAZYVIEW_LOCK_HEARTBEAT_MS / LAZYVIEW_LOCK_LEASE_MS")?;
         let server_id_fixed = get("LAZYVIEW_SERVER_ID").is_some();
         let server_id = match get("LAZYVIEW_SERVER_ID") {
             Some(v) => v
@@ -385,6 +403,8 @@ impl Config {
             lock_wait_s: num("LAZYVIEW_TEST_LOCK_WAIT_S", DEFAULT_LOCK_WAIT_S)?.max(1),
             swap_lock_wait_s: num("LAZYVIEW_SWAP_LOCK_WAIT_S", DEFAULT_SWAP_LOCK_WAIT_S)?.max(1),
             heartbeat: Duration::from_millis(num("LAZYVIEW_HEARTBEAT_MS", 5_000)?.max(100)),
+            lock_heartbeat,
+            lock_lease,
             visibility_delay: Duration::from_millis(num("LAZYVIEW_VISIBILITY_DELAY_MS", 20)?),
             position_persist_interval: Duration::from_millis(num(
                 "LAZYVIEW_POSITION_PERSIST_MS",
@@ -804,6 +824,52 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         Config::from_lookup(|k| m.get(k).cloned())
+    }
+
+    /// The leadership lock's lease (review A-06): the two settings, their floors, and the rule
+    /// that keeps the beats inside the lease.
+    #[test]
+    fn lock_lease_settings() {
+        let c = cfg(&[("LAZYVIEW_DSN", "x")]).unwrap();
+        assert_eq!(c.lock_heartbeat, Duration::from_millis(5_000));
+        // The default lease is four beats of the default heartbeat (lv-super ruling 1): the
+        // shortest lease the rules allow for that beat period.
+        assert_eq!(c.lock_lease, Duration::from_millis(20_000));
+        // The floors: a beat the server would not honour, or a period so short every blip looks
+        // like a lost node, is lifted to the smallest sound value rather than refused.
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_LOCK_HEARTBEAT_MS", "10"),
+            ("LAZYVIEW_LOCK_LEASE_MS", "4000"),
+        ])
+        .unwrap();
+        assert_eq!(c.lock_heartbeat, Duration::from_millis(1_000));
+        assert_eq!(c.lock_lease, Duration::from_millis(4_000));
+        // A lease the beats cannot fit inside is refused, with both names in the message: the
+        // lease would end before this instance has noticed it.
+        let e = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_LOCK_HEARTBEAT_MS", "5000"),
+            ("LAZYVIEW_LOCK_LEASE_MS", "10000"),
+        ])
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("LAZYVIEW_LOCK_LEASE_MS"), "{msg}");
+        assert!(msg.contains("LAZYVIEW_LOCK_HEARTBEAT_MS"), "{msg}");
+        // After the heartbeat floor is applied, not before: 500 ms beats are 1 s beats here.
+        assert!(cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_LOCK_HEARTBEAT_MS", "500"),
+            ("LAZYVIEW_LOCK_LEASE_MS", "3000"),
+        ])
+        .is_err());
+        assert!(cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_LOCK_HEARTBEAT_MS", "500"),
+            ("LAZYVIEW_LOCK_LEASE_MS", "4000"),
+        ])
+        .is_ok());
+        assert!(cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_LOCK_HEARTBEAT_MS", "abc"),]).is_err());
     }
 
     #[test]
