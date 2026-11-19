@@ -9,15 +9,21 @@
  * Nothing looks anything up in an account, so `cdk synth` runs offline and the composition can be
  * reviewed and asserted without cloud credentials. Run a subset by name:
  * `cdk synth -c targets=rds-mysql-84,rds-pg-17 -c expiry=2026-11-18T14:00:00Z -c run-id=1234`.
+ * The task that runs the suites exists only when the run hands the app a pinned runner image
+ * (`-c runner-image=…` or `MATRIX_RUNNER_IMAGE`): a run that only provisions databases never
+ * creates a cluster, a task definition or the endpoints a task needs, and a run that means to test
+ * cannot do so with an unpinned build, because the image URI is checked where it is used.
  *
- * Still ahead of this file: parameter groups with the binlog/GTID settings (PR A2), Aurora and
- * Multi-AZ failover variants (PR A3), and the in-VPC task that runs the suites (PR A4).
+ * Still ahead of this file: parameter groups with the binlog/GTID settings (PR A2) and the Aurora
+ * and Multi-AZ failover variants (PR A3).
  */
 import { App, Stack, type StackProps } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
+import { MatrixArtifactBucket } from '../lib/bucket';
 import { instanceEngineFor, MatrixDbInstance, MatrixEngine } from '../lib/db-instance';
 import { MatrixNetwork } from '../lib/network';
 import { MatrixParameterGroup } from '../lib/params';
+import { MatrixDatabaseCredential, MatrixRunner } from '../lib/runner';
 import { MatrixAdminSecret } from '../lib/secret';
 import { applyMatrixTags, expiryFromNow } from '../lib/tags';
 
@@ -54,10 +60,16 @@ export interface MatrixStackProps extends StackProps {
   /** ISO-8601 UTC instant after which the cleanup job may delete everything the run created. */
   readonly expiry: string;
   readonly runId: string;
+  /** Pinned ECR URI of the runner image. Without it the run provisions no test compute at all. */
+  readonly runnerImage?: string;
 }
 
 export class MatrixStack extends Stack {
   readonly targets: readonly MatrixTarget[];
+  /** The databases of the run with their credentials, in target order; the runner reads these. */
+  readonly credentials: readonly MatrixDatabaseCredential[];
+  /** The task the suites run on, or absent when the run asked for databases only. */
+  readonly runner?: MatrixRunner;
 
   constructor(scope: Construct, id: string, props: MatrixStackProps) {
     super(scope, id, props);
@@ -70,8 +82,10 @@ export class MatrixStack extends Stack {
     // One parameter group per engine family, shared by every row of that family: the settings are
     // the family's, and a second copy of them per instance would buy nothing.
     const parameterGroups = new Map<string, MatrixParameterGroup>();
+    const credentials: MatrixDatabaseCredential[] = [];
     for (const target of props.targets) {
       const secret = new MatrixAdminSecret(this, `Admin-${target.id}`);
+      credentials.push({ id: target.id, engine: target.engine, secret });
       const family = parameterFamilyOf(target);
       let parameterGroup = parameterGroups.get(family);
       if (parameterGroup === undefined) {
@@ -90,6 +104,21 @@ export class MatrixStack extends Stack {
         instanceType: target.instanceType,
         secret,
         parameterGroup,
+      });
+    }
+    this.credentials = credentials;
+
+    if (props.runnerImage !== undefined) {
+      // One bucket and one task for the run, not one per target: the binaries are the same build
+      // for every row, the artifacts are kept apart by prefix, and one task definition is one set
+      // of grants to review instead of one per database.
+      const bucket = new MatrixArtifactBucket(this, 'Artifacts');
+      this.runner = new MatrixRunner(this, 'Runner', {
+        network,
+        bucket,
+        databases: credentials,
+        imageUri: props.runnerImage,
+        runId: props.runId,
       });
     }
   }
@@ -112,6 +141,8 @@ export interface MatrixAppProps {
   readonly targets?: readonly string[];
   readonly expiry: string;
   readonly runId: string;
+  /** Pinned ECR URI of the runner image; without it the run deploys databases and no compute. */
+  readonly runnerImage?: string;
   /** @default MATRIX_STACK_NAME */
   readonly stackName?: string;
   /** Account and region the run deploys into. They come from the environment the workflow sets. */
@@ -125,6 +156,7 @@ export function createMatrixStack(app: App, props: MatrixAppProps): MatrixStack 
     targets: selectTargets(props.targets),
     expiry: props.expiry,
     runId: props.runId,
+    runnerImage: props.runnerImage,
   });
   applyMatrixTags(stack, { expiry: props.expiry, runId: props.runId });
   return stack;
@@ -174,6 +206,7 @@ function main(): void {
     targets: contextList(app, 'targets'),
     expiry: contextString(app, 'expiry') ?? expiryFromNow(),
     runId,
+    runnerImage: contextString(app, 'runner-image') ?? process.env.MATRIX_RUNNER_IMAGE,
     env: account && region ? { account, region } : undefined,
   });
 }
