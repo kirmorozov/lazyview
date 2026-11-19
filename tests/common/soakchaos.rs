@@ -473,6 +473,15 @@ pub async fn run_event(
             exec(&mut c, "UPDATE items SET qty = qty + 1 WHERE grp > 0")
                 .await
                 .context("stop event: the second statement while the engine is down")?;
+            // PR 8 (`167-chaos-window`): the cascade pair of the plan — an `ON UPDATE CASCADE`
+            // key move and an `ON DELETE CASCADE` parent delete (and the `entities` delete that
+            // cascades to `entity_refs`) inside the window, so every resume rehearses the #167
+            // shape: the parent events replay against the cache the seed read left behind.
+            for stmt in super::soakwork::SoakWorkload::cascade_in_window(run.seed, at.as_secs()) {
+                exec(&mut c, &stmt)
+                    .await
+                    .with_context(|| format!("stop event: the window cascade: {stmt}"))?;
+            }
             c.disconnect().await.ok();
             eng = run.start_engine()?;
             let mut c = run.src.conn().await?;
@@ -487,6 +496,26 @@ pub async fn run_event(
                  (the Full/Chained views rebuild by design, F5)",
                 counter(&d, "full_rebuilds")
             ));
+            // The window's budget (the #167 remedy, the ruling lv-super kept since
+            // `tmp/out/lvs-cascade-gap/decisions.md`): the cascade views the window writes are
+            // never rebuilt and refresh as a whole at most once — the counters are per engine
+            // start, and this is the only start since the window, so they read per window
+            // directly. `full_rebuilds == 0` for an incremental view is the F5 rule the event's
+            // closing `quiesce_and_check` already holds; here the refresh is approved so that
+            // check tolerates the one refresh the window owns.
+            let cascade = super::soakwork::soak_cascade_views();
+            for v in view_rows(&eng, run.src, run.specs).await? {
+                if cascade.contains(&v.name.as_str()) {
+                    ensure!(
+                        v.whole_view_refreshes <= 1,
+                        "{what}: the cascade view {} refreshed its whole view {} times in one \
+                         engine-restart window (budget 1)",
+                        v.name,
+                        v.whole_view_refreshes
+                    );
+                    run.approved.approve(&format!("{}@{}", v.name, v.target), 1);
+                }
+            }
             c.disconnect().await.ok();
         }
         // The `reg_down_target_keeps_its_keys` set (`regressions/availability.rs:262`): a target

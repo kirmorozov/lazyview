@@ -910,6 +910,55 @@ impl SoakWorkload {
         }]
     }
 
+    /// The cascade statements a chaos event runs **while the engine is down** (PR 8,
+    /// `167-chaos-window`): the shape of `reg_cascade_window_parent_delete`, made a scheduled
+    /// step. An `ON UPDATE CASCADE` key move, an `ON DELETE CASCADE` parent delete and the
+    /// `entities` → `entity_refs` delete all sit between `stop()` and `start_engine`, so the
+    /// resume replays them against the cache the seed read left behind (#167). The ids come from
+    /// the event's own seeded slot high above the allocators' range, so the paced writers never
+    /// touch these rows; the parent has no `sets_notes` child, so its key move is not restricted
+    /// (the `sets_notes` FK declares no `ON UPDATE` action); each statement is its own
+    /// transaction, the clean-stop shape of `regressions/catchup.rs:209`, so the seed read can
+    /// land between any two of them.
+    pub fn cascade_in_window(seed: u64, at_secs: u64) -> Vec<String> {
+        let base = 1_000_000_000
+            + (super::derive_seed(seed, &format!("cascade-win{at_secs}")) % 500_000_000) as i64;
+        let (p, p2, c1, _c2, e, seq) = (
+            base,
+            base + 1,
+            base + 1_000,
+            base + 1_001,
+            base + 2_000_000,
+            1_i64,
+        );
+        vec![
+            format!("INSERT INTO sets (id, name) VALUES ({p}, {})", q(&format!("win {p}"))),
+            format!(
+                "INSERT INTO sets_items (id, set_id, label) VALUES ({c1}, {p}, {})",
+                q(&format!("item {c1}"))
+            ),
+            // ON UPDATE CASCADE: the children follow the key server side (their binlog images
+            // are not row-logged — the reason the cascade cache exists).
+            format!("UPDATE sets SET id = {p2} WHERE id = {p}"),
+            // One child vanishes on its own: a cache seeded after this and before the parent
+            // delete keeps the sibling and cannot name the unit this row left (the #167 shape).
+            format!("DELETE FROM sets_items WHERE id = {c1}"),
+            // ON DELETE CASCADE: the server deletes the sibling; neither delete is row-logged.
+            format!("DELETE FROM sets WHERE id = {p2}"),
+            // The `entities` parent and its cascading `entity_refs` child (the plan's arm).
+            format!(
+                "INSERT INTO entities (id, grp, kind, state, created_at) VALUES ({e}, 1, 'win', 'new', NOW(6)) \
+                 ON DUPLICATE KEY UPDATE grp = VALUES(grp), kind = VALUES(kind), state = VALUES(state), created_at = VALUES(created_at)"
+            ),
+            format!(
+                "INSERT INTO entity_refs (entity_id, seq, city) SELECT {e}, {seq}, {} FROM entities WHERE id = {e} \
+                 ON DUPLICATE KEY UPDATE city = VALUES(city)",
+                q("win")
+            ),
+            format!("DELETE FROM entities WHERE id = {e}"),
+        ]
+    }
+
     /// One random operation: (label, statements). Weights follow §2: the FK and cascade ops are a
     /// tenth of the mix, the plain DML the rest.
     pub fn op(&mut self) -> (&'static str, Vec<String>) {

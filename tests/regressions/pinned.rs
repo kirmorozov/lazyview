@@ -1959,3 +1959,126 @@ fn reg_cascade_refusal_core_guard() {
         eng.stop().await
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// #167 — the replay window in the chaos schedule (PR 8, 167-chaos-window)
+// ---------------------------------------------------------------------------------------------
+
+/// #167, the live finding (owner escalation 2026-11-18): the per-PR soak smoke run 44307858047
+/// (mysql84, seed 0x37d9e7d0bd6339ee) left `wc_child_only` and `wc_parts_by_item` — cascade
+/// children of `sets` — holding rows their parent's FK cascade had already deleted server side,
+/// after the scheduled `crash@+104s`. The smoke's replay: the same pinned seed, the same neutral
+/// workload and writers (the seeds `soak.rs::start_writers` derives), the same single
+/// `EngineCrash` event through the schedule's own `run_event`, and the smoke's closing exactness
+/// check. Fails before the fix (the cascade views keep the vanished rows, the check disagrees);
+/// passes after it (the window costs at most one whole-view refresh per view, never a rebuild).
+#[test]
+fn reg_cascade_window_seed_replay() {
+    scenario("reg_casc_seedwin", |ctx| async move {
+        const SEED: u64 = 0x37d9e7d0bd6339ee;
+        // The pinned schedule: the seed's smoke window is exactly the one crash event the live
+        // finding ran (this trips, loudly, if the schedule ever moves).
+        let events = crate::common::soakchaos::plan(SEED, 5, 10, false);
+        ensure!(
+            events.len() == 1
+                && events[0].0 == std::time::Duration::from_secs(104)
+                && matches!(events[0].1, crate::common::soakchaos::Chaos::EngineCrash),
+            "the pinned smoke schedule for seed {SEED:#x} changed: {events:?}"
+        );
+        let specs = crate::common::soakwork::soak_views();
+        let targets = std::collections::HashMap::new();
+        let db = ctx.new_db("reg_casc_seedwin").await?;
+        let ids =
+            crate::common::soakwork::setup_soak(&db, SEED, crate::common::workload::Sizes::tiny())
+                .await?;
+        let (eng, _) = start_with_views(&ctx, &db, &specs, &[]).await?;
+        // The smoke's writers: same count, same TPS split, same derived seeds.
+        let n = crate::common::soakwork::soak_writers();
+        let per = ((crate::common::soakwork::soak_rate() as usize) / n).max(1) as u32;
+        let mut txs = Vec::with_capacity(n);
+        let mut hs = Vec::with_capacity(n);
+        for w in 0..n {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let db = db.clone();
+            let ids = ids.clone();
+            hs.push(tokio::spawn(async move {
+                crate::common::soakwork::run_paced(
+                    &db,
+                    ids,
+                    crate::common::derive_seed(SEED, &format!("writer{w}")),
+                    1,
+                    per,
+                    rx,
+                )
+                .await
+            }));
+            txs.push(tx);
+        }
+        let mut logs = Vec::new();
+        let mut approved = crate::common::soakcheck::Ledger::default();
+        // The smoke's pacing: the writers run against the live engine until the scheduled
+        // minute of the event — the crash must find the same workload shape the live run saw
+        // at +104 s, not the schema minutes after setup.
+        let began = std::time::Instant::now();
+        while began.elapsed() < events[0].0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let mut run = crate::common::soakchaos::ChaosRun {
+            ctx: &ctx,
+            src: &db,
+            targets: &targets,
+            specs: &specs,
+            writers: &txs,
+            ov: &[],
+            logs: &mut logs,
+            approved: &mut approved,
+            seed: SEED,
+            toxi_i: 0,
+        };
+        let (row, mut eng) =
+            crate::common::soakchaos::run_event(&mut run, eng, events[0].1, events[0].0).await?;
+        ensure!(
+            row.check.pass != Some(false),
+            "the crash@+104s event's own check disagreed: {:?}",
+            row.check
+        );
+        // The smoke's close: pause the writers for good, join them, the final exactness check.
+        crate::common::soakcheck::set_writers(&txs, true);
+        for h in hs.drain(..) {
+            h.await.map_err(anyhow::Error::from)??;
+        }
+        let fin = crate::common::soakcheck::quiesce_and_check(
+            &ctx,
+            &mut eng,
+            &db,
+            &targets,
+            &specs,
+            &txs,
+            &mut approved,
+            "seed replay: the check after crash@+104s",
+        )
+        .await?;
+        ensure!(
+            fin.check.pass == Some(true),
+            "the oracle disagreed after the pinned crash window: {:?}",
+            fin.check
+        );
+        // The window ran through the gap path (the live finding did too), and each cascade view
+        // paid at most one whole-view refresh for it — never a rebuild (F5, the ruling of
+        // `tmp/out/lvs-cascade-gap/decisions.md`).
+        let rows = crate::common::soakcheck::view_rows(&eng, &db, &specs).await?;
+        let cascade = crate::common::soakwork::soak_cascade_views();
+        for v in rows.iter().filter(|v| cascade.contains(&v.name.as_str())) {
+            ensure!(
+                v.whole_view_refreshes <= 1,
+                "cascade view {} refreshed its whole view {} times in one crash window (budget 1)",
+                v.name,
+                v.whole_view_refreshes
+            );
+        }
+        ctx.log(format!(
+            "seed replay {SEED:#x}: crash@+104s exact, cascade views within budget"
+        ));
+        eng.stop().await
+    });
+}
