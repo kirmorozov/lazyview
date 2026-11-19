@@ -1,0 +1,24 @@
+{
+  "name": "cloud-db-matrix-aws",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Offline-synthesizable AWS CDK composition for the weekly managed-database test matrix",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "build": "tsc",
+    "synth": "npm run build && cdk synth --quiet",
+    "test": "npm run build && node --test dist/test/skeleton.test.js"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.277.0",
+    "constructs": "10.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "aws-cdk": "2.1148.1",
+    "typescript": "5.9.3"
+  }
+}

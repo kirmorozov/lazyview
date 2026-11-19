@@ -1,0 +1,23 @@
+{
+  "app": "node dist/bin/app.js",
+  "build": "npm run build",
+  "output": "cdk.out",
+  "versionReporting": false,
+  "watch": {
+    "include": ["**"],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      "**/*.d.ts",
+      "**/*.js",
+      "tsconfig.json",
+      "package*.json",
+      "node_modules",
+      "dist",
+      "test"
+    ]
+  },
+  "context": {
+    "@aws-cdk/core:target-partitions": ["aws", "aws-cn"]
+  }
+}
