@@ -3479,6 +3479,11 @@ impl Engine {
             // Why this round ends, once it breaks (A-02); `None` is a round that ended because the
             // process is shutting down or the source told the reader to start over.
             let mut end = None;
+            // What the reader said when it ended the round on an undecodable event: the decoder's
+            // own words, which tell the operator what to do about it (an unreadable compressed
+            // event names the server switch to turn off). Carried to the one line below, which is
+            // where a stream error is reported — logging it here too would print it every round.
+            let mut end_detail: Option<String> = None;
             // Read while the last flush ran: processed first, in order (see `flush_draining`).
             let mut drained = Drained::new(self.cfg.mem.drain_max_bytes);
             loop {
@@ -3559,8 +3564,10 @@ impl Engine {
                             // reader stays on this event; the round-end report names the position
                             // once and the pause backs off like a failed connect. The liveness
                             // beat below stays: the process *is* alive, the counter is what shows
-                            // the view is not advancing.
+                            // the view is not advancing. The message itself goes to that report:
+                            // a `warn!` here would repeat it every round of the backoff.
                             end = Some(StreamEnd::Undecodable);
+                            end_detail = Some(format!("{e:#}"));
                         } else {
                             warn!("binlog stream error: {e:#}; reconnecting");
                             end = Some(StreamEnd::Transient);
@@ -3613,12 +3620,19 @@ impl Engine {
                         stuck_streak = stuck_streak.saturating_add(1);
                     } else {
                         // Named once per position: another round at the same place says nothing
-                        // new, and the counter is what grows.
+                        // new, and the counter is what grows. The decoder's own words ride along:
+                        // the position alone does not tell an operator what to do, and what the
+                        // refused event says (a server switch to turn off, a build to replace) is
+                        // said once here instead of once per round of the backoff.
                         let total = Metrics::get(&self.metrics.stream_reconnect_undecodable);
+                        let detail = end_detail
+                            .as_deref()
+                            .unwrap_or("the reader refused the event it read");
                         error!(
                             position = %at,
                             "binlog event cannot be decoded; the reader stays here and backs off \
-                             like a failed connect ({total} reconnects at this position so far)"
+                             like a failed connect ({total} reconnects at this position so far): \
+                             {detail}"
                         );
                         stuck_at = Some(at);
                         stuck_streak = 1;

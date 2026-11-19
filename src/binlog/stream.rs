@@ -582,18 +582,23 @@ impl Tracker {
     /// decoder's own — the event arrived and this build cannot read it — so it becomes an
     /// [`Undecodable`] naming the kind and the position. The engine then backs off instead of
     /// reconnecting every 200 ms, and the fatal path logs this one line.
-    /// Cost per event: one read of the event type in the already-parsed header (no allocation, no
-    /// syscall); the label and the message are built only where an event failed.
+    /// Cost per event: two reads of fields of the already-parsed header (no allocation, no
+    /// syscall); the label, the position and the message are built only where an event failed.
     pub(super) fn map_event(&mut self, ev: Event) -> Result<Item> {
+        // Both are fields of the header the connection has already parsed. Nothing else is built
+        // before the call: `Position` holds a `String`, so it is made in the closure below, where
+        // an event has already failed — as `Tracker::rows` does. Reading it there is still the
+        // event's own position: `advance` moves `pos` to this event's end and only `on_rotate`
+        // replaces the file, which it does after its own error points have run.
         let et = ev.header().event_type_raw();
-        // Both reads are fields of the header the connection has already parsed: no allocation,
-        // no syscall. The label and the message below are built only where an event failed.
-        let at = Position {
-            file: self.pos.file.clone(),
-            pos: u64::from(ev.header().log_pos()),
-        };
-        self.map_event_inner(ev)
-            .map_err(|e| Undecodable::tag(e, kind_label(et), None, &at))
+        let log_pos = u64::from(ev.header().log_pos());
+        self.map_event_inner(ev).map_err(|e| {
+            let at = Position {
+                file: self.pos.file.clone(),
+                pos: log_pos,
+            };
+            Undecodable::tag(e, kind_label(et), None, &at)
+        })
     }
 
     fn map_event_inner(&mut self, ev: Event) -> Result<Item> {
