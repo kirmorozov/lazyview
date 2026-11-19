@@ -349,9 +349,11 @@ pub(crate) fn json_param() -> String {
     "?".to_string()
 }
 
-/// The collation `CONVERT(... USING charset)` yields on a MariaDB server: its
+/// The collation `CAST(... AS CHAR CHARACTER SET charset)` yields on a MariaDB server: its
 /// `character_set_collations` variable (a charset -> collation map) overrides the charset
-/// default, and asking the server carries that override into the answer. None if unknown.
+/// default, and asking the server carries that override into the answer. None if unknown. Asked in
+/// the shape [`crate::catalog::TEXT_PARAM_PREFIX`] binds a string in, so the answer is the collation
+/// a bound value of this charset really carries.
 pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<Option<String>> {
     if charset.is_empty()
         || !charset
@@ -362,7 +364,7 @@ pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<
     }
     let v = conn
         .query_first::<Option<String>, _>(format!(
-            "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
+            "SELECT CAST(COLLATION(CAST(CAST('' AS BINARY) AS CHAR CHARACTER SET {charset})) AS CHAR)"
         ))
         .await
         .with_context(|| format!("default collation of character set {charset}"))?;

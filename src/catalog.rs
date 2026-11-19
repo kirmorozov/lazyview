@@ -204,12 +204,12 @@ impl Column {
     }
 
     /// Drops the `COLLATE` of a string param when the column has `default`, the collation that
-    /// `CONVERT(... USING charset)` yields on the server. The param then has the column's own
-    /// IMPLICIT coercibility; an EXPLICIT one clashes with any `COLLATE` in the view definition
-    /// ("Illegal mix of collations").
+    /// `CAST(... AS CHAR CHARACTER SET charset)` yields on the server. The param then has the
+    /// column's own IMPLICIT coercibility; an EXPLICIT one clashes with any `COLLATE` in the view
+    /// definition ("Illegal mix of collations").
     pub fn with_default_collation(mut self, default: Option<&str>) -> Column {
         if let (Some(cs), Some(co), Some(d)) = (&self.charset, &self.collation, default) {
-            if co.eq_ignore_ascii_case(d) && self.param.starts_with("CONVERT(") {
+            if co.eq_ignore_ascii_case(d) && self.param.starts_with(TEXT_PARAM_PREFIX) {
                 self.param = text_param(cs, None);
             }
         }
@@ -217,11 +217,25 @@ impl Column {
     }
 }
 
-/// Typed placeholder for a string value: its bytes in the column's charset (and collation).
+/// The start of a bound string's placeholder ([`text_param`]'s shape). The collation probes of the
+/// flavors (`crate::source::mysql::default_collation`, `crate::source::maria::default_collation`)
+/// ask the server about this same expression, and the lookup that drops a `COLLATE`
+/// (`crate::engine::without_collate`) recognizes a bound string by this prefix: one text, four
+/// places that have to change together.
+pub(crate) const TEXT_PARAM_PREFIX: &str = "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET ";
+
+/// Typed placeholder for a string value: its bytes in the column's charset (and collation), with
+/// the column's collation when it is not the charset's default. Not `CONVERT(CAST(? AS BINARY)
+/// USING charset)`: that is a CONVERSION, and MariaDB (10.11 and 13.0, issue #25) replaces every
+/// byte that is not valid in the connection's character set (utf8mb4) with `?` on the way, so a
+/// latin1 `ï` (0xEF) became `?` and the lookup of such a key matched no row: the view kept its old
+/// aggregates and stayed `ready`. `CAST(... AS CHAR CHARACTER SET charset)` reinterprets the bytes
+/// instead, which both server families keep, and yields the same collation and coercibility; MySQL
+/// documents the two forms as equivalent.
 fn text_param(charset: &str, collation: Option<&str>) -> String {
     match collation {
-        Some(co) => format!("CONVERT(CAST(? AS BINARY) USING {charset}) COLLATE {co}"),
-        None => format!("CONVERT(CAST(? AS BINARY) USING {charset})"),
+        Some(co) => format!("{TEXT_PARAM_PREFIX}{charset}) COLLATE {co}"),
+        None => format!("{TEXT_PARAM_PREFIX}{charset})"),
     }
 }
 
@@ -304,7 +318,8 @@ pub type TableRef = (String, String);
 #[derive(Default)]
 pub struct Catalog {
     tables: HashMap<TableRef, Arc<TableInfo>>,
-    /// Charset -> collation of `CONVERT(... USING charset)` (None: unknown).
+    /// Charset -> collation of `CAST(... AS CHAR CHARACTER SET charset)` (None: unknown), the
+    /// collation [`text_param`] yields when the column does not ask for another one.
     default_collations: HashMap<String, Option<String>>,
 }
 
@@ -333,7 +348,7 @@ impl Catalog {
         // The per-flavor catalog loaders (F6), chosen by the caps picked at connect: MariaDB
         // answers `GENERATION_EXPRESSION` as plain SQL and its `character_set_collations`
         // overrides the default collation of a charset; the MySQL family prints the expression
-        // string-escaped and probes `COLLATION(CONVERT(...))` per charset.
+        // string-escaped and probes `COLLATION(CAST(... AS CHAR CHARACTER SET ...))` per charset.
         let loaded = if caps.sql_generation_expressions {
             crate::source::maria::load_table(conn, schema, name, caps, &mut self.default_collations)
                 .await?

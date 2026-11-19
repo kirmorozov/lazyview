@@ -634,7 +634,7 @@ pub(crate) async fn read_columns(
 
 /// The MySQL / Percona table metadata: the five `information_schema` reads in MySQL spelling,
 /// string-escaped generation expressions ([`unescape_generation_expression`]) and a
-/// `COLLATION(CONVERT(...))` probe for every charset the table uses.
+/// `COLLATION(CAST(... AS CHAR CHARACTER SET ...))` probe for every charset the table uses.
 pub(crate) async fn load_table(
     conn: &mut Conn,
     schema: &str,
@@ -949,9 +949,12 @@ pub(crate) fn generated_deps(expr: &str, names: &[String]) -> Option<Vec<usize>>
     Some(deps)
 }
 
-/// The collation `CONVERT(... USING charset)` yields on this server (its default for the
-/// charset). None if unknown. The MariaDB answer, which its `character_set_collations` can
-/// override, is the flavor's own [`crate::source::maria::default_collation`].
+/// The collation `CAST(... AS CHAR CHARACTER SET charset)` yields on this server (its default for
+/// the charset). None if unknown. The MariaDB answer, which its `character_set_collations` can
+/// override, is the flavor's own [`crate::source::maria::default_collation`]. The question is asked
+/// in the shape [`crate::catalog::TEXT_PARAM_PREFIX`] binds a string in, so the answer is the
+/// collation a bound value of this charset actually carries; `CONVERT(... USING charset)` is the
+/// conversion, not the reinterpretation, and the two can differ.
 pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<Option<String>> {
     if charset.is_empty()
         || !charset
@@ -962,7 +965,7 @@ pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<
     }
     let v = conn
         .query_first::<Option<String>, _>(format!(
-            "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
+            "SELECT CAST(COLLATION(CAST(CAST('' AS BINARY) AS CHAR CHARACTER SET {charset})) AS CHAR)"
         ))
         .await
         .with_context(|| format!("default collation of character set {charset}"))?;

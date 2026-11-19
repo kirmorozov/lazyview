@@ -7124,12 +7124,13 @@ async fn run_pending(sup: &Supervisor, p: &mut PendingRefresh) -> Result<supervi
 }
 
 /// A bound string param without its trailing ` COLLATE <co>`: only for a param of the shape
-/// `CONVERT(CAST(? AS BINARY) USING <cs>) COLLATE <co>` (a string column, [`crate::catalog`]),
-/// which is the one that carries a collation of its own; a param that has none, and one of any
-/// other shape, is returned as it is. See the lookup that uses it.
+/// `CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET <cs>) COLLATE <co>` (a string column,
+/// [`crate::catalog::TEXT_PARAM_PREFIX`]), which is the one that carries a collation of its own; a
+/// param that has none, and one of any other shape, is returned as it is. See the lookup that
+/// uses it.
 fn without_collate(param: &str) -> &str {
     match param
-        .strip_prefix("CONVERT(")
+        .strip_prefix(crate::catalog::TEXT_PARAM_PREFIX)
         .and_then(|_| param.rfind(" COLLATE "))
     {
         Some(i) => &param[..i],
@@ -7653,13 +7654,15 @@ mod tests {
     #[test]
     fn a_lookup_param_loses_only_its_collate() {
         assert_eq!(
-            without_collate("CONVERT(CAST(? AS BINARY) USING utf8mb4) COLLATE utf8mb4_bin"),
-            "CONVERT(CAST(? AS BINARY) USING utf8mb4)",
+            without_collate(
+                "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1) COLLATE latin1_bin",
+            ),
+            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)",
             "the collation of the view definition decides"
         );
         assert_eq!(
-            without_collate("CONVERT(CAST(? AS BINARY) USING utf8mb4)"),
-            "CONVERT(CAST(? AS BINARY) USING utf8mb4)",
+            without_collate("CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)"),
+            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)",
             "a param without one is as it was"
         );
         assert_eq!(without_collate("?"), "?");

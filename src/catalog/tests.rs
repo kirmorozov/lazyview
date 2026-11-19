@@ -144,13 +144,13 @@ fn opaque_types_and_default_collations() {
     );
     assert_eq!(
         s.param,
-        "CONVERT(CAST(? AS BINARY) USING utf8mb4) COLLATE utf8mb4_0900_ai_ci"
+        "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_0900_ai_ci"
     );
     assert_eq!(
         s.clone()
             .with_default_collation(Some("utf8mb4_0900_ai_ci"))
             .param,
-        "CONVERT(CAST(? AS BINARY) USING utf8mb4)"
+        "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET utf8mb4)"
     );
     assert_eq!(
         s.clone()
@@ -160,6 +160,29 @@ fn opaque_types_and_default_collations() {
         "a non-default collation stays explicit"
     );
     assert_eq!(s.clone().with_default_collation(None).param, s.param);
+    // A non-UTF8 charset: the bytes of the row image are reinterpreted, never converted (MariaDB
+    // turned a byte invalid in the connection's utf8mb4 into `?` inside `CONVERT(... USING ...)`).
+    let l = Column::new(
+        "l",
+        "varchar",
+        "varchar(5)",
+        Some("latin1"),
+        Some("latin1_swedish_ci"),
+        Some(5),
+        false,
+    );
+    assert_eq!(
+        l.param,
+        "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1) COLLATE latin1_swedish_ci"
+    );
+    assert_eq!(
+        l.clone()
+            .with_default_collation(Some("latin1_swedish_ci"))
+            .param,
+        "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)",
+        "the probe's answer drops the collation of a non-UTF8 column too"
+    );
+    assert!(!l.exact_key(), "latin1 binlog bytes are not unit keys");
     let i = Column::simple("i", "int");
     assert_eq!(i.clone().with_default_collation(Some("x")).param, i.param);
     let e = Column::new(

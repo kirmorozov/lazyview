@@ -889,9 +889,9 @@ fn values_binary_padding() {
 /// byte is 0x5C, the backslash, e.g. 表 = 0x955C; `CHAR(150)` is 300 bytes, a two-byte length
 /// in row images). Group views take `MIN(id)` as the group's name: which member's spelling the
 /// server shows for a group of equal keys is not defined. Such columns as keys (group, join,
-/// primary key) run on MySQL and Percona only: on MariaDB that is a known limitation (issue
-/// #25), its lookups turn their non-UTF-8 bytes into '?', so changes of such keys are not
-/// refreshed.
+/// primary key) run on every server: a lookup binds its bytes with `CAST(... AS CHAR CHARACTER
+/// SET ...)` (issue #25), which reinterprets them instead of converting them the way
+/// `CONVERT(... USING ...)` does, the form on which MariaDB lost the bytes above 0x7F.
 #[test]
 fn values_non_utf8_charsets() {
     scenario("val_charsets", |ctx| async move {
@@ -930,11 +930,7 @@ fn values_non_utf8_charsets() {
                 "SELECT attr, label FROM item WHERE label <> '表'",
             ),
         ];
-        if ctx.server().is_mariadb() {
-            ctx.skip("key views: known limitation, issue #25");
-        } else {
-            specs.extend(keys);
-        }
+        specs.extend(keys);
         let ddl = [
             "CREATE TABLE entity (id INT PRIMARY KEY, a VARCHAR(10) CHARACTER SET latin1 NULL, \
              b CHAR(10) CHARACTER SET latin1 NULL, c VARCHAR(10) CHARACTER SET sjis NULL, \
