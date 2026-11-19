@@ -2,7 +2,8 @@ name: ci
 
 # Every pull_request, push to main, v* tag and workflow_dispatch runs the same full set: lint, unit,
 # e2e, deny (cargo-deny advisories + licenses), features (the optional cargo features built and
-# tested), scan-image (trivy), the integration matrix, integration-multi, integration-pg (PostgreSQL
+# tested; their clippy runs sit in `lint`), scan-image (trivy), the integration matrix,
+# integration-multi, integration-pg (PostgreSQL
 # as a TARGET: every supported major, on the baseline source mysql84), integration-pg-multi (the same
 # target grid the other way round: every MySQL-family source on the baseline target pg16) and
 # integration-pgsrc (PostgreSQL as a SOURCE, every major). Every landed commit therefore shows its own
@@ -71,7 +72,9 @@ jobs:
     name: lint (fmt + clippy)
     if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # 30, not 20: the two feature clippy runs build their own dependency trees on a cache miss,
+    # and the aws-secrets one (aws-config / aws-sdk-secretsmanager and the smithy stack) is large.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -89,6 +92,14 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: cargo clippy (feature roaring)
         run: cargo clippy --locked --all-targets --features roaring -- -D warnings
+      - name: cargo clippy (feature aws-secrets)
+        # The `aws-secret://` tree (src/secrets.rs `mod aws` and the cfg(feature) cases in
+        # src/secrets/tests.rs) is compiled under no linter without this step: the aws-*
+        # dependencies are built only by the `features` job, which runs `cargo test`, so a lint
+        # escape in the feature's code could never fail a run (and `cargo build` alone would not
+        # see the cfg(test) cases at all). Same command as the roaring step above; the feature's
+        # build and unit tests stay in `features` (S-09).
+        run: cargo clippy --locked --all-targets --features aws-secrets -- -D warnings
 
   unit:
     name: unit tests
@@ -145,7 +156,9 @@ jobs:
       fail-fast: false
       matrix:
         # Every non-default feature in Cargo.toml gets one entry (S-09: the
-        # optional features are the untested part of the lockfile).
+        # optional features are the untested part of the lockfile). A new feature
+        # here needs a matching `cargo clippy (feature …)` step in `lint`: this job
+        # builds and tests, that one lints.
         features: [roaring, aws-secrets]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
