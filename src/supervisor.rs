@@ -51,8 +51,6 @@ pub(crate) struct Policy {
     pub jitter: bool,
 }
 
-// READS and CONNECT get their call sites as the engine and target loops switch over.
-#[allow(dead_code)]
 impl Policy {
     /// An idempotent statement (the old `RETRIES` + [`backoff`]): 3 retries,
     /// 50 ms doubling up to 500 ms, jittered.
