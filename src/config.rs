@@ -152,6 +152,10 @@ pub struct Config {
     /// reads of a fence fail (see `source::maria::snapshot_position`), the stand-in for a transient
     /// source error there (not a connection-class one).
     pub test_fail_snapshot: Option<usize>,
+    /// Test hook `LAZYVIEW_TEST_UNDECODABLE_ROWS=<n>`: the first `n` rows events the reader
+    /// delivers are handled as undecodable (review A-02), the stand-in for an event this build
+    /// cannot decode. See `Engine::test_undecodable`.
+    pub test_undecodable_rows: u32,
     /// Test hook `LAZYVIEW_TEST_BINLOG_DSN=<dsn>`: the DSN of the binlog dump connection
     /// alone (`BinlogReader::connect`), so a network test can cut the stream without touching
     /// the reads. Unset ⇒ `Config::dsn`: the same endpoint, nothing extra opened.
@@ -454,6 +458,7 @@ impl Config {
                 .filter(|&n| n > 0),
             test_fail_snapshot: Some(num("LAZYVIEW_TEST_FAIL_SNAPSHOT", 0)? as usize)
                 .filter(|&n| n > 0),
+            test_undecodable_rows: num("LAZYVIEW_TEST_UNDECODABLE_ROWS", 0)? as u32,
             test_binlog_dsn,
             test_query_dsn,
             test_meta_dsn,

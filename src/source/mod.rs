@@ -477,6 +477,94 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
         })
 }
 
+/// A binlog event this build cannot map (review A-02): the bytes arrived and the decoder refused
+/// them, so reading again from the saved position fails on the same bytes until a fixed build
+/// runs. That is the difference from a source that is unreachable or has lost the file
+/// ([`MissingBinlog`]) — one waits for the source, the other waits for a deploy, and only the
+/// first is a network fault. The owner's ruling (2026-11-16) keeps a decode failure that exits
+/// the process fatal, so the fields below are what the one ERROR line has to name: kind, table,
+/// position.
+#[derive(Debug)]
+pub struct Undecodable {
+    /// The event kind with its raw code, e.g. `rows(UPDATE_ROWS_V1)(31)` or `TABLE_MAP(19)`.
+    pub kind: String,
+    /// The table the event names when one is known: `schema.table` when a TABLE_MAP was seen for
+    /// the id, `table id <n>` when it was not — the second is the commonest reason a rows event
+    /// cannot be decoded. `None` for a failure to map the event itself, where no table is named
+    /// by the bytes at all.
+    pub table: Option<String>,
+    /// Where the event sits in the binlog file: the position the reader keeps coming back to.
+    pub position: Position,
+    /// What the decoder said.
+    detail: String,
+}
+
+impl Undecodable {
+    /// Tags an error of the mapper with what the event was. Called only where an event failed,
+    /// never on the hot path; the message of `e` is kept whole in [`Undecodable::detail`].
+    pub(crate) fn tag(
+        e: anyhow::Error,
+        kind: String,
+        table: Option<String>,
+        at: &Position,
+    ) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            kind,
+            table,
+            position: at.clone(),
+            detail: format!("{e:#}"),
+        })
+    }
+}
+
+impl std::fmt::Display for Undecodable {
+    /// The one line an operator of a crashing instance gets (the owner's ruling of 2026-11-16
+    /// keeps a decode failure fatal): kind, position, table when the bytes name one, and what the
+    /// decoder said. The engine logs it as it is, so no prefix of its own repeats these words.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.table {
+            Some(t) => write!(
+                f,
+                "cannot decode {} at {}: table {}, {}",
+                self.kind, self.position, t, self.detail
+            ),
+            None => write!(
+                f,
+                "cannot decode {} at {}: {}",
+                self.kind, self.position, self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Undecodable {}
+
+/// True when the stream failed because an event cannot be decoded rather than because the source
+/// went away (A-02), so the caller backs off instead of reconnecting on the network schedule.
+/// Two sources, both the decoder's own: an error the mapper tagged with [`Undecodable`], and a
+/// dump packet that is not a readable event at all — the reader reports those as an `io::Error`
+/// of the invalid-data class. A truncated read arrives as `UnexpectedEof`, which [`is_transient`]
+/// owns: a cut connection is not a decoder bug.
+pub fn is_undecodable(e: &anyhow::Error) -> bool {
+    fn undecodable_io(io: &std::io::Error) -> bool {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::Unsupported
+        )
+    }
+    e.chain().any(|c| {
+        c.downcast_ref::<Undecodable>().is_some()
+            || match c.downcast_ref::<mysql_async::Error>() {
+                Some(mysql_async::Error::Io(mysql_async::IoError::Io(io))) => undecodable_io(io),
+                _ => false,
+            }
+            || c.downcast_ref::<std::io::Error>()
+                .is_some_and(undecodable_io)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     pub flavor: Flavor,

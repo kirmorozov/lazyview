@@ -994,3 +994,120 @@ fn reg_statement_format_dml_is_warned_not_dropped() {
         Ok(())
     });
 }
+
+/// A-02: an event the decoder cannot map is not a network fault. On the reviewed commit the
+/// reader reconnected to the same position every 200 ms forever — `/livez` green, nothing on
+/// `/metrics`, the view late with no signal. Now the reason is counted per round, the stuck
+/// position is named once rather than once per retry, and the wait follows the connect ladder
+/// (1 s doubling to 30 s, jittered). `LAZYVIEW_TEST_UNDECODABLE_ROWS` makes the reader refuse the
+/// next rows events of a table a view reads: no server gives a reason to fail on bytes it has
+/// just written, so the hook stands in for the decoder bug while the handling is the real one.
+/// Nothing is dropped: the reader re-reads from the saved boundary, so the view ends correct.
+#[test]
+fn reg_undecodable_event_backs_off_and_counts() {
+    scenario("reg_undecodable", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_entities",
+            Kind::Incremental,
+            "SELECT id, grp, status FROM entities",
+        )];
+        let addr = free_local_addr()?;
+        let ov = [
+            ("LAZYVIEW_TEST_UNDECODABLE_ROWS", "3"),
+            ("LAZYVIEW_HEALTH_ADDR", addr.as_str()),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_undecodable", ENTITIES, &specs, &ov).await?;
+        let mut c = db.conn().await?;
+        let s0 = eng.snapshot();
+        ensure!(
+            s0.stream_reconnect_undecodable == 0 && s0.events_undecodable == 0,
+            "the hook fired before any row of the view's table was written: {:?}",
+            (s0.events_undecodable, s0.stream_reconnect_undecodable)
+        );
+        // The saved position while the reader is stuck must be the one it is stuck at: captured
+        // here so the stuck rounds can be compared with it.
+        let pinned = eng.applied().context("no applied position at ready")?;
+        let t0 = std::time::Instant::now();
+        exec(&mut c, "INSERT INTO entities VALUES (20, 4, 'new')").await?;
+        // The three injected rounds: each ends at the same position and backs off, so the last
+        // one lands no earlier than the first two steps of the ladder (≥ 0.5 s and ≥ 1 s).
+        let three = loop {
+            let s = eng.snapshot();
+            if s.stream_reconnect_undecodable >= 3 {
+                break s;
+            }
+            ensure!(
+                t0.elapsed() < Duration::from_secs(60),
+                "the reader never reported an undecodable round: {} of 3 — log {}",
+                s.stream_reconnect_undecodable,
+                eng.log_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        eng.check_alive()?;
+        ensure!(
+            three.stream_reconnect_undecodable == 3 && three.events_undecodable == 3,
+            "the reader reported {:?} undecodable events/reconnects for the 3 injected ones",
+            (three.events_undecodable, three.stream_reconnect_undecodable)
+        );
+        for (name, got) in [
+            ("transient", three.stream_reconnect_transient),
+            ("closed", three.stream_reconnect_closed),
+            ("silence", three.stream_reconnect_silence),
+        ] {
+            ensure!(
+                got == 0,
+                "a stuck round counted as a {name} reconnect too ({got})"
+            );
+        }
+        // The position is pinned: nothing was applied while the reader was coming back to the
+        // same event, which is what makes the counter (not a moved position) the signal.
+        ensure!(
+            eng.applied().as_ref() == Some(&pinned),
+            "the applied position moved while the reader was stuck: {:?} != {pinned:?}",
+            eng.applied()
+        );
+        // The probes stay green: the process *is* alive, the counter is what shows the view is not
+        // advancing. And the counter is on `/metrics` with the name the alert rule of the
+        // observability plan reads.
+        let (code, _) = http_get(&addr, "/livez").await?;
+        ensure!(code == 200, "/livez while the reader was stuck: {code}");
+        let (code, body) = http_get(&addr, "/metrics").await?;
+        ensure!(code == 200, "/metrics: {code}");
+        ensure!(
+            body.contains("lazyview_stream_reconnect_undecodable_total 3"),
+            "/metrics does not show the 3 stuck reconnects:\n{}",
+            body.lines()
+                .filter(|l| l.contains("stream_reconnect") || l.contains("events_undecodable"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // Once per position, not once per retry: one line for three rounds at the same place.
+        let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+        let named = log.matches("binlog event cannot be decoded").count();
+        ensure!(
+            named == 1,
+            "the stuck position was named {named} times for 3 rounds: log {}",
+            eng.log_path.display()
+        );
+        // The ladder, in wall time: the three pauses are the connect steps (1 s, 2 s, 4 s) times
+        // a jitter of 0.5 .. 1.5, so catching up cannot take less than their lowest 3.5 s — where
+        // the flat 200 ms of the reviewed commit took under a second.
+        eng.wait_caught_up(&mut c, t_catchup()).await?;
+        let elapsed = t0.elapsed();
+        ensure!(
+            elapsed >= Duration::from_secs(3),
+            "three stuck rounds took {elapsed:?}: the reader did not back off to the connect ladder"
+        );
+        ctx.log(format!("stuck for {elapsed:?}, then caught up"));
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "after three undecodable rounds",
+        )
+        .await?;
+        eng.stop().await
+    });
+}

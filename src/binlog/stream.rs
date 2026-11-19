@@ -6,7 +6,7 @@ use crate::source::mysql::{
     QueryKind, Time2Twin,
 };
 use crate::source::{
-    is_duplicate_server_id_error, maria, missing_binlog_message, position_rule, Step,
+    is_duplicate_server_id_error, maria, missing_binlog_message, position_rule, Step, Undecodable,
     ACCESS_DENIED_CODES,
 };
 
@@ -56,6 +56,44 @@ const ER_MISSING_GTID: u16 = 3082;
 /// The first writable offset of a binlog file (after its format-description event). A GTID dump
 /// reads no position, but the dump thread still refuses anything below this.
 const BINLOG_START_POS: u64 = 4;
+
+/// The kind of an event in words, for the ERROR line of an undecodable one (review A-02): a
+/// decode failure exits the process, so the line has to say what the event was. The raw code
+/// rides along in [`kind_label`], so an unknown code stays recognizable. Both run only where an
+/// event failed to map, never per event.
+fn event_kind(et: u8) -> &'static str {
+    match et {
+        ty::QUERY => "QUERY",
+        ty::ROTATE => "ROTATE",
+        ty::FORMAT_DESCRIPTION => "FORMAT_DESCRIPTION",
+        ty::XID => "XID",
+        ty::TABLE_MAP => "TABLE_MAP",
+        ty::INCIDENT => "INCIDENT",
+        ty::HEARTBEAT | ty::HEARTBEAT_V2 => "HEARTBEAT",
+        ty::TRANSACTION_PAYLOAD => "TRANSACTION_PAYLOAD",
+        ty::WRITE_ROWS_V1 => "rows(WRITE_ROWS_V1)",
+        ty::UPDATE_ROWS_V1 => "rows(UPDATE_ROWS_V1)",
+        ty::DELETE_ROWS_V1 => "rows(DELETE_ROWS_V1)",
+        ty::WRITE_ROWS => "rows(WRITE_ROWS)",
+        ty::UPDATE_ROWS => "rows(UPDATE_ROWS)",
+        ty::DELETE_ROWS => "rows(DELETE_ROWS)",
+        ty::PARTIAL_UPDATE_ROWS => "rows(PARTIAL_UPDATE_ROWS)",
+        ty::PRE_GA_WRITE_ROWS..=ty::PRE_GA_DELETE_ROWS => "rows(pre-GA)",
+        ty::GTID => "GTID",
+        ty::GTID_TAGGED => "GTID_TAGGED",
+        ty::XA_PREPARE => "XA_PREPARE",
+        ty::MARIA_GTID => "MARIA_GTID",
+        ty::MARIA_PARTIAL_ROWS => "rows(MARIA_PARTIAL_ROWS)",
+        ty::MARIA_QUERY_COMPRESSED => "QUERY(compressed)",
+        ty::MARIA_DELETE_ROWS_COMPRESSED => "rows(DELETE_ROWS_COMPRESSED)",
+        _ => "event",
+    }
+}
+
+/// [`event_kind`] with the raw code appended: `rows(UPDATE_ROWS_V1)(31)`.
+fn kind_label(et: u8) -> String {
+    format!("{}({et})", event_kind(et))
+}
 
 /// Position bookkeeping and event → [`Item`] mapping, independent of the connection.
 pub(super) struct Tracker {
@@ -319,7 +357,36 @@ impl BinlogReader {
 }
 
 impl Tracker {
+    /// [`Tracker::rows_inner`] tagged for review A-02: a rows event this build cannot decode. The
+    /// label names the table when a TABLE_MAP was seen for the id and the bare id when it was
+    /// not — the second is the commonest failure, and "table id 42" alone tells an operator
+    /// nothing. Runs only where a decode failed, never on the hot path.
     pub(super) fn rows(
+        &self,
+        table_id: u64,
+        event: &Event,
+    ) -> Result<Vec<(Option<BinlogRow>, Option<BinlogRow>)>> {
+        self.rows_inner(table_id, event).map_err(|e| {
+            let table = self.tables.get(&table_id).map_or_else(
+                || format!("table id {table_id}"),
+                |(_, tme, _)| tme_name(tme),
+            );
+            // The event's own end position, not the tracker's: a rows event is decoded at the
+            // flush, by which time the reader has read past it.
+            let at = Position {
+                file: self.pos.file.clone(),
+                pos: u64::from(event.header().log_pos()),
+            };
+            Undecodable::tag(
+                e,
+                kind_label(event.header().event_type_raw()),
+                Some(table),
+                &at,
+            )
+        })
+    }
+
+    fn rows_inner(
         &self,
         table_id: u64,
         event: &Event,
@@ -511,7 +578,25 @@ impl Tracker {
     }
 
     /// Updates the position bookkeeping for `ev` and maps it to an [`Item`].
+    /// [`Tracker::map_event_inner`] tagged for review A-02: every error the mapper raises is the
+    /// decoder's own — the event arrived and this build cannot read it — so it becomes an
+    /// [`Undecodable`] naming the kind and the position. The engine then backs off instead of
+    /// reconnecting every 200 ms, and the fatal path logs this one line.
+    /// Cost per event: one read of the event type in the already-parsed header (no allocation, no
+    /// syscall); the label and the message are built only where an event failed.
     pub(super) fn map_event(&mut self, ev: Event) -> Result<Item> {
+        let et = ev.header().event_type_raw();
+        // Both reads are fields of the header the connection has already parsed: no allocation,
+        // no syscall. The label and the message below are built only where an event failed.
+        let at = Position {
+            file: self.pos.file.clone(),
+            pos: u64::from(ev.header().log_pos()),
+        };
+        self.map_event_inner(ev)
+            .map_err(|e| Undecodable::tag(e, kind_label(et), None, &at))
+    }
+
+    fn map_event_inner(&mut self, ev: Event) -> Result<Item> {
         let header = ev.header();
         let et = header.event_type_raw();
 

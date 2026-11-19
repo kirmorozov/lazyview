@@ -973,3 +973,116 @@ fn gtid_dump_sids_wire_shape() {
         );
     }
 }
+
+// ---- A-02: an event this build cannot decode is tagged, and is not a network fault
+
+/// The family the review names: a rows event whose `TABLE_MAP` was never seen. The error has to
+/// name the kind, the table and the position (the owner's ruling of 2026-11-16 keeps this fatal,
+/// so the one ERROR line is the whole record), and it must classify as undecodable rather than
+/// transient: the engine backs off instead of reconnecting every 200 ms on the network schedule.
+#[test]
+fn undecodable_rows_event_names_kind_table_position() {
+    let t = Tracker::new(Flavor::MySql, &pos("binlog.000001", 4));
+    let err = t.rows(7, &write_rows(240, 7, 1)).unwrap_err();
+    assert!(crate::source::is_undecodable(&err), "{err}");
+    assert!(
+        !is_transient(&err),
+        "a decoder failure is not a network fault: {err}"
+    );
+    let m = format!("{err:#}");
+    assert!(
+        m.contains(&format!(
+            "cannot decode rows(WRITE_ROWS_V1)({})",
+            ty::WRITE_ROWS_V1
+        )),
+        "{m}"
+    );
+    assert!(m.contains("table id 7"), "{m}");
+    assert!(m.contains("binlog.000001:240"), "{m}");
+    assert!(m.contains("no TABLE_MAP"), "{m}");
+}
+
+/// With a `TABLE_MAP` seen, the line names the table rather than an id an operator cannot read,
+/// and a failure of the row decode itself (not the missing map) is tagged the same way.
+#[test]
+fn undecodable_rows_event_names_the_table() {
+    let mut t = Tracker::new(Flavor::MySql, &pos("binlog.000001", 4));
+    t.map_event(table_map(100, 9, "shop", "items")).unwrap();
+    // A rows event that names another table than the id it was filed under: the decoder refuses
+    // it, and what the operator must see is the table the map was for.
+    let err = t.rows(9, &write_rows(320, 10, 1)).unwrap_err();
+    assert!(crate::source::is_undecodable(&err), "{err}");
+    assert!(!is_transient(&err), "{err}");
+    let m = format!("{err:#}");
+    assert!(m.contains("table `shop`.`items`"), "{m}");
+    assert!(m.contains("binlog.000001:320"), "{m}");
+    assert!(m.contains("not 9"), "{m}");
+}
+
+/// A mapping failure of the event itself (an event type this build refuses to read) is tagged too,
+/// with the kind and the position and no table: the bytes name none.
+#[test]
+fn undecodable_map_failure_names_kind_and_position() {
+    let mut t = Tracker::new(Flavor::MariaDb, &pos("mariadb-bin.000001", 4));
+    // MariaDB's compressed events need `binlog_commit_order_support`, which the reader refuses:
+    // a real "this build cannot read it" for the flavor it is not meant for.
+    let err = t
+        .map_event(ev(ty::MARIA_QUERY_COMPRESSED, 512, &[0; 8]))
+        .unwrap_err();
+    assert!(crate::source::is_undecodable(&err), "{err}");
+    assert!(!is_transient(&err), "{err}");
+    let m = format!("{err:#}");
+    assert!(
+        m.contains(&format!(
+            "cannot decode QUERY(compressed)({}) at mariadb-bin.000001:512",
+            ty::MARIA_QUERY_COMPRESSED
+        )),
+        "{m}"
+    );
+    assert!(m.contains("log_bin_compress"), "{m}");
+}
+
+/// The other half of the rule: nothing that means "the source went away" may read as undecodable,
+/// or a cut connection would back off on the decoder's schedule.
+#[test]
+fn a_network_fault_is_never_undecodable() {
+    let srv = |code: u16, msg: &str| {
+        anyhow::Error::new(mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: msg.into(),
+            state: "HY000".into(),
+        }))
+    };
+    for (code, msg) in [
+        (2013u16, "Lost connection to source during query"),
+        (1236, "Master has purged all binlogs for the replica"),
+        (1040, "Too many connections"),
+    ] {
+        let e = srv(code, msg);
+        assert!(
+            !crate::source::is_undecodable(&e),
+            "{code} is not the decoder"
+        );
+    }
+    for kind in [
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::UnexpectedEof,
+        std::io::ErrorKind::TimedOut,
+    ] {
+        let e = anyhow::Error::new(mysql_async::Error::Io(mysql_async::IoError::Io(
+            std::io::Error::new(kind, "x"),
+        )));
+        assert!(
+            !crate::source::is_undecodable(&e),
+            "{kind:?} is not the decoder"
+        );
+        assert!(is_transient(&e), "{kind:?} is the network's");
+    }
+    // A dump packet that is not a readable event at all is the decoder's: invalid data.
+    let e = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "not a binlog event",
+    ));
+    assert!(crate::source::is_undecodable(&e));
+    assert!(!is_transient(&e));
+}

@@ -94,6 +94,19 @@ counters!(
     // Times this instance was fenced by its own lock task: another instance holds the lock or the
     // fencing epoch moved while our session was away, so we are the replaced one and must stop.
     leader_fenced,
+    // Binlog events the decoder could not map (review A-02). Counted once per event, on the two
+    // paths that meet one: the reader's mapping (`binlog::Tracker::map_event`) and the row decode
+    // of `Item::Rows`, which exits the process (the owner's ruling: a decode failure is a bug).
+    events_undecodable,
+    // Why one round of the binlog loop ended and the reader reconnected (review A-02), so
+    // `/metrics` tells a stream stuck on one event (`stream_reconnect_undecodable_total` rising
+    // while the position does not move) from a source that keeps cutting the connection. Counted
+    // per round, never per event. The reader keeps the events: a round that reconnects re-reads
+    // from the saved boundary, so none of these counters means a change was dropped.
+    stream_reconnect_undecodable,
+    stream_reconnect_transient,
+    stream_reconnect_closed,
+    stream_reconnect_silence,
 );
 
 /// Point-in-time values (may go down), maintained by the engine.

@@ -670,6 +670,45 @@ struct BuildDone {
     result: Result<Built>,
 }
 
+/// Why one round of the binlog loop ended and the reader is about to reconnect (review A-02).
+/// The reason decides the pause and the counter, so `/metrics` can tell the stall states apart:
+/// a source that keeps cutting the stream is not a reader stuck on one event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamEnd {
+    /// An event the decoder cannot map. Reading again from the saved boundary fails on the same
+    /// bytes, so the flat 200 ms a network fault gets was an endless hot loop that left `/livez`
+    /// green (A-02); this reason backs off like a failed connect instead.
+    Undecodable,
+    /// A source-class stream error: the connection or the dump thread went away, or an error the
+    /// reader cannot prove is the decoder's.
+    Transient,
+    /// The server closed the dump (`Ok(None)`).
+    Closed,
+    /// Neither an event nor a heartbeat for `silence`: a half-open connection.
+    Silence,
+}
+
+/// The wait before the next reconnect, by why the last round ended (review A-02). It runs once
+/// per reconnect, never per event. `streak` counts the consecutive rounds that ended on the same
+/// undecodable position, so a stuck event follows the shared connect shape — 1 s doubling to 30 s
+/// with jitter (`supervisor::Policy::CONNECT`) — and the reader is reading the next event again
+/// within a second of a fixed build replacing this one. Every other reason keeps the pause it had
+/// before A-02: a round that delivered something reconnects after 200 ms, one that died at the
+/// door waits a connect cap. The reader drops nothing on any path: a reconnect re-reads from the
+/// saved boundary.
+fn stream_pause(end: Option<StreamEnd>, delivered: bool, streak: u32) -> Duration {
+    match end {
+        Some(StreamEnd::Undecodable) => supervisor::backoff(
+            streak.max(1),
+            supervisor::Policy::CONNECT.base,
+            supervisor::Policy::CONNECT.cap,
+            supervisor::Policy::CONNECT.jitter,
+        ),
+        _ if delivered => Duration::from_millis(200),
+        _ => supervisor::Policy::CONNECT.cap,
+    }
+}
+
 struct Engine {
     cfg: Config,
     metrics: Arc<Metrics>,
@@ -3342,6 +3381,33 @@ impl Engine {
 
     // ---------------------------------------------------------------- streaming
 
+    /// Test hook `LAZYVIEW_TEST_UNDECODABLE_ROWS=<n>` (review A-02): the first `n` rows events the
+    /// reader delivers are handled as undecodable. A server gives no reason to fail to decode an
+    /// event it has just written, so this is how the stuck reader is tested on real servers; the
+    /// handling itself is the real one (`StreamEnd::Undecodable`), so the classification, the
+    /// counters, the backoff ladder and the pinned position all run for real. Cost when unset,
+    /// which is every production run: one `u32` load and a predictable branch per rows event; no
+    /// allocation, no syscall. It keeps no state of its own — the count it compares against is
+    /// the `events_undecodable` counter itself. Only the rows of tables a view reads count: the
+    /// engine's own writes (state, definitions, the fence, the materialized views) come back on
+    /// the same stream and would otherwise spend the budget at arbitrary points.
+    fn test_undecodable(&self, item: &Item) -> bool {
+        let n = self.cfg.test_undecodable_rows;
+        if n == 0 {
+            return false;
+        }
+        match item {
+            Item::Rows { table_id, .. } => {
+                let read = self
+                    .table_ids
+                    .get(table_id)
+                    .is_some_and(|(_, route, src)| route.is_some() || src.is_some());
+                read && Metrics::get(&self.metrics.events_undecodable) < u64::from(n)
+            }
+            _ => false,
+        }
+    }
+
     async fn stream(
         &mut self,
         start: Position,
@@ -3351,6 +3417,10 @@ impl Engine {
         let mut pos = start;
         // Not even the server's heartbeats for this long: the connection is dead (half-open).
         let silence = (self.cfg.heartbeat * 3).max(Duration::from_secs(15));
+        // The event the reader is stuck on, and how many rounds in a row it has stopped there
+        // (A-02): the position is what makes "log it once" and "grow the backoff" the same state.
+        let mut stuck_at: Option<Position> = None;
+        let mut stuck_streak: u32 = 0;
         'reconnect: loop {
             // The core's boundary is where reading starts: on the first connect the resume
             // position, on a reconnect the last boundary. Buffered ids then pin real positions,
@@ -3406,6 +3476,9 @@ impl Engine {
             Metrics::set(&self.metrics.gauges.starting, 0);
             let mut last_event = Instant::now();
             let mut delivered = false;
+            // Why this round ends, once it breaks (A-02); `None` is a round that ended because the
+            // process is shutting down or the source told the reader to start over.
+            let mut end = None;
             // Read while the last flush ran: processed first, in order (see `flush_draining`).
             let mut drained = Drained::new(self.cfg.mem.drain_max_bytes);
             loop {
@@ -3438,6 +3511,7 @@ impl Engine {
                         _ = tokio::time::sleep_until(sleep_until.into()), if deadline.is_some() && !self.in_txn => idle = true,
                         _ = tokio::time::sleep_until((last_event + silence).into()) => {
                             warn!("no binlog event or heartbeat for {silence:?}; reconnecting");
+                            end = Some(StreamEnd::Silence);
                             break;
                         }
                     }
@@ -3449,13 +3523,30 @@ impl Engine {
                             delivered = true;
                         }
                         Metrics::add(&self.metrics.events, 1);
+                        if self.test_undecodable(&item) {
+                            // Test hook: the same handling as a real mapping failure, so the
+                            // stuck reader of A-02 is testable on a server.
+                            end = Some(StreamEnd::Undecodable);
+                            break;
+                        }
                         if let Err(e) = self.on_item(&reader, item).await {
-                            error!("processing binlog event: {e:#}");
+                            if source::is_undecodable(&e) {
+                                // A-02, the owner's ruling: an event the decoder cannot map is a
+                                // bug and the process exits rather than skip it, so this line is
+                                // the whole record the operator needs — kind, table and position
+                                // are in the message (`source::Undecodable`'s own words) — and the
+                                // restart loop is what the alert of the observability plan reads.
+                                Metrics::add(&self.metrics.events_undecodable, 1);
+                                error!("binlog reader: {e:#}");
+                            } else {
+                                error!("processing binlog event: {e:#}");
+                            }
                             return Err(e);
                         }
                     }
                     Some(Ok(None)) => {
                         warn!("binlog stream closed by server; reconnecting");
+                        end = Some(StreamEnd::Closed);
                         break;
                     }
                     Some(Err(e)) => {
@@ -3463,8 +3554,16 @@ impl Engine {
                             self.on_missing_binlog(&e).await?;
                         } else if binlog::is_duplicate_server_id(&e) {
                             self.reroll_server_id();
+                        } else if source::is_undecodable(&e) {
+                            // A-02: not a network fault, so not the network's schedule. The
+                            // reader stays on this event; the round-end report names the position
+                            // once and the pause backs off like a failed connect. The liveness
+                            // beat below stays: the process *is* alive, the counter is what shows
+                            // the view is not advancing.
+                            end = Some(StreamEnd::Undecodable);
                         } else {
                             warn!("binlog stream error: {e:#}; reconnecting");
+                            end = Some(StreamEnd::Transient);
                         }
                         break;
                     }
@@ -3501,6 +3600,50 @@ impl Engine {
                     self.housekeeping().await?;
                 }
             }
+            // Why the round ended (A-02): one counter per reason, so `/metrics` separates a
+            // source that keeps cutting the stream from a reader stuck on one event; the stuck
+            // position named once rather than once per retry; and the backoff for a reader that
+            // would otherwise spin on one undecodable event. Counted per round, never per event.
+            let streak = match end {
+                Some(StreamEnd::Undecodable) => {
+                    Metrics::add(&self.metrics.events_undecodable, 1);
+                    Metrics::add(&self.metrics.stream_reconnect_undecodable, 1);
+                    let at = reader.position().clone();
+                    if stuck_at.as_ref() == Some(&at) {
+                        stuck_streak = stuck_streak.saturating_add(1);
+                    } else {
+                        // Named once per position: another round at the same place says nothing
+                        // new, and the counter is what grows.
+                        let total = Metrics::get(&self.metrics.stream_reconnect_undecodable);
+                        error!(
+                            position = %at,
+                            "binlog event cannot be decoded; the reader stays here and backs off \
+                             like a failed connect ({total} reconnects at this position so far)"
+                        );
+                        stuck_at = Some(at);
+                        stuck_streak = 1;
+                    }
+                    stuck_streak
+                }
+                Some(StreamEnd::Transient) => {
+                    Metrics::add(&self.metrics.stream_reconnect_transient, 1);
+                    0
+                }
+                Some(StreamEnd::Closed) => {
+                    Metrics::add(&self.metrics.stream_reconnect_closed, 1);
+                    0
+                }
+                Some(StreamEnd::Silence) => {
+                    Metrics::add(&self.metrics.stream_reconnect_silence, 1);
+                    0
+                }
+                None => 0,
+            };
+            if streak == 0 {
+                // Any other round, or another event, starts the ladder again.
+                stuck_at = None;
+                stuck_streak = 0;
+            }
             Metrics::set(&self.metrics.gauges.streaming, 0);
             let _ = reader.close().await;
             // Changes of a partially read transaction are kept: re-applying them is harmless.
@@ -3510,12 +3653,9 @@ impl Engine {
             self.xa_current = None;
             self.txn_foreign = false;
             pos = self.boundary.to_position();
-            // A stream that fails right after connecting backs off like a failed connect.
-            let pause = if delivered {
-                Duration::from_millis(200)
-            } else {
-                supervisor::Policy::CONNECT.cap
-            };
+            // A stream that fails right after connecting backs off like a failed connect; a
+            // reader stuck on one event follows the same ladder (A-02, see `stream_pause`).
+            let pause = stream_pause(end, delivered, streak);
             self.metrics.beat();
             tokio::select! {
                 _ = tokio::time::sleep(pause) => {}
@@ -8380,5 +8520,47 @@ mod managed_service_tests {
         assert!(!wants_gtid_tip(false, Some("on")));
         assert!(!wants_gtid_tip(false, None));
         assert!(!wants_gtid_tip(true, Some("OFF")));
+    }
+
+    /// A-02: the wait before a reconnect is the network's schedule for a network fault and the
+    /// connect ladder for a reader stuck on one undecodable event — never the flat 200 ms, which
+    /// is what made the stuck reader an endless hot loop with green probes. The bounds are the
+    /// ladder's because [`supervisor::backoff`] jitters (0.5 .. 1.5 of the step).
+    #[test]
+    fn stream_pause_backs_off_for_an_undecodable_event() {
+        for streak in 1..=6u32 {
+            let step = (Duration::from_secs(1) * (1u32 << (streak - 1)))
+                .min(supervisor::Policy::CONNECT.cap);
+            let p = stream_pause(Some(StreamEnd::Undecodable), true, streak);
+            assert!(
+                p >= step.mul_f64(0.49) && p <= step.mul_f64(1.51),
+                "streak {streak}: {p:?} is not the {step:?} connect step with jitter"
+            );
+            assert!(p > Duration::from_millis(200), "streak {streak}: {p:?}");
+        }
+        // The first round of a streak already backs off: `streak` counts the round that just ended.
+        assert!(
+            stream_pause(Some(StreamEnd::Undecodable), false, 0) >= Duration::from_millis(500),
+            "a stuck reader never reconnects on the network's short timer"
+        );
+        // Every other reason keeps exactly the pause it had before A-02: 200 ms once something was
+        // delivered this connection, a connect cap when the round died at the door.
+        for end in [
+            Some(StreamEnd::Transient),
+            Some(StreamEnd::Closed),
+            Some(StreamEnd::Silence),
+            None,
+        ] {
+            assert_eq!(
+                stream_pause(end, true, 3),
+                Duration::from_millis(200),
+                "{end:?}"
+            );
+            assert_eq!(
+                stream_pause(end, false, 3),
+                supervisor::Policy::CONNECT.cap,
+                "{end:?}"
+            );
+        }
     }
 }
