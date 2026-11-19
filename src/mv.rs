@@ -534,7 +534,6 @@ pub(crate) fn batches<T>(
 
 /// Multi-row parameterized INSERTs (upserts with `upsert`, see [`Layout::row_key`]), at most
 /// `w.batch_rows` rows and about `w.batch_bytes` bytes each.
-#[allow(clippy::too_many_arguments)]
 pub async fn insert_rows<C: Queryable>(
     conn: &mut C,
     schema: &str,
@@ -953,7 +952,6 @@ fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) {
 /// Writes a diff in one transaction (see [`Diff`]). `began` is set once the transaction has
 /// been started on the server (from then on a lost connection may still commit: see the
 /// supervisor's zombie fence).
-#[allow(clippy::too_many_arguments)]
 pub async fn write_diff(
     conn: &mut Conn,
     schema: &str,
@@ -1073,7 +1071,6 @@ async fn write_tx_mysql(
 /// `chunk` (all rows when `None`), writing only units whose rows differ. `new` comes from
 /// [`prepare`] and is immutable ([`diff`] only reads it), so one chunk prepares once and every
 /// target of the chunk shares it (see [`apply`] for rows that are not converted yet).
-#[allow(clippy::too_many_arguments)]
 pub async fn apply_prepared(
     conn: &mut Conn,
     schema: &str,
@@ -1102,7 +1099,6 @@ pub async fn apply_prepared(
 /// [`apply_prepared`] for new rows that still need converting: one copy of `new_rows` for
 /// [`prepare`]. A caller with several targets of the same chunk prepares once and calls
 /// [`apply_prepared`] per target instead.
-#[allow(clippy::too_many_arguments)]
 pub async fn apply(
     conn: &mut Conn,
     schema: &str,
@@ -1123,7 +1119,6 @@ pub async fn apply(
 /// [`crate::target::postgres::PgConn::write_tx`] - the shape `supervisor::write_once` already
 /// uses for one op. One dispatch per chunk, never per row; the diff and the batches are the same
 /// allocations the MySQL arm makes, so a PostgreSQL chunk costs what a MySQL one does.
-#[allow(clippy::too_many_arguments)]
 pub async fn apply_prepared_on(
     conn: &mut crate::target::Conn,
     schema: &str,

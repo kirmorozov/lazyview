@@ -259,7 +259,6 @@ pub(crate) fn cascade_maps(
 /// when its join condition is exactly the foreign-key equality: the constraint guarantees the
 /// parent row exists, so the condition matches it whenever the child's key is non-NULL (a child
 /// with a NULL key is not cascaded into).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn cascade_joined(
     x: usize,
     y: usize,

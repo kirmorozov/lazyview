@@ -6753,7 +6753,6 @@ impl Engine {
 
     /// Lineage lookup of alias `alias` (see [`Self::lookups`]): `keys` are primary keys of its
     /// changed rows.
-    #[allow(clippy::too_many_arguments)]
     async fn lineage_lookup(
         &mut self,
         plan: &ViewPlan,
@@ -7503,7 +7502,6 @@ async fn seed_cache(conn: &mut Conn, plan: &ViewPlan) -> Result<cascade::Cache> 
     Ok(cache)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn build_task(
     src_opts: Opts,
     src_schema: String,

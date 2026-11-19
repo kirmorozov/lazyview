@@ -977,7 +977,6 @@ impl PgConn {
     /// the same `MAX_PARAMS` cap and the same metrics as `crate::mv::insert_rows`, one statement
     /// per batch, every value rendered by [`param_text`] for its target column (T2). Reached
     /// through `crate::mv::fill` (the build's plain INSERTs, T6) and PR T5's write pool (upserts).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn insert_rows(
         &self,
         schema: &str,
@@ -1078,7 +1077,6 @@ impl PgConn {
     /// analogue of. No `@lv_tz` session dance (§0.10): the session is UTC from connect (T1.4).
     /// `began` is set where `write_diff` sets it, before the transaction is opened. Called by
     /// `supervisor::write_once` on the op's own [`PgConn`] from the write pool (T5.1).
-    #[allow(clippy::too_many_arguments)] // mirrors write_tx_mysql
     pub(crate) async fn write_tx(
         &mut self,
         schema: &str,

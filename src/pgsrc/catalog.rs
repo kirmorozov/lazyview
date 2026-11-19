@@ -273,7 +273,6 @@ pub(crate) type FkRow = (String, String, String, String, String, String, String)
 
 /// Builds one [`FkRow`] (a tuple alias has no constructor of its own): the fixture spelling
 /// the tests share with the live read.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn fk_row(
     conname: &str,
     child_col: &str,
