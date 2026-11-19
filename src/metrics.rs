@@ -87,6 +87,13 @@ counters!(
     // Child rows a mapped cascade changed, replayed from the in-memory cascade cache
     // (src/cascade.rs): the global sum over views, added in publish_stats.
     cascade_rows,
+    // Beats of the leadership lock's own session that could not be answered (review A-06): the
+    // session is dropped and re-opened, and the lock confirmed again, on the next beat. One count
+    // per beat, never per binlog event: a GC pause or a proxy blip shows here, not in a fatality.
+    leader_beat_failures,
+    // Times this instance was fenced by its own lock task: another instance holds the lock or the
+    // fencing epoch moved while our session was away, so we are the replaced one and must stop.
+    leader_fenced,
 );
 
 /// Point-in-time values (may go down), maintained by the engine.
@@ -102,6 +109,11 @@ pub struct Gauges {
     pub heartbeat_unix: AtomicU64,
     /// 1 while waiting for another instance's lock on the schema (hot standby).
     pub standby: AtomicU64,
+    /// Unix seconds of the last beat the leadership lock's own session answered, by the lock's own
+    /// task (review A-06). Kept apart from `heartbeat_unix` on purpose: that one is the binlog
+    /// loop's liveness and what `/livez` judges, and a keepalive on another connection must never
+    /// make a loop that stopped looking alive.
+    pub leader_last_beat_ok: AtomicU64,
     /// 1 from process start until the binlog stream is first connected.
     pub starting: AtomicU64,
     /// Rows read from the sources and not yet written to every target.
@@ -190,6 +202,13 @@ impl Metrics {
     /// Marks the engine as making progress (liveness).
     pub fn beat(&self) {
         Metrics::set(&self.gauges.heartbeat_unix, unix_now());
+    }
+
+    /// Records that the leadership lock's own session answered a beat (review A-06). Deliberately
+    /// not [`Metrics::beat`]: that one is the binlog loop's liveness, and a keepalive that runs on
+    /// its own connection would keep `/livez` green over a loop that stopped.
+    pub fn leader_beat_ok(&self) {
+        Metrics::set(&self.gauges.leader_last_beat_ok, unix_now());
     }
 
     pub fn set(g: &AtomicU64, v: u64) {

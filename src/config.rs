@@ -155,8 +155,13 @@ pub struct Config {
     /// of the per-build source reads. Unset ⇒ `Config::dsn`.
     pub test_query_dsn: Option<String>,
     /// Test hook `LAZYVIEW_TEST_META_DSN=<dsn>`: the DSN of the metadata connection (the
-    /// catalog writes, the fencing epoch, the leadership lock). Unset ⇒ `Config::dsn`.
+    /// catalog writes, the fencing epoch). Unset ⇒ `Config::dsn`.
     pub test_meta_dsn: Option<String>,
+    /// Test hook `LAZYVIEW_TEST_LOCK_DSN=<dsn>`: the DSN of the leadership lock's own session
+    /// (review A-06), the connection its heartbeat task beats and reconnects. Unset ⇒ the
+    /// metadata endpoint (`test_meta_dsn`, then `Config::dsn`): the lock must stay on the server
+    /// that holds the `_lazyview_status` epoch row it fences.
+    pub test_lock_dsn: Option<String>,
     /// Test hook `LAZYVIEW_TEST_LOCK_WAIT_S=<s>` (default 60): how long at most a session the
     /// engine opens waits for a table lock (`SET SESSION lock_wait_timeout`, the third statement
     /// of `crate::target::source_session_setup`); a refresh blocked longer fails and is retried with backoff.
@@ -349,7 +354,7 @@ impl Config {
         // reads and the metadata connection each take their own endpoint when the hook is set,
         // read through `connection` so `mariadb://`, the TLS modes and the encoding are exactly
         // LAZYVIEW_DSN's. Unset ⇒ `dsn`, so a run without the hooks never leaves LAZYVIEW_DSN.
-        let role_dsn = |prefix: &str| -> Result<Option<String>> {
+        let role_dsn_opt = |prefix: &str| -> Result<Option<String>> {
             // No cleartext warning for a test hook: those endpoints exist for the network tests.
             let v = connection(&get, prefix, false, None)?;
             if let Some(v) = &v {
@@ -357,11 +362,18 @@ impl Config {
                 // `postgres://` one is refused here with the "not supported yet" message.
                 crate::dialect::Family::from_source_dsn(v)?;
             }
-            Ok(v.or_else(|| Some(dsn.clone())))
+            Ok(v)
+        };
+        let role_dsn = |prefix: &str| -> Result<Option<String>> {
+            Ok(role_dsn_opt(prefix)?.or(Some(dsn.clone())))
         };
         let test_binlog_dsn = role_dsn("LAZYVIEW_TEST_BINLOG")?;
         let test_query_dsn = role_dsn("LAZYVIEW_TEST_QUERY")?;
         let test_meta_dsn = role_dsn("LAZYVIEW_TEST_META")?;
+        // The lock's own endpoint stays where the epoch row it fences is, so an unset hook means
+        // "the metadata connection's server", and the engine falls back that way
+        // (`test_lock_dsn` ⇒ `test_meta_dsn` ⇒ `dsn`); `None` here says nothing was set.
+        let test_lock_dsn = role_dsn_opt("LAZYVIEW_TEST_LOCK")?;
         Ok(Config {
             dsn,
             source_family,
@@ -400,6 +412,7 @@ impl Config {
             test_binlog_dsn,
             test_query_dsn,
             test_meta_dsn,
+            test_lock_dsn,
             lock_wait_s: num("LAZYVIEW_TEST_LOCK_WAIT_S", DEFAULT_LOCK_WAIT_S)?.max(1),
             swap_lock_wait_s: num("LAZYVIEW_SWAP_LOCK_WAIT_S", DEFAULT_SWAP_LOCK_WAIT_S)?.max(1),
             heartbeat: Duration::from_millis(num("LAZYVIEW_HEARTBEAT_MS", 5_000)?.max(100)),
@@ -824,6 +837,30 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         Config::from_lookup(|k| m.get(k).cloned())
+    }
+
+    /// The fourth role the network tests can aim a fault at (review A-06): the leadership lock's
+    /// own session. Unset, `Config` says nothing and `Engine::start` falls back to the metadata
+    /// endpoint (the lock must stay on the server of the epoch row it fences); set, it moves alone.
+    #[test]
+    fn the_lock_role_hook_is_read_or_left_unset() {
+        let dsn = "mysql://lv@db:3306/app";
+        let c = cfg(&[("LAZYVIEW_DSN", dsn)]).unwrap();
+        assert_eq!(
+            c.test_lock_dsn, None,
+            "an unset hook leaves the choice of the server to the engine"
+        );
+        let c = cfg(&[("LAZYVIEW_DSN", dsn), ("LAZYVIEW_TEST_META_DSN", dsn)]).unwrap();
+        assert_eq!(c.test_lock_dsn, None, "the metadata hook is not the lock's");
+        let lock = "mysql://lv@127.0.0.1:3307/app";
+        let c = cfg(&[("LAZYVIEW_DSN", dsn), ("LAZYVIEW_TEST_LOCK_DSN", lock)]).unwrap();
+        assert_eq!(c.test_lock_dsn.as_deref(), Some(lock));
+        // A role's DSN is a source DSN, as the other three: `postgres://` is refused here.
+        assert!(cfg(&[
+            ("LAZYVIEW_DSN", dsn),
+            ("LAZYVIEW_TEST_LOCK_DSN", "postgres://lv@db:5432/app"),
+        ])
+        .is_err());
     }
 
     /// The leadership lock's lease (review A-06): the two settings, their floors, and the rule

@@ -756,6 +756,14 @@ struct Engine {
     build_rx: Option<mpsc::UnboundedReceiver<BuildDone>>,
     build_slots: Arc<tokio::sync::Semaphore>,
     leader: coord::Leadership,
+    /// What the leadership lock's own task publishes (review A-06): `Fenced` means another
+    /// instance has the lock and this one is the replaced one. Checking it costs a `watch` borrow —
+    /// an atomic read, no round-trip, no allocation, and nothing on the binlog event path.
+    leader_state: watch::Receiver<LeaderState>,
+    /// The engine's end of the lock's beat task: dropped with the engine, which stops the task and
+    /// closes the lock session, so a dropped engine releases the lock instead of making the next
+    /// instance wait for the lease.
+    lock_task: LockTask,
     ready_logged: bool,
     /// The warn for the changes kept for targets that are behind passing their budget was
     /// emitted: one warn and one count per crossing of `LAG_HOLD_BYTES`, not per housekeeping
@@ -771,7 +779,6 @@ struct Engine {
     /// Hands each flush's per-view counters to the statistics aggregator task (src/stats.rs);
     /// the task ends when this, its only sender, is dropped with the engine.
     stats_tx: crate::stats::FoldSender,
-    last_meta_ping: Instant,
     /// Concurrent refreshes on connection pools; `None` with `LAZYVIEW_SUPERVISOR=off` (one
     /// sequential refresh on the connections above).
     sup: Option<Supervisor>,
@@ -996,6 +1003,183 @@ fn mode_name(plan: &ViewPlan) -> (&'static str, Option<String>) {
     }
 }
 
+// ------------------------------------------------------------------------------------ leadership
+//
+// The lock that says which instance of this schema is the active one lives on a connection of its
+// own and is beaten by the task below — not by the binlog loop, which a swap waiting its
+// `lock_wait_timeout` or a catch-up batch can occupy for longer than the lease (review A-06,
+// condition 2), and not per binlog event: the cost is one tiny statement per instance per
+// `LAZYVIEW_LOCK_HEARTBEAT_MS` (~0.2 QPS at the default), whatever the event rate.
+
+/// What this instance's own lock task knows about its leadership. Read through a
+/// [`watch`]: a gate pays an atomic read and no round-trip, so checking it can never become work
+/// on the event path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaderState {
+    /// The lock session answered its last beat and holds the named lock: this instance is the
+    /// active one.
+    Active,
+    /// Another session holds the lock, or the fencing epoch moved while our session was away:
+    /// this instance is the replaced one. `why` names the epochs for the log and the fatal error.
+    Fenced(String),
+}
+
+/// What one beat of the lock session said.
+enum Beat {
+    /// The session answered and still holds the lock.
+    Held,
+    /// The session answered: some other session holds the lock now. `why` says what the backend
+    /// knows (the two epochs), for the WARN and the engine's fatal error.
+    Taken(String),
+}
+
+/// The lock session as the beat task sees it: two calls, either of which can fail. Its own trait
+/// so the task's state machine can be driven by a script in a unit test, with no server behind it.
+trait LockBeat: Send {
+    /// Keeps the session from going silent and reports whether it still holds the lock. `Err`
+    /// means the session cannot be trusted: it is dropped and `rejoin` opens a new one.
+    fn beat(&mut self) -> impl Future<Output = Result<Beat>> + Send;
+
+    /// Takes the lock again on a re-opened session. `Err` with a transient cause means the lock
+    /// server is simply away — try again on the next beat; any other `Err` means this instance
+    /// was replaced.
+    fn rejoin(&mut self) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// [`coord::LockSession`] seen as the two calls the beat task makes.
+struct LockSessionBeat {
+    session: coord::LockSession,
+    instance_id: String,
+    /// For the fenced message: what this instance believed when it took the lock.
+    epoch: u64,
+    lock_name: String,
+}
+
+impl LockBeat for LockSessionBeat {
+    async fn beat(&mut self) -> Result<Beat> {
+        if self.session.beat().await? {
+            Ok(Beat::Held)
+        } else {
+            Ok(Beat::Taken(format!(
+                "another session holds the leadership lock `{}` while we hold epoch {}",
+                self.lock_name, self.epoch
+            )))
+        }
+    }
+
+    async fn rejoin(&mut self) -> Result<()> {
+        self.session.rejoin(&self.instance_id).await
+    }
+}
+
+/// The engine's end of the lock task: dropping it — which happens with the engine — stops the
+/// task, and the task taking its session with it closes that connection, so the named lock is
+/// released at once instead of after the lease.
+struct LockTask {
+    stop: Option<watch::Sender<bool>>,
+}
+
+impl LockTask {
+    /// Ends the beat task, which takes the lock session with it: the named lock is released now
+    /// instead of when the lease ends. `Engine::stream` calls this as it ends; `Drop` is the same
+    /// call for the paths that never get there (a fatal error, a panic, a dropped engine).
+    fn stop(&mut self) {
+        // Dropping the last sender is the stop signal: a `watch` answers `changed()` at once,
+        // forever, on a closed channel — and `take` is how one drops it from here.
+        drop(self.stop.take());
+    }
+}
+
+impl Drop for LockTask {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Publishes the state unless it already says that, so a beat that changes nothing wakes nobody.
+fn publish_leader(state: &watch::Sender<LeaderState>, next: LeaderState) {
+    state.send_if_modified(|cur| {
+        if *cur == next {
+            false
+        } else {
+            *cur = next;
+            true
+        }
+    });
+}
+
+/// The lock task's own verdict that this instance has been replaced: counted, logged at WARN with
+/// both epochs, and published for the engine to stop with (review A-06 condition 3; the gates that
+/// stop the writes this instance has already started are `lockhb-fence`). The session goes with
+/// the task, so the replacement never waits on a lock we no longer hold.
+fn fence_leader(metrics: &Metrics, state: &watch::Sender<LeaderState>, why: String) {
+    Metrics::add(&metrics.leader_fenced, 1);
+    warn!("fenced: {why}; this instance is the replaced one and stops at its next check");
+    publish_leader(state, LeaderState::Fenced(why));
+}
+
+/// The leadership lock's own task (review A-06): one bounded statement per `heartbeat` on the
+/// lock's own session, which keeps the server from ever seeing that session go silent while this
+/// instance lives — the lease exists to end a *lost* node's session, never a live one's — and
+/// which notices a lock someone else has taken within one beat instead of at the binlog loop's
+/// next 60 s check (a check that loop could also be too busy to run).
+///
+/// A beat that cannot be answered is not fatal: the session is dropped, a fresh one is opened and
+/// the lock and the epoch confirmed again (`coord::LockSession::rejoin`), so a GC pause, a CPU
+/// starvation or a proxy blip never ends a healthy instance with builds running. Only a rejoin
+/// that finds the lock held elsewhere, or the epoch moved, says this instance was replaced.
+async fn run_lock_beat<D: LockBeat + Send + 'static>(
+    mut d: D,
+    heartbeat: Duration,
+    metrics: Arc<Metrics>,
+    state: watch::Sender<LeaderState>,
+    mut shutdown: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        match d.beat().await {
+            Ok(Beat::Held) => {
+                metrics.leader_beat_ok();
+                publish_leader(&state, LeaderState::Active);
+            }
+            Ok(Beat::Taken(why)) => {
+                fence_leader(&metrics, &state, why);
+                return;
+            }
+            Err(e) => {
+                Metrics::add(&metrics.leader_beat_failures, 1);
+                warn!(
+                    "leadership lock: beat failed ({}); rejoining",
+                    e.root_cause()
+                );
+                match d.rejoin().await {
+                    Ok(()) => {
+                        metrics.leader_beat_ok();
+                        publish_leader(&state, LeaderState::Active);
+                        info!("leadership lock: session re-opened, the lock and epoch confirmed; still the active instance");
+                    }
+                    // The lock server is away: the lease is the server's own clock, so this
+                    // instance keeps its lock there for now and the next beat tries again. The
+                    // beat that failed already counted; a deferred rejoin is not a second one.
+                    Err(e) if binlog::is_transient(&e) => {
+                        warn!("leadership lock: rejoin deferred ({})", e.root_cause());
+                    }
+                    Err(e) => {
+                        fence_leader(&metrics, &state, format!("{e:#}"));
+                        return;
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(heartbeat) => {}
+            _ = shutdown.changed() => if *shutdown.borrow() { return },
+            // The engine went: release the lock rather than hold it until the lease does.
+            _ = stop.changed() => return,
+        }
+    }
+}
+
 impl Engine {
     /// `Ok(None)`: shutdown requested while waiting for the database or the lock.
     async fn start(
@@ -1056,18 +1240,57 @@ impl Engine {
         } else {
             meta::ensure(&mut meta_conn, &schema).await?;
         }
-        let Some(leader) = coord::acquire(
-            &mut meta_conn,
-            &meta_opts,
+        // The leadership lock goes on a session of its own (review A-06): `meta_conn` stays what
+        // the catalog, the state rows and the position writes use, and the lock — with the lease
+        // the server enforces on it — is kept alive by the task below, never by this connection or
+        // by the binlog loop. Its endpoint is the metadata one unless a test names another: the
+        // lock and the `_lazyview_status` epoch row it fences must stay on one server.
+        let lock_opts = role_opts(
+            cfg.test_lock_dsn
+                .as_deref()
+                .or(cfg.test_meta_dsn.as_deref()),
+            &cfg.dsn,
+        )?;
+        let Some(session) = coord::LockSession::open(
+            lock_opts,
             &schema,
             &cfg.instance_id,
             &metrics,
+            coord::Lease::from_config(&cfg),
             shutdown,
         )
         .await?
         else {
             return Ok(None);
         };
+        let leader = coord::Leadership {
+            lock_name: session.leadership.lock_name.clone(),
+            epoch: session.leadership.epoch,
+        };
+        info!(
+            "leadership lock `{}` held on a session of its own: beat {} s, lease {} s",
+            leader.lock_name,
+            cfg.lock_heartbeat.as_secs_f64(),
+            cfg.lock_lease.as_secs_f64()
+        );
+        // The beat task, on the runtime and not on the binlog loop, so a loop occupied past the
+        // lease cannot starve the beats (condition 2). The engine owns the only stop sender: when
+        // it goes, the task stops and closes the session, which releases the named lock at once.
+        let (lock_stop, lock_stop_rx) = watch::channel(false);
+        let (leader_tx, leader_rx) = watch::channel(LeaderState::Active);
+        tokio::spawn(run_lock_beat(
+            LockSessionBeat {
+                session,
+                instance_id: cfg.instance_id.clone(),
+                epoch: leader.epoch,
+                lock_name: leader.lock_name.clone(),
+            },
+            cfg.lock_heartbeat,
+            metrics.clone(),
+            leader_tx,
+            shutdown.clone(),
+            lock_stop_rx,
+        ));
 
         let mut targets = BTreeMap::new();
         targets.insert(
@@ -1191,6 +1414,10 @@ impl Engine {
             build_rx: Some(build_rx),
             build_slots: Arc::new(tokio::sync::Semaphore::new(cfg_build_concurrency)),
             leader,
+            leader_state: leader_rx,
+            lock_task: LockTask {
+                stop: Some(lock_stop),
+            },
             ready_logged: false,
             lag_budget_warned: false,
             flush_wrote: Vec::new(),
@@ -1198,7 +1425,6 @@ impl Engine {
             last_touch: Instant::now(),
             last_stats: (Instant::now(), Default::default()),
             stats_tx,
-            last_meta_ping: Instant::now(),
             sup,
             dedup,
             stmt_dml_last: HashMap::new(),
@@ -1857,33 +2083,30 @@ impl Engine {
         self.metrics.beat();
     }
 
-    /// Re-opens the metadata connection after a connection-class error. The leadership lock
-    /// died with the old connection: it is taken again and the fencing epoch checked, and if
-    /// another instance took over meanwhile this one stops (`Err`). `Ok(false)`: still
+    /// Re-opens the metadata connection after a connection-class error. Nothing leadership-related
+    /// is settled here any more (review A-06): the lock died with this connection only while it
+    /// rode it, and it does not any more. The lock's own task holds and re-confirms it on its own
+    /// session and fences this instance if another has taken it, and `meta::save_position` still
+    /// refuses the position write of an instance whose epoch moved. `Ok(false)`: still
     /// unreachable, try again later.
     async fn heal_meta(&mut self) -> Result<bool> {
         let conn = connect_source(&self.meta_opts, self.cfg.lock_wait_s, &self.metrics).await;
         self.metrics.beat();
-        let mut conn = match conn {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("metadata connection still unreachable: {}", e.root_cause());
-                return Ok(false);
-            }
-        };
-        match coord::reacquire(&mut conn, &self.leader, &self.cfg.instance_id).await {
-            Ok(()) => {
-                self.meta = conn;
-                info!("metadata connection re-established; still the active instance");
+        match conn {
+            Ok(c) => {
+                self.meta = c;
+                info!("metadata connection re-established");
                 Ok(true)
             }
-            Err(e) if binlog::is_transient(&e) => Ok(false),
-            Err(e) => Err(e),
+            Err(e) => {
+                warn!("metadata connection still unreachable: {}", e.root_cause());
+                Ok(false)
+            }
         }
     }
 
-    /// A failed metadata statement: connection-class errors heal the connection and are
-    /// retried later; anything else (lost leadership, a changed epoch) is fatal.
+    /// A failed metadata statement: connection-class errors heal the connection and are retried
+    /// later; anything else (a changed epoch, a statement the server refuses) is fatal.
     async fn meta_failed(&mut self, e: anyhow::Error, what: &str) -> Result<()> {
         if !binlog::is_transient(&e) {
             return Err(e.context(what.to_string()));
@@ -3310,6 +3533,9 @@ impl Engine {
                 n.task.abort();
             }
         }
+        // The loop is over: stop beating and close the lock session, so the named lock goes here
+        // and now rather than making whoever starts the next instance wait for our lease.
+        self.lock_task.stop();
         info!("stopped");
         Ok(())
     }
@@ -4020,8 +4246,9 @@ impl Engine {
         self.ready_logged = all_ready;
     }
 
-    /// Periodic one-line activity summary and metadata-connection keepalive (which also
-    /// verifies we still hold the leadership lock).
+    /// Periodic one-line activity summary and the keepalives of the connections the loop owns.
+    /// Leadership is not checked here any more (review A-06): the lock's own task beats its own
+    /// session and this reads, for free, what that task published.
     async fn housekeeping(&mut self) -> Result<()> {
         if self.last_stats.0.elapsed() >= Duration::from_secs(60) {
             let now = self.metrics.snapshot();
@@ -4040,11 +4267,13 @@ impl Engine {
                 self.heal_src().await;
             }
         }
-        if self.last_meta_ping.elapsed() >= Duration::from_secs(60) {
-            self.last_meta_ping = Instant::now();
-            if let Err(e) = coord::verify(&mut self.meta, &self.leader).await {
-                self.meta_failed(e, "checking the leadership lock").await?;
-            }
+        // The leadership lock is no longer checked from here (review A-06): the lock's own task
+        // beats its own session and publishes what it found, and this is the cheap read of that.
+        // Once per housekeeping tick, never a round-trip on the metadata connection this loop
+        // shares with the catalog and the position writes — and a replaced instance now learns it
+        // within one beat instead of one minute, whether or not the metadata connection answers.
+        if let LeaderState::Fenced(why) = &*self.leader_state.borrow() {
+            bail!("fenced: {why}");
         }
         // The changes kept for targets that are behind are bounded: past the budget the engine
         // only reports (`lag_over_budget`) — nothing is dropped and nothing is rebuilt, the
@@ -7639,6 +7868,257 @@ mod role_dsn_tests {
         // `Config` refuses a `postgres://` one earlier, with its own message.
         assert!(role_opts(Some("not a dsn"), dsn).is_err());
         assert!(role_opts(Some("postgres://a@b/d"), dsn).is_err());
+    }
+
+    /// The lock's own endpoint (review A-06): unset, it is the metadata server's, because the lock
+    /// and the `_lazyview_status` epoch row it fences must stay together; set, the network test
+    /// aims its fault at the lock's session alone.
+    #[test]
+    fn the_lock_role_follows_the_metadata_role_until_it_is_named() {
+        let dsn = "mysql://lv:p@db:3306/app";
+        let meta = "mysql://lv:p@127.0.0.1:3311/app";
+        let lock = "mysql://lv:p@127.0.0.1:3312/app";
+        let of = |test_lock: Option<&str>, test_meta: Option<&str>| {
+            role_opts(test_lock.or(test_meta), dsn).unwrap()
+        };
+        // Nothing set: the lock sits where LAZYVIEW_DSN sits, like every other role.
+        let o = of(None, None);
+        assert_eq!((o.ip_or_hostname(), o.tcp_port()), ("db", 3306));
+        // The metadata hook alone moves the lock too — the epoch row moved, so the lock follows.
+        let o = of(None, Some(meta));
+        assert_eq!((o.ip_or_hostname(), o.tcp_port()), ("127.0.0.1", 3311));
+        // The lock's own hook wins, and moves nothing else.
+        let o = of(Some(lock), Some(meta));
+        assert_eq!((o.ip_or_hostname(), o.tcp_port()), ("127.0.0.1", 3312));
+    }
+}
+
+#[cfg(test)]
+mod lock_task_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// One scripted answer of the lock session's beat.
+    #[derive(Debug, Clone, Copy)]
+    enum Script {
+        /// Answered, and the lock is still ours.
+        Held,
+        /// Answered, and another session holds the lock now.
+        Taken,
+        /// No answer within the beat's bound: the session is gone and `rejoin` is due.
+        Lost,
+    }
+
+    /// What a rejoin after a lost session answers.
+    #[derive(Debug, Clone)]
+    enum Rejoin {
+        /// The lock server cannot be reached (a transient error): the beat is retried, the
+        /// instance keeps its lock for now.
+        Away,
+        /// The lock is held elsewhere or the epoch moved: this instance is the replaced one.
+        Replaced(&'static str),
+        /// The lock and the same epoch came back: still the leader.
+        Held,
+    }
+
+    /// The [`LockBeat`] seam driven by a script: the lock task's whole state machine, with no
+    /// server behind it.
+    struct Scripted {
+        beats: VecDeque<Script>,
+        rejoins: VecDeque<Rejoin>,
+        /// Closed when the script is through — the way the engine's drop ends the task.
+        stop: Option<watch::Sender<bool>>,
+        beats_done: Arc<AtomicUsize>,
+        rejoins_done: Arc<AtomicUsize>,
+    }
+
+    impl LockBeat for Scripted {
+        async fn beat(&mut self) -> Result<Beat> {
+            self.beats_done.fetch_add(1, Ordering::Relaxed);
+            match self.beats.pop_front() {
+                None => {
+                    drop(self.stop.take());
+                    Ok(Beat::Held)
+                }
+                Some(Script::Held) => Ok(Beat::Held),
+                Some(Script::Taken) => Ok(Beat::Taken(
+                    "another session holds the leadership lock `lazyview:7` while we hold epoch 2"
+                        .to_string(),
+                )),
+                Some(Script::Lost) => Err(anyhow!(
+                    "the lock session did not answer a beat within 20 ms"
+                )),
+            }
+        }
+
+        async fn rejoin(&mut self) -> Result<()> {
+            self.rejoins_done.fetch_add(1, Ordering::Relaxed);
+            match self.rejoins.pop_front() {
+                None => Ok(()),
+                Some(Rejoin::Away) => Err(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "the lock server is away",
+                ))),
+                Some(Rejoin::Replaced(why)) => Err(anyhow!(why)),
+                Some(Rejoin::Held) => Ok(()),
+            }
+        }
+    }
+
+    struct Run {
+        state: LeaderState,
+        metrics: Arc<Metrics>,
+        beats: usize,
+        rejoins: usize,
+    }
+
+    /// Runs the lock task over a script and reports what it left behind. The task ends by itself
+    /// when it fences, and with the script otherwise (the driver closes the stop channel), so a
+    /// run that needs neither would hang and fails on the bound below instead.
+    fn drive(beats: &[Script], rejoins: &[Rejoin]) -> Run {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (beats_done, rejoins_done) =
+            (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let d = Scripted {
+            beats: beats.iter().copied().collect(),
+            rejoins: rejoins.iter().cloned().collect(),
+            stop: Some(stop_tx),
+            beats_done: beats_done.clone(),
+            rejoins_done: rejoins_done.clone(),
+        };
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = watch::channel(LeaderState::Active);
+        let (_sd, sd_rx) = watch::channel(false);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let ended = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    run_lock_beat(
+                        d,
+                        Duration::from_millis(5),
+                        metrics.clone(),
+                        tx,
+                        sd_rx,
+                        stop_rx,
+                    ),
+                )
+                .await
+            })
+            .is_ok();
+        assert!(
+            ended,
+            "the lock task must end: fenced, or with the script and its stop"
+        );
+        let state = (*rx.borrow()).clone();
+        Run {
+            state,
+            metrics,
+            beats: beats_done.load(Ordering::Relaxed),
+            rejoins: rejoins_done.load(Ordering::Relaxed),
+        }
+    }
+
+    /// A healthy instance: every beat answered, the state stays `Active`, the beat clock moves,
+    /// and nothing is counted as a failure.
+    #[test]
+    fn a_beat_answers_and_we_stay_the_leader() {
+        let r = drive(&[Script::Held, Script::Held, Script::Held], &[]);
+        assert_eq!(r.state, LeaderState::Active);
+        assert_eq!(
+            r.beats, 4,
+            "the script's three beats, plus the one that finds it through and ends the task"
+        );
+        assert_eq!(r.rejoins, 0, "no rejoin without a lost session");
+        assert_eq!(Metrics::get(&r.metrics.leader_beat_failures), 0);
+        assert_eq!(Metrics::get(&r.metrics.leader_fenced), 0);
+        assert!(
+            Metrics::get(&r.metrics.gauges.leader_last_beat_ok) > 0,
+            "the beat marks the lock's own clock"
+        );
+    }
+
+    /// The beat answers and the lock is someone else's: fenced at once, counted, and the reason
+    /// names the lock and our epoch for the log and the engine's fatal error.
+    #[test]
+    fn a_beat_that_says_the_lock_is_taken_elsewhere_fences_us() {
+        let r = drive(&[Script::Held, Script::Taken], &[]);
+        let why = match &r.state {
+            LeaderState::Fenced(why) => why.clone(),
+            other => panic!("expected Fenced, got {other:?}"),
+        };
+        assert!(
+            why.contains("lazyview:7") && why.contains("epoch 2"),
+            "{why}"
+        );
+        assert_eq!(Metrics::get(&r.metrics.leader_fenced), 1);
+        assert_eq!(r.beats, 2, "the task stops beating once it has fenced us");
+        assert_eq!(
+            r.rejoins, 0,
+            "an answered beat that says `taken` needs no rejoin"
+        );
+    }
+
+    /// A session that dies and comes back with the same epoch (a GC pause, a proxy blip): the
+    /// instance keeps leading, with the failure counted and no fence — the case condition 2 is
+    /// about, and the reason the beats are not run from the binlog loop.
+    #[test]
+    fn a_lost_session_rejoined_on_the_same_epoch_keeps_us_active() {
+        let r = drive(&[Script::Held, Script::Lost, Script::Held], &[Rejoin::Held]);
+        assert_eq!(r.state, LeaderState::Active);
+        assert_eq!(Metrics::get(&r.metrics.leader_beat_failures), 1);
+        assert_eq!(Metrics::get(&r.metrics.leader_fenced), 0);
+        assert_eq!(r.rejoins, 1);
+        assert_eq!(
+            r.beats, 4,
+            "the third beat answers: the same epoch, still the leader"
+        );
+    }
+
+    /// A rejoin that finds another instance holding the lock (or the epoch moved while we were
+    /// away): this one is the replaced one, and it is fenced on the spot.
+    #[test]
+    fn a_rejoin_that_finds_the_lock_gone_elsewhere_fences_us() {
+        let r = drive(
+            &[Script::Held, Script::Lost],
+            &[Rejoin::Replaced(
+                "another lazyview instance took over while disconnected (epoch Some(3), ours 2); stopping",
+            )],
+        );
+        let why = match &r.state {
+            LeaderState::Fenced(why) => why.clone(),
+            other => panic!("expected Fenced, got {other:?}"),
+        };
+        assert!(why.contains("epoch Some(3), ours 2"), "{why}");
+        assert_eq!(Metrics::get(&r.metrics.leader_fenced), 1);
+        assert_eq!(r.rejoins, 1);
+    }
+
+    /// A lock server that is simply away defers the rejoin, it does not fence anyone: our session
+    /// and its lease are the server's business, and a healthy instance with builds running must
+    /// never be ended by a network fault.
+    #[test]
+    fn a_lock_server_that_is_away_only_defers_the_rejoin() {
+        let r = drive(
+            &[Script::Held, Script::Lost, Script::Lost, Script::Held],
+            &[Rejoin::Away, Rejoin::Away, Rejoin::Held],
+        );
+        assert_eq!(
+            r.state,
+            LeaderState::Active,
+            "an unreachable lock server is not a takeover"
+        );
+        assert_eq!(Metrics::get(&r.metrics.leader_fenced), 0);
+        assert_eq!(
+            Metrics::get(&r.metrics.leader_beat_failures),
+            2,
+            "one count per beat that went unanswered, a deferred rejoin is not a second one"
+        );
+        assert_eq!(r.rejoins, 2);
     }
 }
 
