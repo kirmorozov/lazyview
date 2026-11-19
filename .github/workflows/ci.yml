@@ -66,6 +66,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
+  # The skip guard: every `cargo test` step below tees its own output into this directory and
+  # each job ends with a `skip guard` step that fails the job on a printed SKIP or a test
+  # libtest counted as ignored (no allowlist). Pre-release (advisory) legs tee one level deeper,
+  # under advisory/, and their own continue-on-error step judges them: an advisory skip shows
+  # there and never blocks a run.
+  LV_TEST_LOGS: tmp/out/ci-test-logs
 
 jobs:
   lint:
@@ -118,9 +124,32 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo test --lib --bins
-        run: cargo test --locked --lib --bins
+        # `test result: ok` on its own says nothing about the tests that did not run, so the
+        # output is teed for the guard step below.
+        run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
+          cargo test --locked --lib --bins 2>&1 | tee "$LV_TEST_LOGS/lib-bins.log"
       - name: lib tests (feature roaring)
-        run: cargo test --locked --lib --features roaring
+        run: |
+          set -o pipefail
+          cargo test --locked --lib --features roaring 2>&1 | tee "$LV_TEST_LOGS/lib-roaring.log"
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
 
   deny:
     name: "supply-chain (cargo-deny: advisories + licenses)"
@@ -174,7 +203,27 @@ jobs:
       - name: cargo test --lib --bins (feature ${{ matrix.features }})
         # Builds the feature's dependency tree (the aws tree only ever compiles
         # here) and runs the unit tests against it. Required by `release`.
-        run: cargo test --locked --lib --bins --features "${{ matrix.features }}"
+        run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
+          cargo test --locked --lib --bins --features "${{ matrix.features }}" 2>&1 \
+            | tee "$LV_TEST_LOGS/features-${{ matrix.features }}.log"
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
 
   integration:
     # One job per server flavor of docker-compose.test.yml (docs/server-setup.md "Supported
@@ -262,7 +311,11 @@ jobs:
         # --no-fail-fast: run every suite and report all failures, not just the first.
         # The chaos binary (chaos_* scenarios + selftest_toxi_*) runs for real in its own steps
         # below (strict there); filtered out here so it never runs twice.
-        run: cargo test --locked --no-fail-fast --test '*' -- --test-threads=1 --skip targets_pg_ --skip chaos_ --skip selftest_toxi_
+        run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
+          cargo test --locked --no-fail-fast --test '*' -- --test-threads=1 --skip targets_pg_ --skip chaos_ --skip selftest_toxi_ 2>&1 \
+            | tee "$LV_TEST_LOGS/${{ matrix.flavor }}-suites.log"
       # The chaos binary over the toxiproxy daemon (compose profile `chaos`, started above): the
       # harness arms real network faults between the engines and this job's server. always() so a
       # suite failing above never hides these results; a dead daemon or a lost opt-in env fails
@@ -284,7 +337,10 @@ jobs:
           # the proxies, which is the point; setup and oracle queries stay on the admin account (Q4).
           LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           LAZYVIEW_HEALTH_ADDR: "off"
-        run: cargo test --locked --test chaos -- --test-threads=1 selftest_toxi_
+        run: |
+          set -o pipefail
+          cargo test --locked --test chaos -- --test-threads=1 selftest_toxi_ 2>&1 \
+            | tee "$LV_TEST_LOGS/${{ matrix.flavor }}-toxi.log"
       - name: chaos scenarios
         if: always() && !cancelled()
         # Required, like the self-tests above: scripts/chaos-gate.sh fails this step on any chaos
@@ -309,8 +365,24 @@ jobs:
         run: |
           set +o pipefail
           cargo test --locked --test chaos -- --test-threads=1 --color never chaos_ --skip chaos_tgt_pg_ 2>&1 \
-            | tee chaos-scenarios.log
-          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "$FLAVOR" chaos-scenarios.log
+            | tee "$LV_TEST_LOGS/${{ matrix.flavor }}-chaos.log"
+          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "$FLAVOR" "$LV_TEST_LOGS/${{ matrix.flavor }}-chaos.log"
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
       - name: advisory flavor failed
         if: failure() && matrix.advisory
         run: |
@@ -393,12 +465,30 @@ jobs:
         # known ones must show up as passed (a rename would otherwise leave this job green
         # without running them).
         run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
           cargo test --locked --no-fail-fast --test targets --test regressions -- --test-threads=1 \
-            --color never targets_ reg_multi_target_with_one_down 2>&1 | tee multi-server-tests.log
+            --color never targets_ reg_multi_target_with_one_down 2>&1 | tee "$LV_TEST_LOGS/multi-server-tests.log"
           for t in targets_fan_out_and_retarget targets_invalid_configurations_error \
                    targets_one_target_down reg_multi_target_with_one_down; do
-            grep -q "^test $t \.\.\. ok$" multi-server-tests.log || { echo "::error::$t did not run and pass"; exit 1; }
+            grep -q "^test $t \.\.\. ok$" "$LV_TEST_LOGS/multi-server-tests.log" || { echo "::error::$t did not run and pass"; exit 1; }
           done
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
       - name: collect server logs
         if: failure()
         run: |
@@ -492,8 +582,10 @@ jobs:
           # No targets_pg_ test may report SKIP here (the rule the matrix's targets_ legs use).
           LAZYVIEW_TEST_STRICT: "targets_pg_"
         run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
           pgtarget() {
-            local name=$1 port=$2 log="pg-target-$1.log"
+            local name=$1 port=$2 log="$LV_TEST_LOGS/pg-target-$1.log"
             LAZYVIEW_TEST_PG_DSNS="$name=postgres://lv:lv@127.0.0.1:$port/lvtest" \
               cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
               | tee "$log"
@@ -523,14 +615,26 @@ jobs:
           LAZYVIEW_TEST_REQUIRE_MULTI: "1"
           LAZYVIEW_TEST_STRICT: "targets_pg_"
         run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS/advisory"
           cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
-            | tee pg-target-pg19rc2.log
+            | tee "$LV_TEST_LOGS/advisory/pg-target-pg19rc2.log"
           for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
                    targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others \
                    targets_pg_group_by_unindexable_key; do
-            grep -q "^test $t \.\.\. ok$" pg-target-pg19rc2.log \
+            grep -q "^test $t \.\.\. ok$" "$LV_TEST_LOGS/advisory/pg-target-pg19rc2.log" \
               || { echo "::error::pg19rc2: $t did not run and pass"; exit 1; }
           done
+          # The guard for this advisory leg, in the leg's own continue-on-error step: an advisory
+          # skip is shown here and never blocks the run (owner question Q-O6, adopted).
+          adv=$(find "$LV_TEST_LOGS/advisory" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$adv" || { echo "::error::no advisory leg log under $LV_TEST_LOGS/advisory: this leg must tee its output there"; exit 1; }
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $adv) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::pg19rc2 target leg: the skip guard found a skipped or ignored test; this leg must run for real when its server is promoted"
+            exit 1
+          fi
       - name: advisory pg19rc2 target failed
         if: steps.pg19.outcome == 'failure'
         run: |
@@ -565,8 +669,24 @@ jobs:
         run: |
           set +o pipefail
           cargo test --locked --test chaos -- --test-threads=1 --color never chaos_tgt_pg_ 2>&1 \
-            | tee chaos-pg-target-tests.log
-          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "postgres target" chaos-pg-target-tests.log
+            | tee "$LV_TEST_LOGS/chaos-pg-target-tests.log"
+          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "postgres target" "$LV_TEST_LOGS/chaos-pg-target-tests.log"
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
       - name: collect server logs
         if: failure()
         run: |
@@ -673,8 +793,10 @@ jobs:
           # No targets_pg_ test may report SKIP here (same rule the matrix's targets_ legs use).
           LAZYVIEW_TEST_STRICT: "targets_pg_"
         run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
           pgsource() {
-            local name=$1 port=$2 log="pg-target-$1-to-pg16.log"
+            local name=$1 port=$2 log="$LV_TEST_LOGS/pg-target-$1-to-pg16.log"
             LAZYVIEW_TEST_DSNS="$name=mysql://lv:lv@127.0.0.1:$port/lvtest" \
               cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
               | tee "$log"
@@ -708,8 +830,10 @@ jobs:
           LAZYVIEW_TEST_REQUIRE_MULTI: "1"
           LAZYVIEW_TEST_STRICT: "targets_pg_"
         run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS/advisory"
           pgsource() {
-            local name=$1 port=$2 log="pg-target-$1-to-pg16.log"
+            local name=$1 port=$2 log="$LV_TEST_LOGS/advisory/pg-target-$1-to-pg16.log"
             LAZYVIEW_TEST_DSNS="$name=mysql://lv:lv@127.0.0.1:$port/lvtest" \
               cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
               | tee "$log"
@@ -724,12 +848,38 @@ jobs:
           pgsource mariadb130     33130
           pgsource mariadb131-rc  33131
           pgsource mariadb132-pre 33132
+          # The guard for this advisory leg, in the leg's own continue-on-error step: an advisory
+          # skip is shown here and never blocks the run (owner question Q-O6, adopted).
+          adv=$(find "$LV_TEST_LOGS/advisory" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$adv" || { echo "::error::no advisory leg log under $LV_TEST_LOGS/advisory: this leg must tee its output there"; exit 1; }
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $adv) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::advisory source legs: the skip guard found a skipped or ignored test; this leg must run for real when its server is promoted"
+            exit 1
+          fi
       - name: advisory source legs failed
         if: steps.pgsrcadv.outcome == 'failure'
         run: |
           echo "::warning title=advisory sources failed::mysql2610, mariadb130, mariadb131-rc or mariadb132-pre failed against pg16 (advisory, tested but not required for a release): see the pg-target-*-to-pg16 logs"
           echo "### :warning: advisory MySQL-family sources failed against pg16" >> "$GITHUB_STEP_SUMMARY"
           echo "One of mysql2610, mariadb130, mariadb131-rc, mariadb132-pre failed the targets_pg_ scenarios as a source into PostgreSQL 16. It does not block this run; check the log before the flavor is promoted to the blocking set." >> "$GITHUB_STEP_SUMMARY"
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
       - name: collect server logs
         if: failure()
         run: |
@@ -814,6 +964,8 @@ jobs:
           LAZYVIEW_HEALTH_ADDR: "off"
           LAZYVIEW_TEST_REQUIRE_PG: "1"
         run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
           cargo test --locked --no-fail-fast --lib -- --color never --exact \
             dialect::postgres::tests::parse_profile_is_the_postgresql_one \
             dialect::postgres::tests::pg_only_constructs_are_refused \
@@ -822,7 +974,7 @@ jobs:
             pgsrc::tests::keys_need_whole_not_null_columns \
             pgsrc::tests::foreign_keys_keep_only_the_cascading_actions \
             pgsrc::tests::views_are_refused_naming_replica_identity \
-            2>&1 | tee pg-source-tests.log
+            2>&1 | tee "$LV_TEST_LOGS/pg-source-tests.log"
           for t in dialect::postgres::tests::parse_profile_is_the_postgresql_one \
                    dialect::postgres::tests::pg_only_constructs_are_refused \
                    pgsrc::tests::pg_catalog_rows_build_a_table_info \
@@ -830,7 +982,7 @@ jobs:
                    pgsrc::tests::keys_need_whole_not_null_columns \
                    pgsrc::tests::foreign_keys_keep_only_the_cascading_actions \
                    pgsrc::tests::views_are_refused_naming_replica_identity; do
-            grep -q "^test $t \.\.\. ok$" pg-source-tests.log || { echo "::error::$t did not run and pass"; exit 1; }
+            grep -q "^test $t \.\.\. ok$" "$LV_TEST_LOGS/pg-source-tests.log" || { echo "::error::$t did not run and pass"; exit 1; }
           done
       # (2) The phase-3 logical-replication smoke on the live pin, per source major: the four GA
       # majors that are blocking in the grid (pg14 is the AWS-only tier, pg18 the latest GA) plus the
@@ -841,7 +993,7 @@ jobs:
       - name: logical replication smoke (pg16 + pg15 + pg17 + pg18 + pg14, blocking)
         run: |
           smoke() {
-            local name=$1 port=$2 log="smoke-$1.log"
+            local name=$1 port=$2 log="$LV_TEST_LOGS/smoke-$1.log"
             LAZYVIEW_TEST_PG_DSNS="$name=postgres://lv:lv@127.0.0.1:$port/lvtest" \
             LAZYVIEW_HEALTH_ADDR="off" LAZYVIEW_TEST_REQUIRE_PG="1" LAZYVIEW_TEST_STRICT="pgsrc_" \
               cargo test --locked --no-fail-fast --test pgsrc_replication -- --color never --exact \
@@ -861,18 +1013,46 @@ jobs:
         id: smoke19
         continue-on-error: true
         run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS/advisory"
           LAZYVIEW_TEST_PG_DSNS="pg19rc2=postgres://lv:lv@127.0.0.1:35437/lvtest" \
           LAZYVIEW_HEALTH_ADDR="off" LAZYVIEW_TEST_REQUIRE_PG="1" LAZYVIEW_TEST_STRICT="pgsrc_" \
             cargo test --locked --no-fail-fast --test pgsrc_replication -- --color never --exact \
-              pgsrc_replication_decodes_insert_update_delete 2>&1 | tee smoke-pg19rc2.log
-          grep -q "^test pgsrc_replication_decodes_insert_update_delete \.\.\. ok$" smoke-pg19rc2.log \
+              pgsrc_replication_decodes_insert_update_delete 2>&1 | tee "$LV_TEST_LOGS/advisory/smoke-pg19rc2.log"
+          grep -q "^test pgsrc_replication_decodes_insert_update_delete \.\.\. ok$" "$LV_TEST_LOGS/advisory/smoke-pg19rc2.log" \
             || { echo "::error::pg19rc2 smoke failed"; exit 1; }
+          # The guard for this advisory leg, in the leg's own continue-on-error step: an advisory
+          # skip is shown here and never blocks the run (owner question Q-O6, adopted).
+          adv=$(find "$LV_TEST_LOGS/advisory" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$adv" || { echo "::error::no advisory leg log under $LV_TEST_LOGS/advisory: this leg must tee its output there"; exit 1; }
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $adv) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::pg19rc2 source smoke: the skip guard found a skipped or ignored test; this leg must run for real when its server is promoted"
+            exit 1
+          fi
       - name: advisory pg19rc2 smoke failed
         if: steps.smoke19.outcome == 'failure'
         run: |
           echo "::warning title=advisory source failed::pg19rc2 is the pre-release PostgreSQL major (advisory, tested but not required for a release): see the pgsrc smoke logs"
           echo "### :warning: pg19rc2: advisory PostgreSQL source smoke failed" >> "$GITHUB_STEP_SUMMARY"
           echo "PostgreSQL 19rc2 failed the logical-replication source smoke. It does not block this run; check the logs before 19.0 ships, when the leg becomes blocking." >> "$GITHUB_STEP_SUMMARY"
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
       - name: collect server logs
         if: failure()
         run: |
@@ -1153,9 +1333,27 @@ jobs:
           LAZYVIEW_TEST_STRICT: soak_
         shell: bash
         run: |
-          cargo test --locked --test soak -- --test-threads=1 --color never soak_smoke_30m 2>&1 | tee soak-pr.log
-          grep -q "^test soak_smoke_30m \.\.\. ok$" soak-pr.log \
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
+          cargo test --locked --test soak -- --test-threads=1 --color never soak_smoke_30m 2>&1 | tee "$LV_TEST_LOGS/soak-pr.log"
+          grep -q "^test soak_smoke_30m \.\.\. ok$" "$LV_TEST_LOGS/soak-pr.log" \
             || { echo "::error::soak_smoke_30m did not run and pass (the bounded soak skipped?)"; exit 1; }
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
       - name: upload the soak report
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1216,7 +1414,27 @@ jobs:
           LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           LAZYVIEW_TEST_SOAK: smoke
           LAZYVIEW_TEST_STRICT: soak_
-        run: cargo test --locked --test soak -- --test-threads=1 soak_smoke_30m
+        run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
+          cargo test --locked --test soak -- --test-threads=1 soak_smoke_30m 2>&1 \
+            | tee "$LV_TEST_LOGS/soak-smoke-${{ matrix.flavor }}.log"
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
       - name: upload the soak report
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1269,7 +1487,27 @@ jobs:
           LAZYVIEW_TEST_SOAK: long
           LAZYVIEW_TEST_SOAK_MINUTES: "180"
           LAZYVIEW_TEST_STRICT: soak_
-        run: cargo test --locked --test soak -- --test-threads=1 soak_long
+        run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
+          cargo test --locked --test soak -- --test-threads=1 soak_long 2>&1 \
+            | tee "$LV_TEST_LOGS/soak-long-mysql84.log"
+      # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
+      # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
+      # only way to keep this job green is to run every test for real in a job that has its subject.
+      - name: skip guard (no SKIP, no ignored tests)
+        run: |
+          set -o pipefail
+          logs=$(find "$LV_TEST_LOGS" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort) || true
+          test -n "$logs" || { echo "::error::no test log in $LV_TEST_LOGS: every cargo test step must tee its output there"; exit 1; }
+          for f in $logs; do grep -q 'test result:' "$f" || { echo "::error::$f holds no test result line: the tee caught no cargo test output"; exit 1; }; done
+          found=$(grep -HE '\bSKIP|test result:.* [1-9][0-9]* ignored' $logs) || true
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::the skip guard found a skipped or ignored test above: it must run for real in a job that has its subject (no allowlist)"
+            exit 1
+          fi
+          echo "skip guard: $(echo "$logs" | wc -l) log(s), no SKIP line and no ignored test"
       - name: upload the soak report
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
