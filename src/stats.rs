@@ -209,6 +209,10 @@ pub struct Fold {
     pub pending: u64,
     /// Rows kept in the live version's in-memory cascade cache.
     pub cascade_cached_rows: u64,
+    /// Consecutive failed refreshes of the view at the moment of hand-over (the engine's
+    /// `Slot::refresh_failures`: a counter of the attempt streak, not a tally — every flush
+    /// carries the current value, and the next success carries 0).
+    pub refresh_failures: u64,
 }
 
 /// The statistics of one view, owned by the aggregator task.
@@ -225,6 +229,9 @@ struct ViewStats {
     whole: u64,
     last_whole: Option<(&'static str, u64)>,
     last_refresh_unix: u64,
+    /// Consecutive failed refreshes, as the engine last reported them (a successful refresh
+    /// reports 0; see [`Fold::refresh_failures`]).
+    refresh_failures: u64,
 }
 
 impl ViewStats {
@@ -235,6 +242,7 @@ impl ViewStats {
             flush,
             pending,
             cascade_cached_rows,
+            refresh_failures,
             ..
         } = f;
         self.mode = mode;
@@ -252,6 +260,9 @@ impl ViewStats {
             self.last_whole = flush.last_whole;
         }
         self.last_refresh_unix = self.last_refresh_unix.max(flush.last_refresh_unix);
+        // The streak of failed refreshes, not a tally: the value the engine held at hand-over
+        // (every flush re-publishes it, so a dropped fold cannot skew it like a lost count).
+        self.refresh_failures = refresh_failures;
     }
 
     fn snapshot(&self) -> ViewSnapshot {
@@ -280,6 +291,7 @@ impl ViewStats {
             lookup_queries: self.work.lookup_queries,
             flushes: self.refreshes,
             last_flush_unix: self.last_refresh_unix,
+            refresh_failures: self.refresh_failures,
         }
     }
 }
@@ -348,6 +360,11 @@ macro_rules! view_snapshot_fields {
                 series ("flushes", "Refreshes of the view.", true);
             last_flush_unix: u64, json "last_flush_unix",
                 series ("last_flush_timestamp_seconds", "Unix time of the view's last refresh.", false);
+            /// Consecutive failed refreshes (the next success resets it to 0). A view whose
+            /// refresh fails on every attempt stays `ready` (a failed refresh never re-plans or
+            /// rebuilds), so this gauge — not `lazyview_views_error` — is its alert signal.
+            refresh_failures: u64, json "refresh_failures",
+                series ("refresh_failures", "Failed refreshes in a row (the next success resets it).", false);
         }
     };
 }

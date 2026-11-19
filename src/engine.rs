@@ -521,7 +521,9 @@ struct Slot {
     last_plan: Option<Arc<ViewPlan>>,
     /// As [`Version::catalog_head`], for `last_plan`.
     last_plan_head: Option<Position>,
-    /// Consecutive failed refreshes of the live version.
+    /// Consecutive failed refreshes of the live version. Published every flush as
+    /// `lazyview_view_refresh_failures` (see [`Self::publish_stats`] and src/stats.rs): a view
+    /// whose refresh fails on every attempt stays `ready`, so this is its alert signal (O-02).
     refresh_failures: u32,
     /// Re-plan once the build in flight is done (its source data was replaced meanwhile).
     replan_after: bool,
@@ -5330,6 +5332,10 @@ impl Engine {
                     flush: std::mem::take(&mut s.stats),
                     pending,
                     cascade_cached_rows: cached,
+                    // The streak the alerting reads (O-02): one u32 read per view per flush,
+                    // no new per-event work (`Slot::refresh_failures` moves only on a refresh
+                    // outcome; its zeroing is the success path's `std::mem::take`).
+                    refresh_failures: u64::from(s.refresh_failures),
                 }
             })
             .collect();

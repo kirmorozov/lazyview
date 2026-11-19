@@ -28,6 +28,7 @@ fn fold(view: &str, tally: Tally, flush: Flush, pending: u64) -> Fold {
         flush,
         pending,
         cascade_cached_rows: 0,
+        refresh_failures: 0,
     }
 }
 
@@ -261,6 +262,34 @@ fn builds_and_whole_view_refreshes() {
     agg.apply(vec![fold("s.w", Tally::default(), Flush::default(), 0)]);
     let snap = agg.snapshot();
     assert_eq!(snap.views.keys().collect::<Vec<_>>(), ["s.w"]);
+}
+
+/// A view whose refresh keeps failing while it stays `ready` (O-02): the engine's streak
+/// reaches `/metrics` and `/stats` as reported, and the success that ends the streak (a fold
+/// carrying 0) clears it — it is a point-in-time value, not a cumulative counter.
+#[test]
+fn refresh_failure_streak_is_published_and_cleared() {
+    let mut agg = Aggregator::default();
+    let mut f = fold("s.v", Tally::default(), Flush::default(), 0);
+    f.refresh_failures = 3;
+    agg.apply(vec![f]);
+    assert_eq!(agg.view("s.v").refresh_failures, 3);
+    let mut out = String::new();
+    agg.snapshot().write_prometheus(&mut out, |v| v.to_string());
+    assert!(out.contains("# TYPE lazyview_view_refresh_failures gauge\n"));
+    assert!(out.contains("lazyview_view_refresh_failures{view=\"s.v\"} 3\n"));
+    assert_eq!(
+        agg.snapshot().to_json()["views"]["s.v"]["refresh_failures"],
+        3
+    );
+    agg.apply(vec![fold("s.v", Tally::default(), Flush::default(), 0)]);
+    let mut out = String::new();
+    agg.snapshot().write_prometheus(&mut out, |v| v.to_string());
+    assert!(out.contains("lazyview_view_refresh_failures{view=\"s.v\"} 0\n"));
+    assert_eq!(
+        agg.snapshot().to_json()["views"]["s.v"]["refresh_failures"],
+        0
+    );
 }
 
 #[test]

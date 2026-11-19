@@ -1154,6 +1154,289 @@ fn chaos_src_refresh_result_cut() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The alert-state scenario of PR O-2 (review A-03 "Remains", work list #1 / O-01+O-02): the
+// state in which the process keeps running while a view stops advancing — a refresh that fails
+// on every attempt — must be visible on the scrape. `lazyview_view_refresh_failures` climbs to
+// the shipped rule's threshold while `ready`, `/readyz` and `lazyview_views_error` say nothing;
+// `lazyview_refresh_errors_total` (the backstop rule's series) keeps climbing; the next
+// success clears the streak (src/stats.rs, src/engine.rs `publish_stats`).
+// ---------------------------------------------------------------------------------------------
+
+/// The `max` of the `name{view="…"}` series of a `/metrics` body (`None` when the scrape has
+/// none): the left-hand side of the shipped rule `LazyviewRefreshFailing`
+/// (`max by (namespace,job,view)(lazyview_view_refresh_failures)`), evaluated over one live
+/// scrape the way Prometheus would.
+fn view_metric_max(body: &str, name: &str) -> Option<f64> {
+    let prefix = format!("{name}{{view=\"");
+    let mut best: Option<f64> = None;
+    for line in body.lines() {
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((_, v)) = rest.rsplit_once(' ') else {
+            continue;
+        };
+        if let Ok(v) = v.trim().parse::<f64>() {
+            best = Some(best.map_or(v, |b| b.max(v)));
+        }
+    }
+    best
+}
+
+/// One unlabeled series (`name value`) of a `/metrics` body: the instance gauges and counters
+/// the health endpoint exports (`name` matches exactly — the trailing space keeps
+/// `lazyview_views` from matching `lazyview_views_ready`).
+fn metric(body: &str, name: &str) -> Option<f64> {
+    let exact = format!("{name} ");
+    body.lines().find_map(|l| {
+        l.strip_prefix(&exact)?
+            .split_whitespace()
+            .next()?
+            .parse::<f64>()
+            .ok()
+    })
+}
+
+/// The delta of one budget-table counter since a window opened (the table of `Fix::counter`,
+/// readable while the test still owns the engine handle).
+fn counter_after(eng: &Engine, window: &Window, name: &str) -> u64 {
+    counters(eng, &window.0)
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map_or(0, |(_, v)| v)
+}
+
+#[test]
+fn chaos_refresh_failing_while_ready_is_visible() {
+    let _one = toxi::exclusive();
+    scenario("chaos_refresh_failing_while_ready", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        refresh_failing_while_ready(&ctx, &toxi).await
+    });
+}
+
+/// The review's state, made to happen: the refresh's own read of the source dies mid-result-set
+/// on every attempt, and the view keeps its live version — retried with backoff on the same
+/// changes, never re-planned, never rebuilt (owner rule). Everything the probes and the six old
+/// rules read must stay green while the new gauge and the backstop counter climb; after the link
+/// recovers the gauge must clear and the oracle must be exact.
+async fn refresh_failing_while_ready(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
+    let tag = "chaos_ref_fail";
+    let db = ctx.new_db(tag).await?;
+    let _clean = toxi.for_schema(&db.name); // the §2.2 guard, before the first proxy
+    let ids = setup_soak(&db, ctx.sub_seed(tag), small_sizes()).await?;
+    let t1 = ctx.new_db(&format!("{tag}_t1")).await?;
+    // The narrowed neutral set on two direct targets: the fault is only the engine's read link,
+    // so a failing refresh must still leave everything else advancing.
+    let specs: Vec<ViewSpec> = chaos_views()?
+        .into_iter()
+        .map(|s| {
+            if s.kind == Kind::Chained {
+                s
+            } else {
+                s.with_targets("source,t1")
+            }
+        })
+        .collect();
+    let p = toxi
+        .proxy(&db.name, "query", &toxi::upstream(&db.flavor))
+        .await?;
+    toxi.wait_listening(&p).await?;
+    let qdsn = dsn_via_proxy(&engine_dsn(&db), p.listen)?;
+    let mut env: Vec<(String, String)> = target_env(&[("t1", t1.dsn.as_str())]);
+    for (k, v) in [
+        // The same knobs `setup` pins: the engine's own timeouts decide how long a fault lasts.
+        ("LAZYVIEW_HEARTBEAT_MS", "200"),
+        ("LAZYVIEW_TARGET_TIMEOUT_MS", "2000"),
+        ("LAZYVIEW_TEST_QUERY_DSN", qdsn.as_str()),
+        // Pinned to the mode production runs: the refresh's chunk reads then go through the
+        // supervisor's pools, whose reads are bounded, so one cut costs one failed attempt and the
+        // engine's loop returns to the top instead of waiting on one dead read.
+        ("LAZYVIEW_SUPERVISOR", "adaptive"),
+    ] {
+        env.push((k.to_string(), v.to_string()));
+    }
+    let health = free_local_addr()?;
+    env.push(("LAZYVIEW_HEALTH_ADDR".to_string(), health.clone()));
+    let (mut eng, _) = start_with_views(ctx, &db, &specs, &ov_refs(&env)).await?;
+    let mut c = db.conn().await?;
+    eng.wait_caught_up(&mut c, t_catchup()).await?;
+    c.disconnect().await.ok();
+    let window = Window::now(&eng);
+    let mut w = spawn_writers(&db, &ids, ctx.sub_seed(tag));
+    soakchaos::wait_streaming(&mut eng).await?;
+    let errs0 = counter_after(&eng, &window, "refresh_errors");
+    // The fault: the refresh's read of the source dies mid-result-set, on every attempt and on
+    // every retry. `limit_data` passes `bytes` of the downstream and then ends the stream, and its
+    // budget belongs to the connection, so a reconnect does not escape it; a failed refresh keeps
+    // its changes for the next attempt (src/engine.rs `live_end`), so the retry reads the same rows
+    // and dies in the same place — the streak of `REFRESH_ERROR_SHOWN_AFTER` forms on the backoff
+    // ladder. Two faults were tried here first and are the wrong fault on this link, both for the
+    // same reason: they kill the flush's *fence* read as well, and a flush that cannot take its
+    // fence never attempts a refresh at all, so `refresh_failures` would never move — the link
+    // outage (`toxi.disable`, every connect refused) and the black hole (`timeout{timeout:0}`,
+    // §2.6, and these reads carry no timeout of their own).
+    // The fan-out is what makes the lookup big enough to cross the budget: `bytes` is a quarter of
+    // the bytes that go in, derived from the same statements (never a magic guess), as in S-5.
+    const FANOUT: usize = 8_000;
+    let entities = ids.seed_entities.max(2) as usize;
+    let fan_rows = |n: usize, from: i64| {
+        let mut vals = Vec::with_capacity(n);
+        let mut payload = 0usize;
+        for k in 0..n {
+            let row = format!(
+                "(1, {}, {}, 'fan')",
+                (k % (entities - 1)) + 2,
+                from + k as i64
+            );
+            payload += row.len();
+            vals.push(row);
+        }
+        let stmt = format!(
+            "INSERT INTO links (src_id, dst_id, seq, kind) VALUES {}",
+            vals.join(",")
+        );
+        (stmt, payload)
+    };
+    let (stmt, payload) = fan_rows(
+        FANOUT,
+        ids.link_seq.fetch_add(FANOUT as i64, Ordering::Relaxed) + 1,
+    );
+    toxi.arm(
+        &p,
+        &Toxic::limit_data((payload / 4).max(4_096) as u64, Dir::Downstream).named("cut"),
+    )
+    .await?;
+    let mut c = db.conn().await?;
+    txn(&mut c, &[stmt], false).await?;
+    c.disconnect().await.ok();
+    // 1. The rule's condition forms: the per-view streak reaches `REFRESH_ERROR_SHOWN_AFTER`
+    //    (3 = the threshold in `prometheusrule.yaml`). A smaller fan-out every ~2 s keeps the
+    //    pending change set big, so no small retry can slip through and reset the streak.
+    let polls = std::sync::atomic::AtomicU32::new(0);
+    wait_until(
+        "a view's failure streak to reach the rule threshold (lazyview_view_refresh_failures >= 3)",
+        FAULT_BUDGET,
+        || async {
+            let (_, body) = http_get(&health, "/metrics").await?;
+            let streak = view_metric_max(&body, "lazyview_view_refresh_failures").unwrap_or(0.0);
+            let top_up = FANOUT / 4;
+            if streak < 3.0 && polls.fetch_add(1, Ordering::Relaxed) % 40 == 39 {
+                let (stmt, _) = fan_rows(
+                    top_up,
+                    ids.link_seq.fetch_add(top_up as i64, Ordering::Relaxed) + 1,
+                );
+                let mut c = db.conn().await?;
+                txn(&mut c, &[stmt], false).await?;
+                c.disconnect().await.ok();
+            }
+            Ok(streak >= 3.0)
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "the fault never landed on the refresh's read link: {} failed refreshes without \
+             any view reaching the streak of 3",
+            counter_after(&eng, &window, "refresh_errors")
+        )
+    })?;
+    // 2. One scrape, both shipped rule exprs evaluated on it, and the blind spot itself:
+    //    everything the probes and the old rules read still says the instance is healthy.
+    let (status, body) = http_get(&health, "/metrics").await?;
+    ensure!(status == 200, "/metrics answered {status}");
+    ensure!(
+        view_metric_max(&body, "lazyview_view_refresh_failures").unwrap_or(0.0) >= 3.0,
+        "the scraped streak dropped below the threshold between the wait and this scrape"
+    );
+    let views = metric(&body, "lazyview_views").context("no lazyview_views in the scrape")?;
+    let ready = metric(&body, "lazyview_views_ready").context("no lazyview_views_ready")?;
+    let in_error = metric(&body, "lazyview_views_error").context("no lazyview_views_error")?;
+    ensure!(
+        views >= 1.0 && ready == views && in_error == 0.0,
+        "a refresh that fails forever must not move `ready` or `views_error` (that is the \
+         blind spot this alert exists for): views={views} ready={ready} error={in_error}"
+    );
+    ensure!(
+        metric(&body, "lazyview_streaming") == Some(1.0),
+        "only the refresh's read link is cut: the dump link must still be streaming"
+    );
+    let (status, _) = http_get(&health, "/readyz").await?;
+    ensure!(
+        status == 200,
+        "/readyz while a refresh fails forever: {status}"
+    );
+    // The backstop rule's LHS is `increase(lazyview_refresh_errors_total[30m])`: over the one
+    // scrape it is that instance counter having moved. Both sides are read — the scraped series
+    // exists and is above 0, and the engine's own tally moved by at least the 3 attempts the
+    // streak of step 1 implies (`errs0` is the tally before the outage).
+    let scraped = metric(&body, "lazyview_refresh_errors_total");
+    let attempts = counter_after(&eng, &window, "refresh_errors");
+    ensure!(
+        scraped.unwrap_or(0.0) > 0.0 && attempts >= errs0 + 3,
+        "the backstop rule's series (increase(lazyview_refresh_errors_total[30m]) > 0) did not \
+         climb: scraped {scraped:?}, {attempts} failed refreshes in the window (before: {errs0})"
+    );
+    // 3. From the 3rd failure in a row the state rows show the error (the engine writes it at
+    //    exactly the rule's threshold, `REFRESH_ERROR_SHOWN_AFTER`).
+    wait_until(
+        "_lazyview_state.last_error to show the failing refresh",
+        FAULT_BUDGET,
+        || async {
+            let mut c = db.conn().await?;
+            let n: Option<i64> = c
+                .query_first(
+                    "SELECT COUNT(*) FROM _lazyview_state WHERE last_error LIKE 'refresh failed%'",
+                )
+                .await?;
+            c.disconnect().await.ok();
+            Ok(n.unwrap_or(0) > 0)
+        },
+    )
+    .await?;
+    // 4. The resolve side: clear the cut, the next success clears the streak, and what the failed
+    //    attempts kept is applied — never by a rebuild.
+    toxi.remove_toxic(&p, "cut").await?;
+    wait_until(
+        "the streak to clear once refreshes succeed again",
+        FAULT_BUDGET,
+        || async {
+            let (_, body) = http_get(&health, "/metrics").await?;
+            Ok(view_metric_max(&body, "lazyview_view_refresh_failures").unwrap_or(0.0) == 0.0)
+        },
+    )
+    .await?;
+    quiesce_writers(&mut w).await?;
+    let mut c = db.conn().await?;
+    eng.wait_caught_up(&mut c, t_catchup()).await?;
+    c.disconnect().await.ok();
+    verify_targets(
+        ctx,
+        &mut eng,
+        &db,
+        &tmap(&t1),
+        &HashMap::new(),
+        &specs,
+        "after the refresh link recovered",
+    )
+    .await?;
+    ensure!(
+        counter_after(&eng, &window, "full_rebuilds") == 0,
+        "a failing refresh escalated to a whole rebuild; it must be retried, never rebuilt \
+         (the rule of reg_failing_refresh_retries_without_rebuild)"
+    );
+    ctx.log(format!(
+        "failing-while-ready visible: {} failed refreshes behind a green readyz",
+        counter_after(&eng, &window, "refresh_errors")
+    ));
+    eng.check_alive()?;
+    eng.stop().await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // The target-side scenarios (plan §3 rows 6–9): faults on the write link of a target and
 // fragmentation on both sides at once. Everything the engine does to a target goes through that
 // target's proxy (`lv_<schema>_t1`); the harness — DDL, seed, writers, oracle — stays on direct

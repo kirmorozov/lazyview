@@ -66,3 +66,33 @@ spec:
             severity: warning
           annotations:
             summary: "{{ $value }} lazyview view(s) of {{ $labels.job }} in {{ $labels.namespace }} have no live table yet."
+        - alert: LazyviewRefreshFailing
+          # A view whose refresh fails on every attempt keeps its live version and stays
+          # `ready` (a failed refresh is retried with backoff, never re-planned or rebuilt —
+          # owner rule), so LazyviewViewsInError cannot see it and /readyz stays green: this
+          # gauge is the alert signal for that state (review A-03, O-02). The threshold 3 is
+          # REFRESH_ERROR_SHOWN_AFTER (src/engine.rs) — the same streak at which the engine
+          # writes `_lazyview_state.last_error`; `for: 2m` is longer than the 30 s cap of the
+          # refresh retry backoff (src/engine.rs, supervisor::backoff on Policy::READS), so an
+          # attempt that clears on its first retry never alerts. Both are engine settings, not
+          # guesses; tune them in your overlay together with the engine knobs they mirror.
+          expr: max by (namespace, job, view) (lazyview_view_refresh_failures) >= 3
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "View {{ $labels.view }} of {{ $labels.job }} in {{ $labels.namespace }} has failed {{ $value }} refreshes in a row: it is stale while showing ready."
+            description: "SELECT name, target, state, last_error, refreshed_at FROM _lazyview_state WHERE CONCAT('<schema>.', name) = '{{ $labels.view }}' (the label is schema.view; last_error is filled from the 3rd failure)"
+        - alert: LazyviewRefreshErrors
+          # Backstop for the rule above: `refresh_errors` (src/metrics.rs) counts every failed
+          # refresh attempt instance-wide, so a failure that never builds a streak on one view
+          # (views rotating, restarts clearing the streak) still surfaces. The 30 m window
+          # covers a full pass of the retry ladder to its 30 s cap (src/engine.rs); for: 30m
+          # asks the instance to keep failing across two windows, so one transient blip
+          # (a brief target outage cleared on retry 1) never alerts.
+          expr: increase(lazyview_refresh_errors_total[30m]) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "lazyview instance {{ $labels.job }} in {{ $labels.namespace }} keeps failing refreshes ({{ $value }} in the last 30 m)."
