@@ -1664,3 +1664,298 @@ fn reg_cascade_deletes_per_key() {
         eng.stop().await
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// #167 — the replay window after a crash, on the map-cascade route (PR 7, 167-core-refusal-guard)
+// ---------------------------------------------------------------------------------------------
+
+/// (Re)starts the replay's paced writers, the shape of `soak.rs::start_writers`: one task per
+/// writer with its own stop watch, each owning its share of the TPS, seeds derived as the smoke
+/// derives them (`writer{w}` over the run seed).
+async fn spawn_replay_writers(
+    db: &Db,
+    ids: &std::sync::Arc<crate::common::soakwork::SoakIds>,
+    seed: u64,
+    n: usize,
+    per_writer: u32,
+) -> (
+    Vec<tokio::sync::watch::Sender<bool>>,
+    Vec<tokio::task::JoinHandle<Result<usize>>>,
+) {
+    let mut txs = Vec::with_capacity(n);
+    let mut hs = Vec::with_capacity(n);
+    for w in 0..n {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let db = db.clone();
+        let ids = ids.clone();
+        hs.push(tokio::spawn(async move {
+            crate::common::soakwork::run_paced(
+                &db,
+                ids,
+                derive_seed(seed, &format!("writer{w}")),
+                1,
+                per_writer,
+                rx,
+            )
+            .await
+        }));
+        txs.push(tx);
+    }
+    (txs, hs)
+}
+
+/// Joins the replay's writer tasks (they exit when their watch turns).
+async fn join_replay_writers(
+    handles: &mut Vec<tokio::task::JoinHandle<Result<usize>>>,
+) -> Result<u64> {
+    let mut total = 0u64;
+    for h in handles.drain(..) {
+        total += h.await.map_err(anyhow::Error::from)?? as u64;
+    }
+    Ok(total)
+}
+
+/// One exactness check of the replay, the smoke's own pattern (`soak.rs::soak_run`): pause the
+/// writers, join them, `quiesce_and_check`; a row that did not pass names itself in `failed`.
+#[allow(clippy::too_many_arguments)]
+async fn replay_check(
+    ctx: &Ctx,
+    eng: &mut Engine,
+    db: &Db,
+    specs: &[ViewSpec],
+    txs: &mut [tokio::sync::watch::Sender<bool>],
+    hs: &mut Vec<tokio::task::JoinHandle<Result<usize>>>,
+    approved: &mut crate::common::soakcheck::Ledger,
+    what: &str,
+    failed: &mut Vec<String>,
+) -> Result<()> {
+    crate::common::soakcheck::set_writers(txs, true);
+    join_replay_writers(hs).await?;
+    let targets: std::collections::HashMap<String, Db> = std::collections::HashMap::new();
+    let row = crate::common::soakcheck::quiesce_and_check(
+        ctx, eng, db, &targets, specs, txs, approved, what,
+    )
+    .await?;
+    if row.check.pass != Some(true) {
+        failed.push(format!("{}: {:?}", row.check.name, row.check));
+    }
+    Ok(())
+}
+
+/// #167, the live finding (owner escalation 2026-11-18): the per-PR soak smoke run 44307858047
+/// (mysql84, seed 0x37d9e7d0bd6339ee) left `wc_child_only` and `wc_parts_by_item` — cascade
+/// children of `sets` on the map route — holding rows their parent's FK cascade had already
+/// deleted server side, after `crash@+104s`. The seed read at resume had moved the window's
+/// children out of the cache, and the cache under the parent's key still held the surviving
+/// siblings: `feed_mapped_cascade` expanded those and named nothing for the vanished ones, so no
+/// refresh ever healed them (the whole-view mark fired only when the cache named *no* child).
+///
+/// This is the smoke's own replay: the same seed, the same neutral workload, the same schedule
+/// (`plan(SEED, 5, 10, false)` is exactly the one `crash` event at +104 s — the test trips if
+/// that ever changes), the same checks. Fail-before/pass-after: red on origin/main at d885d74..
+/// (the extra `sets_items` rows survive the checks), green with the partial-cache whole-view
+/// mark in `feed_mapped_cascade` / `drain`.
+#[test]
+fn reg_cascade_refusal_seed_replay() {
+    scenario("reg_casc_seed167", |ctx| async move {
+        const SEED: u64 = 0x37d9e7d0bd6339ee;
+        let events = crate::common::soakchaos::plan(SEED, 5, 10, false);
+        ensure!(
+            events.len() == 1
+                && events[0].0 == std::time::Duration::from_secs(104)
+                && matches!(events[0].1, crate::common::soakchaos::Chaos::EngineCrash),
+            "the pinned smoke schedule for seed {SEED:#x} changed: {events:?}"
+        );
+        let specs = crate::common::soakwork::soak_views();
+        let targets = std::collections::HashMap::new();
+        let db = ctx.new_db("reg_casc_seed167").await?;
+        let ids =
+            crate::common::soakwork::setup_soak(&db, SEED, crate::common::workload::Sizes::tiny())
+                .await?;
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &[]).await?;
+        let n_writers = crate::common::soakwork::soak_writers();
+        let per_writer =
+            ((crate::common::soakwork::soak_rate() as usize) / n_writers).max(1) as u32;
+        let began = std::time::Instant::now();
+        let deadline = began + std::time::Duration::from_secs(300);
+        let mut approved = crate::common::soakcheck::Ledger::default();
+        let mut logs: Vec<std::path::PathBuf> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        let (mut txs, mut hs) = spawn_replay_writers(&db, &ids, SEED, n_writers, per_writer).await;
+        let mut next_check = began + std::time::Duration::from_secs(60);
+        let mut done = 0usize;
+        // One crash event, then checks every 60 s and a final one — the smoke's loop
+        // (`soak.rs::soak_run`) narrowed to this schedule.
+        loop {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            if let Some((at, kind)) = events
+                .get(done)
+                .copied()
+                .filter(|(at, _)| began + *at <= std::time::Instant::now())
+            {
+                done += 1;
+                let mut run = crate::common::soakchaos::ChaosRun {
+                    ctx: &ctx,
+                    src: &db,
+                    targets: &targets,
+                    specs: &specs,
+                    writers: &txs,
+                    ov: &[],
+                    logs: &mut logs,
+                    approved: &mut approved,
+                    seed: SEED,
+                    toxi_i: done - 1,
+                };
+                let (row, next) =
+                    crate::common::soakchaos::run_event(&mut run, eng, kind, at).await?;
+                eng = next;
+                if row.check.pass != Some(true) {
+                    failed.push(format!("{}: {:?}", row.check.name, row.check));
+                }
+                // The counters of the run that crashed are gone with it; the window's budget is
+                // measured on the engine that resumed (`Snapshot::since` would underflow across
+                // engines, `soak.rs:310`).
+                let (t2, h2) = spawn_replay_writers(&db, &ids, SEED, n_writers, per_writer).await;
+                txs = t2;
+                hs = h2;
+                continue;
+            }
+            let soon = events
+                .get(done)
+                .map_or(next_check, |(at, _)| began + *at)
+                .min(next_check);
+            if soon > std::time::Instant::now() {
+                tokio::time::sleep(soon - std::time::Instant::now()).await;
+            }
+            if std::time::Instant::now() < next_check {
+                continue; // an event became due while waiting
+            }
+            next_check = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            replay_check(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                &mut txs,
+                &mut hs,
+                &mut approved,
+                &format!("scheduled @+{}s", began.elapsed().as_secs()),
+                &mut failed,
+            )
+            .await?;
+            let (t2, h2) = spawn_replay_writers(&db, &ids, SEED, n_writers, per_writer).await;
+            txs = t2;
+            hs = h2;
+        }
+        replay_check(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            &mut txs,
+            &mut hs,
+            &mut approved,
+            "final",
+            &mut failed,
+        )
+        .await?;
+        join_replay_writers(&mut hs).await.ok();
+        let d = eng.snapshot();
+        ensure!(
+            failed.is_empty(),
+            "the seeded #167 replay (seed {SEED:#x}, crash@+104s) left views stale: {}",
+            failed.join(" | ")
+        );
+        let s = eng.stats_of(&db, "wc_child_only")?;
+        ensure!(
+            s.cascade_gaps >= 1,
+            "the resume replay window never ran on the map route (no cascade gap on \
+             `wc_child_only`): {s:?} — the reproduction did not fire on this flavor"
+        );
+        // The remedy is the whole-view refresh of the window, never a rebuild of the view:
+        // `wc_child_only` is incremental, so its heal shows up as a `whole` and no build.
+        ensure!(
+            s.builds == 0,
+            "`wc_child_only` was not healed by the window's whole-view refresh (or was rebuilt): \
+             {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        let p = eng.stats_of(&db, "wc_parts_by_item")?;
+        ensure!(
+            p.builds == 0,
+            "`wc_parts_by_item` was rebuilt by the window: {p:?}"
+        );
+        ctx.log(format!(
+            "seeded #167 replay exact after crash@+104s: {s:?} / {p:?} {}",
+            fmt_snapshot(&d)
+        ));
+        eng.stop().await
+    });
+}
+
+/// #167 guard (PR 7): a plan whose static route is Dedup but that carries a map cascade must run
+/// on the viewplan executor, and its window must be healed by a refresh, never a rebuild. The
+/// core asked `core_refusal` only for plans whose static route is `Dedup` (`exec.rs::sync`), so
+/// the refusal line in the engine log names both facts; `stats_of` then shows the window's gap
+/// counted and `/stats` the whole run rebuild-free. When `05-cg-core` lands the core's #167
+/// fixes it updates this test and the `core_refusal_*` unit tests together (named in its spec).
+#[test]
+fn reg_cascade_refusal_core_guard() {
+    scenario("reg_casc_coreguard", |ctx| async move {
+        let ddl: Vec<&str> = vec![
+            "CREATE TABLE entities (id INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)",
+            "CREATE TABLE items (id INT UNSIGNED PRIMARY KEY, entity_id INT UNSIGNED NOT NULL, \
+             qty INT NOT NULL, FOREIGN KEY (entity_id) REFERENCES entities (id) \
+             ON DELETE CASCADE ON UPDATE CASCADE)",
+            "INSERT INTO entities VALUES (1, 'e1'), (2, 'e2')",
+            "INSERT INTO items VALUES (11, 1, 1), (12, 1, 2), (21, 2, 3)",
+        ];
+        let specs = vec![ViewSpec::new(
+            "v_items_direct",
+            Kind::Incremental,
+            "SELECT id, entity_id, qty FROM items WHERE qty >= 0",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_casc_coreguard", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let refused = crate::common::soakchaos::grep_log(
+            &eng.log_path,
+            "would leave kept rows stale view=v_items_direct",
+        )?;
+        ensure!(
+            refused.is_some(),
+            "the map-cascade view on a Dedup-routed plan was not refused by the core guard \
+             (no `... would leave kept rows stale view=v_items_direct` line in the engine log): \
+             {refused:?}"
+        );
+        eng.stop().await?;
+        // A parent delete in the resume window: the children are gone server side, the seed read
+        // never sees them, and the cache under the parent's key is empty — the whole-view refresh
+        // of the landed window fix heals it, with no rebuild.
+        exec_all(&mut sc, &["DELETE FROM entities WHERE id = 1"]).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the deleted parent's children after the restart",
+        )
+        .await?;
+        let s = eng.stats_of(&db, "v_items_direct")?;
+        let d = eng.snapshot();
+        ensure!(
+            s.cascade_gaps >= 1 && d.full_rebuilds == 0,
+            "the window's delete was not counted as a gap, or cost a rebuild: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!(
+            "core guard holds; window: {s:?} {}",
+            fmt_snapshot(&d)
+        ));
+        eng.stop().await
+    });
+}

@@ -182,7 +182,23 @@ fn soak_mode(mode: &'static str) {
             return Ok(());
         }
         let dir = run_dir();
-        let seed = ctx.sub_seed("soak");
+        // `LAZYVIEW_TEST_SOAK_SEED` (a u64, decimal or `0x` hex) pins the run's seed: the replay
+        // drill of `soak_minutes` replays a past run's schedule and workload from its reported
+        // seed alone, without knowing the base seed it was derived from.
+        let seed = match std::env::var("LAZYVIEW_TEST_SOAK_SEED") {
+            Ok(v) => {
+                let v = v.trim();
+                match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                    Some(h) => {
+                        u64::from_str_radix(h, 16).expect("LAZYVIEW_TEST_SOAK_SEED is not a u64")
+                    }
+                    None => v
+                        .parse::<u64>()
+                        .expect("LAZYVIEW_TEST_SOAK_SEED is not a u64"),
+                }
+            }
+            Err(_) => ctx.sub_seed("soak"),
+        };
         let mut report = Report::new(mode, seed, &ctx.server().base_dsn, ctx.flavor());
         let mut logs: Vec<PathBuf> = Vec::new();
         ctx.log(format!(

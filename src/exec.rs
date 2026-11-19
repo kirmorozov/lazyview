@@ -1046,6 +1046,70 @@ mod tests {
         );
     }
 
+    /// #167 guard (PR 7, `167-core-refusal-guard`): every cascade route shape stays on the
+    /// viewplan executor until `05-cg-core` lands #167's replay-window fixes on the core.
+    /// `core_refusal` refuses the traced shape by name and *any* other cascade through one shape-
+    /// agnostic arm (`cascades.first()`), so mapped cascades, parent-side routes on a view whose
+    /// child is also routed, and derived / direct / untraced routes alike keep executor (b) — the
+    /// refusal is by plan property, never by table or view names. When the core gains the fixes,
+    /// update exactly these expectations (the `05-cg-core` spec names this test).
+    #[test]
+    fn core_refusal_keeps_every_cascade_shape_on_the_executor() {
+        // A map cascade whose parent is also read by the plan (a parent route on a view whose
+        // child is routed) — the shape the live #167 finding hit (soak seed 0x37d9e7d0bd6339ee).
+        let map = plan_in(
+            "SELECT o.oid, MAX(a.val) AS x FROM obj o \
+             JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 GROUP BY o.oid",
+            &fk_catalog(true),
+        );
+        // The parent read through a partial alias: the cascade is traced.
+        let traced = plan_in(
+            "SELECT c.gid, o.oid, MAX(a.val) AS x, MAX(b.val) AS y FROM link c \
+             JOIN obj o ON o.oid = c.oid JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 \
+             LEFT JOIN obj_attr b ON b.oid = o.oid AND b.aid IN (8, 9) GROUP BY c.gid, o.oid",
+            &fk_catalog(false),
+        );
+        for (what, p, want_traced) in [("map", &map, false), ("traced", &traced, true)] {
+            let access = AccessPlan::of(p);
+            assert!(
+                !access.cascades.is_empty(),
+                "{what}: want a cascade route on the plan"
+            );
+            assert_eq!(
+                access.cascades.iter().any(|c| matches!(c.via, Via::Traced)),
+                want_traced,
+                "{what}: traced route where it should not be: {access:?}"
+            );
+            if !want_traced {
+                assert!(
+                    access
+                        .cascades
+                        .iter()
+                        .any(|c| matches!(c.via, Via::Map { .. })),
+                    "{what}: want a map cascade: {access:?}"
+                );
+            }
+            let why = Dedup::core_refusal(p).unwrap_or_else(|| {
+                panic!("{what}: a cascade plan must keep the executor: {access:?}")
+            });
+            assert!(
+                why.contains(if want_traced {
+                    "traced"
+                } else {
+                    "replay-window"
+                }),
+                "{what}: the refusal must name why this cascade keeps the executor: {why}"
+            );
+        }
+        // The second arm is shape-agnostic (`cascades.first()`), so it refuses every `Via` the
+        // analyzer can emit — including `Derived`, `Direct` and `Untraced` — as long as the plan
+        // carries a cascade; only a plan with no cascade at all is accepted.
+        assert!(
+            Dedup::core_refusal(&plan(DIRECT)).is_none(),
+            "a cascade-free plan is accepted"
+        );
+    }
+
     /// Hop plans keep the executor. Their units come from the core's hop answer cache, which a
     /// change to the partner table in the same window cannot invalidate (the three cases in
     /// `tmp/out/lvs-step6/6t/hops-followup.md`), so `sync` refuses them the way it refuses a

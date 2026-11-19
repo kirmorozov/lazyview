@@ -791,6 +791,18 @@ fn feed_mapped_cascade(
             if !moved.is_empty() && expand(plan, ci, moved, new.as_ref(), dirty) == Fed::Recorded {
                 fed = Fed::Recorded;
             }
+            // A partial cache inside a gap window (the live #167 finding, soak seed
+            // 0x37d9e7d0bd6339ee): the seed read already moved the window's children, so `rows`
+            // can name only *some* of the children kept under `old`, and the marks on those
+            // cannot heal the vanished ones (a delete, or SET NULL / SET DEFAULT leaves them at
+            // no nameable FK). Mark the whole view as in the all-vanished case above — `all`
+            // coalesces, so the window costs at most one refresh per flush, and the marks of the
+            // kept rows above stand. A `moved` side is a CASCADE key update (the children did
+            // not vanish), whose new-side read above is exact, so this arm cannot reach there.
+            if dirty.cache.gap && children_vanish(new.as_ref()) {
+                dirty.mark_all(plan);
+                fed = Fed::Recorded;
+            }
             fed
         }
     }
@@ -1002,6 +1014,15 @@ pub fn drain(plan: &ViewPlan, dirty: &mut ViewDirty, log: Vec<cascade::Logged>) 
                         dirty.mark_all(plan);
                     } else {
                         expand(plan, route, rows, new.as_ref(), dirty);
+                        // A partial cache inside a gap window, as in `feed_mapped_cascade`: the
+                        // seed read already moved the window's children, so `rows` can name only
+                        // some of the children kept under `old` and the marks on those cannot
+                        // heal the vanished ones; mark the whole view too (one refresh per flush
+                        // at most, `all` coalesces). `moved` is non-empty only for a CASCADE
+                        // key update, whose children have not vanished.
+                        if dirty.cache.gap && children_vanish(new.as_ref()) {
+                            dirty.mark_all(plan);
+                        }
                     }
                 }
                 if !moved.is_empty() {
@@ -2000,6 +2021,23 @@ mod tests {
             Fed::Recorded
         );
         assert!(d.all && d.tally.cascade_gaps == 2);
+        // A partial cache inside the window (the live #167 finding, per-PR soak seed
+        // 0x37d9e7d0bd6339ee on mysql84): the seed read already moved the window's children,
+        // so the cache under `old` keeps only some of them and `expand` cannot name the units
+        // the vanished ones left. The kept row is marked and the whole view is marked too — a
+        // refresh of the view, never a rebuild.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        feed_map(&p, to_attrs, &mut d, None, Some(&r1));
+        d.cache.gap = true;
+        assert_eq!(
+            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
+            Fed::Recorded
+        );
+        assert!(
+            d.all && !d.rebuild,
+            "partial-cache gap must mark the view: {d:?}"
+        );
+        assert_eq!(d.tally.cascade_gaps, 1);
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
             feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
