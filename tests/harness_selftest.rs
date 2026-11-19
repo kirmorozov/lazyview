@@ -1,6 +1,7 @@
-//! Self-tests of the integration harness that do not need the engine: fresh schemas, binlog
-//! positions, workload generator + all view SQL on every flavor, the oracle (hand-filled table vs
-//! view, mismatch detection and diff formatting).
+//! Self-tests of the integration harness that do not need the in-process engine: fresh schemas,
+//! binlog positions, workload generator + all view SQL on every flavor, the oracle (hand-filled
+//! table vs view, mismatch detection and diff formatting), and the engine-as-process harness
+//! (`common::engineproc`: the real binary spawned, scraped, sampled and killed).
 //!
 //! The maintenance tools that used to live here (schema cleanup, workload dumping) are
 //! examples: `cargo run --example cleanup_test_schemas`, `cargo run --example dump_workload`.
@@ -10,6 +11,7 @@ mod common;
 use std::sync::Arc;
 
 use anyhow::{bail, ensure};
+use common::engineproc::{self, EngineProc, KillPoint, KillPointPlan, ProcStat, Sample, Scraped};
 use common::oracle::{diff_tables, hand_materialize, Table};
 use common::soakcheck::{
     percentiles, scan_warn_text, slope_kib_per_hour, soak_rss_slope_mib_h, unexpected_warns,
@@ -19,6 +21,10 @@ use common::workload::{
     Txn, Workload,
 };
 use common::*;
+use std::fmt::Write as _;
+use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 #[test]
 fn selftest_schema_and_position() {
@@ -583,4 +589,500 @@ fn selftest_strict_skip_rules() {
     // Strict off, or not covering the test: the skip stays a visible skip.
     assert!(skip_failure(None, "targets_pg_first_build", "no PostgreSQL DSN").is_none());
     assert!(skip_failure(Some("targets_"), "tg_fanout", "no DSN").is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The engine-as-process harness (tests/common/engineproc.rs, plan tmp/out/lvs-perf/plan §PR1)
+// ---------------------------------------------------------------------------------------------
+
+/// The Prometheus reader, on the shape `src/health/prometheus.rs` writes: counters carry `_total`,
+/// gauges are plain, labels are quoted and escaped; and a malformed exposition must not sneak
+/// through. Pure: no server, so it can never print a SKIP.
+#[test]
+fn selftest_engineproc_prom_parse() {
+    let text = "# HELP lazyview_events_total x\n# TYPE lazyview_events_total counter\n\
+                lazyview_events_total 17\nlazyview_flushes_total 3\nlazyview_streaming 1\n\
+                lazyview_inflight_rows 0\nlazyview_applied_binlog_pos{file=\"binlog.000007\"} 4213\n\
+                lazyview_supervisor_max{pool=\"write\",endpoint=\"an\\\"x\"} 4\n\
+                lazyview_heartbeat_age_seconds 1.5\n";
+    let s = Scraped::parse(Instant::now(), text).expect("parse the exposition");
+    assert_eq!(s.counter("events"), 17, "counters carry the _total suffix");
+    assert_eq!(
+        s.gauge("lazyview_streaming"),
+        1.0,
+        "the lazyview_ prefix is optional"
+    );
+    assert_eq!(s.gauge("no_such_metric"), 0.0, "an absent metric reads 0");
+    assert_eq!(
+        s.labelled("supervisor_max", "endpoint", "an\"x"),
+        Some(4.0),
+        "an escaped label value"
+    );
+    assert_eq!(s.gauge("heartbeat_age_seconds"), 1.5, "a fractional gauge");
+    let p = s.applied_position().expect("the applied position");
+    assert_eq!((p.file.as_str(), p.pos), ("binlog.000007", 4213));
+    assert!(s.state_line().contains("streaming=1"), "{}", s.state_line());
+    // Counter deltas; a restart whose counter went back down saturates at 0.
+    let later = Scraped::parse(Instant::now(), "lazyview_events_total 25\n").unwrap();
+    assert_eq!(later.delta(&s, "events"), 8);
+    assert_eq!(s.delta(&later, "events"), 0);
+    for bad in [
+        "lazyview_x",
+        "lazyview_x notanumber",
+        "lazyview_x{a=\"1\" 1",
+        " 5",
+    ] {
+        assert!(
+            engineproc::parse_prometheus(bad).is_err(),
+            "accepted {bad:?}"
+        );
+    }
+}
+
+/// `/proc` parsing on fixtures — a `comm` holding spaces and parentheses is the classic trap — and
+/// the reduction of a sample list: median, peak, the kernel's high-water mark, the CPU delta.
+#[test]
+fn selftest_engineproc_proc_parse() {
+    let line = "42 (lazy view (x)) S 1 42 41 0 -1 0 0 0 0 0 1200 34 0 0 2 0 4195868 0 0 0 0";
+    let (state, ticks) = engineproc::parse_stat(line).expect("parse stat");
+    assert_eq!(state, 'S');
+    assert_eq!(ticks, 1234, "utime+stime, counted from the last `)`");
+    assert_eq!(
+        engineproc::parse_stat("1 (x) S 1"),
+        None,
+        "too few fields is not a reading"
+    );
+
+    let status = "Name:lazyview\nVmRSS:   123456 kB\nRssAnon:     100 kB\nVmHWM:   234567 kB\n";
+    assert_eq!(
+        engineproc::parse_status_mem(status),
+        Some((123456, 234567)),
+        "VmRSS and VmHWM in KiB"
+    );
+    assert_eq!(
+        engineproc::parse_status_mem("Name:lazyview\nVmRSS: 1 kB\n"),
+        None,
+        "a status without VmHWM is not a reading"
+    );
+
+    let st = |state: char, cpu_ticks: u64, rss_kib: u64, vmhwm_kib: u64| ProcStat {
+        state,
+        cpu_ticks,
+        rss_kib,
+        vmhwm_kib,
+    };
+    let samples = vec![
+        Sample {
+            at: Duration::from_millis(0),
+            stat: st('R', 100, 100, 120),
+        },
+        Sample {
+            at: Duration::from_millis(10),
+            stat: st('T', 100, 300, 320),
+        },
+        Sample {
+            at: Duration::from_millis(20),
+            stat: st('T', 100, 200, 320),
+        },
+        Sample {
+            at: Duration::from_millis(30),
+            stat: st('S', 150, 500, 520),
+        },
+        Sample {
+            at: Duration::from_millis(40),
+            stat: st('S', 150, 400, 520),
+        },
+    ];
+    let u = engineproc::reduce_samples(samples);
+    assert_eq!(
+        (u.samples, u.stopped_samples),
+        (5, 2),
+        "the stopped window is counted"
+    );
+    assert_eq!(u.rss_med_kib, 300, "the median of 100,200,300,400,500");
+    assert_eq!((u.rss_first_kib, u.rss_peak_kib), (100, 500));
+    assert_eq!(u.rss_mean_kib, 300);
+    assert_eq!(u.vmhwm_kib, 520, "the kernel's peak, not the sampled one");
+    assert_eq!(u.wall, Duration::from_millis(40));
+    assert!((u.cpu_seconds - 0.5).abs() < 1e-9, "{}", u.cpu_seconds);
+    assert_eq!(
+        engineproc::reduce_samples(vec![]).samples,
+        0,
+        "no samples, no claim"
+    );
+}
+
+/// The kill-point picker: the same seed gives the same sequence (so a red run reproduces), every
+/// point is dealt once per deck (a crash loop covers every mode before any repeats), and `peek` does
+/// not consume the plan.
+#[test]
+fn selftest_engineproc_kill_points_seeded() {
+    let seq = |seed: u64| -> Vec<&'static str> {
+        KillPointPlan::new(seed)
+            .peek(24)
+            .iter()
+            .map(|k| k.name())
+            .collect()
+    };
+    assert_eq!(seq(7), seq(7), "the same seed must give the same sequence");
+    assert_ne!(seq(7), seq(8), "different seeds must differ");
+    for seed in [1u64, 7, 99, 1_234_567] {
+        let s = seq(seed);
+        for k in KillPoint::all() {
+            let n = s[..KillPoint::all().len()]
+                .iter()
+                .filter(|x| **x == k.name())
+                .count();
+            assert_eq!(
+                n,
+                1,
+                "seed {seed}: {} dealt {n} times in the first deck",
+                k.name()
+            );
+        }
+    }
+    let mut p = KillPointPlan::new(3);
+    let expected = p.peek(3);
+    let dealt: Vec<KillPoint> = (0..3).map(|_| p.next()).collect();
+    assert_eq!(expected, dealt, "peek previews exactly what next() deals");
+    assert!(
+        KillPoint::all().contains(&expected[0]),
+        "a point outside the deck"
+    );
+    // Every name is distinct, so a table row per point cannot collide.
+    let names: Vec<&str> = KillPoint::all().iter().map(|k| k.name()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "{names:?}");
+}
+
+/// The sampler against the kernel's own accounting for **one** process: `VmHWM` is what `time -v`
+/// prints as maximum resident set size and `utime+stime` what it prints as user+system (both come
+/// from `getrusage`'s source), so the sampled peak RSS has to land within 5 % of the peak the kernel
+/// recorded. GNU `time` is compared as well when the host has it — it is not installed here, and a
+/// host without it still gets the kernel's numbers, which are the same ones. `sort` on a seeded file:
+/// deterministic, and it holds megabytes in memory, so a 5 % band says something.
+#[test]
+fn selftest_engineproc_sampler_vs_time() {
+    let dir = logs_root().join(format!("selftest-sampler-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("sort-in.txt");
+    let mut r = engineproc::Rng::new(0x243f_6a88_85a3_08d3); // fixed: the same file every run
+    let mut data = String::new();
+    for i in 0..60_000 {
+        writeln!(data, "{:020x} line-{i}", r.next_u64()).unwrap();
+    }
+    assert!(
+        data.len() >= 1 << 20,
+        "the workload is too small to measure: {} B",
+        data.len()
+    );
+    std::fs::write(&input, &data).unwrap();
+    let sort = ["/usr/bin/sort", "/bin/sort"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .expect("sort");
+
+    let (u, gnu) = engineproc::run_measured(
+        &sort,
+        &[input.display().to_string(), "-o".into(), "/dev/null".into()],
+        Duration::from_millis(2),
+    )
+    .expect("run sort under the sampler");
+    engineproc::measured(format!("sampler: {}", u.line()));
+    engineproc::measured(format!("kernel : time -v: {gnu:?}"));
+    assert!(
+        u.samples >= 10,
+        "too few samples to say anything: {}",
+        u.line()
+    );
+    assert!(u.cpu_seconds > 0.0, "sort used no CPU: {}", u.line());
+    assert!(
+        u.rss_peak_kib > u.rss_first_kib,
+        "the sampler never saw the memory grow: {}",
+        u.line()
+    );
+    assert!(
+        u.rss_first_kib <= u.rss_med_kib && u.rss_med_kib <= u.rss_peak_kib,
+        "{}",
+        u.line()
+    );
+    assert!(
+        u.vmhwm_kib >= u.rss_peak_kib,
+        "the kernel's peak below the sampled one: {}",
+        u.line()
+    );
+    // The fidelity claim: at 2 ms the sampled peak came within 5 % of the peak the kernel recorded.
+    let missed = 100.0 - 100.0 * u.rss_peak_kib as f64 / u.vmhwm_kib as f64;
+    assert!(
+        u.vmhwm_kib.saturating_sub(u.rss_peak_kib) <= (u.vmhwm_kib * 5 / 100).max(256),
+        "the sampler missed {missed:.1}% of the peak: {}",
+        u.line()
+    );
+    if let Some(t) = gnu {
+        let near = |a: f64, b: f64, floor: f64| (a - b).abs() <= (a.max(b) * 0.05).max(floor);
+        assert!(
+            near(u.cpu_seconds, t.user_s + t.sys_s, 0.05),
+            "sampler cpu {:.3}s vs time -v {:.3}+{:.3}s",
+            u.cpu_seconds,
+            t.user_s,
+            t.sys_s
+        );
+        assert!(
+            near(u.vmhwm_kib as f64, t.max_rss_kib as f64, 256.0),
+            "sampler vmhwm {}KiB vs time -v {}KiB",
+            u.vmhwm_kib,
+            t.max_rss_kib
+        );
+    } else {
+        println!(
+            "NOTE: /usr/bin/time (GNU time) is not on this host: the kernel's own VmHWM and \
+                  utime+stime were compared, which is what `time -v` reports"
+        );
+    }
+    engineproc::measured(format!(
+        "sampler-test harness peak RSS {} MiB (cap: well under 500)",
+        engineproc::self_vmhwm_mib()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The engine as a real process killed with real signals: `/startupz` answers, `/metrics` is gated by
+/// `LAZYVIEW_HEALTH_TOKEN` and parses, the sampler sees the process, `SIGSTOP` freezes it (its health
+/// endpoint with it — the pull-the-plug model, not a simulation), `SIGCONT` thaws it, and `kill -9`
+/// leaves the signal in the exit status. The timings are printed: PR2's recovery table starts here.
+#[test]
+fn selftest_engineproc_process_lifecycle() {
+    scenario("selftest_engineproc_live", |ctx| async move {
+        let db = ctx.new_db("eplive").await?;
+        let mut e = EngineProc::start(&ctx, &db, &[]).await?;
+        let pid = e.pid();
+        let t_boot = e.wait_startup(Duration::from_secs(60)).await?;
+        engineproc::measured(format!(
+            "startupz: {} pid {pid} answered after {t_boot:.2?} (spawn→health port)",
+            e.label
+        ));
+        ctx.log(format!(
+            "engine {} pid {pid}: /startupz after {t_boot:.2?}, log {}",
+            e.label,
+            e.log_path.display()
+        ));
+        // The open probes answer; `/metrics` is not open to an untokened request.
+        assert_eq!(e.get("/livez", false).await?.0, 200, "/livez is open");
+        assert_eq!(
+            e.scrape_unauthorized().await?,
+            401,
+            "an untokened /metrics must be refused"
+        );
+
+        e.start_sampler(Duration::from_millis(20));
+        let t_stream = e.wait_streaming(Duration::from_secs(90)).await?;
+        let s = e.scrape().await?;
+        assert!(
+            s.samples.iter().any(|p| p.name == "lazyview_events_total"),
+            "the counters block is missing from /metrics"
+        );
+        assert_eq!(s.gauge("streaming"), 1.0);
+        assert_eq!(
+            s.gauge("starting"),
+            0.0,
+            "starting goes to 0 when the stream opens"
+        );
+        engineproc::measured(format!(
+            "streaming: {} reached streaming after {t_stream:.2?}",
+            e.label
+        ));
+        ctx.log(format!(
+            "engine streaming after {t_stream:.2?}; {}",
+            s.state_line()
+        ));
+
+        // SIGSTOP: the process stops, so its health endpoint stops with it.
+        e.freeze()?;
+        let t0 = Instant::now();
+        while engineproc::proc_state(pid) != Some('T') {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "never stopped (state {:?})",
+                engineproc::proc_state(pid)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let frozen = tokio::time::timeout(Duration::from_millis(1500), e.scrape()).await;
+        assert!(frozen.is_err(), "the frozen engine answered /metrics");
+
+        // SIGCONT: the process and its endpoint come back.
+        e.resume()?;
+        let t0 = Instant::now();
+        while !matches!(engineproc::proc_state(pid), Some('R') | Some('S')) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "never resumed (state {:?})",
+                engineproc::proc_state(pid)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            e.get("/livez", false).await?.0,
+            200,
+            "the resumed engine answers again"
+        );
+
+        let u = e.stop_sampler()?;
+        engineproc::measured(format!("sampler: {} pid {pid}: {}", e.label, u.line()));
+        ctx.log(format!("engine {} pid {pid}: {}", e.label, u.line()));
+        assert!(u.samples >= 5, "the sampler saw {} samples", u.samples);
+        assert!(
+            u.rss_med_kib > 0 && u.rss_peak_kib >= u.rss_med_kib,
+            "{}",
+            u.line()
+        );
+        assert!(
+            u.stopped_samples >= 1,
+            "the SIGSTOP window was never sampled: {}",
+            u.line()
+        );
+
+        // kill -9: the kernel closes the sockets, so the servers see the drop and the instance lock
+        // goes with the connection; the harness sees the signal in the exit status.
+        e.kill_now()?;
+        let st = e.wait_exit(Duration::from_secs(10))?;
+        assert_eq!(st.signal(), Some(9), "not killed by SIGKILL: {st:?}");
+        EngineProc::wait_pid_gone(pid, Duration::from_secs(10))?;
+        assert!(e.exit_status().is_some(), "the exit status is recorded");
+        engineproc::measured(format!(
+            "lifecycle-test harness peak RSS {} MiB (cap: well under 500)",
+            engineproc::self_vmhwm_mib()
+        ));
+        Ok(())
+    });
+}
+
+/// The real binary applying real binlog events: a filter/projection view over a neutral `items`
+/// table converges while the process runs, its counters move, an incremental view does not fall back
+/// to a rebuild (`full_rebuilds` delta 0 over the incremental phase), and `SIGTERM` stops it. This is
+/// what PR2 measures the recovery *of*, so the times are printed here first.
+#[test]
+fn selftest_engineproc_applies_changes() {
+    scenario("selftest_engineproc_applies", |ctx| async move {
+        let db = ctx.new_db("epapply").await?;
+        let mut c = db.conn().await?;
+        exec(
+            &mut c,
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, qty INT NOT NULL, kind VARCHAR(16) NOT NULL)",
+        )
+        .await?;
+        ensure_lazyview_table(&mut c).await?;
+        add_definition(
+            &mut c,
+            "CREATE VIEW items_big AS SELECT id, qty FROM items WHERE qty > 100",
+            None,
+        )
+        .await?;
+        c.disconnect().await.ok();
+
+        let mut e =
+            EngineProc::start(&ctx, &db, &[("LAZYVIEW_POSITION_PERSIST_MS", "500")]).await?;
+        let t_boot = e.wait_startup(Duration::from_secs(60)).await?;
+        let t_stream = e.wait_streaming(Duration::from_secs(90)).await?;
+        // /readyz is red until every view has a live version, so green here means the first build is
+        // done and what comes next is the incremental path the rule is about.
+        let t_ready = e.wait_ready(Duration::from_secs(120)).await?;
+        engineproc::measured(format!(
+            "first build: {} startupz {t_boot:.2?}, streaming {t_stream:.2?}, readyz {t_ready:.2?} (spawn→)",
+            e.label
+        ));
+        ctx.log(format!(
+            "engine {} built its first view: startupz {t_boot:.2?}, streaming {t_stream:.2?}, \
+             readyz {t_ready:.2?}",
+            e.label
+        ));
+        let before = e.scrape().await?;
+
+        // The workload, through the source: half the rows are above the filter.
+        let (mut want_n, mut want_sum) = (0i64, 0i64);
+        let mut ins = String::from("INSERT INTO items (id, qty, kind) VALUES ");
+        for id in 1..=500i64 {
+            let qty = if id % 2 == 0 { 150 } else { 50 };
+            if qty > 100 {
+                want_n += 1;
+                want_sum += id;
+            }
+            write!(ins, "({id}, {qty}, 'k{}'),", id % 5).unwrap();
+        }
+        ins.truncate(ins.len() - 1);
+        let mut c = db.conn().await?;
+        exec(&mut c, &ins).await?;
+        c.disconnect().await.ok();
+
+        // The view converges on what the test wrote, compared as aggregates in SQL: the harness never
+        // holds a whole view in memory.
+        let t0 = Instant::now();
+        wait_until(
+            "items_big to hold the rows written after the first build",
+            Duration::from_secs(120),
+            || {
+                // Copies, so the FnMut can be called again after the first future is consumed.
+                let (db, want_n, want_sum) = (&db, want_n, want_sum);
+                async move {
+                    let mut c = db.conn().await?;
+                    let n = count(&mut c, "items_big").await?;
+                    let s =
+                        scalar_i64(&mut c, "SELECT COALESCE(SUM(id), 0) FROM items_big").await?;
+                    c.disconnect().await.ok();
+                    Ok(n == want_n && s == want_sum)
+                }
+            },
+        )
+        .await?;
+        let t_caught = t0.elapsed();
+
+        let after = e.scrape().await?;
+        let events = after.delta(&before, "events");
+        let applied = after.delta(&before, "mv_rows_inserted")
+            + after.delta(&before, "mv_rows_upserted")
+            + after.delta(&before, "mv_rows_deleted");
+        engineproc::measured(format!(
+            "apply: {} applied {applied} MV rows from {events} binlog events, caught up in {t_caught:.2?}, \
+             full_rebuilds delta 0",
+            e.label
+        ));
+        ctx.log(format!(
+            "engine applied {applied} MV rows from {events} binlog events, caught up in {t_caught:.2?}; \
+             {}",
+            after.state_line()
+        ));
+        assert!(events > 0, "the binlog loop read no events");
+        assert!(
+            applied >= want_n as u64,
+            "the engine wrote {applied} MV rows, expected at least {want_n}"
+        );
+        assert_eq!(
+            after.delta(&before, "full_rebuilds"),
+            0,
+            "an incremental view fell back to a full rebuild"
+        );
+
+        // And it stops when asked: the graceful shutdown, whose time is recorded (no budget yet —
+        // PR5 sets budgets from the measured distribution).
+        let t_stop = Instant::now();
+        let st = e.stop()?;
+        engineproc::measured(format!(
+            "stop: {} left on SIGTERM in {:.2?}: {st:?}",
+            e.label,
+            t_stop.elapsed()
+        ));
+        engineproc::measured(format!(
+            "apply-test harness peak RSS {} MiB (cap: well under 500)",
+            engineproc::self_vmhwm_mib()
+        ));
+        ctx.log(format!(
+            "engine stopped in {:.2?}: {st:?}",
+            e.spawned_at.elapsed()
+        ));
+        EngineProc::wait_pid_gone(e.pid(), Duration::from_secs(10))?;
+        Ok(())
+    });
 }

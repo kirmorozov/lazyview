@@ -8,6 +8,9 @@
 
 #![allow(dead_code, unused_imports)]
 
+// The engine as its own process: spawn the real binary, its health endpoints, /proc CPU+RSS, real
+// signals, and the seeded kill-point picker (plan tmp/out/lvs-perf/plan/breakdown.md PR1).
+pub mod engineproc;
 pub mod oracle;
 pub mod pg;
 // The analyzer's test-only renamer (one implementation for unit and integration tests).
