@@ -37,11 +37,22 @@ cp -r deploy/k8s/overlays/example deploy/k8s/overlays/prod
 # overlay and create the Secret yourself once the namespace exists:
 #   kubectl -n lazyview create secret generic lazyview-db --from-literal=LAZYVIEW_HOST=db.example.com \
 #     --from-literal=LAZYVIEW_USER=lazyview --from-literal=LAZYVIEW_PASSWORD='change-me' \
-#     --from-literal=LAZYVIEW_DATABASE=app
+#     --from-literal=LAZYVIEW_DATABASE=lazyview
 kubectl apply -k deploy/k8s/overlays/prod
 kubectl -n lazyview get pods        # with 2 replicas, both READY 1/1: one active, one hot standby
 kubectl -n lazyview logs -l app.kubernetes.io/name=lazyview --prefix | grep -E 'standing by|took over|streaming'
 ```
+
+* The [base manifest](../deploy/k8s/base/deployment.yaml) runs both runs of
+  [one deployment](operations.md#the-two-runs): a `setup` initContainer with `args: ["setup"]`
+  creates and migrates lazyview's own tables and validates the definitions, then the service
+  container starts. It is idempotent and runs on every pod start, so a rollout with a new image is
+  also the upgrade step; a failing setup fails the pod, which the rollout reports
+  (`kubectl -n lazyview rollout undo deployment/lazyview`).
+* Simple setup: the initContainer reads the same Secret `lazyview-db` as the service, so the
+  install is the one `kubectl apply -k` above. Advanced setup (three accounts): give it a Secret of
+  its own with the setup account — the commented `lazyview-setup-db` Secret and patch in
+  `overlays/example/kustomization.yaml` ([server setup](server-setup.md#advanced-setup-recommended-for-production)).
 
 * The base uses `ghcr.io/kirmorozov/lazyview:edge`, built from every push to `main`; it may be
   unstable, so use a release for production — pin one (`newTag: 0.1.0`, the first one), an exact
@@ -115,14 +126,15 @@ read at container start: after
 | endpoint | Deployment probe | fails (503) when | does not fail for |
 |---|---|---|---|
 | `/livez` (alias `/healthz`) | `livenessProbe` | the engine loop has made no progress for `LAZYVIEW_LIVENESS_STALL_SECS` (120), or for `LAZYVIEW_LIVENESS_BOOT_STALL_SECS` (900) while it boots: the process is wedged and a restart fixes it | long builds, database outages, binlog lag, hot standby, views in error |
-| `/startupz` | `startupProbe` | the same as `/livez`; it does not wait for the database (`?verbose` shows the boot phase) | waiting for the database, migrating metadata, acquiring the lock |
+| `/startupz` | `startupProbe` | the same as `/livez`; it does not wait for the database (`?verbose` shows the boot phase) | waiting for the database, checking lazyview's own tables, acquiring the lock |
 | `/readyz` | `readinessProbe` as `/readyz?standby=ok&building=ok` | starting; hot standby (except with `?standby=ok`); binlog disconnected longer than `LAZYVIEW_READY_DISCONNECT_GRACE_SECS` (30); a view with no live table yet (except with `?building=ok`); engine stalled; a view in error, but only with `LAZYVIEW_READY_REQUIRE_ALL=true` | a view rebuilding behind its live table, short reconnects |
 
 * `?verbose` lists the individual checks (Kubernetes apiserver style). `?format=json` or
   `Accept: application/json` returns JSON. `?require_all=1` applies the strict view check for a
   single request. `HEAD` works everywhere.
 * Booting means: connecting to the source (a connect to an unreachable host can take about 130 s),
-  migrating metadata, and after taking the lock loading definitions, resuming views and opening
+  checking lazyview's own tables (the `setup` initContainer has created them; the service issues no
+  DDL there), and after taking the lock loading definitions, resuming views and opening
   the first binlog stream. A standby boots again when it takes over, long after the startupProbe
   passed, so this budget lives in liveness rather than in the startupProbe. A startupProbe that
   waited for the database would restart pods during a database outage, which does not help.
@@ -178,9 +190,10 @@ read at container start: after
     `LazyviewViewsNotLive` reports builds that take more than 2 h.
 * Strategy `RollingUpdate` with `maxSurge: 1, maxUnavailable: 0`. The new pod becomes Ready as a
   standby, then an old pod is terminated. If that pod was the active one, a standby takes over.
-  Standby readiness proves that the image starts, the configuration parses, the source accepts
-  the credentials and the metadata tables are migrated. Target DSNs and connections, the
-  `REPLICATION SLAVE` / `REPLICATION CLIENT` grants and the view definitions are only checked after
+  Standby readiness proves that the image starts, the configuration parses, the source accepts the
+  credentials and the `setup` initContainer passed, so lazyview's own tables are there. Target DSNs
+  and connections, the `REPLICATION SLAVE` / `REPLICATION CLIENT` grants and the view definitions
+  are only checked after
   a pod takes the lock. A release that breaks those still rolls out and fails on takeover; undo it
   with `kubectl -n lazyview rollout undo deployment/lazyview`. `Recreate` also works, but it stops
   everything first.

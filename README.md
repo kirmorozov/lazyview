@@ -7,50 +7,89 @@ a view is a plain table read, and the source tables are never locked.
 
 ## Quickstart
 
-**1. Prepare the database** (once, as an admin). `app` is the schema that holds your tables,
-lazyview's metadata tables and the views.
+lazyview runs in two runs, and each one needs only the rights of its own run:
+
+| run | command | what it does |
+|---|---|---|
+| setup and migration | `lazyview setup` | creates and migrates lazyview's own tables (`_lazyview`, `_lazyview_state`, `_lazyview_status`, `_lazyview_fence`) and logs a plan for every enabled definition; exits `0` when everything is ready. Run it once at install and once per upgrade (the simple setup below uses one account for both runs) |
+| operations | `lazyview` (or `lazyview run`) | the service: streams the binlog and maintains the views. It never creates or alters lazyview's own tables — a missing table or column stops it at startup (exit `2`) with the setup run named as the fix |
+
+**1. Prepare the database** (once, as an admin). lazyview keeps its own tables, and the tables it
+builds for your views, in a schema of its own (`lazyview` below). `app` is the schema that holds
+your tables: lazyview only reads it.
 
 ```sql
-CREATE DATABASE IF NOT EXISTS app;
+CREATE DATABASE IF NOT EXISTS lazyview;
 CREATE USER 'lazyview'@'%' IDENTIFIED BY 'change-me';
-GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lazyview'@'%';
+-- lazyview's own schema: its tables, the view tables it builds there, its probe views:
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, CREATE VIEW, SHOW VIEW
-  ON app.* TO 'lazyview'@'%';
+  ON lazyview.* TO 'lazyview'@'%';
+-- your schema: the sources the views read (lazyview never writes here):
+GRANT SELECT ON app.* TO 'lazyview'@'%';
+-- the binlog stream (global on MySQL / MariaDB, never per schema):
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lazyview'@'%';
 ```
+
+This is the simple setup: one account plays both runs, and it can create and drop tables only in
+lazyview's own schema. [Server setup](docs/server-setup.md#advanced-setup-recommended-for-production)
+is the production layout: three accounts — **setup**, **control** (it alone writes the definitions)
+and **consumption** (the service) — with one `GRANT` script per account.
 
 The binlog must be on, in ROW format with full row images. MySQL and Percona 8.x do that by
 default. MariaDB, RDS and Aurora need some configuration, see [server setup](docs/server-setup.md).
 
-**2. Run it** (database on the Docker host, health port: see [operations](docs/operations.md#running-with-docker)).
+**2. The setup run** (once at install, once per upgrade — the binary, or the same image as a
+one-shot):
+
+```sh
+export LAZYVIEW_DSN=mysql://lazyview:change-me@db.example.com:3306/lazyview
+lazyview setup        # creates and migrates the tables, validates the definitions, exits 0
+docker run --rm -e LAZYVIEW_DSN="$LAZYVIEW_DSN" ghcr.io/kirmorozov/lazyview:0.1.0 setup   # the image
+```
+
+**3. The service** (database on the Docker host, health port: see [operations](docs/operations.md#running-with-docker)).
 
 ```sh
 docker run -d --name lazyview --restart unless-stopped \
   -e LAZYVIEW_HOST=db.example.com \
   -e LAZYVIEW_USER=lazyview \
   -e LAZYVIEW_PASSWORD='change-me' \
-  -e LAZYVIEW_DATABASE=app \
+  -e LAZYVIEW_DATABASE=lazyview \
   ghcr.io/kirmorozov/lazyview:0.1.0
 ```
 
-Releases are tagged `X.Y.Z`, `X.Y` and `latest`; `edge` is built from every push to `main` and may
-be unstable — for trying what is coming, not for production. To try it with a bundled MySQL 8.4, run
-`docker compose -f docker-compose.example.yml up -d --build --wait` from a checkout, or set
-`LAZYVIEW_IMAGE=ghcr.io/kirmorozov/lazyview:0.1.0` to use the published image (see the header of
-[docker-compose.example.yml](docker-compose.example.yml)). Kubernetes: [docs/kubernetes.md](docs/kubernetes.md).
+On Kubernetes the two runs are still one copy-paste step: the
+[base manifest](deploy/k8s/base/deployment.yaml) runs `lazyview setup` in a `setup` initContainer
+before the service container, on every pod start — that is also the upgrade step
+([Kubernetes](docs/kubernetes.md#deploy)).
 
-**3. Define a view.** lazyview creates the `_lazyview` table on startup. Each row is one view, here
-a `CREATE VIEW` statement (or `name` plus a plain `SELECT`).
+```sh
+cp -r deploy/k8s/overlays/example deploy/k8s/overlays/prod   # set the Secret, then:
+kubectl apply -k deploy/k8s/overlays/prod                     # the setup initContainer runs step 2 first
+```
+
+Releases are tagged `X.Y.Z`, `X.Y` and `latest`; `edge` is built from every push to `main` and may
+be unstable — for trying what is coming, not for production. To try both runs at once with a
+bundled MySQL 8.4, run `docker compose -f docker-compose.example.yml up -d --build --wait` from a
+checkout (its `lazyview-setup` one-shot is the setup run, and the service starts once it exits `0`),
+or set `LAZYVIEW_IMAGE=ghcr.io/kirmorozov/lazyview:0.1.0` to use the published image (see the header
+of [docker-compose.example.yml](docker-compose.example.yml)). Kubernetes:
+[docs/kubernetes.md](docs/kubernetes.md).
+
+**4. Define a view** (any client, once the setup run has created `_lazyview`). Each row is one view, here
+a `CREATE VIEW` statement (or `name` plus a plain `SELECT`). An unqualified table name means
+lazyview's own schema, so the sources it reads from your schema are qualified (`app.orders`).
 
 ```sql
-CREATE TABLE orders (id INT PRIMARY KEY, customer VARCHAR(50), total DECIMAL(10,2));
-INSERT INTO orders VALUES (1, 'ann', 10), (2, 'bob', 5), (3, 'ann', 7);
+CREATE TABLE app.orders (id INT PRIMARY KEY, customer VARCHAR(50), total DECIMAL(10,2));
+INSERT INTO app.orders VALUES (1, 'ann', 10), (2, 'bob', 5), (3, 'ann', 7);
 
-INSERT INTO _lazyview (definition) VALUES
+INSERT INTO lazyview._lazyview (definition) VALUES
  ('CREATE VIEW customer_totals AS
-   SELECT customer, SUM(total) AS total, COUNT(*) AS n FROM orders GROUP BY customer');
+   SELECT customer, SUM(total) AS total, COUNT(*) AS n FROM app.orders GROUP BY customer');
 
-SELECT * FROM _lazyview_overview;   -- what each view is doing
-SELECT * FROM customer_totals;      -- a plain table, once built
+SELECT * FROM lazyview._lazyview_overview;   -- what each view is doing
+SELECT * FROM lazyview.customer_totals;      -- a plain table, once built
 ```
 
 `state` is `building`, `ready` or `error` (see `last_error`). `mode` is `incremental` or `full`,
@@ -63,9 +102,9 @@ Later, change the view (the old version stays readable until the new one is read
 (drops the table):
 
 ```sql
-UPDATE _lazyview SET definition = 'SELECT customer, COUNT(*) AS n FROM orders GROUP BY customer'
+UPDATE lazyview._lazyview SET definition = 'SELECT customer, COUNT(*) AS n FROM app.orders GROUP BY customer'
  WHERE name = 'customer_totals';
-DELETE FROM _lazyview WHERE name = 'customer_totals';
+DELETE FROM lazyview._lazyview WHERE name = 'customer_totals';
 ```
 
 Platforms:

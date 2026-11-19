@@ -17,6 +17,24 @@ Value formats:
 * Durations: whole numbers in the unit the name says (`_MS` milliseconds, `_SECS` seconds).
 * Enumerations (`LAZYVIEW_START_MODE`, `LAZYVIEW_TLS`, …): any case.
 
+## The two runs and their accounts
+
+`lazyview setup` (the setup and migration run) and `lazyview` / `lazyview run` (the operations run)
+read the same variables, and each run takes its own account ([the two runs](operations.md#the-two-runs)):
+
+| account | used by | what it needs |
+|---|---|---|
+| setup | `lazyview setup`, at install and at upgrade | DDL on lazyview's own tables, plus the `SELECT` rights that let it plan the definitions |
+| control | whoever writes the definitions (the service never does) | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on `_lazyview` |
+| consumption | the operations run | `SELECT` on `_lazyview`, DML on the status tables, `SELECT` on the sources its views read, DDL for its own view tables, and `REPLICATION SLAVE` / `REPLICATION CLIENT` where it reads the binlog |
+
+The simple setup gives one account all of these; the [server setup](server-setup.md#advanced-setup-recommended-for-production)
+is the production layout and carries one `GRANT` script per account and per layout (a control
+database on the source, a separate control instance, a target instance). Nothing else in this page
+differs between the runs: the setup run reads the connection variables exactly as the operations
+run does, so pointing it at the setup account is a matter of the Secret or the env file you start
+it with.
+
 ## Connection
 
 The source is the server whose binlog lazyview reads. It also holds the metadata tables and is the
@@ -124,7 +142,7 @@ LAZYVIEW_TARGET_REPORTING_DSN=mysql://lazyview:change-me@reporting-db:3306/repor
 | variable | default | meaning |
 |---|---|---|
 | `LAZYVIEW_START_MODE` | `resume` | `resume`: continue from the saved binlog position and reuse existing tables. `rebuild`: rebuild every view, then stream from the current position. `once`: rebuild every view, also those already built, and exit (code `1` if any failed). See [start modes](operations.md#start-modes) |
-| `LAZYVIEW_SYNC` | `true` | `false`: create or migrate the metadata tables, validate every enabled definition, log its mode and its access plan, and compare each plan's fingerprint with the one stored in `_lazyview_state.access`: per (view, target) it logs `access same`, `access changed (stored X, now Y)` or `access new (no state)`. A change is logged, not an error — the exit code is `1` only for invalid definitions, so this works as a CI check. It takes the instance lock first: next to a running instance, give it another `LAZYVIEW_INSTANCE_ID` (for example `ci`) |
+| `LAZYVIEW_SYNC` | `true` | **Deprecated (one release): `false` is an alias of the `lazyview setup` command** — it logs a WARN and does what the setup run does: create or migrate lazyview's own tables, validate every enabled definition, log its mode and its access plan, and compare each plan's fingerprint with the one stored in `_lazyview_state.access`: per (view, target) it logs `access same`, `access changed (stored X, now Y)` or `access new (no state)`. A change is logged, not an error — the exit code is `1` only for invalid definitions, so this works as a CI check. It takes the instance lock first: next to a running instance, give it another `LAZYVIEW_INSTANCE_ID` (for example `ci`). Write `lazyview setup` (with the setup account) instead; see [the two runs](operations.md#the-two-runs) |
 | `LAZYVIEW_FULL_REFRESH_MS` | `60000` | full-mode views are rebuilt at most once per interval. A change marks the view stale; the rebuild starts once the interval since the previous rebuild started has passed. `0` rebuilds as soon as possible. The same limit applies to incremental views that need a rebuild because the affected rows are unknown: a cascading foreign key (see [foreign keys](views.md#foreign-key-cascades)) |
 | `LAZYVIEW_DROP_REMOVED` | `true` | drop the tables of removed or disabled definitions and of removed targets. `false` keeps them (no longer maintained). Tables lazyview did not create are never dropped |
 | `LAZYVIEW_ON_MISSING_BINLOG` | `fail` | the saved binlog file was purged from the server: `fail` exits with an error, `rebuild` rebuilds every view from the current position |

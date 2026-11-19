@@ -1,5 +1,24 @@
 # Operations
 
+## The two runs
+
+lazyview has exactly two kinds of runs, and each account only needs what its run does (the
+accounts and their `GRANT`s: [server setup](server-setup.md#advanced-setup-recommended-for-production)):
+
+| run | command | what it does | account |
+|---|---|---|---|
+| setup and migration | `lazyview setup` | creates and migrates lazyview's own tables (`_lazyview`, `_lazyview_state`, `_lazyview_status`, `_lazyview_fence`) in the configured schema, validates every enabled definition and logs its mode and plan; exits `0` when all is ready, `1` when a definition is invalid. Idempotent, and it builds no view tables and never moves the saved binlog position | setup (DDL on lazyview's own tables) |
+| operations | `lazyview` (or `lazyview run`) | streams the binlog and maintains the views. It never issues DDL on lazyview's own tables: it checks them through `information_schema` with `SELECT` rights only, and a missing table or column is a startup error (exit `2`) naming the fix — run `lazyview setup` with the setup account | consumption (no DDL on lazyview's own tables) |
+
+View tables are **not** lazyview's own tables: their DDL (build, swap, drop) stays in the
+operations run, as always. `lazyview setup` is also a CI check: an invalid definition is exit `1`.
+It takes the instance lock first, so next to a running instance give it another
+`LAZYVIEW_INSTANCE_ID` (for example `ci`).
+
+`LAZYVIEW_SYNC=false` is a **deprecated alias of `lazyview setup`** (one release): it logs a WARN
+and behaves exactly like the setup run. Replace it in scripts and CI with `lazyview setup`, run
+with the setup account.
+
 ## Running with Docker
 
 ```sh
@@ -13,6 +32,11 @@ docker run -d --name lazyview --restart unless-stopped \
 * `lazyview.env` holds `NAME=value` lines (`LAZYVIEW_HOST=…`, `LAZYVIEW_USER=…`,
   `LAZYVIEW_PASSWORD=…`, `LAZYVIEW_DATABASE=…`). This keeps the password out of your shell history.
   Docker takes the values literally: no quotes, no `$` expansion.
+* Before the first start of the service, and once per upgrade, run the setup run with the same
+  file ([the two runs](#the-two-runs)): `docker run --rm --env-file lazyview.env
+  ghcr.io/kirmorozov/lazyview:0.1.0 setup`. It creates and migrates lazyview's own tables and
+  validates the definitions; the operations run above creates and alters none of them and refuses
+  to start until they exist.
 * The image runs as `65532:65532` and writes no files, so `--read-only`, `--cap-drop ALL` and
   `--security-opt no-new-privileges` work.
 * The endpoint binds `127.0.0.1:8080` inside the container, which is not the host: `-p 8080:8080`
@@ -42,21 +66,37 @@ docker run -d --name lazyview --restart unless-stopped \
   `sha-<commit>` is every published build.
   Details: [development](development.md#image).
 
-As a Compose service for an existing database:
+As Compose services for an existing database — the two runs, so the one-shot setup run comes
+first and the service starts only once it exits `0`
+([docker-compose.example.yml](../docker-compose.example.yml) is this, with a database of its own):
 
 ```yaml
 services:
-  lazyview:
+  lazyview-setup:                            # the setup run: once, at install and at upgrade
+    image: ghcr.io/kirmorozov/lazyview:0.1.0
+    command: ["setup"]
+    restart: "no"
+    healthcheck:
+      disable: true                          # the image's HEALTHCHECK probes the service
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment: &db
+      LAZYVIEW_HOST: db.example.com
+      LAZYVIEW_USER: lazyview
+      LAZYVIEW_PASSWORD: change-me
+      LAZYVIEW_DATABASE: lazyview
+  lazyview:                                  # the operations run
     image: ghcr.io/kirmorozov/lazyview:0.1.0
     restart: unless-stopped
+    depends_on:
+      lazyview-setup:
+        condition: service_completed_successfully
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     environment:
-      LAZYVIEW_HOST: db.example.com
-      LAZYVIEW_USER: lazyview
-      LAZYVIEW_PASSWORD: change-me
-      LAZYVIEW_DATABASE: app
+      <<: *db
 ```
 
 Compose expands `$` in the file, so write a `$` in a value as `$$` (`s3cr$$t` for `s3cr$t`).
@@ -74,14 +114,17 @@ docker compose -f docker-compose.example.yml up -d --build --wait
 
 | command | effect |
 |---|---|
-| `lazyview` | run the service (configured by environment variables) |
+| `lazyview` (`lazyview run`) | run the service — the operations run (configured by environment variables); it never issues DDL on lazyview's own tables |
+| `lazyview setup` | the setup and migration run: create and migrate lazyview's own tables, validate every enabled definition and log its mode and plan, then exit (`0` ready, `1` a definition is invalid). Run it as the setup account, once at install and once per upgrade |
 | `lazyview healthcheck` | exit `0` if the running service's `/livez` answers `200` within 3 s, else `1` |
 | `lazyview --version` (`-V`, `version`) | print the version |
 | `lazyview --help` (`-h`, `help`) | short usage |
 
 Exit codes of the service: `0` after a clean stop (SIGTERM or Ctrl-C), after
-`LAZYVIEW_START_MODE=once` and after a successful `LAZYVIEW_SYNC=false` check. `2` for a
-configuration error (`configuration error: …`) or an unknown argument. `1` for any other fatal
+`LAZYVIEW_START_MODE=once` and after a successful `lazyview setup`. `2` for a
+configuration error (`configuration error: …`), an unknown argument, and for a missing
+table or column of lazyview's own (the error names `lazyview setup` with the setup account as
+the fix). `1` for any other fatal
 error (`fatal: …`), including an invalid or schema-less `LAZYVIEW_DSN` and a missing
 `LAZYVIEW_TLS_CA` file (see [configuration](configuration.md)). Run it with a restart
 policy; it resumes from the saved position. To see the last exit and the restart count:
@@ -321,8 +364,9 @@ SELECT id, user, host, time FROM information_schema.PROCESSLIST
 | `rebuild` | rebuild every view, then stream from the current binlog position |
 | `once` | rebuild every view, also those already built, and exit: `0` if all succeeded, `1` if any failed |
 
-`LAZYVIEW_SYNC=false` only creates or migrates the metadata tables and validates the definitions
-(see [views](views.md#defining-a-view)).
+Neither mode creates or migrates lazyview's own tables: that is the job of
+[`lazyview setup`](#the-two-runs), which also checks every definition without building anything
+(see [defining a view](views.md#defining-a-view)).
 
 ## Restart and resume
 
@@ -422,18 +466,23 @@ position for the views of its own instance.
 
 1. Pin the new version (`ghcr.io/kirmorozov/lazyview:X.Y.Z`) and restart the container, or roll
    the Deployment ([Kubernetes](kubernetes.md#rollouts-drains-and-standby)).
-2. At startup, lazyview adds missing columns to its metadata tables. This only adds columns and
-   is safe to run repeatedly.
+2. Run `lazyview setup` with the new version **once, before the new operations run starts**
+   ([the two runs](#the-two-runs)). The new image may need a table or a column the old schema
+   lacks, and the operations run no longer migrates: it checks its own tables and refuses to
+   start (exit `2`) until the setup run has created or migrated them. The setup run only adds
+   columns and is safe to run repeatedly. On Kubernetes the `setup` initContainer does this by
+   itself on every pod start, so `kubectl apply -k` stays a single copy-paste step
+   ([Kubernetes](kubernetes.md#deploy)).
 3. With `LAZYVIEW_START_MODE=resume` (the default) it continues from the saved position. Views
    whose definition and table layout are unchanged are reused; the rest are rebuilt online.
    Select/join views over several tables are rebuilt once when an upgrade adds hidden lineage
    columns to their layout (see [the materialized table](views.md#the-materialized-table)).
 4. Views that are resumed keep their previous `_lazyview_state.mode` and `detail` (`detail` is
    NULL after the upgrade that introduced it) until they are next rebuilt.
-   `LAZYVIEW_SYNC=false` with another `LAZYVIEW_INSTANCE_ID` prints the current classification of
+   `lazyview setup` with another `LAZYVIEW_INSTANCE_ID` prints the current classification of
    every definition.
-5. Before an upgrade you can preview which views plan differently: run `LAZYVIEW_SYNC=false`
-   with another `LAZYVIEW_INSTANCE_ID`. It prints each definition's access plan and, per
+5. Before an upgrade you can preview which views plan differently: run `lazyview setup` of the new
+   image with another `LAZYVIEW_INSTANCE_ID`. It prints each definition's access plan and, per
    (view, target), `access same`, `access changed (stored X, now Y)` or `access new (no state)`.
    A change is not an error — the new binary may plan better — but `access changed` lists the
    views whose routes or traced columns differ from what the running instance stored.
