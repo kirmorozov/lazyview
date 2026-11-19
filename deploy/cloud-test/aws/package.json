@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc",
     "synth": "npm run build && cdk synth --quiet",
-    "test": "npm run build && node --test dist/test/skeleton.test.js"
+    "test": "npm run build && node --test dist/test/*.test.js"
   },
   "dependencies": {
     "aws-cdk-lib": "2.277.0",

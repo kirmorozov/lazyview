@@ -7,8 +7,10 @@
  * the binlog suite pass while testing nothing. Nothing scales — one instance, no storage growth
  * past what the run asks for — so a run that would cost more has nowhere to go.
  *
- * Engine *settings* (binlog format and image, GTID, logical replication) are parameter groups and
- * belong to PR A2; clusters and Multi-AZ failover variants belong to PR A3.
+ * The engine's own settings — binlog format and image, GTID, logical replication — are a parameter
+ * group, and the instance refuses to build without one: an instance that runs on the service's
+ * defaults is not the server the suite thinks it is testing. Clusters and Multi-AZ failover
+ * variants belong to PR A3.
  */
 import { Annotations, Duration, RemovalPolicy } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
@@ -17,6 +19,7 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import { Construct } from 'constructs';
+import type { MatrixParameterGroup } from './params';
 import { MatrixAdminSecret } from './secret';
 
 /** The engine families the matrix runs on RDS, named the way RDS names them. */
@@ -58,6 +61,12 @@ export interface MatrixDbInstanceProps {
   /** Full instance type, e.g. `db.t4g.medium`. */
   readonly instanceType: string;
   readonly secret: MatrixAdminSecret;
+  /**
+   * The engine settings of the target's family, created once per family by the run and shared by
+   * every instance of it. Required: an instance on the service's defaults is a different server
+   * from the one the suite measures.
+   */
+  readonly parameterGroup: MatrixParameterGroup;
   /** Seed schema the bootstrap SQL creates the suite's accounts in. @default DEFAULT_DATABASE_NAME */
   readonly databaseName?: string;
   /** @default DEFAULT_ALLOCATED_STORAGE_GB */
@@ -92,6 +101,10 @@ export class MatrixDbInstance extends Construct {
     if (!INSTANCE_TYPE_PATTERN.test(props.instanceType)) {
       throw new Error(`instance type "${props.instanceType}" is not a full RDS class such as db.t4g.medium`);
     }
+    // The group is shared across a family, so the check that matters is that it is the family of
+    // *this* engine: binlog settings in a group attached to the wrong kind of database configure
+    // nothing, and the run would go on measuring an unconfigured server.
+    assertParameterGroupFamilyFor(props.engine, props.parameterGroup.family);
 
     this.storageEncryptionKey =
       props.storageEncryptionKey ??
@@ -104,7 +117,9 @@ export class MatrixDbInstance extends Construct {
     this.storageEncryptionKey.grantEncryptDecrypt(new iam.ServicePrincipal('rds.amazonaws.com'));
 
     this.instance = new rds.DatabaseInstance(this, 'Db', {
-      engine: engineFor(props.engine, props.engineVersion),
+      engine: instanceEngineFor(props.engine, props.engineVersion),
+      // The family's engine settings, never the service's defaults.
+      parameterGroup: props.parameterGroup.group,
       credentials: rds.Credentials.fromSecret(props.secret.secret, props.secret.username),
       vpc: props.vpc,
       // The run's private subnet group, which the network owns and destroys: a database in here
@@ -156,9 +171,10 @@ export const CFN_ENGINE_VERSION_RULE_ID = 'CloudFormation-Validate::E9006';
 
 /**
  * The engine RDS is asked for, from the full build string. The major is what RDS matches a
- * parameter group family on, so it is taken from the same string rather than a second source.
+ * parameter group family on, so it is taken from the same string rather than a second source — the
+ * instance and its parameter group are both built from it and cannot drift apart.
  */
-function engineFor(engine: MatrixEngine, version: string): rds.IInstanceEngine {
+export function instanceEngineFor(engine: MatrixEngine, version: string): rds.IInstanceEngine {
   const parts = version.split('.');
   if (parts.length < 2 || parts.some((part) => !/^\d+$/.test(part))) {
     throw new Error(`engine version "${version}" is not a full dotted build such as 8.4.13`);
@@ -170,6 +186,19 @@ function engineFor(engine: MatrixEngine, version: string): rds.IInstanceEngine {
     return rds.DatabaseInstanceEngine.mariaDb({ version: rds.MariaDbEngineVersion.of(version, majorOf(version, 2)) });
   }
   return rds.DatabaseInstanceEngine.postgres({ version: rds.PostgresEngineVersion.of(version, majorOf(version, 1)) });
+}
+
+/**
+ * Checks a parameter group family against the engine it is about to configure, and returns it.
+ * RDS names a family after the engine it configures (`mysql8.4`, `mariadb10.11`, `postgres17`), so
+ * a family that does not start with the engine is a group attached to the wrong kind of database:
+ * it would set binlog parameters nothing reads, and the run would measure an unconfigured server.
+ */
+export function assertParameterGroupFamilyFor(engine: MatrixEngine, family: string): string {
+  if (!family.startsWith(engine)) {
+    throw new Error(`parameter group family "${family}" configures something other than a "${engine}" database`);
+  }
+  return family;
 }
 
 function majorOf(version: string, components: number): string {

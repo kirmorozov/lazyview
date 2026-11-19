@@ -15,8 +15,9 @@
  */
 import { App, Stack, type StackProps } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import { MatrixDbInstance, MatrixEngine } from '../lib/db-instance';
+import { instanceEngineFor, MatrixDbInstance, MatrixEngine } from '../lib/db-instance';
 import { MatrixNetwork } from '../lib/network';
+import { MatrixParameterGroup } from '../lib/params';
 import { MatrixAdminSecret } from '../lib/secret';
 import { applyMatrixTags, expiryFromNow } from '../lib/tags';
 
@@ -66,8 +67,20 @@ export class MatrixStack extends Stack {
     this.targets = props.targets;
 
     const network = new MatrixNetwork(this, 'Network');
+    // One parameter group per engine family, shared by every row of that family: the settings are
+    // the family's, and a second copy of them per instance would buy nothing.
+    const parameterGroups = new Map<string, MatrixParameterGroup>();
     for (const target of props.targets) {
       const secret = new MatrixAdminSecret(this, `Admin-${target.id}`);
+      const family = parameterFamilyOf(target);
+      let parameterGroup = parameterGroups.get(family);
+      if (parameterGroup === undefined) {
+        parameterGroup = new MatrixParameterGroup(this, `Params-${family.replace(/[^A-Za-z0-9]/g, '-')}`, {
+          engine: target.engine,
+          engineVersion: target.engineVersion,
+        });
+        parameterGroups.set(family, parameterGroup);
+      }
       new MatrixDbInstance(this, `Db-${target.id}`, {
         vpc: network.vpc,
         subnetGroup: network.databaseSubnetGroup,
@@ -76,9 +89,22 @@ export class MatrixStack extends Stack {
         engineVersion: target.engineVersion,
         instanceType: target.instanceType,
         secret,
+        parameterGroup,
       });
     }
   }
+}
+
+/**
+ * The parameter group family a target's settings belong to. Asked of the engine object rather than
+ * spelled out here, so the group and the instance cannot end up configured for different engines.
+ */
+function parameterFamilyOf(target: MatrixTarget): string {
+  const family = instanceEngineFor(target.engine, target.engineVersion).parameterGroupFamily;
+  if (family === undefined) {
+    throw new Error(`target "${target.id}" runs a build with no parameter group family`);
+  }
+  return family;
 }
 
 export interface MatrixAppProps {

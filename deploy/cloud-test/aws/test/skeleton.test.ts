@@ -15,6 +15,7 @@ import { Match, Template } from 'aws-cdk-lib/assertions';
 import { createMatrixStack, MATRIX_STACK_NAME, RDS_TARGETS } from '../bin/app';
 import { DEFAULT_DATABASE_NAME, exportedLogTypes, MatrixDbInstance, MatrixEngine, MIN_BACKUP_RETENTION_DAYS } from '../lib/db-instance';
 import { MATRIX_VPC_CIDR, MatrixNetwork } from '../lib/network';
+import { MatrixParameterGroup } from '../lib/params';
 import { ADMIN_PASSWORD_LENGTH, DEFAULT_ADMIN_USERNAME, EXCLUDED_PASSWORD_CHARACTERS, MatrixAdminSecret } from '../lib/secret';
 import { EXPIRY_TAG_KEY, MANAGED_BY_TAG_KEY, MANAGED_BY_TAG_VALUE, RUN_ID_TAG_KEY } from '../lib/tags';
 
@@ -282,11 +283,16 @@ test('a database refuses a configuration the service would quietly do something 
 
   const network = new MatrixNetwork(stack, 'ExtraNetwork');
   const secret = new MatrixAdminSecret(stack, 'ExtraSecret');
+  const parameterGroup = new MatrixParameterGroup(stack, 'ExtraParams', {
+    engine: MatrixEngine.MySQL,
+    engineVersion: '8.4.13',
+  });
   const base = {
     vpc: network.vpc,
     subnetGroup: network.databaseSubnetGroup,
     securityGroup: network.databaseSecurityGroup,
     secret,
+    parameterGroup,
     engine: MatrixEngine.MySQL,
     engineVersion: '8.4.13',
     instanceType: 'db.t4g.medium',
