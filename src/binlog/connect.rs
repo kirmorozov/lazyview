@@ -161,8 +161,10 @@ pub(crate) async fn probe_var_retry(conn: &mut Conn, var: &str) -> Result<Option
 /// On MariaDB `log_bin_compress=OFF` is required as well: compressed events (types 165–171)
 /// cannot be decoded by this reader. So is a file binlog: with `binlog_storage_engine=innodb`
 /// (MariaDB >= 12.3) the server only serves binlog dumps that start from a GTID ("GTID starting
-/// position is required on master with --binlog-storage-engine enabled"), and this reader
-/// starts and resumes from a file and offset.
+/// position is required on master with --binlog-storage-engine enabled"), and a first build has
+/// no GTID set to start from — it starts by file and offset, and so does every saved cursor
+/// written before GTID starts (the flavor module's `dump_gtid_list` serves the ones that do
+/// carry a set). The requirement therefore stays until the engine always resumes by GTID.
 pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     let row: Row = conn
         .query_first(
@@ -293,8 +295,10 @@ pub(super) fn requirement_problems(
     if maria && !storage_engine.is_empty() {
         problems.push(format!(
             "binlog_storage_engine is {storage_engine} (must be unset: a binlog kept in the \
-             storage engine is only served to replicas that start from a GTID, {} reads \
-             it by file and position); fix: remove binlog_storage_engine from my.cnf and restart",
+             storage engine is only served to replicas that start from a GTID, and {} still \
+             starts by file and position whenever the saved cursor carries no GTID set — a \
+             first build never has one); fix: remove binlog_storage_engine from my.cnf and \
+             restart",
             product().0
         ));
     }

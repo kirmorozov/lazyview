@@ -714,8 +714,9 @@ fn default_program_names_in_messages() {
         requirement_problems(Flavor::MariaDb, "ON", "row", "full", "OFF", "innodb"),
         vec![
             "binlog_storage_engine is innodb (must be unset: a binlog kept in the storage engine \
-             is only served to replicas that start from a GTID, lazyview reads it by file and \
-             position); fix: remove binlog_storage_engine from my.cnf and restart"
+             is only served to replicas that start from a GTID, and lazyview still starts by \
+             file and position whenever the saved cursor carries no GTID set — a first build \
+             never has one); fix: remove binlog_storage_engine from my.cnf and restart"
                 .to_string()
         ]
     );
