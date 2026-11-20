@@ -60,7 +60,7 @@ import {
   REQUIRE_SECURE_TRANSPORT_PARAMETER,
 } from '../lib/params';
 import { DEFAULT_ADMIN_USERNAME, MatrixAdminSecret } from '../lib/secret';
-import { failoverZones, MIN_STANDBY_INSTANCES } from '../lib/multiaz';
+import { failoverZones, MIN_STANDBY_INSTANCES, requireStandby } from '../lib/multiaz';
 import { EXPIRY_TAG_KEY, MANAGED_BY_TAG_KEY, MANAGED_BY_TAG_VALUE, RUN_ID_TAG_KEY } from '../lib/tags';
 
 const RUN_ID = 'test-run';
@@ -196,6 +196,65 @@ test('every Aurora row is a cluster with a writer and a reader in a zone of its 
         `${node.id}: an untagged node is invisible to cleanup and to the budget alarm`,
       );
     }
+  }
+});
+
+/**
+ * The reader fan-out no row reaches: every `AURORA_TARGETS` row asks for the one reader a failover
+ * promotes, so the rows above synthesize two nodes over two zones and the loop that builds the
+ * readers runs exactly once. A change that dropped the second reader, or gave both readers the same
+ * zone, would leave those rows green. Three nodes over three zones is what makes both the fan-out and
+ * the per-node zone pick observable; the zones are named here because the assertion is about the
+ * spread, and a stack with no region has only indices to compare.
+ */
+test('a cluster with two readers gives every node a zone of its own', () => {
+  const expiry = futureExpiry();
+  const zones = ['us-east-1a', 'us-east-1b', 'us-east-1c'];
+  // An instance row, so the only cluster in the template is the one this test composes.
+  const stack = createMatrixStack(new App(), { targets: ['rds-pg-17'], expiry, runId: RUN_ID });
+  const network = stack.node.findChild('Network') as unknown as MatrixNetwork;
+  const secret = new MatrixAdminSecret(stack, 'FanOutSecret');
+  const group = new MatrixClusterParameterGroup(stack, 'FanOutGroup', {
+    engine: MatrixClusterEngine.AuroraMySQL,
+    engineVersion: '8.0.mysql_aurora.3.12.0',
+  });
+  new MatrixAuroraCluster(stack, 'FanOutCluster', {
+    vpc: network.vpc,
+    subnetGroup: network.databaseSubnetGroup,
+    securityGroup: network.databaseSecurityGroup,
+    engine: MatrixClusterEngine.AuroraMySQL,
+    engineVersion: '8.0.mysql_aurora.3.12.0',
+    instanceType: 'db.t4g.medium',
+    secret,
+    clusterParameterGroup: group,
+    readers: 2,
+    availabilityZones: zones,
+  });
+  const template = Template.fromStack(stack);
+
+  const clusters = resourcesOf(template, 'AWS::RDS::DBCluster');
+  assert.equal(clusters.length, 1, 'the run has the one cluster this row composes');
+  const [clusterId] = clusters[0]!;
+  const nodes = nodesOfCluster(template, clusterId);
+  assert.equal(nodes.length, 3, 'a writer and the two readers the row asks for');
+  assert.equal(
+    nodes.filter((node) => node.id.includes('Reader')).length,
+    2,
+    'both readers are there: drop one and the scenario promotes whatever the outage leaves',
+  );
+
+  const picked = nodes.map((node) => node.properties.AvailabilityZone);
+  assert.equal(new Set(picked).size, 3, `${picked.join(', ')} — three nodes, three distinct zones`);
+  assert.deepEqual(
+    [...picked].sort(),
+    [...zones].sort(),
+    'every node of the row lands in a zone of its own: two nodes in one zone is a copy, not a failover',
+  );
+
+  for (const node of nodes) {
+    assert.equal(node.properties.DBInstanceClass, 'db.t4g.medium', `${node.id}: a second reader is a second node the row prices`);
+    assert.equal(node.properties.PubliclyAccessible, false, `${node.id}: no node of the run is reachable from outside the VPC`);
+    assert.deepEqual(tagValues(node.properties.Tags), expectedTags(expiry), `${node.id}: an untagged node is invisible to cleanup`);
   }
 });
 
@@ -392,6 +451,12 @@ test('a cluster asks for the settings of its own engine family and refuses a row
   // And a row cannot be failed over inside one zone.
   assert.throws(() => failoverZones(['us-east-1a'], 2, 'cluster node'), /at least 2 availability zones/);
   assert.throws(() => failoverZones(['us-east-1a', 'us-east-1a'], 2, 'cluster node'), /repeat themselves/);
+  // Distinct zones are not enough: a row with more nodes than the run has zones would have to put
+  // two of them in one, which is the copy this whole file refuses.
+  assert.throws(() => failoverZones(['us-east-1a', 'us-east-1b'], 3, 'cluster node'), /need 3 availability zones/);
+  // The count has to be a number of nodes, not a number that rounds up to one: a fractional reader
+  // is a node the service cannot be asked for, and a run that built one would measure nothing.
+  assert.throws(() => requireStandby('reader', 1.5), /at least 1 reader/);
   assert.throws(() => assertClusterParameterGroupFamilyFor(MatrixClusterEngine.AuroraMySQL, 'aurora-postgresql16'), /configures something other than/);
   assert.equal(assertClusterParameterGroupFamilyFor(MatrixClusterEngine.AuroraPostgreSQL, 'aurora-postgresql16'), 'aurora-postgresql16');
 });
