@@ -1103,11 +1103,129 @@ mod tests {
         }
         // The second arm is shape-agnostic (`cascades.first()`), so it refuses every `Via` the
         // analyzer can emit — including `Derived`, `Direct` and `Untraced` — as long as the plan
-        // carries a cascade; only a plan with no cascade at all is accepted.
+        // carries a cascade; only a plan with no cascade at all is accepted. One plan per those
+        // remaining kinds, each with NO traced route (so the answer cannot come from the first
+        // arm) and each expected to name the replay-window reason.
+        for (what, wanted, candidates) in [
+            (
+                "derived",
+                (|v: &Via| matches!(v, Via::Derived { .. })) as fn(&Via) -> bool,
+                &[
+                    (false, "SELECT a.id, a.val FROM obj_attr a WHERE a.aid = 7"),
+                    (
+                        false,
+                        "SELECT c.gid, c.oid, MAX(a.val) AS x FROM link c \
+                         JOIN obj_attr a ON a.oid = c.oid AND a.aid = 7 GROUP BY c.gid, c.oid",
+                    ),
+                    (
+                        false,
+                        "SELECT g.gid, COUNT(*) AS n, MAX(a.val) AS x FROM grp g \
+                         JOIN link c ON c.gid = g.gid JOIN obj_attr a ON a.oid = c.oid \
+                         AND a.aid = 7 GROUP BY g.gid",
+                    ),
+                ][..],
+            ),
+            (
+                "direct",
+                (|v: &Via| matches!(v, Via::Direct { .. })) as fn(&Via) -> bool,
+                &[
+                    (
+                        false,
+                        "SELECT a.oid, MAX(a.val) AS x FROM obj_attr a GROUP BY a.oid",
+                    ),
+                    (
+                        false,
+                        "SELECT c.oid, COUNT(*) AS n, MAX(a.val) AS x FROM link c \
+                         JOIN obj_attr a ON a.oid = c.oid GROUP BY c.oid",
+                    ),
+                    (
+                        true,
+                        "SELECT c.oid, COUNT(*) AS n FROM link c GROUP BY c.oid",
+                    ),
+                ][..],
+            ),
+            (
+                "untraced",
+                (|v: &Via| matches!(v, Via::Untraced { .. })) as fn(&Via) -> bool,
+                &[
+                    // `note` has no key: the cascade map cannot keep its rows, so the route is
+                    // neither unit, traced, derived nor mapped — the shape with no route at all.
+                    (
+                        true,
+                        "SELECT g.gid, COUNT(*) AS n, MAX(t.w) AS x FROM grp g \
+                         JOIN link c ON c.gid = g.gid LEFT JOIN note t ON t.oid = c.oid \
+                         GROUP BY g.gid",
+                    ),
+                    (
+                        true,
+                        "SELECT g.gid, COUNT(*) AS n, MAX(t.w) AS x FROM grp g \
+                         JOIN link c ON c.gid = g.gid JOIN obj o ON o.oid = c.gid \
+                         LEFT JOIN note t ON t.oid = o.oid GROUP BY g.gid",
+                    ),
+                ][..],
+            ),
+        ] {
+            let (p, access) = plan_for_via(what, wanted, candidates);
+            assert!(
+                !access.cascades.is_empty(),
+                "{what}: want a cascade route on the plan"
+            );
+            assert!(
+                !access.cascades.iter().any(|c| matches!(c.via, Via::Traced)),
+                "{what}: no traced route here, so only the shape-agnostic arm can answer: \
+                 {access:?}"
+            );
+            let why = Dedup::core_refusal(&p).unwrap_or_else(|| {
+                panic!("{what}: a cascade plan must keep the executor: {access:?}")
+            });
+            assert!(
+                why.contains("replay-window"),
+                "{what}: the shape-agnostic arm must name why this cascade keeps the executor: \
+                 {why}"
+            );
+        }
         assert!(
             Dedup::core_refusal(&plan(DIRECT)).is_none(),
             "a cascade-free plan is accepted"
         );
+    }
+
+    /// The first formulation of `candidates` that puts a cascade of route kind `wanted` on a
+    /// plan carrying no traced cascade at all, so `core_refusal` answers it through the
+    /// shape-agnostic arm alone. The candidates are the analyzer's own fixtures for that shape
+    /// (`(map_shape, sql)` over `fk_catalog`): a formulation the analyzer rejects, or that
+    /// routes another way, is passed over, and a `wanted` none of them yields fails the test —
+    /// the guard names the shape, so it is pinned, not skipped.
+    fn plan_for_via(
+        what: &str,
+        wanted: fn(&Via) -> bool,
+        candidates: &[(bool, &str)],
+    ) -> (Arc<ViewPlan>, AccessPlan) {
+        let mut tried: Vec<String> = Vec::new();
+        for (map_shape, sql) in candidates {
+            let built = crate::analyze::parse_definition(&format!("CREATE VIEW v AS {sql}"))
+                .ok()
+                .and_then(|d| crate::analyzer::plan(&d, "db", &fk_catalog(*map_shape)).ok());
+            let Some(p) = built else {
+                tried.push(format!("{sql}: no plan"));
+                continue;
+            };
+            let p = Arc::new(p);
+            let access = AccessPlan::of(&p);
+            let holds = access.cascades.iter().any(|c| wanted(&c.via));
+            let traced = access.cascades.iter().any(|c| matches!(c.via, Via::Traced));
+            if !holds || traced {
+                let vias: Vec<String> = access
+                    .cascades
+                    .iter()
+                    .map(|c| format!("{:?}", c.via))
+                    .collect();
+                tried.push(format!("{sql}: vias {vias:?}"));
+                continue;
+            }
+            return (p, access);
+        }
+        panic!("no {what} cascade among the fixtures: {tried:?}");
     }
 
     /// Hop plans keep the executor. Their units come from the core's hop answer cache, which a

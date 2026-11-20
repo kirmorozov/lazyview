@@ -2662,4 +2662,287 @@ mod tests {
         assert!(dirty.cache.rows(0).unwrap().rows.contains_key(&key));
         assert_eq!(dirty.cache.rows(0).unwrap().rows.get(&key), Some(&row));
     }
+
+    /// A binlog row of `n` INT columns; `None` is an absent column (it decodes to NULL).
+    fn part_row(vals: &[Option<i64>]) -> BinlogRow {
+        BinlogRow::new(
+            vals.iter()
+                .map(|v| v.map(|v| BinlogValue::Value(mysql_async::Value::Int(v))))
+                .collect(),
+            std::sync::Arc::from(
+                vals.iter()
+                    .map(|_| {
+                        mysql_async::Column::new(mysql_async::consts::ColumnType::MYSQL_TYPE_LONG)
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    }
+
+    /// [`part_row`] with every column present.
+    fn full_row(vals: &[i64]) -> BinlogRow {
+        part_row(&vals.iter().map(|&v| Some(v)).collect::<Vec<_>>())
+    }
+
+    /// The #167 gap fixtures for `feed_mapped_cascade` and [`drain`]: `ent` is a parent the view
+    /// does not read, with a two-column key; `notes` hangs under it on one of its columns and
+    /// `subs` on both. Both routes are cascade maps (the child has a key, nothing pins the FK),
+    /// so both sites see them as a mapped cascade.
+    fn gap_plan() -> ViewPlan {
+        use std::sync::Arc;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, FkAction, ForeignKey, TableInfo};
+
+        let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+        let fk =
+            |child_cols: Vec<usize>, parent_cols: &[&str], on_delete: &str, on_update: &str| {
+                ForeignKey {
+                    parent: ("db".into(), "ent".into()),
+                    child_cols,
+                    parent_cols: parent_cols.iter().map(|s| (*s).to_string()).collect(),
+                    // The server's referential rule text, as the catalog decodes it: SET DEFAULT
+                    // arrives as SetNull (`FkAction::parse`), the same no-nameable-FK shape.
+                    on_delete: FkAction::parse(on_delete),
+                    on_update: FkAction::parse(on_update),
+                }
+            };
+        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades| {
+            (
+                ("db".to_string(), name.to_string()),
+                Arc::new(TableInfo {
+                    schema: "db".into(),
+                    name: name.into(),
+                    columns,
+                    pk,
+                    unique_keys: vec![],
+                    cascades,
+                    is_view: false,
+                    view_bases: vec![],
+                }),
+            )
+        };
+        let tables: std::collections::HashMap<_, _> = [
+            table("grp", vec![int("gid")], vec![0], vec![]),
+            table("ent", vec![int("id"), int("ver")], vec![0], vec![]),
+            // The bridge the view reads the children through, joined on their FK columns: a
+            // change of those columns is then a change of the alias's image, so a kept row that
+            // vanishes or moves is a change the replay can buffer.
+            table(
+                "link",
+                vec![int("gid"), int("eid"), int("ver")],
+                vec![0, 1, 2],
+                vec![],
+            ),
+            table(
+                "notes",
+                vec![int("nid"), int("eid"), int("val")],
+                vec![0],
+                vec![fk(vec![1], &["id"], "SET DEFAULT", "SET NULL")],
+            ),
+            table(
+                "subs",
+                vec![int("sid"), int("eid"), int("ver"), int("val")],
+                vec![0],
+                vec![fk(vec![1, 2], &["id", "ver"], "CASCADE", "CASCADE")],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        plan(
+            &parse_definition(
+                "CREATE VIEW v AS SELECT g.gid, COUNT(*) AS n, MAX(w.val) AS x, MAX(v.val) AS y \
+                 FROM grp g JOIN link c ON c.gid = g.gid JOIN notes w ON w.eid = c.eid \
+                 JOIN subs v ON v.eid = c.eid AND v.ver = c.ver GROUP BY g.gid",
+            )
+            .unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap()
+    }
+
+    /// The route of these fixtures' mapped cascade, with the shape the mark's arm depends on
+    /// pinned (a map, not unit / traced / derived, no bound on the keys that reach the view).
+    fn gap_route(p: &ViewPlan, child: &str, cols: usize) -> usize {
+        let ci = p
+            .cascades
+            .iter()
+            .position(|c| c.child.1 == child)
+            .unwrap_or_else(|| panic!("{}: {:?}", child, p.cascades));
+        let c = &p.cascades[ci];
+        assert!(
+            matches!(p.mode, Mode::Grouped)
+                && c.map.is_some()
+                && !c.traced
+                && !c.derived
+                && c.unit_from_parent.is_none()
+                && c.reach.is_none()
+                && c.child_cols.len() == cols
+                && c.parent_cols == (0..cols).collect::<Vec<_>>(),
+            "{child}: these cases pin the cascade-MAP arm: {c:?} ({:?})",
+            p.mode
+        );
+        ci
+    }
+
+    /// The gap-window mark covers every way the children vanish from where the cascade map keeps
+    /// them — a parent delete leaves them no new FK at all, the SET NULL / SET DEFAULT the fix's
+    /// comment names leaves them a new FK of all NULLs, and these are different arms of
+    /// `feed_mapped_cascade`'s `new` — at both sites that decide it. Each case holds a child
+    /// under the old key, so the marks on the kept rows alone would leave the vanished ones
+    /// stale: the whole view is marked, never rebuilt.
+    #[test]
+    fn gap_window_marks_the_view_for_every_way_children_vanish() {
+        let p = gap_plan();
+        let notes = gap_route(&p, "notes", 1);
+        let fk10: Key = vec![Datum::Int(10)].into();
+        let nulls: Key = vec![Datum::Null].into();
+        let kept = |p: &ViewPlan, d: &mut ViewDirty| {
+            assert_eq!(
+                feed_map(p, notes, d, None, Some(&full_row(&[1, 10, 5]))),
+                Fed::Skipped,
+                "the child is kept under the old FK (a ready cache is in memory only)"
+            );
+            d.cache.gap = true;
+        };
+        // The feed site, a parent KEY update under SET NULL.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        kept(&p, &mut d);
+        assert_eq!(
+            feed_cascade(
+                &p,
+                notes,
+                &mut d,
+                Some(&full_row(&[10, 1])),
+                Some(&full_row(&[11, 1]))
+            ),
+            Fed::Recorded
+        );
+        assert!(
+            d.all && !d.rebuild,
+            "SET NULL on update must mark the whole view: {d:?}"
+        );
+        assert_eq!(d.tally.cascade_gaps, 1);
+        // The feed site, a parent DELETE under SET DEFAULT: the children are set to NULL rather
+        // than deleted, so they are gone from the cache without a key to name them by.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        kept(&p, &mut d);
+        assert_eq!(
+            feed_cascade(&p, notes, &mut d, Some(&full_row(&[10, 1])), None),
+            Fed::Recorded
+        );
+        assert!(
+            d.all && !d.rebuild,
+            "SET DEFAULT on delete must mark the whole view: {d:?}"
+        );
+        // The drain site: the same vanishings re-applied to the installed cache, with a child
+        // kept under the old key and with none (the all-vanished arm of the two it takes).
+        for (what, keep) in [
+            ("a child kept under the old key", true),
+            ("none kept", false),
+        ] {
+            let mut d = ViewDirty::for_aliases(p.aliases.len());
+            if keep {
+                kept(&p, &mut d);
+            } else {
+                d.cache.gap = true;
+            }
+            drain(
+                &p,
+                &mut d,
+                vec![cascade::Logged::Parent {
+                    route: notes,
+                    old: fk10.clone(),
+                    new: Some(nulls.clone()),
+                }],
+            );
+            assert!(
+                d.all && !d.rebuild,
+                "drain, {what}: SET NULL must mark the whole view: {d:?}"
+            );
+        }
+    }
+
+    /// The same mark is one decision over the WHOLE cascade key, and it must not fire where the
+    /// children are still nameable. On the two-column route (`ent`.`id` + `ver`): an all-NULL
+    /// new FK marks the view, a partly-NULL one does not (`children_vanish` is `all(is_null)`,
+    /// not `any`: a partly-NULL key still names its rows), and a CASCADE key update whose
+    /// children the seed already moved under the new key must not cost the whole-view refresh
+    /// the fix's comment says this arm cannot reach.
+    #[test]
+    fn gap_mark_follows_the_whole_composite_cascade_key() {
+        let p = gap_plan();
+        let subs = gap_route(&p, "subs", 2);
+        // An all-NULL new FK: gone from both columns of the key, so no lookup names what they
+        // left behind.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed_map(&p, subs, &mut d, None, Some(&full_row(&[1, 10, 2, 5]))),
+            Fed::Skipped
+        );
+        d.cache.gap = true;
+        assert_eq!(
+            feed_cascade(
+                &p,
+                subs,
+                &mut d,
+                Some(&full_row(&[10, 2])),
+                Some(&part_row(&[None, None]))
+            ),
+            Fed::Recorded
+        );
+        assert!(
+            d.all && !d.rebuild,
+            "an all-NULL composite key must mark the view: {d:?}"
+        );
+        // A partly-NULL new FK: the children are still under a nameable key, so the marks on the
+        // kept rows heal them and the whole view must NOT be refreshed.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed_map(&p, subs, &mut d, None, Some(&full_row(&[1, 10, 2, 5]))),
+            Fed::Skipped
+        );
+        d.cache.gap = true;
+        assert_eq!(
+            feed_cascade(
+                &p,
+                subs,
+                &mut d,
+                Some(&full_row(&[10, 2])),
+                Some(&part_row(&[Some(11), None]))
+            ),
+            Fed::Recorded
+        );
+        assert!(
+            !d.all && !d.rebuild,
+            "a partly-NULL key still names its rows: {d:?}"
+        );
+        assert!(!d.is_empty(), "the kept rows are marked: {d:?}");
+        // A CASCADE key update the seed already moved under the new key: the new-side read is
+        // exact, so the arm that marks the whole view cannot be reached — the children did not
+        // vanish, and refreshing the whole view for it would be a spurious cost.
+        let mut d = ViewDirty::for_aliases(p.aliases.len());
+        assert_eq!(
+            feed_map(&p, subs, &mut d, None, Some(&full_row(&[1, 11, 2, 5]))),
+            Fed::Skipped
+        );
+        d.cache.gap = true;
+        assert_eq!(
+            feed_cascade(
+                &p,
+                subs,
+                &mut d,
+                Some(&full_row(&[10, 2])),
+                Some(&full_row(&[11, 2]))
+            ),
+            Fed::Recorded
+        );
+        assert!(
+            !d.all && !d.rebuild,
+            "a CASCADE key update must not mark the whole view: {d:?}"
+        );
+        assert!(!d.is_empty(), "the moved rows are marked: {d:?}");
+        assert_eq!(d.tally.cascade_gaps, 1);
+    }
 }
