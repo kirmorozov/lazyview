@@ -4,12 +4,18 @@
 //! `docs/development.md`); when it is unset the tests print a notice and pass.
 //! Every server is tested concurrently; each run uses fresh schemas and replica server ids, and
 //! only items of its own schema are asserted (other sessions may write concurrently).
+//!
+//! Two tests of this binary really do run at once at `--test-threads=2`, so everything a
+//! collection waits for or counts as its own — the marker table, the XA xids, the schema match —
+//! is derived from that run's schema or from a per-run counter, never from a name the binary
+//! shares (#272: a shared marker truncated a concurrent test's stream, shared xids admitted
+//! another instance's XA groups as ours).
 
 mod common;
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -83,6 +89,19 @@ fn server_id() -> u32 {
         .fetch_add(1, Ordering::Relaxed)
 }
 
+/// XA xid material, unique per workload rather than per process. XA ids are server-global, so two
+/// concurrent instances of one flow (a second test of this binary, or one scenario run twice) on
+/// one server would otherwise use the same ones: the other instance's XA groups would pass for
+/// ours, and `XA START` could be refused with XAER_DUPID (#272).
+fn xa_nonce() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(0);
+    // An odd multiplier is a bijection on the low 32 bits, so concurrent calls cannot repeat one.
+    (seed()
+        ^ N.fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        & 0xffff_ffff
+}
+
 fn unique_schema(tag: &str) -> String {
     static N: AtomicU32 = AtomicU32::new(0);
     format!(
@@ -147,9 +166,28 @@ struct Seen {
     groups: Vec<Group>,
     /// (table, column count) of TABLE_MAP items of the test schema.
     maps: BTreeSet<(String, u64)>,
-    /// First rows event of the test schema: `(table_id, event)`.
-    sample_rows: Option<(u64, Event)>,
+    /// First rows event of the test schema since the last observed rotation. Sampled by file, not
+    /// by run: the tracker keeps a table map across one rotation, and another session's
+    /// `FLUSH BINARY LOGS` on a shared server adds rotations at will (#272).
+    sample: Option<Sample>,
+    /// How often a rows event of the file just left was decoded again at the rotation (the
+    /// table-map-retention check; `collect` guarantees it runs at least once per collection).
+    retained: usize,
+    /// Any rows event of the test schema, for the unknown-table-id check (which never reaches a
+    /// table map, so its age does not matter).
+    any_rows: Option<(u64, Event)>,
+    /// The files the stream moved into, in order (first entry: where it started).
+    files: Vec<String>,
     heartbeats: usize,
+}
+
+/// One rows event of the test schema with the rows as decoded when it was first seen, so it can
+/// be decoded again once the stream has moved on: equal decodes show the TABLE_MAP is still known.
+struct Sample {
+    table_id: u64,
+    table: String,
+    event: Event,
+    rows: Vec<(Image, Image)>,
 }
 
 /// JSON columns are compared semantically (MySQL binary JSON vs MariaDB text).
@@ -195,9 +233,10 @@ fn check_pos(pos: &Position, last: &mut Option<Position>) -> Result<()> {
     Ok(())
 }
 
-/// Reads until a Statement containing `marker`, keeping only items of `schema` (and XA
-/// transactions whose xid is in `xids`). Also checks invariants that hold for every transaction
-/// in the stream (not only ours).
+/// Reads until a Statement of `schema` containing `marker` (its [`marker_table`] name, unique to
+/// this collection: a name shared with another test would end it early), keeping only items of
+/// `schema` (and XA transactions whose xid is in `xids`). Also checks invariants that hold for
+/// every transaction in the stream (not only ours).
 async fn collect(
     reader: &mut BinlogReader,
     schema: &str,
@@ -205,6 +244,9 @@ async fn collect(
     marker: &str,
 ) -> Result<Seen> {
     let deadline = Instant::now() + Duration::from_secs(60);
+    // The schema as a quoted identifier: `contains(schema)` alone would also accept another
+    // session's schema whose name merely has this one as a prefix (`lvbs_s_1` in `lvbs_s_11`).
+    let quoted = format!("`{schema}`");
     let mut seen = Seen::default();
     let mut tables: HashMap<u64, (String, String)> = HashMap::new();
     let mut mapped_in_txn: BTreeSet<u64> = BTreeSet::new();
@@ -212,6 +254,8 @@ async fn collect(
     let mut xa_start: Option<String> = None;
     let mut cur: Vec<Ev> = Vec::new();
     let mut last: Option<Position> = None;
+    let mut cur_file = reader.position().file.clone();
+    seen.files.push(cur_file.clone());
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let item = tokio::time::timeout(left, reader.next())
@@ -223,6 +267,36 @@ async fn collect(
                 )
             })??
             .ok_or_else(|| anyhow!("stream closed before marker"))?;
+        // One comparison per event: a ROTATE — ours or another session's — moves the sampled
+        // rows event into `prev_sample`, so the sample is always the first one of the file
+        // before the current one (#272; the tracker keeps a table map across one rotation only).
+        if reader.position().file != cur_file {
+            // A rotation was just observed, so exactly one rotation has passed since the sample
+            // was taken: its TABLE_MAP must still be known (the tracker keeps it across one), and
+            // it must decode to what it decoded when it was seen — whatever other sessions did to
+            // the server in between (#272: sampling at the start of the run let a concurrent
+            // session's FLUSH BINARY LOGS push the sample out of the one-rotation promise).
+            if let Some(sm) = seen.sample.take() {
+                let late = reader
+                    .rows(sm.table_id, &sm.event)
+                    .with_context(|| {
+                        format!("table map of {} lost across the rotation", sm.table_id)
+                    })?
+                    .into_iter()
+                    .map(|(b, a)| Ok((image(&sm.table, b)?, image(&sm.table, a)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                ensure!(
+                    late == sm.rows,
+                    "rows event of table id {} decodes differently after the rotation",
+                    sm.table_id
+                );
+                ensure!(!late.is_empty(), "sample rows event decodes to no row");
+                seen.retained += 1;
+            }
+            seen.sample = None;
+            cur_file = reader.position().file.clone();
+            seen.files.push(cur_file.clone());
+        }
         // Closes the current group with `kind` at `pos`; kept when it is ours.
         let mut close = |kind: Close, pos: Position, ours: bool, cur: &mut Vec<Ev>| -> Result<()> {
             check_pos(&pos, &mut last)?;
@@ -287,14 +361,24 @@ async fn collect(
                     .into_iter()
                     .map(|(b, a)| Ok((image(table, b)?, image(table, a)?)))
                     .collect::<Result<Vec<_>>>()?;
+                if seen.any_rows.is_none() {
+                    seen.any_rows = Some((table_id, event.clone()));
+                }
+                if seen.sample.is_none() {
+                    // Only the first rows event of a file is kept: the clone is once per
+                    // rotation, not per event.
+                    seen.sample = Some(Sample {
+                        table_id,
+                        table: table.clone(),
+                        event,
+                        rows: rows.clone(),
+                    });
+                }
                 cur.push(Ev::Rows {
                     table: table.clone(),
                     kind,
                     rows,
                 });
-                if seen.sample_rows.is_none() {
-                    seen.sample_rows = Some((table_id, event));
-                }
             }
             Item::Commit { pos } => close(Close::Commit, pos, false, &mut cur)?,
             Item::XaPrepare { xid, pos } => {
@@ -315,8 +399,10 @@ async fn collect(
                     cur.is_empty(),
                     "statement {query:?} inside an open transaction"
                 );
-                let done = query.contains(marker);
-                let ours = query.contains(schema);
+                let ours = query.contains(&quoted);
+                // Only this test's own marker ends the collection: on a shared server another
+                // session's marker used to stop it here, dropping the rest of our stream (#272).
+                let done = ours && query.contains(marker);
                 cur.extend(ours.then(|| stmt_ev(schema, query)));
                 // A CREATE … SELECT continues with rows + Commit in the same GTID transaction.
                 close(Close::Statement, pos, ours, &mut cur)?;
@@ -391,6 +477,16 @@ const T_DDL: &str = "(id INT UNSIGNED NOT NULL PRIMARY KEY, u INT UNSIGNED NULL,
 
 const MARKER: &str = "zz_marker_done";
 
+/// The marker table that ends one collection, named for the schema it ends. One shared name would
+/// let any other session on a shared server end it (#272).
+fn marker_table(schema: &str) -> String {
+    let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a: stable for a given schema
+    for b in schema.as_bytes() {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{MARKER}_{h:x}")
+}
+
 #[derive(Debug, Clone)]
 struct ExpGroup {
     evs: Vec<Ev>,
@@ -416,6 +512,8 @@ struct Workload {
     gtids: Vec<String>,
     /// Canonical ids of the workload's XA transactions.
     xids: Vec<String>,
+    /// Name of the marker table that ends this workload's own collection.
+    marker: String,
     server_uuid: String,
 }
 
@@ -654,7 +752,7 @@ async fn run_workload(w: &mut Conn, w2: &mut Conn, tag: &str) -> Result<Workload
     w.query_drop("FLUSH BINARY LOGS").await?;
     // 10-13: two-phase XA commit, with another session's transaction between PREPARE and
     // COMMIT: XaStart, rows, XaPrepare … XaEnd(commit)
-    let xt = format!("{:x}", seed() & 0xffff_ffff);
+    let xt = format!("{:x}", xa_nonce());
     let g1 = format!("lvc{xt}");
     let x1 = xid_canon(g1.as_bytes(), b"", 1);
     w.query_drop(format!("XA START '{g1}'")).await?;
@@ -726,8 +824,9 @@ async fn run_workload(w: &mut Conn, w2: &mut Conn, tag: &str) -> Result<Workload
         Close::Commit,
         (!maria).then(|| x3.clone())
     );
-    // 11: marker DDL ends the collection
-    let marker = format!("CREATE TABLE `{s}`.{MARKER} (id INT)");
+    // 11: marker DDL ends the collection; its name belongs to this schema alone.
+    let mt = marker_table(&s);
+    let marker = format!("CREATE TABLE `{s}`.{mt} (id INT)");
     w.query_drop(&marker).await?;
     group!(vec![Ev::Stmt(marker)]);
 
@@ -740,6 +839,7 @@ async fn run_workload(w: &mut Conn, w2: &mut Conn, tag: &str) -> Result<Workload
         groups,
         gtids,
         xids: vec![x1, x2, x3],
+        marker: mt,
         server_uuid,
     })
 }
@@ -803,7 +903,7 @@ async fn stream_scenario(dsn: String) -> Result<()> {
     )
     .await?;
     ensure!(r.flavor() == wl.flavor);
-    let seen = collect(&mut r, &s, &wl.xids, MARKER).await?;
+    let seen = collect(&mut r, &s, &wl.xids, &wl.marker).await?;
     let got = flat(&seen.groups);
     ensure!(
         got == want,
@@ -858,16 +958,18 @@ async fn stream_scenario(dsn: String) -> Result<()> {
         seen.maps
     );
 
-    // Table maps survive a rotation: the first rows event (old file) still decodes.
-    let (tid, ev) = seen
-        .sample_rows
-        .clone()
-        .ok_or_else(|| anyhow!("no rows event seen"))?;
+    // `collect` decoded a rows event of the file it just left at every rotation it observed
+    // (see the rotation arm there); at least one rotation must have been crossed with rows of
+    // ours behind it — our own FLUSH BINARY LOGS guarantees that.
     ensure!(
-        r.rows(tid, &ev)?.len() == 1,
-        "sample rows event decodes to one row"
+        seen.retained > 0,
+        "no rotation crossed with rows of {s} behind it: files {:?}, start {} .. {}",
+        seen.files,
+        wl.start,
+        r.position()
     );
     // rows() without a table map fails cleanly.
+    let (_tid, ev) = seen.any_rows.ok_or_else(|| anyhow!("no rows event seen"))?;
     let err = r
         .rows(0x00ab_cdef, &ev)
         .expect_err("decoding with an unknown table id must fail");
@@ -930,7 +1032,7 @@ async fn stream_scenario(dsn: String) -> Result<()> {
             Duration::from_secs(5),
         )
         .await?;
-        let rest = collect(&mut r2, &s, &wl.xids, MARKER)
+        let rest = collect(&mut r2, &s, &wl.xids, &wl.marker)
             .await
             .with_context(|| format!("resuming after group {i} at {}", g.end))?;
         r2.close().await?;
@@ -988,6 +1090,24 @@ async fn stream_items_rows_positions_and_resume() {
     on_all_servers("stream_items_rows_positions_and_resume", |_name, dsn| {
         stream_scenario(dsn)
     })
+    .await;
+}
+
+/// The same scenario twice at once on one server, inside one test: the shape `--test-threads=2`
+/// gives when two tests of this binary overlap (#272). Both instances share the server, so each
+/// must collect exactly the stream of its own schema: a marker, an xid or a name shared with the
+/// other instance truncates or corrupts the collection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_two_concurrent_scenarios_are_isolated() {
+    on_all_servers(
+        "stream_two_concurrent_scenarios_are_isolated",
+        |_name, dsn| async move {
+            let (a, b) = tokio::join!(stream_scenario(dsn.clone()), stream_scenario(dsn));
+            a.context("scenario 1")?;
+            b.context("scenario 2")?;
+            Ok(())
+        },
+    )
     .await;
 }
 
@@ -1572,7 +1692,8 @@ async fn partial_rows_workload(
             (row(3, 70000, 'd'), None),
         ],
     });
-    let marker = format!("CREATE TABLE `{s}`.`{MARKER}` (id INT)");
+    let mt = marker_table(s);
+    let marker = format!("CREATE TABLE `{s}`.`{mt}` (id INT)");
     w.query_drop(&marker).await?;
     want.push(Ev::Stmt(marker));
 
@@ -1610,7 +1731,7 @@ async fn partial_rows_workload(
         Duration::from_secs(1),
     )
     .await?;
-    let seen = collect(&mut r, s, &[], MARKER).await?;
+    let seen = collect(&mut r, s, &[], &mt).await?;
     let got = merged(&flat(&seen.groups));
     ensure!(
         got == want,
