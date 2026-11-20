@@ -95,6 +95,11 @@ pub(super) fn prometheus(m: &Metrics, o: &Observed, s: &Settings) -> String {
         "# HELP lazyview_inflight_rows Rows read from the sources and not yet written to every target (concurrent refreshes).\n# TYPE lazyview_inflight_rows gauge\nlazyview_inflight_rows {}",
         Metrics::get(&m.gauges.inflight_rows)
     );
+    let _ = writeln!(
+        out,
+        "# HELP lazyview_lag_bytes_held Estimated bytes of the keys kept for targets that are behind; past the derived lag budget the LAZYVIEW_LAG_OVER_BUDGET arm acts (pause holds the reader).\n# TYPE lazyview_lag_bytes_held gauge\nlazyview_lag_bytes_held {}",
+        Metrics::get(&m.gauges.lag_bytes_held)
+    );
     // Per connection pool of the refresh supervisor (src/supervisor.rs).
     let pools = m.pool_gauges();
     if let Some(first) = pools.first() {

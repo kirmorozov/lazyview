@@ -27,7 +27,7 @@ use crate::analyze::{self, Mode, ViewPlan};
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position};
 use crate::cascade;
 use crate::catalog::{Catalog, TableInfo, TableRef};
-use crate::config::{Config, MissingBinlog, StartMode};
+use crate::config::{Config, LagOverBudget, MissingBinlog, StartMode};
 use crate::coord;
 use crate::datum::{Datum, Key};
 use crate::lookback::Lookback;
@@ -1127,7 +1127,8 @@ const STATS_PUBLISH_INTERVAL: u64 = 15;
 /// with no limit gets the constants the engine carried before: 32 MiB for this queue and 256 MiB
 /// for each of the three holds below (`Config::mem.build_hold_bytes`, `.xa_hold_bytes`,
 /// `.lag_hold_bytes`, documented where they act: `hold_for_builds`, the unrouted rows of a
-/// prepared XA in `on_rows`, and `lag_over_budget`).
+/// prepared XA in `on_rows`, and `hold_for_lag` for the keys kept for targets that are behind,
+/// the arm `Config::lag_over_budget` names).
 const DRAIN_MAX_EVENTS: usize = 100_000;
 /// Queue slots kept once a drained queue is empty again (a larger queue is shrunk to this).
 const DRAIN_KEEP_SLOTS: usize = 1024;
@@ -4585,6 +4586,24 @@ impl Engine {
                     {
                         break 'reconnect;
                     }
+                    // Likewise once per flush: the keys kept for a target that is behind, over
+                    // their budget, hold the reader under `LAZYVIEW_LAG_OVER_BUDGET=pause` (the
+                    // decision is this check — one pass over the lag entries per flush; the event
+                    // path pays nothing, and `drop_refresh` cannot reach here: config refuses it).
+                    if self.cfg.lag_over_budget == LagOverBudget::Pause
+                        && self.lag_over_budget().is_some()
+                        && !self
+                            .hold_for_lag(
+                                &mut reader,
+                                &mut drained,
+                                &mut last_event,
+                                &mut build_rx,
+                                shutdown,
+                            )
+                            .await?
+                    {
+                        break 'reconnect;
+                    }
                 }
                 if !self.in_txn {
                     self.housekeeping().await?;
@@ -4855,6 +4874,61 @@ impl Engine {
         }
         self.clock.reading = true;
         info!(paused = ?since.elapsed(), "binlog reading resumed");
+        // Not read meanwhile: the silence check starts afresh.
+        *last_event = Instant::now();
+        Ok(true)
+    }
+
+    /// Holds the binlog reader while the changes kept for targets that are behind are over their
+    /// budget — the bound that acts for that buffer (review R-01), the arm
+    /// `Config::lag_over_budget == Pause` of `LAZYVIEW_LAG_OVER_BUDGET` (the default). Dropping
+    /// those keys instead would cost each behind target a whole-view refresh, which is the
+    /// `drop_refresh` arm of M2b once the bounded sweep of 03-stream-refresh lands; the owner
+    /// ruled out rebuilding an incremental view, so holding is the only bound that keeps both the
+    /// memory and the correctness rule. Nothing is read meanwhile, so the server's socket fills
+    /// and the stream waits; build results are taken, a due flush runs (a flush is what catches a
+    /// target up and lifts the hold), and the loop keeps beating (`/livez`) and doing housekeeping,
+    /// which is also where a lagging target's retry time (`retry_lag`) is awaited. The saved
+    /// position already waits for these keys ([`lag_floor`]), so a restart under the hold replays
+    /// the outage into the same key sets: the pause can delay the instance, never lose a change.
+    /// Called only after a flush, between transactions, like [`Self::hold_for_builds`]. Cost
+    /// (guard R3): one pass over the slots' lag entries to decide, and one per second of a hold —
+    /// the event path is untouched. Counted once per hold in `lag_reader_holds`, never per tick.
+    /// `Ok(false)`: shutdown was requested meanwhile.
+    async fn hold_for_lag(
+        &mut self,
+        reader: &mut BinlogReader,
+        drained: &mut Drained,
+        last_event: &mut Instant,
+        build_rx: &mut mpsc::UnboundedReceiver<BuildDone>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<bool> {
+        Metrics::add(&self.metrics.lag_reader_holds, 1);
+        let held = self.lag_held_bytes();
+        warn!(
+            held_mib = held >> 20,
+            budget = self.cfg.mem.lag_hold_bytes,
+            "the changes kept for targets that are behind exceed their byte budget; binlog \
+             reading paused until they catch up (the keys are kept and the saved position waits \
+             for them, so a restart replays the outage rather than losing them)"
+        );
+        let since = Instant::now();
+        while self.lag_over_budget().is_some() {
+            let tick = Instant::now() + Duration::from_secs(1);
+            let wake = self.flush_deadline().map_or(tick, |d| d.min(tick));
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => if *shutdown.borrow() { return Ok(false); },
+                Some(done) = build_rx.recv() => self.on_build_done(done),
+                _ = tokio::time::sleep_until(wake.into()) => {}
+            }
+            self.metrics.beat();
+            if self.flush_due() {
+                self.flush_draining(reader, drained, last_event).await?;
+            }
+            self.housekeeping().await?;
+        }
+        info!(paused = ?since.elapsed(), "binlog reading resumed: the targets that were behind caught up");
         // Not read meanwhile: the silence check starts afresh.
         *last_event = Instant::now();
         Ok(true)
@@ -5630,9 +5704,12 @@ impl Engine {
         if let LeaderState::Fenced(why) = &*self.leader_state.borrow() {
             bail!("fenced: {why}");
         }
-        // The changes kept for targets that are behind are bounded: past the budget the engine
-        // only reports (`lag_over_budget`) — nothing is dropped and nothing is rebuilt, the
-        // saved position waits for the kept keys instead (`pending_floor`).
+        // The changes kept for targets that are behind have a bound that acts (review R-01): past
+        // the budget the arm `Config::lag_over_budget` names decides, and this names the crossing
+        // once (`lag_over_budget`, the `lag_budget_warned` latch). Under `pause` — the default —
+        // `hold_for_lag` holds the reader after the next flush; nothing is dropped and nothing is
+        // rebuilt, the saved position waits for the kept keys instead (`pending_floor`). The pass
+        // that decides is this one (per tick, never per event) and it maintains `lag_bytes_held`.
         match self.lag_over_budget() {
             Some(held) if !self.lag_budget_warned => self.report_lag_over_budget(held),
             Some(_) => {}
@@ -6191,13 +6268,12 @@ impl Engine {
         (held > budget).then_some(held)
     }
 
-    /// The estimated bytes kept for targets that are behind, when they exceed their budget
-    /// (`Config::mem.lag_hold_bytes`; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). One pass over the slots;
-    /// called from `housekeeping`, never per event and never per flush. The budget is a
-    /// reporting threshold only: passing it drops nothing and rebuilds nothing (see
-    /// [`Self::report_lag_over_budget`]).
-    fn lag_over_budget(&self) -> Option<usize> {
-        let budget = self.cfg.mem.lag_hold_bytes;
+    /// The estimated bytes kept for targets that are behind, over every view and target
+    /// (`Lag.units` + `Lag.partial`, at the `units_bytes` estimate). One pass over the slots' lag
+    /// entries; called from `housekeeping` and when a hold is decided after a flush — never per
+    /// event and never per flush on the event path. It also maintains the `lag_bytes_held` gauge,
+    /// so the pass costs nothing extra for `/metrics`.
+    fn lag_held_bytes(&self) -> usize {
         let held: usize = self
             .slots
             .iter()
@@ -6205,15 +6281,29 @@ impl Engine {
             .flat_map(|l| l.lag.values())
             .map(|g| units_bytes(&g.units, &g.partial))
             .sum();
-        (held > budget).then_some(held)
+        Metrics::set(&self.metrics.gauges.lag_bytes_held, held as u64);
+        held
     }
 
-    /// The budget of the changes kept for targets that are behind was passed: report only, take
-    /// no action. A target that is down has nothing draining its keys while it is unreachable,
-    /// but they are sets, bounded by the distinct ids the view can have, so it keeps them until
-    /// it catches up; the saved position waits for them ([`lag_floor`]), so a restart replays
-    /// the outage instead of losing the changes silently. Names the target that has been behind
-    /// longest: it is the one keeping keys the longest, usually the unreachable one. Called
+    /// The estimated bytes kept for targets that are behind, when they exceed their budget
+    /// (`Config::mem.lag_hold_bytes`; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). Past it the buffer
+    /// has a bound that acts, by the arm `Config::lag_over_budget` names (review R-01): `pause`
+    /// holds the binlog reader ([`Self::hold_for_lag`]) until the target catches up, and reports
+    /// it on the crossing ([`Self::report_lag_over_budget`]). `drop_refresh` is refused at config
+    /// time until M2b lands the bounded sweep it ends in.
+    fn lag_over_budget(&self) -> Option<usize> {
+        let held = self.lag_held_bytes();
+        (held > self.cfg.mem.lag_hold_bytes).then_some(held)
+    }
+
+    /// The budget of the changes kept for targets that are behind was passed: name it once. The
+    /// bound itself acts separately, by the arm `Config::lag_over_budget` names — under `pause`
+    /// `hold_for_lag` holds the reader, and this line is what tells an operator which target is
+    /// being waited for. A target that is down has nothing draining its keys while it is
+    /// unreachable, but they are sets, bounded by the distinct ids the view can have, so it keeps
+    /// them until it catches up; the saved position waits for them ([`lag_floor`]), so a restart
+    /// replays the outage instead of losing the changes silently. Names the target that has been
+    /// behind longest: it is the one keeping keys the longest, usually the unreachable one. Called
     /// once per crossing (the `lag_budget_warned` latch), not per housekeeping tick.
     fn report_lag_over_budget(&mut self, held: usize) {
         self.lag_budget_warned = true;
@@ -6231,8 +6321,12 @@ impl Engine {
             }
         }
         if let Some((view, target)) = best {
+            let acts = match self.cfg.lag_over_budget {
+                LagOverBudget::Pause => "binlog reading is held until it catches up",
+                LagOverBudget::DropRefresh => "its key set is dropped and the view refreshed",
+            };
             warn!(view = %view, target = %target, buffered_mib = held >> 20,
-                "the changes kept for this target exceed their {budget} byte budget; they are kept until it catches up, and the saved position waits for them");
+                "the changes kept for this target exceed their {budget} byte budget; they are kept until it catches up, the saved position waits for them, and {acts}");
         }
     }
 

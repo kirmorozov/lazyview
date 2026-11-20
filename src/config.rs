@@ -21,6 +21,26 @@ pub enum MissingBinlog {
     Rebuild,
 }
 
+/// `LAZYVIEW_LAG_OVER_BUDGET`: the bound that acts on the keys kept for targets that are behind
+/// once they pass their byte budget (`Config::mem.lag_hold_bytes`, review R-01). Until this
+/// setting existed the budget only produced a warn, which left the buffer free to grow past any
+/// limit. There is no warn-only value any more (lv-super ruling 4, 2026-11-16): a buffer with a
+/// budget that nothing enforces is the thing the review called a blocker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LagOverBudget {
+    /// The binlog reader waits while the keys are over budget (`Engine::hold_for_lag`, the shape
+    /// of `hold_for_builds`): memory bounded, nothing dropped, the saved position already waits
+    /// for these keys (`lag_floor`), so the target catches up from what was kept. The default:
+    /// the memory-safe arm, and the one that needs nothing else landed.
+    #[default]
+    Pause,
+    /// The key set is dropped and the target gets a bounded whole-view refresh when it is back
+    /// (the owner's choice (b) for R-01). It ends in a whole-view refresh, so it waits for the
+    /// bounded sweep of 03-stream-refresh (PR D `engine-sweep` + PR E `sup-sweep`): refused at
+    /// config time until M2b adds the arm, rather than accepted and silently doing something else.
+    DropRefresh,
+}
+
 /// `LAZYVIEW_SUPERVISOR`: how flush work is executed (docs/design-supervisor.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorMode {
@@ -176,8 +196,9 @@ pub struct Config {
     /// for building versions instead of the budget the total gave it (see `Engine::hold_for_builds`).
     pub test_build_hold_bytes: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_LAG_HOLD_BYTES=<bytes>`: the byte budget of the changes kept
-    /// for targets that are behind instead of the budget the total gave it (see
-    /// `Engine::lag_over_budget`: past it the engine only reports).
+    /// for targets that are behind instead of the budget the total gave it, so a test can run that
+    /// buffer far below its size (past it the arm `Config::lag_over_budget` names acts:
+    /// `Engine::hold_for_lag` for `pause`).
     pub test_lag_hold_bytes: Option<usize>,
     /// The engine's byte budgets — the read-ahead queue, the build hold, the XA hold, the lag
     /// hold and the dedup core — derived once at startup from `LAZYVIEW_MEMORY_BUDGET_BYTES`,
@@ -185,6 +206,10 @@ pub struct Config {
     /// [`crate::mem`], review R-01 / N-06). The two hooks above override the field they name;
     /// everything else the engine reads for a byte budget is this.
     pub mem: crate::mem::MemoryBudget,
+    /// `LAZYVIEW_LAG_OVER_BUDGET=pause|drop_refresh` (default `pause`): what acts on the keys kept
+    /// for targets that are behind once they pass `mem.lag_hold_bytes` — the reader waits, or (not
+    /// yet) the keys are dropped for a bounded whole-view refresh. See [`LagOverBudget`].
+    pub lag_over_budget: LagOverBudget,
     /// Test hook `LAZYVIEW_TEST_FAIL_IDENTITY=<n>`: the first `n` source identity reads of a
     /// start fail (see `engine::server_identity`), the stand-in for a connection blip there.
     pub test_fail_identity: Option<usize>,
@@ -334,6 +359,26 @@ impl Config {
                     "fail" => MissingBinlog::Fail,
                     "rebuild" => MissingBinlog::Rebuild,
                     _ => bail!("LAZYVIEW_ON_MISSING_BINLOG must be fail|rebuild"),
+                },
+            };
+        // The bound that acts on the keys kept for a target that is behind (review R-01). The
+        // drop arm ends in a whole-view refresh and so waits for the bounded sweep of
+        // 03-stream-refresh: it is refused here, at config time, with what is missing and what to
+        // use meanwhile — a setting that is accepted and then does something else is worse than a
+        // refused start.
+        let lag_over_budget =
+            match get("LAZYVIEW_LAG_OVER_BUDGET").map(|v| v.trim().to_ascii_lowercase()) {
+                None => LagOverBudget::default(),
+                Some(v) => match v.as_str() {
+                    "" | "pause" => LagOverBudget::Pause,
+                    "drop_refresh" => bail!(
+                        "LAZYVIEW_LAG_OVER_BUDGET=drop_refresh is not yet: dropping the keys kept \
+                         for a target that is behind costs that target a whole-view refresh, which \
+                         needs the bounded sweep of 03-stream-refresh (PR D engine-sweep and PR E \
+                         sup-sweep) landed; until M2b adds it use pause (the default), which holds \
+                         the binlog reader instead"
+                    ),
+                    _ => bail!("LAZYVIEW_LAG_OVER_BUDGET must be pause|drop_refresh"),
                 },
             };
         // The leadership lock's lease (review A-06): the beat period of the lock's own session and
@@ -518,6 +563,7 @@ impl Config {
             test_build_hold_bytes,
             test_lag_hold_bytes,
             mem,
+            lag_over_budget,
             test_fail_identity: Some(num("LAZYVIEW_TEST_FAIL_IDENTITY", 0)? as usize)
                 .filter(|&n| n > 0),
             test_fail_snapshot: Some(num("LAZYVIEW_TEST_FAIL_SNAPSHOT", 0)? as usize)
@@ -1179,6 +1225,34 @@ mod tests {
                 with(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_MEMORY_BUDGET_BYTES", bad)]).is_err(),
                 "{bad}"
             );
+        }
+    }
+
+    /// The bound that acts on the keys kept for a target that is behind (review R-01): `pause` is
+    /// the default and the only arm that exists today, `drop_refresh` is refused at config time
+    /// with what it waits for, and any other word is refused like any other setting.
+    #[test]
+    fn lag_over_budget_policy() {
+        let c = cfg(&[("LAZYVIEW_DSN", "x")]).unwrap();
+        assert_eq!(c.lag_over_budget, LagOverBudget::Pause, "the default");
+        for v in ["pause", "PAUSE", " pause ", ""] {
+            let c = cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_LAG_OVER_BUDGET", v)]).unwrap();
+            assert_eq!(c.lag_over_budget, LagOverBudget::Pause, "{v}");
+        }
+        let e = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_LAG_OVER_BUDGET", "drop_refresh"),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("not yet"), "{e}");
+        assert!(e.contains("whole-view refresh"), "{e}");
+        assert!(e.contains("pause"), "{e}: must say what to use meanwhile");
+        for bad in ["warn", "warn_only", "drop", "off"] {
+            let e = cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_LAG_OVER_BUDGET", bad)])
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("pause|drop_refresh"), "{bad}: {e}");
         }
     }
 
