@@ -763,38 +763,74 @@ fn selftest_engineproc_kill_points_seeded() {
 /// recorded. GNU `time` is compared as well when the host has it — it is not installed here, and a
 /// host without it still gets the kernel's numbers, which are the same ones. `sort` on a seeded file:
 /// deterministic, and it holds megabytes in memory, so a 5 % band says something.
+///
+/// The window is sized by **work**, not by the runner: the sampler takes one sample per interval, so a
+/// fixed input measures a different number of samples on every machine class — a fast runner sorted the
+/// first input in 20 ms and the window came out at 9 samples, too few to say anything about a peak. So
+/// the input doubles from the size that proves the claim on a slow host until the run outlasts the
+/// minimum window by a margin. A fast runner gets more work, never a shorter look. The bar below is
+/// what has to be cleared either way.
 #[test]
 fn selftest_engineproc_sampler_vs_time() {
+    /// The bar: below it a "peak" is one `/proc` read of one process and nothing more.
+    const MIN_SAMPLES: usize = 10;
+    /// How far above the bar the window is driven, so a runner several times faster than this host
+    /// cannot land the sample count on the edge of the bar.
+    const WINDOW_MARGIN: usize = 3;
+    /// Ceiling on the growth: room to clear the margin on a very fast runner, small enough that
+    /// `sort` stays a fraction of the harness's own memory.
+    const MAX_LINES: usize = 600_000;
+    const INTERVAL: Duration = Duration::from_millis(2);
+
     let dir = logs_root().join(format!("selftest-sampler-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let input = dir.join("sort-in.txt");
-    let mut r = engineproc::Rng::new(0x243f_6a88_85a3_08d3); // fixed: the same file every run
-    let mut data = String::new();
-    for i in 0..60_000 {
-        writeln!(data, "{:020x} line-{i}", r.next_u64()).unwrap();
-    }
-    assert!(
-        data.len() >= 1 << 20,
-        "the workload is too small to measure: {} B",
-        data.len()
-    );
-    std::fs::write(&input, &data).unwrap();
     let sort = ["/usr/bin/sort", "/bin/sort"]
         .iter()
         .map(PathBuf::from)
         .find(|p| p.is_file())
         .expect("sort");
 
-    let (u, gnu) = engineproc::run_measured(
-        &sort,
-        &[input.display().to_string(), "-o".into(), "/dev/null".into()],
-        Duration::from_millis(2),
-    )
-    .expect("run sort under the sampler");
-    engineproc::measured(format!("sampler: {}", u.line()));
+    let mut lines = 60_000;
+    let (u, gnu) = loop {
+        let mut r = engineproc::Rng::new(0x243f_6a88_85a3_08d3); // fixed: every size is the same file, longer
+        let mut data = String::new();
+        for i in 0..lines {
+            writeln!(data, "{:020x} line-{i}", r.next_u64()).unwrap();
+        }
+        assert!(
+            data.len() >= 1 << 20,
+            "the workload is too small to measure: {} B",
+            data.len()
+        );
+        std::fs::write(&input, &data).unwrap();
+        let (u, gnu) = engineproc::run_measured(
+            &sort,
+            &[input.display().to_string(), "-o".into(), "/dev/null".into()],
+            INTERVAL,
+        )
+        .expect("run sort under the sampler");
+        engineproc::measured(format!(
+            "sampler: {lines} lines, {} KiB in: {}",
+            data.len() / 1024,
+            u.line()
+        ));
+        if u.samples >= MIN_SAMPLES * WINDOW_MARGIN {
+            break (u, gnu);
+        }
+        assert!(
+            lines * 2 <= MAX_LINES,
+            "sort of {} lines still only filled the window with {}/{} samples: {}",
+            lines,
+            u.samples,
+            MIN_SAMPLES,
+            u.line()
+        );
+        lines *= 2;
+    };
     engineproc::measured(format!("kernel : time -v: {gnu:?}"));
     assert!(
-        u.samples >= 10,
+        u.samples >= MIN_SAMPLES,
         "too few samples to say anything: {}",
         u.line()
     );
