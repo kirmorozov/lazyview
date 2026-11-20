@@ -67,10 +67,16 @@ impl Key {
     /// An embedding program's text key: `Int` when `s` is the canonical decimal form of an i64
     /// (`s == n.to_string()`), else a one-part `Bytes` tuple; `from_text(s).to_text() == s`.
     pub fn from_text(s: &str) -> Key {
-        match s.parse::<i64>() {
-            Ok(n) if n.to_string() == s => Key::Int(intset::from_i64(n)),
-            _ => Key::Tuple(Box::new([Datum::Bytes(s.as_bytes().to_vec())])),
+        // The shape check decides what `n.to_string()` would print without printing it: one
+        // `String` per key was the whole cost of the numeric path. A number whose shape is
+        // canonical but that does not fit an `i64` fails the parse and takes the `Bytes` arm,
+        // exactly as before.
+        if is_canonical_decimal(s) {
+            if let Ok(n) = s.parse::<i64>() {
+                return Key::Int(intset::from_i64(n));
+            }
         }
+        Key::Tuple(Box::new([Datum::Bytes(s.as_bytes().to_vec())]))
     }
 
     /// Appends the text form: `Int` in decimal; a one-part `Bytes` tuple as UTF-8 (lossy); any
@@ -89,6 +95,25 @@ impl Key {
             },
         }
     }
+}
+
+/// `true` when `s` is exactly what `i64::to_string` prints for the number it parses to: ASCII
+/// digits, at most one leading `-`, no leading zero, and no `-0`. This is the check
+/// [`Key::from_text`] needs, and it allocates nothing.
+fn is_canonical_decimal(s: &str) -> bool {
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let first = match digits.as_bytes().first() {
+        Some(b) => *b,
+        None => return false,
+    };
+    if first == b'0' {
+        // The bare `0` only: `007` and `-0` are not forms `to_string` ever prints.
+        return !negative && digits.len() == 1;
+    }
+    digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// What one row change did to an id (an action's facts, for targets that declare them).

@@ -35,3 +35,8 @@ pub mod mv;
 pub mod plan_swap;
 pub mod supervisor;
 pub mod target;
+
+// The unit tests' counting allocator: `cfg(test)` only, so the library and the shipping binary
+// keep the system allocator (src/alloc_measure.rs).
+#[cfg(test)]
+mod alloc_measure;

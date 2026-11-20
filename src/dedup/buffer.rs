@@ -87,15 +87,30 @@ impl IdSet {
     /// Removes and returns at most `n` ids: the smallest integers first, then tuples.
     pub fn take(&mut self, n: usize) -> IdSet {
         let mut out = IdSet::default();
-        let ints = self.ints.pop_smallest(n);
-        for v in ints {
-            out.ints.insert(v);
+        if n >= self.ints.len() as usize {
+            // The chunk budget covers every integer of the space (`Buffer::take` hands each space
+            // the whole remaining budget, and a generation's space is usually smaller than a
+            // chunk): move the set out instead of copying every id through the `pop_smallest`
+            // `Vec` and hashing it back in one by one.
+            out.ints = std::mem::take(&mut self.ints);
+        } else {
+            for v in self.ints.pop_smallest(n) {
+                out.ints.insert(v);
+            }
         }
         let k = (n - out.len()).min(self.keys.len());
-        let tuples: Vec<Tuple> = self.keys.iter().take(k).cloned().collect();
-        for t in tuples {
-            self.keys.remove(&t);
-            out.keys.insert(t);
+        if k == self.keys.len() {
+            // Likewise for the tuples: taking all of them is a swap, not a clone per id.
+            out.keys = std::mem::take(&mut self.keys);
+        } else {
+            // A `HashSet` cannot be mutated while it is iterated, so these `k` ids are cloned out
+            // first and only then removed one by one. Their payloads, not the `Vec`, are the cost
+            // here (measured: the same as before this change).
+            let tuples: Vec<Tuple> = self.keys.iter().take(k).cloned().collect();
+            for t in tuples {
+                self.keys.remove(&t);
+                out.keys.insert(t);
+            }
         }
         out
     }
