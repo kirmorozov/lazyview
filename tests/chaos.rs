@@ -659,12 +659,12 @@ async fn finish(ctx: &Arc<Ctx>, f: &mut Fix, w: &mut Writers, when: &str) -> Res
 /// allocator, so a writer running at the same time cannot collide with them.
 fn items_txn(ids: &SoakIds, rows: usize) -> (Vec<String>, usize) {
     let entities = ids.seed_entities.max(1);
-    // `SoakIds::fresh` hands out the value `fetch_add` *returned*, so the block is
-    // `from ..= from + rows - 1` and the allocator resumes at `from + rows`: reserving `rows` and
-    // starting at `+ 1` left the block's last id inside the range the paced writers are still
-    // handed, and a writer's `INSERT … ON DUPLICATE KEY` took that row first, so the transaction's
-    // last statement died on ERROR 1062 for `items.PRIMARY` (issue #229's second flake).
-    let from = ids.item.fetch_add(rows as i64, Ordering::Relaxed);
+    // Block reservation: `fresh_block` takes the `fetch_add` result verbatim, so the block is
+    // `from ..= from + rows - 1` and the allocator resumes at `from + rows`. (A `+ 1` on the
+    // reservation left the block's last id inside the range the paced writers are still handed,
+    // and a writer's `INSERT … ON DUPLICATE KEY` took that row first, so the transaction's last
+    // statement died on ERROR 1062 for `items.PRIMARY` — issue #229's second flake.)
+    let from = SoakIds::fresh_block(&ids.item, rows as i64);
     let mut stmts = Vec::new();
     let mut bytes = 0usize;
     let mut done = 0usize;
@@ -1093,7 +1093,10 @@ fn chaos_src_refresh_result_cut() {
                                         // derived from the same statements (never a magic guess).
         const FANOUT: usize = 8_000;
         let entities = f.ids.seed_entities.max(2) as usize;
-        let from = f.ids.link_seq.fetch_add(FANOUT as i64, Ordering::Relaxed) + 1;
+        // One block reservation for the fan-out (issue #247: the old `fetch_add(…) + 1` shape
+        // re-handed the block's last id to a paced writer — rare ERROR 1062; see
+        // `SoakIds::fresh_block`).
+        let from = SoakIds::fresh_block(&f.ids.link_seq, FANOUT as i64);
         let mut vals = Vec::with_capacity(FANOUT);
         let mut payload = 0usize;
         for k in 0..FANOUT {
@@ -1311,10 +1314,8 @@ async fn refresh_failing_while_ready(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         );
         (stmt, payload)
     };
-    let (stmt, payload) = fan_rows(
-        FANOUT,
-        ids.link_seq.fetch_add(FANOUT as i64, Ordering::Relaxed) + 1,
-    );
+    // Block reservations take the `fetch_add` result verbatim (`SoakIds::fresh_block`, #247).
+    let (stmt, payload) = fan_rows(FANOUT, SoakIds::fresh_block(&ids.link_seq, FANOUT as i64));
     let per_row = (payload / FANOUT).max(1) as u64;
     let cut = (per_row * lazyview::supervisor::MIN_CHUNK as u64 / 4).max(4_096);
     toxi.arm(&p, &Toxic::limit_data(cut, Dir::Downstream).named("cut"))
@@ -1334,10 +1335,8 @@ async fn refresh_failing_while_ready(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
             let streak = view_metric_max(&body, "lazyview_view_refresh_failures").unwrap_or(0.0);
             let top_up = FANOUT / 4;
             if streak < 3.0 && polls.fetch_add(1, Ordering::Relaxed) % 40 == 39 {
-                let (stmt, _) = fan_rows(
-                    top_up,
-                    ids.link_seq.fetch_add(top_up as i64, Ordering::Relaxed) + 1,
-                );
+                let (stmt, _) =
+                    fan_rows(top_up, SoakIds::fresh_block(&ids.link_seq, top_up as i64));
                 let mut c = db.conn().await?;
                 txn(&mut c, &[stmt], false).await?;
                 c.disconnect().await.ok();

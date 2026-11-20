@@ -435,6 +435,23 @@ impl SoakIds {
     fn max(c: &AtomicI64) -> i64 {
         (c.load(Ordering::SeqCst) - 1).max(1)
     }
+    /// Reserve a block of `n` ids in one step: the caller uses `from ..= from + n - 1` and the
+    /// allocator resumes at `from + n`, so no paced writer's [`SoakIds::fresh`] can share an id
+    /// with the block. `fresh` hands out exactly the value `fetch_add` *returned*, so the
+    /// `fetch_add` result is taken verbatim here: reserving `n` and starting at `+ 1` left the
+    /// block's last id inside the range the paced writers are still handed — a writer's
+    /// `INSERT … ON DUPLICATE KEY` took that row first, and the block's own last statement died
+    /// on ERROR 1062 (issue #229's second flake, in `items_txn`; the same shape on `link_seq`
+    /// was issue #247).
+    ///
+    /// Audit (issue #247): no block reservation outside this helper remains — every other
+    /// `fetch_add` in `tests/common` is a single-step counter (`soakwork.rs`/`workload.rs`
+    /// `fresh`, `workload.rs`'s XA-retry counter, `mod.rs`'s `engine_seq`) or a non-id counter
+    /// (`toxi.rs`, `engineproc.rs`); the `regressions`/`generated_facts`/`supervisor`/
+    /// `binlog_stream` hits are run or event counters, not ids.
+    pub fn fresh_block(c: &AtomicI64, n: i64) -> i64 {
+        c.fetch_add(n, Ordering::SeqCst)
+    }
 }
 
 const KINDS: &[&str] = &["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
@@ -1601,4 +1618,51 @@ pub fn soak_writers() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(4)
+}
+
+#[cfg(test)]
+mod block_reservation_tests {
+    use super::*;
+
+    fn ids(start: i64) -> SoakIds {
+        let one = || AtomicI64::new(1);
+        SoakIds {
+            seed_entities: 0,
+            seed_items: 0,
+            seed_sets: 0,
+            seed_sets_items: 0,
+            groups: 0,
+            entity: one(),
+            item: one(),
+            link_seq: AtomicI64::new(start),
+            tag_seq: one(),
+            group: one(),
+            set: one(),
+            set_item: one(),
+            part_seq: one(),
+            set_note: one(),
+            ref_seq: one(),
+            xid: one(),
+        }
+    }
+
+    /// Issue #247's shape: `fresh` hands out exactly the value `fetch_add` returned, so a block
+    /// reserved with `fetch_add(n) + 1` (rows `from ..= from + n - 1` = `old + 1 ..= old + n`)
+    /// still leaves `old + n` where the next paced writer's `fresh` takes it — the block's own
+    /// `INSERT` and the writer then collide on one row (the rare ERROR 1062). The reservation
+    /// must take the `fetch_add` result verbatim, which is what `SoakIds::fresh_block` does.
+    #[test]
+    fn reserved_block_and_fresh_never_share_an_id() {
+        const N: i64 = 8_000;
+        let ids = ids(1_000_000);
+        let from = SoakIds::fresh_block(&ids.link_seq, N);
+        let mut handed: Vec<i64> = (0..N).map(|k| from + k).collect();
+        handed.extend((0..N).map(|_| SoakIds::fresh(&ids.link_seq)));
+        let uniq: std::collections::HashSet<i64> = handed.iter().copied().collect();
+        assert_eq!(
+            uniq.len(),
+            handed.len(),
+            "a paced writer was handed an id the reserved block already used (issue #247)"
+        );
+    }
 }
