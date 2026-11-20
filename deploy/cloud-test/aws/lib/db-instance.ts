@@ -9,8 +9,9 @@
  *
  * The engine's own settings — binlog format and image, GTID, logical replication — are a parameter
  * group, and the instance refuses to build without one: an instance that runs on the service's
- * defaults is not the server the suite thinks it is testing. Clusters and Multi-AZ failover
- * variants belong to PR A3.
+ * defaults is not the server the suite thinks it is testing. The failover variants of a row are
+ * `lib/multiaz.ts` (this instance with a standby in another zone) and `lib/aurora-cluster.ts`
+ * (a cluster with readers), both of which build on this file's rules rather than repeating them.
  */
 import { Annotations, Duration, RemovalPolicy } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
@@ -48,6 +49,18 @@ export function exportedLogTypes(engine: MatrixEngine): readonly string[] {
 }
 
 const INSTANCE_TYPE_PATTERN = /^db\.[a-z0-9]+\.[a-z0-9]+$/;
+
+/**
+ * Refuses an instance class that is not spelled out in full, and returns the one that is. A row that
+ * named a family instead of a class would get whatever the service chooses inside it, so the run's
+ * cost and the suite's memory floor would both be decided after the row was written.
+ */
+export function assertInstanceClass(instanceType: string): string {
+  if (!INSTANCE_TYPE_PATTERN.test(instanceType)) {
+    throw new Error(`instance type "${instanceType}" is not a full RDS class such as db.t4g.medium`);
+  }
+  return instanceType;
+}
 
 export interface MatrixDbInstanceProps {
   readonly vpc: ec2.IVpc;
@@ -98,9 +111,7 @@ export class MatrixDbInstance extends Construct {
         `backup retention must be at least ${MIN_BACKUP_RETENTION_DAYS} day: without automated backups RDS keeps no binlogs and the binlog suite tests nothing`,
       );
     }
-    if (!INSTANCE_TYPE_PATTERN.test(props.instanceType)) {
-      throw new Error(`instance type "${props.instanceType}" is not a full RDS class such as db.t4g.medium`);
-    }
+    assertInstanceClass(props.instanceType);
     // The group is shared across a family, so the check that matters is that it is the family of
     // *this* engine: binlog settings in a group attached to the wrong kind of database configure
     // nothing, and the run would go on measuring an unconfigured server.

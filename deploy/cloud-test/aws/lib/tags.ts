@@ -5,8 +5,14 @@
  * deletes on when a run dies mid-flight, `run-id` ties a resource and its bill back to one
  * workflow run, and `managed-by` is the key the owner's budget alarm is set on. They are the only
  * tags this composition sets, and they name nothing beyond the run itself.
+ *
+ * They are applied with CDK's own tag aspect, added once to the stack: asking for a tag is itself
+ * an aspect, so asking for one from *inside* another aspect's visit makes synthesis restart its
+ * aspect passes for every resource in the run, and past a hundred resources it gives up. The
+ * standard mechanism adds the aspect once, before synthesis starts, and reaches everything in the
+ * tree that can carry a tag — which is the whole point of tagging a run rather than a resource.
  */
-import { Aspects, IAspect, Resource, Tags } from 'aws-cdk-lib';
+import { Tags } from 'aws-cdk-lib';
 import type { IConstruct } from 'constructs';
 
 export const EXPIRY_TAG_KEY = 'expiry';
@@ -47,35 +53,23 @@ export function assertValidExpiry(expiry: string): string {
   return expiry;
 }
 
-/** Puts the three matrix tags on every taggable resource in the tree it is applied to. */
-export class MatrixTags implements IAspect {
-  private readonly entries: ReadonlyArray<readonly [string, string]>;
-
-  constructor(props: MatrixTagProps) {
-    this.entries = [
-      [EXPIRY_TAG_KEY, assertValidExpiry(props.expiry)],
-      [RUN_ID_TAG_KEY, props.runId],
-      [MANAGED_BY_TAG_KEY, MANAGED_BY_TAG_VALUE],
-    ];
-  }
-
-  visit(node: IConstruct): void {
-    // A Resource is the only node that renders a tag list CloudFormation reads; constructs that
-    // only group or configure others have nothing to tag.
-    if (!(node instanceof Resource)) {
-      return;
-    }
-    const tags = Tags.of(node);
-    for (const [key, value] of this.entries) {
-      tags.add(key, value);
-    }
-  }
+/** The three tags a run's resources carry, in the order the reader lists them. */
+export function matrixTagEntries(props: MatrixTagProps): ReadonlyArray<readonly [string, string]> {
+  return [
+    [EXPIRY_TAG_KEY, assertValidExpiry(props.expiry)],
+    [RUN_ID_TAG_KEY, props.runId],
+    [MANAGED_BY_TAG_KEY, MANAGED_BY_TAG_VALUE],
+  ];
 }
 
 /**
  * Tags everything the run creates. A crashed run stays findable, stays billable to one alarm, and
  * stays deletable by the cleanup job, which is what makes a weekly cloud job safe to run at all.
+ * An expiry that has already passed refuses the whole run rather than tagging a dead one.
  */
 export function applyMatrixTags(scope: IConstruct, props: MatrixTagProps): void {
-  Aspects.of(scope).add(new MatrixTags(props));
+  const tags = Tags.of(scope);
+  for (const [key, value] of matrixTagEntries(props)) {
+    tags.add(key, value);
+  }
 }

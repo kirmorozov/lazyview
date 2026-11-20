@@ -29,8 +29,12 @@ function futureExpiry(): string {
   return new Date(Date.now() + 60 * 60 * 1000).toISOString();
 }
 
+/**
+ * A1's proof is about the plain rows, so a default synth means those: the Multi-AZ and Aurora rows
+ * arrive by name, and `test/failover.test.ts` is where they are measured.
+ */
 function synth(targets?: readonly string[], expiry: string = futureExpiry()): Template {
-  return Template.fromStack(createMatrixStack(new App(), { targets, expiry, runId: RUN_ID }));
+  return Template.fromStack(createMatrixStack(new App(), { targets: targets ?? RDS_TARGETS.map((target) => target.id), expiry, runId: RUN_ID }));
 }
 
 function propertiesOf(template: Template, type: string): Array<Record<string, unknown>> {

@@ -47,8 +47,13 @@ function futureExpiry(): string {
   return new Date(Date.now() + 60 * 60 * 1000).toISOString();
 }
 
+/**
+ * A2's proof is about the instance rows and the group each one reads, so a default synth means those:
+ * a failover row is the same build twice, and the Aurora rows are composed by `lib/aurora-cluster.ts`.
+ * `test/failover.test.ts` measures the failover rows and the clusters.
+ */
 function synth(targets?: readonly string[], expiry: string = futureExpiry()): Template {
-  return Template.fromStack(createMatrixStack(new App(), { targets, expiry, runId: RUN_ID }));
+  return Template.fromStack(createMatrixStack(new App(), { targets: targets ?? RDS_TARGETS.map((target) => target.id), expiry, runId: RUN_ID }));
 }
 
 function propertiesOf(template: Template, type: string): Array<Record<string, unknown>> {

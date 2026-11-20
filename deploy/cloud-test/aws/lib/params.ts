@@ -118,6 +118,138 @@ export const FORBIDDEN_PARAMETERS: Readonly<Record<MatrixEngine, readonly string
   ],
 };
 
+/**
+ * The two engine families the matrix runs on Aurora, spelled the way RDS spells them. A cluster is
+ * not an instance with a standby attached: it is a different resource, with its own parameter group
+ * (a *cluster* parameter group) and its own parameter families, so it has its own engine names.
+ */
+export enum MatrixClusterEngine {
+  AuroraMySQL = 'aurora-mysql',
+  AuroraPostgreSQL = 'aurora-postgresql',
+}
+
+/**
+ * The engine a client reaches an Aurora row with. A cluster answers on its family's port with its
+ * family's client, so the runner's credential variable and the port rule that lets the task reach
+ * it are derived from this, not from the cluster engine's name, which no client understands.
+ */
+export function clusterClientEngineFor(engine: MatrixClusterEngine): MatrixEngine {
+  return engine === MatrixClusterEngine.AuroraMySQL ? MatrixEngine.MySQL : MatrixEngine.PostgreSQL;
+}
+
+/**
+ * The Aurora switch that makes its binlog readable while it is being written. It is also what the
+ * commit-order fence accepts in place of `binlog_order_commits`: `src/fence.rs:37-44` treats an
+ * `aurora_enhanced_binlog` status of `ACTIVE` as the proof that a committed change is visible.
+ */
+export const AURORA_ENHANCED_BINLOG_PARAMETER = 'aurora_enhanced_binlog';
+/** The two cluster settings the enhanced binlog has to be off before it will turn on. */
+export const AURORA_BINLOG_BACKUP_PARAMETER = 'binlog_backup';
+export const AURORA_BINLOG_REPLICATION_GLOBALDB_PARAMETER = 'binlog_replication_globaldb';
+/**
+ * How stale a read from a reader may be. The matrix leaves it at the engine default (session-level,
+ * so a read after a write on the promoted node cannot see the old leader's stale state), which is
+ * why it must not appear in the group at all — see `CLUSTER_FORBIDDEN_PARAMETERS`.
+ */
+export const AURORA_REPLICA_READ_CONSISTENCY_PARAMETER = 'aurora_replica_read_consistency';
+/**
+ * The row image as the Aurora families spell it: the Aurora parameter reference lists `full`,
+ * `minimal`, `noblob` in lower case, where the RDS MySQL families list `FULL`. The server reports
+ * `FULL` either way, and lazyview reads the server's value, but a group that handed RDS the other
+ * spelling would be refused when the run creates it.
+ */
+export const AURORA_ROW_IMAGE_FULL = 'full';
+
+/** What each Aurora family must set in its cluster parameter group. Exported for the assertions. */
+export const CLUSTER_REQUIRED_PARAMETERS: Readonly<Record<MatrixClusterEngine, readonly string[]>> = {
+  [MatrixClusterEngine.AuroraMySQL]: [
+    BINLOG_FORMAT_PARAMETER,
+    BINLOG_ROW_IMAGE_PARAMETER,
+    BINLOG_ROW_VALUE_OPTIONS_PARAMETER,
+    AURORA_ENHANCED_BINLOG_PARAMETER,
+    AURORA_BINLOG_BACKUP_PARAMETER,
+    AURORA_BINLOG_REPLICATION_GLOBALDB_PARAMETER,
+    REQUIRE_SECURE_TRANSPORT_PARAMETER,
+  ],
+  [MatrixClusterEngine.AuroraPostgreSQL]: [
+    LOGICAL_REPLICATION_PARAMETER,
+    FORCE_SSL_PARAMETER,
+    MAX_WAL_SENDERS_PARAMETER,
+    MAX_REPLICATION_SLOTS_PARAMETER,
+  ],
+};
+
+/**
+ * Names this Aurora family must not mention. Each of these would either be refused when the group is
+ * created, or would silently replace the setting the row is there to measure.
+ */
+export const CLUSTER_FORBIDDEN_PARAMETERS: Readonly<Record<MatrixClusterEngine, readonly string[]>> = {
+  [MatrixClusterEngine.AuroraMySQL]: [
+    // GTIDs: AWS lists `gtid-mode` as only *sometimes* modifiable on Aurora — it moves through
+    // OFF_PERMISSIVE and ON_PERMISSIVE and needs a reboot, so a group cannot ask for ON at create
+    // time. The engine's own tip says the same thing from the other side: `src/engine.rs:117-119`
+    // withholds the GTID advice on Aurora, "where the parameter does not exist as such". An Aurora
+    // row therefore runs without GTIDs and is exact through the enhanced binlog instead, which is
+    // the same no-GTID case the managed MariaDB rows run.
+    GTID_MODE_PARAMETER,
+    ENFORCE_GTID_CONSISTENCY_PARAMETER,
+    // The fence reads the enhanced binlog's status here (`src/fence.rs:37-44`); a variable that
+    // decides nothing on this engine would only make the group look like the RDS one.
+    BINLOG_ORDER_COMMITS_PARAMETER,
+    AURORA_REPLICA_READ_CONSISTENCY_PARAMETER,
+    LOG_BIN_COMPRESS_PARAMETER,
+    LOGICAL_REPLICATION_PARAMETER,
+    FORCE_SSL_PARAMETER,
+  ],
+  [MatrixClusterEngine.AuroraPostgreSQL]: [
+    BINLOG_FORMAT_PARAMETER,
+    BINLOG_ROW_IMAGE_PARAMETER,
+    BINLOG_ROW_VALUE_OPTIONS_PARAMETER,
+    LOG_BIN_COMPRESS_PARAMETER,
+    GTID_MODE_PARAMETER,
+    ENFORCE_GTID_CONSISTENCY_PARAMETER,
+    BINLOG_ORDER_COMMITS_PARAMETER,
+    REQUIRE_SECURE_TRANSPORT_PARAMETER,
+    AURORA_ENHANCED_BINLOG_PARAMETER,
+    AURORA_BINLOG_BACKUP_PARAMETER,
+    AURORA_BINLOG_REPLICATION_GLOBALDB_PARAMETER,
+    AURORA_REPLICA_READ_CONSISTENCY_PARAMETER,
+  ],
+};
+
+/** The engine settings one Aurora family of the matrix runs with, in its cluster parameter group. */
+export function auroraClusterParametersFor(engine: MatrixClusterEngine): Readonly<Record<string, string>> {
+  if (engine === MatrixClusterEngine.AuroraMySQL) {
+    return {
+      // This one parameter is what makes an Aurora MySQL cluster a binlog source at all: RDS's
+      // Aurora reference says `log-bin` follows `binlog_format` and is not settable on its own, and
+      // the family's default is OFF. A cluster whose group leaves it out has no binlog to read.
+      [BINLOG_FORMAT_PARAMETER]: BINLOG_FORMAT_ROW,
+      [BINLOG_ROW_IMAGE_PARAMETER]: AURORA_ROW_IMAGE_FULL,
+      // Empty, as on RDS: AWS's own prerequisites for reading an Aurora binlog say
+      // `binlog_row_value_options` must not be `PARTIAL_JSON`, which rewrites an updated JSON
+      // column into a partial event instead of the row a view was built from.
+      [BINLOG_ROW_VALUE_OPTIONS_PARAMETER]: BINLOG_ROW_VALUE_OPTIONS_NONE,
+      // The fence's proof on this engine, and the only way to read the binlog as it is written.
+      [AURORA_ENHANCED_BINLOG_PARAMETER]: BOOLEAN_ON,
+      // Both are preconditions of the enhanced binlog, not preferences: AWS requires them off
+      // before it will turn on, and refuses the combination otherwise.
+      [AURORA_BINLOG_BACKUP_PARAMETER]: BOOLEAN_OFF,
+      [AURORA_BINLOG_REPLICATION_GLOBALDB_PARAMETER]: BOOLEAN_OFF,
+      [REQUIRE_SECURE_TRANSPORT_PARAMETER]: BOOLEAN_ON,
+    };
+  }
+  // Aurora PostgreSQL decodes logically with the same RDS switches as RDS PostgreSQL: the cluster
+  // is a source only while `rds.logical_replication` is on, TLS is enforced by `rds.force_ssl`, and
+  // the reader needs slots and wal senders to exist at all.
+  return {
+    [LOGICAL_REPLICATION_PARAMETER]: BOOLEAN_ON,
+    [FORCE_SSL_PARAMETER]: BOOLEAN_ON,
+    [MAX_WAL_SENDERS_PARAMETER]: REPLICATION_CONNECTIONS,
+    [MAX_REPLICATION_SLOTS_PARAMETER]: REPLICATION_CONNECTIONS,
+  };
+}
+
 /** The engine settings one family of the matrix runs with. */
 export function matrixParametersFor(engine: MatrixEngine): Readonly<Record<string, string>> {
   if (engine === MatrixEngine.MySQL) {
