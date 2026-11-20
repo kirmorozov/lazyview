@@ -434,6 +434,28 @@ struct Lag {
     /// keys kept. Its kept keys live only in memory, so the saved position waits for its
     /// `since` (`pending_floor`) and a restart replays the outage rather than losing them.
     down: bool,
+    /// Units `note_refresh` re-fed to this group **since the last claim** (#214). A claimed
+    /// group's detached retry reads the sources at or after its claim, so an unit re-fed after
+    /// the claim may be missing from what that retry writes even when it was in the claim
+    /// snapshot: `lag_subtract` posts it back, and it stays owed until a later retry — whose
+    /// claim cleared this and whose read follows the change — writes it. Without this the
+    /// subtraction removed it (it was in the claim) and a change that arrived after the read
+    /// was lost: the target kept a row the source no longer had.
+    /// Cost (guard R3): one set feed per lagging target per refresh — the same shape as the
+    /// feed above it in `note_refresh`, cleared per claim — never per binlog event.
+    posted: UnitSet,
+    posted_partial: Vec<UnitSet>,
+    posted_all: bool,
+}
+
+impl Lag {
+    /// Forgets the re-fed-since-claim marks: the retry starting now reads the sources from
+    /// here on, so it writes everything fed until now; later feeds post again (`note_refresh`).
+    fn clear_posted(&mut self) {
+        self.posted = UnitSet::default();
+        self.posted_partial = Vec::new();
+        self.posted_all = false;
+    }
 }
 
 /// Lowers `floor` to `p` when that is a known position older than it.
@@ -822,8 +844,18 @@ struct Engine {
     /// the task ends when this, its only sender, is dropped with the engine.
     stats_tx: crate::stats::FoldSender,
     /// Concurrent refreshes on connection pools; `None` with `LAZYVIEW_SUPERVISOR=off` (one
-    /// sequential refresh on the connections above).
-    sup: Option<Supervisor>,
+    /// sequential refresh on the connections above). Shared as an `Arc`: a detached lag
+    /// retry drives its writes from a spawned task while the flush tick moves on (#214).
+    sup: Option<Arc<Supervisor>>,
+    /// Lag retries the detached tasks are running (#214): at most one per (slot, target).
+    /// The handle is kept so a task that died without its message (a panic) frees its
+    /// target on the next tick; results are folded in by `lag_end` on a later tick.
+    lag_retries: HashMap<(usize, String), tokio::task::JoinHandle<()>>,
+    lag_tx: mpsc::UnboundedSender<(usize, LagRetry, Result<Refreshed>)>,
+    lag_rx: mpsc::UnboundedReceiver<(usize, LagRetry, Result<Refreshed>)>,
+    /// Results drained from `lag_rx` whose slot is mid-swap (see `refresh_all_live`): they
+    /// wait here, in arrival order, until the swap is in.
+    lag_held: VecDeque<(usize, LagRetry, Result<Refreshed>)>,
     /// Executor (a): the dedup core and its targets, one per live version on the Dedup route
     /// (src/exec.rs).
     dedup: crate::exec::Dedup,
@@ -910,10 +942,10 @@ impl Drained {
     /// Queues `r`, read from binlog file `file`. Heartbeats are dropped: they carry nothing, and
     /// one taken from the queue would move the position to the reader's, past the events queued
     /// behind it (see `Engine::on_item`); the next one read while idle does that instead.
-    fn push(&mut self, r: Read, file: &str) {
+    fn push(&mut self, r: Read, file: &str) -> usize {
         let b = match &r {
             Ok(Some(Item::Rows { event, .. })) => 64 + event.data().len(),
-            Ok(Some(Item::Heartbeat)) => return,
+            Ok(Some(Item::Heartbeat)) => return 0,
             _ => 64,
         };
         if self.queue.is_empty() {
@@ -921,6 +953,7 @@ impl Drained {
         }
         self.bytes += b;
         self.queue.push_back((r, b));
+        b
     }
 
     fn pop(&mut self) -> Option<Read> {
@@ -1369,6 +1402,7 @@ impl Engine {
             .map(|(k, v)| (k, v.hash))
             .collect();
         let (build_tx, build_rx) = mpsc::unbounded_channel();
+        let (lag_tx, lag_rx) = mpsc::unbounded_channel();
         let cfg_build_concurrency = cfg.build_concurrency;
         let sup = Supervisor::new(
             &cfg.supervisor,
@@ -1376,7 +1410,8 @@ impl Engine {
             &session_sql_mode(&mut src).await?,
             cfg.lock_wait_s,
             metrics.clone(),
-        );
+        )
+        .map(Arc::new);
         match cfg.supervisor.mode {
             crate::config::SupervisorMode::Off => {
                 info!("refreshes run sequentially (LAZYVIEW_SUPERVISOR=off)")
@@ -1469,6 +1504,10 @@ impl Engine {
             last_stats: (Instant::now(), Default::default()),
             stats_tx,
             sup,
+            lag_retries: HashMap::new(),
+            lag_tx,
+            lag_rx,
+            lag_held: VecDeque::new(),
             dedup,
             stmt_dml_last: HashMap::new(),
         };
@@ -3494,14 +3533,26 @@ impl Engine {
                     crate::metrics::unix_now(),
                 );
                 let deadline = self.flush_deadline();
-                let sleep_until =
-                    deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+                // A lag entry's `retry_at` also wakes the loop: the claim and the folding of
+                // a finished detached retry run at their scheduled time, not at the slot's
+                // next due flush (#214 — an entry armed by a just-failed swap would else
+                // wait a whole interval and its target's catch-up could miss a verify).
+                let wake = match (deadline, self.lag_any().then(|| self.lag_wake())) {
+                    (Some(d), Some(w)) => Some(d.min(w)),
+                    (Some(d), None) => Some(d),
+                    (None, Some(w)) => Some(w),
+                    (None, None) => None,
+                };
                 let mut idle = false;
                 let mut read = drained.pop();
                 if read.is_some() && *shutdown.borrow() {
                     break 'reconnect;
                 }
                 if read.is_none() {
+                    let sleep_fut = tokio::time::sleep_until(
+                        wake.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
+                            .into(),
+                    );
                     tokio::select! {
                         biased;
                         _ = shutdown.changed() => {
@@ -3515,7 +3566,7 @@ impl Engine {
                             read = Some(item);
                         }
                         // Polled last: fires only while the stream has nothing to deliver.
-                        _ = tokio::time::sleep_until(sleep_until.into()), if deadline.is_some() && !self.in_txn => idle = true,
+                        _ = sleep_fut, if wake.is_some() && !self.in_txn => idle = true,
                         _ = tokio::time::sleep_until((last_event + silence).into()) => {
                             warn!("no binlog event or heartbeat for {silence:?}; reconnecting");
                             end = Some(StreamEnd::Silence);
@@ -3606,6 +3657,11 @@ impl Engine {
                     }
                 }
                 if !self.in_txn {
+                    if self.lag_any() {
+                        // Claims and folds at their scheduled time (see `lag_wake`), even
+                        // when no slot is due; when one is, the flush already did this.
+                        self.lag_service().await;
+                    }
                     self.housekeeping().await?;
                 }
             }
@@ -3731,6 +3787,22 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| reader.position().file.clone());
         let (mut read_any, mut full) = (false, false);
+        // The changes this flush read while it ran, and whether any of them is one the targets
+        // owe: rows of a table other than the engine's own bookkeeping (its definitions, state,
+        // status and commit-fence rows — the ones `on_item` filters out where they arrive, so no
+        // target ever applies them). The engine's own rows must not count as the stream moving:
+        // on a flavor whose visibility fence is a *write* rather than a wait — the commit-order
+        // row of the MySQL family without GTIDs (`mysql::commit_order`, `src/fence.rs`), which
+        // the flush commits itself, as Percona Server does with GTIDs off — the flush reads its
+        // own fence row back out of the binlog while it runs, and counting it accounts every
+        // target of every flush as behind on the engine's own account. From there the healthy
+        // targets are skipped by the refresh and their catch-up queues behind the target that is
+        // not answering: independence broken (#214, percona84). A table this run has no map
+        // entry for counts, as before. Cost (guard R3): one `contains` over the (at most four)
+        // ids of our own tables per event read during a flush, and one `String` clone per flush.
+        let (mut owed_bytes, mut owed_changes) = (0usize, false);
+        let mut own_ids: Vec<u64> = Vec::new();
+        let schema = self.schema.clone();
         let metrics = self.metrics.clone();
         // Everything fed so far (the binlog read position) is what this flush applies: the
         // position the targets will have applied when it is through (#215, see below).
@@ -3754,28 +3826,77 @@ impl Engine {
                     }
                     read = reader.next(), if open => {
                         *last_event = Instant::now();
-                        drained.push(read, &file);
+                        // A table map always precedes the rows events it describes, so the ids of
+                        // our own tables are known by the time their rows are weighed; an id the
+                        // server reused for another table is not ours (it drops out of the list).
+                        let owed = match &read {
+                            Ok(Some(item)) => Self::owed_item(item, schema.as_str(), &mut own_ids),
+                            _ => false,
+                        };
+                        let b = drained.push(read, &file);
+                        if owed {
+                            owed_bytes += b;
+                            owed_changes = true;
+                        }
                         read_any = true;
                     }
                 }
             }
         };
-        // A flush that outran its writes: while it ran the stream moved past what it applied by
-        // more than the budget of the changes kept for targets that are behind — the targets
-        // answered every write, yet demonstrably fall behind (a starved link; #215). Reported
-        // and accounted as lagging, the same way a target that failed its writes is. Decided
-        // from the applied position against the budget, never from error text. Cost (guard R3):
-        // one position compare and one pass over the (view, target) pairs per flush; the event
-        // path is untouched (the reader's position is read once, here, not per event).
-        if r.is_ok() && read_any {
-            self.mark_behind_targets(&applied, reader.position(), drained.bytes);
+        // A flush that outran its writes: while it ran, changes the targets owed arrived past
+        // what it applied — more of them than the budget of the changes kept for targets that are
+        // behind — and the targets answered every write, yet demonstrably fall behind (a starved
+        // link; #215). Reported and accounted as lagging, the same way a target that failed its
+        // writes is. Decided from the applied position against the budget, never from error text,
+        // and only over the changes the targets owe (see above: the engine's own bookkeeping rows
+        // are not one, or a flavor that fences with a write flags its own targets behind).
+        // Cost (guard R3): one position compare and one pass over the (view, target) pairs per
+        // flush; the event path is untouched (the reader's position is read once, here, not per
+        // event).
+        if r.is_ok() && read_any && owed_changes {
+            self.mark_behind_targets(&applied, reader.position(), owed_bytes);
         }
         r
     }
 
+    /// Whether an event read while a flush ran is a change the targets owe: rows of a table
+    /// other than the engine's own bookkeeping, or a statement (DDL changes what the views mean).
+    /// `own_ids` is the table ids the table-map events of this flush named as ours: a map updates
+    /// it (a table map always precedes the rows events it describes), and an id the server reused
+    /// for another table leaves it. A table with no map entry in this flush counts, as before.
+    fn owed_item(item: &Item, schema: &str, own_ids: &mut Vec<u64>) -> bool {
+        match item {
+            Item::TableMap {
+                table_id,
+                schema: s,
+                table,
+                ..
+            } => {
+                if s.as_str() == schema
+                    && (table.as_str() == meta::DEFS
+                        || table.as_str() == meta::STATE
+                        || table.as_str() == meta::STATUS
+                        || table.as_str() == mysql::table())
+                {
+                    if !own_ids.contains(table_id) {
+                        own_ids.push(*table_id);
+                    }
+                } else {
+                    own_ids.retain(|x| *x != *table_id);
+                }
+                false
+            }
+            Item::Rows { table_id, .. } => !own_ids.contains(table_id),
+            Item::Statement { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Flags the targets the flush just wrote as behind: the flush applied everything up to
-    /// `applied`, while the stream was read up to `read` (events worth `drained_bytes` are
-    /// queued behind that position). Past the `Config::mem.lag_hold_bytes` budget
+    /// `applied`, while the stream was read up to `read` (`owed_bytes` of changes the targets
+    /// owe arrived meanwhile: rows of a table other than the engine's own bookkeeping, so a
+    /// flush is never flagged behind by the fence or state row it wrote itself). Past the
+    /// `Config::mem.lag_hold_bytes` budget
     /// (`LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests) every target that took this flush's writes is
     /// flagged in [`Version::behind`]: the next refresh skips it and hands it its changes
     /// through a `lag` entry (`note_refresh`), or the entry is made when the flag's retry time
@@ -3783,14 +3904,14 @@ impl Engine {
     /// writes failed gets: kept keys, the budget warning, `retry_lag` catching it up and
     /// counting the catch-up. Nothing is rebuilt or dropped; a target that keeps up again
     /// simply never gets flagged (only a written target of a slow flush is).
-    fn mark_behind_targets(&mut self, applied: &Position, read: &Position, drained_bytes: usize) {
+    fn mark_behind_targets(&mut self, applied: &Position, read: &Position, owed_bytes: usize) {
         let budget = self.cfg.mem.lag_hold_bytes;
         // Bytes between the two positions: an offset difference in one binlog file; across a
         // rotation the size of the files between is unknown, so the queue alone decides.
         let behind = if read.file == applied.file {
             read.pos.saturating_sub(applied.pos) > budget as u64
         } else {
-            drained_bytes > budget
+            owed_bytes > budget
         };
         if !behind {
             return;
@@ -3806,7 +3927,7 @@ impl Engine {
                 }
                 l.behind.insert(t.clone(), retry_at);
                 warn!(view = %l.name, target = %t,
-                    "writes to this target are behind: the stream has moved {drained_bytes} \
+                    "writes to this target are behind: the stream has moved {owed_bytes} \
                      bytes of changes past the position this flush applied, over the {budget} \
                      byte budget; the target is accounted as lagging until it catches up");
             }
@@ -5671,7 +5792,9 @@ impl Engine {
             // Only some targets of an otherwise live view: those are retried on their own.
             let plan = n.plan.clone();
             for t in &n.targets {
-                self.target_down(i, &n.name, t, Some(&plan), &e).await;
+                if !self.lag_after_build_fail(i, t, &plan) {
+                    self.target_down(i, &n.name, t, Some(&plan), &e).await;
+                }
             }
             self.rebuild_routes();
             return;
@@ -5724,7 +5847,12 @@ impl Engine {
             n.targets.retain(|x| *x != t);
             if n.partial || !n.targets.is_empty() || n.swapped.contains(&t) {
                 let plan = n.plan.clone();
-                self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                // A maintained Full-mode target that failed the build lags (its own
+                // whole-view refresh catches it up) instead of becoming a `Down` target
+                // that `retry_down` rebuilds onto through the fault (#214).
+                if !self.lag_after_build_fail(i, &t, &plan) {
+                    self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                }
             }
             first_err.get_or_insert(e);
         }
@@ -5979,7 +6107,12 @@ impl Engine {
                     let e = e.context(format!("swapping in new version on target {t}"));
                     n.targets.retain(|x| *x != t);
                     let plan = n.plan.clone();
-                    self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                    // A Full-mode target that only failed the swap lags (its whole-view
+                    // refresh re-applies and the swap is not needed) — see the build path
+                    // above (#214). The dropped connection above is re-dialled by it.
+                    if !self.lag_after_build_fail(i, &t, &plan) {
+                        self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                    }
                     first_err.get_or_insert(e);
                 }
             }
@@ -6084,6 +6217,19 @@ impl Engine {
             }
             None => {
                 let empty = live_dirty.is_empty();
+                // (#214) Targets still behind carry into the new version: the ones that
+                // were swapped in got the complete view and owe nothing (their entries
+                // would only delay a needed `ready`), but a target that was not — it
+                // failed the build or the swap above, or it already lagged — keeps its
+                // entry, or nothing would ever catch it up: it is in none of the version's
+                // targets, and `retry_down` no longer rebuilds onto it.
+                let (mut lag, mut behind) = self.slots[i]
+                    .live
+                    .take()
+                    .map(|l| (l.lag, l.behind))
+                    .unwrap_or_default();
+                lag.retain(|t, _| !swapped.iter().any(|s| s == t));
+                behind.retain(|t, _| !swapped.iter().any(|s| s == t));
                 self.slots[i].live = Some(Version {
                     plan: n.plan,
                     layout,
@@ -6092,8 +6238,8 @@ impl Engine {
                     dirty: live_dirty,
                     frozen: false,
                     since: if empty { None } else { since },
-                    lag: BTreeMap::new(),
-                    behind: BTreeMap::new(),
+                    lag,
+                    behind,
                     recent,
                     catalog_head: n.catalog_head,
                     table_heads: HashMap::new(),
@@ -6118,6 +6264,13 @@ impl Engine {
     }
 
     async fn refresh_live(&mut self, i: usize) {
+        // The sequential path (`LAZYVIEW_SUPERVISOR=off`): nothing else of this slot is running,
+        // so its lagging targets are retried here, ahead of the healthy writes. The supervised
+        // flush runs the same retries beside those writes instead (`refresh_all_live`). A swap
+        // in progress keeps its changes (see `live_begin`), and with them its retries.
+        if !self.slots[i].next.as_ref().is_some_and(|n| n.swapping) {
+            self.retry_lag(i).await;
+        }
         let Some(mut st) = self.live_begin(i).await else {
             return;
         };
@@ -6135,14 +6288,16 @@ impl Engine {
         self.live_end(i, st, r).await;
     }
 
-    /// What [`Self::refresh_live`] does before the refresh: lagging targets, full-mode views
-    /// (rebuilt instead), and the changes to apply. None: nothing to refresh now.
+    /// What [`Self::refresh_live`] does before the refresh: full-mode views (rebuilt instead) and
+    /// the changes to apply, on the targets that are not behind (a lagging target, including one
+    /// whose retry this flush is running, is not written here — see `lag_due`). The lagging
+    /// targets themselves are the caller's step (`retry_lag`, `refresh_all_live`).
+    /// None: nothing to refresh now.
     async fn live_begin(&mut self, i: usize) -> Option<LiveRefresh> {
         // A routine rebuild is being swapped in: changes wait for it (see `finish_next`).
         if self.slots[i].next.as_ref().is_some_and(|n| n.swapping) {
             return None;
         }
-        self.retry_lag(i).await;
         let def_id = self.slots[i].def_id;
         let replan_pending = self.replan.contains_key(&def_id);
         let backing_off = self.slots[i].retry_at.is_some_and(|t| t > Instant::now());
@@ -6173,7 +6328,22 @@ impl Engine {
                     n.since.get_or_insert(p);
                 }
             } else if full_due && !replan_pending {
-                let all = l.targets.clone();
+                // #214: as on the unit path above, targets that are behind are not written
+                // here. Rebuilding onto a black-holed target would hold the next rebuild for
+                // its connect timeout and answer its lag with repeated full rebuilds
+                // (`retry_down`); a down target only lags — its own whole-view refresh in
+                // `lag_due`/`lag_end` catches it up when it answers. If every target is
+                // behind, those refreshes alone carry the view and nothing rebuilds.
+                let all: Vec<String> = l
+                    .targets
+                    .iter()
+                    .filter(|t| !lagging.contains(t))
+                    .cloned()
+                    .collect();
+                if all.is_empty() {
+                    l.dirty.all = true;
+                    return None;
+                }
                 self.start_next(i, plan, name, all, false).await;
             } else {
                 // Not due yet: stay stale until the next refresh slot (see flush_deadline).
@@ -6229,6 +6399,9 @@ impl Engine {
                 failures: 1,
                 retry_at: Instant::now() + connect_retry_delay(1),
                 down: false,
+                posted: UnitSet::default(),
+                posted_partial: Vec::new(),
+                posted_all: false,
             });
         }
         // A target flagged behind (`mark_behind_targets`) that this refresh applied to none of:
@@ -6248,6 +6421,9 @@ impl Engine {
                         failures: 0,
                         retry_at: Instant::now() + connect_retry_delay(1),
                         down: false,
+                        posted: UnitSet::default(),
+                        posted_partial: Vec::new(),
+                        posted_all: false,
                     },
                 );
             }
@@ -6257,6 +6433,11 @@ impl Engine {
                 g.units.extend(r.units.clone());
                 extend_partial(&mut g.partial, r.partial.clone());
                 g.all |= r.all;
+                // #214: if this target's retry was claimed and runs detached, its write may
+                // predate this refresh; post the units so the fold keeps them owed.
+                g.posted.extend(r.units.clone());
+                extend_partial(&mut g.posted_partial, r.partial.clone());
+                g.posted_all |= r.all;
             }
         }
         s.stats.refreshed(r.units, r.partial, r.all, &r.work);
@@ -6359,8 +6540,40 @@ impl Engine {
     }
 
     /// Retries targets whose writes failed; one that keeps failing is reported down (and
-    /// rebuilt once it answers again).
+    /// rebuilt once it answers again). The sequential path (`LAZYVIEW_SUPERVISOR=off`), where
+    /// nothing else of the slot is running to wait for them: the supervised flush prepares the
+    /// same retries with its healthy refreshes and runs them beside the writes
+    /// ([`Self::lag_due`], [`Self::lag_end`]).
     async fn retry_lag(&mut self, i: usize) {
+        for mut g in self.lag_due(i, true) {
+            let r = self
+                .refresh(
+                    &g.plan,
+                    &g.layout,
+                    &mut g.dirty,
+                    std::slice::from_ref(&g.t),
+                    &g.name,
+                    &mut g.look,
+                    None,
+                )
+                .await;
+            self.lag_end(g, r).await;
+        }
+    }
+
+    /// The lagging targets of slot `i` whose `retry_at` has come due, each with the catch-up it
+    /// needs: `kept` is the group as the lag map holds it, `dirty` the units its retry writes.
+    /// `take`: the sequential path takes the group out of the map here (the flush is not written
+    /// while the retry runs, so nothing else looks at it); the supervised path leaves it there,
+    /// so the flush keeps skipping the target and keeps its floor (`live_begin`, `pending_floor`).
+    /// One flush cannot pick the same target twice: its retry is awaited before the next one
+    /// begins.
+    fn lag_due(&mut self, i: usize, take: bool) -> Vec<LagRetry> {
+        // A routine rebuild is being swapped in: its changes wait for it (see `finish_next`),
+        // and with them its retries (as in `live_begin`).
+        if self.slots[i].next.as_ref().is_some_and(|n| n.swapping) {
+            return Vec::new();
+        }
         let now = Instant::now();
         // Behind flags whose retry time came without a refresh handing them their units (a
         // one-target view: the skipped refresh has no target left to read the materialized
@@ -6391,6 +6604,9 @@ impl Engine {
                     failures: 0,
                     retry_at: now,
                     down: false,
+                    posted: UnitSet::default(),
+                    posted_partial: Vec::new(),
+                    posted_all: false,
                 };
                 l.lag.entry(t).or_insert(seed);
             }
@@ -6402,86 +6618,213 @@ impl Engine {
                 .filter(|(_, g)| g.retry_at <= now)
                 .map(|(t, _)| t.clone())
                 .collect(),
-            None => return,
+            None => return Vec::new(),
         };
+        let mut out = Vec::new();
         for t in due {
             let Some(l) = self.slots[i].live.as_mut() else {
-                return;
-            };
-            let Some(mut g) = l.lag.remove(&t) else {
-                continue;
+                return out;
             };
             let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
-            let mut d = ViewDirty {
+            let kept = if take {
+                // Sequential path: the group leaves the map and its retry runs at once
+                // (`retry_lag`), so nothing feeds it while it runs — the claim's read covers
+                // everything fed until now (#214).
+                l.lag.remove(&t).map(|mut g| {
+                    g.clear_posted();
+                    g
+                })
+            } else {
+                None
+            };
+            let Some(g) = kept.as_ref().or_else(|| l.lag.get(&t)) else {
+                continue;
+            };
+            let dirty = ViewDirty {
                 units: g.units.clone(),
                 partial: g.partial.clone(),
                 images: vec![KeySet::default(); plan.aliases.len()],
                 all: g.all,
                 ..Default::default()
             };
-            let r = self
-                .refresh(
-                    &plan,
-                    &layout,
-                    &mut d,
-                    std::slice::from_ref(&t),
-                    &name,
-                    &mut Lookback::default(),
-                    None,
-                )
-                .await;
-            let s = &mut self.slots[i];
-            let Some(l) = s.live.as_mut() else {
-                return;
-            };
-            match r {
-                Ok(r) if r.failed.is_empty() => {
-                    info!(view = %name, target = %t, "target caught up");
-                    Metrics::add(&self.metrics.target_catchups, 1);
-                    let (id, hash) = (s.def_id, s.hash.clone());
-                    self.set_state(&name, &t, id, &hash, Some(&plan), "ready", None)
-                        .await;
-                    // A target reported down was taken out of the version's targets; it is
-                    // maintained again from now on, and its `Down` entry is gone with its keys.
-                    let was_down = g.down;
-                    if let Some(l) = self.slots[i].live.as_mut() {
-                        if was_down && !l.targets.contains(&t) {
-                            l.targets.push(t.clone());
-                            l.targets.sort();
-                        }
-                    }
-                    if was_down {
-                        self.slots[i].down.remove(&t);
-                        self.rebuild_routes();
+            out.push(LagRetry {
+                i,
+                t,
+                name,
+                plan,
+                layout,
+                dirty,
+                claimed_units: g.units.clone(),
+                claimed_partial: g.partial.clone(),
+                claimed_all: g.all,
+                look: Lookback::default(),
+                kept,
+                p: None,
+            });
+        }
+        out
+    }
+
+    /// Subtracts what a retry carried (the claim-time snapshot) from the group: while the
+    /// retry ran detached, the flushes of the intervening ticks added their units to the
+    /// same group (`note_refresh`) — those stay owed to the target until a later retry
+    /// writes them (#214). Whether the group is empty afterwards: the target caught up.
+    /// On the sequential path nothing writes to the group while its retry runs, so this
+    /// subtracts exactly what it holds and is a no-op check.
+    fn lag_subtract(
+        g: &mut Lag,
+        claimed_units: &UnitSet,
+        claimed_partial: &[UnitSet],
+        claimed_all: bool,
+    ) -> bool {
+        for v in claimed_units.ints.to_sorted_vec() {
+            g.units.ints.remove(v);
+        }
+        g.units.keys.retain(|k| !claimed_units.keys.contains(k));
+        for (set, c) in g.partial.iter_mut().zip(claimed_partial) {
+            for v in c.ints.to_sorted_vec() {
+                set.ints.remove(v);
+            }
+            set.keys.retain(|k| !c.keys.contains(k));
+        }
+        g.all &= !claimed_all;
+        // #214: units re-fed since the claim stay owed even though the claim also held them:
+        // this retry's write was computed from a read taken before those changes. The claim
+        // cleared these marks, so they hold exactly what `note_refresh` fed while it ran.
+        g.units.extend(std::mem::take(&mut g.posted));
+        extend_partial(&mut g.partial, std::mem::take(&mut g.posted_partial));
+        g.all |= std::mem::take(&mut g.posted_all);
+        g.units.is_empty() && g.partial.iter().all(UnitSet::is_empty) && !g.all
+    }
+
+    /// The target of a Full-mode view's maintained live version that a build or swap failed
+    /// on becomes a lagging target that owes the whole view (`all`) — not a `Down` target
+    /// that `retry_down` keeps rebuilding onto (each attempt pays the unresponsive target's
+    /// connect, and a down target answers lag with a rebuild, which #214 forbids: a down
+    /// target only lags). The flush's own lag retry (`lag_due`/`lag_end`) catches it up with
+    /// one whole-view refresh when it answers, and `lag_end` reports it down only if that
+    /// keeps failing. False: not a maintained target of the live version (a new version, a
+    /// frozen swap, an incremental view with its own lag bookkeeping, or a target the view
+    /// never had) — `target_down` and a retried build as before.
+    fn lag_after_build_fail(&mut self, i: usize, t: &str, plan: &Arc<ViewPlan>) -> bool {
+        if !matches!(plan.mode, Mode::Full(_)) {
+            return false;
+        }
+        let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&l.plan, plan) || !l.targets.iter().any(|x| x == t) {
+            return false;
+        }
+        let since = l
+            .since
+            .clone()
+            .unwrap_or_else(|| self.boundary.to_position());
+        debug!(view = %plan.name, target = %t, "build or swap failed on the maintained target: it lags the whole view until it answers");
+        l.lag.entry(t.to_string()).or_insert(Lag {
+            units: UnitSet::default(),
+            partial: Vec::new(),
+            all: true,
+            since,
+            failures: 0,
+            retry_at: Instant::now() + connect_retry_delay(1),
+            down: false,
+            posted: UnitSet::default(),
+            posted_partial: Vec::new(),
+            posted_all: false,
+        });
+        true
+    }
+
+    /// The tail of one lagging target's retry, shared by both paths (the accounting of
+    /// [`Self::retry_lag`], unchanged): caught up, or behind at its `retry_at` backoff, and
+    /// reported down once its failures reach [`LAG_MAX_FAILURES`]. The group is taken out of the
+    /// lag map here (`kept`, when the retry did not already take it) so that whatever the flush
+    /// of a concurrent retry added to it — [`Self::note_refresh`] gives a target that is behind
+    /// the units this flush applied elsewhere — is kept with it, and put back last: `l` borrows
+    /// the slot, and `target_down` and `rebuild_routes` need `self` to itself.
+    async fn lag_end(&mut self, mut retry: LagRetry, r: Result<Refreshed>) {
+        let i = retry.i;
+        let (t, name, plan) = (retry.t.clone(), retry.name.clone(), retry.plan.clone());
+        let s = &mut self.slots[i];
+        let Some(l) = s.live.as_mut() else {
+            return;
+        };
+        let Some(mut g) = retry.kept.take().or_else(|| l.lag.remove(&t)) else {
+            return;
+        };
+        match r {
+            Ok(r) if r.failed.is_empty() => {
+                // Only the units this retry carried were written; what the flushes of the
+                // ticks it ran through added to the group stay owed, and the catch-up is
+                // counted when the group empties (#214).
+                if !Self::lag_subtract(
+                    &mut g,
+                    &retry.claimed_units,
+                    &retry.claimed_partial,
+                    retry.claimed_all,
+                ) {
+                    g.failures = 0;
+                    g.retry_at = Instant::now();
+                    debug!(view = %name, target = %t,
+                           left = g.units.ints.len() as usize + g.units.keys.len(),
+                           claimed = retry.claimed_units.ints.len() as usize + retry.claimed_units.keys.len(),
+                           "lag retry wrote its claim: the group stays owed");
+                    l.lag.insert(t, g);
+                    return;
+                }
+                debug!(view = %name, target = %t,
+                       claimed = retry.claimed_units.ints.len() as usize + retry.claimed_units.keys.len(),
+                       "lag retry caught up (group empty)");
+                info!(view = %name, target = %t, "target caught up");
+                Metrics::add(&self.metrics.target_catchups, 1);
+                let (id, hash) = (s.def_id, s.hash.clone());
+                self.set_state(&name, &t, id, &hash, Some(&plan), "ready", None)
+                    .await;
+                // A target reported down was taken out of the version's targets; it is
+                // maintained again from now on, and its `Down` entry is gone with its keys.
+                let was_down = g.down;
+                // A Full-mode target that failed a build/swap is not in the live version's
+                // targets either (it lagged instead of going down, #214): a target the view's
+                // definition lists is maintained again once it has caught up.
+                let rejoin = !was_down && self.slots[i].targets.contains(&t);
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    if (was_down || rejoin) && !l.targets.contains(&t) {
+                        l.targets.push(t.clone());
+                        l.targets.sort();
                     }
                 }
-                Ok(r) => {
-                    g.failures += 1;
-                    // Reported down after LAG_MAX_FAILURES: excluded from the refresh's targets,
-                    // its state shows the error, and it is retried here at the capped backoff.
-                    // Its keys stay (owner rule: a traceable change is never answered with a
-                    // rebuild), so `retry_lag` catches it up when it answers; `retry_down` only
-                    // builds targets that were never built on at all.
-                    let e = r.failed.into_iter().next().unwrap().1;
-                    if g.failures >= LAG_MAX_FAILURES && !g.down {
-                        g.down = true;
-                        l.targets.retain(|x| *x != t);
-                        self.target_down(i, &name, &t, Some(&plan), &e).await;
-                        self.rebuild_routes();
-                    }
-                    g.retry_at = Instant::now() + connect_retry_delay(g.failures);
-                    // The keys go back into the lag map last: `l` borrows the slot, and
-                    // `target_down` and `rebuild_routes` above need `self` to itself.
-                    if let Some(l) = self.slots[i].live.as_mut() {
-                        l.lag.insert(t, g);
-                    }
+                if was_down {
+                    self.slots[i].down.remove(&t);
+                    self.rebuild_routes();
                 }
-                Err(e) => {
-                    // The sources could not be read: not this target's fault.
-                    debug!(view = %name, target = %t, "retrying lagging target: {e:#}");
-                    g.retry_at = Instant::now() + Duration::from_secs(1);
+            }
+            Ok(r) => {
+                g.failures += 1;
+                // Reported down after LAG_MAX_FAILURES: excluded from the refresh's targets,
+                // its state shows the error, and it is retried here at the capped backoff.
+                // Its keys stay (owner rule: a traceable change is never answered with a
+                // rebuild), so `retry_lag` catches it up when it answers; `retry_down` only
+                // builds targets that were never built on at all.
+                let e = r.failed.into_iter().next().unwrap().1;
+                warn!(view = %name, target = %t, failures = g.failures,
+                      "lagged target refresh failed: {e:#}");
+                if g.failures >= LAG_MAX_FAILURES && !g.down {
+                    g.down = true;
+                    l.targets.retain(|x| *x != t);
+                    self.target_down(i, &name, &t, Some(&plan), &e).await;
+                    self.rebuild_routes();
+                }
+                g.retry_at = Instant::now() + connect_retry_delay(g.failures);
+                if let Some(l) = self.slots[i].live.as_mut() {
                     l.lag.insert(t, g);
                 }
+            }
+            Err(e) => {
+                // The sources could not be read: not this target's fault.
+                debug!(view = %name, target = %t, "retrying lagging target: {e:#}");
+                g.retry_at = Instant::now() + Duration::from_secs(1);
+                l.lag.insert(t, g);
             }
         }
     }
@@ -6502,7 +6845,7 @@ impl Engine {
     ) -> Result<Refreshed> {
         if self.sup.is_some() {
             let mut p = self
-                .prepare_refresh(plan, layout, dirty, targets, table, recent, since)
+                .prepare_refresh(plan, layout, dirty, targets, table, recent, since, true)
                 .await?;
             let out = run_pending(self.sup.as_ref().expect("supervised"), &mut p).await;
             self.metrics.beat();
@@ -6664,6 +7007,10 @@ impl Engine {
     /// engine's own connections) and the job for the supervisor's pools (see
     /// `src/supervisor.rs`), run by [`run_pending`] and completed by [`finish_refresh`]. A
     /// target without a working control connection (write limits, sql_mode) fails right away.
+    /// `connect`: the supervised healthy path makes sure of the target's control connection
+    /// first. A detached lag retry passes `false` (#214): its one target was written before,
+    /// so those settings are already in hand, and a black-holed target must not cost this tick
+    /// a connect — the supervisor's endpoint dials the write itself, on the task.
     async fn prepare_refresh(
         &mut self,
         plan: &Arc<ViewPlan>,
@@ -6673,6 +7020,7 @@ impl Engine {
         table: &str,
         recent: &mut Lookback,
         since: Option<&Position>,
+        connect: bool,
     ) -> Result<PendingRefresh> {
         let mut p = PendingRefresh {
             global: matches!(plan.mode, Mode::Global),
@@ -6725,9 +7073,11 @@ impl Engine {
         }
         let mut jobs = Vec::new();
         for t in targets {
-            if let Err(e) = self.target_conn(t).await {
-                p.failed.push((t.clone(), e.context(format!("target {t}"))));
-                continue;
+            if connect {
+                if let Err(e) = self.target_conn(t).await {
+                    p.failed.push((t.clone(), e.context(format!("target {t}"))));
+                    continue;
+                }
             }
             let target = &self.targets[t.as_str()];
             let (Some(write), Some(mode)) = (target.write, target.sql_mode.clone()) else {
@@ -6740,7 +7090,7 @@ impl Engine {
             let (opts, schema) = (target.opts.clone(), target.schema.clone());
             let endpoint = self
                 .sup
-                .as_mut()
+                .as_ref()
                 .expect("supervised refresh")
                 .write_endpoint(t, target.kind, &opts, &mode, self.cfg.lock_wait_s);
             jobs.push(supervisor::TargetJob {
@@ -6772,7 +7122,13 @@ impl Engine {
     }
 
     /// The live refreshes of every slot at once (supervised): each view's lookups in turn, then
-    /// every view's chunk reads and writes together on the shared pools, then each result.
+    /// every view's chunk reads and writes together on the shared pools, then each result. A
+    /// lagging target's retry belongs to the same round and to nothing else (#214): it is
+    /// prepared and run once every healthy target of this flush has been written, so an
+    /// unresponsive target is never ahead of, and never in the way of, the writes the others get
+    /// (it used to be retried at the head of `live_begin`, where one 10 s connect held up every
+    /// view behind it). The retries run beside each other, and its `retry_at` backoff alone
+    /// decides when it is tried again.
     async fn refresh_all_live(&mut self) {
         let mut started = Vec::new();
         for i in 0..self.slots.len() {
@@ -6788,30 +7144,175 @@ impl Engine {
                     &st.name,
                     &mut st.recent,
                     st.since.as_ref(),
+                    true,
                 )
                 .await;
             started.push((i, st, p));
         }
-        if started.is_empty() {
-            return;
-        }
-        let sup = self.sup.as_ref().expect("supervised refresh");
-        let outs = futures_util::future::join_all(started.iter_mut().map(|(_, _, p)| async move {
-            match p {
-                Ok(p) => Some(run_pending(sup, p).await),
-                Err(_) => None,
+        if !started.is_empty() {
+            let sup = self.sup.as_ref().expect("supervised refresh");
+            let outs =
+                futures_util::future::join_all(started.iter_mut().map(|(_, _, p)| async move {
+                    match p {
+                        Ok(p) => Some(run_pending(sup, p).await),
+                        Err(_) => None,
+                    }
+                }))
+                .await;
+            self.metrics.beat();
+            for ((i, mut st, p), out) in started.into_iter().zip(outs) {
+                let r = match (p, out) {
+                    (Ok(p), Some(out)) => finish_refresh(&mut st.dirty, p, out),
+                    (Err(e), _) => Err(e),
+                    (Ok(_), None) => unreachable!("every prepared refresh ran"),
+                };
+                self.live_end(i, st, r).await;
             }
-        }))
-        .await;
-        self.metrics.beat();
-        for ((i, mut st, p), out) in started.into_iter().zip(outs) {
-            let r = match (p, out) {
-                (Ok(p), Some(out)) => finish_refresh(&mut st.dirty, p, out),
-                (Err(e), _) => Err(e),
-                (Ok(_), None) => unreachable!("every prepared refresh ran"),
-            };
-            self.live_end(i, st, r).await;
         }
+        self.lag_service().await;
+    }
+
+    /// Servicing of the targets that are behind, run after every flush tick and on any wake
+    /// the manager loop takes for it (#214). A retry belongs to the same round as its target,
+    /// not to this tick: the tick spawns it and never awaits it, so one unresponsive target's
+    /// connect costs only the retry — the flush wrote the healthy targets while it ran, and
+    /// the next one does too. Its result folds here as soon as it arrives; while it runs the
+    /// group stays in `l.lag`, so the flush keeps skipping the target and `pending_floor`
+    /// keeps its floor. The writes go through the target's own pool, the same two-write
+    /// endpoint a healthy flush's writes take — a retry never reserves a target's pool ahead
+    /// of a flush that wants it. An entry armed after a flush's writes (a build or swap that
+    /// failed on its target) is claimed by this same pass, without waiting for the slot's
+    /// next due time: the entry's `retry_at` schedules a wake (`lag_wake`) and this servicing
+    /// claims at most once per target per pass. Cost (guard R3): per loop iteration only the
+    /// slot scan below (same shape as `flush_due`), never per binlog event.
+    async fn lag_service(&mut self) {
+        while let Ok(m) = self.lag_rx.try_recv() {
+            self.lag_held.push_back(m);
+        }
+        let mut at = 0;
+        while at < self.lag_held.len() {
+            if self.slots[self.lag_held[at].0]
+                .next
+                .as_ref()
+                .is_some_and(|n| n.swapping)
+            {
+                // A routine rebuild is swapping into that slot: its changes, and the folding
+                // of its retries, wait for it (`lag_due` holds the target for the same
+                // reason). The message waits in `lag_held`, and the target stays claimed.
+                at += 1;
+                continue;
+            }
+            let (i, g, r) = self.lag_held.remove(at).unwrap();
+            self.lag_retries.remove(&(i, g.t.clone()));
+            self.lag_end(g, r).await;
+        }
+        // A retry whose task ended without a message (it panicked): free the target so its
+        // `retry_at` schedules a new attempt.
+        let lost: Vec<(usize, String)> = self
+            .lag_retries
+            .iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|((i, t), _)| (*i, t.clone()))
+            .collect();
+        for k in lost {
+            self.lag_retries.remove(&k);
+        }
+        // Start the retries that are due — at most one per target (one still running is
+        // due again each pass: its `retry_at` stays behind until the result folds in).
+        let sup = match self.sup.clone() {
+            Some(s) => s,
+            None => return,
+        };
+        for i in 0..self.slots.len() {
+            for mut g in self.lag_due(i, false) {
+                let key = (i, g.t.clone());
+                if self.lag_retries.contains_key(&key) {
+                    continue;
+                }
+                // The retry starts here: its claim clears the re-fed marks, so what it reads
+                // from now on it writes (#214; feeds after this moment post again).
+                if let Some(lg) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
+                    if let Some(g0) = lg.lag.get_mut(&g.t) {
+                        g0.clear_posted();
+                    }
+                }
+                debug!(view = %g.name, target = %g.t, all = g.claimed_all, "lag refresh claimed");
+                // Prepared here: the lagging target's units are already resolved (its
+                // lookback is empty) and with `connect: false` nothing dials it — the
+                // connect happens on the task, on the supervisor's pool.
+                g.p = Some(
+                    self.prepare_refresh(
+                        &g.plan,
+                        &g.layout,
+                        &mut g.dirty,
+                        std::slice::from_ref(&g.t),
+                        &g.name,
+                        &mut g.look,
+                        None,
+                        false,
+                    )
+                    .await,
+                );
+                let (tx, metrics, sup) = (self.lag_tx.clone(), self.metrics.clone(), sup.clone());
+                let h = tokio::spawn(async move {
+                    let i = g.i;
+                    let r = match g.p.take() {
+                        Some(Ok(mut p)) => {
+                            let out = run_pending(&sup, &mut p).await;
+                            metrics.beat();
+                            finish_refresh(&mut g.dirty, p, out)
+                        }
+                        Some(Err(e)) => Err(e),
+                        None => Ok(Refreshed::default()),
+                    };
+                    let _ = tx.send((i, g, r));
+                });
+                self.lag_retries.insert(key, h);
+            }
+        }
+    }
+
+    /// Whether [`Self::lag_service`] has anything to do: the manager loop calls it (and lets
+    /// it schedule wakes) only while some target is behind or a detached retry runs, so an
+    /// engine with no lag pays one emptiness check per slot per iteration, nothing per event.
+    fn lag_any(&self) -> bool {
+        !self.lag_held.is_empty()
+            || !self.lag_retries.is_empty()
+            || self.slots.iter().any(|s| {
+                s.live
+                    .as_ref()
+                    .is_some_and(|l| !l.lag.is_empty() || !l.behind.is_empty())
+            })
+    }
+
+    /// When [`Self::lag_service`] should run next, for the manager loop's idle wake: the
+    /// earliest `retry_at` of an unclaimed entry (a claimed one is a task that will report
+    /// through `lag_rx`, which wakes the loop by itself). Entries of a slot whose rebuild is
+    /// swapping are held anyway (`lag_due` returns none), so they schedule no wake. With a
+    /// detached retry running the fold is polled at a coarse step, bounded by the task's own
+    /// completion: nothing spins when there is nothing pending.
+    fn lag_wake(&self) -> Instant {
+        let now = Instant::now();
+        let mut w = now + Duration::from_secs(3600);
+        if !self.lag_retries.is_empty() || !self.lag_held.is_empty() {
+            w = now + Duration::from_millis(250);
+        }
+        for (si, s) in self.slots.iter().enumerate() {
+            if s.next.as_ref().is_some_and(|n| n.swapping) {
+                continue;
+            }
+            if let Some(l) = s.live.as_ref().filter(|l| !l.frozen) {
+                for (t, g) in &l.lag {
+                    // A claimed entry (its detached task runs) schedules nothing: the task's
+                    // result message wakes the loop, and its stale `retry_at` must not.
+                    if self.lag_retries.contains_key(&(si, t.clone())) {
+                        continue;
+                    }
+                    w = w.min(g.retry_at.max(now));
+                }
+            }
+        }
+        w
     }
 
     /// Executor (a): the dedup core's due jobs until none is due (a failed job's lane holds it
@@ -7488,6 +7989,31 @@ struct LiveRefresh {
     def_id: u64,
     replan_pending: bool,
     full_due: bool,
+}
+
+/// One lagging target's catch-up between [`Engine::lag_due`] and [`Engine::lag_end`] (the retry
+/// of [`Engine::retry_lag`], and of the supervised flush, which prepares it with the healthy
+/// refreshes of the same round). `kept` is the group as the lag map held it, when the retry took
+/// it out; `dirty` is what its retry writes (its kept keys, plus the units this flush gives the
+/// targets that are not behind); `p` is the prepared run, `None` until the flush prepares it.
+struct LagRetry {
+    /// The view's slot.
+    i: usize,
+    /// The target's name, and the view's name its state rows are kept under.
+    t: String,
+    name: String,
+    plan: Arc<ViewPlan>,
+    layout: Layout,
+    dirty: ViewDirty,
+    /// The units the group owed when the retry claimed it (a snapshot of its `dirty`): the
+    /// retry writes exactly these, and a success clears only these from the group — a flush
+    /// may have added more to it while a detached retry ran (`note_refresh`, #214).
+    claimed_units: UnitSet,
+    claimed_partial: Vec<UnitSet>,
+    claimed_all: bool,
+    look: Lookback,
+    kept: Option<Lag>,
+    p: Option<Result<PendingRefresh>>,
 }
 
 /// A supervised refresh with its lookups done (see [`Engine::prepare_refresh`]).
@@ -8399,6 +8925,9 @@ mod tests {
             failures: 0,
             retry_at: Instant::now(),
             down,
+            posted: UnitSet::default(),
+            posted_partial: Vec::new(),
+            posted_all: false,
         }
     }
 
