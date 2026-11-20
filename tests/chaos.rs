@@ -927,6 +927,132 @@ fn chaos_src_binlog_blackhole() {
     });
 }
 
+/// Issue #248, reproduced on purpose: the dump link stays black-holed **longer than the fixed
+/// 180 s a catch-up used to be given**, which is the exact shape of the flake
+/// (`exclusive_server_restarts_are_not_fatal` on mariadb130, 1 run in 114: `applied` on the old
+/// binlog file, the target on the next one, the engine alive inside a reconnect cycle). The fault
+/// is proven to have landed before anything is waited on, and both halves of the proof are
+/// assertions in this one run:
+///
+/// * **red, the old bound**: with the fault still armed, the fixed
+///   [`Engine::wait_applied`](`Engine::wait_applied`) deadline expires on a live engine. Had that
+///   wait been the catch-up's only bound — as it was — this is where #248 failed.
+/// * **green, the engine's own bound**: the same target reached by
+///   [`Engine::wait_applied_progressive`], which lets a catch-up run while the engine is alive and
+///   not stalled past what `engine_bounds` says a living engine can spend.
+///
+/// The engine is then verified exact, and no incremental view may have taken a whole rebuild.
+#[test]
+fn chaos_src_binlog_catchup_after_a_slow_reconnect() {
+    let _one = toxi::exclusive();
+    scenario(
+        "chaos_src_binlog_catchup_after_a_slow_reconnect",
+        |ctx| async move {
+            let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+                return Ok(());
+            };
+            let seed = ctx.sub_seed("chaos_src_binlog_catchup_after_a_slow_reconnect");
+            let mut f = setup(&ctx, "chaos_s9", &toxi, &["binlog"]).await?;
+            let mut w = spawn_writers(&f.db, &f.ids, seed);
+            f.wait_streaming().await?;
+            f.arm("binlog", &Toxic::timeout(0).named("black-hole"))
+                .await?;
+            wait_until(
+                "the silence detector to declare the stream dead",
+                FAULT,
+                || {
+                    let f = &f;
+                    async move { Ok(f.log_line("no binlog event or heartbeat")?.is_some()) }
+                },
+            )
+            .await
+            .with_context(|| {
+                format!(
+                "the fault never landed: {} of silence across the dump link and the engine never \
+                 logged 'no binlog event or heartbeat'",
+                FAULT.as_secs()
+            )
+            })?;
+            ensure!(
+                !f.streaming(),
+                "the fault never landed: the engine still reported itself streaming through a \
+             black-holed dump link"
+            );
+            // The backlog the catch-up has to bring over: written behind the fault, so the position to
+            // reach is ahead of the frozen one by construction, exactly as in #248 (the writers keep
+            // going too, as they did in the restart test that flaked).
+            let (stmts, bytes) = items_txn(&f.ids, 400);
+            let mut c = f.db.conn().await?;
+            for s in &stmts {
+                exec(&mut c, s).await?;
+            }
+            let target = server_position(&mut c).await?;
+            c.disconnect().await.ok();
+            let frozen = f
+                .eng
+                .applied()
+                .context("the engine had not applied a binlog position before the fault")?;
+            ensure!(
+                target > frozen,
+                "the reproduction did not open a backlog: applied {frozen} already covers the \
+             source's {target}"
+            );
+            // --- red: the fixed bound, on a live engine, with the fault still armed.
+            let floor = t_catchup();
+            let t = std::time::Instant::now();
+            let red = f.eng.wait_applied(&target, floor).await;
+            let expired = t.elapsed();
+            ensure!(
+            red.is_err(),
+            "the reproduction is not one: the fixed bound of {floor:?} caught the engine anyway \
+             ({expired:?}), so no catch-up of this shape could have flaked — #248's premise needs \
+             re-reading. Underlying error: {red:#?}"
+        );
+            f.eng.check_alive()?;
+            ensure!(
+                !f.streaming() && f.eng.applied().as_ref() == Some(&frozen),
+                "the engine was not frozen inside the fixed bound as #248 was: streaming={}, \
+             applied={:?}, expected {frozen} and no stream",
+                f.streaming(),
+                f.eng.applied(),
+            );
+            ctx.log(format!(
+            "reproduced #248: the fixed catch-up bound expired at {expired:?} on a live engine \
+             frozen at {frozen} (target {target}, {} bytes of row events behind the fault)",
+            bytes
+        ));
+            // --- green: the same target, bounded by the engine's own numbers. The toxic is removed
+            // here, not before: the engine may still be inside a `Policy::CONNECT` run, and the wait
+            // that has to survive it is the one under test.
+            f.disarm("binlog", "black-hole").await?;
+            let green = std::time::Instant::now();
+            f.eng
+                .wait_applied_progressive(&target, floor)
+                .await
+                .with_context(|| {
+                    format!(
+                    "the progress-aware catch-up gave up on an engine that was only reconnecting: \
+                     frozen at {frozen} for {expired:?} under the fault and the engine's own bound \
+                     is {:?} (engine_bounds::stall)",
+                    engine_bounds::stall(engine_bounds::default_target_timeout())
+                )
+                })?;
+            ctx.log(format!(
+                "caught up {floor:?} past the old bound: applied {frozen} -> {target} in {:?} \
+             from the fault's end",
+                green.elapsed()
+            ));
+            finish(&ctx, &mut f, &mut w, "after the slow reconnect").await?;
+            ensure!(
+                f.counter("full_rebuilds") == 0,
+                "a black-holed dump link cost {} whole rebuild(s) of the engine",
+                f.counter("full_rebuilds")
+            );
+            Ok(())
+        },
+    );
+}
+
 /// All three source roles behind one proxy with `latency{120,60}` both ways and `bandwidth{64}`
 /// both ways: the view must lag while the fault is armed and return to ~0 after it is removed,
 /// without ever losing exactness. Both samples are bounded waits on an observable, never a sleep

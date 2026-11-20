@@ -73,6 +73,13 @@ pub const DEFAULT_LOCK_WAIT_S: u64 = 60;
 /// and left to the next full rebuild (A-05, N-01), never retried on the binlog loop (N-02).
 pub const DEFAULT_SWAP_LOCK_WAIT_S: u64 = 5;
 
+/// `LAZYVIEW_TARGET_TIMEOUT_MS` ([`Config::target_timeout`]) when the operator sets nothing: the
+/// one op bound a catch-up's statements can burn, per try. Public, like the retry numbers of
+/// `supervisor`, so the harness can bound a catch-up by the engine's own arithmetic (issue #248).
+///
+/// [`Config::target_timeout`]: Config::target_timeout
+pub const DEFAULT_TARGET_TIMEOUT_MS: u64 = 60_000;
+
 /// `min(4, max(1, cores / 4))`.
 pub fn default_cpu_workers() -> usize {
     let cores = std::thread::available_parallelism()
@@ -446,7 +453,7 @@ impl Config {
             build_concurrency: num("LAZYVIEW_BUILD_CONCURRENCY", 2)?.max(1) as usize,
             full_refresh_interval: Duration::from_millis(num("LAZYVIEW_FULL_REFRESH_MS", 60_000)?),
             target_timeout: Duration::from_millis(
-                num("LAZYVIEW_TARGET_TIMEOUT_MS", 60_000)?.max(1_000),
+                num("LAZYVIEW_TARGET_TIMEOUT_MS", DEFAULT_TARGET_TIMEOUT_MS)?.max(1_000),
             ),
             plan_timeout: Duration::from_millis(num("LAZYVIEW_PLAN_TIMEOUT_MS", 10_000)?.max(1)),
             test_plan_delay: marker_delay("LAZYVIEW_TEST_PLAN_DELAY")?,

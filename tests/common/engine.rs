@@ -177,7 +177,10 @@ impl Engine {
         }
     }
 
-    /// Waits until `applied() >= target`.
+    /// Waits until `applied() >= target`, with a fixed wall-clock `timeout`. The
+    /// [`Self::wait_applied_progressive`] variant is what a *catch-up* uses (#248); this one is
+    /// for the waits that want a hard wall — a scenario that proves the engine does *not* catch
+    /// up, or that measures how long something takes.
     pub async fn wait_applied(&mut self, target: &Position, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -230,6 +233,84 @@ impl Engine {
         self.wait_caught_up_rounds(src, timeout, 3).await
     }
 
+    /// The catch-up wait of issue #248: the same target test as [`Self::wait_applied`], bounded
+    /// by the engine's own numbers instead of a fixed wall clock.
+    ///
+    /// `floor` (the caller's [`t_catchup`]) is exactly what a healthy engine is held to today —
+    /// nothing is raised for an engine that catches up inside it. Past the floor the wait goes on
+    /// while `applied()` advances, and it still fails the moment a living engine stands still
+    /// longer than [`engine_bounds::stall`] accounts for. A catch-up that is genuinely stuck
+    /// therefore fails, and its message names the bound it died on instead of guessing 180 s.
+    pub async fn wait_applied_progressive(
+        &mut self,
+        target: &Position,
+        floor: Duration,
+    ) -> Result<()> {
+        // The op bound of the engine this handle runs: an operator who raises
+        // `LAZYVIEW_TARGET_TIMEOUT_MS` above the default gets the longer allowance that engine
+        // can actually need; one who lowers it is still bounded by the harness's patience floor.
+        let timeout = self.cfg.target_timeout.max(Duration::from_millis(
+            lazyview::config::DEFAULT_TARGET_TIMEOUT_MS,
+        ));
+        let start = Instant::now();
+        let mut rule = CatchUp::new(start, floor, engine_bounds::stall(timeout));
+        loop {
+            let applied = self.metrics.applied();
+            if let Some(a) = &applied {
+                if a >= target {
+                    return Ok(());
+                }
+            }
+            if let Err(e) = self.check_alive() {
+                // As in `wait_applied`: a transient probe error spends budget, a dead engine fails
+                // at once.
+                if !super::is_transient(&e) || Instant::now() > start + floor {
+                    return Err(e);
+                }
+            }
+            if let CatchUpVerdict::Failed(why) = rule.sample(Instant::now(), applied.as_ref()) {
+                bail!(
+                    "engine {} not caught up: applied={:?} target={target} metrics={:?} — log {}\n{why}",
+                    self.label,
+                    self.metrics.applied().map(|p| p.to_string()),
+                    self.metrics.snapshot(),
+                    self.log_path.display(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    }
+
+    /// [`Self::wait_caught_up_rounds`] with the progress rule of
+    /// [`Self::wait_applied_progressive`] (#248): every round keeps the caller's floor, and an
+    /// engine that is still advancing is never cut off at it. The fixed variant stays for the
+    /// waits that *want* a hard wall (a scenario that proves the engine cannot catch up).
+    pub async fn wait_caught_up_rounds_progressive(
+        &mut self,
+        src: &mut Conn,
+        floor: Duration,
+        rounds: usize,
+    ) -> Result<()> {
+        let deadline = Instant::now() + floor;
+        for _ in 0..rounds.max(1) {
+            let target = server_position(src).await?;
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            self.wait_applied_progressive(&target, left).await?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::wait_caught_up`] with the progress rule of [`Self::wait_applied_progressive`].
+    pub async fn wait_caught_up_progressive(
+        &mut self,
+        src: &mut Conn,
+        floor: Duration,
+    ) -> Result<()> {
+        self.wait_caught_up_rounds_progressive(src, floor, 3).await
+    }
+
     /// Update statistics of view `view` of `db`, as `GET /stats` reports them (src/stats.rs).
     /// Every flush hands them to the aggregator task before it advances the applied position;
     /// this waits (at most 5 s) until the task published every batch handed over so far, so
@@ -248,6 +329,171 @@ impl Engine {
     pub fn stats_of(&self, db: &Db, view: &str) -> Result<ViewStats> {
         self.view_stats(db, view)
             .with_context(|| format!("view `{view}` is not listed in /stats"))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Catch-up bounds (issue #248): waits sized from the engine, never from a wall-clock guess
+// ---------------------------------------------------------------------------------------------
+
+/// The engine's own bounds on one catch-up.
+///
+/// `t_catchup()` — 180 s of wall clock, fixed — was the only bound on "the engine has applied
+/// everything", and it failed a catch-up that was still going:
+/// `exclusive_server_restarts_are_not_fatal` died 1 run in 114 on mariadb130 with `applied` on the
+/// old binlog file and the target on the next one, i.e. with the engine inside a reconnect cycle.
+/// The engine puts no bound on a catch-up (refined review N-03/N-05), so a fixed guess is wrong by
+/// construction; the honest number is the engine's own arithmetic, the way `BH_CONNECT_*` sizes the
+/// blackhole scenario's waits (`tests/chaos.rs`). Read from `src/` rather than mirrored there, so
+/// it cannot drift (lv-super's ruling of 2026-11-18, #2).
+///
+/// Two things keep `applied()` from advancing while the engine is alive and the harness is waiting:
+///
+/// * one failed `Policy::CONNECT` run of the stream loop ([`engine_bounds::connect_cycle`]):
+///   `CONNECT_ATTEMPTS` tries of `BINLOG_CONNECT_TIMEOUT` each, the widest backoff between them,
+///   plus the one cap wait a wholly failed run pays before the next run (`engine.rs`, `'reconnect`);
+/// * one statement of the flush being caught up ([`engine_bounds::statement_op`]):
+///   `STATEMENT_ATTEMPTS + 1` tries of the target timeout each, the widest backoff between them
+///   (`supervisor.rs`, `retrying`).
+///
+/// They can come one after the other — a flush whose statement times out is followed by the
+/// stream's own reconnect — so [`engine_bounds::stall`] sums them: 152.5 s + 240.5 s = 393 s on the
+/// library's defaults, more than twice the 180 s the harness used to insist on, and the same for
+/// every flavor. No bound here is a guess; each term names its `src/` number.
+pub mod engine_bounds {
+    use std::time::Duration;
+
+    use lazyview::{
+        config::DEFAULT_TARGET_TIMEOUT_MS,
+        engine::BINLOG_CONNECT_TIMEOUT,
+        supervisor::{
+            self, CONNECT_ATTEMPTS, CONNECT_BACKOFF_BASE, CONNECT_BACKOFF_CAP, CONNECT_JITTER,
+            STATEMENTS_JITTER, STATEMENT_ATTEMPTS, STATEMENT_BACKOFF_BASE, STATEMENT_BACKOFF_CAP,
+        },
+    };
+
+    /// The widest a policy's wait between two tries gets at try `n` (`supervisor.rs::backoff`,
+    /// whose jitter tops out at 1.5 × `min(base · 2^(n−1), cap)`).
+    fn backoff(n: u32, base: Duration, cap: Duration, jitter: bool) -> Duration {
+        supervisor::backoff_max(n, base, cap, jitter)
+    }
+
+    /// One whole failed `Policy::CONNECT` run of the binlog stream loop, including the cap wait
+    /// that follows a run that failed entirely.
+    pub fn connect_cycle() -> Duration {
+        (0..CONNECT_ATTEMPTS)
+            .map(|_| BINLOG_CONNECT_TIMEOUT)
+            .sum::<Duration>()
+            + (1..CONNECT_ATTEMPTS)
+                .map(|n| backoff(n, CONNECT_BACKOFF_BASE, CONNECT_BACKOFF_CAP, CONNECT_JITTER))
+                .sum::<Duration>()
+            + CONNECT_BACKOFF_CAP
+    }
+
+    /// One statement of a refresh under `Policy::STATEMENTS`, every try at the target's own
+    /// timeout: the cost of a target that answers nothing until `LAZYVIEW_TARGET_TIMEOUT_MS`.
+    pub fn statement_op(target_timeout: Duration) -> Duration {
+        (0..=STATEMENT_ATTEMPTS)
+            .map(|_| target_timeout)
+            .sum::<Duration>()
+            + (1..=STATEMENT_ATTEMPTS)
+                .map(|n| {
+                    backoff(
+                        n,
+                        STATEMENT_BACKOFF_BASE,
+                        STATEMENT_BACKOFF_CAP,
+                        STATEMENTS_JITTER,
+                    )
+                })
+                .sum::<Duration>()
+    }
+
+    /// The longest a **living** engine can stand still without advancing `applied()`: one timed-out
+    /// statement of the flush it is catching up, then one failed reconnect cycle before the flush
+    /// can be tried again. Past this, the wait fails: the engine is not slow, it is stuck.
+    pub fn stall(target_timeout: Duration) -> Duration {
+        connect_cycle() + statement_op(target_timeout)
+    }
+
+    /// `LAZYVIEW_TARGET_TIMEOUT_MS` as the engine ships it: what a catch-up's statements are
+    /// bounded by unless an operator says otherwise.
+    pub fn default_target_timeout() -> Duration {
+        Duration::from_millis(DEFAULT_TARGET_TIMEOUT_MS)
+    }
+}
+
+/// The rule of [`Engine::wait_applied_progressive`] as a state machine over (`now`, `applied`), so
+/// its arithmetic is testable without an engine and without a server (#248).
+pub struct CatchUp {
+    floor: Duration,
+    stall: Duration,
+    start: Instant,
+    last_advance: Instant,
+    last_applied: Option<Position>,
+    ticks: u64,
+}
+
+/// Where [`CatchUp`] stands after one sample.
+#[derive(Debug)]
+pub enum CatchUpVerdict {
+    /// The wait may keep going: the engine is inside what its own bounds allow.
+    Waiting,
+    /// The wait is over and the engine did not catch up: the string says which bound died.
+    Failed(String),
+}
+
+impl CatchUp {
+    /// `floor` is the fixed bound a healthy engine is held to (its `t_catchup()`), `stall` the
+    /// engine's own bound on one silent stretch ([`engine_bounds::stall`]). The floor is a floor
+    /// only: a bound never comes out *shorter* than the wait its caller asked for.
+    pub fn new(start: Instant, floor: Duration, stall: Duration) -> CatchUp {
+        CatchUp {
+            floor,
+            stall: stall.max(floor),
+            start,
+            last_advance: start,
+            last_applied: None,
+            ticks: 0,
+        }
+    }
+
+    /// One sample of the clock and of `applied()`. Strict progress resets the stall clock; the
+    /// wait ends when a stretch with no progress outlasts the engine's own bound. The first
+    /// position the wait sees is **not** progress: the stall clock starts when the caller started
+    /// waiting, so an engine that was already frozen when the wait began is measured from then.
+    pub fn sample(&mut self, now: Instant, applied: Option<&Position>) -> CatchUpVerdict {
+        if let Some(a) = applied {
+            let advanced = match &self.last_applied {
+                None => false,
+                Some(p) => a > p,
+            };
+            if self.last_applied.is_none() {
+                self.last_applied = Some(a.clone());
+            } else if advanced {
+                self.last_advance = now;
+                self.last_applied = Some(a.clone());
+                self.ticks += 1;
+            }
+        }
+        let stalled = now.saturating_duration_since(self.last_advance);
+        if stalled <= self.stall {
+            return CatchUpVerdict::Waiting;
+        }
+        let elapsed = now.saturating_duration_since(self.start);
+        let where_ = match &self.last_applied {
+            Some(p) => format!("applied {p} has not advanced"),
+            None => "the engine has never reported an applied position".to_string(),
+        };
+        CatchUpVerdict::Failed(format!(
+            "{where_} for {stalled:?}, past the {:?} a living engine can account for \
+             ({} progress tick(s) so far, floor {:?}, {elapsed:?} elapsed): one failed connect \
+             cycle of {:?} plus one timed-out statement of {:?}",
+            self.stall,
+            self.ticks,
+            self.floor,
+            engine_bounds::connect_cycle(),
+            engine_bounds::statement_op(engine_bounds::default_target_timeout()),
+        ))
     }
 }
 
@@ -418,10 +664,157 @@ pub fn is_cadence_rebuilt(spec: &ViewSpec) -> bool {
     spec.kind != Kind::Incremental || workload::reads_fk_child(&spec.name)
 }
 
-/// Default timeouts (scaled).
+/// Default timeouts (scaled). `t_catchup` is a **floor** for the catch-up waits of #248:
+/// [`Engine::wait_applied_progressive`] holds a healthy engine to exactly this and lets only the
+/// engine's own numbers ([`engine_bounds`]) take it longer; every other wait ends at it.
 pub fn t_ready() -> Duration {
     Duration::from_secs_f64(180.0 * scale().max(1.0))
 }
 pub fn t_catchup() -> Duration {
     Duration::from_secs_f64(180.0 * scale().max(1.0))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The catch-up rule of #248, scripted: no engine, no server, no sleep
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(file: &str, pos: u64) -> Position {
+        Position {
+            file: file.to_string(),
+            pos,
+        }
+    }
+
+    /// The premise of #248: what a living engine may legitimately take is more than the fixed
+    /// 180 s it used to be held to — and it is the same for every flavor, because it is made of
+    /// the engine's own constants and not of anything the server is.
+    #[test]
+    fn the_engine_own_bound_exceeds_the_old_fixed_guess() {
+        let stall = engine_bounds::stall(engine_bounds::default_target_timeout());
+        assert!(
+            stall > t_catchup(),
+            "{stall:?} vs the fixed {:?}: if the engine's numbers came down to this, the \
+             progress rule is dead weight and #248's premise needs re-reading",
+            t_catchup()
+        );
+    }
+
+    /// The two terms, pinned to the arithmetic of the `src/` numbers they are made of — a drift
+    /// guard on both sides (ruling 2026-11-18 #2: no literals feed a bound, but a bound's shape
+    /// must still be written down somewhere).
+    #[test]
+    fn bounds_follow_the_engine_constants() {
+        // src/engine.rs: 5 attempts × 20 s of connect. src/supervisor.rs: CONNECT backs off
+        // 1 s doubling to 30 s, jittered (× 1.5 at the top) → 1.5 + 3 + 6 + 12 = 22.5 s, and a
+        // wholly failed run pays one 30 s cap; STATEMENTS runs 3 retries + the first try at the
+        // 60 s target timeout, backing off 50 ms doubling to 500 ms → 0.075 + 0.15 + 0.3 s.
+        let cases = [
+            (
+                engine_bounds::connect_cycle(),
+                Duration::from_secs_f64(152.5),
+                "connect cycle",
+            ),
+            (
+                engine_bounds::statement_op(Duration::from_secs(60)),
+                Duration::from_secs_f64(240.525),
+                "timed-out statement",
+            ),
+            (
+                engine_bounds::stall(Duration::from_secs(60)),
+                Duration::from_secs_f64(393.025),
+                "stall",
+            ),
+        ];
+        for (got, want, what) in cases {
+            assert!(
+                got.abs_diff(want) <= Duration::from_millis(1),
+                "{what}: {got:?}, expected {want:?} from the engine's own numbers"
+            );
+        }
+    }
+
+    /// An engine that keeps advancing is never cut off at the floor — the case the old fixed
+    /// deadline got wrong.
+    #[test]
+    fn a_progressing_engine_outlives_the_floor() {
+        let start = Instant::now();
+        let stall = engine_bounds::stall(engine_bounds::default_target_timeout());
+        let mut rule = CatchUp::new(start, Duration::from_secs(180), stall);
+        let step = Duration::from_secs(30);
+        for n in 1..=30u64 {
+            // 15 minutes of steady progress: 5× the floor, and never a stall near the bound.
+            let v = rule.sample(
+                start + step * (n as u32),
+                Some(&pos("mariadb-bin.000011", n * 100)),
+            );
+            assert!(
+                matches!(v, CatchUpVerdict::Waiting),
+                "sample {n} ended a wait that was still advancing: {v:?}"
+            );
+        }
+    }
+
+    /// A frozen engine still fails, at the bound the engine's numbers allow — not at 180 s, and
+    /// not forever.
+    #[test]
+    fn a_frozen_engine_fails_at_its_bound() {
+        let start = Instant::now();
+        let stall = engine_bounds::stall(engine_bounds::default_target_timeout());
+        let mut rule = CatchUp::new(start, Duration::from_secs(180), stall);
+        let frozen = Some(pos("mariadb-bin.000011", 1841));
+        // Past the floor and still inside what a reconnect cycle plus a timed-out statement
+        // explain: the wait that flaked (#248) is allowed to run.
+        assert!(matches!(
+            rule.sample(start + Duration::from_secs(200), frozen.as_ref()),
+            CatchUpVerdict::Waiting
+        ));
+        assert!(matches!(
+            rule.sample(start + stall - Duration::from_millis(1), frozen.as_ref()),
+            CatchUpVerdict::Waiting
+        ));
+        let v = rule.sample(start + stall + Duration::from_millis(1), frozen.as_ref());
+        match v {
+            CatchUpVerdict::Failed(why) => {
+                assert!(why.contains("has not advanced"), "{why}");
+                assert!(why.contains("1841"), "{why}");
+            }
+            CatchUpVerdict::Waiting => panic!("a stall past the engine's own bound must fail"),
+        }
+    }
+
+    /// An engine that never reports a position is stuck too, on the same clock.
+    #[test]
+    fn an_engine_that_never_reports_fails_on_the_same_clock() {
+        let start = Instant::now();
+        let stall = engine_bounds::stall(engine_bounds::default_target_timeout());
+        let mut rule = CatchUp::new(start, Duration::from_secs(180), stall);
+        assert!(matches!(
+            rule.sample(start + stall, None),
+            CatchUpVerdict::Waiting
+        ));
+        match rule.sample(start + stall + Duration::from_millis(1), None) {
+            CatchUpVerdict::Failed(why) => assert!(why.contains("never reported"), "{why}"),
+            CatchUpVerdict::Waiting => panic!("no position forever must fail"),
+        }
+    }
+
+    /// The floor is a floor: a wait never ends *earlier* than the bound its caller asked for, so
+    /// swapping in the rule cannot make any other test fail sooner.
+    #[test]
+    fn the_floor_is_never_shortened() {
+        let start = Instant::now();
+        let mut rule = CatchUp::new(start, Duration::from_secs(600), Duration::from_secs(60));
+        assert!(matches!(
+            rule.sample(start + Duration::from_secs(599), None),
+            CatchUpVerdict::Waiting
+        ));
+        assert!(matches!(
+            rule.sample(start + Duration::from_secs(601), None),
+            CatchUpVerdict::Failed(_)
+        ));
+    }
 }
