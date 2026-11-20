@@ -57,6 +57,11 @@ const ER_MISSING_GTID: u16 = 3082;
 /// reads no position, but the dump thread still refuses anything below this.
 const BINLOG_START_POS: u64 = 4;
 
+/// No file name at all: what a GTID start sends, so the request says nothing about this server's
+/// files. On MariaDB it is also how the dump thread is told to read the start from
+/// `@slave_connect_state` ([`crate::source::maria::dump_gtid_list`]).
+const NO_BINLOG_FILE: &[u8] = b"";
+
 /// The kind of an event in words, for the ERROR line of an undecodable one (review A-02): a
 /// decode failure exits the process, so the line has to say what the event was. The raw code
 /// rides along in [`kind_label`], so an unknown code stays recognizable. Both run only where an
@@ -170,9 +175,10 @@ impl BinlogReader {
     /// the request and is kept only for the tracker's bookkeeping and error text. Without a set
     /// (or with a blank one) this is exactly `connect`: the file/pos dump of pre-GTID days.
     ///
-    /// On MariaDB `gtid` is ignored and the request stays file/pos: its dump asks for the
-    /// MariaDB `domain-server-seq` list in a shape only the flavor module may speak, and that
-    /// request lives in `source/maria.rs` (PR C), never as a core branch.
+    /// On MariaDB the same start is the flavor module's own request: `source/maria.rs` renders
+    /// the `domain-server-seq` list and sets the session variables the server reads, and
+    /// the packet stays the ordinary dump with an empty file name — MariaDB has no GTID payload
+    /// there, so no core branch and no raw-stream access is needed.
     ///
     /// A GTID text with no usable transaction is refused here, not sent: an empty GTID dump
     /// means "from the start of my oldest binlog" to the server, and a silent wrong resume is
@@ -188,9 +194,7 @@ impl BinlogReader {
         gtid: Option<&str>,
         heartbeat: Duration,
     ) -> Result<Self> {
-        let gtid = gtid
-            .map(str::trim)
-            .filter(|g| !g.is_empty() && flavor != Flavor::MariaDb);
+        let gtid = gtid.map(str::trim).filter(|g| !g.is_empty());
         let mut conn = Conn::new(opts)
             .await
             .context("opening the binlog connection")?;
@@ -211,6 +215,20 @@ impl BinlogReader {
         // "position < 4", is checked on the GTID dump too), so the request says nothing about
         // this server's files.
         let (request, asked) = match gtid {
+            // MariaDB's GTID start is flavor code: the list text and the two session variables
+            // are MariaDB's own ([`crate::source::maria::dump_gtid_list`],
+            // [`crate::source::maria::prepare_dump`]); the packet is the ordinary dump with an
+            // empty file name, which is what a MariaDB replica sends for a GTID start.
+            Some(text) if flavor == Flavor::MariaDb => {
+                let list = maria::dump_gtid_list(text)?;
+                maria::prepare_dump(&mut conn, &list).await?;
+                (
+                    BinlogStreamRequest::new(server_id)
+                        .with_filename(NO_BINLOG_FILE)
+                        .with_pos(BINLOG_START_POS),
+                    format!("MariaDB GTID list {list}"),
+                )
+            }
             Some(text) => (
                 BinlogStreamRequest::new(server_id)
                     .with_gtid()

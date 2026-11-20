@@ -22,7 +22,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use lazyview::binlog::*;
 use lazyview::source::{
-    is_access_denied, is_duplicate_server_id, is_missing_binlog, Flavor, Item, Position, RowsKind,
+    gtid_covers, is_access_denied, is_duplicate_server_id, is_missing_binlog, Cursor, Flavor, Item,
+    Position, RowsKind,
 };
 use mysql_async::binlog::events::Event;
 use mysql_async::binlog::row::BinlogRow;
@@ -1205,12 +1206,13 @@ async fn stream_server_checks_and_missing_binlog() {
     .await;
 }
 
-/// PR B: a start carrying `g=` opens a GTID dump on the MySQL family — file and position are
-/// zeroed and the server starts after the set: rows already in the set are not delivered,
-/// rows committed after it are. A blank start keeps the old file/pos path (the GTID-off
-/// world), MariaDB keeps it regardless (its dump is the flavor module's own request, PR C),
-/// and a text with no usable transaction is refused before the request — never answered with
-/// a dump from the start of the oldest binlog.
+/// A start carrying `g=` opens a GTID dump on every flavor — file and position stop mattering and
+/// the server starts after the set: rows already in the set are not delivered, rows committed
+/// after it are. Each flavor speaks its own wire shape for it (PR B: the MySQL family's binary
+/// SID blocks; PR C: MariaDB's `domain-server-seq` list through `@slave_connect_state` and a
+/// nameless dump request), and this runs the same scenario over both. A blank start keeps the old
+/// file/pos path (the GTID-off world), and a text with no usable transaction is refused before
+/// the request — never answered with a dump from the start of the oldest binlog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_resume_by_gtid() {
     on_all_servers("stream_resume_by_gtid", |_name, dsn| async move {
@@ -1252,7 +1254,7 @@ async fn stream_resume_by_gtid() {
             .await?
             .ok_or_else(|| anyhow!("SHOW BINARY LOGS is empty"))?;
         let first: String = row.get(0).ok_or_else(|| anyhow!("no Log_name column"))?;
-        let by_gtid = info.flavor != Flavor::MariaDb && saved.is_some();
+        let by_gtid = saved.is_some();
         let from = if by_gtid {
             Position {
                 file: String::new(),
@@ -1325,6 +1327,16 @@ async fn stream_resume_by_gtid() {
                 _ => {}
             }
         }
+        if by_gtid {
+            // The start named no file of this server, so the name the reader reports must come
+            // from the stream itself (the dump thread's opening rotate) — the position a resume
+            // saves next is this server's, not the one the cursor arrived with.
+            ensure!(
+                !reader.position().file.is_empty(),
+                "the GTID dump never named the file it reads: {:?}",
+                reader.position()
+            );
+        }
         reader.close().await?;
         if by_gtid {
             ensure!(
@@ -1378,32 +1390,19 @@ async fn stream_gtid_start_refuses_unusable_set() {
             )
             .await?;
             r.close().await?;
-            if info.flavor == Flavor::MariaDb {
-                // MariaDB does not read the set yet (PR C owns its dump): a foreign-shaped text
-                // must not raise the client-side GTID refusal there.
-                match BinlogReader::connect_gtid(
-                    replica_opts(&dsn)?,
-                    server_id(),
-                    info.flavor,
-                    &pos,
-                    Some("1-2-3"),
-                    Duration::from_secs(5),
-                )
-                .await
-                {
-                    Ok(r) => r.close().await?,
-                    Err(e) => ensure!(
-                        !format!("{e:#}").contains("saved GTID set"),
-                        "MariaDB spoke the client-side GTID refusal early: {e:#}"
-                    ),
-                }
-                return Ok(());
-            }
-            for bad in [
-                "not-a-uuid:1-2",
-                "00000000-0000-0000-0000-000000000001:",
-                "00000000-0000-0000-0000-000000000001:0",
-            ] {
+            // Nothing usable in the text: refused here, before any request leaves. Each flavor's
+            // own grammar decides what usable means (the MySQL family's `dump_sids`, MariaDB's
+            // `dump_gtid_list`), and both refuse with words that name the GTID state.
+            let bad: &[&str] = if info.flavor == Flavor::MariaDb {
+                &["not-a-list", "0-1", "0-1-0"]
+            } else {
+                &[
+                    "not-a-uuid:1-2",
+                    "00000000-0000-0000-0000-000000000001:",
+                    "00000000-0000-0000-0000-000000000001:0",
+                ]
+            };
+            for &bad in bad {
                 let e = BinlogReader::connect_gtid(
                     replica_opts(&dsn)?,
                     server_id(),
@@ -1424,6 +1423,67 @@ async fn stream_gtid_start_refuses_unusable_set() {
         },
     )
     .await;
+}
+
+/// The resume bar (ruling 4) is a question asked of the server **before** the dump, not a promise
+/// the dump packet keeps. Asked for a state this node never held, neither wire refuses: MySQL
+/// ignores uuids it has never seen and MariaDB's `@slave_connect_state` tolerates a
+/// `domain-server` pair it has nothing for (its strict mode guards the *purged* case, where the
+/// transactions existed and are gone). Both would answer with a stream from the oldest binlog —
+/// the silent wrong resume. So the subset question of `source::gtid_covers` (PR A) is what stops
+/// it, and this checks that question against a real server's own state on both flavors: the state
+/// the server reports covers, a state it has never written does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_resume_by_gtid_requires_the_source_to_cover_the_state() {
+    on_all_servers(
+        "stream_resume_by_gtid_requires_the_source_to_cover_the_state",
+        |_name, dsn| async move {
+            let mut c = connect(&dsn).await?;
+            let info = server_info(&mut c).await?;
+            let pos = current_position(&mut c).await?;
+            // A state of this server's own grammar, naming transactions it has never written:
+            // a uuid no writer here has, and a domain-server pair this server_id has nothing in,
+            // above seq 1 so a server that tolerates an unknown pair only at its start still has
+            // to answer for it.
+            let foreign = if info.flavor == Flavor::MariaDb {
+                "987654-654321-7"
+            } else {
+                "f3f3f3f3-1111-2222-3333-444444444444:1-7"
+            };
+            ensure!(
+                !covers(&mut c, info.flavor, &pos, foreign).await?,
+                "{:?} covers a GTID state it never wrote: {foreign:?}",
+                info.flavor
+            );
+            // The state the server itself reports as written must cover. A `gtid_mode=OFF` server
+            // reports no state at all, so there is nothing for it to say yes to — the refusal
+            // above is the whole story there, and the no-GTID leg of the resume rules (the
+            // engine's) owns that server's message.
+            let own: Option<String> = if info.flavor == Flavor::MariaDb {
+                c.query_first("SELECT @@GLOBAL.gtid_binlog_state").await?
+            } else {
+                c.query_first("SELECT @@GLOBAL.gtid_executed").await?
+            };
+            let own = own.unwrap_or_default().trim().to_string();
+            if !own.is_empty() {
+                ensure!(
+                    covers(&mut c, info.flavor, &pos, &own).await?,
+                    "{:?} does not cover the GTID state it reports: {own:?}",
+                    info.flavor
+                );
+            }
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// `source::gtid_covers` for a start cursor this server's file and position, with `text` as its
+/// `[g=…]` set — the question the engine asks before it dares to ask for a GTID dump.
+async fn covers(conn: &mut Conn, flavor: Flavor, at: &Position, text: &str) -> Result<bool> {
+    let saved =
+        Cursor::from_parts(flavor, at.file.clone(), at.pos).with_gtid(Some(text.to_string()));
+    gtid_covers(conn, &saved).await
 }
 
 /// Plain TCP (caching_sha2_password full authentication via RSA key exchange), the unix socket

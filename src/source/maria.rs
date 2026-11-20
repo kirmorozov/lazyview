@@ -425,6 +425,69 @@ pub(crate) fn parse_gtid_set(text: &str) -> mysql::GtidSet {
     set
 }
 
+/// MariaDB's GTID dump: the `domain-server-seq` list of the start cursor's `[g=…]` text, in the
+/// shape `SET @slave_connect_state` (and `mariadb-binlog -j`) take.
+///
+/// MariaDB has no GTID payload on the dump request — that is MySQL's `COM_BINLOG_DUMP_GTID`. A
+/// replica asks for a GTID start by setting the two session variables [`prepare_dump`] sends and
+/// then requesting an ordinary dump with **no file name**; the server starts the stream after the
+/// list. So the request itself needs nothing flavor-shaped (no raw-stream access), and only this
+/// list and those statements are MariaDB's.
+///
+/// The list carries one high-water mark per `domain-server` pair, which is what the server reads
+/// from it (the same shape `@@GLOBAL.gtid_binlog_state` prints): `[g=…]` was parsed by
+/// [`parse_gtid_set`], so a pair's transactions are `1..=seq` and the dump begins after `seq`.
+///
+/// A text with no usable transaction is an `Err`, never an empty list: an empty list asks the
+/// server for the start of its oldest binlog, which is never what a resume meant (the safety bar:
+/// never a silent wrong resume). The caller reports this as a cursor problem.
+///
+/// Cost note (owner rule): called once per binlog connection, where the start is decided; the
+/// event path gains no byte, no allocation, no branch. std only — the copy set must not need a
+/// GTID crate for one render.
+pub(crate) fn dump_gtid_list(text: &str) -> Result<String> {
+    let mut out = String::new();
+    for (pair, ranges) in parse_gtid_set(text) {
+        // The key is the `domain-server` of a well-formed entry (see [`parse_gtid_set`]), so the
+        // rendered line is digits and dashes only — safe to put in the statement below.
+        let hi = ranges.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
+        if hi == 0 {
+            continue; // seq 0 names no transaction
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&pair);
+        out.push('-');
+        out.push_str(&hi.to_string());
+    }
+    if out.is_empty() {
+        bail!("the saved GTID list {text:?} leaves no transaction to resume after");
+    }
+    Ok(out)
+}
+
+/// The two session statements that make MariaDB answer the ordinary `COM_BINLOG_DUMP` of
+/// [`crate::binlog::stream`] (no file name, the minimum position) from a GTID position:
+/// `@slave_connect_state` is the list to resume after, and `@slave_gtid_strict_mode = 1` makes the
+/// server refuse a list whose transactions its binlog held and no longer has — a purged resume
+/// point becomes the typed position-gone error instead of a dump from the oldest binlog (the same
+/// reason a real GTID replica sets it). What strict mode does *not* refuse is a `domain-server`
+/// pair the node has never written: that question is answered before the request, by
+/// [`crate::source::gtid_covers`], never by trusting the packet. The third statement a real
+/// replica sends, `@slave_gtid_ignore_duplicates`, decides what a *replica* applies and is
+/// not read by the dump thread, so it stays at its default here.
+///
+/// Cost note: two statements per binlog connection, on the connect path only.
+pub(crate) async fn prepare_dump(conn: &mut Conn, list: &str) -> Result<()> {
+    conn.query_drop(format!("SET @slave_connect_state = '{list}'"))
+        .await
+        .with_context(|| format!("SET @slave_connect_state = '{list}'"))?;
+    conn.query_drop("SET @slave_gtid_strict_mode = 1")
+        .await
+        .context("SET @slave_gtid_strict_mode = 1")
+}
+
 /// The MariaDB subset question for [`crate::source::gtid_covers`]: does this node's
 /// `@@GLOBAL.gtid_binlog_state` include `saved`? Compared in flavor code over the parsed lists
 /// (MariaDB has no server-side subset function to hand the question to), reusing the shared

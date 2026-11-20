@@ -842,4 +842,32 @@ mod tests {
         // empty saved set
         assert!(mysql::gtid_subset(&s(""), &s("0-1-100")));
     }
+
+    /// PR C: the `[g=…]` text → the list `SET @slave_connect_state` takes. One high-water mark
+    /// per `domain-server` pair (what the server reads from a list), intervals merged first, and
+    /// nothing usable is an error — never an empty list, which the server would answer with a
+    /// dump from its oldest binlog.
+    #[test]
+    fn maria_dump_gtid_list() {
+        let list = |t: &str| maria::dump_gtid_list(t).unwrap();
+        assert_eq!(list("0-1-100"), "0-1-100");
+        // an explicit window goes out as its end: the server's list is a high-water mark too
+        assert_eq!(list("0-1-40-60"), "0-1-60");
+        // two entries of one pair merge to their highest seq, and pairs keep a stable order
+        assert_eq!(list("0-1-3,0-1-10-12"), "0-1-12");
+        assert_eq!(list("1-2-5,0-7-9,0-10-1"), "0-10-1,0-7-9,1-2-5");
+        // whitespace and a repeated pair are tolerated (the text comes from a saved cursor)
+        assert_eq!(list(" 0-1-4 , 0-1-2 "), "0-1-4");
+        // Nothing usable: refused, with words that name the GTID list.
+        for bad in ["", "   ", "not-a-list", "0-1", "0-1-x", "0-1-0", "0-1-5-3"] {
+            let e = match maria::dump_gtid_list(bad) {
+                Ok(list) => panic!("{bad:?} accepted as {list:?}"),
+                Err(e) => e,
+            };
+            assert!(
+                format!("{e:#}").contains("GTID list"),
+                "{bad:?} refused with the wrong words: {e:#}"
+            );
+        }
+    }
 }
