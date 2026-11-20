@@ -1278,8 +1278,19 @@ async fn refresh_failing_while_ready(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
     // fence never attempts a refresh at all, so `refresh_failures` would never move — the link
     // outage (`toxi.disable`, every connect refused) and the black hole (`timeout{timeout:0}`,
     // §2.6, and these reads carry no timeout of their own).
-    // The fan-out is what makes the lookup big enough to cross the budget: `bytes` is a quarter of
-    // the bytes that go in, derived from the same statements (never a magic guess), as in S-5.
+    // The fan-out is what makes the read big enough to die, and the budget is what makes it die
+    // EVERY time: the refresh's source reads are chunked through the supervisor's pools
+    // (`chunk_size` ≤ `LAZYVIEW_QUERY_CHUNK` = 1000 rows, ≥ `supervisor::MIN_CHUNK`,
+    // src/supervisor.rs), so the budget must sit under the bytes of the SMALLEST chunked read,
+    // not under the bytes of the whole result. S-5's quarter-of-the-result budget (tried here
+    // first) fits every single chunk — a chunk read lands on a pool connection of its own with
+    // a fresh budget — so the chunked retries complete between the cuts and the streak never
+    // forms: on mariadb123 in CI run 44474008134 that was 71 failed refreshes, no view past
+    // attempt 2. A quarter of ONE fan row's bytes times `MIN_CHUNK` (derived from the same
+    // statements again, never a magic guess), floored at what the flush's fence reads still
+    // need to pass through (a few hundred bytes of `SHOW MASTER STATUS` /
+    // `SELECT @@gtid_binlog_pos`): every chunked read of the held fan rows (≥ 100 rows, ≈ 1.5 KB
+    // on the wire) crosses the budget in its first result packet and the attempt dies.
     const FANOUT: usize = 8_000;
     let entities = ids.seed_entities.max(2) as usize;
     let fan_rows = |n: usize, from: i64| {
@@ -1304,11 +1315,10 @@ async fn refresh_failing_while_ready(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         FANOUT,
         ids.link_seq.fetch_add(FANOUT as i64, Ordering::Relaxed) + 1,
     );
-    toxi.arm(
-        &p,
-        &Toxic::limit_data((payload / 4).max(4_096) as u64, Dir::Downstream).named("cut"),
-    )
-    .await?;
+    let per_row = (payload / FANOUT).max(1) as u64;
+    let cut = (per_row * lazyview::supervisor::MIN_CHUNK as u64 / 4).max(4_096);
+    toxi.arm(&p, &Toxic::limit_data(cut, Dir::Downstream).named("cut"))
+        .await?;
     let mut c = db.conn().await?;
     txn(&mut c, &[stmt], false).await?;
     c.disconnect().await.ok();
