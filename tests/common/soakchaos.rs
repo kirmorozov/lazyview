@@ -27,7 +27,8 @@ use lazyview::Snapshot;
 use mysql_async::prelude::Queryable;
 
 use super::soakcheck::{
-    counter, counters, quiesce_and_check, unix_now, view_rows, Check, CheckRow, Lag, Ledger, MemRow,
+    counter, counters, quiesce_and_check, unix_now, view_rows, Attribution, Check, CheckRow, Lag,
+    Ledger, MemRow,
 };
 use super::workload::names;
 use super::*;
@@ -367,6 +368,10 @@ pub struct ChaosRun<'a> {
     pub ov: &'a [(&'a str, &'a str)],
     pub logs: &'a mut Vec<PathBuf>,
     pub approved: &'a mut Ledger,
+    /// What the stop/crash events of the run have accounted for in the counter budget
+    /// (`soakcheck::Attribution`, #266): the window each one owns, so a check can tell the fence
+    /// of an orphaned write from a fence nothing explains.
+    pub attribution: &'a mut Attribution,
     /// The run's base seed: `NetworkFault` draws its toxic from this and [`Self::toxi_i`].
     pub seed: u64,
     /// The event's index in the seeded schedule (`toxi{i}` labels, T7).
@@ -394,8 +399,12 @@ impl ChaosRun<'_> {
         self.logs.push(eng.log_path.clone());
         // Per-view `/stats` counters are per engine start (`engine.rs:24` a fresh `Metrics`):
         // approvals were earned against the old engine's cumulative numbers, which the new
-        // engine's zeros make meaningless — the ledger empties with the engine.
+        // engine's zeros make meaningless — the ledger empties with the engine. The budget
+        // attribution forgets which values it has reported for the same reason (#266); the windows
+        // of the events stay, because the engine this call starts is the one the stop event's
+        // orphan is waiting in.
         self.approved.clear();
+        self.attribution.engine_restarted();
         Ok(eng)
     }
 }
@@ -418,6 +427,8 @@ pub async fn run_event(
     let what = format!("{}@+{}s", kind.name(), at.as_secs());
     let ctx = run.ctx;
     ctx.log(format!("chaos {what}"));
+    // The wall time the event ran in, for the budget attribution below (#266).
+    let began_unix = unix_now();
     let mut eng = eng;
     let mut problems: Vec<String> = Vec::new();
     let mut extra: Vec<String> = Vec::new();
@@ -918,6 +929,19 @@ pub async fn run_event(
         problems.push(format!("{e:#}"));
     }
 
+    // The budget attribution of #266: the two kinds that stop the engine leave the write they had
+    // in flight alive — `eng.stop()` releases the pool without killing it — and the engine this
+    // event starts fences that orphan on its way through the catch-up (`lost_backend` →
+    // `Endpoint::fence`, `src/supervisor.rs:173`, `:331-343`), which is the counted, designed §4.3
+    // recovery. Its own check and the scheduled checks that follow read the counter from the
+    // engine's start, so the window is recorded here and `soakcheck::budget_problems` allows the
+    // rise only inside it; outside it, or for any other counter, a rise stays a hard failure.
+    if matches!(kind, Chaos::EngineStop | Chaos::EngineCrash) {
+        let tail_s = t_catchup().as_secs() + eng.cfg.target_timeout.as_secs();
+        run.attribution
+            .record_fence_window(&what, began_unix, unix_now(), tail_s);
+    }
+
     // Every event ends with the exactness check of §3 (§3's rule: "every event is followed by an
     // exactness check").
     let mut row = match quiesce_and_check(
@@ -928,6 +952,7 @@ pub async fn run_event(
         run.specs,
         run.writers,
         run.approved,
+        run.attribution,
         &what,
     )
     .await

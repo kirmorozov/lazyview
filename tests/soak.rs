@@ -10,8 +10,8 @@ use anyhow::{ensure, Context, Result};
 use common::oracle::fingerprint;
 use common::soakchaos::{plan, run_event, soak_chaos_per_h, ChaosRun};
 use common::soakcheck::{
-    quiesce_and_check, run_dir, scan_warns, set_writers, soak_check_s, Check, CheckRow, Ledger,
-    Report, Window,
+    quiesce_and_check, run_dir, scan_warns, set_writers, soak_check_s, Attribution, Check,
+    CheckRow, Ledger, Report, Window,
 };
 use common::soakwork::{
     run_paced, run_soak_batches, setup_soak, soak_rate, soak_views, soak_writers, SoakIds,
@@ -297,6 +297,9 @@ async fn soak_run(
     // The approved-rebuild ledger of the per-view F5 rule (S3.3/Q3): chaos events fill it, the
     // checks honor it, and a fresh engine empties it (`ChaosRun::start_engine_with`).
     let mut approved = Ledger::default();
+    // The same for the counter budget (S2.4, #266): the stop/crash events the run has executed,
+    // with the window each owns for a fence of the write it left in flight.
+    let mut attribution = Attribution::default();
     let mut totals: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut done = 0usize;
     let out = loop {
@@ -322,6 +325,7 @@ async fn soak_run(
                 ov: &ov,
                 logs,
                 approved: &mut approved,
+                attribution: &mut attribution,
                 seed,
                 toxi_i: done - 1,
             };
@@ -371,6 +375,7 @@ async fn soak_run(
             &specs,
             &writers.0,
             &mut approved,
+            &mut attribution,
             &format!("scheduled @+{}s", began.elapsed().as_secs()),
         )
         .await?;

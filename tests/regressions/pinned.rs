@@ -1726,6 +1726,7 @@ async fn replay_check(
     txs: &mut [tokio::sync::watch::Sender<bool>],
     hs: &mut Vec<tokio::task::JoinHandle<Result<usize>>>,
     approved: &mut crate::common::soakcheck::Ledger,
+    attribution: &mut crate::common::soakcheck::Attribution,
     what: &str,
     failed: &mut Vec<String>,
 ) -> Result<()> {
@@ -1733,7 +1734,15 @@ async fn replay_check(
     join_replay_writers(hs).await?;
     let targets: std::collections::HashMap<String, Db> = std::collections::HashMap::new();
     let row = crate::common::soakcheck::quiesce_and_check(
-        ctx, eng, db, &targets, specs, txs, approved, what,
+        ctx,
+        eng,
+        db,
+        &targets,
+        specs,
+        txs,
+        approved,
+        attribution,
+        what,
     )
     .await?;
     if row.check.pass != Some(true) {
@@ -1779,6 +1788,7 @@ fn reg_cascade_refusal_seed_replay() {
         let began = std::time::Instant::now();
         let deadline = began + std::time::Duration::from_secs(300);
         let mut approved = crate::common::soakcheck::Ledger::default();
+        let mut attribution = crate::common::soakcheck::Attribution::default();
         let mut logs: Vec<std::path::PathBuf> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         let (mut txs, mut hs) = spawn_replay_writers(&db, &ids, SEED, n_writers, per_writer).await;
@@ -1805,6 +1815,7 @@ fn reg_cascade_refusal_seed_replay() {
                     ov: &[],
                     logs: &mut logs,
                     approved: &mut approved,
+                    attribution: &mut attribution,
                     seed: SEED,
                     toxi_i: done - 1,
                 };
@@ -1841,6 +1852,7 @@ fn reg_cascade_refusal_seed_replay() {
                 &mut txs,
                 &mut hs,
                 &mut approved,
+                &mut attribution,
                 &format!("scheduled @+{}s", began.elapsed().as_secs()),
                 &mut failed,
             )
@@ -1857,6 +1869,7 @@ fn reg_cascade_refusal_seed_replay() {
             &mut txs,
             &mut hs,
             &mut approved,
+            &mut attribution,
             "final",
             &mut failed,
         )
@@ -2016,6 +2029,7 @@ fn reg_cascade_window_seed_replay() {
         }
         let mut logs = Vec::new();
         let mut approved = crate::common::soakcheck::Ledger::default();
+        let mut attribution = crate::common::soakcheck::Attribution::default();
         // The smoke's pacing: the writers run against the live engine until the scheduled
         // minute of the event — the crash must find the same workload shape the live run saw
         // at +104 s, not the schema minutes after setup.
@@ -2032,6 +2046,7 @@ fn reg_cascade_window_seed_replay() {
             ov: &[],
             logs: &mut logs,
             approved: &mut approved,
+            attribution: &mut attribution,
             seed: SEED,
             toxi_i: 0,
         };
@@ -2055,6 +2070,7 @@ fn reg_cascade_window_seed_replay() {
             &specs,
             &txs,
             &mut approved,
+            &mut attribution,
             "seed replay: the check after crash@+104s",
         )
         .await?;

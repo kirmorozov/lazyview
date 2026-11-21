@@ -680,6 +680,10 @@ impl Ledger {
 /// above its bar and outside both of those tolerations fails like an unapproved one; a fresh
 /// engine empties the ledger, whose bars were earned against counters that no longer exist.
 ///
+/// `attribution` is the same idea for the counter budget (S2.4, #266, [`Attribution`]): the
+/// stop/crash events the run has executed, whose orphaned write the engine they started is allowed
+/// to fence. A rise nothing explains fails, as before.
+///
 /// The counter table is measured against [`Snapshot::default()`], i.e. since the engine started;
 /// between two consecutive checks the caller keeps a [`Window`] and calls [`counters`].
 #[allow(clippy::too_many_arguments)] // the check's whole context, like `soak_run` (S3.4)
@@ -691,14 +695,16 @@ pub async fn quiesce_and_check(
     specs: &[ViewSpec],
     writers: &[watch::Sender<bool>],
     ledger: &mut Ledger,
+    attribution: &mut Attribution,
     what: &str,
 ) -> Result<CheckRow> {
     set_writers(writers, true);
-    let out = check_once(ctx, eng, src, targets, specs, ledger, what).await;
+    let out = check_once(ctx, eng, src, targets, specs, ledger, attribution, what).await;
     set_writers(writers, false);
     out
 }
 
+#[allow(clippy::too_many_arguments)] // the check's whole context, like `quiesce_and_check`
 async fn check_once(
     ctx: &Ctx,
     eng: &mut Engine,
@@ -706,6 +712,7 @@ async fn check_once(
     targets: &HashMap<String, Db>,
     specs: &[ViewSpec],
     ledger: &mut Ledger,
+    attribution: &mut Attribution,
     what: &str,
 ) -> Result<CheckRow> {
     let t = Instant::now();
@@ -772,8 +779,10 @@ async fn check_once(
         }
     }
     let whole_view_refreshes: u64 = views.iter().map(|v| v.whole_view_refreshes).sum();
-    // (5) the counter budget (§4).
+    // (5) the counter budget (§4), with the chaos attribution of #266: a stop/crash event of this
+    // run may own a `supervisor_zombie_kills` rise, and the row says which one.
     let counters = counters(eng, &Snapshot::default());
+    let budget = budget_problems(&counters, attribution, unix_now());
     // (6) lag, (7) memory, (8) the log scan (this engine's current log; the soak keeps every
     // start's path in a Vec and scans them all, S3.4).
     let lag = lag_sample(&mut sc, eng).await?;
@@ -793,7 +802,7 @@ async fn check_once(
             .iter()
             .map(|v| format!("incremental view did a whole-view refresh: {v}")),
     );
-    problems.extend(budget_problems(&counters));
+    problems.extend(budget.problems);
     problems.extend(
         unexpected_warns
             .iter()
@@ -807,9 +816,14 @@ async fn check_once(
             explained.join(", ")
         )
     };
+    let attributed_note = if budget.attributed.is_empty() {
+        String::new()
+    } else {
+        format!("; budget: {}", budget.attributed.join("; "))
+    };
     let detail = format!(
         "{what}: {} view rows, {} recheck(s), full_rebuilds {}, whole_view_refreshes {}{}, \
-         lag {:.2}s, RSS {} KiB, inflight {}, {} WARN buckets ({} unexpected), {} ms",
+         lag {:.2}s, RSS {} KiB, inflight {}, {} WARN buckets ({} unexpected){}, {} ms",
         views.len(),
         rechecks,
         counter(&counters, "full_rebuilds"),
@@ -820,6 +834,7 @@ async fn check_once(
         mem.inflight_rows,
         warns.len(),
         unexpected_warns.len(),
+        attributed_note,
         t.elapsed().as_millis(),
     );
     let shown = if problems.is_empty() {
@@ -948,18 +963,126 @@ pub const HARD_BUDGET: &[&str] = &[
     "supervisor_zombie_kills",
 ];
 
-/// The hard-budget violations in a [`counters`] table (empty = nothing rose).
-pub fn budget_problems(counters: &[(&'static str, u64)]) -> Vec<String> {
-    HARD_BUDGET
-        .iter()
-        .filter_map(|n| {
-            counters
-                .iter()
-                .find(|(c, _)| c == n)
-                .filter(|(_, v)| *v > 0)
-                .map(|(n, v)| format!("counter {n} rose to {v}"))
-        })
-        .collect()
+/// A stop or crash the run has executed, with the wall-clock window in which the engine it started
+/// may still be fencing the write that event left behind. Published by
+/// [`soakchaos::run_event`](super::soakchaos::run_event) for the two kinds that stop the engine,
+/// read by [`budget_problems`].
+#[derive(Debug, Clone)]
+pub struct FenceWindow {
+    /// The event's report name — `Chaos::name` plus its offset in the seeded schedule, e.g.
+    /// `stop@+1425s`, the same words its own check row starts with.
+    pub event: String,
+    /// `unix_now()` when the event began.
+    pub began: u64,
+    /// `unix_now()` when the event's own work ended (its exactness check follows that).
+    pub ended: u64,
+    /// The seconds after `ended` during which a fence can still be this event's orphan — the
+    /// caller's bound, from the harness's and the engine's own numbers: the restart's catch-up
+    /// floor `t_catchup()` (`engine.rs:425`, the budget the event's own catch-up wait runs under)
+    /// plus one target statement timeout (`Config::target_timeout`, `src/config.rs:124`), the
+    /// longest a write blocked behind the orphan may run before it is the one that fences.
+    pub tail_s: u64,
+}
+
+/// The chaos attribution of the hard budget (S2.4, #266): which counter rise of a check a chaos
+/// event of *this run* owns. [`budget_problems`] consults it, so the recovery a stop or crash
+/// legitimately causes is not mistaken for the fault it looks like, while every other rise stays
+/// the hard failure it has always been.
+#[derive(Debug, Default)]
+pub struct Attribution {
+    /// The stop/crash events executed so far, oldest first, each with the window it owns.
+    fences: Vec<FenceWindow>,
+    /// The last value of each budget counter a check has reported *on the current engine*. The
+    /// counters are per engine start (`soakchaos.rs:15`, `engine.rs:24`), so `value > seen` is a
+    /// rise in this window and `value == seen` is the same counter still sitting where a check has
+    /// already accounted for it.
+    seen: HashMap<&'static str, u64>,
+}
+
+impl Attribution {
+    /// The run executed the stop/crash event `event` between `began` and `ended` (unix seconds), so
+    /// a fence it left behind may surface until `ended + tail_s` (the caller's bound,
+    /// [`FenceWindow::tail_s`]).
+    pub fn record_fence_window(&mut self, event: &str, began: u64, ended: u64, tail_s: u64) {
+        self.fences.retain(|f| f.event != event);
+        self.fences.push(FenceWindow {
+            event: event.to_string(),
+            began,
+            ended,
+            tail_s,
+        });
+    }
+
+    /// A fresh engine: its counters start at zero, so what a check reported against the old ones is
+    /// no comparison to make — the same rule that empties the [`Ledger`] (`Ledger::clear`). The
+    /// windows stay: the orphan of the stop that *started* this engine is what its first checks see.
+    pub fn engine_restarted(&mut self) {
+        self.seen.clear();
+    }
+
+    /// The most recent stop/crash event whose window still owns a fence read at `now`.
+    fn owner(&self, now: u64) -> Option<&FenceWindow> {
+        self.fences
+            .iter()
+            .rev()
+            .find(|f| now >= f.began && now <= f.ended + f.tail_s)
+    }
+}
+
+/// The verdict of [`budget_problems`] on one check's counters table.
+#[derive(Debug, Default)]
+pub struct Budget {
+    /// The violations, each in the table's own words (`counter {n} rose to {v}`).
+    pub problems: Vec<String>,
+    /// The rises a chaos event of the run owns, as the audit line of the check row: counter, value,
+    /// event and window. A rise that was *not* attributed is a problem, never a note.
+    pub attributed: Vec<String>,
+}
+
+/// The hard-budget violations in a [`counters`] table, read at wall time `now`, with the chaos
+/// attribution of #266 (empty problems = nothing rose that nothing explains).
+///
+/// A rise is a *rise*: the table counts from the engine's start ([`Snapshot::default`]), so a
+/// counter a check has already accounted for is not reported twice by the checks that follow it,
+/// and a counter that climbs further is reported again. `supervisor_zombie_kills` has one
+/// documented case: a stop or crash releases the pool without killing the write in flight
+/// (`eng.stop()`, `soakchaos.rs:464`), that orphan holds the target's row locks, and the engine the
+/// event starts fences it on its way through catch-up — `lost_backend` → `Endpoint::fence`
+/// (`src/supervisor.rs:173`, `:331-343`), the designed §4.3 recovery. So the counter may rise in a
+/// check whose read time an executed `EngineStop`/`EngineCrash` window covers
+/// ([`Attribution::owner`]), and only there: the event's own assertions still have to see the engine
+/// streaming and exact afterwards (unchanged, `soakchaos::run_event`), the decision is written into
+/// the check row so an auditor sees counter, window and event, and any rise with no such event in
+/// flight — at any level, on any engine — fails exactly as before. The production signal stands: an
+/// unattributed fence is still a hard failure. The other three counters have no documented case and
+/// are untouched.
+pub fn budget_problems(
+    counters: &[(&'static str, u64)],
+    attribution: &mut Attribution,
+    now: u64,
+) -> Budget {
+    let mut out = Budget::default();
+    for n in HARD_BUDGET {
+        let Some((_, v)) = counters.iter().find(|(c, _)| c == n) else {
+            continue;
+        };
+        if *v <= attribution.seen.get(*n).copied().unwrap_or(0) {
+            continue; // not a rise: an earlier check accounted for this value already
+        }
+        if *n == "supervisor_zombie_kills" {
+            if let Some(f) = attribution.owner(now) {
+                out.attributed.push(format!(
+                    "counter {n} = {v}, owned by chaos {} (executed @{},{}) — the orphaned write \
+                     of the stop/crash, fenced by the engine it started (§4.3)",
+                    f.event, f.began, f.ended
+                ));
+                attribution.seen.insert(*n, *v);
+                continue;
+            }
+        }
+        out.problems.push(format!("counter {n} rose to {v}"));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1213,4 +1336,107 @@ fn word(hay: &str, needle: &str) -> bool {
     let edge = |i: usize| i >= b.len() || !(b[i].is_ascii_alphanumeric() || b[i] == b'_');
     hay.match_indices(needle)
         .any(|(i, _)| (i == 0 || edge(i - 1)) && edge(i + needle.len()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The budget attribution, unit-proved (S2.4, #266)
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{budget_problems, Attribution};
+
+    /// The budget table of the window that failed #266 (`smoke2/soak-mariadb1011.log:42-43`, seed
+    /// 177381178456): the hard-budget counters all at 0 except the one fence the engine that
+    /// `stop@+1425s` started did while it caught up. `full_rebuilds` is the run's ordinary number
+    /// (F5: not a hard-budget counter) and must not matter to the verdict.
+    fn smoke2(kills: u64) -> Vec<(&'static str, u64)> {
+        vec![
+            ("full_rebuilds", 7),
+            ("refresh_errors", 0),
+            ("plans_timed_out", 0),
+            ("binlog_backpressure", 0),
+            ("lag_over_budget", 0),
+            ("target_catchups", 0),
+            ("supervisor_zombie_kills", kills),
+        ]
+    }
+
+    /// The stop event of the failing run: `chaos stop@+1425s` executed at +1464.1 s and its engine
+    /// was up at +1464.2 s, so the window is 1464..1464 + tail, read 50 s later by the event's own
+    /// check. The tail is the caller's bound — `t_catchup()` (180 s here) plus one target statement
+    /// timeout (60 s) — and 240 s is what that adds up to on these numbers.
+    fn smoke2_attribution() -> Attribution {
+        let mut a = Attribution::default();
+        a.record_fence_window("stop@+1425s", 1_464, 1_464, 240);
+        a
+    }
+
+    /// Green after: the fence the stop owns passes, is named in the row, and the scheduled check
+    /// that repeats the same value a second later does not report it again.
+    #[test]
+    fn budget_attribution_owns_a_zombie_fence_inside_the_stop_window() {
+        let mut a = smoke2_attribution();
+        // The event's own check (`stop@+1425s`), read 50 s into the window.
+        let b = budget_problems(&smoke2(1), &mut a, 1_514);
+        assert!(b.problems.is_empty(), "{:?}", b.problems);
+        assert_eq!(b.attributed.len(), 1, "{:?}", b.attributed);
+        assert!(b.attributed[0].contains("supervisor_zombie_kills = 1"));
+        assert!(b.attributed[0].contains("stop@+1425s"));
+        // The scheduled check 1 s later (`scheduled @+1474s`): the counter has not risen since, so
+        // the row carries no problem and no second attribution line.
+        let b = budget_problems(&smoke2(1), &mut a, 1_515);
+        assert!(b.problems.is_empty() && b.attributed.is_empty(), "{b:?}");
+        // A second fence of the same orphan inside the window is still the same designed recovery —
+        // and it is written into the row rather than passed in silence.
+        let b = budget_problems(&smoke2(2), &mut a, 1_520);
+        assert!(b.problems.is_empty() && b.attributed.len() == 1, "{b:?}");
+        // Past the window, the same rise belongs to nobody and fails.
+        let b = budget_problems(&smoke2(3), &mut a, 1_705);
+        assert_eq!(b.problems, ["counter supervisor_zombie_kills rose to 3"]);
+        assert!(b.attributed.is_empty());
+    }
+
+    /// Red before, and still the rule for a fence nothing explains: without an executed stop/crash
+    /// the table is exactly the failure #266 reported.
+    #[test]
+    fn budget_attribution_fails_an_unattributed_zombie_kill() {
+        // No chaos event at all — the ordinary soak minute that fences for no reason.
+        let mut a = Attribution::default();
+        let b = budget_problems(&smoke2(1), &mut a, 1_514);
+        assert_eq!(b.problems, ["counter supervisor_zombie_kills rose to 1"]);
+        assert!(b.attributed.is_empty());
+        // A rise an earlier check already accounted for is not a rise — but `seen` is per engine,
+        // and a fresh engine's counters start at zero, so the same number on the engine the stop
+        // started is a rise again: that is #266's own case, and the window owns it.
+        let mut a = smoke2_attribution();
+        assert!(budget_problems(&smoke2(1), &mut a, 1_500)
+            .problems
+            .is_empty());
+        a.engine_restarted();
+        let b = budget_problems(&smoke2(1), &mut a, 1_501);
+        assert!(b.problems.is_empty() && b.attributed.len() == 1, "{b:?}");
+        assert!(b.attributed[0].contains("stop@+1425s"));
+        // And on a fresh engine past every window it is the failure it always was.
+        a.engine_restarted();
+        assert_eq!(
+            budget_problems(&smoke2(1), &mut a, 3_000).problems,
+            ["counter supervisor_zombie_kills rose to 1"]
+        );
+    }
+
+    /// The other three hard-budget counters have no documented case at all: a live stop window
+    /// owns nothing of them, and an unattributed rise is reported by every check that reads it.
+    #[test]
+    fn budget_attribution_leaves_the_other_counters_hard() {
+        let mut t = smoke2(0);
+        t[1].1 = 1; // refresh_errors
+        let mut a = Attribution::default();
+        a.record_fence_window("crash@+60s", 1_000, 1_010, 240);
+        for _ in 0..2 {
+            let b = budget_problems(&t, &mut a, 1_020);
+            assert_eq!(b.problems, ["counter refresh_errors rose to 1"]);
+            assert!(b.attributed.is_empty());
+        }
+    }
 }
