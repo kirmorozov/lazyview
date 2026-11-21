@@ -62,9 +62,19 @@ counters!(
     // Targets brought up to date from the changes kept for them (`retry_lag`).
     target_catchups,
     // Crossings of the byte budget of the changes kept for targets that are behind: reported
-    // (a warn naming the view, the target and the estimate), never acted on — a target that
-    // is down keeps its keys until it catches up (see `Engine::lag_over_budget`).
+    // (a warn naming the view, the target and the estimate) and acted on by the arm
+    // `LAZYVIEW_LAG_OVER_BUDGET` names — `pause` holds the binlog reader (see
+    // `Engine::hold_for_lag`) while a target keeps keys it is owed (a target that is down keeps
+    // its keys until it catches up; see `Engine::lag_over_budget`).
     lag_over_budget,
+    // Times the binlog reader was held because the changes kept for targets that are behind were
+    // over their budget (the pause arm of `LAZYVIEW_LAG_OVER_BUDGET`). One count per hold, never
+    // per event or per tick (see `Engine::hold_for_lag`).
+    lag_reader_holds,
+    // Key sets dropped for a target that was behind, past its budget (the `drop_refresh` arm of
+    // `LAZYVIEW_LAG_OVER_BUDGET`, review R-01 (b)). Zero until M2b lands that arm: the pause arm
+    // drops nothing, which is the point of it.
+    lag_keys_dropped,
     // Failed refresh attempts of live views (each retried with backoff, never a rebuild).
     refresh_errors,
     definition_reloads,
@@ -137,6 +147,10 @@ pub struct Gauges {
     pub starting: AtomicU64,
     /// Rows read from the sources and not yet written to every target.
     pub inflight_rows: AtomicU64,
+    /// Estimated bytes of the keys kept for targets that are behind (`Engine::lag_held_bytes`),
+    /// read at the housekeeping tick and when a hold is decided — never per binlog event. Compare
+    /// with `Config::mem.lag_hold_bytes`: past it the `LAZYVIEW_LAG_OVER_BUDGET` arm acts.
+    pub lag_bytes_held: AtomicU64,
 }
 
 /// Gauges of one supervisor connection pool (`pool` = `read` | `write`, `endpoint` = `source` or
