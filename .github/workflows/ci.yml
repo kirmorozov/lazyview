@@ -58,18 +58,22 @@ name: ci
 # integration-pg
 # (integration-pg-multi pins that target and rotates the sources, so the faults are not paid for
 # twice; its legs are the targets_pg_ gates).
-# The soak jobs (bottom of the file) are the two bounded soaks: `soak-pr`, a bounded 5-minute smoke
+# The soak jobs (bottom of the file) are the bounded soaks: `soak-pr`, a bounded 5-minute smoke
 # on mysql84, runs on pushes and ci:full pull requests (a check of its own, so its log shows
-# soak_smoke_30m passing for real); `soak-smoke` (30 minutes, mysql84 + mariadb1011) runs only for the nightly and
-# a manual run, and `report` opens or updates the one open issue labelled `nightly` after a failed
-# nightly. The nightly is nightly.yml calling this workflow on the schedule: the schedule event then
-# runs the soak jobs only (every regular job skips), because a push to main has already run the
-# full set on this very commit (#236) and the nightly adds only what that push does not run. The
-# long soak (tests/soak.rs `soak_long`) is not a CI job: GitHub Actions have time limits, so it
-# runs locally as a release gate through the repo's own runner, scripts/soak.sh: `scripts/soak.sh
-# long [hours]` (its `smoke [flavor]` is the same 30-minute smoke, run by hand). That runner
-# is PR #363; it has since landed (scripts/soak.sh is on main), so the gate runs from the repo,
-# not from a scratch dir.
+# soak_smoke_30m passing for real); `soak-manual` (owner's ~15-minute tier: the smoke at a length
+# the dispatcher picks, mysql84, behind the soak_minutes input, never on a pull request or a push);
+# `soak-smoke` (30 minutes, mysql84 + mariadb1011) runs only for the nightly and a manual run, and
+# `report` opens or updates the one open issue labelled `nightly` after a failed nightly. No other
+# job asks for a soak tier: the two opt-in tests of tests/soak.rs are filtered out of the
+# integration matrix's own run plan (see its `integration tests` step), because a job that cannot
+# run a test must not ask for one. The nightly is nightly.yml calling this workflow on the schedule:
+# the schedule event then runs the soak jobs only (every regular job skips), because a push to main
+# has already run the full set on this very commit (#236) and the nightly adds only what that push
+# does not run. The long soak (tests/soak.rs `soak_long`) is not a CI job: GitHub Actions have time
+# limits, so it runs locally as a release gate through the repo's own runner, scripts/soak.sh:
+# `scripts/soak.sh long [hours]` (its `smoke [flavor]` is the same 30-minute smoke, run by hand).
+# That runner is PR #363; it has since landed (scripts/soak.sh is on main), so the gate runs from
+# the repo, not from a scratch dir.
 # twice; its legs are the targets_pg_ gates). The jobs that gate image/release (the supply-chain scans,
 # deny + scan-image, and the optional features) are not advisory (S-09): an advisory job gates nothing.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
@@ -104,6 +108,17 @@ on:
     # the merge forever).
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      # The manually triggered soak tier, the one to reach for from the CLI: one soak of
+      # `soak_minutes` minutes on mysql84 (owner, 2026-11-21: "long jobs might be good to keep at
+      # 15 minutes in github actions, as separate manually triggered job, can you trigfer from
+      # cli?"). 0 leaves the tier out of the run, so a dispatch that wants no soak is exactly the
+      # pre-soak-manual dispatch. 5..=60; see the `soak-manual` job for the gate.
+      #   gh workflow run ci.yml --repo kirmorozov/lazyview --ref <branch> -F soak_minutes=15
+      soak_minutes:
+        description: "Run the manually triggered soak tier for this many minutes (0 = do not run it; 5..=60, e.g. 15)"
+        type: number
+        default: 0
   # Called by nightly.yml (the nightly on main HEAD). Its caller's event is `schedule`, so every
   # regular job skips and only the soak jobs and report run; workflow_call is listed alongside
   # schedule in those `if`s so the split holds whichever event name the called workflow sees.
@@ -552,14 +567,24 @@ jobs:
         # is its own cells and the exclusive suite is its own step, both skipped here).
         # The chaos binary (chaos_* scenarios + selftest_toxi_*) runs for real in its own cells and
         # steps below (strict there); filtered out here so it never runs twice.
+        # The two opt-in soak tiers (soak_smoke_30m, soak_long) are filtered out on the same rule:
+        # this job never sets LAZYVIEW_TEST_SOAK, so asking for them printed `soak_smoke_30m ...
+        # SKIP` and `soak_long ... SKIP` in every shard -- a job that cannot run a test must not ask
+        # for one (owner, 2026-11-21, on the #285 guard: "guard may be correct, lets tests fail and
+        # keep working on fixing the inplementation so solution is clean and complete"). They run
+        # for real, with the switch set and LAZYVIEW_TEST_STRICT=soak_, in the soak jobs at the
+        # bottom of the file (soak-pr 5 min on the bounded smoke, soak-manual on a dispatch,
+        # soak-smoke 30 min nightly); the 3-hour soak_long runs locally as a release gate through
+        # scripts/soak.sh, never as a job here. Here only soak_workload_is_deterministic runs, and
+        # it needs no long window.
         # The gate below is scripts/chaos-gate.sh with tests/integration-known-red.txt, used exactly
         # as the chaos steps use it: any failing test this file does not list FAILS the step (a
         # ::error:: per test names the file to fix), and a listed one still runs and is reported in
         # the job summary with its issue. No continue-on-error, no skip, no retry; every entry is
-        # temporary and owner-approved and its fix PR deletes it. Two entries went with the
-        # saved-position fix — `pinned::reg_cascade_refusal_seed_replay` (#319) and
-        # `lifecycle_crash_consistency` (#345), neither of which anyone has reproduced — so only
-        # `bench_throughput_shapes` (#378) is listed. The gate's SKIP guard is chaos-specific, so
+        # temporary and owner-approved and its fix PR deletes it. Which integration tests the file
+        # lists, and how many, is whatever tests/integration-known-red.txt holds at the time: its
+        # own header is the list of contents and change history, so this comment never counts or
+        # names entries. The gate's SKIP guard is chaos-specific, so
         # the skip discipline of this step stays what LAZYVIEW_TEST_STRICT above already enforces.
         # --color never: the gate's greps read these lines as plain text. The exit status of the runner
         # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
@@ -580,6 +605,7 @@ jobs:
           set +o pipefail
           scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv "${names[@]}" -- \
             --test-threads=1 --color never --skip targets_pg_ --skip chaos_ --skip selftest_toxi_ \
+            --skip soak_smoke_30m --skip soak_long \
             2>&1 | tee integration-tests.log
           scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "${{ matrix.group }} group shard ${{ matrix.shard }} integration" \
             integration-tests.log tests/integration-known-red.txt
@@ -1483,9 +1509,11 @@ jobs:
   # ---- Soak jobs (tests/soak.rs). All strict: LAZYVIEW_TEST_STRICT=soak_ is the harness's own
   # strict mode (tests/common, from the tests-strict-targets PR), so a skipped soak scenario
   # fails the job instead of printing a green SKIP line. soak-pr runs on every pull request;
-  # soak-smoke is the nightly's (nightly.yml calls this workflow on the schedule) and a manual run
-  # of this workflow, so a branch can prove them before merge. Both are bounded: the long soak
-  # (tests/soak.rs soak_long) runs locally, not here (see the header). ----
+  # soak-manual only on a dispatch that sets soak_minutes; soak-smoke is the nightly's (nightly.yml
+  # calls this workflow on the schedule) and a manual run of this workflow, so a branch can prove them
+  # before merge. All are bounded: the long soak (tests/soak.rs soak_long) runs locally, not here (see
+  # the header). Nothing else runs a soak test: the integration matrix filters the two opt-in tests
+  # (soak_smoke_30m, soak_long) out of its own plan, which is what keeps its shards skip-free. ----
 
   soak-pr:
     # The bounded soak on pull requests: 5 minutes (LAZYVIEW_TEST_SOAK_MINUTES) on mysql84, as
@@ -1539,6 +1567,94 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-pr-mysql84
+          path: tmp/out/lvs-soak/
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: stop mysql84
+        if: always()
+        run: docker compose down -v
+
+  soak-manual:
+    # The owner's ~15-minute tier, on demand (owner, 2026-11-21: "long jobs might be good to keep
+    # at 15 minutes in github actions, as separate manually triggered job, can you trigfer from
+    # cli?"): the smoke mode of tests/soak.rs at a length the dispatcher chooses, on mysql84, in a
+    # job of its own that no pull request, push or nightly ever runs. From the CLI:
+    #   gh workflow run ci.yml --repo kirmorozov/lazyview --ref <branch> -F soak_minutes=15
+    #   gh run rerun <run-id> --repo kirmorozov/lazyview --job <job-id>    # one job of a finished run
+    # It is soak-pr's body with the bound taken from `soak_minutes` (the dispatch input above)
+    # instead of the hardcoded 5, so the same tee+grep gate makes a run that never executed the
+    # soak impossible and a skip cannot leave it green (strict below turns one into a failure).
+    # soak-pr stays the per-PR signal at 5 minutes; the nightly's 30-minute smoke (soak-smoke) is
+    # untouched, and the long soak runs locally as a release gate through `scripts/soak.sh long`, never as a job.
+    # The tier is capped at 60 minutes (the step below refuses anything else, so the job's own name
+    # and timeout can never misreport what ran); above that, run soak-smoke (nightly) or the local scripts/soak.sh long.
+    name: soak manual (mysql84, ${{ inputs.soak_minutes }} min)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.soak_minutes > 0 }}
+    runs-on: ubuntu-24.04
+    # The tier's own minutes (at the 60-minute cap) + the test's 30-minute margin (F12 in
+    # tests/soak.rs) + the build and the server start. `timeout-minutes` takes no expression, so
+    # this is the cap, written out.
+    timeout-minutes: 120
+    env:
+      COMPOSE_FILE: docker-compose.test.yml
+      FLAVOR: mysql84
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start mysql84 (in the background)
+        run: docker compose up -d --quiet-pull "$FLAVOR"
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache (its mysql84 job writes it); never a second writer.
+          shared-key: integration
+          save-if: false
+      - name: build the soak tests
+        run: cargo test --locked --test soak --no-run
+      - name: wait for mysql84
+        run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"
+      - name: server version
+        run: docker compose exec -T "$FLAVOR" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
+      - name: soak (${{ inputs.soak_minutes }} minutes)
+        # The tier at its 60-minute cap + the test's own 30-minute margin (F12) + the tee.
+        timeout-minutes: 100
+        env:
+          LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
+          LAZYVIEW_HEALTH_ADDR: "off"
+          LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
+          LAZYVIEW_TEST_SOAK: smoke
+          LAZYVIEW_TEST_SOAK_MINUTES: ${{ inputs.soak_minutes }}
+          LAZYVIEW_TEST_STRICT: soak_
+        shell: bash
+        run: |
+          # The bound is the input, and the input is only ever a whole number of minutes in 5..=60.
+          # soak_minutes() (tests/soak.rs) silently falls back to the smoke's own 30-minute default
+          # outside 5..=4320 and the smoke plans its chaos per hour, so refuse anything this job's
+          # name and timeout would misreport rather than quietly run a different tier.
+          mins="${LAZYVIEW_TEST_SOAK_MINUTES}"
+          case "$mins" in ''|*[!0-9]*) echo "::error::soak_minutes='${mins}' is not a whole number of minutes"; exit 1;; esac
+          if [ "$mins" -lt 5 ] || [ "$mins" -gt 60 ]; then
+            echo "::error::soak_minutes=${mins} is outside the 5..=60 this job covers (the nightly keeps the 30-minute smoke; scripts/soak.sh runs the 24-72 hour long soak locally)"
+            exit 1
+          fi
+          # tee + grep, as in soak-pr: `test result: ok` on its own says nothing about a soak that
+          # never ran. The log goes under $LV_TEST_LOGS so the #285 skip guard sees it once that PR
+          # lands; until then the directory is this job's own.
+          logs="${LV_TEST_LOGS:-tmp/out/ci-test-logs}"
+          mkdir -p "$logs"
+          cargo test --locked --test soak -- --test-threads=1 --color never soak_smoke_30m 2>&1 \
+            | tee "$logs/soak-manual-${mins}m.log"
+          grep -q "^test soak_smoke_30m \.\.\. ok$" "$logs/soak-manual-${mins}m.log" \
+            || { echo "::error::soak_smoke_30m did not run and pass at ${mins} minutes"; exit 1; }
+      - name: upload the soak report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-manual-mysql84
           path: tmp/out/lvs-soak/
           retention-days: 14
           if-no-files-found: ignore
