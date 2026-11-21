@@ -801,6 +801,10 @@ struct Engine {
     /// instance has the lock and this one is the replaced one. Checking it costs a `watch` borrow —
     /// an atomic read, no round-trip, no allocation, and nothing on the binlog event path.
     leader_state: watch::Receiver<LeaderState>,
+    /// Armed while that state is not `Active` (lv-super ruling 1): the flush holds until then, and
+    /// [`Self::flush_deadline`] will not let the loop wake before it, so a closed gate costs one
+    /// wake per beat instead of a spin.
+    leader_hold: Option<Instant>,
     /// The engine's end of the lock's beat task: dropped with the engine, which stops the task and
     /// closes the lock session, so a dropped engine releases the lock instead of making the next
     /// instance wait for the lease.
@@ -823,7 +827,7 @@ struct Engine {
     stats_tx: crate::stats::FoldSender,
     /// Concurrent refreshes on connection pools; `None` with `LAZYVIEW_SUPERVISOR=off` (one
     /// sequential refresh on the connections above).
-    sup: Option<Supervisor>,
+    sup: Option<Arc<Supervisor>>,
     /// Executor (a): the dedup core and its targets, one per live version on the Dedup route
     /// (src/exec.rs).
     dedup: crate::exec::Dedup,
@@ -1057,6 +1061,13 @@ pub enum LeaderState {
     /// The lock session answered its last beat and holds the named lock: this instance is the
     /// active one.
     Active,
+    /// No beat has been answered for `2 x LAZYVIEW_LOCK_HEARTBEAT_MS`, so the lease this instance's
+    /// lock lives on may be running out and another instance may take the lock at any moment
+    /// (lv-super ruling 1, 2026-11-16). It closes the same gates as `Fenced` — no *new* write
+    /// starts here — but it is not a verdict: the beat that answers, or the rejoin that confirms
+    /// the same epoch, brings this back to `Active`, and the writes already dispatched are ended
+    /// through the zombie fence at once rather than left to run to `LAZYVIEW_TARGET_TIMEOUT_MS`.
+    Uncertain,
     /// Another session holds the lock, or the fencing epoch moved while our session was away:
     /// this instance is the replaced one. `why` names the epochs for the log and the fatal error.
     Fenced(String),
@@ -1110,6 +1121,57 @@ impl LockBeat for LockSessionBeat {
     }
 }
 
+/// What the lock task asks of the refresh supervisor the moment the lease stops being provable
+/// (lv-super ruling 1, 2026-11-16): end the target writes this instance has already started, at
+/// once. The lease must not expire with a write of ours still running, or the replacement's
+/// refresh of the same rows becomes the older of two writers.
+///
+/// A trait so the beat task's state machine can be driven by a script in a unit test with no target
+/// behind it, for the same reason [`LockBeat`] exists.
+trait WriteFence: Send + Sync + 'static {
+    /// Ends the write ops in flight through the zombie fence (§4.3) and reports how many the
+    /// servers confirmed gone. Bounded per op by `supervisor::FENCE_WAIT`, and called on a
+    /// transition of the lock state — never per row, never per binlog event.
+    fn stop_writes(&self) -> impl Future<Output = usize> + Send;
+}
+
+/// The writes this instance can have in flight, as the lock task sees them: the refresh supervisor's,
+/// when it runs one. `LAZYVIEW_SUPERVISOR=off` issues no write ops, so there is nothing to end.
+/// An enum over a `dyn WriteFence` because the trait's method returns a future, and a task that
+/// beats on a bounded statement of its own has no business paying a vtable for it.
+enum Writes {
+    Supervised(Arc<Supervisor>),
+    None,
+}
+
+impl WriteFence for Writes {
+    async fn stop_writes(&self) -> usize {
+        match self {
+            Writes::Supervised(s) => s.fence_writes_in_flight().await,
+            Writes::None => 0,
+        }
+    }
+}
+
+/// The same leadership state, seen by the refresh supervisor's write ops
+/// ([`supervisor::LeaderGate`]): one `watch` borrow per write op, so the gate that keeps a replaced
+/// — or no-longer-provable — instance off the targets costs an atomic read and nothing else.
+struct LeaderWriteGate {
+    state: watch::Receiver<LeaderState>,
+}
+
+impl supervisor::LeaderGate for LeaderWriteGate {
+    fn check(&self, endpoint: &str) -> Result<()> {
+        match &*self.state.borrow() {
+            LeaderState::Active => Ok(()),
+            LeaderState::Uncertain => Err(anyhow!(
+                "{endpoint}: the leadership lock has not answered a beat; no new writes until it is confirmed again"
+            )),
+            LeaderState::Fenced(why) => Err(anyhow!("fenced: {why}")),
+        }
+    }
+}
+
 /// The engine's end of the lock task: dropping it — which happens with the engine — stops the
 /// task, and the task taking its session with it closes that connection, so the named lock is
 /// released at once instead of after the lease.
@@ -1147,13 +1209,63 @@ fn publish_leader(state: &watch::Sender<LeaderState>, next: LeaderState) {
 }
 
 /// The lock task's own verdict that this instance has been replaced: counted, logged at WARN with
-/// both epochs, and published for the engine to stop with (review A-06 condition 3; the gates that
-/// stop the writes this instance has already started are `lockhb-fence`). The session goes with
-/// the task, so the replacement never waits on a lock we no longer hold.
+/// both epochs, and published for the engine to stop with (review A-06 condition 3). The session
+/// goes with the task, so the replacement never waits on a lock we no longer hold.
 fn fence_leader(metrics: &Metrics, state: &watch::Sender<LeaderState>, why: String) {
     Metrics::add(&metrics.leader_fenced, 1);
     warn!("fenced: {why}; this instance is the replaced one and stops at its next check");
     publish_leader(state, LeaderState::Fenced(why));
+}
+
+/// (lv-super ruling 1, 2026-11-16) Two periods without an answered beat: this instance can no
+/// longer prove it holds the lock, so it stops issuing writes — the same gates `Fenced` closes, and
+/// for the same reason: whoever takes the lock must not find two writers of the same rows — and the
+/// writes it has already started are ended through the zombie fence rather than left to run to
+/// `LAZYVIEW_TARGET_TIMEOUT_MS`. One entry and one count per episode of uncertainty; the beat that
+/// answers, or the rejoin that confirms the same epoch, publishes `Active` again.
+///
+/// The fence runs on a task of its own (at most one at a time): the beats must not wait for it,
+/// because a beat task that goes silent is exactly what loses the lease.
+fn hold_writes<F: WriteFence>(
+    metrics: &Metrics,
+    state: &watch::Sender<LeaderState>,
+    fence: &Arc<F>,
+    fencing: &mut Option<JoinHandle<usize>>,
+    uncertain_after: Duration,
+) {
+    if !matches!(*state.borrow(), LeaderState::Active) {
+        return;
+    }
+    Metrics::add(&metrics.leader_uncertain, 1);
+    warn!("leadership lock: no beat answered for {uncertain_after:?}; holding every write gate until the lock is confirmed again");
+    publish_leader(state, LeaderState::Uncertain);
+    if fencing.as_ref().is_none_or(JoinHandle::is_finished) {
+        let fence = fence.clone();
+        *fencing = Some(tokio::spawn(async move { fence.stop_writes().await }));
+    }
+}
+
+/// Ends the write ops this instance started before it goes: one of ours must not commit after the
+/// replacement's, so here the fence *is* awaited (unlike the `Uncertain` entry, where the beats have
+/// to keep running). Bounded per op by `supervisor::FENCE_WAIT`.
+async fn quarantine_writes<F: WriteFence>(fencing: &mut Option<JoinHandle<usize>>, fence: &Arc<F>) {
+    match fencing.take() {
+        Some(h) => {
+            let _ = h.await;
+        }
+        None => {
+            fence.stop_writes().await;
+        }
+    }
+}
+
+/// Stops a fence still running when the instance ends for a reason that is not a takeover: the
+/// process is leaving, and an unfinished KILL of a connection that dies with it is not worth the
+/// wait. What could not be confirmed stays parked, as it does for a timed-out write.
+fn stop_fencing(fencing: &mut Option<JoinHandle<usize>>) {
+    if let Some(h) = fencing.take() {
+        h.abort();
+    }
 }
 
 /// The leadership lock's own task (review A-06): one bounded statement per `heartbeat` on the
@@ -1166,21 +1278,32 @@ fn fence_leader(metrics: &Metrics, state: &watch::Sender<LeaderState>, why: Stri
 /// the lock and the epoch confirmed again (`coord::LockSession::rejoin`), so a GC pause, a CPU
 /// starvation or a proxy blip never ends a healthy instance with builds running. Only a rejoin
 /// that finds the lock held elsewhere, or the epoch moved, says this instance was replaced.
-async fn run_lock_beat<D: LockBeat + Send + 'static>(
+///
+/// What two periods of unanswered beats do say (ruling 1) is `Uncertain`: the gates close and the
+/// writes in flight are fenced, because the lease — the server's clock, which we cannot read — may
+/// already be running out. `Lease::new` demands a lease of at least `4 x heartbeat` so that all of
+/// this, and one more beat to confirm the lock on the way back, ends before the lease does.
+async fn run_lock_beat<D: LockBeat + Send + 'static, F: WriteFence>(
     mut d: D,
     heartbeat: Duration,
     metrics: Arc<Metrics>,
     state: watch::Sender<LeaderState>,
+    fence: Arc<F>,
     mut shutdown: watch::Receiver<bool>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let uncertain_after = 2 * heartbeat;
+    let mut last_ok = Instant::now();
+    let mut fencing: Option<JoinHandle<usize>> = None;
     loop {
         match d.beat().await {
             Ok(Beat::Held) => {
                 metrics.leader_beat_ok();
+                last_ok = Instant::now();
                 publish_leader(&state, LeaderState::Active);
             }
             Ok(Beat::Taken(why)) => {
+                quarantine_writes(&mut fencing, &fence).await;
                 fence_leader(&metrics, &state, why);
                 return;
             }
@@ -1193,6 +1316,7 @@ async fn run_lock_beat<D: LockBeat + Send + 'static>(
                 match d.rejoin().await {
                     Ok(()) => {
                         metrics.leader_beat_ok();
+                        last_ok = Instant::now();
                         publish_leader(&state, LeaderState::Active);
                         info!("leadership lock: session re-opened, the lock and epoch confirmed; still the active instance");
                     }
@@ -1203,17 +1327,29 @@ async fn run_lock_beat<D: LockBeat + Send + 'static>(
                         warn!("leadership lock: rejoin deferred ({})", e.root_cause());
                     }
                     Err(e) => {
+                        quarantine_writes(&mut fencing, &fence).await;
                         fence_leader(&metrics, &state, format!("{e:#}"));
                         return;
                     }
                 }
             }
         }
+        // The bound, checked once per pass: a beat that hung until its timeout answered nothing
+        // either, and the time it hung for counts towards this. One answered beat resets it.
+        if last_ok.elapsed() >= uncertain_after {
+            hold_writes(&metrics, &state, &fence, &mut fencing, uncertain_after);
+        }
         tokio::select! {
             _ = tokio::time::sleep(heartbeat) => {}
-            _ = shutdown.changed() => if *shutdown.borrow() { return },
+            _ = shutdown.changed() => if *shutdown.borrow() {
+                stop_fencing(&mut fencing);
+                return
+            },
             // The engine went: release the lock rather than hold it until the lease does.
-            _ = stop.changed() => return,
+            _ = stop.changed() => {
+                stop_fencing(&mut fencing);
+                return
+            },
         }
     }
 }
@@ -1278,6 +1414,27 @@ impl Engine {
         } else {
             meta::ensure(&mut meta_conn, &schema).await?;
         }
+        // The leadership state, published by the beat task below and read by every write gate
+        // (ruling 1): the engine holds the receiver, the task the sender. Open before the
+        // supervisor, which is gated by it, and before the lock session: an instance that never
+        // gets the lock never publishes anything, and `Active` is what a fresh session means.
+        let (leader_tx, leader_rx) = watch::channel(LeaderState::Active);
+        // The refresh supervisor, and the two ends of its leadership gate: the write ops ask the
+        // `watch` before they are issued, and the lock task ends the ops already running the moment
+        // the lease stops being provable. `Arc` because both of them share it.
+        let mut sup = Supervisor::new(
+            &cfg.supervisor,
+            &query_opts,
+            &session_sql_mode(&mut src).await?,
+            cfg.lock_wait_s,
+            metrics.clone(),
+        );
+        if let Some(s) = sup.as_mut() {
+            s.set_leader_gate(Arc::new(LeaderWriteGate {
+                state: leader_rx.clone(),
+            }));
+        }
+        let sup = sup.map(Arc::new);
         // The leadership lock goes on a session of its own (review A-06): `meta_conn` stays what
         // the catalog, the state rows and the position writes use, and the lock — with the lease
         // the server enforces on it — is kept alive by the task below, never by this connection or
@@ -1315,7 +1472,12 @@ impl Engine {
         // lease cannot starve the beats (condition 2). The engine owns the only stop sender: when
         // it goes, the task stops and closes the session, which releases the named lock at once.
         let (lock_stop, lock_stop_rx) = watch::channel(false);
-        let (leader_tx, leader_rx) = watch::channel(LeaderState::Active);
+        // The writes this instance can have in flight, for the lock task to end the moment the lease
+        // stops being provable (ruling 1). `LAZYVIEW_SUPERVISOR=off` issues none.
+        let fence = Arc::new(match &sup {
+            Some(s) => Writes::Supervised(s.clone()),
+            None => Writes::None,
+        });
         tokio::spawn(run_lock_beat(
             LockSessionBeat {
                 session,
@@ -1326,6 +1488,7 @@ impl Engine {
             cfg.lock_heartbeat,
             metrics.clone(),
             leader_tx,
+            fence,
             shutdown.clone(),
             lock_stop_rx,
         ));
@@ -1370,13 +1533,6 @@ impl Engine {
             .collect();
         let (build_tx, build_rx) = mpsc::unbounded_channel();
         let cfg_build_concurrency = cfg.build_concurrency;
-        let sup = Supervisor::new(
-            &cfg.supervisor,
-            &query_opts,
-            &session_sql_mode(&mut src).await?,
-            cfg.lock_wait_s,
-            metrics.clone(),
-        );
         match cfg.supervisor.mode {
             crate::config::SupervisorMode::Off => {
                 info!("refreshes run sequentially (LAZYVIEW_SUPERVISOR=off)")
@@ -1458,6 +1614,7 @@ impl Engine {
             build_slots: Arc::new(tokio::sync::Semaphore::new(cfg_build_concurrency)),
             leader,
             leader_state: leader_rx,
+            leader_hold: None,
             lock_task: LockTask {
                 stop: Some(lock_stop),
             },
@@ -1954,6 +2111,14 @@ impl Engine {
                 error: err.map(str::to_string),
             },
         );
+        // The leadership gate (ruling 1) on the one path that writes `_lazyview_state`: what the
+        // views look like from here is recorded for the operator-facing reads, but the row itself
+        // is the new leader's to write — it owns the same instance id, and a replaced instance that
+        // kept writing them would make the state rows say what only this instance knows.
+        if self.leader_holds_writes() {
+            debug!("state row of {name}@{target} held: the leadership lock does not allow new writes right now");
+            return;
+        }
         let r = meta::set_state(
             &mut self.meta,
             StateUpdate {
@@ -2154,6 +2319,14 @@ impl Engine {
         if !binlog::is_transient(&e) {
             return Err(e.context(what.to_string()));
         }
+        // The leadership gate (ruling 1) covers the metadata connection too: while the lock cannot
+        // be proven, nothing is re-issued through it after a reconnect — a verdict the server gives
+        // us (a changed epoch, a refused statement) is still fatal above, and the new leader owns
+        // these rows. Waiting for the next beat is what an uncertain one does instead.
+        if self.leader_holds_writes() {
+            warn!("{what}: {}; the leadership lock does not allow new writes, waiting for the next beat", e.root_cause());
+            return Ok(());
+        }
         warn!("{what}: {}; reconnecting", e.root_cause());
         self.heal_meta().await.map(|_| ())
     }
@@ -2163,6 +2336,13 @@ impl Engine {
     /// whoever reads `_lazyview_overview` sees stale views instead of `ready` ones. Not
     /// resumable: the next start that can run rebuilds them (and writes their state again).
     async fn mark_unusable(&mut self, why: &str) {
+        // The leadership gate (ruling 1): writing `error` over the state rows of this instance is
+        // the new leader's job, so a gated instance — one that is replaced, or cannot prove its
+        // lease — leaves the rows the replacement is about to own alone.
+        if self.leader_holds_writes() {
+            warn!("not recording the stop in _lazyview_state ({why}): the leadership lock does not allow this instance to write");
+            return;
+        }
         let reason = format!("stale: lazyview stopped: {why}");
         if let Err(e) = meta::mark_all_error(&mut self.meta, &reason).await {
             warn!("recording the stop in _lazyview_state: {e:#}");
@@ -2288,6 +2468,11 @@ impl Engine {
     /// those of removed tables and names) back as last written, so `_lazyview_overview` does not
     /// show NULL until a restart.
     async fn restore_state_rows(&mut self) -> Result<()> {
+        // (ruling 1) A write path of the coordination store, so the same gate: rows deleted while
+        // this instance cannot prove its lock are restored by whoever can.
+        if self.leader_holds_writes() {
+            return Ok(());
+        }
         let present: HashSet<(String, String)> = meta::state_keys(&mut self.meta)
             .await?
             .into_iter()
@@ -5112,7 +5297,15 @@ impl Engine {
         let persist = self
             .persist_needed
             .then(|| self.last_persist + self.cfg.position_persist_interval);
-        [urgent, batch, persist].into_iter().flatten().min()
+        // A closed leadership gate holds the flush: the loop wakes at the end of the hold rather
+        // than on every due change, and since `flush_due_within` reads this deadline, neither the
+        // batch window nor the persist interval can re-issue a gated flush ahead of it.
+        let next = [urgent, batch, persist].into_iter().flatten().min();
+        match (next, self.leader_hold) {
+            (Some(d), Some(hold)) => Some(d.max(hold)),
+            (None, hold) => hold,
+            (d, None) => d,
+        }
     }
 
     fn flush_due(&self) -> bool {
@@ -5129,7 +5322,32 @@ impl Engine {
 
     // ---------------------------------------------------------------- flush
 
+    /// The leadership gates (review A-06 condition 3, lv-super ruling 1): one `watch` borrow — an
+    /// atomic read, no allocation, no round trip — asked before any *new* work is issued and never
+    /// per binlog event: the flush entry, the position save, the state-row writes, and a failed
+    /// metadata statement. `true` means nothing new may start here: this instance is either the
+    /// replaced one (`Fenced`, which ends the loop with the fatal error naming both epochs) or the
+    /// one that cannot prove its lease right now (`Uncertain`, which an answered beat restores).
+    ///
+    /// The refresh supervisor's write ops are gated by the same state, through
+    /// [`supervisor::LeaderGate`]; `leader_hold` is what keeps the loop off a closed gate.
+    fn leader_holds_writes(&self) -> bool {
+        !matches!(*self.leader_state.borrow(), LeaderState::Active)
+    }
+
     async fn flush(&mut self) -> Result<()> {
+        // The leadership gate (review A-06 condition 3, lv-super ruling 1), at the one point where
+        // every write of this instance is issued: while the lock cannot be proven — the replaced
+        // instance, or the one whose beats have stopped being answered — no refresh, no state row
+        // and no position save starts. The dirty changes stay as they are, so the flush that
+        // follows the next beat applies them; `leader_hold` is what keeps the loop asleep until
+        // then, and the supervisor's own gate is the backstop for an op issued after this check.
+        if self.leader_holds_writes() {
+            self.leader_hold = Some(Instant::now() + self.cfg.lock_heartbeat);
+            debug!("flush held: the leadership lock does not allow new writes right now");
+            return Ok(());
+        }
+        self.leader_hold = None;
         let started = Instant::now();
         // (re)filled by `note_refresh` as this flush's refreshes complete (#215).
         self.flush_wrote.clear();
@@ -6740,7 +6958,7 @@ impl Engine {
             let (opts, schema) = (target.opts.clone(), target.schema.clone());
             let endpoint = self
                 .sup
-                .as_mut()
+                .as_ref()
                 .expect("supervised refresh")
                 .write_endpoint(t, target.kind, &opts, &mode, self.cfg.lock_wait_s);
             jobs.push(supervisor::TargetJob {
@@ -7373,6 +7591,15 @@ impl Engine {
     /// it needs no guard here; [`meta::load_position`] is the one place that can hand back no
     /// cursor at all (nothing saved yet, or a row of an older build).
     async fn persist_position(&mut self, force: bool) -> Result<()> {
+        // The leadership gate (ruling 1): the saved position is a row of the coordination store,
+        // and an instance whose lock it cannot prove does not own it — the replacement writes it
+        // under the same instance id. Held back rather than failed: `persist_needed` stays armed,
+        // so the save follows the next beat. `meta::save_position`'s `WHERE epoch = ?` stays as the
+        // backstop for a save that began while the beat was still believed.
+        if self.leader_holds_writes() {
+            debug!("position save held: the leadership lock does not allow new writes right now");
+            return Ok(());
+        }
         let mut pos = self.pending_floor(true);
         for (xid, xa) in self.xa_pending.iter_mut() {
             if !xa.start.is_some() {
@@ -8065,6 +8292,7 @@ mod role_dsn_tests {
 #[cfg(test)]
 mod lock_task_tests {
     use super::*;
+    use crate::supervisor::LeaderGate;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8135,11 +8363,28 @@ mod lock_task_tests {
         }
     }
 
+    /// The [`WriteFence`] seam: counts the times the lock task asked for the writes in flight to be
+    /// ended, and says that no server confirmed any of them gone (which is what a fence that has to
+    /// park its ids looks like to the caller).
+    struct ScriptedFence {
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl WriteFence for ScriptedFence {
+        async fn stop_writes(&self) -> usize {
+            self.stops.fetch_add(1, Ordering::Relaxed) + 1
+        }
+    }
+
     struct Run {
         state: LeaderState,
         metrics: Arc<Metrics>,
         beats: usize,
         rejoins: usize,
+        /// Times the lock task asked for the in-flight writes to be ended.
+        fences: usize,
+        /// Every state the task published, in order (the final one is `state`).
+        published: Vec<LeaderState>,
     }
 
     /// Runs the lock task over a script and reports what it left behind. The task ends by itself
@@ -8159,24 +8404,47 @@ mod lock_task_tests {
         let metrics = Arc::new(Metrics::default());
         let (tx, rx) = watch::channel(LeaderState::Active);
         let (_sd, sd_rx) = watch::channel(false);
+        let stops = Arc::new(AtomicUsize::new(0));
+        let published = Arc::new(std::sync::Mutex::new(Vec::new()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         let ended = rt
             .block_on(async {
-                tokio::time::timeout(
+                // The history of what the task published: the last value of a `watch` says nothing
+                // about the states the gates stood closed in between.
+                let rec = {
+                    let published = published.clone();
+                    let mut rec = tx.subscribe();
+                    tokio::spawn(async move {
+                        while rec.changed().await.is_ok() {
+                            published
+                                .lock()
+                                .unwrap()
+                                .push(rec.borrow_and_update().clone());
+                        }
+                    })
+                };
+                let r = tokio::time::timeout(
                     Duration::from_secs(5),
                     run_lock_beat(
                         d,
                         Duration::from_millis(5),
                         metrics.clone(),
                         tx,
+                        Arc::new(ScriptedFence {
+                            stops: stops.clone(),
+                        }),
                         sd_rx,
                         stop_rx,
                     ),
                 )
-                .await
+                .await;
+                // The recorder ends with the sender; give it its last look before the runtime
+                // goes, so a state published on the way out is not missed.
+                let _ = tokio::time::timeout(Duration::from_millis(100), rec).await;
+                r
             })
             .is_ok();
         assert!(
@@ -8184,11 +8452,14 @@ mod lock_task_tests {
             "the lock task must end: fenced, or with the script and its stop"
         );
         let state = (*rx.borrow()).clone();
+        let states = std::mem::take(&mut *published.lock().unwrap());
         Run {
             state,
             metrics,
             beats: beats_done.load(Ordering::Relaxed),
             rejoins: rejoins_done.load(Ordering::Relaxed),
+            fences: stops.load(Ordering::Relaxed),
+            published: states,
         }
     }
 
@@ -8288,6 +8559,107 @@ mod lock_task_tests {
             "one count per beat that went unanswered, a deferred rejoin is not a second one"
         );
         assert_eq!(r.rejoins, 2);
+    }
+
+    /// Ruling 1: two periods without an answered beat close the write gates — `Uncertain`, which is
+    /// not a verdict — and the target writes this instance has already started are ended at once
+    /// rather than left to run out `LAZYVIEW_TARGET_TIMEOUT_MS`: the lease must not expire with one
+    /// of ours still running. The beat that answers opens the gates again, and an instance that
+    /// never lost the lock is never fenced.
+    #[test]
+    fn two_periods_without_an_answer_close_the_gates_and_fence_the_writes() {
+        let r = drive(
+            &[Script::Held, Script::Lost, Script::Lost, Script::Held],
+            &[Rejoin::Away, Rejoin::Away],
+        );
+        assert_eq!(
+            r.published,
+            vec![LeaderState::Uncertain, LeaderState::Active],
+            "closed by two unanswered beats, opened by the beat that answered"
+        );
+        assert_eq!(r.state, LeaderState::Active, "the lock was ours throughout");
+        assert_eq!(
+            Metrics::get(&r.metrics.leader_uncertain),
+            1,
+            "one entry per episode of uncertainty, not one per beat"
+        );
+        assert_eq!(
+            r.fences, 1,
+            "the writes in flight were ended as the gates closed, not when the beat came back"
+        );
+        assert_eq!(Metrics::get(&r.metrics.leader_fenced), 0);
+        assert_eq!(r.rejoins, 2, "one per beat that could not be answered");
+    }
+
+    /// A single unanswered beat is not two: one blip and a rejoin on the same epoch never closes a
+    /// gate — the false alarm that would stall a healthy instance's refreshes (condition 2's worry,
+    /// now for the gates too).
+    #[test]
+    fn one_unanswered_beat_closes_nothing() {
+        let r = drive(&[Script::Held, Script::Lost, Script::Held], &[Rejoin::Held]);
+        assert_eq!(r.published, Vec::new(), "never left `Active`");
+        assert_eq!(r.state, LeaderState::Active);
+        assert_eq!(Metrics::get(&r.metrics.leader_uncertain), 0);
+        assert_eq!(r.fences, 0, "nothing was in flight to end");
+    }
+
+    /// Ruling 1, the way back: the gates reopen on a rejoin that confirms the same epoch — the same
+    /// proof `Active` has always required, given after the gates were closed.
+    #[test]
+    fn a_rejoin_that_confirms_the_epoch_reopens_the_gates() {
+        let r = drive(
+            &[Script::Held, Script::Lost, Script::Lost, Script::Lost],
+            &[Rejoin::Away, Rejoin::Away, Rejoin::Held],
+        );
+        assert_eq!(
+            r.published,
+            vec![LeaderState::Uncertain, LeaderState::Active],
+            "the confirmed rejoin, not the next beat, is what reopened them"
+        );
+        assert_eq!(Metrics::get(&r.metrics.leader_fenced), 0);
+        assert_eq!(Metrics::get(&r.metrics.leader_beat_failures), 3);
+    }
+
+    /// A replaced instance leaves no write of ours behind to commit after the replacement's: the
+    /// in-flight writes are fenced before the fatal state is published, on both ways out — the beat
+    /// that answers "someone else holds it", and the rejoin that finds the epoch moved.
+    #[test]
+    fn a_fenced_instance_ends_the_writes_it_started_before_it_exits() {
+        let r = drive(&[Script::Held, Script::Taken], &[]);
+        assert!(matches!(r.state, LeaderState::Fenced(_)), "{:?}", r.state);
+        assert_eq!(
+            r.fences, 1,
+            "quarantined through the zombie fence before the exit was published"
+        );
+        assert_eq!(r.published.len(), 1, "one publish: the fenced state itself");
+
+        let r = drive(
+            &[Script::Held, Script::Lost],
+            &[Rejoin::Replaced(
+                "another lazyview instance took over while disconnected (epoch Some(3), ours 2); stopping",
+            )],
+        );
+        assert!(matches!(r.state, LeaderState::Fenced(_)), "{:?}", r.state);
+        assert_eq!(r.fences, 1, "the same, on the rejoin's verdict");
+    }
+
+    /// The gate the refresh supervisor asks before issuing a write op: `Active` lets it through, and
+    /// both states that are not `Active` refuse it — `Uncertain` with the reason an operator needs
+    /// (the beat, not a takeover), `Fenced` with the epochs.
+    #[test]
+    fn the_write_gate_refuses_every_state_but_active() {
+        let (tx, rx) = watch::channel(LeaderState::Active);
+        let gate = LeaderWriteGate { state: rx };
+        gate.check("items").expect("the active instance writes");
+        tx.send_replace(LeaderState::Uncertain);
+        let e = gate.check("items").unwrap_err().to_string();
+        assert!(
+            e.contains("items") && e.contains("leadership lock") && e.contains("confirmed again"),
+            "{e}"
+        );
+        tx.send_replace(LeaderState::Fenced("epoch 3, ours 2".to_string()));
+        let e = gate.check("items").unwrap_err().to_string();
+        assert!(e.contains("epoch 3, ours 2"), "{e}");
     }
 }
 

@@ -21,7 +21,7 @@
 //! [`retrying`], diffs of [`OFFLOAD_ROWS`] rows or [`OFFLOAD_DATUMS`] values off the async
 //! threads, idle pooled connections closed after [`INACTIVE_TTL`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -204,6 +204,29 @@ enum WriteConn {
     Postgres(crate::target::postgres::PgConn),
 }
 
+/// What a new write op has to pass before it is issued (review A-06 condition 3, lv-super ruling
+/// 1 of 2026-11-16): the supervisor cannot judge leadership — the lock's own task does, on a
+/// session of its own — so it asks this instead, once per write op, never per row.
+///
+/// `Err` means this instance must not start a write: it is the replaced one, or it can no longer
+/// prove it still holds the lock (`LeaderState::Uncertain`) and no write of ours may still be
+/// running when the lease ends. The engine's gate is a `tokio::sync::watch` borrow — an atomic
+/// read, no allocation, no round trip — so passing it can never become work on the event path.
+pub trait LeaderGate: Send + Sync + 'static {
+    /// `Ok(())`: this instance is the active one and may issue a write to `endpoint`.
+    fn check(&self, endpoint: &str) -> Result<()>;
+}
+
+/// The gate that asks nothing: every write may run. The engine always installs a real one; this is
+/// what unit tests and any other user of [`Supervisor`] get until it does.
+pub struct AlwaysLeader;
+
+impl LeaderGate for AlwaysLeader {
+    fn check(&self, _endpoint: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// One connection pool with a fixed number of permits (the pool size).
 pub struct Endpoint {
     /// `source` or the target's name.
@@ -218,6 +241,12 @@ pub struct Endpoint {
     /// Connection ids of write ops that may still commit (their fence did not complete). Held
     /// while they are fenced, so no write starts before that is settled.
     zombies: tokio::sync::Mutex<Vec<u32>>,
+    /// The connection ids of the write ops running on this endpoint *right now*, so the leadership
+    /// gate can end them the moment the lease stops being provable (ruling 1: the lease must not
+    /// expire with a write of ours still running). Noted once per write op, when its connection is
+    /// picked, and removed by the guard that noted it — never per row, never per binlog event. A
+    /// plain `std` mutex: it is held for an insert or a remove, across no await.
+    writing: Mutex<BTreeSet<u32>>,
 }
 
 /// A permit of an [`Endpoint`] (the in-flight gauge follows it).
@@ -229,6 +258,28 @@ struct Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         self.gauges.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The note that a write op is running on connection `id` of `endpoint`, for as long as the guard
+/// lives (see [`Endpoint::writing`]). A guard rather than a pair of calls because a write op can be
+/// left without a tail: an op that never returns must still leave the set clean, or the target
+/// would stay closed to writes for the rest of the process.
+struct Inflight<'a> {
+    endpoint: &'a Endpoint,
+    id: u32,
+}
+
+impl<'a> Inflight<'a> {
+    fn new(endpoint: &'a Endpoint, id: u32) -> Inflight<'a> {
+        metrics::lock(&endpoint.writing).insert(id);
+        Inflight { endpoint, id }
+    }
+}
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        metrics::lock(&self.endpoint.writing).remove(&self.id);
     }
 }
 
@@ -285,6 +336,7 @@ impl Endpoint {
             max,
             gauges,
             zombies: tokio::sync::Mutex::new(Vec::new()),
+            writing: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -326,14 +378,17 @@ impl Endpoint {
 
     /// Kills connection `id` (a write op that may still commit) and waits until the server no
     /// longer lists it; on failure it stays pending and blocks further writes (see
-    /// [`Endpoint::settle_zombies`]).
+    /// [`Endpoint::settle_zombies`]). The list is a set of ids: an id already pending (parked
+    /// early, as [`Endpoint::fence_inflight`] parks them) is not put in twice.
     async fn fence(&self, id: u32, metrics: &Metrics) -> Result<()> {
         Metrics::add(&metrics.supervisor_zombie_kills, 1);
         let mut pending = self.zombies.lock().await;
         let r = crate::target::fence(self.kind, &self.opts, id, metrics).await;
         if let Err(e) = &r {
             warn!(endpoint = %self.name, connection = id, "could not confirm that a timed-out write is gone: {e:#}; no writes to this target until it is");
-            pending.push(id);
+            if !pending.contains(&id) {
+                pending.push(id);
+            }
         }
         r
     }
@@ -359,6 +414,51 @@ impl Endpoint {
             ))),
             None => Ok(()),
         }
+    }
+
+    /// The gate every new write op passes, in this order: the leadership gate, then the zombies of
+    /// earlier writes (§4.3). A replaced — or no-longer-provable — instance therefore issues nothing
+    /// at all, and the next refresh never overtakes an older write of ours.
+    ///
+    /// Cheaper than it looks, and never on the event path: the gate is a `watch` borrow and
+    /// `settle_zombies` answers without a round trip while no fence is pending.
+    async fn admit_write(&self, gate: &dyn LeaderGate) -> Result<()> {
+        gate.check(&self.name)?;
+        self.settle_zombies().await
+    }
+
+    /// Ends the write ops running on this endpoint right now, through the same zombie fence a
+    /// timed-out write goes through ([`Endpoint::fence`]), and returns how many of them the server
+    /// confirmed gone. Called when the leadership of this instance stops being provable (ruling 1),
+    /// so the lease never expires with a write of ours still running.
+    ///
+    /// The ids are parked in the zombie list *before* any of them is killed, so a write op that
+    /// slips past [`Endpoint::admit_write`] in the meantime still cannot start its statements
+    /// before every one of these is settled; one that a fence could not confirm stays parked and
+    /// keeps its target closed to writes, exactly as a timed-out write does.
+    async fn fence_inflight(&self, metrics: &Metrics) -> usize {
+        let ids: Vec<u32> = metrics::lock(&self.writing).iter().copied().collect();
+        if ids.is_empty() {
+            return 0;
+        }
+        {
+            let mut pending = self.zombies.lock().await;
+            for id in &ids {
+                if !pending.contains(id) {
+                    pending.push(*id);
+                }
+            }
+        }
+        let mut settled = 0;
+        for id in &ids {
+            // `fence` counts the kill, warns and parks the id when the server keeps listing it.
+            if self.fence(*id, metrics).await.is_ok() {
+                let mut pending = self.zombies.lock().await;
+                pending.retain(|z| z != id);
+                settled += 1;
+            }
+        }
+        settled
     }
 
     pub async fn disconnect(&self) {
@@ -466,16 +566,27 @@ struct Run {
     writes: AtomicUsize,
     /// Rows written (one lock per chunk and target).
     rows: Mutex<crate::stats::Rows>,
+    /// The leadership gate every write op of this run passes (review A-06 condition 3): shared by
+    /// the whole run, so a takeover that lands in the middle of a refresh stops the write ops this
+    /// run has not issued yet.
+    gate: Arc<dyn LeaderGate>,
 }
 
 /// The pools and limits of the refresh supervisor.
 pub struct Supervisor {
     cfg: SupervisorConfig,
     read: Arc<Endpoint>,
-    write: BTreeMap<String, Arc<Endpoint>>,
+    /// The write pools, one per target, created on first use. Behind a mutex because
+    /// [`Supervisor::write_endpoint`] takes `&self`: the supervisor is shared with the lock task,
+    /// which ends its write ops through it (ruling 1). Held for a lookup or an insert, across no
+    /// await, once per target per refresh.
+    write: Mutex<BTreeMap<String, Arc<Endpoint>>>,
     cpu: Arc<Semaphore>,
     budget: Arc<Budget>,
     metrics: Arc<Metrics>,
+    /// The leadership gate installed by the engine (review A-06 condition 3, ruling 1); until it
+    /// does — and for every user that has no leadership lock — every write may run.
+    gate: Arc<dyn LeaderGate>,
 }
 
 impl Supervisor {
@@ -504,7 +615,7 @@ impl Supervisor {
         Some(Supervisor {
             cfg: cfg.clone(),
             read,
-            write: BTreeMap::new(),
+            write: Mutex::new(BTreeMap::new()),
             cpu: Arc::new(Semaphore::new(cfg.cpu_workers.max(1))),
             budget: Arc::new(Budget {
                 max: cfg.max_inflight_rows.max(1),
@@ -512,12 +623,40 @@ impl Supervisor {
                 freed: Notify::new(),
             }),
             metrics,
+            gate: Arc::new(AlwaysLeader),
         })
     }
 
-    /// The write pool of target `name` (created on first use).
+    /// Installs the leadership gate the write ops of every run pass (the engine calls this with a
+    /// gate over the lock task's `watch`; see [`LeaderGate`]).
+    pub fn set_leader_gate(&mut self, gate: Arc<dyn LeaderGate>) {
+        self.gate = gate;
+    }
+
+    /// (lv-super ruling 1 of 2026-11-16) Ends the write ops this instance has started, at once, so
+    /// the leadership lease never expires with one of ours still running: each running op's
+    /// connection goes through the zombie fence of §4.3 (KILL, then wait until the server stops
+    /// listing it), and an op whose fence cannot be confirmed keeps its target closed to writes
+    /// until it is, exactly as a timed-out write does.
+    ///
+    /// The lock task calls it the moment a beat stops being answered — one dispatch per running op,
+    /// never per row and never per binlog event, and bounded by [`FENCE_WAIT`] each. Returns the
+    /// number of ops the servers confirmed gone.
+    pub async fn fence_writes_in_flight(&self) -> usize {
+        // The endpoints copied out first: the map's lock is held for no await.
+        let endpoints: Vec<Arc<Endpoint>> = metrics::lock(&self.write).values().cloned().collect();
+        let mut settled = 0;
+        for e in endpoints {
+            settled += e.fence_inflight(&self.metrics).await;
+        }
+        settled
+    }
+
+    /// The write pool of target `name` (created on first use). `&self`: the supervisor is shared
+    /// with the lock task, which ends its write ops through it (ruling 1), so nothing takes it
+    /// mutably; the map is held for the insert alone, across no await.
     pub fn write_endpoint(
-        &mut self,
+        &self,
         name: &str,
         kind: crate::target::Kind,
         opts: &crate::target::Opts,
@@ -526,7 +665,8 @@ impl Supervisor {
     ) -> Arc<Endpoint> {
         let max = self.cfg.max_for_target(name);
         let metrics = self.metrics.clone();
-        self.write
+        let mut write = metrics::lock(&self.write);
+        write
             .entry(name.to_string())
             .or_insert_with(|| {
                 Endpoint::new(
@@ -587,6 +727,7 @@ impl Supervisor {
             serial,
             writes: AtomicUsize::new(0),
             rows: Mutex::new(Default::default()),
+            gate: self.gate.clone(),
         });
         // The units, then each set of partial unit keys.
         let mut cursors: Vec<(Option<Vec<usize>>, ChunkCursor)> = units
@@ -652,7 +793,9 @@ impl Supervisor {
 
     pub async fn disconnect(&self) {
         self.read.disconnect().await;
-        for e in self.write.values() {
+        // The endpoints copied out first: the map's lock is held for no await.
+        let endpoints: Vec<Arc<Endpoint>> = metrics::lock(&self.write).values().cloned().collect();
+        for e in endpoints {
             e.disconnect().await;
         }
     }
@@ -853,13 +996,22 @@ async fn write_once(
     prepared: &Arc<Prepared>,
 ) -> Result<Applied> {
     let job = &run.job;
-    target.endpoint.settle_zombies().await?;
+    // The write gate (review A-06 condition 3, lv-super ruling 1): leadership first, then the
+    // zombies of earlier writes. A refused op issues no statement at all, so a replaced instance
+    // writes nothing to a target, and an older write of ours never overtakes a newer one.
+    target.endpoint.admit_write(&*run.gate).await?;
     let began = AtomicBool::new(false);
     // The one match (T5.2): it picks the statement arm and the id the fence must kill
     // (`conn.id()` for MySQL, `PgConn::pid` for PostgreSQL).
     match target.endpoint.conn().await? {
         WriteConn::Mysql(mut conn) => {
             let id = conn.id();
+            // From here this op is one of the writes "in flight": it is noted so the leadership
+            // gate can end it the moment the lease stops being provable, and the gate is asked
+            // once more now that the connection is known — a beat that failed in between is
+            // noticed before the first statement of this op, not after its transaction.
+            let _inflight = Inflight::new(&target.endpoint, id);
+            run.gate.check(&target.name)?;
             let r = tokio::time::timeout(job.timeout, async {
                 let old = mv::read_old(
                     &mut conn,
@@ -893,6 +1045,8 @@ async fn write_once(
             // `postgres::fence_and_wait`, which terminates exactly this op's dedicated
             // backend, D10); the statements are the `PgConn` methods T4 staged for this.
             let id = conn.pid as u32;
+            let _inflight = Inflight::new(&target.endpoint, id);
+            run.gate.check(&target.name)?;
             let r = tokio::time::timeout(job.timeout, async {
                 let old = conn
                     .read_old(
@@ -1158,5 +1312,151 @@ mod tests {
             .expect("admitted once rows are written")
             .unwrap();
         assert_eq!(Metrics::get(&metrics.gauges.inflight_rows), 0);
+    }
+
+    /// The gate of the tests below: it says whatever the case asks and counts the asks.
+    struct Gate {
+        allowed: bool,
+        asks: AtomicUsize,
+    }
+
+    impl Gate {
+        fn open() -> Gate {
+            Gate {
+                allowed: true,
+                asks: AtomicUsize::new(0),
+            }
+        }
+        fn closed() -> Gate {
+            Gate {
+                allowed: false,
+                asks: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl LeaderGate for Gate {
+        fn check(&self, endpoint: &str) -> Result<()> {
+            self.asks.fetch_add(1, Ordering::Relaxed);
+            if self.allowed {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "{endpoint}: the leadership lock has not answered a beat"
+                ))
+            }
+        }
+    }
+
+    /// A write endpoint with nothing behind it: the pool connects lazily, so a case that issues no
+    /// statement — which is the whole point of the gate — needs no server.
+    fn write_endpoint() -> Arc<Endpoint> {
+        let (_, opts) =
+            crate::target::opts("mysql://root@127.0.0.1:1/lazyview").expect("a MySQL target DSN");
+        Endpoint::new(
+            "write",
+            "items",
+            crate::target::Kind::Mysql,
+            &opts,
+            2,
+            "ANSI",
+            1,
+            &Metrics::default(),
+        )
+    }
+
+    /// The dispatch gate of §2: once the lock task says this instance cannot prove the lock, a
+    /// write op is refused before its first statement, in a shape the op's retry loop does not
+    /// retry and the zombie fence does not mistake for a lost backend.
+    #[tokio::test]
+    async fn a_write_op_is_refused_while_the_lock_is_not_proven() {
+        let ep = write_endpoint();
+        let gate = Gate::closed();
+        let e = ep.admit_write(&gate).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("items"), "names the target it refused: {msg}");
+        assert!(
+            !is_overload(&e),
+            "a refused write is not a transient fault the op retries: {msg}"
+        );
+        assert!(
+            !lost_backend(&e),
+            "a refused op never connected, so there is no backend to fence: {msg}"
+        );
+        assert_eq!(gate.asks.load(Ordering::Relaxed), 1);
+        assert!(
+            ep.zombies.lock().await.is_empty(),
+            "the gate was asked before the zombie settle, so no fence was attempted"
+        );
+    }
+
+    /// The same gate, open: the op passes it and the zombie check answers without a round trip,
+    /// which is what makes it cheap enough to stand in front of every write op.
+    #[tokio::test]
+    async fn a_write_op_passes_an_open_gate_and_the_zombie_check() {
+        let ep = write_endpoint();
+        let gate = Gate::open();
+        ep.admit_write(&gate)
+            .await
+            .expect("nothing is fenced and the lock is proven: the op may issue its statements");
+        assert_eq!(gate.asks.load(Ordering::Relaxed), 1);
+        // The gate of a process with no leadership lock at all asks nothing and refuses nothing.
+        ep.admit_write(&AlwaysLeader).await.expect("always allowed");
+    }
+
+    /// The order the two half-gates stand in: a parked zombie must not be what a gated instance
+    /// reports, because it never reaches the zombie settle.
+    #[tokio::test]
+    async fn the_gate_stands_before_the_zombie_settle() {
+        let ep = write_endpoint();
+        ep.zombies.lock().await.push(77);
+        let e = ep.admit_write(&Gate::closed()).await.unwrap_err();
+        assert!(
+            format!("{e:#}").contains("leadership lock"),
+            "the leadership answer, not the zombie's: {e:#}"
+        );
+        assert_eq!(
+            *ep.zombies.lock().await,
+            vec![77],
+            "a gated instance leaves the zombie list as it found it"
+        );
+    }
+
+    /// Ruling 1, the other half: the instance that can no longer prove the lease ends the writes it
+    /// has already started. Their ids are parked before any of them is killed, so nothing new can
+    /// start while they are being fenced, and an id the server keeps listing stays parked and keeps
+    /// the target closed to writes (§4.3). Here no server answers, so every fence fails: that is
+    /// the case worth pinning.
+    #[tokio::test]
+    async fn the_writes_in_flight_are_parked_and_stay_parked_until_fenced() {
+        let m = Metrics::default();
+        let ep = write_endpoint();
+        assert_eq!(
+            ep.fence_inflight(&m).await,
+            0,
+            "nothing in flight: no fence is attempted at all"
+        );
+        let (_a, _b) = (Inflight::new(&ep, 11), Inflight::new(&ep, 12));
+        assert_eq!(metrics::lock(&ep.writing).len(), 2, "two ops are running");
+        let settled = tokio::time::timeout(Duration::from_secs(30), ep.fence_inflight(&m))
+            .await
+            .expect("the fence is bounded per id");
+        assert_eq!(settled, 0, "no server to confirm them gone");
+        assert_eq!(
+            Metrics::get(&m.supervisor_zombie_kills),
+            2,
+            "one kill per op that was running"
+        );
+        assert_eq!(
+            *ep.zombies.lock().await,
+            vec![11, 12],
+            "unconfirmed: parked, so the next write op of this target waits"
+        );
+        drop(_a);
+        drop(_b);
+        assert!(
+            metrics::lock(&ep.writing).is_empty(),
+            "a finished op is removed from the record, guard or no guard"
+        );
     }
 }

@@ -107,6 +107,12 @@ counters!(
     stream_reconnect_transient,
     stream_reconnect_closed,
     stream_reconnect_silence,
+    // Times the lock task entered `Uncertain` (lv-super ruling 1, 2026-11-16): two periods without
+    // an answered beat, so the write gates closed and the ops in flight were fenced until the lock
+    // was confirmed again. One count per episode — not per beat and never per binlog event. A rate
+    // here means the lock session keeps going silent (an overloaded server, a flaky network): the
+    // instance is not lost, but every entry is a stall of its refreshes worth seeing.
+    leader_uncertain,
 );
 
 /// Point-in-time values (may go down), maintained by the engine.
