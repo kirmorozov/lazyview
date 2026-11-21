@@ -4434,10 +4434,15 @@ impl Engine {
             // known empty: a view with nothing read yet ages from here, not from the epoch.
             let head = reader.heartbeat_head();
             let applied = self.boundary.to_position();
-            self.clock.at_head = head != 0
-                && !self.in_txn
-                && applied.pos == head
-                && applied.file == reader.position().file;
+            // The payload equality proves the head when the server's payload matches what the
+            // views applied; the position equality does the same when the payload cannot be
+            // trusted (some servers/flavors deliver the dump-empty heartbeat without a payload
+            // position we can match): everything this connection has read is committed, the
+            // queue is empty (the zero branch's `pending_read`), so nothing sits unread between
+            // the applied position and the head the heartbeat just proved.
+            self.clock.at_head = !self.in_txn
+                && ((head != 0 && applied.pos == head && applied.file == reader.position().file)
+                    || applied == *reader.position());
             self.clock.head_ts = self.clock.now();
         }
         match item {
@@ -4656,7 +4661,7 @@ impl Engine {
                 // table. This is the newest change handed to the views and (once) the oldest
                 // this connection has read; the non-zero branch of `lag` ages both against the
                 // source's clock, and only a heartbeat may call the stream at the head again.
-                let ts = u64::from(reader.event_ts());
+                let ts = u64::from(event.header().timestamp());
                 if ts != 0 {
                     if self.clock.fed_ts == 0 {
                         self.clock.gap_ts = ts;
