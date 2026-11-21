@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::metrics::Metrics;
+use crate::target::postgres::PgConn;
 
 pub struct Leadership {
     pub lock_name: String,
@@ -39,6 +40,25 @@ const BEAT_PROBE: &str = "DO 1";
 /// Whether this very session still holds the lock (the check [`verify`] makes).
 const LOCK_OWNED: &str = "SELECT IS_USED_LOCK(?) = CONNECTION_ID()";
 
+/// Takes the leadership lock on a PostgreSQL session without waiting for it (`true` = this session
+/// holds it) — [`GET_LOCK_NOW`]'s counterpart on the control store's server (§3 of the lost-node
+/// plan). The one bigint argument, not the two-`int4` form: `pg_locks` then reports the key as
+/// `classid` = its high half and `objid` = its low half, which is what [`PG_LOCK_OWNED`] checks.
+const PG_TRY_LOCK: &str = "SELECT pg_try_advisory_lock($1)";
+/// The keepalive one PostgreSQL beat sends: any statement is activity to the server, and `SELECT 1`
+/// is the cheapest one that needs no catalog access at all.
+const PG_BEAT_PROBE: &str = "SELECT 1";
+/// Whether this very backend still holds the advisory lock — [`LOCK_OWNED`]'s counterpart, on the
+/// lock catalog rather than a function, because advisory locks have no name to ask about. The two
+/// `int4` casts are the point, not decoration: `classid`/`objid` are `oid` (unsigned) and hold the
+/// key's halves bit for bit, while the halves taken from a bigint are signed, so both sides are
+/// compared as `int4`. Verified on a real server: the key `0x1_FFFFFFFF` reads back as
+/// `classid = 1, objid = 4294967295`, and this predicate is `true` for the backend that holds the
+/// lock and `false` for another key and for another pid.
+const PG_LOCK_OWNED: &str = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid::int4 = ($1 >> 32)::int4 AND objid::int4 = (($1 << 32) >> 32)::int4 AND pid = $2)";
+/// The server's own version, read before the lease is set ([`MIN_PG_SERVER_VERSION`]).
+const PG_SERVER_VERSION: &str = "SELECT current_setting('server_version_num')::int8";
+
 /// The shortest beat period, and the shortest lease the server accepts for `wait_timeout` (both
 /// MySQL and MariaDB floor it at 2 s).
 const MIN_HEARTBEAT: Duration = Duration::from_millis(1_000);
@@ -46,6 +66,19 @@ const MIN_LEASE: Duration = Duration::from_millis(2_000);
 /// A beat bound below this is smaller than one round-trip on a loaded server, so every beat would
 /// look like a failure.
 const MIN_BEAT_TIMEOUT: Duration = Duration::from_millis(100);
+/// The first PostgreSQL server whose `idle_session_timeout` can hold the lock's lease: advisory
+/// locks are older, but without a session the server ends by itself the lease is only a client-side
+/// hope, and an older server answers the `SET` with "unrecognized configuration parameter".
+const MIN_PG_SERVER_VERSION: i64 = 140_000;
+/// The gap between two tries of [`PG_TRY_LOCK`] while [`REACQUIRE_WAIT`] lasts: a try never waits
+/// for the lock (that is the point of `try`), so it is polled on a timer — 20 one-row reads of one
+/// session, once, on the way back from a lost session. Never per binlog event.
+const REACQUIRE_POLL: Duration = Duration::from_millis(250);
+/// The `lock_timeout` of the lock's own PostgreSQL session ([`PgConn::connect`]'s argument). Nothing
+/// on that session waits: `pg_try_advisory_lock` returns instead of blocking and the beat reads one
+/// row, so this is the floor the server accepts, to make sure a lock session can never be the one
+/// that sits waiting on a lock.
+const PG_LOCK_SESSION_LOCK_WAIT_S: u64 = 1;
 
 pub fn lock_name(schema: &str, instance_id: &str) -> String {
     format!(
@@ -158,10 +191,10 @@ pub enum Take {
 /// to open a session that ends itself when its client goes silent, to take the lock on it, to
 /// keep it alive, and to take it back after a lost session.
 ///
-/// `MysqlLock` (today's only backend) is a named lock and the session's own `wait_timeout`. The
-/// control store (03-control-store-plan) implements the same four operations for PostgreSQL with
-/// a session advisory lock and `idle_session_timeout`: a session that ends frees its locks, which
-/// is the whole release story — only the DSN changes.
+/// `MysqlLock` is a named lock and the session's own `wait_timeout`; [`PgAdvisory`] is the same four
+/// operations on a PostgreSQL session advisory lock with `idle_session_timeout`, for the control
+/// store (03-control-store-plan): a session that ends frees its locks, which is the whole release
+/// story — only the DSN changes.
 pub trait LockBackend: Send {
     /// The connection the lock lives on: while it is open and beaten, the lock is ours.
     type Session: Send;
@@ -246,6 +279,316 @@ impl LockBackend for MysqlLock {
 
     async fn rejoin(&mut self, conn: &mut Conn, l: &Leadership, instance_id: &str) -> Result<()> {
         reacquire(conn, l, instance_id).await
+    }
+}
+
+/// The fencing epoch's row, which the PostgreSQL backend needs from the store it guards: an
+/// advisory lock says whether *someone* holds it now, not whether the epoch moved while our session
+/// was away, and "the epoch moved" is what says this instance is the replaced one ([`reacquire`]).
+///
+/// The row is the control store's own (03-control-store-plan: `_lazyview_status`, then the store's
+/// lock rows), so the store implements this; until it does, the backend below has no call site and
+/// [`LockStore::from_dsn`] is the seam that waits for it.
+pub trait FencingRow: Send {
+    /// The takeover bookkeeping, on the session that just took the lock: bumps the epoch for
+    /// `instance_id` and returns the epoch that is now ours ([`bump_epoch`]'s equivalent).
+    fn bump(&mut self, instance_id: &str) -> impl Future<Output = Result<u64>> + Send;
+
+    /// The epoch as the row has it now ([`reacquire`]'s read): a value other than ours says another
+    /// instance took over while our session was away.
+    fn epoch(&mut self, instance_id: &str) -> impl Future<Output = Result<u64>> + Send;
+}
+
+/// The lease a PostgreSQL lock session sets for itself: `idle_session_timeout` ends a session the
+/// server has heard nothing from for that long, and a session that ends frees its advisory locks —
+/// the same release as a named lock dying with its session (condition 1 of review A-06), and the
+/// same answer when the host is lost without a FIN, since the check is the server's read timeout.
+///
+/// The unit is milliseconds, so the number is the lease exactly: no rounding, and so no lease that
+/// ends earlier than the settings asked for (unlike MySQL's whole-second `wait_timeout`). `0` would
+/// mean "no timeout" — no lease at all — which `Lease::new` already rules out at 2 s.
+fn pg_lease_statement(lease: Duration) -> String {
+    format!("SET idle_session_timeout = '{}ms'", lease.as_millis())
+}
+
+/// The advisory-lock key of one instance's lock: the same hash the lock *name* is built from
+/// ([`lock_name`], and so the control store's salted name flows through unchanged), read as the
+/// 63-bit non-negative bigint `pg_try_advisory_lock` wants.
+///
+/// Why an integer at all: `hashtext`, the hash a PostgreSQL query would reach for, is 32 bits, and
+/// 4 billion keys collide across schemas; `definition_hash` is the 64-bit hash this lock's identity
+/// already has, and masking its top bit keeps the key positive, which is what makes the two halves
+/// [`PG_LOCK_OWNED`] compares unambiguous.
+pub fn advisory_key(schema: &str, instance_id: &str) -> i64 {
+    let hex = crate::analyze::definition_hash(&lock_name(schema, instance_id));
+    let bits = u64::from_str_radix(&hex, 16)
+        .unwrap_or_else(|e| unreachable!("definition_hash is 16 hex digits, `{hex}`: {e}"));
+    (bits & i64::MAX as u64) as i64
+}
+
+/// Where the leadership lock lives — which is where the control store lives, because the lock and
+/// the fencing-epoch row it guards must stay on one server (the split-brain rule the control-store
+/// plan holds). One choice, from the lock endpoint's DSN, picks both.
+///
+/// Today's engine always lands on `MysqlLock` (`LockSession::open`, the metadata server); this is
+/// the dispatch 03-control-store-plan wires when the store moves.
+#[derive(Debug)]
+pub enum LockStore {
+    /// The metadata server: a MySQL-family named lock, leased by its own `wait_timeout`.
+    Mysql,
+    /// The control store: a PostgreSQL session advisory lock, leased by `idle_session_timeout`
+    /// ([`PgAdvisory`]).
+    Postgres,
+}
+
+impl LockStore {
+    /// The store a lock endpoint names. The scheme is read the way `src/config.rs` reads a DSN's
+    /// (`mariadb://` is the MySQL family, `postgres://` and libpq's `postgresql://` are PostgreSQL),
+    /// case-insensitively as any URI scheme is; an endpoint that is neither is refused rather than
+    /// guessed at.
+    pub fn from_dsn(dsn: &str) -> Result<LockStore> {
+        let d = dsn.trim().to_ascii_lowercase();
+        if d.starts_with("mysql://") || d.starts_with("mariadb://") {
+            Ok(LockStore::Mysql)
+        } else if d.starts_with("postgres://") || d.starts_with("postgresql://") {
+            Ok(LockStore::Postgres)
+        } else {
+            bail!(
+                "the leadership lock server must be a mysql:// or postgres:// endpoint, got `{dsn}`"
+            )
+        }
+    }
+}
+
+/// The PostgreSQL backend for [`LockSession`]: a session-scoped advisory lock on a session the
+/// server ends by itself once its client has gone silent, so the lease, the beat task and the
+/// fencing gates of the MySQL backend carry over unchanged and only the four operations below do
+/// (`open`, `try_hold`, `beat`, `rejoin`). Advisory locks die with their session — including when
+/// the postmaster itself dies — which is the whole release story.
+///
+/// Nothing in the engine reaches it yet: the lock endpoint is read as a MySQL `Opts` and a
+/// `postgres://` lock DSN is refused where it is read (`Config::test_lock_dsn`), so what today's
+/// tests prove are the key, the statements and the epoch rule; the integration suite lands with the
+/// control store's server (03-control-store-plan, lv-devops).
+pub struct PgAdvisory<F: FencingRow> {
+    dsn: String,
+    /// The lock's name, for the messages: two instances say the same thing about the same lock
+    /// whether they met it through `lock_name` or through its key.
+    name: String,
+    key: i64,
+    /// The statement that gives a fresh session its lease ([`pg_lease_statement`]).
+    lease_stmt: String,
+    /// The row the epoch of this lock lives on: the store's, not ours.
+    row: F,
+}
+
+impl<F: FencingRow> PgAdvisory<F> {
+    /// The backend for one instance's own lock session on the control store at `dsn`.
+    pub fn new(
+        dsn: impl Into<String>,
+        schema: &str,
+        instance_id: &str,
+        lease: Lease,
+        row: F,
+    ) -> PgAdvisory<F> {
+        PgAdvisory {
+            dsn: dsn.into(),
+            name: lock_name(schema, instance_id),
+            key: advisory_key(schema, instance_id),
+            lease_stmt: pg_lease_statement(lease.lease),
+            row,
+        }
+    }
+
+    /// The key the lock is held under (the same one [`advisory_key`] and [`PG_LOCK_OWNED`] use).
+    pub fn key(&self) -> i64 {
+        self.key
+    }
+}
+
+impl<F: FencingRow> LockBackend for PgAdvisory<F> {
+    type Session = PgConn;
+
+    fn lease_statements(&self) -> Vec<String> {
+        vec![self.lease_stmt.clone()]
+    }
+
+    async fn open(&mut self) -> Result<PgConn> {
+        // The connect a PostgreSQL target uses: rustls with the ring provider, the DSN's
+        // `sslrootcert`, the connect bound every connection the service opens obeys, and the
+        // backend's `pid` read once — the ownership check below is about exactly that backend.
+        let conn = PgConn::connect(
+            &self.dsn,
+            PG_LOCK_SESSION_LOCK_WAIT_S,
+            crate::supervisor::CONNECT_TIMEOUT,
+        )
+        .await
+        .with_context(|| format!("the lock server at {}", self.dsn))?;
+        // The lease is a GUC only PG 14 has, so the version is asked first: a 13 server gets the
+        // settings error that explains itself, not an "unrecognized configuration parameter".
+        let version: i64 = conn
+            .client
+            .query_one(PG_SERVER_VERSION, &[])
+            .await
+            .context("lock session: server version")?
+            .get(0);
+        if version < MIN_PG_SERVER_VERSION {
+            bail!(
+                "the leadership lock on the control store needs PostgreSQL 14 or newer for \
+                 `idle_session_timeout` ({} is {})",
+                self.dsn,
+                version
+            );
+        }
+        for stmt in self.lease_statements() {
+            conn.client
+                .execute(&stmt, &[])
+                .await
+                .with_context(|| format!("lock session: {stmt}"))?;
+        }
+        Ok(conn)
+    }
+
+    async fn try_hold(&mut self, conn: &mut PgConn) -> Result<Take> {
+        match conn.client.query_one(PG_TRY_LOCK, &[&self.key]).await {
+            Ok(row) => Ok(if row.get::<_, bool>(0) {
+                Take::Held
+            } else {
+                Take::Busy
+            }),
+            // `try` never waits, so the answers are only these: the server ran the statement and
+            // someone else holds the key, the session cannot be trusted (`Take::Lost`, and `rejoin`
+            // opens a new one), or the server refused the statement — which waiting will not fix,
+            // the same three-way split as [`try_hold`] for MySQL.
+            Err(e) if e.is_closed() || e.as_db_error().is_none() => Ok(Take::Lost(e.into())),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn beat(&mut self, conn: &mut PgConn) -> Result<bool> {
+        // Two one-row reads of one session per beat, `heartbeat` apart (~0.4 QPS per instance),
+        // never per binlog event: the probe is what the server counts as activity on the session,
+        // and the check is `IS_USED_LOCK` for a lock that has no name to ask about.
+        conn.client
+            .query_one(PG_BEAT_PROBE, &[])
+            .await
+            .context("lock session: keepalive")?;
+        let owned: bool = conn
+            .client
+            .query_one(PG_LOCK_OWNED, &[&self.key, &conn.pid])
+            .await
+            .context("lock session: ownership check")?
+            .get(0);
+        Ok(owned)
+    }
+
+    async fn rejoin(&mut self, conn: &mut PgConn, l: &Leadership, instance_id: &str) -> Result<()> {
+        // Our own old session may still hold the advisory lock for a moment: a session the server
+        // has ended frees its locks only once it has finished, and the backend of a blip lingers
+        // until the lease ends. So the lock is tried again until [`REACQUIRE_WAIT`] has gone —
+        // `reacquire`'s `GET_LOCK(?, 5)` on a server whose try-lock never waits for anything.
+        let deadline = tokio::time::Instant::now() + REACQUIRE_WAIT;
+        loop {
+            let got: bool = conn
+                .client
+                .query_one(PG_TRY_LOCK, &[&self.key])
+                .await
+                .context("lock session: re-take")?
+                .get(0);
+            if got {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "lost leadership lock `{}` while disconnected; another instance is active",
+                    l.lock_name
+                );
+            }
+            tokio::time::sleep(REACQUIRE_POLL).await;
+        }
+        // The lock is back; only the row says whether someone took over in between.
+        check_epoch(self.row.epoch(instance_id).await?, l.epoch)
+    }
+}
+
+/// The one rule [`reacquire`] states, shared with [`PgAdvisory::rejoin`]: the lock came back, so the
+/// epoch has to be the one we left, or this instance is the replaced one and must stop.
+fn check_epoch(got: u64, ours: u64) -> Result<()> {
+    if got != ours {
+        bail!(
+            "another lazyview instance took over while disconnected (epoch {got}, ours {ours}); stopping"
+        );
+    }
+    Ok(())
+}
+
+impl<F: FencingRow> LockSession<PgAdvisory<F>> {
+    /// Opens the instance's lock session on the control store at `dsn` and waits until this process
+    /// holds the advisory lock, then bumps the fencing epoch on `row`: what `LockSession::open` is
+    /// for the MySQL session, on the leased PostgreSQL one, with the same waiting (250 ms to 5 s,
+    /// shutdown-aware) and the same `Ok(None)` when shutdown was requested while waiting — a store
+    /// that is away for a while is not a reason to exit.
+    pub async fn open_control_store(
+        dsn: &str,
+        schema: &str,
+        instance_id: &str,
+        metrics: &Metrics,
+        lease: Lease,
+        shutdown: &mut watch::Receiver<bool>,
+        row: F,
+    ) -> Result<Option<LockSession<PgAdvisory<F>>>> {
+        // The validated numbers, not the ones handed in, are what the session then uses — the same
+        // rule `LockSession::open` applies, so a lease that cannot outlive the beats that guard it
+        // never fences a healthy instance.
+        let lease = Lease::new(lease.heartbeat, lease.lease, lease.beat_timeout)?;
+        let mut backend = PgAdvisory::new(dsn, schema, instance_id, lease, row);
+        let mut session = backend.open().await?;
+        let mut logged = false;
+        let mut wait = Duration::from_millis(250);
+        loop {
+            match backend.try_hold(&mut session).await? {
+                Take::Held => break,
+                Take::Busy => {}
+                Take::Lost(e) => {
+                    warn!("waiting for the leadership lock: lock session lost ({e}); reconnecting");
+                    metrics.beat();
+                    match backend.open().await {
+                        Ok(c) => session = c,
+                        Err(_) => {
+                            tokio::time::sleep(wait).await;
+                            wait = (wait * 2).min(Duration::from_secs(5));
+                        }
+                    }
+                    continue;
+                }
+            }
+            if !logged {
+                info!("the leadership lock of schema `{schema}` (LAZYVIEW_INSTANCE_ID={instance_id}) is held by another instance; waiting out its lease and taking over then");
+                logged = true;
+            }
+            Metrics::set(&metrics.gauges.standby, 1);
+            metrics.beat();
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = shutdown.changed() => if *shutdown.borrow() { return Ok(None) },
+            }
+            wait = (wait * 2).min(Duration::from_secs(5));
+        }
+        Metrics::set(&metrics.gauges.standby, 0);
+        if logged {
+            info!("took over as active instance");
+        }
+        let epoch = backend.row.bump(instance_id).await?;
+        let name = backend.name.clone();
+        Ok(Some(LockSession {
+            backend,
+            session: Some(session),
+            beat_timeout: lease.beat_timeout,
+            leadership: Leadership {
+                lock_name: name,
+                epoch,
+            },
+        }))
     }
 }
 
@@ -664,5 +1007,167 @@ mod tests {
         );
         // The lock name is the one `acquire` takes: schema + instance, hashed.
         assert_eq!(b.name, lock_name("testdb", "default"));
+    }
+
+    /// A row of one number: the PostgreSQL backend asks it only on the way in (`bump`) and on the
+    /// way back (`epoch`), and the real row is the control store's (03-control-store-plan).
+    #[derive(Default)]
+    struct TestRow {
+        epoch: u64,
+    }
+
+    impl FencingRow for TestRow {
+        async fn bump(&mut self, _instance_id: &str) -> Result<u64> {
+            self.epoch += 1;
+            Ok(self.epoch)
+        }
+
+        async fn epoch(&mut self, _instance_id: &str) -> Result<u64> {
+            Ok(self.epoch)
+        }
+    }
+
+    fn pg_lease() -> Lease {
+        Lease::new(
+            Duration::from_millis(5_000),
+            Duration::from_millis(20_000),
+            Duration::from_millis(5_000),
+        )
+        .unwrap()
+    }
+
+    /// The advisory key is the lock name's own hash kept inside 63 bits: one lock is one key for
+    /// every instance that means it, another schema or another instance is another key, and the key
+    /// is never negative — which is what makes the two halves `PG_LOCK_OWNED` compares unambiguous.
+    #[test]
+    fn advisory_key_is_the_lock_name_hash_in_63_bits() {
+        let k = advisory_key("testdb", "default");
+        assert!(k >= 0, "{k}");
+        assert_eq!(k, advisory_key("testdb", "default"), "one lock, one key");
+        let bits = u64::from_str_radix(
+            &crate::analyze::definition_hash(&lock_name("testdb", "default")),
+            16,
+        )
+        .unwrap();
+        assert_eq!(k as u64, bits & i64::MAX as u64, "the name's own hash");
+        // Another schema, another instance, another (salted) name: another lock. A lost node's key
+        // can never be the key the replacement means by its own lock.
+        assert_ne!(k, advisory_key("otherdb", "default"));
+        assert_ne!(k, advisory_key("testdb", "other"));
+        assert_ne!(k, advisory_key("testdb", "default#salt"));
+    }
+
+    /// The two `int4` halves `PG_LOCK_OWNED` reads a bigint key into, as PostgreSQL does: the high
+    /// half as a shift, the low half through a left shift (a plain `bigint` cast to `int4` refuses
+    /// a low half over 2^31, and `pg_locks.objid` is unsigned, so both sides have to meet as `int4`).
+    /// The pairs are what a PostgreSQL 16 server reported for these keys.
+    #[test]
+    fn advisory_key_halves_are_what_pg_locks_reports() {
+        fn halves(key: i64) -> (i32, i32) {
+            ((key >> 32) as i32, ((key << 32) >> 32) as i32)
+        }
+        // 0x1_FFFFFFFF: classid 1, objid 4294967295 — `-1` as `int4`.
+        assert_eq!(halves(8_589_934_591), (1, -1));
+        // 0x1_2000_0000 + 1912276171: classid 287, objid 1912276171.
+        assert_eq!(halves(1_234_567_890_123), (287, 1_912_276_171));
+        // The key space the backend actually uses is non-negative, so the high half always fits.
+        assert_eq!(halves(i64::MAX), (2_147_483_647, -1));
+    }
+
+    /// What the PostgreSQL session says to hold the lock, to keep it, and to check it is still ours,
+    /// and the lease that session sets for itself: one `try` that never waits, one probe and one
+    /// one-row catalog read per beat, nothing that grows with the work.
+    #[test]
+    fn pg_lock_session_statement_shapes() {
+        assert_eq!(PG_TRY_LOCK, "SELECT pg_try_advisory_lock($1)");
+        assert_eq!(PG_BEAT_PROBE, "SELECT 1");
+        assert_eq!(
+            PG_SERVER_VERSION,
+            "SELECT current_setting('server_version_num')::int8"
+        );
+        assert!(
+            PG_LOCK_OWNED.contains("locktype = 'advisory'"),
+            "{PG_LOCK_OWNED}"
+        );
+        assert!(
+            PG_LOCK_OWNED.contains("classid::int4 = ($1 >> 32)::int4"),
+            "{PG_LOCK_OWNED}"
+        );
+        assert!(
+            PG_LOCK_OWNED.contains("objid::int4 = (($1 << 32) >> 32)::int4"),
+            "{PG_LOCK_OWNED}"
+        );
+        assert!(PG_LOCK_OWNED.contains("pid = $2"), "{PG_LOCK_OWNED}");
+        // The version that must answer before any of them runs.
+        assert_eq!(MIN_PG_SERVER_VERSION, 140_000);
+
+        let b = PgAdvisory::new(
+            "postgres://lv@127.0.0.1:5432/lvtest",
+            "testdb",
+            "default",
+            pg_lease(),
+            TestRow::default(),
+        );
+        // Milliseconds are the GUC's own unit, so the lease is set exactly as the settings say.
+        assert_eq!(
+            b.lease_statements(),
+            ["SET idle_session_timeout = '20000ms'".to_string()]
+        );
+        assert_eq!(
+            pg_lease_statement(Duration::from_millis(15_001)),
+            "SET idle_session_timeout = '15001ms'"
+        );
+        // `0` would mean "no timeout" — no lease at all — and `Lease::new` is what rules it out, so
+        // no session is ever opened under an ungoverned one.
+        assert!(Lease::new(
+            Duration::from_millis(1_000),
+            Duration::ZERO,
+            Duration::from_millis(1_000)
+        )
+        .is_err());
+        // The same identity the MySQL backend holds the lock under.
+        assert_eq!(b.name, lock_name("testdb", "default"));
+        assert_eq!(b.key(), advisory_key("testdb", "default"));
+    }
+
+    /// The rule that decides, on the way back from a lost session, between "still the leader" and
+    /// "you have been replaced" — the epoch, in the same words `reacquire` uses.
+    #[test]
+    fn rejoining_keeps_the_epoch_we_left() {
+        assert!(check_epoch(7, 7).is_ok());
+        let e = check_epoch(8, 7).unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("epoch 8, ours 7"), "{m}");
+        assert!(m.contains("stopping"), "{m}");
+    }
+
+    /// The lock server is the endpoint's, the way every other DSN is read: the MySQL family for the
+    /// metadata server, PostgreSQL for the control store, and nothing else accepted. This is the
+    /// dispatch 03-control-store-plan wires; the engine still always lands on `MysqlLock`.
+    #[test]
+    fn the_lock_store_comes_from_the_endpoint() {
+        assert!(matches!(
+            LockStore::from_dsn("mysql://lv@h/db").unwrap(),
+            LockStore::Mysql
+        ));
+        assert!(matches!(
+            LockStore::from_dsn(" mariadb://lv@h/db ").unwrap(),
+            LockStore::Mysql
+        ));
+        assert!(matches!(
+            LockStore::from_dsn("postgres://lv@h/db").unwrap(),
+            LockStore::Postgres
+        ));
+        assert!(matches!(
+            LockStore::from_dsn("POSTGRESQL://lv@h/db").unwrap(),
+            LockStore::Postgres
+        ));
+        for d in ["sqlite://h/db", "http://127.0.0.1:5432/db", ""] {
+            let e = LockStore::from_dsn(d).unwrap_err();
+            assert!(
+                e.to_string().contains("mysql:// or postgres://"),
+                "{d}: {e}"
+            );
+        }
     }
 }
