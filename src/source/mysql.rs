@@ -1103,6 +1103,17 @@ pub(crate) fn merge_interval(v: &mut Vec<(u64, u64)>, lo: u64, hi: u64) {
     if lo > hi {
         return;
     }
+    // Hot path (the engine merges one transaction number per committed transaction, ruling 6):
+    // a number that lands in or is adjacent to the last range — the sequential case — extends
+    // it in place: no vector rebuild, no allocation. Everything else takes the general walk.
+    if let Some(last) = v.last_mut() {
+        if lo >= last.0 && lo <= last.1.saturating_add(1) {
+            if hi > last.1 {
+                last.1 = hi;
+            }
+            return;
+        }
+    }
     let (mut lo, mut hi) = (lo, hi);
     let mut res: Vec<(u64, u64)> = Vec::with_capacity(v.len() + 1);
     let mut inserted = false;
@@ -1159,6 +1170,96 @@ pub(crate) fn gtid_subset(saved: &GtidSet, source: &GtidSet) -> bool {
             .get(sid)
             .is_some_and(|src| ivals.iter().all(|&(lo, hi)| covers_interval(src, lo, hi)))
     })
+}
+
+/// The part of `saved` that `source` does not cover: the named difference a clean stop shows
+/// the operator (the safety bar: name both sides, never a silent wrong resume). Ranges keep
+/// their bounds; an empty result means `saved ⊆ source`.
+pub(crate) fn gtid_missing(saved: &GtidSet, source: &GtidSet) -> GtidSet {
+    let mut out = GtidSet::new();
+    for (sid, ivals) in saved {
+        let Some(src) = source.get(sid) else {
+            out.insert(sid.clone(), ivals.clone());
+            continue;
+        };
+        let mut miss = Vec::new();
+        for &(lo, hi) in ivals {
+            let mut need = lo;
+            for &(a, b) in src {
+                if need > hi {
+                    break;
+                }
+                if b < need {
+                    continue;
+                }
+                if a > need {
+                    miss.push((need, a.saturating_sub(1).min(hi)));
+                }
+                need = b.saturating_add(1).max(need);
+            }
+            if need <= hi {
+                miss.push((need, hi));
+            }
+        }
+        if !miss.is_empty() {
+            out.insert(sid.clone(), miss);
+        }
+    }
+    out
+}
+
+/// Merges one transaction's GTID (`uuid:gno`, or `uuid:tag:gno` for a tagged event) into the
+/// set the reader has **consumed**: the engine's call per `Item::Gtid`, once per committed
+/// transaction. The last `:` separates the number (the tag sits before it), the source id is
+/// everything up to the first `:`. A known source id costs no allocation (map lookup + the
+/// in-place fast path of [`merge_interval`]); only a first-time id allocates its key. Text that
+/// is not a well-formed `sid:number` returns `false` and changes nothing — dropped, never
+/// guessed (the caller keeps its older set, which under-claims and so stays safe).
+pub(crate) fn merge_gtid(set: &mut GtidSet, gtid: &str) -> bool {
+    let Some((head, gno)) = gtid.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(gno) = gno.trim().parse::<u64>() else {
+        return false;
+    };
+    let sid = match head.split(':').next() {
+        Some(s) => s.trim().to_ascii_lowercase(),
+        None => return false,
+    };
+    if sid.is_empty() || uuid_bytes(&sid).is_none() {
+        return false;
+    }
+    match set.get_mut(sid.as_str()) {
+        Some(ivals) => merge_interval(ivals, gno, gno),
+        None => {
+            let mut ivals = Vec::with_capacity(1);
+            merge_interval(&mut ivals, gno, gno);
+            set.insert(sid, ivals);
+        }
+    }
+    true
+}
+
+/// The set as canonical MySQL/Percona text (`uuid:1-5:10,uuid2:3` — the spelling
+/// `@@GLOBAL.gtid_executed` prints): the [`Cursor`](crate::source::Cursor) `[g=…]` render, the
+/// inverse of [`parse_gtid_set`] up to interval spelling. std only (the copy-set rule).
+pub(crate) fn render_set(set: &GtidSet) -> String {
+    let mut out = String::new();
+    for (sid, ivals) in set {
+        for (lo, hi) in ivals {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(sid);
+            out.push(':');
+            out.push_str(&lo.to_string());
+            if hi > lo {
+                out.push('-');
+                out.push_str(&hi.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// `xxxxxxxx-xxxx-…` (32 hex digits, hyphens optional, either case) → the 16 wire bytes; `None`
@@ -1226,6 +1327,27 @@ pub(crate) async fn gtid_covers(conn: &mut Conn, saved: Option<&str>) -> Result<
     let st = crate::binlog::gtid_state(conn).await?;
     let executed = st.executed.unwrap_or_default();
     Ok(gtid_subset(&saved, &parse_gtid_set(&executed)))
+}
+
+/// Whether the node behind `conn` is a **read node** (`@@GLOBAL.read_only` or
+/// `@@GLOBAL.super_read_only` on): a role probe, not a configuration opinion. The commit-order
+/// fence row is a writer-side mechanism — on a node that refuses writes anyway, visibility is
+/// the GTID wait or the snapshot position (the engine's side of this), and the row is skipped.
+/// Two tiny queries on the connect path, cached by the caller; `super_read_only` predates some
+/// MariaDB lines, where its absence is simply "not set".
+pub(crate) async fn read_node(conn: &mut Conn) -> Result<bool> {
+    let ro: Option<Option<i8>> = conn
+        .query_first("SELECT @@GLOBAL.read_only = 1")
+        .await
+        .context("reading @@GLOBAL.read_only")?;
+    if ro.flatten().unwrap_or(0) != 0 {
+        return Ok(true);
+    }
+    let sro: Option<Option<i8>> = conn
+        .query_first("SELECT @@GLOBAL.super_read_only = 1")
+        .await
+        .unwrap_or(None);
+    Ok(sro.flatten().unwrap_or(0) != 0)
 }
 
 /// Whether the server still has the file of `at` in its log index — what a lost slot means here.

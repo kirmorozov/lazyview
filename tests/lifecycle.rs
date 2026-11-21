@@ -505,9 +505,16 @@ fn lifecycle_start_modes() {
 
 /// A start whose saved position cannot be read while its binlog file still exists (a position
 /// past the end of the file, which the dump thread answers with 1236; a position saved on another
-/// server) stops lazyview but leaves the `ready` state rows alone: only a purged file makes the
-/// views stale for good (tests/exclusive.rs). Once the cause is undone, the next start resumes
-/// without a rebuild.
+/// server with no GTID set to vouch for it) stops lazyview but leaves the `ready` state rows
+/// alone: only a purged file makes the views stale for good (tests/exclusive.rs). Once the cause
+/// is undone, the next start resumes without a rebuild.
+///
+/// A foreign identity is the one leg the adoption rules of the resume-by-GTID plan answer for
+/// (ruling 4, and `reg_unreadable_identity_keeps_resume_guard` in tests/regressions/lifecycle.rs
+/// branches the same way): a cursor that carries a set this server's own state covers is adopted
+/// and the stream opens by GTID, so that leg waits for the run to go ready instead of for a stop;
+/// a cursor without a set is still refused by the identity rule, and the `ready` rows are checked
+/// either way.
 #[test]
 fn lifecycle_unreadable_position_keeps_ready_rows() {
     scenario("lc_unreadable", |ctx| async move {
@@ -545,7 +552,11 @@ fn lifecycle_unreadable_position_keeps_ready_rows() {
             !cursor.is_empty(),
             "the engine saved no cursor to make unreadable"
         );
-        for (what, set, expect) in [
+        // Whether the row carries a GTID set decides the second leg (see the doc above): a
+        // covered set is adopted by the rules of the resume-by-GTID plan, no set at all (the
+        // upgrade shape, or a `gtid_mode=OFF` source) is refused by the identity rule.
+        let carries_set = cursor.contains("[g=");
+        for (what, set, expect, adopt) in [
             (
                 "a position past the end of its file",
                 format!(
@@ -555,18 +566,36 @@ fn lifecycle_unreadable_position_keeps_ready_rows() {
                     pos + 1_000_000_000
                 ),
                 "is no longer available",
+                false,
             ),
             (
                 "a position saved on another server",
                 "UPDATE _lazyview_status SET server_identity = 'another-server'".to_string(),
                 "was written by server",
+                true,
             ),
         ] {
             exec(&mut c, &set).await?;
-            let eng = ctx.start_engine(&db, &[])?;
-            match eng.wait_finished(Duration::from_secs(60)).await? {
-                Ok(()) => bail!("{what}: lazyview did not stop"),
-                Err(e) => ensure!(e.contains(expect), "{what}: unexpected stop: {e}"),
+            if adopt && carries_set {
+                // Ruling 4: this server's own executed state is the proof, not its name. The
+                // stream opens by GTID on the saved set and the views say what the oracle says.
+                let mut eng = ctx.start_engine(&db, &[])?;
+                wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+                verify(
+                    &ctx,
+                    &mut eng,
+                    &db,
+                    &specs,
+                    "adopted by GTID across a foreign identity",
+                )
+                .await?;
+                eng.stop().await?;
+            } else {
+                let eng = ctx.start_engine(&db, &[])?;
+                match eng.wait_finished(Duration::from_secs(60)).await? {
+                    Ok(()) => bail!("{what}: lazyview did not stop"),
+                    Err(e) => ensure!(e.contains(expect), "{what}: unexpected stop: {e}"),
+                }
             }
             let rows: Vec<(String, String)> = c
                 .query("SELECT CAST(name AS CHAR), CAST(state AS CHAR) FROM _lazyview_state")
