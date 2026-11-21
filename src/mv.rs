@@ -4,7 +4,7 @@
 //! Sources are only ever read with plain SELECTs (never INSERT ... SELECT), so the service takes
 //! no locks on source rows; all writes go to the target tables.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
@@ -752,18 +752,14 @@ enum UnitRead {
     Json,
 }
 
-/// The statement of [`source_units`] and how each of its columns is read: `SELECT DISTINCT
-/// <unit expressions> FROM <the plan's FROM clause>` with the plan's own `WHERE`, `GROUP BY` and
-/// `HAVING`, ordered by the unit. That is all it is: the cursor answers "which units are there",
-/// the per-unit chunk reads do the work, so refreshing a whole view is a sequence of chunks and
-/// never one collected view (R-02).
-///
-/// `Err` when the plan has no unit list to stream: a non-incremental plan (its SELECT is the
-/// user's text: there is no FROM clause of our own to project, and its `dirty.all` is a rebuild),
-/// a plan without units, or a view whose rows are not a set of units — a window function or a
-/// top-N. There the unit list is wider than the view, and a chunk of it would delete rows the
-/// view keeps, so the caller keeps the read it has today.
-fn units_sql(plan: &ViewPlan, layout: &Layout) -> Result<(String, Vec<UnitRead>)> {
+/// Whether a view's rows are the set of units a cursor can walk, and its chunks can be written
+/// unit by unit: the guard of both unit cursors ([`units_sql`] and [`target_units`]) and of the
+/// existence read ([`vanished`]). `Err` for the views that have no such unit list: a
+/// non-incremental plan (its SELECT is the user's text: there is no FROM clause of our own to
+/// project, and its `dirty.all` is a rebuild), a plan without units, or a view whose rows are not
+/// a set of units — a window function or a top-N. There the unit list is wider than the view, and
+/// a chunk of it would delete rows the view keeps, so the caller keeps the read it has today.
+fn streamable(plan: &ViewPlan, layout: &Layout) -> Result<()> {
     if !plan.is_incremental() {
         bail!(
             "view `{}`: the unit cursor reads an incremental plan's FROM clause",
@@ -787,6 +783,12 @@ fn units_sql(plan: &ViewPlan, layout: &Layout) -> Result<(String, Vec<UnitRead>)
             plan.unit_exprs.len()
         );
     }
+    Ok(())
+}
+
+/// The source side of a units cursor: one projection item per unit expression, with how it comes
+/// back from the server (see [`UnitRead`]). The caller has checked [`streamable`].
+fn unit_cols(plan: &ViewPlan, layout: &Layout) -> (Vec<String>, Vec<UnitRead>) {
     let mut cols: Vec<String> = Vec::with_capacity(plan.unit_exprs.len());
     let mut read: Vec<UnitRead> = Vec::with_capacity(plan.unit_exprs.len());
     for (j, e) in plan.unit_exprs.iter().enumerate() {
@@ -808,35 +810,124 @@ fn units_sql(plan: &ViewPlan, layout: &Layout) -> Result<(String, Vec<UnitRead>)
         };
         cols.push(item);
     }
-    let mut sql = format!("SELECT DISTINCT {} FROM {}", cols.join(", "), plan.from_sql);
-    if let Some(w) = &plan.where_sql {
-        sql.push_str(" WHERE ");
-        sql.push_str(w);
+    (cols, read)
+}
+
+/// The target side of a units cursor: one projection item per unit *column* of the materialized
+/// table, each read exactly as [`read_old`] reads it (see [`Layout::read_list`], which is where
+/// `UNIX_TIMESTAMP` and the plain quoted name come from). That is the whole contract: a key the
+/// target cursor hands out is the key of the rows `read_old` answers for it, and the same datum a
+/// chunk read of the source gives for the same unit — which is what lets [`vanished`] compare the
+/// two sides at all.
+fn target_unit_cols(layout: &Layout) -> (Vec<String>, Vec<UnitRead>) {
+    let epoch: Vec<usize> = layout.epoch.iter().map(|(p, _)| *p).collect();
+    let mut cols: Vec<String> = Vec::with_capacity(layout.unit_pos.len());
+    let mut read: Vec<UnitRead> = Vec::with_capacity(layout.unit_pos.len());
+    for name in layout.unit_cols() {
+        let p = layout.unit_pos[cols.len()];
+        let item = if epoch.contains(&p) {
+            read.push(UnitRead::Epoch);
+            format!("UNIX_TIMESTAMP({name})")
+        } else if layout.cols[p].data_type == "json" {
+            read.push(UnitRead::Json);
+            format!("CAST({name} AS CHAR)")
+        } else {
+            read.push(UnitRead::Raw);
+            name
+        };
+        cols.push(item);
     }
-    if let Some(g) = &plan.group_sql {
+    (cols, read)
+}
+
+/// The data type of each unit column, in the unit order: what [`unit_datums`] normalizes a cursor's
+/// row by, the same names [`Layout::unit_kinds`] classifies. Both cursors read the same unit
+/// columns, so one list serves the source's expressions and the target's columns.
+fn unit_types(layout: &Layout) -> Vec<String> {
+    layout
+        .unit_pos
+        .iter()
+        .map(|&p| layout.cols[p].data_type.clone())
+        .collect()
+}
+
+/// `SELECT DISTINCT <cols> FROM <from> [WHERE <where> [AND <extra>]] [GROUP BY <group>]
+/// [HAVING <having>] ORDER BY <cols>`: the shape a units cursor streams and the existence read of
+/// [`vanished`] asks. The order is by the projected expressions, which `SELECT DISTINCT` requires
+/// of an ORDER BY item; it costs the server nothing when the units are an index's columns, because
+/// the loose index scan answers the DISTINCT and the order in one pass. `extra` is a predicate
+/// over the same FROM clause AND-ed onto the plan's own `WHERE` (the chunk filter).
+fn distinct_units_sql(
+    cols: &[String],
+    from: &str,
+    where_sql: Option<&str>,
+    group_sql: Option<&str>,
+    having_sql: Option<&str>,
+    extra: Option<&str>,
+) -> String {
+    let mut sql = format!("SELECT DISTINCT {} FROM {}", cols.join(", "), from);
+    match (where_sql, extra) {
+        (Some(w), Some(e)) => sql.push_str(&format!(" WHERE ({w}) AND ({e})")),
+        (Some(w), None) => sql.push_str(&format!(" WHERE {w}")),
+        (None, Some(e)) => sql.push_str(&format!(" WHERE {e}")),
+        (None, None) => {}
+    }
+    if let Some(g) = group_sql {
         sql.push_str(" GROUP BY ");
         sql.push_str(g);
     }
-    if let Some(h) = &plan.having_sql {
+    if let Some(h) = having_sql {
         sql.push_str(" HAVING ");
         sql.push_str(h);
     }
-    // (The same expressions: `SELECT DISTINCT` rejects an ORDER BY item its select list does
-    // not hold. It costs the server nothing when the units are an index's columns: the loose
-    // index scan answers the DISTINCT and the order in one pass.)
     sql.push_str(" ORDER BY ");
     sql.push_str(&cols.join(", "));
-    Ok((sql, read))
+    sql
 }
 
-/// The unit key of one row of [`units_sql`]'s statement: the same [`Datum`]s [`to_datums`] gives
-/// for those columns of a [`read_source`] row, so the chunk filter finds the rows of its unit.
-fn unit_datums(read: &[UnitRead], vals: Vec<Value>) -> Key {
+/// The statement of [`source_units`]: the plan's own unit expressions over its own FROM clause,
+/// with the plan's `WHERE`, `GROUP BY` and `HAVING`. That is all it is: the cursor answers "which
+/// units are there", the per-unit chunk reads do the work, so refreshing a whole view is a
+/// sequence of chunks and never one collected view (R-02).
+fn units_sql(plan: &ViewPlan, layout: &Layout) -> Result<(String, Vec<UnitRead>)> {
+    streamable(plan, layout)?;
+    let (cols, read) = unit_cols(plan, layout);
+    Ok((
+        distinct_units_sql(
+            &cols,
+            &plan.from_sql,
+            plan.where_sql.as_deref(),
+            plan.group_sql.as_deref(),
+            plan.having_sql.as_deref(),
+            None,
+        ),
+        read,
+    ))
+}
+
+/// The unit key of one row of a units cursor ([`units_sql`], [`target_units_sql`], the existence
+/// read of [`vanished`]): the same [`Datum`]s [`to_datums`] gives for those columns of a
+/// [`read_source`] or [`read_old`] row, so a chunk the cursor handed out matches the rows of its
+/// unit on both sides. `types` are the unit columns' data types ([`unit_types`]): [`to_datums`]
+/// sees them through [`crate::dialect::mysql::normalize_row`], which a cursor's row goes through
+/// here too (a BIT comes back as the integer the row holds, a TIME as the text every server
+/// accepts as its parameter), and the epoch and JSON entries then read as they do there.
+fn unit_datums(read: &[UnitRead], types: &[String], vals: Vec<Value>) -> Key {
+    let mut row = vals;
+    crate::dialect::mysql::normalize_row(
+        types.iter().map(String::as_str),
+        read.iter()
+            .enumerate()
+            .filter(|(_, r)| **r == UnitRead::Epoch)
+            .map(|(i, _)| i),
+        &mut row,
+        crate::dialect::mysql::epoch_to_utc,
+    );
     read.iter()
-        .zip(vals)
+        .zip(row)
         .map(|(r, v)| match r {
-            // (The epoch through the same UTC form the value of a chunk read goes through.)
-            UnitRead::Epoch => Datum::from_value(crate::dialect::mysql::epoch_to_utc(v)),
+            // (The epoch is the UTC datetime `normalize_row` made of it, as in `to_datums`.)
+            UnitRead::Epoch => Datum::from_value(v),
             UnitRead::Json => match v {
                 Value::Bytes(b) => Datum::Bytes(json_canonical(&b)),
                 v => Datum::from_value(v),
@@ -863,6 +954,8 @@ pub struct UnitStream<'a> {
     res: QueryResult<'a, 'static, BinaryProtocol>,
     /// How each column of the statement is read, in the plan's unit order (see [`units_sql`]).
     read: Vec<UnitRead>,
+    /// The unit columns' data types, in the same order (see [`unit_datums`]).
+    types: Vec<String>,
     /// Unit keys per chunk, clamped by [`source_units`] to what a chunk filter can bind.
     chunk: usize,
     /// Keys handed out so far.
@@ -891,7 +984,7 @@ impl<'a> UnitStream<'a> {
                 self.done = true;
                 break;
             };
-            out.push(unit_datums(&self.read, r.unwrap()));
+            out.push(unit_datums(&self.read, &self.types, r.unwrap()));
         }
         if out.is_empty() {
             self.done = true;
@@ -952,10 +1045,169 @@ pub async fn source_units<'a>(
     Ok(UnitStream {
         res,
         read,
+        types: unit_types(layout),
         chunk,
         seen: 0,
         done: false,
     })
+}
+
+/// The statement of [`target_units`]: `SELECT DISTINCT <unit columns> FROM <schema>.<table>`,
+/// ordered by the same expressions. It is the target's twin of [`units_sql`] with no plan in it:
+/// the units the view *holds*, which is what the vanished-unit pass of a whole refresh walks
+/// (R-02). The caller has checked [`streamable`], so the unit list is the view's own.
+fn target_units_sql(layout: &Layout, schema: &str, table: &str) -> (String, Vec<UnitRead>) {
+    let (cols, read) = target_unit_cols(layout);
+    let sql = format!(
+        "SELECT DISTINCT {} FROM {}.{} ORDER BY {}",
+        cols.join(", "),
+        q(schema),
+        q(table),
+        cols.join(", ")
+    );
+    (sql, read)
+}
+
+/// The units the materialized table `schema`.`table` holds, as a streamed cursor (see
+/// [`UnitStream`]): the target's twin of [`source_units`], same chunking, same keys.
+///
+/// This is the second cursor of a whole-view refresh. The first ([`source_units`]) covers the
+/// units the source has now; this one covers the units the *view* has, so the refresh also sees the
+/// units that vanished from the source while the view was behind (#167's gap windows): for a chunk
+/// of them [`vanished`] asks the source once, and the units it no longer answers for have their
+/// rows deleted by the ordinary chunk path ([`read_old`] + [`diff`] against an empty [`Prepared`] +
+/// [`write_diff`]). Nothing is held: as in [`source_units`], one chunk of keys exists at a time,
+/// and the cursor is the connection's open result set — a sweep streams it on a connection of its
+/// own and reads and writes the chunks on the ones the refresh already uses. Started once per whole
+/// refresh, never per binlog event; its state is engine memory only, so a restart re-runs the sweep
+/// from the start, which is idempotent.
+///
+/// `chunk` is the caller's `cfg.query_chunk` (lv-super's ruling 6: no new setting), clamped to what
+/// a chunk filter's parameters allow — the same bound [`read_old`] and [`vanished`] bind under, so
+/// a chunk this cursor hands out is a chunk both can use. `Err` for a view whose rows are not a set
+/// of units, which keeps the whole read it has today (see [`streamable`]).
+///
+/// MySQL family targets, as `Conn` is: a PostgreSQL target is read by its own client
+/// ([`crate::target::postgres::PgConn::read_old`]), and its cursor comes with the sweep's PostgreSQL
+/// leg rather than as code nothing calls yet (lv-super's ruling 7).
+pub async fn target_units<'a>(
+    conn: &'a mut Conn,
+    schema: &str,
+    table: &str,
+    plan: &ViewPlan,
+    layout: &Layout,
+    chunk: usize,
+    metrics: &Metrics,
+) -> Result<UnitStream<'a>> {
+    streamable(plan, layout)?;
+    let (sql, read) = target_units_sql(layout, schema, table);
+    let chunk = chunk_limit(layout.unit_pos.len(), chunk);
+    // (A plain statement, as in [`source_units`]: the cursor runs once per whole refresh.)
+    let res = conn.exec_iter(sql, ()).await?;
+    Metrics::add(&metrics.mv_queries, 1);
+    Ok(UnitStream {
+        res,
+        read,
+        types: unit_types(layout),
+        chunk,
+        seen: 0,
+        done: false,
+    })
+}
+
+/// What [`vanished`] concluded about one chunk of the target's units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Vanished {
+    /// These of the chunk's units have no row left in the source: their target rows may go, and
+    /// the ordinary chunk path deletes them ([`read_old`] + [`diff`] with an empty [`Prepared`]).
+    Keys(Vec<Key>),
+    /// The source answered for the chunk with a key that is not one of the chunk's own: under a
+    /// case-insensitive collation the two are the same unit, and only the server can tell. Do not
+    /// delete from this chunk: refresh it from the source instead ([`read_source`] +
+    /// [`apply_prepared`]), which reaches the same end state and lets the server do the comparison
+    /// (a unit the source really has keeps its rows, rewritten to the source's own text; a unit it
+    /// has lost loses them in the diff). Returned for a chunk the equality fast path cannot settle
+    /// — the integer chunks of an `Ints` cursor always can.
+    Ambiguous,
+}
+
+/// Which units of one target chunk the source no longer has: ONE read of the source, the shape of
+/// [`units_sql`] with the chunk's filter AND-ed onto the plan's `WHERE` — the keys only, never a
+/// view row (`SELECT DISTINCT` of the unit expressions, so at most `chunk` rows come back, and the
+/// loose index scan answers it as an index lookup per unit). `fresh`: see [`read_source`].
+///
+/// This is the pass that makes the target's cursor safe to delete from: the units the source still
+/// answers for are left to their own chunk refresh, and only the units it is silent about are
+/// deleted. The comparison is exact on purpose, and [`Vanished::Ambiguous`] is how the function
+/// says "not by me": a chunk whose answers are the chunk's own keys matches key for key, so a key
+/// with no answer has no source rows; an answer that is some other text (a case variant of a key,
+/// under a CI collation) breaks that argument, and guessing from here would delete a live unit's
+/// rows. The plan's cost note (lv-super's ruling 2): one such read per chunk of the target's units,
+/// which is what a merge-join of the two cursors across servers would cost in state instead.
+///
+/// A unit whose rows are gone *and* whose text the source no longer spells the same way is answered
+/// for by nothing, so it is deleted whether or not the chunk is ambiguous; the ambiguity only ever
+/// withholds a delete, never causes one.
+pub async fn vanished(
+    src: &mut Conn,
+    plan: &ViewPlan,
+    layout: &Layout,
+    chunk: &UnitChunk,
+    metrics: &Metrics,
+    fresh: bool,
+) -> Result<Vanished> {
+    streamable(plan, layout)?;
+    let n_units = plan.unit_exprs.len();
+    // (The chunk filter binds a parameter per key column, as `read_source` does. A chunk of its own
+    // comes from [`target_units`], which clamps it to this budget; a caller-built one is refused.)
+    if chunk.len().saturating_mul(n_units).saturating_add(n_units) > MAX_PARAMS {
+        bail!(
+            "view `{}`: a chunk of {} units of {n_units} columns binds more than the {} parameters \
+             a statement holds; take the chunk from `target_units`",
+            plan.name,
+            chunk.len(),
+            MAX_PARAMS
+        );
+    }
+    let keys: Vec<Key> = match chunk {
+        UnitChunk::Ints(v) => v.iter().map(|&i| Key::from([Datum::Int(i)])).collect(),
+        UnitChunk::Keys(k) => k.to_vec(),
+        // (A partial chunk constrains only some unit columns: it cannot say which *units* are
+        // there, which is the one question this read answers.)
+        UnitChunk::Partial(..) => {
+            bail!(
+                "view `{}`: the vanished-unit read needs a whole unit chunk, not a partial one",
+                plan.name
+            )
+        }
+    };
+    let (cols, read) = unit_cols(plan, layout);
+    let (filter, params) = chunk.filter_typed(&plan.unit_exprs, &layout.unit_kinds());
+    let sql = distinct_units_sql(
+        &cols,
+        &plan.from_sql,
+        plan.where_sql.as_deref(),
+        plan.group_sql.as_deref(),
+        plan.having_sql.as_deref(),
+        Some(&filter),
+    );
+    let rows: Vec<Row> = exec_source(src, sql, params, fresh).await?;
+    Metrics::add(&metrics.source_queries, 1);
+    let types = unit_types(layout);
+    let answers: HashSet<Key> = rows
+        .into_iter()
+        .map(|r| unit_datums(&read, &types, r.unwrap()))
+        .collect();
+    // (Every answer that is one of the chunk's own keys settles that key: it has rows. An answer
+    // that is none of them is a key the server matched to a chunk key without spelling it the same
+    // way — a collation variant — and no key of this chunk can be trusted to be absent then.)
+    let asked: HashSet<&Key> = keys.iter().collect();
+    if answers.iter().any(|a| !asked.contains(a)) {
+        return Ok(Vanished::Ambiguous);
+    }
+    Ok(Vanished::Keys(
+        keys.into_iter().filter(|k| !answers.contains(k)).collect(),
+    ))
 }
 
 /// The datums a row is compared and grouped by in [`diff`]: JSON values (MySQL/Percona `json`
@@ -2169,7 +2421,7 @@ mod tests {
             Value::Int(3),
         ];
         assert_eq!(
-            unit_datums(&read, vec![epoch]).to_vec(),
+            unit_datums(&read, &unit_types(&l), vec![epoch]).to_vec(),
             to_datums(&l, &row)[..1].to_vec(),
             "the cursor's key is the key of a chunk read"
         );
@@ -2202,7 +2454,7 @@ mod tests {
         );
         let doc = Value::Bytes(b"{\"b\": 1, \"a\": 2}".to_vec());
         assert_eq!(
-            unit_datums(&read, vec![doc.clone()]).to_vec(),
+            unit_datums(&read, &unit_types(&l), vec![doc.clone()]).to_vec(),
             to_datums(&l, &[doc])[..1].to_vec(),
             "the cursor's key is the key of a chunk read"
         );
@@ -2244,5 +2496,154 @@ mod tests {
         assert_eq!(chunk_limit(1, 500), 500);
         assert_eq!(chunk_limit(1, usize::MAX), MAX_PARAMS);
         assert_eq!(chunk_limit(4, usize::MAX), MAX_PARAMS / 4);
+    }
+
+    /// The target's cursor lists the view's own unit columns and nothing else: no plan `WHERE`
+    /// (the target holds what the view holds), the unit's own order, the table quoted.
+    #[test]
+    fn the_target_cursor_lists_the_view_s_own_unit_columns() {
+        let p = ev_plan("CREATE VIEW v AS SELECT id, g FROM ev WHERE g > 0");
+        let l = layout(
+            vec![col("id", "int", "int", None), col("g", "int", "int", None)],
+            2,
+            vec![0],
+            true,
+        );
+        assert!(streamable(&p, &l).is_ok());
+        let (sql, read) = target_units_sql(&l, "db", "v_mv");
+        assert_eq!(read, vec![UnitRead::Raw]);
+        let u = l.unit_cols().join(", ");
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT DISTINCT {u} FROM {}.{} ORDER BY {u}",
+                q("db"),
+                q("v_mv")
+            )
+        );
+        // (The plan's filter is not in it: this is the units the view holds, vanished ones included
+        // — they are the reason the pass exists.)
+        for absent in ["WHERE", "GROUP BY", "HAVING", "LIMIT"] {
+            assert!(!sql.contains(absent), "{absent}: {sql}");
+        }
+        // A view whose rows are not a set of units has no target list either: a chunk of a wider
+        // unit list would delete the rows the view keeps.
+        let top = ev_plan("CREATE VIEW v AS SELECT id, g FROM ev ORDER BY g LIMIT 5");
+        assert!(streamable(&top, &l).is_err(), "top-N");
+        let g = ev_plan("CREATE VIEW v AS SELECT COUNT(*) AS n FROM ev");
+        let lg = layout(vec![col("n", "bigint", "bigint", None)], 1, vec![], true);
+        assert!(streamable(&g, &lg).is_err(), "no unit");
+    }
+
+    /// A TIMESTAMP unit of the target is read as an epoch and a JSON unit as text: the very
+    /// expressions [`read_old`] reads its rows with, so a target cursor's key is the key of the
+    /// rows `read_old` answers for it and the key a chunk read of the source gives as well.
+    #[test]
+    fn the_target_cursor_reads_a_unit_column_as_read_old_reads_it() {
+        let mut l = layout(
+            vec![
+                col("g", "timestamp", "timestamp", None),
+                col("n", "bigint", "bigint", None),
+            ],
+            2,
+            vec![0],
+            true,
+        );
+        l.epoch = vec![(0, "`g`".to_string())];
+        let (sql, read) = target_units_sql(&l, "db", "v_mv");
+        assert_eq!(read, vec![UnitRead::Epoch]);
+        assert!(
+            sql.contains(&format!("UNIX_TIMESTAMP({})", l.unit_cols()[0])),
+            "{sql}"
+        );
+        let l = layout(
+            vec![
+                col("doc", "json", "json", None),
+                col("n", "bigint", "bigint", None),
+            ],
+            2,
+            vec![0],
+            true,
+        );
+        let (sql, read) = target_units_sql(&l, "db", "v_mv");
+        assert_eq!(read, vec![UnitRead::Json]);
+        assert!(
+            sql.contains(&format!("CAST({} AS CHAR)", l.unit_cols()[0])),
+            "`SELECT DISTINCT` cannot group a JSON column: {sql}"
+        );
+    }
+
+    /// The vanished-unit read is the units cursor with the chunk's filter AND-ed onto the plan's
+    /// own `WHERE`: the plan's FROM clause and nothing else, its `GROUP BY` and `HAVING` kept (a
+    /// unit the grouped result drops has no rows in the view), the keys only.
+    #[test]
+    fn the_vanished_read_is_the_units_cursor_plus_the_chunk_filter() {
+        let p = ev_plan(
+            "CREATE VIEW v AS SELECT g, COUNT(*) AS n FROM ev WHERE g > 0 GROUP BY g \
+             HAVING COUNT(*) > 2",
+        );
+        assert!(p.is_incremental(), "{:?}", p.mode);
+        let l = layout(
+            vec![
+                col("g", "int", "int", None),
+                col("n", "bigint", "bigint", None),
+            ],
+            2,
+            vec![0],
+            true,
+        );
+        let (cols, read) = unit_cols(&p, &l);
+        assert_eq!(read, vec![UnitRead::Raw]);
+        let build = |c: &UnitChunk| {
+            let (f, ps) = c.filter_typed(&p.unit_exprs, &l.unit_kinds());
+            let sql = distinct_units_sql(
+                &cols,
+                &p.from_sql,
+                p.where_sql.as_deref(),
+                p.group_sql.as_deref(),
+                p.having_sql.as_deref(),
+                Some(&f),
+            );
+            (sql, f, ps)
+        };
+        // The integer fast path: literals, no parameters, and one bounded index lookup per unit.
+        let ints = UnitChunk::Ints(vec![1, 2, 9]);
+        let (sql, f, params) = build(&ints);
+        assert!(
+            sql.starts_with(&format!("SELECT DISTINCT {} FROM {}", cols[0], p.from_sql)),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(&format!(
+                "WHERE ({}) AND ({})",
+                p.where_sql.clone().unwrap(),
+                f
+            )),
+            "the plan's filter and the chunk's, neither alone: {sql}"
+        );
+        assert!(sql.contains("GROUP BY"), "{sql}");
+        assert!(sql.contains("HAVING COUNT(*) > 2"), "{sql}");
+        assert!(
+            sql.ends_with(&format!(" ORDER BY {}", cols[0])),
+            "the order is the select list: {sql}"
+        );
+        assert!(params.is_empty(), "an Ints chunk binds nothing: {params:?}");
+        // A keys chunk binds a parameter per column of every key; a NULL key is a literal, and a
+        // key whose text the collation matches is the server's to judge, never ours.
+        let keys = UnitChunk::Keys(vec![
+            Key::from([Datum::Bytes(b"a".to_vec())]),
+            Key::from([Datum::Null]),
+        ]);
+        let (sql, f, params) = build(&keys);
+        assert!(
+            sql.contains(&format!(
+                "WHERE ({}) AND ({})",
+                p.where_sql.clone().unwrap(),
+                f
+            )),
+            "{sql}"
+        );
+        assert!(f.contains("IS NULL"), "the NULL key: {f}");
+        assert_eq!(params.len(), 1, "the NULL is a literal: {params:?}");
     }
 }
