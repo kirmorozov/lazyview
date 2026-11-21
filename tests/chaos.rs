@@ -2201,9 +2201,10 @@ fn chaos_tgt_pg_bandwidth_starvation() {
 /// claims. (The existing lag scenarios use 1 byte.)
 const LAG_PROOF_BUDGET: u64 = 16;
 
-/// R-01 / M2, the pause arm (`LAZYVIEW_LAG_OVER_BUDGET=pause`, the default): `lv_<s>_t1` upstream
-/// cut at the edge (`reset_peer{timeout:0}`, so every write to it fails at once) while writers
-/// keep pushing, with the lag buffer at [`LAG_PROOF_BUDGET`] bytes. The
+/// R-01 / M2, the pause arm (`LAZYVIEW_LAG_OVER_BUDGET=pause`, the default): writers push a steady
+/// stream on the healthy link first, then `lv_<s>_t1` upstream is cut at the edge
+/// (`reset_peer{timeout:300}`, so every write to it is refused), with the lag buffer at
+/// [`LAG_PROOF_BUDGET`] bytes. The
 /// bound must **act**, where before this PR the budget only produced a warn: the keys kept for the
 /// behind target are counted and far above the budget (`lag_bytes_held`), the binlog reader is
 /// held (`lag_reader_holds` ≥ 1) so the backlog is not read into memory while one target is behind
@@ -2253,14 +2254,43 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         "initial build on both targets",
     )
     .await?;
-    let before = eng.snapshot();
-    // `reset_peer{timeout:0}` upstream: every connect and every write to `t1` is cut at the edge,
-    // so a flush's write to it fails in milliseconds and its units go to the target's kept keys.
-    // (A `timeout{timeout:0}` black hole does the same but costs a 10 s connect timeout per try,
-    // which paces the lag this scenario has to build in seconds.)
-    toxi.arm(&p1, &Toxic::reset_peer(0).on(Dir::Upstream).named("lagrst"))
-        .await?;
+    // The writers run on the healthy link first: by the time the fault lands they are at their
+    // steady rate, so the first failing flush has a stream of changes in flight. Starting them
+    // *after* the cut made the pressure a race the CI runners lost: the immediate RST ends the
+    // failing flush before the writers' first transactions arrive, the hold then reads nothing
+    // (its flushes complete before a read can wait on the socket), and the kept keys stay frozen
+    // at one crossing's worth — below the many-times-over check (red on 6986480, five flavors).
     let (tx, writers) = spawn_target_writers(ctx, &db, ids.clone(), &format!("{tag}_w"), 60);
+    let mut c = db.conn().await?;
+    let pos0 = server_position(&mut c).await?;
+    drop(c);
+    let began = std::time::Instant::now();
+    wait_until(
+        "the writers to be pushing and the engine to keep up on the healthy link (the pressure \
+         must be running before the fault, not start with it)",
+        Duration::from_secs(30),
+        || {
+            let ok = began.elapsed() >= Duration::from_secs(3)
+                && eng.applied().as_ref().is_some_and(|a| a >= &pos0);
+            async move { Ok(ok) }
+        },
+    )
+    .await?;
+    let before = eng.snapshot();
+    // `reset_peer{timeout:300}` upstream: every connect and every write to `t1` is refused at the
+    // edge, so a flush's write to it fails at once and its units go to the target's kept keys.
+    // The 300 ms (armed with a timeout, as #6 arms its reset) keeps the first failing flush's
+    // three supervisor retries ~1 s wide: that window is what lets the flush's overlapped read
+    // take the writers' in-flight stream into the buffer, so the set the hold freezes is many
+    // times its budget rather than the one row that crossed it. (A `timeout{timeout:0}` black
+    // hole also refuses, but costs a 10 s connect timeout per try, pacing the lag this scenario
+    // has to build over minutes; `timeout:0` here answers with the RST before a writer
+    // transaction has arrived, which is the race above.)
+    toxi.arm(
+        &p1,
+        &Toxic::reset_peer(300).on(Dir::Upstream).named("lagrst"),
+    )
+    .await?;
     // The bound acting is observable, not assumed: the keys kept for the black-holed target passed
     // their budget (the gauge, refreshed at the housekeeping tick) and the reader was held for it.
     wait_until(
