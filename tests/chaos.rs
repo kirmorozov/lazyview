@@ -2201,10 +2201,12 @@ fn chaos_tgt_pg_bandwidth_starvation() {
 /// claims. (The existing lag scenarios use 1 byte.)
 const LAG_PROOF_BUDGET: u64 = 16;
 
-/// R-01 / M2, the pause arm (`LAZYVIEW_LAG_OVER_BUDGET=pause`, the default): writers push a steady
-/// stream on the healthy link first, then `lv_<s>_t1` upstream is cut at the edge
-/// (`reset_peer{timeout:300}`, so every write to it is refused), with the lag buffer at
-/// [`LAG_PROOF_BUDGET`] bytes. The
+/// R-01 / M2, the pause arm (`LAZYVIEW_LAG_OVER_BUDGET=pause`, the default): the writers push a
+/// steady stream on the healthy link, the kept-keys buffer is then drained to zero (the writers
+/// stop, the behind flags of the warm-up flushes catch up), `lv_<s>_t1` upstream is cut at the
+/// edge (`reset_peer{timeout:300}`, so every write to it is refused), and the writers' burst
+/// streams into the cut link — so the first failing flush carries a whole batch of the burst and
+/// that batch is the kept set the hold freezes. With the lag buffer at [`LAG_PROOF_BUDGET`] bytes. The
 /// bound must **act**, where before this PR the budget only produced a warn: the keys kept for the
 /// behind target are counted and far above the budget (`lag_bytes_held`), the binlog reader is
 /// held (`lag_reader_holds` ≥ 1) so the backlog is not read into memory while one target is behind
@@ -2254,12 +2256,10 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         "initial build on both targets",
     )
     .await?;
-    // The writers run on the healthy link first: by the time the fault lands they are at their
-    // steady rate, so the first failing flush has a stream of changes in flight. Starting them
-    // *after* the cut made the pressure a race the CI runners lost: the immediate RST ends the
-    // failing flush before the writers' first transactions arrive, the hold then reads nothing
-    // (its flushes complete before a read can wait on the socket), and the kept keys stay frozen
-    // at one crossing's worth — below the many-times-over check (red on 6986480, five flavors).
+    // The writers run on the healthy link first: by the time the fault lands they have shown the
+    // engine can keep up at a steady rate. (With the *only* writer set starting after the cut,
+    // the first failing flush ended before its writers' first transactions arrived and the kept
+    // keys froze at one crossing's worth — red on 6986480, five flavors; see the burst below.)
     let (tx, writers) = spawn_target_writers(ctx, &db, ids.clone(), &format!("{tag}_w"), 60);
     let mut c = db.conn().await?;
     let pos0 = server_position(&mut c).await?;
@@ -2273,6 +2273,35 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
             let ok = began.elapsed() >= Duration::from_secs(3)
                 && eng.applied().as_ref().is_some_and(|a| a >= &pos0);
             async move { Ok(ok) }
+        },
+    )
+    .await?;
+    // Then the buffer is put back to empty before the cut, and the pressure that builds the kept
+    // set streams into the link *after* it is cut. A 16 B budget flags every busy flush behind
+    // (`mark_behind_targets`), so the warm-up leaves the reader cycling through `hold_for_lag`,
+    // and a hold freezes the kept keys at whatever one flush had carried when it entered: with
+    // the fault landing mid-cycle the kept set froze at one transaction's worth (~16 B) and the
+    // many-times-over check timed out (red on 44872983468, all eight flavors). Draining to zero
+    // first makes the crossing deterministic: the first flush that fails on `t1` is the first
+    // flush that has ever seen the burst, and at the burst rate its window (never under
+    // CATCH_UP_BATCH while the stream delivers) holds tens of transactions, many times the
+    // 8x-budget the hold is checked against.
+    stop_writers(ctx, tx, writers).await?;
+    let mut c = db.conn().await?;
+    let pos_quiet = server_position(&mut c).await?;
+    drop(c);
+    wait_until(
+        "the kept keys to drain to zero after the warm-up writers stopped (the cut must land on \
+         an empty buffer, so the first failing flush's batch is the kept set the hold freezes)",
+        FAULT_BUDGET,
+        || {
+            let m = eng.metrics.clone();
+            let a = eng.applied();
+            let pos_q = pos_quiet.clone();
+            async move {
+                Ok(a.as_ref().is_some_and(|p| p >= &pos_q)
+                    && lazyview::Metrics::get(&m.gauges.lag_bytes_held) == 0)
+            }
         },
     )
     .await?;
@@ -2291,6 +2320,12 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         &Toxic::reset_peer(300).on(Dir::Upstream).named("lagrst"),
     )
     .await?;
+    // The burst streams into the cut link now: every transaction the writers commit from here is
+    // a change `t1` is owed, and the first failing flush takes a whole batch of them into the
+    // kept keys before the bound can freeze the buffer (at the warm-up's 60 tps a flush window
+    // held about one transaction — the ~16 B freeze of 44872983468; at 400 it holds tens, and
+    // the reader is free until the first crossing because the buffer was empty at the cut).
+    let (tx, writers) = spawn_target_writers(ctx, &db, ids.clone(), &format!("{tag}_b"), 400);
     // The bound acting is observable, not assumed: the keys kept for the black-holed target passed
     // their budget (the gauge, refreshed at the housekeeping tick) and the reader was held for it.
     wait_until(
