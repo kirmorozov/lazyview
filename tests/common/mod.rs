@@ -13,6 +13,9 @@
 pub mod engineproc;
 pub mod oracle;
 pub mod pg;
+// The kill-and-recover suite's machinery: kill-point waits, the recovery time table, the SQL-side
+// exactness check, the paced writer (plan tmp/out/lvs-perf/plan/breakdown.md §2, PR2).
+pub mod recovery;
 // The analyzer's test-only renamer (one implementation for unit and integration tests).
 #[path = "../../src/analyzer/rename.rs"]
 pub mod rename;

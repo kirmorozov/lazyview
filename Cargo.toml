@@ -64,6 +64,13 @@ aws-secrets = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
 [dev-dependencies]
 rand = "0.10"
 
+# The kill-and-recover binary is named with a dash on purpose: the `chaos-*` name is the convention
+# the test runners use to wire the network-fault daemon and to fail a chaos run whose scenarios only
+# skipped (the same convention `tests/chaos.rs` follows), and an underscore would not match it.
+[[test]]
+name = "chaos-recovery"
+path = "tests/chaos_recovery.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1
