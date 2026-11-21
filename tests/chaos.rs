@@ -27,7 +27,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use common::soakchaos;
@@ -808,6 +808,24 @@ fn bh_backoff_max(n: u32) -> Duration {
         .mul_f64(1.5)
 }
 
+/// What a failed recovery proof of the black-hole scenario reports (#264): how many times the
+/// stream actually came back (each successful reconnect logs one `streaming binlog` line,
+/// src/engine.rs; the attempts themselves log at debug only), the `supervisor_retries` delta
+/// since the proved tick, and where `applied` ended — so a real never-comes-back (the
+/// production path of G3/G5) is attributable in one run instead of needing a rerun.
+fn bh_recovery_evidence(f: &Fix, retries_at_proof: u64) -> String {
+    let reconnects = std::fs::read_to_string(&f.eng.log_path)
+        .map(|t| t.lines().filter(|l| l.contains("streaming binlog")).count())
+        .unwrap_or(0);
+    let m = f.eng.metrics.snapshot();
+    format!(
+        "recovery evidence after the black hole: {reconnects} 'streaming binlog' line(s), \
+         supervisor_retries +{} since the proved tick, applied={:?}",
+        m.supervisor_retries.saturating_sub(retries_at_proof),
+        f.eng.applied().map(|p| p.to_string()),
+    )
+}
+
 /// `timeout{timeout:0}` on the dump link never closes it and never delivers anything, so the only
 /// thing that can end the fault is the engine's own bounds (the one place they live now that the
 /// reader has no idle timeout of its own): the stream loop's silence detector,
@@ -817,8 +835,10 @@ fn bh_backoff_max(n: u32) -> Duration {
 /// attempts log at debug only and the engine's `binlog connect failed` line waits for the whole
 /// run, so the counter is the only in-run evidence of the attempt), removes the toxic, and gives
 /// the recovery the rest of a CONNECT run plus one cap: the engine may be inside a 20 s attempt
-/// or inside the cap wait when the toxic goes away. The stream then comes back from the saved
-/// position.
+/// or inside the cap wait when the toxic goes away. Recovery is then proven by *delivery* — the
+/// `events` counter moving past its value at disarm and `applied` reaching the source's binlog
+/// end captured after disarm — not by the `streaming` gauge alone, which is set before the first
+/// event is read (the #264 false positive).
 #[test]
 fn chaos_src_binlog_blackhole() {
     let _one = toxi::exclusive();
@@ -830,7 +850,6 @@ fn chaos_src_binlog_blackhole() {
         let mut f = setup(&ctx, "chaos_s2", &toxi, &["binlog"]).await?;
         let mut w = spawn_writers(&f.db, &f.ids, seed);
         f.wait_streaming().await?;
-        let before = f.eng.snapshot();
         f.arm("binlog", &Toxic::timeout(0).named("black-hole"))
             .await?;
         // The engine notices on its own: the stream loop's silence detector, then the reconnect
@@ -887,36 +906,80 @@ fn chaos_src_binlog_blackhole() {
             "reconnect proved: supervisor_retries {} -> {}",
             started.supervisor_retries, ticked
         ));
-        let saved = soakchaos::saved_position(&f.db).await?;
         f.disarm("binlog", "black-hole").await?;
         // The engine may be anywhere in a CONNECT run when the toxic goes away: inside one
         // attempt (≤ the connect timeout) or inside the one-cap wait that follows a whole
         // failed run (src/engine.rs), so the recovery waits cover the rest of a run — every
         // attempt plus every backoff between attempts — plus one cap, before the run that
-        // connects succeeds.
+        // connects succeeds. All three proofs below share this one budget (#264).
         let connect_run =
             Duration::from_secs(u64::from(BH_CONNECT_ATTEMPTS) * BH_CONNECT_TIMEOUT.as_secs())
                 + (1..BH_CONNECT_ATTEMPTS)
                     .map(bh_backoff_max)
                     .sum::<Duration>();
         let reconnect = connect_run + BH_CONNECT_CAP;
-        wait_until(
+        let deadline = Instant::now() + reconnect;
+        let left = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+        };
+        // The proof is delivery, not registration (#264). The `streaming` gauge is set the
+        // moment `BinlogReader::connect` returns — registered as a replica, zero events read
+        // (src/engine.rs) — and the engine's saved position lags `applied` by the save
+        // cadence (soakchaos::saved_position), so the old `f.streaming()` + one-shot
+        // `wait_applied(&saved)` + `ensure!(d.events > 0)` could sample the real window
+        // between registration and the first counted event (src/engine.rs counts at delivery)
+        // and cry "never came back" on a stream that recovers a moment later. What proves
+        // recovery instead: the `events` counter (incremented at delivery) moving past its
+        // value at disarm, and `applied` reaching the source's binlog end captured *after*
+        // disarm — the writers wrote behind the removed toxic the whole time (direct links,
+        // §3), so only a stream that came back and delivered can apply it. The streaming
+        // gauge stays as the first gate: a stream that never re-registers fails there, and
+        // delivery cannot start without it.
+        let at_disarm = f.eng.snapshot().events;
+        let mut c = f.db.conn().await?;
+        let head = server_position(&mut c).await?;
+        c.disconnect().await.ok();
+        if let Err(e) = wait_until(
             "the engine streaming again after the black hole",
-            reconnect,
+            left(),
             || {
                 let f = &f;
                 async move { Ok(f.streaming()) }
             },
         )
-        .await?;
-        f.eng.wait_applied(&saved, reconnect).await?;
-        let d = f.eng.snapshot().since(&before);
-        ensure!(
-            d.events > 0,
-            "the stream never came back after the black hole was removed: {} events since the \
-             fault, expected the backlog (saved position {saved:?})",
-            d.events
-        );
+        .await
+        {
+            ctx.log(bh_recovery_evidence(&f, ticked));
+            return Err(e).with_context(|| {
+                "the stream never re-registered after the black hole was removed".to_string()
+            });
+        }
+        if let Err(e) = wait_until("the recovered stream to deliver an event", left(), || {
+            let f = &f;
+            async move { Ok(f.eng.snapshot().events > at_disarm) }
+        })
+        .await
+        {
+            ctx.log(bh_recovery_evidence(&f, ticked));
+            return Err(e).with_context(|| {
+                format!(
+                    "the stream never came back after the black hole was removed: it \
+                     re-registered but the events counter stayed at {at_disarm} (its value \
+                     at disarm) for the rest of a CONNECT run ({reconnect:?})"
+                )
+            });
+        }
+        if let Err(e) = f.eng.wait_applied(&head, left()).await {
+            ctx.log(bh_recovery_evidence(&f, ticked));
+            return Err(e).with_context(|| {
+                format!(
+                    "the delivered stream never applied the source's binlog end {head} \
+                     captured after the black hole was removed"
+                )
+            });
+        }
         finish(&ctx, &mut f, &mut w, "after the black hole").await?;
         ensure!(
             f.counter("full_rebuilds") == 0,
