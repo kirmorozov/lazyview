@@ -976,4 +976,83 @@ mod tests {
         assert_eq!(plan.dialect, Kind::Mysql);
         assert_eq!(plan.budget, PG_KEY_BYTES);
     }
+
+    /// E11 (c): a declared key the engine's own key budget cannot hold is refused *before* anything is
+    /// rendered, with the budget (`MY_KEY_BYTES` 3072 / `PG_KEY_BYTES` 2704 / `MAX_KEY_PARTS` 16,
+    /// src/target/mod.rs:575-596) quoted and the tightest target named (the integration half of this
+    /// row is `idx_over_budget_errors_with_reason`); a declared column is never silently truncated,
+    /// because E8 refuses a prefix length in the user grammar.
+    ///
+    /// RED today for the reason the plan's table gives: `fit_key`'s `None` is only consulted for the
+    /// engine's own keys (src/target/mod.rs:695-752) — it answers `Some` for both keys below.
+    #[test]
+    fn index_key_budget_refused_before_render() {
+        use crate::mv::MvCol;
+        let col = |name: &str, column_type: &str| MvCol {
+            name: name.to_string(),
+            src_name: name.to_string(),
+            column_type: column_type.to_string(),
+            data_type: column_type
+                .split('(')
+                .next()
+                .unwrap_or(column_type)
+                .to_string(),
+            charset: None,
+            collation: None,
+            nullable: false,
+        };
+        let plan_for = |cols: &[MvCol], budget: u64| {
+            let layout = crate::mv::Layout {
+                cols: cols.to_vec(),
+                n_visible: cols.len(),
+                hidden: Vec::new(),
+                unit_pos: Vec::new(),
+                primary: false,
+                lineage: Vec::new(),
+                epoch: Vec::new(),
+                identity: Vec::new(),
+                partial: Vec::new(),
+                key_budget: budget,
+            };
+            (KeyPlan::for_layout(&layout, Kind::Mysql), layout)
+        };
+
+        // E11 (a), second half: "separately a 17-column index" — over MAX_KEY_PARTS.
+        let wide17: Vec<MvCol> = (0..MAX_KEY_PARTS + 1)
+            .map(|i| col(&format!("c{i}"), "int"))
+            .collect();
+        let (plan, layout) = plan_for(&wide17, MY_KEY_BYTES);
+        let parts: Vec<(&MvCol, KeyPart)> = layout.cols.iter().map(|c| (c, plan.part(c))).collect();
+        assert!(
+            parts.len() > MAX_KEY_PARTS,
+            "E11 (a): the case must declare more parts than MAX_KEY_PARTS ({MAX_KEY_PARTS})"
+        );
+        assert!(
+            fit_key(&parts, &plan).is_none(),
+            "E11 (c): a declared key of {} parts must be refused by the budget seam (MAX_KEY_PARTS \
+             is {MAX_KEY_PARTS}) instead of being rendered; fit_key answered {:?}",
+            parts.len(),
+            fit_key(&parts, &plan),
+        );
+
+        // E11 (a), first half: `name VARCHAR(2000)` in the key, so `(3072|2704) * 4` bytes overflow.
+        // A declared key may not be shortened by the engine: E8 refuses `name(4)`, so the only honest
+        // answer is the named budget error, not a silently-prefixed `name(768)`.
+        let over: Vec<MvCol> = vec![col("name", "varchar(2000)"), col("total", "decimal(10,2)")];
+        let (plan, layout) = plan_for(&over, MY_KEY_BYTES);
+        let parts: Vec<(&MvCol, KeyPart)> = layout.cols.iter().map(|c| (c, plan.part(c))).collect();
+        assert!(
+            fit_key(&parts, &plan).is_none(),
+            "E11 (c): a declared key over the budget must be refused, not rendered with a prefix the \
+             user never wrote; fit_key answered {:?}",
+            fit_key(&parts, &plan),
+        );
+        // The seam the error must quote (E11 (c) "quotes the budget and the offending index", and
+        // names the target whose budget was the tightest — asserted end-to-end by the integration row).
+        assert_eq!(
+            (MY_KEY_BYTES, PG_KEY_BYTES, MAX_KEY_PARTS),
+            (3072, 2704, 16)
+        );
+        assert_eq!(min_key_budget([Kind::Mysql, Kind::Postgres]), PG_KEY_BYTES);
+    }
 }

@@ -1,0 +1,33 @@
+# User-declared index cases (tests/indexes.rs) of #278: one "<test name> #<open issue>" per line,
+# the shape of tests/chaos-known-red.txt. Blank lines and `#` comment lines are ignored; the name
+# is the test function, exactly as cargo prints it.
+#
+# NOT WIRED INTO CI ON PURPOSE: .github/workflows/ci.yml and the chaos guard step are out of scope
+# for the red-test pass, so nothing reads this file yet — the tests fail the `indexes` step and that
+# is the point (owner ruling D8: these tests are the specification, red until P1-P6 land). Whoever
+# wires it (breakdown.md P7) decides whether a red `indexes` step blocks a run; the entries below are
+# the list of tests that are RED BY DESIGN, never a place to park a regression: an entry leaves when
+# its case turns green, and none of them may be weakened, skipped or deleted to make CI pass.
+idx_single_at_create #278
+idx_unique_at_create #278
+idx_fulltext_where_supported #278
+idx_multi_column_order_matters #278
+idx_coexist_with_engine_keys #278
+idx_declared_later_online #278
+idx_fanout_all_targets_converge #278
+idx_on_declared_virtual_column #278
+idx_reconciles_same_name_different_columns #278
+idx_declared_twice_is_idempotent #278
+idx_over_undeclared_column_errors #278
+idx_declared_during_inflight_build #278
+idx_resume_after_interrupted_reconcile #278
+idx_drift_reconverges_without_report_only #278
+idx_name_collision_two_views #278
+idx_unsupported_forms_fail_at_parse #278
+idx_fulltext_refused_on_pg #278
+idx_unknown_column_errors #278
+idx_over_budget_errors_with_reason #278
+idx_unique_violated_reports_and_survives #278
+idx_fulltext_declared_later_never_blocks_writes #278
+idx_pg_concurrently_invalid_swept #278
+idx_mdl_wait_does_not_stall_writes #278
