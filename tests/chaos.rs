@@ -440,9 +440,22 @@ struct Fix {
     window: Window,
 }
 
-/// The roles of F4 a scenario may isolate: `binlog`, `query`, `meta`, or `src` for all three at
-/// once (scenario 3, where the fault is deliberately not attributable to one role).
+/// The roles of F4 a scenario may isolate: `binlog`, `query`, `meta`, `lock` (the leadership
+/// lock's own session, review A-06), or `src` for all three source roles at once (scenario 3,
+/// where the fault is deliberately not attributable to one role).
 async fn setup(ctx: &Arc<Ctx>, tag: &str, toxi: &Toxi, roles: &[&str]) -> Result<Fix> {
+    setup_extra(ctx, tag, toxi, roles, &[]).await
+}
+
+/// [`setup`] with the engine settings `extra`, appended after the scenario's own so a scenario can
+/// pin a number of its own — the lock scenarios shrink the lease to the smallest the rules allow.
+async fn setup_extra(
+    ctx: &Arc<Ctx>,
+    tag: &str,
+    toxi: &Toxi,
+    roles: &[&str],
+    extra: &[(&str, &str)],
+) -> Result<Fix> {
     let db = ctx.new_db(tag).await?;
     let ids = setup_soak(&db, ctx.sub_seed(tag), small_sizes()).await?;
     let t1 = ctx.new_db(&format!("{tag}_t1")).await?;
@@ -485,6 +498,9 @@ async fn setup(ctx: &Arc<Ctx>, tag: &str, toxi: &Toxi, roles: &[&str]) -> Result
         proxies.insert((*role).to_string(), p);
     }
     env.extend(target_env(&[("t1", t1.dsn.as_str())]));
+    for (k, v) in extra {
+        env.push((k.to_string(), v.to_string()));
+    }
     let (mut eng, _) = start_with_views(ctx, &db, &specs, &ov_refs(&env)).await?;
     // The first builds happen here; the no-rebuild window opens after them (F6).
     let mut c = db.conn().await?;
@@ -2494,4 +2510,525 @@ fn chaos_both_sides_fragmented() {
         eng.stop().await?;
         Ok(())
     });
+}
+
+// =============================================================================================
+// The leadership lock under a fault (review A-06, plan `tmp/out/lvs-lock-hb` PR 4).
+//
+// Three things the lock and its own beat task owe a proof against a real server:
+//  1. a lock connection that stops answering (a black hole, a partitioned node) really *ends*: the
+//     server waits out the session's own `wait_timeout` (the lease) and the named lock dies with the
+//     session, so the replacement streams within the bound — release, not only detection (cond. 1);
+//  2. an instance whose write path is behind for longer than the lease is NOT replaced: the beats
+//     are answered by their own task, so a busy engine never loses its lock (condition 2 — the
+//     regression test for the days the lock rode the binlog loop, `src/coord.rs`, `src/engine.rs`);
+//  3. an instance that has lost its lock writes nothing: neither the one whose beats stop being
+//     answered (`Uncertain`, every write gate closed, lv-super ruling 1 of 2026-11-16) nor the
+//     frozen one of the owner's "pull the plug / power out case" (SIGSTOP, 2026-11-17) writes a
+//     view row or saves a position after another instance holds the lock.
+//
+// The numbers are the smallest the rules allow: `LAZYVIEW_LOCK_HEARTBEAT_MS` floors at 1 s and
+// `Lease::new` demands `lease >= 4 x heartbeat` (`src/coord.rs`), so a takeover is bounded in
+// seconds here. Every real duration is printed with the harness's `MEASURED` line, as the owner
+// asked for the recovery numbers to be measured and reported.
+// =============================================================================================
+
+use common::engineproc::{measured, proc_state, EngineProc};
+use std::time::Instant;
+
+/// The lock's own settings for these three scenarios: the floor the rules allow (a 1 s beat, and a
+/// lease of exactly the `4 x` `Lease::new` demands), so a scenario runs in seconds and asserts about
+/// the mechanism rather than about waiting out a 15 s lease.
+const LOCK_ENV: [(&str, &str); 2] = [
+    ("LAZYVIEW_LOCK_HEARTBEAT_MS", "1000"),
+    ("LAZYVIEW_LOCK_LEASE_MS", "4000"),
+];
+/// The two numbers above as durations, for the bounds and the reports.
+const LOCK_BEAT: Duration = Duration::from_millis(1_000);
+const LOCK_LEASE: Duration = Duration::from_millis(4_000);
+/// The `LAZYVIEW_INSTANCE_ID` every harness engine shares (`Ctx::start_engine`, and the standby of
+/// `tests/health.rs:268`): the lock name is schema + this id, so two engines on one schema and one
+/// id are exactly the rolling-update overlap the lock exists to settle (owner 2026-11-17).
+const LOCK_INSTANCE: &str = "test";
+/// A bounded wait for the takeover: the lease (4 s) + the standby's own poll (≤ 5 s,
+/// `src/coord.rs`) + connect and start (`supervisor::CONNECT_TIMEOUT` 10 s) + room for the catch-up.
+/// The *measured* number is what the scenario prints; this bound only catches a mechanism that
+/// never happens at all.
+const TAKEOVER: Duration = Duration::from_secs(90);
+
+/// The fencing epoch of this schema's instance row — the witness that exactly one takeover happened
+/// (`coord::bump_epoch` runs once per takeover, and only on a takeover).
+async fn lock_epoch(db: &Db) -> Result<u64> {
+    let mut c = db.conn().await?;
+    let e: Option<u64> = c
+        .exec_first(
+            "SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
+            (LOCK_INSTANCE,),
+        )
+        .await
+        .with_context(|| format!("the epoch row of instance `{LOCK_INSTANCE}`"))?;
+    c.disconnect().await.ok();
+    e.with_context(|| format!("`_lazyview_status` has no row for instance `{LOCK_INSTANCE}`"))
+}
+
+/// Both halves of the connection black-holed: `timeout{timeout:0}` on `downstream` alone still lets
+/// the client's bytes reach the server, and a session the server is still reading from never looks
+/// idle — the lease *is* the server's socket-read timeout, so a black hole that is meant to end the
+/// session has to eat both directions.
+async fn arm_black_hole_both_ways(f: &Fix, role: &str) -> Result<()> {
+    f.arm(role, &Toxic::timeout(0).named("black-hole-down"))
+        .await?;
+    f.arm(
+        role,
+        &Toxic::timeout(0).named("black-hole-up").on(Dir::Upstream),
+    )
+    .await
+}
+
+/// One counter of a running engine, by name — the same table its `/metrics` serves.
+fn ctr(m: &Arc<lazyview::Metrics>, name: &str) -> u64 {
+    m.counters()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map_or(0, |(_, v)| v)
+}
+
+/// A node whose lock link is black-holed — the partition, with the process still alive. The server
+/// must end the silent lock session when the lease runs out, the replacement must stream within the
+/// bound, and the old instance must write nothing from the moment its gates closed.
+#[test]
+fn chaos_lock_blackhole_takeover() {
+    let _one = toxi::exclusive();
+    scenario("chaos_lock_blackhole_takeover", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        let seed = ctx.sub_seed("chaos_lock_blackhole_takeover");
+        // The lock is the only role behind a proxy: the replacement's session and the old
+        // instance's other links are ordinary connections, so everything below is about the lock.
+        let mut f = setup_extra(&ctx, "chaos_lock1", &toxi, &["lock"], &LOCK_ENV).await?;
+        let db = f.db.clone();
+        let specs = f.specs.clone();
+        let targets = f.targets.clone();
+        let mut w = spawn_writers(&db, &f.ids, seed);
+        f.wait_streaming().await?;
+        let mut b = ctx.start_engine(&db, &LOCK_ENV)?;
+        let bm = b.metrics.clone();
+        wait_until("the replacement in hot standby", FAULT, || {
+            let bm = bm.clone();
+            async move { Ok(bm.gauges.standby.load(Ordering::Relaxed) == 1) }
+        })
+        .await?;
+        ensure!(
+            bm.gauges.streaming.load(Ordering::Relaxed) == 0,
+            "the replacement streamed while another instance held the lock"
+        );
+        let epoch_before = lock_epoch(&db).await?;
+        let position_before = soakchaos::saved_position(&db).await?;
+        let am = f.eng.metrics.clone();
+        let beats_before = ctr(&am, "leader_beat_failures");
+        arm_black_hole_both_ways(&f, "lock").await?;
+        wait_until(
+            "the replaced instance to close its write gates",
+            FAULT,
+            || {
+                let am = am.clone();
+                async move {
+                    Ok(ctr(&am, "leader_uncertain") >= 1 || ctr(&am, "leader_fenced") >= 1)
+                }
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "the black hole never reached the lock: {} s of silence on the lock link and the \
+                 instance neither went Uncertain nor was fenced",
+                FAULT.as_secs()
+            )
+        })?;
+        ensure!(
+            f.log_line("no beat answered")?.is_some(),
+            "the lock task never said the lease had stopped being provable"
+        );
+        // The baseline is taken once the loop has actually run into the closed gate (its own
+        // `flush held` line), so anything still draining from before the gate is behind us.
+        wait_until("the loop to hit the closed gate", FAULT, || {
+            let log = f.eng.log_path.clone();
+            async move { Ok(soakchaos::grep_log(&log, "flush held")?.is_some()) }
+        })
+        .await?;
+        let held = f.eng.snapshot();
+        let applied_held = f.eng.applied();
+        // The takeover, timed from the instant the fault was armed.
+        let t0 = Instant::now();
+        wait_until("the replacement streaming", TAKEOVER, || {
+            let bm = bm.clone();
+            async move { Ok(bm.gauges.streaming.load(Ordering::Relaxed) == 1) }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "the replacement never streamed: the lease did not end the black-holed lock \
+                 session within {TAKEOVER:?} (lease {LOCK_LEASE:?} + standby poll <= 5 s + start)"
+            )
+        })?;
+        let takeover = t0.elapsed();
+        measured(format!(
+            "chaos_lock_blackhole_takeover: replacement streaming {takeover:?} after the lock was \
+             black-holed (lease {LOCK_LEASE:?}, beat {LOCK_BEAT:?}, standby poll <= 5 s)"
+        ));
+        // One takeover, and only the replacement bumped the epoch.
+        let epoch_now = lock_epoch(&db).await?;
+        ensure!(
+            epoch_now == epoch_before + 1,
+            "the epoch moved from {epoch_before} to {epoch_now}: expected exactly one takeover"
+        );
+        // The replaced instance wrote nothing from the closed gate on: no flush completed, no row to
+        // any target, and the position it had saved stays exactly where it was.
+        let d = f.eng.snapshot().since(&held);
+        ensure!(
+            d.flushes == 0
+                && d.mv_rows_inserted == 0
+                && d.mv_rows_upserted == 0
+                && d.mv_queries == 0
+                && d.mv_rows_deleted == 0,
+            "the replaced instance kept writing while its lock was gone: {}",
+            fmt_snapshot(&d)
+        );
+        ensure!(
+            f.eng.applied() == applied_held,
+            "the replaced instance advanced its applied position from {applied_held:?} to {:?} \
+             after its gates closed",
+            f.eng.applied()
+        );
+        ensure!(
+            ctr(&am, "leader_beat_failures") > beats_before,
+            "no beat of the black-holed session ever failed"
+        );
+        ensure!(
+            soakchaos::saved_position(&db).await? == position_before,
+            "the replaced instance saved a position after its lock was gone"
+        );
+        // Now let the old instance learn what happened: with the fault gone, its rejoin finds the
+        // lock held elsewhere, and it must leave as the replaced one.
+        f.disarm("lock", "black-hole-down").await?;
+        f.disarm("lock", "black-hole-up").await?;
+        let a = f.eng;
+        let exit = a.wait_finished(Duration::from_secs(90)).await?;
+        let why = match &exit {
+            Ok(()) => String::new(),
+            Err(e) => e.clone(),
+        };
+        ensure!(
+            why.contains("fenced"),
+            "the replaced instance exited with {exit:?}, not as the fenced one"
+        );
+        ensure!(
+            ctr(&am, "leader_fenced") == 1,
+            "leader_fenced is {}, expected one fencing of the black-holed instance",
+            ctr(&am, "leader_fenced")
+        );
+        ctx.log(format!("replaced instance fenced: {why}"));
+        // The replacement owns the schema: it applies everything the writers did through the whole
+        // fault, exactly, and without ever rebuilding an incremental view.
+        quiesce_writers(&mut w).await?;
+        let mut c = db.conn().await?;
+        b.wait_caught_up(&mut c, t_catchup()).await?;
+        c.disconnect().await.ok();
+        verify_targets(
+            &ctx,
+            &mut b,
+            &db,
+            &targets,
+            &HashMap::new(),
+            &specs,
+            "after the black-holed lock",
+        )
+        .await?;
+        assert_no_rebuilds(&b, &db, &specs, &b.snapshot(), "after the black-holed lock")?;
+        b.check_alive()?;
+        b.stop().await?;
+        Ok(())
+    });
+}
+
+/// A healthy instance whose write path is behind by far more than the lease must keep its lock:
+/// the beats are answered by their own task, so a slow engine is not a lost node (condition 2: the
+/// false alarm that would end a healthy instance and lose its running builds). Here the source-read
+/// link is throttled until flushes take many lease-periods, while the lock's own session is untouched.
+#[test]
+fn chaos_lock_slow_loop_no_takeover() {
+    let _one = toxi::exclusive();
+    scenario("chaos_lock_slow_loop_no_takeover", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        let seed = ctx.sub_seed("chaos_lock_slow_loop_no_takeover");
+        let mut f = setup_extra(&ctx, "chaos_lock2", &toxi, &["lock", "query"], &LOCK_ENV).await?;
+        let db = f.db.clone();
+        let mut w = spawn_writers(&db, &f.ids, seed);
+        f.wait_streaming().await?;
+        let mut b = ctx.start_engine(&db, &LOCK_ENV)?;
+        let bm = b.metrics.clone();
+        wait_until("the would-be replacement in hot standby", FAULT, || {
+            let bm = bm.clone();
+            async move { Ok(bm.gauges.standby.load(Ordering::Relaxed) == 1) }
+        })
+        .await?;
+        let epoch_before = lock_epoch(&db).await?;
+        let am = f.eng.metrics.clone();
+        let last_beat = am.gauges.leader_last_beat_ok.load(Ordering::Relaxed);
+        // Throttle the reads every refresh needs: slow round trips and a trickle of result bytes.
+        // Nothing touches the lock link — that is the point of the scenario.
+        f.arm(
+            "query",
+            &Toxic::latency(1_200, 0, Dir::Downstream).named("slow-read-down"),
+        )
+        .await?;
+        f.arm(
+            "query",
+            &Toxic::latency(1_200, 0, Dir::Upstream).named("slow-read-up"),
+        )
+        .await?;
+        f.arm(
+            "query",
+            &Toxic::bandwidth(16, Dir::Downstream).named("thin-read"),
+        )
+        .await?;
+        // Watch the engine for six lease-periods: how long does it go without applying anything,
+        // and does a single beat go unanswered in that time? Every sample is an observable and the
+        // loop ends on a bound, never on a pause the harness guessed.
+        let watch = 6 * LOCK_LEASE;
+        let t0 = Instant::now();
+        let mut last_applied = f.eng.applied();
+        let mut moved = Instant::now();
+        let mut stalled = Duration::ZERO;
+        let mut backlog = 0u64;
+        let mut next_gap = Instant::now();
+        while t0.elapsed() < watch {
+            let a = f.eng.applied();
+            if a != last_applied {
+                last_applied = a;
+                moved = Instant::now();
+            }
+            stalled = stalled.max(moved.elapsed());
+            if Instant::now() >= next_gap {
+                backlog = backlog.max(f.gap_bytes().await?);
+                next_gap = Instant::now() + Duration::from_secs(1);
+            }
+            ensure!(
+                ctr(&am, "leader_fenced") == 0,
+                "a slow engine was fenced by its own lock task"
+            );
+            ensure!(
+                bm.gauges.standby.load(Ordering::Relaxed) == 1
+                    && bm.gauges.streaming.load(Ordering::Relaxed) == 0,
+                "a second instance took the lock from an engine that only had its reads throttled"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ensure!(
+            ctr(&am, "leader_uncertain") == 0,
+            "the lock task went Uncertain {} time(s) while the engine was only slow at its reads \
+             (beat {LOCK_BEAT:?}, lease {LOCK_LEASE:?}): a slow loop must not be a lost node",
+            ctr(&am, "leader_uncertain")
+        );
+        ensure!(
+            ctr(&am, "leader_beat_failures") == 0,
+            "the beat task missed {} beat(s) while the reads were throttled — the beats may not \
+             depend on any other link",
+            ctr(&am, "leader_beat_failures")
+        );
+        let now_beat = am.gauges.leader_last_beat_ok.load(Ordering::Relaxed);
+        ensure!(
+            now_beat >= last_beat + watch.as_secs() / 2,
+            "the lock session's own beats stopped being answered while the reads were throttled: \
+             last_ok {last_beat} -> {now_beat}"
+        );
+        ensure!(
+            stalled >= LOCK_LEASE,
+            "the scenario tested nothing: the engine applied something every {stalled:?}, never \
+             past the lease ({LOCK_LEASE:?}) it has to survive"
+        );
+        ensure!(
+            lock_epoch(&db).await? == epoch_before,
+            "an engine that was merely slow lost the lock: the epoch moved"
+        );
+        measured(format!(
+            "chaos_lock_slow_loop_no_takeover: applied position stalled {stalled:?} ({}x the lease) \
+             with a {backlog}-byte binlog backlog behind it: 0 unanswered beats, 0 Uncertain \
+             entries, no takeover (lease {LOCK_LEASE:?})",
+            (stalled.as_secs_f64() / LOCK_LEASE.as_secs_f64()).max(1.0) as u64
+        ));
+        for n in ["slow-read-down", "slow-read-up", "thin-read"] {
+            f.disarm("query", n).await?;
+        }
+        // The engine was healthy all along: it catches up and every view is exact.
+        f.wait_streaming().await?;
+        finish(&ctx, &mut f, &mut w, "after the slow reads cleared").await?;
+        ensure!(
+            ctr(&am, "leader_fenced") == 0 && ctr(&am, "leader_uncertain") == 0,
+            "a throttled read link cost the instance {} fencing(s) and {} Uncertain entry(ies)",
+            ctr(&am, "leader_fenced"),
+            ctr(&am, "leader_uncertain")
+        );
+        ensure!(
+            bm.gauges.standby.load(Ordering::Relaxed) == 1,
+            "the second instance ever stopped standing by: it took a lock it was never given"
+        );
+        ensure!(
+            lock_epoch(&db).await? == epoch_before,
+            "the epoch moved during a scenario that must not have a takeover"
+        );
+        b.check_alive()?;
+        b.stop().await?;
+        Ok(())
+    });
+}
+
+/// The owner's "connection crash / pull the plug / power out case" (2026-11-17): a frozen host sends
+/// no FIN, so the server keeps its sessions until the lease says otherwise. The old instance here is
+/// a real process and gets SIGSTOP; the replacement starts and takes over by the lease; then the old
+/// one is SIGCONTinued and must write nothing — it self-fences (ruling 1) and exits.
+#[test]
+fn chaos_lock_frozen_old_instance_writes_nothing() {
+    let _one = toxi::exclusive();
+    scenario(
+        "chaos_lock_frozen_old_instance_writes_nothing",
+        |ctx| async move {
+            let Some(_toxi) = toxi::open_if_enabled(&ctx).await? else {
+                return Ok(());
+            };
+            let seed = ctx.sub_seed("chaos_lock_frozen_old_instance_writes_nothing");
+            let db = ctx.new_db("chaos_lock3").await?;
+            let ids = setup_soak(&db, ctx.sub_seed("chaos_lock3"), small_sizes()).await?;
+            let specs = chaos_views()?;
+            let mut c = db.conn().await?;
+            ensure_lazyview_table(&mut c).await?;
+            add_views(&mut c, &specs).await?;
+            c.disconnect().await.ok();
+            // The old instance as a deployment runs it: its own process, its own health endpoint.
+            let mut a = EngineProc::start(&ctx, &db, &LOCK_ENV).await?;
+            a.wait_startup(t_ready()).await?;
+            let up = a.wait_streaming(t_catchup()).await?;
+            ctx.log(format!(
+                "old instance streaming {up:?} after spawn (pid {})",
+                a.pid()
+            ));
+            let mut b = ctx.start_engine(&db, &LOCK_ENV)?;
+            let bm = b.metrics.clone();
+            wait_until("the replacement waiting for the lock", FAULT, || {
+                let bm = bm.clone();
+                async move { Ok(bm.gauges.standby.load(Ordering::Relaxed) == 1) }
+            })
+            .await?;
+            let epoch_before = lock_epoch(&db).await?;
+            let mut w = spawn_writers(&db, &ids, seed);
+            // Pull the plug: the process stops, its sockets stay open, and the server cannot know it is
+            // gone — the only thing that can end its lock session is the lease.
+            let pre = a.scrape().await?;
+            let pre_rows = pre.counter("mv_rows_inserted");
+            let pre_applied = pre.applied_position();
+            a.freeze()?;
+            let pid = a.pid();
+            wait_until("the old process to be stopped (state T)", BOUND, || async {
+                Ok(proc_state(pid) == Some('T'))
+            })
+            .await?;
+            let t0 = Instant::now();
+            wait_until("the replacement streaming", TAKEOVER, || {
+                let bm = bm.clone();
+                async move { Ok(bm.gauges.streaming.load(Ordering::Relaxed) == 1) }
+            })
+            .await
+            .with_context(|| {
+                format!(
+                "the replacement never took over from a frozen instance within {TAKEOVER:?}: the \
+                 lease ({LOCK_LEASE:?}) is what ends a session whose host sent nothing at all"
+            )
+            })?;
+            let takeover = t0.elapsed();
+            measured(format!(
+            "chaos_lock_frozen_old_instance_writes_nothing: replacement streaming {takeover:?} \
+             after SIGSTOP of the holder (lease {LOCK_LEASE:?}, standby poll <= 5 s, then start)"
+        ));
+            ensure!(
+                lock_epoch(&db).await? == epoch_before + 1,
+                "the epoch did not move exactly once on the takeover by the replacement"
+            );
+            // Wake the frozen one. Its lock session is the one the server ended at the end of the lease,
+            // so it must notice on its next beat, close every gate, and leave; between the wake and its
+            // exit not one row may reach a target.
+            a.resume()?;
+            let mut post = None;
+            let tw = Instant::now();
+            while post.is_none() && common::engineproc::pid_alive(pid) && tw.elapsed() < BOUND {
+                if let Ok(s) = a.scrape().await {
+                    post = Some(s);
+                } else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            let post_rows = post
+                .as_ref()
+                .map_or(pre_rows, |s| s.counter("mv_rows_inserted"));
+            if let Some(s) = &post {
+                ensure!(
+                    s.counter("mv_rows_inserted") == pre_rows,
+                    "the woken instance wrote {} row(s) to the targets after its lock was gone",
+                    s.counter("mv_rows_inserted").saturating_sub(pre_rows)
+                );
+                ensure!(
+                    s.applied_position() == pre_applied,
+                    "the woken instance advanced its applied position from {pre_applied:?} to {:?}",
+                    s.applied_position()
+                );
+            }
+            let st = a.wait_exit(Duration::from_secs(90))?;
+            ensure!(
+            !st.success(),
+            "the woken instance exited successfully ({st}) — a replaced instance must leave as the \
+             fenced one; log tail:\n{}",
+            a.log_tail(15)
+        );
+            let fenced = soakchaos::grep_log(&a.log_path, "fenced")?.is_some()
+                || soakchaos::grep_log(&a.log_path, "another lazyview instance")?.is_some();
+            ensure!(
+                fenced,
+                "the woken instance left without ever naming the takeover; log tail:\n{}",
+                a.log_tail(15)
+            );
+            measured(format!(
+                "chaos_lock_frozen_old_instance_writes_nothing: old process wrote {} row(s) after \
+             SIGCONT and exited {st} having named the takeover",
+                post_rows.saturating_sub(pre_rows)
+            ));
+            // The replacement owns the schema: everything the writers did — during the freeze and after
+            // the wake — is in the views exactly, and no incremental view was rebuilt for it.
+            quiesce_writers(&mut w).await?;
+            let mut c = db.conn().await?;
+            b.wait_caught_up(&mut c, t_catchup()).await?;
+            c.disconnect().await.ok();
+            verify_targets(
+                &ctx,
+                &mut b,
+                &db,
+                &HashMap::new(),
+                &HashMap::new(),
+                &specs,
+                "after the frozen instance was replaced",
+            )
+            .await?;
+            assert_no_rebuilds(
+                &b,
+                &db,
+                &specs,
+                &b.snapshot(),
+                "after the frozen instance was replaced",
+            )?;
+            b.check_alive()?;
+            b.stop().await?;
+            Ok(())
+        },
+    );
 }
