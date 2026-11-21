@@ -96,3 +96,107 @@ spec:
             severity: warning
           annotations:
             summary: "lazyview instance {{ $labels.job }} in {{ $labels.namespace }} keeps failing refreshes ({{ $value }} in the last 30 m)."
+        # ── The rest of the stall states: the process runs, the probes are green, a view stops
+        #    advancing (review O-02). Every threshold below is a knob the rule comment names, not
+        #    a guess; deploy/k8s/overlays/example/prometheus-thresholds.yaml shows how an overlay
+        #    overrides one without copying the file. ──────────────────────────────────────────
+        - alert: LazyviewViewBehindSource
+          # "This view is N seconds behind the source" (review O-01): the gauge is the source's
+          # own clock on both sides (src/engine.rs, SourceClock::lag — a clock the engine measures
+          # at connect and at every housekeeping tick), so it reads 0 while a caught-up view sits
+          # idle and grows with the real age of a backlog. The instance's other age metric,
+          # lazyview_applied_position_age_seconds, also grows while the source is idle and so
+          # stays a diagnostic only: this is the one to alert on. The guard keeps the states
+          # LazyviewDown / LazyviewNotScraped / LazyviewNotStreaming own off this rule: here the
+          # stream is running and only the view is late. 300 s is the shipped default, a
+          # per-deployment setting, not a code constant (owner 2026-11-16): a deployment whose
+          # refresh cadence is normally slower overrides it in its overlay together with the
+          # engine's own cadence knobs (LAZYVIEW_BATCH_WINDOW_MS, LAZYVIEW_HEARTBEAT_MS). `for: 10m`
+          # asks the view to stay behind across several flushes, so one big transaction being
+          # applied does not alert (the number falls back to 0 the moment the view has applied
+          # everything the reader has seen).
+          expr: max by (namespace, job, view) (lazyview_view_source_lag_seconds) > 300 and on (namespace, job) (max by (namespace, job) (lazyview_streaming) == 1)
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "View {{ $labels.view }} of {{ $labels.job }} in {{ $labels.namespace }} is {{ $value }} s behind the source while the stream runs."
+            description: "The view has not applied what the reader has read for that long; 0 means caught up. Which stall state it is: lazyview_view_refresh_failures (a refresh that fails on every attempt — see LazyviewRefreshFailing), lazyview_binlog_backpressure_total (binlog reading held by a build — see LazyviewBinlogReadingPaused), lazyview_stream_reconnect_undecodable_total (the reader stuck on one event — see LazyviewStreamUndecodable). SELECT name, target, state, last_error, refreshed_at FROM _lazyview_state WHERE CONCAT('<schema>.', name) = '{{ $labels.view }}' (the label is schema.view)"
+        - alert: LazyviewBinlogReadingPaused
+          # The "paused reader": binlog reading is held while the changes buffered for building
+          # views sit past their byte budget (src/engine.rs `hold_for_builds`), so the source keeps
+          # writing and nothing is read. The budget is `MemoryBudget::build_hold_bytes`
+          # (src/mem.rs), derived from the memory the pod is given, so the knob this threshold
+          # mirrors is `resources.limits.memory` of deploy/k8s/base/deployment.yaml (an overlay
+          # raises it, or accepts a longer hold). Holding is normal while a view builds its first
+          # version — `for: 30m` therefore asks the holds to keep appearing across two 30 m
+          # windows, not one blip — and while it holds, lazyview_view_source_lag_seconds is what
+          # makes the wait visible instead of green.
+          expr: increase(lazyview_binlog_backpressure_total[30m]) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "lazyview instance {{ $labels.job }} in {{ $labels.namespace }} keeps pausing binlog reading ({{ $value }} holds in the last 30 m): a building view's changes exceed their budget."
+            description: "Look for 'changes buffered for building views exceed their budget; binlog reading paused until a build is applied' (names the buffered MiB) and 'binlog reading resumed' (names how long each hold lasted); lazyview_view_builds_total and lazyview_view_whole_view_refreshes_total say which view is building"
+        - alert: LazyviewBinlogReadingStuck
+          # Same counter, 2 h: a build that never gets applied (its swap keeps losing the table
+          # lock, a build wedged on a source that never answers) holds the reader for good, and
+          # then every view of the instance falls behind while /livez stays green — the hold loop
+          # keeps beating and runs housekeeping on purpose (src/engine.rs `hold_for_builds`), so
+          # nothing but this counter says so.
+          expr: increase(lazyview_binlog_backpressure_total[30m]) > 0
+          for: 2h
+          labels:
+            severity: critical
+          annotations:
+            summary: "lazyview instance {{ $labels.job }} in {{ $labels.namespace }} has been pausing binlog reading for 2 h: a build is not being applied."
+            description: "The reader is held until a build is applied; nothing is read meanwhile. SELECT name, target, state, refreshed_at FROM _lazyview_state (a version stuck in 'building'), and the 'binlog reading paused' WARN lines for the MiB held"
+        - alert: LazyviewTargetBehind
+          # A target that is behind keeps the changes it owes (they are never dropped and the view
+          # is never rebuilt for them — owner rule); once the keys kept for it pass their byte
+          # budget the engine reports the crossing once, in the WARN line and in
+          # `lag_over_budget` (src/engine.rs `report_lag_over_budget`, budget
+          # `MemoryBudget::lag_hold_bytes` of src/mem.rs, again derived from the pod's memory). The
+          # state is harmless for a minute and an alarm for an hour: the kept changes are memory,
+          # and the target's rows are stale the whole time. `for: 30m` matches the 30 m window (the
+          # ladder of target retries reaches its 30 s cap inside it), so a target that answers on
+          # the second or third try never alerts.
+          expr: increase(lazyview_lag_over_budget_total[30m]) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A target of lazyview instance {{ $labels.job }} in {{ $labels.namespace }} has been behind its byte budget for the last 30 m ({{ $value }} crossings)."
+            description: "The WARN line names the view and the target ('the changes kept for this target exceed their N byte budget'); the target is retried with backoff and catches up from the changes kept for it, never by a rebuild. SELECT name, target, state, last_error FROM _lazyview_state WHERE state = 'error'"
+        - alert: LazyviewViewMetricAbsent
+          # A view that stopped publishing statistics is itself a stall state: every per-view rule
+          # above reads a series that is no longer there. This is absent() per namespace and job
+          # rather than the bare absent(): one deployment must not hide another's silence, and an
+          # instance that genuinely has no view definitions publishes no per-view series at all and
+          # must not alert (hence the `lazyview_views > 0` side, from the same scrape). An
+          # instance that publishes nothing at all is LazyviewDown / LazyviewNotScraped.
+          expr: max by (namespace, job) (lazyview_views) > 0 unless on (namespace, job) (count by (namespace, job) (lazyview_view_source_lag_seconds) > 0)
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "lazyview instance {{ $labels.job }} in {{ $labels.namespace }} has {{ $value }} view(s) but publishes no per-view freshness series: the view alerts above are blind."
+            description: "lazyview_views comes from the scrape while no lazyview_view_source_lag_seconds series does, so the statistics task is not publishing (check the pod's log for the stats aggregator and lazyview_stats_batches_dropped_total in the same scrape)"
+        - alert: LazyviewStreamUndecodable
+          # The reader stuck on one event (review A-02): an event whose payload cannot be decoded
+          # or mapped ends the round, and the round re-reads it from the saved boundary on the
+          # connect ladder (1 s doubling to 30 s, src/engine.rs `stream_pause`), so the position
+          # stops moving while /livez stays green (the loop is alive: it is the event that is not).
+          # `> 3` in 5 m is the shape of that ladder — more than three rounds means the same event
+          # has beaten the backoff at least twice, which no transient decode failure does (a
+          # server does not refuse bytes it has just written; the ERROR line names the event's
+          # kind, table and position once per position). The counter never means a change was
+          # dropped: the reader re-reads from the boundary.
+          expr: increase(lazyview_stream_reconnect_undecodable_total[5m]) > 3
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "lazyview instance {{ $labels.job }} in {{ $labels.namespace }} has been reconnecting onto an undecodable binlog event ({{ $value }} rounds in the last 5 m): the applied position is pinned."
+            description: "The ERROR line 'binlog event cannot be decoded' names the kind, table and position once per position; lazyview_applied_position_age_seconds stays above 0 while this rises. Fix the decoder or the event — there is no skip control (see the plan's open question)"

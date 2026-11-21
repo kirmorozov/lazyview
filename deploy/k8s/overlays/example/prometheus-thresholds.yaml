@@ -1,0 +1,50 @@
+# Tuning the shipped alert thresholds of
+# deploy/k8s/components/prometheus/prometheusrule.yaml without copying that file. The thresholds
+# themselves live in the rule expressions (Prometheus reads one string per rule), so an overlay
+# tunes them with a JSON-6902 patch: add this file next to the component in kustomization.yaml,
+#
+#   components:
+#     - ../../components/prometheus
+#   patches:
+#     - path: prometheus-thresholds.yaml
+#
+# The paths are positions in the rule list of the shipped file (`spec.groups[0].rules`), and each
+# op names the alert it is meant for in a `# alert:` comment: a test (tests/health.rs,
+# `alert_rule_file_matches_its_overrides`) fails if a path ever points at another alert than the
+# one its comment names, so a rule added or reordered upstream cannot silently retarget one of
+# these overrides. Tune `for:` the same way — it is the other half of every threshold (a rule
+# alerts only once its condition has held that long).
+- op: replace
+  path: /spec/groups/0/rules/8/expr # alert: LazyviewViewBehindSource
+  # "This view is N seconds behind the source" (the gauge is the source's own clock on both sides,
+  # src/engine.rs `SourceClock::lag`). 300 s is the shipped default and a deployment setting: a
+  # deployment whose refresh cadence is normally slower raises this, a staging namespace that
+  # wants to see a stall early lowers it. Tune it together with the engine's own cadence knobs —
+  # LAZYVIEW_BATCH_WINDOW_MS (how often the queued changes are applied) and LAZYVIEW_HEARTBEAT_MS
+  # (how often the stream proves it is at its head, which is what lets the gauge read 0 while idle).
+  value: max by (namespace, job, view) (lazyview_view_source_lag_seconds) > 60 and on (namespace, job) (max by (namespace, job) (lazyview_streaming) == 1)
+# A view that stays behind only for a shorter burst of flushes is noise here; the reverse (a slow
+# ETL that is legitimately minutes behind) is what the override above is for.
+#  - op: replace
+#    path: /spec/groups/0/rules/8/for # alert: LazyviewViewBehindSource
+#    value: 5m
+# The two hold-budget rules (the paused reader and its 2 h critical twin) mirror
+# `MemoryBudget::build_hold_bytes` and `.lag_hold_bytes` of src/mem.rs, both derived from the
+# memory the pod is given: prefer raising `resources.limits.memory` of the Deployment (see the
+# `patches:` block of kustomization.yaml) over loosening these, and loosen the windows only when
+# a long first build is expected — an initial build of a big view holds binlog reading on purpose.
+#  - op: replace
+#    path: /spec/groups/0/rules/9/expr # alert: LazyviewBinlogReadingPaused
+#    value: increase(lazyview_binlog_backpressure_total[60m]) > 0
+#  - op: replace
+#    path: /spec/groups/0/rules/10/expr # alert: LazyviewBinlogReadingStuck
+#    value: increase(lazyview_binlog_backpressure_total[60m]) > 0
+#  - op: replace
+#    path: /spec/groups/0/rules/11/expr # alert: LazyviewTargetBehind
+#    value: increase(lazyview_lag_over_budget_total[60m]) > 0
+# The reader stuck on one event (the count is the connect ladder: 1 s doubling to 30 s, so more
+# than three rounds in 5 m is the same event beating the backoff twice). Lower it to alert on the
+# very first stuck rounds, on a source where an undecodable event must never be slept through.
+#  - op: replace
+#    path: /spec/groups/0/rules/13/expr # alert: LazyviewStreamUndecodable
+#    value: increase(lazyview_stream_reconnect_undecodable_total[5m]) > 1

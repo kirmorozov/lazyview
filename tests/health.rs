@@ -1000,3 +1000,630 @@ fn lag_reports_the_gap_after_a_restart() {
         Ok(())
     });
 }
+
+// ── The shipped alert rules for the stall states (review O-02) ────────────────────────────────
+// `deploy/k8s/components/prometheus/prometheusrule.yaml` is the only thing standing between "a
+// view stopped advancing while the process runs" and a human being told. Each test below puts one
+// of those states on a real server, scrapes `/metrics` the way Prometheus does, and evaluates the
+// rule's own expression on that scrape: a rule whose series the engine never publishes, whose
+// guard its own state excludes, or whose threshold the state never crosses, fails here rather than
+// in a cluster three months later. The thresholds are read from the file, so tuning one retargets
+// these tests instead of silently passing them.
+
+/// The shipped rule file and the example overlay that tunes it (deploy artifacts, read from the
+/// source tree; the same files `kustomize` renders).
+const RULES_FILE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/deploy/k8s/components/prometheus/prometheusrule.yaml"
+);
+const THRESHOLDS_FILE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/deploy/k8s/overlays/example/prometheus-thresholds.yaml"
+);
+
+fn read_file(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))
+}
+
+/// The `alert:` names of the rule file, in the order they are shipped in (a YAML sequence, so
+/// each line is `- alert: <Name>`).
+fn rule_names(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            t.strip_prefix("- ")
+                .or(Some(t))
+                .and_then(|s| s.strip_prefix("alert: "))
+        })
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// One field of one rule (`expr`, `for`, `severity`): the value after `<field>: ` inside the block
+/// that starts at `alert: <name>` and ends at the next rule.
+fn rule_field(body: &str, alert: &str, field: &str) -> Result<String> {
+    let mut seen = false;
+    for line in body.lines() {
+        let t = line.trim();
+        let bare = t.strip_prefix("- ").unwrap_or(t);
+        if bare == format!("alert: {alert}") {
+            seen = true;
+            continue;
+        }
+        if !seen {
+            continue;
+        }
+        if let Some(next) = bare.strip_prefix("alert: ") {
+            bail!("rule {alert} has no `{field}:` before the next rule ({next}) of {RULES_FILE}");
+        }
+        if let Some(v) = bare.strip_prefix(&format!("{field}: ")) {
+            return Ok(v.trim().to_string());
+        }
+    }
+    bail!("no rule {alert} in {RULES_FILE}")
+}
+
+/// The metric names one expression reads, as they appear in it.
+fn metric_names(expr: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in expr.match_indices("lazyview_") {
+        let rest = &expr[i..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        if !out.iter().any(|s| s == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// The threshold the shipped `LazyviewViewBehindSource` alerts at, read from the file: the test
+/// that covers it holds a view behind the source for exactly that long plus a margin.
+fn behind_source_threshold() -> Result<u64> {
+    let expr = rule_field(&read_file(RULES_FILE)?, "LazyviewViewBehindSource", "expr")?;
+    let rest = expr
+        .split("lazyview_view_source_lag_seconds) > ")
+        .nth(1)
+        .with_context(|| format!("no lag threshold in {expr}"))?;
+    let digits: String = rest
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits
+        .parse::<u64>()
+        .with_context(|| format!("bad lag threshold in {expr}"))
+}
+
+/// One instance counter of a scrape (`lazyview_<name>_total`).
+async fn counter_of(addr: &str, name: &str) -> Result<f64> {
+    let (status, body) = http_get(addr, "/metrics").await?;
+    ensure!(status == 200, "/metrics answered {status}");
+    metric(&body, name).with_context(|| format!("no {name} in the scrape"))
+}
+
+/// `max by (view)` of a per-view series over one scrape — what the rule's own `max by (...)`
+/// computes over the series of every view of the instance. A line is
+/// `lazyview_view_<name>{view="<schema.view>"} <value>`: the value is the last field of it (the
+/// view label is `schema.view`, so no quoting can hide a space in what is parsed here).
+fn per_view_max(body: &str, name: &str) -> f64 {
+    let prefix = format!("{name}{{view=\"");
+    body.lines()
+        .filter(|l| l.starts_with(&prefix))
+        .filter_map(|l| l.rsplit_once(' ')?.1.trim().parse::<f64>().ok())
+        .fold(0.0_f64, f64::max)
+}
+
+/// How many views publish one per-view series (the `count by (...)` of a rule).
+fn per_view_count(body: &str, name: &str) -> usize {
+    let prefix = format!("{name}{{view=\"");
+    body.lines().filter(|l| l.starts_with(&prefix)).count()
+}
+
+/// `LazyviewViewMetricAbsent`'s expression as one scrape answers it: the instance reports views,
+/// and no view publishes the freshness series the other rules read (`max by (namespace, job)
+/// (lazyview_views) > 0 unless on (...) (count by (...) (lazyview_view_source_lag_seconds) > 0)`).
+fn view_metric_absent(views: f64, published: usize) -> bool {
+    views > 0.0 && published == 0
+}
+
+/// The rule file as a deliverable (no server): every stall state the review names has a rule, the
+/// thresholds and windows are the ones the comments cite, every metric a new rule reads is one the
+/// engine really publishes, and the example overlay's threshold overrides still point at the
+/// alerts their comments name (a rule inserted upstream must not silently retarget one).
+#[test]
+fn alert_rule_file_matches_its_overrides() {
+    init_env();
+    let body = read_file(RULES_FILE).unwrap();
+    let names = rule_names(&body);
+    // The rules that shipped before the observability plan, unchanged and in order, then the ones
+    // that answer review O-02's list of states.
+    assert_eq!(
+        names,
+        vec![
+            "LazyviewDown",
+            "LazyviewUnavailable",
+            "LazyviewNotScraped",
+            "LazyviewNotStreaming",
+            "LazyviewViewsInError",
+            "LazyviewViewsNotLive",
+            "LazyviewRefreshFailing",
+            "LazyviewRefreshErrors",
+            "LazyviewViewBehindSource",
+            "LazyviewBinlogReadingPaused",
+            "LazyviewBinlogReadingStuck",
+            "LazyviewTargetBehind",
+            "LazyviewViewMetricAbsent",
+            "LazyviewStreamUndecodable",
+        ],
+        "the shipped rule list changed"
+    );
+    // Severity and window of each new rule, as the plan set them (a threshold without its `for:`
+    // is only half a threshold: a rule alerts once the condition has held that long).
+    for (alert, sev, window) in [
+        ("LazyviewViewBehindSource", "warning", "10m"),
+        ("LazyviewBinlogReadingPaused", "warning", "30m"),
+        ("LazyviewBinlogReadingStuck", "critical", "2h"),
+        ("LazyviewTargetBehind", "warning", "30m"),
+        ("LazyviewViewMetricAbsent", "warning", "15m"),
+        ("LazyviewStreamUndecodable", "critical", "2m"),
+    ] {
+        assert_eq!(
+            rule_field(&body, alert, "severity").unwrap(),
+            sev,
+            "{alert} severity"
+        );
+        assert_eq!(
+            rule_field(&body, alert, "for").unwrap(),
+            window,
+            "{alert} for"
+        );
+    }
+    // The numbers the plan named, and the guard that keeps the late-view rule off the states
+    // LazyviewDown / LazyviewNotScraped / LazyviewNotStreaming already own.
+    assert_eq!(behind_source_threshold().unwrap(), 300, "lag threshold");
+    let lag_expr = rule_field(&body, "LazyviewViewBehindSource", "expr").unwrap();
+    assert!(
+        lag_expr.contains("lazyview_streaming) == 1"),
+        "the late-view rule must be guarded by the stream being up: {lag_expr}"
+    );
+    for (alert, needle) in [
+        (
+            "LazyviewBinlogReadingPaused",
+            "increase(lazyview_binlog_backpressure_total[30m]) > 0",
+        ),
+        (
+            "LazyviewBinlogReadingStuck",
+            "increase(lazyview_binlog_backpressure_total[30m]) > 0",
+        ),
+        (
+            "LazyviewTargetBehind",
+            "increase(lazyview_lag_over_budget_total[30m]) > 0",
+        ),
+        (
+            "LazyviewStreamUndecodable",
+            "increase(lazyview_stream_reconnect_undecodable_total[5m]) > 3",
+        ),
+    ] {
+        assert_eq!(
+            rule_field(&body, alert, "expr").unwrap(),
+            needle,
+            "{alert} expr"
+        );
+    }
+    // Every metric the new rules read is one the engine publishes: the name, stripped of the
+    // `lazyview_` prefix, the `view_` of a per-view series and the `_total` of a counter, must
+    // appear in the source that defines it (src/metrics.rs's `counters!`, the gauges of
+    // src/health/prometheus.rs, the per-view series of src/stats.rs).
+    let defs = [
+        read_file(concat!(env!("CARGO_MANIFEST_DIR"), "/src/metrics.rs")).unwrap(),
+        read_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/health/prometheus.rs"
+        ))
+        .unwrap(),
+        read_file(concat!(env!("CARGO_MANIFEST_DIR"), "/src/stats.rs")).unwrap(),
+    ]
+    .join("\n");
+    for alert in names.iter().skip(8) {
+        let expr = rule_field(&body, alert, "expr").unwrap();
+        for m in metric_names(&expr) {
+            let base = m
+                .trim_start_matches("lazyview_")
+                .trim_start_matches("view_")
+                .trim_end_matches("_total");
+            assert!(
+                defs.contains(base),
+                "{alert} reads {m}, which no exporter of this build publishes"
+            );
+        }
+    }
+    // The overlay's overrides: each `path:` must land on the alert its `# alert:` comment names.
+    let mut checked = 0;
+    for line in read_file(THRESHOLDS_FILE).unwrap().lines() {
+        let t = line.trim().trim_start_matches('#').trim();
+        let Some(at) = t.find("path: /spec/groups/0/rules/") else {
+            continue;
+        };
+        let rest = &t[at + "path: /spec/groups/0/rules/".len()..];
+        let slash = rest
+            .find('/')
+            .with_context(|| format!("bad path {t}"))
+            .unwrap();
+        let idx: usize = rest[..slash]
+            .parse()
+            .with_context(|| format!("bad index {t}"))
+            .unwrap();
+        let field = rest[slash + 1..].split('#').next().unwrap().trim();
+        assert!(
+            ["expr", "for"].contains(&field),
+            "an override must target expr or for, not {field}"
+        );
+        let named = t
+            .split("# alert: ")
+            .nth(1)
+            .with_context(|| format!("{t} names no alert"))
+            .unwrap()
+            .trim();
+        assert_eq!(
+            names.get(idx).map(String::as_str),
+            Some(named),
+            "the overlay override of rules/{field} points at another rule"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 2, "the overlay documents {checked} overrides");
+    // And the override it does ship changes only the number, not the shape of the expression.
+    let over = read_file(THRESHOLDS_FILE).unwrap();
+    assert!(
+        over.contains("lazyview_view_source_lag_seconds) > 60 and on (namespace, job)"),
+        "the example override of the lag threshold must keep the rule's guard"
+    );
+}
+
+/// The two stall states one held reader produces, on a real server: binlog reading is paused
+/// because the changes buffered for a building view sit past their byte budget
+/// (`LAZYVIEW_TEST_BUILD_HOLD_BYTES=1`, the build sleeping on `LAZYVIEW_TEST_BUILD_DELAY`), so the
+/// source keeps writing and nothing is read. That is `LazyviewBinlogReadingPaused` —
+/// `lazyview_binlog_backpressure_total` climbing — and, for the view whose changes wait behind the
+/// hold, `LazyviewViewBehindSource`: its gauge crosses the shipped 300 s while the rule's guard,
+/// `lazyview_streaming == 1`, still holds. `/livez` and `/readyz` stay green the whole time: this
+/// is the blind spot the review names. When the build lands, the changes the hold kept are applied
+/// in full (the view ends as its oracle's rows, which is what the hold exists to keep true) and the
+/// number returns to 0, so the rule resolves on its own.
+#[test]
+fn alert_rules_behind_source_and_paused_reader() {
+    init_env();
+    scenario("alert_behind_source", |ctx| async move {
+        let db = ctx.new_db("alert_behind").await?;
+        lag_seed(&db, 200).await?;
+        let behind = behind_source_threshold()?;
+        let addr = free_local_addr()?;
+        let (mut eng, _) = start_with_views(
+            &ctx,
+            &db,
+            &[lag_view()],
+            &[
+                ("LAZYVIEW_HEALTH_ADDR", addr.as_str()),
+                ("LAZYVIEW_HEARTBEAT_MS", "500"),
+                ("LAZYVIEW_TEST_BUILD_HOLD_BYTES", "1"),
+                // Longer than the threshold plus the test's margin: the hold must outlast the
+                // crossing, or the rule would never see it.
+                ("LAZYVIEW_TEST_BUILD_DELAY", "/*alert_hold*/:420000"),
+            ],
+        )
+        .await?;
+        let key = format!("{}.vs_lag", db.name);
+        lag_wait_zero(&addr, &key, Duration::from_secs(90)).await?;
+        let before = eng.snapshot();
+        let ready_before = {
+            let (_, body) = http_get(&addr, "/metrics").await?;
+            metric(&body, "lazyview_views_ready").context("no lazyview_views_ready")?
+        };
+        let hkey = format!("{}.vs_hold", db.name);
+        let mut c = db.conn().await?;
+        add_views(
+            &mut c,
+            &[ViewSpec::new(
+                "vs_hold",
+                Kind::Incremental,
+                "SELECT grp, MAX(val) AS mx FROM entity WHERE /*alert_hold*/ 1=1 GROUP BY grp",
+            )],
+        )
+        .await?;
+        wait_state(
+            &mut c,
+            &mut eng,
+            "vs_hold",
+            "building",
+            Duration::from_secs(60),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await; // into the build's sleep
+        lag_rows(&db, 1001, 300).await?; // what queues behind the held reader
+        let base = counter_of(&addr, "lazyview_binlog_backpressure_total").await?;
+        // Both rule expressions evaluated on the same scrapes, until they are true.
+        let t = Instant::now();
+        let (lag, holds) = loop {
+            let (status, body) = http_get(&addr, "/metrics").await?;
+            ensure!(status == 200, "/metrics answered {status}");
+            let lag = per_view_max(&body, "lazyview_view_source_lag_seconds");
+            let holds = metric(&body, "lazyview_binlog_backpressure_total").unwrap_or(0.0);
+            if lag > behind as f64 && holds > base {
+                // The rule's guard: the stream is up, so this state is nobody else's alert.
+                ensure!(
+                    metric(&body, "lazyview_streaming") == Some(1.0),
+                    "the reader is held but the scrape says the stream is down: the guard of \
+                     LazyviewViewBehindSource would swallow this state"
+                );
+                break (lag, holds);
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(behind + 240),
+                "neither rule ever became true behind the held reader: lag {lag} s (needs > \
+                 {behind} s), holds {holds} (was {base}), after {:?}",
+                t.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        };
+        // The probes and the old rules still say the instance is healthy, and no view was rebuilt
+        // to get here (owner rule).
+        assert_alive(&addr, "while the reader is held").await?;
+        let (status, _) = http_get(&addr, K8S_READY).await?;
+        ensure!(status == 200, "/readyz while the reader is held: {status}");
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.binlog_backpressure >= 1,
+            "the hold was never counted in binlog_backpressure: {d:?}"
+        );
+        let (_, body) = http_get(&addr, "/metrics").await?;
+        ensure!(
+            metric(&body, "lazyview_views_ready").unwrap_or(0.0) >= ready_before,
+            "the ready view lost its live version while the reader was held"
+        );
+        // The WARN line the rule's description points an operator at is really written.
+        let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+        ensure!(
+            log.contains("binlog reading paused until a build is applied"),
+            "the hold was never reported in the log: {}",
+            eng.log_path.display()
+        );
+        ctx.log(format!(
+            "alert_behind_source: {lag:.0} s behind a running stream and {holds:.0} reader holds \
+             in {:?} (threshold {behind} s)",
+            t.elapsed()
+        ));
+        // The resolve side: the build lands, the queue is applied in full, both rules go quiet.
+        wait_state(
+            &mut c,
+            &mut eng,
+            "vs_hold",
+            "ready",
+            Duration::from_secs(240),
+        )
+        .await?;
+        lag_wait_zero(&addr, &key, Duration::from_secs(240)).await?;
+        lag_wait_zero(&addr, &hkey, Duration::from_secs(240)).await?;
+        lag_rows_match(&mut c, "vs_lag").await?;
+        c.disconnect().await.ok();
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// `LazyviewTargetBehind` and `LazyviewViewMetricAbsent`, on a real server. The first: the target
+/// stops accepting writes (a `BEFORE INSERT` trigger on the view's own table — neither an overload
+/// nor a connection error, so the engine keeps the changes it owes rather than re-planning them)
+/// and the source keeps writing, so the changes kept for it pass their one-byte budget
+/// (`LAZYVIEW_TEST_LAG_HOLD_BYTES=1`). That crossing is the whole expression of the rule: it is
+/// counted once per crossing in `lazyview_lag_over_budget_total` and reported in the WARN line the
+/// rule's description quotes. Nothing is dropped and nothing is rebuilt (owner rule), `/livez`
+/// stays green, and when the target answers again the kept changes are applied. The second rule:
+/// the per-view freshness series every other rule of that family reads.
+#[test]
+fn alert_rules_target_behind_and_view_metric_absent() {
+    init_env();
+    scenario("alert_target_behind", |ctx| async move {
+        let db = ctx.new_db("alert_target").await?;
+        lag_seed(&db, 200).await?;
+        let addr = free_local_addr()?;
+        let (eng, _) = start_with_views(
+            &ctx,
+            &db,
+            &[lag_view()],
+            &[
+                ("LAZYVIEW_HEALTH_ADDR", addr.as_str()),
+                ("LAZYVIEW_HEARTBEAT_MS", "500"),
+                // The failure here is a target that will not take writes, not congestion: the
+                // supervisor must not read it as load (the setting the regression's down-target
+                // case uses for the same reason).
+                ("LAZYVIEW_SUPERVISOR", "off"),
+                ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "1"),
+            ],
+        )
+        .await?;
+        let key = format!("{}.vs_lag", db.name);
+        lag_wait_zero(&addr, &key, Duration::from_secs(90)).await?;
+        // `LazyviewViewMetricAbsent` on the healthy instance first, while every view is known to
+        // publish: views are reported and every one of them publishes its freshness series, so the
+        // rule must be silent. Its other two branches are the same scrape with the series removed
+        // (a statistics task that stopped publishing — what the rule exists for) and an instance
+        // with no view definitions at all, which publishes no per-view series and is not a stall
+        // state.
+        let (status, body) = http_get(&addr, "/metrics").await?;
+        ensure!(status == 200, "/metrics: {status}");
+        let views = metric(&body, "lazyview_views").context("no lazyview_views")?;
+        let published = per_view_count(&body, "lazyview_view_source_lag_seconds");
+        ensure!(
+            views >= 1.0 && published == views as usize,
+            "{views} views and only {published} freshness series on a healthy instance"
+        );
+        ensure!(
+            !view_metric_absent(views, published),
+            "the absent-rule fired on an instance whose views all publish"
+        );
+        ensure!(
+            view_metric_absent(views, 0),
+            "the absent-rule stays silent when the freshness series are gone"
+        );
+        ensure!(
+            !view_metric_absent(0.0, 0),
+            "the absent-rule alerts on a deployment that simply has no views"
+        );
+        let before = eng.snapshot();
+        let base = counter_of(&addr, "lazyview_lag_over_budget_total").await?;
+        // The fault, then the changes that pile up behind it.
+        let mut block = db.conn().await?;
+        exec(
+            &mut block,
+            "CREATE TRIGGER lv_block BEFORE INSERT ON vs_lag FOR EACH ROW \
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'lazyview test: the target refuses writes'",
+        )
+        .await?;
+        let t = Instant::now();
+        let mut next = 1001_i64;
+        let over = loop {
+            lag_rows(&db, next, 300).await?;
+            next += 300;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let v = counter_of(&addr, "lazyview_lag_over_budget_total").await?;
+            if v > base {
+                break v;
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(180),
+                "lazyview_lag_over_budget_total never moved past {base}: the kept changes never \
+                 passed their budget"
+            );
+        };
+        assert_alive(&addr, "while a target was behind").await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.full_rebuilds == 0,
+            "a target that is behind keeps its changes; it is never rebuilt for them: {d:?}"
+        );
+        let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+        ensure!(
+            log.contains("the changes kept for this target exceed their"),
+            "the rule's description quotes a WARN line the engine never writes: {}",
+            eng.log_path.display()
+        );
+        ctx.log(format!(
+            "alert_target_behind: lag_over_budget {base} -> {over:.0} in {:?}, {published} views \
+             publishing their freshness series",
+            t.elapsed()
+        ));
+        // The resolve side: the target answers again, the changes it owed are applied from what
+        // was kept for it (no rebuild), and the view is its oracle's rows again.
+        exec(&mut block, "DROP TRIGGER lv_block").await?;
+        block.disconnect().await.ok();
+        let mut c = db.conn().await?;
+        let t = Instant::now();
+        loop {
+            if lag_rows_match(&mut c, "vs_lag").await.is_ok() {
+                break;
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(180),
+                "the target never caught up from the changes kept for it"
+            );
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+        ensure!(
+            eng.snapshot().since(&before).target_catchups >= 1,
+            "the catch-up was not counted: the rule's backstop would not see it either"
+        );
+        c.disconnect().await.ok();
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// `LazyviewStreamUndecodable` on a real server: `LAZYVIEW_TEST_UNDECODABLE_ROWS` makes the reader
+/// refuse the next rows events of a table a view reads — no server gives a reason to fail on bytes
+/// it has just written, so the hook stands in for the decoder bug while the handling is the real
+/// one. The reader re-reads the same event from the saved boundary on the connect ladder, so the
+/// rule's counter is the only thing that says so: more than three rounds in 5 m is the shape of
+/// that ladder, `/livez` stays green and the applied position does not move. Nothing is dropped:
+/// once the rounds are through, the rows land in full and the view is caught up.
+#[test]
+fn alert_rules_stream_undecodable() {
+    init_env();
+    scenario("alert_undecodable", |ctx| async move {
+        let db = ctx.new_db("alert_undecodable").await?;
+        lag_seed(&db, 100).await?;
+        let addr = free_local_addr()?;
+        let (eng, _) = start_with_views(
+            &ctx,
+            &db,
+            &[lag_view()],
+            &[
+                ("LAZYVIEW_HEALTH_ADDR", addr.as_str()),
+                ("LAZYVIEW_HEARTBEAT_MS", "500"),
+                ("LAZYVIEW_TEST_UNDECODABLE_ROWS", "6"),
+            ],
+        )
+        .await?;
+        let key = format!("{}.vs_lag", db.name);
+        lag_wait_zero(&addr, &key, Duration::from_secs(90)).await?;
+        let pinned = eng.applied().context("no applied position at ready")?;
+        let base = counter_of(&addr, "lazyview_stream_reconnect_undecodable_total").await?;
+        lag_rows(&db, 1001, 10).await?; // the events the reader is about to refuse
+                                        // The rule's own side: `increase(...[5m]) > 3` is this counter having moved by more than
+                                        // three rounds, and the state that goes with it — alive, position pinned, series published.
+        let t = Instant::now();
+        let stuck = loop {
+            let (status, body) = http_get(&addr, "/metrics").await?;
+            ensure!(status == 200, "/metrics answered {status}");
+            let v = metric(&body, "lazyview_stream_reconnect_undecodable_total").unwrap_or(0.0);
+            if v > base + 3.0 {
+                break v;
+            }
+            let (code, _) = http_get(&addr, "/livez").await?;
+            ensure!(
+                code == 200,
+                "/livez while the reader is stuck on one event: {code}"
+            );
+            ensure!(
+                eng.applied().as_ref() == Some(&pinned),
+                "the position moved while the reader was coming back to the same event"
+            );
+            ensure!(
+                t.elapsed() < Duration::from_secs(120),
+                "lazyview_stream_reconnect_undecodable_total stayed at {v:.0} (base {base}): the \
+                 reader never re-read the event it refused"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        ctx.log(format!(
+            "alert_undecodable: {stuck:.0} stuck rounds ({base:.0} before) in {:?}",
+            t.elapsed()
+        ));
+        // The counter never means a lost change, and it is the signal rather than the stream
+        // gauge: while the reader backs off from the event its connection is down by design
+        // (`lazyview_streaming` dips with each round), and it is back at 1 once the event is
+        // through — with the rows of the refused events applied in full.
+        lag_wait_zero(&addr, &key, Duration::from_secs(180)).await?;
+        // The gauge dips with every backoff pause, so the stream coming back is waited for, not
+        // sampled at one instant: the last round must end in a connected reader.
+        let t = Instant::now();
+        loop {
+            let (_, body) = http_get(&addr, "/metrics").await?;
+            if metric(&body, "lazyview_streaming") == Some(1.0) {
+                break;
+            }
+            ensure!(
+                t.elapsed() < Duration::from_secs(90),
+                "the stream never came back after the rounds were through"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let mut c = db.conn().await?;
+        lag_rows_match(&mut c, "vs_lag").await?;
+        c.disconnect().await.ok();
+        eng.stop().await?;
+        Ok(())
+    });
+}

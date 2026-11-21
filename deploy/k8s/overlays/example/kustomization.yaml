@@ -16,7 +16,8 @@ resources:
 components:
   # Only Prometheus (namespace `monitoring`) may connect to port 8080; kubelet probes always may.
   - ../../components/network-policy
-  # With the Prometheus Operator installed:
+  # With the Prometheus Operator installed (its alert thresholds are deployment settings:
+  # add prometheus-thresholds.yaml to the `patches:` below when you enable this):
   # - ../../components/prometheus
 
 # `edge` is the latest build of main. After the first release (git tag v0.1.0) use
