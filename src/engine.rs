@@ -5696,7 +5696,14 @@ impl Engine {
     /// As [`Self::flush_due`], with the deadline passed by at least `late`.
     fn flush_due_within(&self, late: Duration) -> bool {
         match self.flush_deadline() {
-            Some(d) => Instant::now() >= d + late || self.key_count() >= self.cfg.batch_max_keys,
+            // The core's byte bound is a third trigger (decision 7 / D5): crossing it makes the
+            // next item boundary flush, so the reader keeps its pause in the drain queue
+            // (`flush_draining`) instead of the buffers growing past the bound.
+            Some(d) => {
+                Instant::now() >= d + late
+                    || self.key_count() >= self.cfg.batch_max_keys
+                    || self.dedup.core.over_bound()
+            }
             None => false,
         }
     }
@@ -5727,6 +5734,15 @@ impl Engine {
             self.leader_hold = Some(Instant::now() + self.cfg.lock_heartbeat);
             debug!("flush held: the leadership lock does not allow new writes right now");
             return Ok(());
+        }
+        // Decision 7 / D5: the core's byte bound forces this flush. It is a backstop, not the
+        // reader's brake — the drain queue (`flush_draining`, counted in `binlog_backpressure`)
+        // is what pauses the reader when a flush cannot shrink the buffers (targets backing off).
+        if self.dedup.core.over_bound() {
+            debug!(
+                bytes = self.dedup.core.bytes(),
+                "dedup buffers over their bound: flushing"
+            );
         }
         self.leader_hold = None;
         let started = Instant::now();
