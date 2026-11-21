@@ -62,27 +62,58 @@ const A: &[&str] = &[
 /// Corpus `B` — `tests/targets.rs:447-450`.
 const B: &[&str] = &[
     "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL)",
-    "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL)",
+    "CREATE TABLE items (id INT PRIMARY KEY, owner_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL)",
     "INSERT INTO entities VALUES (1,'alpha'),(2,'beta'),(3,'gamma')",
     "INSERT INTO items VALUES (1,1,10.50),(2,1,20.25),(3,2,5.00),(4,3,7.75),(5,2,0.00)",
 ];
 
 /// Corpus `B` widened by the `VARCHAR(2000)` column E11 needs ("corpus `B` widened by the extra
-/// column"), so the declared key over `(name, total, entity_id)` overflows the key budget.
+/// column"), so the declared key over `(name, total, owner_id)` overflows the key budget.
 const BW: &[&str] = &[
     "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL)",
-    "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL, \
+    "CREATE TABLE items (id INT PRIMARY KEY, owner_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL, \
      name VARCHAR(2000) NOT NULL DEFAULT 'x')",
     "INSERT INTO entities VALUES (1,'alpha'),(2,'beta'),(3,'gamma')",
     "INSERT INTO items VALUES (1,1,10.50,'a'),(2,1,20.25,'b'),(3,2,5.00,'c'),(4,3,7.75,'d'),(5,2,0.00,'e')",
 ];
 
+/// Corpus `B` widened by the integer widths E11's byte accounting is made of: the target id
+/// (`id INT`) beside `big BIGINT UNSIGNED` and `small TINYINT`, and a `wide VARCHAR(K)` whose
+/// width `K` is what the two E11 width sub-cases flip over. The declared key
+/// `(id, big, small, wide)` is then 4 + 8 + 1 fixed bytes plus `K` characters at 4 bytes each
+/// (unknown charset = utf8mb4), so the point where it flips from accepted to refused says what
+/// each part was sized at: a plan that sizes `BIGINT UNSIGNED` like `TINYINT` moves the
+/// MySQL-family boundary from 764/765 characters to 766/767 and fails one of the two legs.
+fn bu(k: u32) -> &'static [&'static str] {
+    own_strs(vec![
+        Box::leak(
+            format!(
+                "CREATE TABLE items (id INT PRIMARY KEY, big BIGINT UNSIGNED NOT NULL, small \
+                 TINYINT NOT NULL, wide VARCHAR({k}) NOT NULL DEFAULT 'x')"
+            )
+            .into_boxed_str(),
+        ),
+        // The extremes of both integer parts: the u64 maximum (no PostgreSQL type holds it) and
+        // both ends of the signed TINYINT range, so a signed/unsigned mix-up shows in the data too.
+        Box::leak(
+            "INSERT INTO items VALUES (1,18446744073709551615,127,'a'),(2,0,-128,'b'),\
+             (3,9223372036854775807,0,'c')"
+                .to_string()
+                .into_boxed_str(),
+        ),
+    ])
+}
+
 // The (a) scripts, verbatim from expectations.md.
 const SEL_TOTALS: &str =
-    "SELECT entity_id, SUM(amount) AS total, COUNT(*) AS n FROM items GROUP BY entity_id";
+    "SELECT owner_id, SUM(amount) AS total, COUNT(*) AS n FROM items GROUP BY owner_id";
 const SEL_STATUS: &str = "SELECT id, grp, status FROM entities";
 const SEL_NAMES: &str = "SELECT id, name FROM entities";
-const SEL_LINKS: &str = "SELECT e.id AS id, e.name AS name, i.amount AS amount FROM entities e JOIN items i ON i.entity_id = e.id";
+const SEL_LINKS: &str = "SELECT e.id AS id, e.name AS name, i.amount AS amount FROM entities e JOIN items i ON i.owner_id = e.id";
+/// E11's width case over corpus `bu(K)`: a plain projection, so every view column keeps the source
+/// column's own declared type — an aggregate of `wide` would not be the varchar the user declares a
+/// key over (the shape of `SEL_STATUS`).
+const SEL_WIDE: &str = "SELECT id, big, small, wide FROM items";
 
 /// The virtual generated column of H8/E3 (D4: declared as an explicit follow-up statement; the
 /// verb's exact spelling is Q1b/OPEN, this is D4's own wording).
@@ -794,17 +825,17 @@ const CASE_H4: Case = Case {
     ddl: B,
     view: "item_totals",
     select: SEL_TOTALS,
-    decls: &["CREATE INDEX i_tot_ent ON item_totals (total, entity_id)"],
-    declared: &[decl("i_tot_ent", &["total", "entity_id"])],
+    decls: &["CREATE INDEX i_tot_ent ON item_totals (total, owner_id)"],
+    declared: &[decl("i_tot_ent", &["total", "owner_id"])],
     err: &[],
     no_table: false,
     pg: true,
 };
 
 /// H4 — multi-column index, order significant. `happy · MYF · PG`
-/// (a) H1's view + `CREATE INDEX i_tot_ent ON item_totals (total, entity_id);` (b) corpus `B`;
-/// (c) `IDX = E ∪ { i_tot_ent (total, entity_id) non-unique }` asserted in `SEQ_IN_INDEX` order, so
-/// `(entity_id, total)` fails the test; PG: `item_totals_i_tot_ent (total, entity_id)`.
+/// (a) H1's view + `CREATE INDEX i_tot_ent ON item_totals (total, owner_id);` (b) corpus `B`;
+/// (c) `IDX = E ∪ { i_tot_ent (total, owner_id) non-unique }` asserted in `SEQ_IN_INDEX` order, so
+/// `(owner_id, total)` fails the test; PG: `item_totals_i_tot_ent (total, owner_id)`.
 #[test]
 fn idx_multi_column_order_matters() {
     scenario("idx_multi_column_order_matters", |ctx| async move {
@@ -1409,7 +1440,7 @@ fn idx_declared_during_inflight_build() {
         // (b) 200 more `items` rows so the backfill lasts.
         let vals: Vec<String> = (100..300).map(|i| format!("({i},1,{i}.50)")).collect();
         let extra = format!(
-            "INSERT INTO items (id, entity_id, amount) VALUES {}",
+            "INSERT INTO items (id, owner_id, amount) VALUES {}",
             vals.join(",")
         );
         let mut all: Vec<&str> = B.to_vec();
@@ -1559,12 +1590,12 @@ fn idx_resume_after_interrupted_reconcile() {
         // (c) the rows are the oracle's.
         let got = rows(
             &mut c2,
-            "SELECT entity_id, total, n FROM item_totals ORDER BY entity_id",
+            "SELECT owner_id, total, n FROM item_totals ORDER BY owner_id",
         )
         .await?;
         let want = rows(
             &mut c2,
-            "SELECT entity_id, SUM(amount), COUNT(*) FROM items GROUP BY entity_id ORDER BY entity_id",
+            "SELECT owner_id, SUM(amount), COUNT(*) FROM items GROUP BY owner_id ORDER BY owner_id",
         )
         .await?;
         ensure!(
@@ -1659,8 +1690,8 @@ const DECL_V_ENT: &str = "CREATE INDEX i_total ON v_ent (status)";
 
 /// E7 — an index-name collision between two views on the same target database.
 /// `edge · MYF (per-table names) · PG (schema-wide names)`
-/// (a) `v_items` = `CREATE VIEW v_items AS SELECT entity_id, SUM(amount) AS total FROM items GROUP BY
-/// entity_id;` + `CREATE INDEX i_total ON v_items (total);`, and `v_ent` = `CREATE VIEW v_ent AS
+/// (a) `v_items` = `CREATE VIEW v_items AS SELECT owner_id, SUM(amount) AS total FROM items GROUP BY
+/// owner_id;` + `CREATE INDEX i_total ON v_items (total);`, and `v_ent` = `CREATE VIEW v_ent AS
 /// SELECT id, status FROM entities;` + `CREATE INDEX i_total ON v_ent (status);`, both on the same
 /// instance/schema; (b) corpus `B`; (c) MYF: both tables keep `i_total` with their own columns, no
 /// error; PG: names are schema-wide (the reason src/target/postgres.rs:721-723 prefixes the table
@@ -1780,7 +1811,7 @@ fn idx_name_collision_two_views() {
     });
 }
 
-const SEL_V_ITEMS: &str = "SELECT entity_id, SUM(amount) AS total FROM items GROUP BY entity_id";
+const SEL_V_ITEMS: &str = "SELECT owner_id, SUM(amount) AS total FROM items GROUP BY owner_id";
 
 /// E8 — unsupported index forms must fail at PARSE with a clear error. `edge · MYF · PG`
 /// (a) each of `((UPPER(total)))`, `(total(4))`, `USING HASH`, `WITH (fillfactor=70)`,
@@ -1966,25 +1997,29 @@ fn idx_unknown_column_errors() {
 
 /// E11 — a declared index too wide for the engine's key budget. `edge · MYF · PG`
 /// (a) H1's view plus a wide text column: `CREATE INDEX i_wide ON item_totals (name, total,
-/// entity_id);` where `name` is `VARCHAR(2000)` (so `(3072|2704) * 4` bytes overflow), and separately
+/// owner_id);` where `name` is `VARCHAR(2000)` (so `(3072|2704) * 4` bytes overflow), and separately
 /// a 17-column index; (b) corpus `B` widened by the extra column; (c) a named error from the existing
 /// budget seam (`MY_KEY_BYTES 3072` / `PG_KEY_BYTES 2704` / `MAX_KEY_PARTS 16`, `fit_key` → `None`,
 /// src/target/mod.rs:575-596, 695-752) that quotes the budget and the offending index; `IDX = E` on
 /// **every** target the view has, including the one whose budget alone was too tight (`min_key_budget`
 /// is the tightest over targets — the error must say which target); no partial index is created
-/// anywhere.
+/// anywhere. Two further legs pin WHAT the budget is computed FROM, not just the words it quotes:
+/// the composite key `(id INT, big BIGINT UNSIGNED, small TINYINT, wide VARCHAR(K))` over corpus
+/// `bu(K)`, accepted at K = 764 (13 fixed bytes + 764 characters at 4 bytes) and refused at
+/// K = 765, so a plan that sizes the unsigned 64-bit part like the 1-byte one, or that renders the
+/// wider key with a prefix the user never wrote, fails one of the two.
 #[test]
 fn idx_over_budget_errors_with_reason() {
     scenario("idx_over_budget_errors_with_reason", |ctx| async move {
         for (tag, decl, name) in [
             (
                 "idx_e11_wide",
-                "CREATE INDEX i_wide ON item_totals (name, total, entity_id)",
+                "CREATE INDEX i_wide ON item_totals (name, total, owner_id)",
                 "i_wide",
             ),
             (
                 "idx_e11_parts",
-                "CREATE INDEX i_many ON item_totals (entity_id, total, n, name, name, name, name, \
+                "CREATE INDEX i_many ON item_totals (owner_id, total, n, name, name, name, name, \
                  name, name, name, name, name, name, name, name, name, name)",
                 "i_many",
             ),
@@ -1994,8 +2029,8 @@ fn idx_over_budget_errors_with_reason() {
                 tag,
                 ddl: BW,
                 view: "item_totals",
-                select: "SELECT entity_id, SUM(amount) AS total, COUNT(*) AS n, MAX(name) AS name \
-                         FROM items GROUP BY entity_id",
+                select: "SELECT owner_id, SUM(amount) AS total, COUNT(*) AS n, MAX(name) AS name \
+                         FROM items GROUP BY owner_id",
                 decls: own_strs(vec![decl]),
                 declared: own_decls(vec![decl_(name)]),
                 err: own_strs(vec![name]),
@@ -2004,42 +2039,93 @@ fn idx_over_budget_errors_with_reason() {
             }));
             // (c) on every target the view has, the declared index is refused, not created.
             case_both(&ctx, case).await?;
-            let (_db, mut eng, mut sc) = open(&ctx, tag, BW, &spec_of(case, None), &[]).await?;
-            // (c) the error quotes the budget and says which target's budget was the tightest.
-            let row = settle(
-                &mut eng,
-                &mut sc,
-                "E11",
-                "item_totals",
-                "source",
-                "error",
-                Duration::from_secs(60),
-            )
-            .await?;
-            let msg = row.last_error.clone().unwrap_or_default();
-            let quoted = ["3072", "2704", "16", "key", "budget"];
-            ensure!(
-                quoted.iter().any(|w| msg.to_ascii_lowercase().contains(w)),
-                "E11 (c): {name}: the error must quote the key budget (MY_KEY_BYTES 3072 / \
-                 PG_KEY_BYTES 2704 / MAX_KEY_PARTS 16); it says: {msg:?}",
-            );
-            ensure!(
-                msg.to_ascii_lowercase().contains("target")
-                    || msg.to_ascii_lowercase().contains("postgres")
-                    || msg.to_ascii_lowercase().contains("mysql"),
-                "E11 (c): {name}: the error must say which target's budget was too tight; it says: {msg:?}",
-            );
-            // (c) no partial index anywhere.
-            let got = myf_idx(&mut sc, "item_totals").await?;
-            ensure!(
-                got.iter().all(|(n, ..)| n != name),
-                "E11 (c): the over-budget index `{name}` was created anyway: {got:?}",
-            );
-            drop(_db);
-            eng.stop().await?;
+            budget_refusal(&ctx, tag, case, name).await?;
+        }
+        // The same key at the two sides of the BYTE budget, over corpus `bu(K)`: `(id, big, small,
+        // wide)` is 4 (INT, the target id) + 8 (`BIGINT UNSIGNED`) + 1 (`TINYINT`) fixed bytes plus
+        // `K` characters at 4 bytes each, so `wide` fits whole up to (3072 - 13) / 4 = 764
+        // characters. `idx_e11_width_fit` must carry the key exactly as declared, and one character
+        // more must be refused rather than silently rendered as `wide(764)` (E8 refuses a prefix the
+        // user never wrote). Together the two legs pin the per-part width and signedness the decision
+        // is made from: size `BIGINT UNSIGNED` like `TINYINT` and the boundary moves to 766/767, so
+        // the refused leg renders an index; size it like two `INT`s and the fitting leg is refused.
+        // The MySQL family is the flavor with a byte boundary for this key: on the PostgreSQL widths
+        // a `varchar` part is `must_prefix` (src/target/postgres.rs:786-831) so `fit_key` has no whole
+        // size for it at ANY `K` — its flip is the 16/17-part one, pinned with the same mix of signed
+        // and unsigned widths in `index_key_budget_refused_before_render` (src/target/mod.rs).
+        for (tag, k, refused) in [
+            ("idx_e11_width_fit", 764u32, false),
+            ("idx_e11_width_over", 765u32, true),
+        ] {
+            let ddl = bu(k);
+            let case = Box::leak(Box::new(Case {
+                id: "E11",
+                tag,
+                ddl,
+                view: "item_wide",
+                select: SEL_WIDE,
+                decls: &["CREATE INDEX i_width ON item_wide (id, big, small, wide)"],
+                declared: own_decls(vec![decl("i_width", &["id", "big", "small", "wide"])]),
+                err: if refused {
+                    own_strs(vec!["i_width"])
+                } else {
+                    &[][..]
+                },
+                no_table: false,
+                // myf-only, for the reason in the comment above.
+                pg: false,
+            }));
+            // (c) the fitting key is created whole (cols, order and SHOW CREATE shape are asserted
+            // by `case_both`); the one-character-wider key is refused by the budget seam.
+            case_both(&ctx, case).await?;
+            if refused {
+                budget_refusal(&ctx, tag, case, "i_width").await?;
+            }
         }
         Ok(())
     });
+}
+
+/// (c) E11: the refusal is the budget seam's own error — it quotes the budget (`MY_KEY_BYTES` 3072 /
+/// `PG_KEY_BYTES` 2704 / `MAX_KEY_PARTS` 16) and names the target whose budget was the tightest —
+/// and no partial index of the declared key is created on the source.
+async fn budget_refusal(ctx: &Ctx, tag: &str, case: &Case, name: &str) -> Result<()> {
+    let (_db, mut eng, mut sc) = open(ctx, tag, case.ddl, &spec_of(case, None), &[]).await?;
+    let row = settle(
+        &mut eng,
+        &mut sc,
+        case.id,
+        case.view,
+        "source",
+        "error",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let msg = row.last_error.clone().unwrap_or_default();
+    let quoted = ["3072", "2704", "16", "key", "budget"];
+    ensure!(
+        quoted.iter().any(|w| msg.to_ascii_lowercase().contains(w)),
+        "{} (c): {name}: the error must quote the key budget (MY_KEY_BYTES 3072 / PG_KEY_BYTES 2704 \
+         / MAX_KEY_PARTS 16); it says: {msg:?}",
+        case.id,
+    );
+    ensure!(
+        msg.to_ascii_lowercase().contains("target")
+            || msg.to_ascii_lowercase().contains("postgres")
+            || msg.to_ascii_lowercase().contains("mysql"),
+        "{} (c): {name}: the error must say which target's budget was too tight; it says: {msg:?}",
+        case.id,
+    );
+    // (c) no partial index anywhere.
+    let got = myf_idx(&mut sc, case.view).await?;
+    ensure!(
+        got.iter().all(|(n, ..)| n != name),
+        "{} (c): the over-budget index `{name}` was created anyway: {got:?}",
+        case.id,
+    );
+    drop(_db);
+    eng.stop().await?;
+    Ok(())
 }
 
 /// E12 — a declared UNIQUE index the data does not satisfy. `edge · MYF · PG`
@@ -2424,7 +2510,7 @@ fn idx_mdl_wait_does_not_stall_writes() {
         loop {
             let seen = scalar_i64(
                 &mut probe,
-                "SELECT COUNT(*) FROM item_totals WHERE entity_id = 3",
+                "SELECT COUNT(*) FROM item_totals WHERE owner_id = 3",
             )
             .await
             .map_err(|e| {

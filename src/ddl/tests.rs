@@ -425,8 +425,8 @@ fn script(view: &str, select: &str, decls: &[&str]) -> String {
 /// The pinned corpora of expectations.md ("Corpora (pinned, existing only)"): `B`'s `items` is
 /// what H1/H4 aggregate, `A`'s `entities` what H2/H8 project. Only their column names appear in
 /// the (a) scripts below; the data itself belongs to the integration half (tests/indexes.rs).
-const SEL_TOTALS: &str = "SELECT entity_id, SUM(amount) AS total, COUNT(*) AS n \
-                          FROM items GROUP BY entity_id";
+const SEL_TOTALS: &str = "SELECT owner_id, SUM(amount) AS total, COUNT(*) AS n \
+                          FROM items GROUP BY owner_id";
 const SEL_STATUS: &str = "SELECT id, grp, status FROM entities";
 const SEL_NAMES: &str = "SELECT id, name FROM entities";
 
@@ -497,9 +497,9 @@ fn parses_index_declarations() {
             "H4",
             "item_totals",
             SEL_TOTALS,
-            "CREATE INDEX i_tot_ent ON item_totals (total, entity_id)",
+            "CREATE INDEX i_tot_ent ON item_totals (total, owner_id)",
             "i_tot_ent",
-            vec!["total", "entity_id"],
+            vec!["total", "owner_id"],
             "",
         ),
     ] {
@@ -528,7 +528,7 @@ fn parses_index_declarations() {
             );
         }
         // (c) asserts the column set in SEQ_IN_INDEX order, so a parse that keeps them in another
-        // order (or only one of them) is a failure — H4: "(entity_id, total) fails the test".
+        // order (or only one of them) is a failure — H4: "(owner_id, total) fails the test".
         let mut at = 0usize;
         for c in &cols {
             let found = kept.to_ascii_lowercase()[at..]
@@ -565,7 +565,7 @@ fn index_declaration_after_create_view_is_one_script() {
             script(
                 "item_totals",
                 SEL_TOTALS,
-                &["CREATE INDEX i_tot_ent ON item_totals (total, entity_id)"],
+                &["CREATE INDEX i_tot_ent ON item_totals (total, owner_id)"],
             ),
         ),
         // E2 (a): "the follow-up statement written twice".
@@ -596,8 +596,8 @@ fn index_declaration_after_create_view_is_one_script() {
     // (a) with the comments and whitespace a hand-written cell has: `-- note`, `/* */`, `#`,
     // and blank lines between the statements (the same G2 handling of src/analyze/parse.rs:216-231).
     let commented =
-        "CREATE VIEW item_totals AS SELECT entity_id, SUM(amount) AS total, COUNT(*) AS n \
-                     FROM items GROUP BY entity_id;\n  -- declared later, by hand\n \
+        "CREATE VIEW item_totals AS SELECT owner_id, SUM(amount) AS total, COUNT(*) AS n \
+                     FROM items GROUP BY owner_id;\n  -- declared later, by hand\n \
                      /* a block comment */\nCREATE INDEX i_total ON item_totals (total);\n#\n";
     let kept = kept(commented);
     assert!(
