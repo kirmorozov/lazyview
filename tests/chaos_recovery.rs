@@ -279,7 +279,10 @@ fn m1_sigkill_at_seeded_kill_points() {
                 // open (the N-01/N-02 mechanic) and `inflight_rows` stays above zero for the kill to
                 // land on. The table has to be live first — an engine killed before its first build
                 // has nothing to swap into, and a lock on a table that is not there is an error, not
-                // a swap.
+                // a swap. And the process itself has to be caught up before the lock lands: a fresh
+                // one still building its views writes into that very table during the build, so the
+                // lock would stall the build — not a flush — and the counter would never leave zero.
+                recovery::recover(&mut e, &db, T_STREAM).await?;
                 recovery::wait_table(&db, "v_items", T_STREAM).await?;
                 let held = recovery::hold_writer_lock(&db, "v_items").await?;
                 // And the work has to arrive *behind* the lock: a flush of events the engine has
@@ -288,6 +291,16 @@ fn m1_sigkill_at_seeded_kill_points() {
                 let landed = recovery::wait_kill_point(&e, point, &pending, &None, T_STREAM).await;
                 recovery::release(held).await;
                 landed?;
+            } else if point == KillPoint::CatchUp {
+                // A backlog only exists for a process that resumes: an engine that starts without a
+                // saved position takes the whole burst into its snapshot build and streams from the
+                // current position, so the applied counter never sits behind one and the wait is
+                // undecidable. Bring this process up to the source first (the shape of a crash after
+                // a position was saved), then put a second burst behind it and land the kill inside
+                // that drain — the same sequence M1-targets measures the catch-up on.
+                recovery::recover(&mut e, &db, T_STREAM).await?;
+                let pending = burst(&db, seed ^ ((i as u64) + 31), 3000).await?;
+                recovery::wait_kill_point(&e, point, &pending, &None, T_STREAM).await?;
             } else {
                 recovery::wait_kill_point(&e, point, &backlog, &None, T_STREAM).await?;
             }
