@@ -2390,23 +2390,27 @@ fn chaos_tgt_pg_bandwidth_starvation() {
 /// claims. (The existing lag scenarios use 1 byte.)
 const LAG_PROOF_BUDGET: u64 = 16;
 
-/// R-01 / M2, the pause arm (`LAZYVIEW_LAG_OVER_BUDGET=pause`, the default): the writers push a
-/// steady stream on the healthy link, the kept-keys buffer is then drained to zero (the writers
-/// stop, the behind flags of the warm-up flushes catch up), `lv_<s>_t1` upstream is cut at the
-/// edge (`reset_peer{timeout:300}`, so every write to it is refused), and the writers' burst
-/// streams into the cut link — so the first failing flush carries a whole batch of the burst and
-/// that batch is the kept set the hold freezes. With the lag buffer at [`LAG_PROOF_BUDGET`] bytes. The
-/// bound must **act**, where before this PR the budget only produced a warn: the keys kept for the
-/// behind target are counted and far above the budget (`lag_bytes_held`), the binlog reader is
-/// held (`lag_reader_holds` ≥ 1) so the backlog is not read into memory while one target is behind
-/// (the applied position stays behind the server's), and the arm costs neither a drop
-/// (`lag_keys_dropped` stays 0 — `pause` drops nothing) nor a rebuild of an incremental view
-/// (`assert_no_rebuilds`). When the link returns the buffer drains to zero with the engine's own
-/// `target caught up` for the behind target (`target_catchups` ≥ 1), and the target that never
-/// faulted is exact against its oracle — the owner's rule that an incremental view is never
-/// rebuilt, plus the "never summon OOM" half of the criterion.
-async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
-    let tag = "chaos_tgt_lag_pause";
+/// One behind target's own share of the lag buffer, for the scenario that must NOT shed anything:
+/// far above what the writers can produce in the scenario's lifetime, so what is observed there is
+/// the bound declining to act while a target is legitimately behind.
+const LAG_KEEP_TARGET_BUDGET: u64 = 1 << 30;
+
+/// R-01 / M2, the KEEP half of the bound (`LAZYVIEW_LAG_OVER_BUDGET=pause`, the default): a target
+/// that is behind keeps the keys it is owed — and, the half the first version of this scenario did
+/// not check, **the healthy target keeps moving while it is**. The writers push a steady stream,
+/// the engine is shown keeping up on both links, `lv_<s>_t1` is cut at the edge
+/// (`reset_peer{timeout:300}`) and the writers keep going. The bound must then do two things and
+/// only two: the keys the behind target is owed are counted and reported far above the instance's
+/// aggregate budget (`lag_bytes_held`, `lag_over_budget`), and nothing is shed while that target is
+/// inside its own share (`lag_target_bytes`) and the hold's deadline (`lag_hold_max`) —
+/// `lag_keys_dropped` stays 0. Above all, with one target unreachable and its buffer many times
+/// over budget, the applied position keeps advancing: the shared binlog reader is never held for
+/// one target (guard S4), so the healthy target is applied as the stream comes, not only after the
+/// fault is repaired. When the link returns, the behind target catches up from what it was kept
+/// (`target caught up` for t1, `target_catchups` >= 1, the buffer back to zero) and BOTH targets are
+/// exact, with no incremental view rebuilt.
+async fn tgt_lag_bound_keeps_the_reader(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
+    let tag = "chaos_tgt_lag_bound";
     let db = ctx.new_db(tag).await?;
     let _clean = toxi.for_schema(&db.name);
     let t1 = ctx.new_db(&format!("{tag}_t1")).await?;
@@ -2429,6 +2433,17 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         "LAZYVIEW_TEST_LAG_HOLD_BYTES".to_string(),
         LAG_PROOF_BUDGET.to_string(),
     ));
+    // Nothing may be shed here: one target's share and the hold's deadline are both far above what
+    // the writers produce, so this scenario observes the bound NOT firing for a target that is
+    // legitimately behind — and the healthy target never stopping because of it.
+    ov.push((
+        "LAZYVIEW_TEST_LAG_TARGET_BYTES".to_string(),
+        LAG_KEEP_TARGET_BUDGET.to_string(),
+    ));
+    ov.push((
+        "LAZYVIEW_LAG_HOLD_MAX_MS".to_string(),
+        "3600000".to_string(),
+    ));
     let (mut eng, _) = start_with_views(ctx, &db, &specs, &ov_refs(&ov)).await?;
     let tmysql: HashMap<String, Db> = [
         ("t1".to_string(), t1.clone()),
@@ -2445,137 +2460,83 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         "initial build on both targets",
     )
     .await?;
-    // The writers run on the healthy link first: by the time the fault lands they have shown the
-    // engine can keep up at a steady rate. (With the *only* writer set starting after the cut,
-    // the first failing flush ended before its writers' first transactions arrived and the kept
-    // keys froze at one crossing's worth — red on 6986480, five flavors; see the burst below.)
-    let (tx, writers) = spawn_target_writers(ctx, &db, ids.clone(), &format!("{tag}_w"), 60);
+    let (tx, writers) = spawn_target_writers(ctx, &db, ids.clone(), &format!("{tag}_w"), 400);
     let mut c = db.conn().await?;
     let pos0 = server_position(&mut c).await?;
     drop(c);
-    let began = std::time::Instant::now();
     wait_until(
-        "the writers to be pushing and the engine to keep up on the healthy link (the pressure \
-         must be running before the fault, not start with it)",
-        Duration::from_secs(30),
-        || {
-            let ok = began.elapsed() >= Duration::from_secs(3)
-                && eng.applied().as_ref().is_some_and(|a| a >= &pos0);
-            async move { Ok(ok) }
-        },
-    )
-    .await?;
-    // Then the buffer is put back to empty before the cut, and the pressure that builds the kept
-    // set streams into the link *after* it is cut. A 16 B budget flags every busy flush behind
-    // (`mark_behind_targets`), so the warm-up leaves the reader cycling through `hold_for_lag`,
-    // and a hold freezes the kept keys at whatever one flush had carried when it entered: with
-    // the fault landing mid-cycle the kept set froze at one transaction's worth (~16 B) and the
-    // many-times-over check timed out (red on 44872983468, all eight flavors). Draining to zero
-    // first makes the crossing deterministic: the first flush that fails on `t1` is the first
-    // flush that has ever seen the burst, and at the burst rate its window (never under
-    // CATCH_UP_BATCH while the stream delivers) holds tens of transactions, many times the
-    // 8x-budget the hold is checked against.
-    stop_writers(ctx, tx, writers).await?;
-    let mut c = db.conn().await?;
-    let pos_quiet = server_position(&mut c).await?;
-    drop(c);
-    wait_until(
-        "the kept keys to drain to zero after the warm-up writers stopped (the cut must land on \
-         an empty buffer, so the first failing flush's batch is the kept set the hold freezes)",
+        "the engine to keep up with the writers on both links before the fault (the pressure must \
+         be running before the cut, not start with it)",
         FAULT_BUDGET,
         || {
-            let m = eng.metrics.clone();
             let a = eng.applied();
-            let pos_q = pos_quiet.clone();
-            async move {
-                Ok(a.as_ref().is_some_and(|p| p >= &pos_q)
-                    && lazyview::Metrics::get(&m.gauges.lag_bytes_held) == 0)
-            }
+            let p = pos0.clone();
+            async move { Ok(a.as_ref().is_some_and(|a| a >= &p)) }
         },
     )
     .await?;
     let before = eng.snapshot();
-    // `reset_peer{timeout:300}` upstream: every connect and every write to `t1` is refused at the
-    // edge, so a flush's write to it fails at once and its units go to the target's kept keys.
-    // The 300 ms (armed with a timeout, as #6 arms its reset) keeps the first failing flush's
-    // three supervisor retries ~1 s wide: that window is what lets the flush's overlapped read
-    // take the writers' in-flight stream into the buffer, so the set the hold freezes is many
-    // times its budget rather than the one row that crossed it. (A `timeout{timeout:0}` black
-    // hole also refuses, but costs a 10 s connect timeout per try, pacing the lag this scenario
-    // has to build over minutes; `timeout:0` here answers with the RST before a writer
-    // transaction has arrived, which is the race above.)
     toxi.arm(
         &p1,
         &Toxic::reset_peer(300).on(Dir::Upstream).named("lagrst"),
     )
     .await?;
-    // The burst streams into the cut link now: every transaction the writers commit from here is
-    // a change `t1` is owed, and the first failing flush takes a whole batch of them into the
-    // kept keys before the bound can freeze the buffer (at the warm-up's 60 tps a flush window
-    // held about one transaction — the ~16 B freeze of 44872983468; at 400 it holds tens, and
-    // the reader is free until the first crossing because the buffer was empty at the cut).
-    let (tx, writers) = spawn_target_writers(ctx, &db, ids.clone(), &format!("{tag}_b"), 400);
-    // The bound acting is observable, not assumed: the keys kept for the black-holed target passed
-    // their budget (the gauge, refreshed at the housekeeping tick) and the reader was held for it.
+    // The bound's reporting half acts: the keys the cut target is owed pass the instance's
+    // aggregate budget, which is what `lag_over_budget` and the gauge count.
     wait_until(
-        "the behind target's keys to pass their budget and the reader to be held (the fault never \
-         landed, or the bound does not act)",
+        "the keys kept for the cut target to pass their budget and be reported (the fault never \
+         landed, or nothing counts them)",
         FAULT_BUDGET,
         || {
             let m = eng.metrics.clone();
             async move {
-                Ok(m.snapshot().lag_reader_holds > before.lag_reader_holds
+                Ok(m.snapshot().lag_over_budget >= 1
                     && lazyview::Metrics::get(&m.gauges.lag_bytes_held) > LAG_PROOF_BUDGET)
             }
         },
     )
     .await?;
-    // And it must act on a buffer that is *many* times its budget, not one that just crossed:
-    // the writers keep the source moving, so the keys the behind target is owed keep growing.
+    // And the half the first version of this scenario never asserted: with `t1` unreachable and its
+    // buffer many times over budget, the shared reader keeps serving `t2` — the applied position
+    // moves on while the behind target is still owed its keys. A pause of the reader for one target
+    // (the shape of the first PR) stops this within a flush or two and the scenario goes red.
+    let moved = eng
+        .applied()
+        .expect("an applied position after the warm-up");
     wait_until(
-        "the keys kept for the behind target to sit many times over their budget (the pressure \
-         never reached the buffer)",
+        "the engine to keep applying for the healthy target while t1 is behind (one target behind \
+         may not stop the shared binlog reader)",
         FAULT_BUDGET,
         || {
+            let a = eng.applied();
             let m = eng.metrics.clone();
+            let from = moved.clone();
             async move {
-                Ok(lazyview::Metrics::get(&m.gauges.lag_bytes_held) >= 8 * LAG_PROOF_BUDGET)
+                Ok(a.as_ref().is_some_and(|a| a > &from)
+                    && lazyview::Metrics::get(&m.gauges.lag_bytes_held) > 0)
             }
         },
     )
     .await?;
-    let held = lazyview::Metrics::get(&eng.metrics.gauges.lag_bytes_held);
-    let d = eng.snapshot().since(&before);
-    ctx.log(format!(
-        "{tag}: held — lag_bytes_held {held} B over a {LAG_PROOF_BUDGET} B budget, reader holds {}",
-        d.lag_reader_holds
-    ));
-    ensure!(
-        held >= 8 * LAG_PROOF_BUDGET,
-        "{tag}: the keys kept for the behind target are only {held} B, not the many times over \
-         the {LAG_PROOF_BUDGET} B budget this scenario is built to exercise"
-    );
-    // The reader was held: with the writers still pushing, what the engine has applied is still
-    // short of what the server has (the backlog stays where it belongs — in the server's binlog).
     let mut c = db.conn().await?;
     let pos = server_position(&mut c).await?;
     drop(c);
-    let applied = eng.applied();
-    ctx.log(format!("{tag}: held — server {pos}, applied {applied:?}"));
-    ensure!(
-        applied.as_ref().is_some_and(|a| a < &pos),
-        "{tag}: the reader applied everything the source had while a target was behind and over \
-         budget (applied {applied:?}, server {pos}): the pause never held the reader"
-    );
-    // The pause costs no correctness data: it drops no key and rebuilds no incremental view.
+    let a = eng.applied();
+    ctx.log(format!(
+        "{tag}: t1 behind and shed nothing — server {pos}, applied {a:?}, held {} B",
+        lazyview::Metrics::get(&eng.metrics.gauges.lag_bytes_held)
+    ));
     let d = eng.snapshot().since(&before);
     ensure!(
         d.lag_keys_dropped == 0,
-        "{tag}: the pause arm dropped {} key set(s); it keeps every change the behind target is \
-         owed",
+        "{tag}: a target inside its own share and the hold's deadline lost {} key set(s); the \
+         bound must keep what a behind target is owed while it is inside both",
         d.lag_keys_dropped
     );
     eng.check_alive()?;
+    // The link returns: everything the behind target was kept is applied, from memory, and both
+    // targets end exact. The kept keys draining to zero with the engine's own `target caught up`
+    // is the engine's statement that every kept key reached the target it was kept for.
     toxi.remove_toxic(&p1, "lagrst").await?;
     wait_until(
         "t1 to catch up from its kept keys after its link was repaired",
@@ -2591,9 +2552,6 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
     let pos = server_position(&mut c).await?;
     drop(c);
     eng.wait_applied(&pos, t_catchup()).await?;
-    // Nothing may be owed any more. The keys a behind target was kept drain through its own
-    // retries, so the buffer coming back to zero — with nothing ever dropped, checked below — is
-    // the engine's own statement that every kept key reached the target it was kept for.
     wait_until(
         "the keys kept for the behind target to drain to zero after its link was repaired",
         FAULT_BUDGET,
@@ -2610,11 +2568,172 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         "{tag}: the kept keys drained to zero with no 'target caught up' line for t1: where did \
          they go?"
     );
-    // And the target that never faulted is exact: the pause holds the reader for the whole
-    // instance, it must never make a healthy target's rows wrong.
+    let d = eng.snapshot().since(&before);
+    ensure!(
+        d.target_catchups >= 1 && d.lag_over_budget >= 1 && d.lag_keys_dropped == 0,
+        "{tag}: the bound's keep half was not observed end to end: {}",
+        fmt_snapshot(&d)
+    );
+    verify_targets(
+        ctx,
+        &mut eng,
+        &db,
+        &tmysql,
+        &HashMap::new(),
+        &specs,
+        "both targets exact after the catch-up",
+    )
+    .await?;
+    assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_tgt_lag_bound")?;
+    eng.check_alive()?;
+    eng.stop().await?;
+    Ok(())
+}
+
+/// R-01 / M2: the bound keeps the healthy targets applying while one target is behind.
+#[test]
+fn chaos_tgt_lag_bound_keeps_healthy_targets() {
+    let _one = toxi::exclusive();
+    scenario("chaos_tgt_lag_bound", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        tgt_lag_bound_keeps_the_reader(&ctx, &toxi).await
+    });
+}
+
+/// R-01 / M2, the bound's other half: the target **never comes back**. This is the case the
+/// unbounded hold could not survive — a decommissioned replica, wrong credentials, a target DB down
+/// for hours — and the scenario the guard's finding 2 asks for. One target's own share of the lag
+/// buffer is 16 bytes and the hold's deadline (`LAZYVIEW_LAG_HOLD_MAX_MS`) is 2 s, so the executor
+/// hook (`exec::Dedup::lag_overflow`) sheds `t1`'s keys and reports it, and the instance must then
+/// carry on alone: the writers keep committing, `t1` stays refused, and the engine still applies the
+/// whole stream for the healthy target (`wait_applied` to the server's position: nothing froze the
+/// reader, and the saved position is not pinned behind keys that no longer exist), ends with the
+/// buffer at zero (`lag_keys_dropped` >= 1 says who emptied it), keeps `t2` exact against its
+/// oracle, answers the drop with no rebuild of any incremental view, and keeps beating.
+async fn tgt_lag_never_returns(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
+    let tag = "chaos_tgt_lag_never";
+    let db = ctx.new_db(tag).await?;
+    let _clean = toxi.for_schema(&db.name);
+    let t1 = ctx.new_db(&format!("{tag}_t1")).await?;
+    let t2 = ctx.new_db(&format!("{tag}_t2")).await?;
+    let ids = setup_soak(&db, ctx.sub_seed(tag), Sizes::scaled()).await?;
+    let specs = chaos_specs("source,t1,t2");
+    let p1 = toxi
+        .proxy(&db.name, "t1", &toxi::upstream(&db.flavor))
+        .await?;
+    toxi.wait_listening(&p1).await?;
+    let mut ov =
+        toxi::proxied_target_env(&[("t1", t1.dsn.as_str(), Some(&p1)), ("t2", &t2.dsn, None)])?;
+    for (k, v) in [
+        ("LAZYVIEW_HEARTBEAT_MS", "200"),
+        ("LAZYVIEW_TARGET_TIMEOUT_MS", "2000"),
+    ] {
+        ov.push((k.to_string(), v.to_string()));
+    }
+    ov.push((
+        "LAZYVIEW_TEST_LAG_HOLD_BYTES".to_string(),
+        LAG_PROOF_BUDGET.to_string(),
+    ));
+    // One target's share far below what the writers produce, and a hold of two seconds: the bound
+    // has to act on `t1` alone, on its own numbers, while the stream runs.
+    ov.push((
+        "LAZYVIEW_TEST_LAG_TARGET_BYTES".to_string(),
+        "16".to_string(),
+    ));
+    ov.push(("LAZYVIEW_LAG_HOLD_MAX_MS".to_string(), "2000".to_string()));
+    let (mut eng, _) = start_with_views(ctx, &db, &specs, &ov_refs(&ov)).await?;
+    let tmysql: HashMap<String, Db> = [
+        ("t1".to_string(), t1.clone()),
+        ("t2".to_string(), t2.clone()),
+    ]
+    .into();
+    verify_targets(
+        ctx,
+        &mut eng,
+        &db,
+        &tmysql,
+        &HashMap::new(),
+        &specs,
+        "initial build on both targets",
+    )
+    .await?;
+    let (tx, writers) = spawn_target_writers(ctx, &db, ids.clone(), &format!("{tag}_w"), 400);
+    let mut c = db.conn().await?;
+    let pos0 = server_position(&mut c).await?;
+    drop(c);
+    wait_until(
+        "the engine to keep up with the writers on both links before the fault",
+        FAULT_BUDGET,
+        || {
+            let a = eng.applied();
+            let p = pos0.clone();
+            async move { Ok(a.as_ref().is_some_and(|a| a >= &p)) }
+        },
+    )
+    .await?;
+    let before = eng.snapshot();
+    // Cut, and never repaired: `t1` is refused at the edge for the rest of the scenario.
+    toxi.arm(
+        &p1,
+        &Toxic::reset_peer(300).on(Dir::Upstream).named("never"),
+    )
+    .await?;
+    // The bound acts on that one target: its key sets are shed, once per set, and reported.
+    wait_until(
+        "the never-returning target's keys to be shed by the executor hook (the bound does not \
+         act, or the fault never landed)",
+        FAULT_BUDGET,
+        || {
+            let m = eng.metrics.clone();
+            async move { Ok(m.snapshot().lag_keys_dropped >= 1) }
+        },
+    )
+    .await?;
+    let d = eng.snapshot().since(&before);
+    ctx.log(format!(
+        "{tag}: t1 never returns — {} key set(s) shed, {} B still held",
+        d.lag_keys_dropped,
+        lazyview::Metrics::get(&eng.metrics.gauges.lag_bytes_held)
+    ));
+    eng.check_alive()?;
+    // The stream is still running and the healthy target is still being applied: the whole rest of
+    // it lands, with `t1` gone forever. This is the assertion the unbounded hold could not pass —
+    // it held the reader for the whole instance, so nothing advanced until the target came back.
+    stop_writers(ctx, tx, writers).await?;
+    let mut c = db.conn().await?;
+    let pos = server_position(&mut c).await?;
+    drop(c);
+    eng.wait_applied(&pos, t_catchup()).await.context(
+        "{tag}: the engine stopped applying for the healthy targets once one target \
+                  stopped answering (a hold of the shared reader for one target)",
+    )?;
+    // The buffer of the gone target is empty and stays empty: no new keys are kept for it, so its
+    // memory is not held for a replica that will not answer (guard R1: shed once per key set).
+    wait_until(
+        "the gone target's kept keys to stay at zero after its last set was shed",
+        FAULT_BUDGET,
+        || {
+            let m = eng.metrics.clone();
+            async move { Ok(lazyview::Metrics::get(&m.gauges.lag_bytes_held) == 0) }
+        },
+    )
+    .await?;
+    let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+    ensure!(
+        log.lines().any(|l| {
+            l.contains("the keys kept for this target passed its own budget")
+                && l.contains("target=t1")
+        }),
+        "{tag}: {} key set(s) were shed with no line naming the target they were shed for",
+        d.lag_keys_dropped
+    );
+    // The target that never faulted is exact against its oracle, and no incremental view was
+    // rebuilt to get there: a dropped key set is reported, never answered with a build.
     let t2only: HashMap<String, Db> = [("t2".to_string(), t2.clone())].into();
     wait_until(
-        "t2 to be exact after the catch-up",
+        "t2 to be exact with t1 gone forever",
         FAULT_BUDGET,
         || async { Ok(check_views_targets(&db, &t2only, &specs).await.is_ok()) },
     )
@@ -2626,30 +2745,30 @@ async fn tgt_lag_pause(ctx: &Ctx, toxi: &Toxi) -> Result<()> {
         &t2only,
         &HashMap::new(),
         &specs,
-        "final on t2 after the catch-up",
+        "t2 exact with t1 gone",
     )
     .await?;
     let d = eng.snapshot().since(&before);
     ensure!(
-        d.lag_reader_holds >= 1 && d.target_catchups >= 1 && d.lag_over_budget >= 1,
-        "{tag}: the pause arm was not observed end to end: {}",
+        d.lag_keys_dropped >= 1 && d.lag_over_budget >= 1,
+        "{tag}: the bound was not observed end to end: {}",
         fmt_snapshot(&d)
     );
-    assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_tgt_lag_pause")?;
+    assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_tgt_lag_never")?;
     eng.check_alive()?;
     eng.stop().await?;
     Ok(())
 }
 
-/// R-01 / M2, the pause arm on a view many times its lag budget.
+/// R-01 / M2: a target that never comes back costs its own keys, not the instance's stream.
 #[test]
-fn chaos_tgt_lag_pause_bounds_reader() {
+fn chaos_tgt_lag_never_returns_sheds_one_target() {
     let _one = toxi::exclusive();
-    scenario("chaos_tgt_lag_pause", |ctx| async move {
+    scenario("chaos_tgt_lag_never", |ctx| async move {
         let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
             return Ok(());
         };
-        tgt_lag_pause(&ctx, &toxi).await
+        tgt_lag_never_returns(&ctx, &toxi).await
     });
 }
 

@@ -41,6 +41,8 @@ const RESERVE_MAX: u64 = 128 * MIB;
 /// holds together overrun `U` by the queue's own share: the reserve absorbs it).
 const DRAIN_DIVISOR: u64 = 32;
 const HOLD_DIVISOR: u64 = 4;
+/// The share of the lag hold one target that is behind may hold ([`MemoryBudget::lag_target_bytes`]).
+const LAG_TARGET_SHARE: u64 = 4;
 
 /// The total that reproduces the constants the engine carried before this module existed:
 /// 32 MiB of queue plus 4 × 256 MiB of holds needs `U = 1 GiB`, plus the 128 MiB the rule keeps
@@ -117,9 +119,14 @@ pub struct MemoryBudget {
     pub build_hold_bytes: usize,
     /// Rows one prepared XA transaction keeps for tables no view reads (past it they are dropped).
     pub xa_hold_bytes: usize,
-    /// The keys kept for targets that are behind (past it the engine reports; the bound that
-    /// acts for this buffer is the lag PR's).
+    /// The keys kept for targets that are behind, all of them together (past it the engine
+    /// reports; the bound that acts on one target's keys is [`Self::lag_target_bytes`], the
+    /// executor hook `exec::Dedup::lag_overflow`).
     pub lag_hold_bytes: usize,
+    /// The keys kept for ONE target that is behind: its own share of the lag budget, so one
+    /// unreachable replica costs one replica's memory and never the whole instance's
+    /// (`exec::Dedup::lag_overflow`, review R-01 / the lag PR).
+    pub lag_target_bytes: usize,
     /// The dedup core's own byte bound (`exec::Dedup::new`: its caller stops reading above it).
     pub dedup_max_bytes: usize,
 }
@@ -142,6 +149,11 @@ impl MemoryBudget {
             build_hold_bytes: as_usize(hold),
             xa_hold_bytes: as_usize(hold),
             lag_hold_bytes: as_usize(hold),
+            // One target's share of the lag hold (review R-01): a target that is behind keeps its
+            // keys while they fit this and the hold's deadline, and the executor hook decides
+            // what a target over both costs (`exec::Dedup::lag_overflow`). A quarter, so that a
+            // few replicas behind together still fit the hold the total gave this buffer.
+            lag_target_bytes: as_usize((hold / LAG_TARGET_SHARE).max(1)),
             dedup_max_bytes: as_usize(hold),
         }
     }

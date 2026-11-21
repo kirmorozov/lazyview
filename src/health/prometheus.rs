@@ -97,7 +97,7 @@ pub(super) fn prometheus(m: &Metrics, o: &Observed, s: &Settings) -> String {
     );
     let _ = writeln!(
         out,
-        "# HELP lazyview_lag_bytes_held Estimated bytes of the keys kept for targets that are behind; past the derived lag budget the LAZYVIEW_LAG_OVER_BUDGET arm acts (pause holds the reader).\n# TYPE lazyview_lag_bytes_held gauge\nlazyview_lag_bytes_held {}",
+        "# HELP lazyview_lag_bytes_held Estimated bytes of the keys kept for targets that are behind; compare it with the derived lag budget; the bound that acts is per target (lazyview_lag_keys_dropped counts what the executor hook shed for a target that stayed behind too long).\n# TYPE lazyview_lag_bytes_held gauge\nlazyview_lag_bytes_held {}",
         Metrics::get(&m.gauges.lag_bytes_held)
     );
     // Per connection pool of the refresh supervisor (src/supervisor.rs).

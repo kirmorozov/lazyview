@@ -28,16 +28,23 @@ pub enum MissingBinlog {
 /// budget that nothing enforces is the thing the review called a blocker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LagOverBudget {
-    /// The binlog reader waits while the keys are over budget (`Engine::hold_for_lag`, the shape
-    /// of `hold_for_builds`): memory bounded, nothing dropped, the saved position already waits
-    /// for these keys (`lag_floor`), so the target catches up from what was kept. The default:
-    /// the memory-safe arm, and the one that needs nothing else landed.
+    /// The keys kept for a target that is behind are HELD: the target is given its own share of
+    /// the lag budget (`Config::mem::lag_target_bytes`) and `Config::lag_hold_max` to come back,
+    /// and while it is inside both, nothing is dropped and the saved position waits for its keys
+    /// (`lag_floor`), so it catches up from what was kept. Past either bound the executor hook
+    /// (`exec::Dedup::lag_overflow`) sheds that target's key sets and reports it — memory bounded,
+    /// and one target behind never stops the shared binlog reader the healthy targets are applied
+    /// with (guard S4; the reader is held for builds and for an XA, never for one lagging target).
+    /// The default: the memory-safe arm, and the one that needs nothing else landed.
     #[default]
     Pause,
-    /// The key set is dropped and the target gets a bounded whole-view refresh when it is back
-    /// (the owner's choice (b) for R-01). It ends in a whole-view refresh, so it waits for the
-    /// bounded sweep of 03-stream-refresh (PR D `engine-sweep` + PR E `sup-sweep`): refused at
-    /// config time until M2b adds the arm, rather than accepted and silently doing something else.
+    /// The key set of a target behind is dropped at once (without waiting for its share of the
+    /// budget or the hold's deadline) and the target gets a bounded whole-view refresh when it is
+    /// back (the owner's choice (b) for R-01) — which is what makes dropping it safe, and what
+    /// `pause` does not have: it reports a shed target for an operator instead. It ends in a
+    /// whole-view refresh, so it waits for the bounded sweep of 03-stream-refresh (PR D
+    /// `engine-sweep` + PR E `sup-sweep`): refused at config time until M2b adds the arm, rather
+    /// than accepted and silently doing something else.
     DropRefresh,
 }
 
@@ -197,19 +204,32 @@ pub struct Config {
     pub test_build_hold_bytes: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_LAG_HOLD_BYTES=<bytes>`: the byte budget of the changes kept
     /// for targets that are behind instead of the budget the total gave it, so a test can run that
-    /// buffer far below its size (past it the arm `Config::lag_over_budget` names acts:
-    /// `Engine::hold_for_lag` for `pause`).
+    /// buffer far below its size (past it the arm `Config::lag_over_budget` names acts, per
+    /// target: `exec::Dedup::lag_overflow`).
     pub test_lag_hold_bytes: Option<usize>,
+    /// Test hook `LAZYVIEW_TEST_LAG_TARGET_BYTES=<bytes>`: the byte budget of the keys kept for
+    /// ONE target that is behind, instead of the share of the lag hold the total gave it (the
+    /// aggregate above is `test_lag_hold_bytes`; `exec::Dedup::lag_overflow` reads this one, so a
+    /// test can drive one target past its bound and see what that target alone costs).
+    pub test_lag_target_bytes: Option<usize>,
     /// The engine's byte budgets — the read-ahead queue, the build hold, the XA hold, the lag
     /// hold and the dedup core — derived once at startup from `LAZYVIEW_MEMORY_BUDGET_BYTES`,
     /// the container's cgroup limit, or the historical constants (the rule and the order in
     /// [`crate::mem`], review R-01 / N-06). The two hooks above override the field they name;
     /// everything else the engine reads for a byte budget is this.
     pub mem: crate::mem::MemoryBudget,
-    /// `LAZYVIEW_LAG_OVER_BUDGET=pause|drop_refresh` (default `pause`): what acts on the keys kept
-    /// for targets that are behind once they pass `mem.lag_hold_bytes` — the reader waits, or (not
-    /// yet) the keys are dropped for a bounded whole-view refresh. See [`LagOverBudget`].
+    /// `LAZYVIEW_LAG_OVER_BUDGET=pause|drop_refresh` (default `pause`): the bound that acts on the
+    /// keys kept for a target that is behind once it passes its own share of the lag budget — the
+    /// keys are held to the hold's deadline and then shed and reported, or (not yet) shed at once
+    /// and answered by a bounded whole-view refresh. See [`LagOverBudget`].
     pub lag_over_budget: LagOverBudget,
+    /// `LAZYVIEW_LAG_HOLD_MAX_MS=<ms>` (default 3 600 000, one hour): how long the keys kept for
+    /// ONE target that is behind are held before the executor hook sheds them and reports that
+    /// target (`exec::Dedup::lag_overflow`). It is what makes the hold a bound rather than a wait
+    /// on a party that may never return: while a behind target still has its keys the saved
+    /// position waits for them (`lag_floor`), so keep this below the source's binlog retention —
+    /// a target that outlives it would otherwise be replayed from a purged binlog.
+    pub lag_hold_max: Duration,
     /// Test hook `LAZYVIEW_TEST_FAIL_IDENTITY=<n>`: the first `n` source identity reads of a
     /// start fail (see `engine::server_identity`), the stand-in for a connection blip there.
     pub test_fail_identity: Option<usize>,
@@ -381,6 +401,11 @@ impl Config {
                     _ => bail!("LAZYVIEW_LAG_OVER_BUDGET must be pause|drop_refresh"),
                 },
             };
+        // How long the keys kept for a behind target are held at all (review R-01): the deadline
+        // of the hold, after which the executor hook sheds them and reports the target, so a
+        // replica that never comes back cannot hold this instance's memory and its saved position
+        // for longer than this.
+        let lag_hold_max = Duration::from_millis(num("LAZYVIEW_LAG_HOLD_MAX_MS", 3_600_000)?);
         // The leadership lock's lease (review A-06): the beat period of the lock's own session and
         // the server-side `wait_timeout` of that session. Checked by `coord::Lease::new`, the same
         // code that will use them, so a setting cannot pass here and be refused there.
@@ -521,6 +546,8 @@ impl Config {
             Some(num("LAZYVIEW_TEST_BUILD_HOLD_BYTES", 0)? as usize).filter(|&b| b > 0);
         let test_lag_hold_bytes =
             Some(num("LAZYVIEW_TEST_LAG_HOLD_BYTES", 0)? as usize).filter(|&b| b > 0);
+        let test_lag_target_bytes =
+            Some(num("LAZYVIEW_TEST_LAG_TARGET_BYTES", 0)? as usize).filter(|&n| n > 0);
         let mut mem = crate::mem::MemoryBudget::resolve_with(
             explicit_total,
             &crate::mem::CgroupPaths::default(),
@@ -532,6 +559,9 @@ impl Config {
         }
         if let Some(b) = test_lag_hold_bytes {
             mem.lag_hold_bytes = b;
+        }
+        if let Some(b) = test_lag_target_bytes {
+            mem.lag_target_bytes = b;
         }
         Ok(Config {
             dsn,
@@ -562,8 +592,10 @@ impl Config {
             test_build_delay: marker_delay("LAZYVIEW_TEST_BUILD_DELAY")?,
             test_build_hold_bytes,
             test_lag_hold_bytes,
+            test_lag_target_bytes,
             mem,
             lag_over_budget,
+            lag_hold_max,
             test_fail_identity: Some(num("LAZYVIEW_TEST_FAIL_IDENTITY", 0)? as usize)
                 .filter(|&n| n > 0),
             test_fail_snapshot: Some(num("LAZYVIEW_TEST_FAIL_SNAPSHOT", 0)? as usize)
@@ -1248,6 +1280,30 @@ mod tests {
         assert!(e.contains("not yet"), "{e}");
         assert!(e.contains("whole-view refresh"), "{e}");
         assert!(e.contains("pause"), "{e}: must say what to use meanwhile");
+        // The bound's own two numbers (review R-01): how long a behind target's keys are held, and
+        // the share of the lag buffer one target may hold — both are what the executor hook reads.
+        assert_eq!(
+            c.lag_hold_max,
+            Duration::from_millis(3_600_000),
+            "one hour of hold by default"
+        );
+        assert!(
+            c.mem.lag_target_bytes < c.mem.lag_hold_bytes,
+            "one target's share ({}) must be smaller than the whole buffer ({})",
+            c.mem.lag_target_bytes,
+            c.mem.lag_hold_bytes
+        );
+        let c = cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_LAG_HOLD_MAX_MS", "2000")]).unwrap();
+        assert_eq!(c.lag_hold_max, Duration::from_millis(2000));
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "x"),
+            ("LAZYVIEW_TEST_LAG_TARGET_BYTES", "16"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.mem.lag_target_bytes, 16,
+            "the test hook runs one target's share far below its size"
+        );
         for bad in ["warn", "warn_only", "drop", "off"] {
             let e = cfg(&[("LAZYVIEW_DSN", "x"), ("LAZYVIEW_LAG_OVER_BUDGET", bad)])
                 .unwrap_err()
