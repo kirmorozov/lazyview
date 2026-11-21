@@ -1310,7 +1310,7 @@ pub async fn verify_targets(
     if !pg_targets.is_empty() {
         let mut sc = src.conn().await?;
         engine
-            .wait_caught_up(&mut sc, t_catchup())
+            .wait_caught_up_progressive(&mut sc, t_catchup())
             .await
             .with_context(|| format!("catch-up before the PostgreSQL check '{what}'"))?;
         sc.disconnect().await.ok();
@@ -1333,7 +1333,7 @@ async fn verify_targets_mysql(
 ) -> Result<()> {
     let mut sc = src.conn().await?;
     engine
-        .wait_caught_up(&mut sc, t_catchup())
+        .wait_caught_up_progressive(&mut sc, t_catchup())
         .await
         .with_context(|| format!("catch-up before check '{what}'"))?;
     engine.check_alive()?;

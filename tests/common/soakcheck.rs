@@ -725,8 +725,12 @@ async fn check_once(
     )
     .await;
     let mut sc = src.conn().await?;
-    // (2) catch-up: three rounds, one per chained level plus margin (`engine.rs:205`).
-    eng.wait_caught_up_rounds(&mut sc, t_catchup(), 3)
+    // (2) catch-up: three rounds, one per chained level plus margin (`engine.rs:205`). The
+    // progress-aware variant (#248): a soak runs on a shared host, and the one thing the fixed
+    // 180 s could not tell apart was a catch-up behind a slow statement or a reconnect cycle from
+    // one that had stopped — the case `supervisor_overload_errors` shows (#260). The floor stays
+    // exactly where it was.
+    eng.wait_caught_up_rounds_progressive(&mut sc, t_catchup(), 3)
         .await
         .with_context(|| format!("'{what}': catch-up before the oracle sweep"))?;
     eng.check_alive()?;

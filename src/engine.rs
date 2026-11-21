@@ -850,7 +850,11 @@ struct Engine {
 }
 
 /// Binlog dump connections: connect, register as a replica and request the stream.
-const BINLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// Public (issue #248) because it is one of the two bounds a catch-up's length is made of — the
+/// harness sizes its catch-up waits from it and from `supervisor`'s retry numbers, never from a
+/// wall-clock guess.
+pub const BINLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Flushes taking longer are logged (debug) with their slowest steps.
 const SLOW_FLUSH: Duration = Duration::from_secs(1);

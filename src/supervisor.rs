@@ -100,7 +100,43 @@ pub(crate) const FENCE_WAIT: Duration = Duration::from_secs(5);
 /// an unreachable host would otherwise hold the loop for the OS's SYN retries (~130 s). The one
 /// 10 s timeout, shared by the pooled connections, the engine's source and metadata connections
 /// and `coord`'s standby.
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+// The retry bounds a catch-up can spend, in the open (issue #248). The test harness used to
+// mirror these as literals (`BH_CONNECT_*` in `tests/chaos.rs`), which can drift; they are the
+// engine's own numbers now, so a wait is sized from them and never from a guess. The two shapes
+// a *living* engine can be silent inside are:
+//
+// * one whole [`Policy::CONNECT`] run of the binlog stream loop: `attempts` tries of
+//   [`crate::engine::BINLOG_CONNECT_TIMEOUT`] each with [`backoff`] between them, and when the
+//   run fails entirely, one [`Self::CONNECT_BACKOFF_CAP`] wait before the next run;
+// * one statement of a refresh under [`Policy::STATEMENTS`]: `attempts + 1` tries of
+//   [`Config::target_timeout`] each with [`backoff`] between them.
+//
+// [`Config::target_timeout`]: crate::config::Config::target_timeout
+/// Attempts one connect gets (`Policy::CONNECT`) — with [`CONNECT_BACKOFF_BASE`],
+/// [`CONNECT_BACKOFF_CAP`] and [`crate::engine::BINLOG_CONNECT_TIMEOUT`], the whole arithmetic of
+/// a failed reconnect cycle.
+pub const CONNECT_ATTEMPTS: u32 = Policy::CONNECT.attempts;
+/// The first wait between two connect attempts (`Policy::CONNECT` doubles it per try).
+pub const CONNECT_BACKOFF_BASE: Duration = Policy::CONNECT.base;
+/// The longest wait between two connect attempts, and the extra wait a wholly failed
+/// `Policy::CONNECT` run pays before the next run (`engine.rs`, the stream loop).
+pub const CONNECT_BACKOFF_CAP: Duration = Policy::CONNECT.cap;
+/// Whether `Policy::CONNECT` jitters its waits (so a bound must use [`backoff_max`]).
+pub const CONNECT_JITTER: bool = Policy::CONNECT.jitter;
+/// Tries one idempotent statement gets (`Policy::STATEMENTS`): a chunk read or write of a
+/// catch-up that hits `Config::target_timeout` on every try costs
+/// `(STATEMENT_ATTEMPTS + 1) × target_timeout` plus the backoffs in between.
+///
+/// [`Config::target_timeout`]: crate::config::Config::target_timeout
+pub const STATEMENT_ATTEMPTS: u32 = Policy::STATEMENTS.attempts;
+/// The first wait between two tries of one statement (`Policy::STATEMENTS` doubles it per try).
+pub const STATEMENT_BACKOFF_BASE: Duration = Policy::STATEMENTS.base;
+/// The longest wait between two tries of one statement (`Policy::STATEMENTS`).
+pub const STATEMENT_BACKOFF_CAP: Duration = Policy::STATEMENTS.cap;
+/// Whether `Policy::STATEMENTS` jitters its waits (so a bound must use [`backoff_max`]).
+pub const STATEMENTS_JITTER: bool = Policy::STATEMENTS.jitter;
 
 /// An op exceeded `LAZYVIEW_TARGET_TIMEOUT_MS` (an overload error).
 #[derive(Debug)]
@@ -185,6 +221,18 @@ pub(crate) fn backoff(attempt: u32, base: Duration, cap: Duration, jitter: bool)
         .unwrap_or(0);
     // 0.5 .. 1.5
     d.mul_f64(0.5 + f64::from(nanos % 1000) / 1000.0)
+}
+
+/// The widest [`backoff`] gets for try `attempt`: `min(base · 2^(attempt−1), cap)`, times the
+/// +50 % top of the jitter when the policy is jittered. Public (issue #248) so the harness can
+/// bound a wait by the slowest real engine rather than by an average one.
+pub fn backoff_max(attempt: u32, base: Duration, cap: Duration, jitter: bool) -> Duration {
+    let d = backoff(attempt, base, cap, false);
+    if jitter {
+        d.mul_f64(1.5)
+    } else {
+        d
+    }
 }
 
 /// The connections behind an [`Endpoint`], one variant per family: `conn()` and
@@ -1201,6 +1249,28 @@ mod tests {
                 }
             }
             assert_eq!(seen, all, "every unit is in a chunk");
+        }
+    }
+
+    /// `backoff_max` is what the harness's catch-up bound multiplies out (#248), so it must be a
+    /// real upper bound of `backoff` and not merely a similar-looking number.
+    #[test]
+    fn backoff_max_is_the_upper_bound() {
+        for (base, cap) in [
+            (Duration::from_secs(1), Duration::from_secs(30)),
+            (Duration::from_millis(50), Duration::from_millis(500)),
+        ] {
+            for n in 1..=6 {
+                let m = backoff_max(n, base, cap, true);
+                assert_eq!(m, backoff(n, base, cap, false).mul_f64(1.5), "{n}");
+                // The jitter is `0.5 .. 1.5` of the same base, so no draw can exceed it.
+                assert!(backoff(n, base, cap, true) <= m, "{n}");
+                assert_eq!(
+                    backoff_max(n, base, cap, false),
+                    backoff(n, base, cap, false),
+                    "{n}"
+                );
+            }
         }
     }
 
