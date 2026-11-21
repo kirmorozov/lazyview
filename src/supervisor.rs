@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use mysql_async::{Conn, Opts, OptsBuilder, PoolConstraints, PoolOpts, Value};
@@ -45,6 +45,9 @@ pub const MIN_CHUNK: usize = 100;
 /// (target modules reach it through [`crate::target::with_retry`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Policy {
+    /// The policy's name, carried by the overload WARN of [`retrying`] / [`retrying_mut`] so a
+    /// log line says which shape was spent (the operator's word for the numbers below).
+    pub name: &'static str,
     pub attempts: u32,
     pub base: Duration,
     pub cap: Duration,
@@ -55,6 +58,7 @@ impl Policy {
     /// An idempotent statement (the old `RETRIES` + [`backoff`]): 3 retries,
     /// 50 ms doubling up to 500 ms, jittered.
     pub(crate) const STATEMENTS: Policy = Policy {
+        name: "statements",
         attempts: 3,
         base: Duration::from_millis(50),
         cap: Duration::from_millis(500),
@@ -62,6 +66,7 @@ impl Policy {
     };
     /// An idempotent read at a source boundary: 5 retries, 200 ms doubling to 2 s, jittered.
     pub(crate) const READS: Policy = Policy {
+        name: "reads",
         attempts: 5,
         base: Duration::from_millis(200),
         cap: Duration::from_secs(2),
@@ -69,6 +74,7 @@ impl Policy {
     };
     /// A repeat of a connect: 5 retries, 1 s doubling to 30 s, jittered.
     pub(crate) const CONNECT: Policy = Policy {
+        name: "connect",
         attempts: 5,
         base: Duration::from_secs(1),
         cap: Duration::from_secs(30),
@@ -81,6 +87,7 @@ impl Policy {
     /// it and leaves the swap to the next rebuild; the engine never retries a swap on the
     /// binlog loop (N-02).
     pub(crate) const SWAP: Policy = Policy {
+        name: "swap",
         attempts: 1,
         base: Duration::from_millis(50),
         cap: Duration::from_millis(50),
@@ -801,6 +808,97 @@ impl Supervisor {
     }
 }
 
+/// Minimum time between overload-retry WARN lines for the same op of the same engine (the
+/// shape of `STMT_DML_LOG_INTERVAL` in `engine.rs`). The per-try line is DEBUG and sits below
+/// the default level, so an engine lagging minutes behind a degraded target produced no visible
+/// line at all (#260 — review N-02's defect class: the retry itself is designed backpressure,
+/// the blindness is the bug). One WARN per (`what`, engine) per interval carries the folded
+/// tries; the counters (`supervisor_overload_errors`, `supervisor_retries`) stay the exact
+/// evidence, they are unchanged.
+const OVERLOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// The rate-limit table behind that WARN, keyed by (`what`, engine): the engine identity is the
+/// address of its `Metrics`' `view_stats` `Registry`, unique per engine and pinned alive by the
+/// `Arc` clone in the entry — so an entry can never be misread as a different engine, and two
+/// engines in one process (the integration suite runs several) rate limit independently, each
+/// against the log file that belongs to it. The keys per engine are a fixed set — the call-site
+/// strings plus one per target name (`"writing to target X"`) — so the table is bounded; the
+/// cap below is a safety net for an unforeseen caller, evicting the entry that logged longest
+/// ago (dropping its `Arc` with it). Cost note (owner rule): this table and its lock are
+/// touched only in the overload-error arm of the retry helpers — never on a per-row or
+/// per-binlog-event path — and a key is allocated once per (`what`, engine), never per try.
+const OVERLOAD_LOG_MAX: usize = 64;
+static OVERLOAD_LOG: Mutex<
+    BTreeMap<(usize, String), (Arc<crate::stats::Registry>, (Option<Instant>, u64))>,
+> = Mutex::new(BTreeMap::new());
+
+/// The gate of the overload WARN, split out of [`note_overload`] so the unit test can drive it
+/// with its own clock (the `stmt_dml_gate` precedent). `Some(count)` when a line is due,
+/// `count` being the tries it reports (this one plus those folded since the last line, which
+/// the entry forgets as it reports them); `None` when the try folds into the next line. `None`
+/// for the time of the last line means "none logged yet", so the first try always logs and no
+/// subtraction can fall below the monotonic clock's origin (review C-03).
+fn overload_log_gate(slot: &mut (Option<Instant>, u64), now: Instant) -> Option<u64> {
+    if let Some(last) = slot.0 {
+        if now.duration_since(last) < OVERLOAD_LOG_INTERVAL {
+            slot.1 += 1; // folded into the next line for this op
+            return None;
+        }
+    }
+    let count = slot.1 + 1;
+    slot.0 = Some(now);
+    slot.1 = 0;
+    Some(count)
+}
+
+/// The operator's trace of an overloaded op (#260): one WARN per (`what`, engine) per
+/// [`OVERLOAD_LOG_INTERVAL`] naming the policy, the attempt and the error's root cause —
+/// `what` already says which op ("reading the sources", "writing to target X") — with the
+/// tries folded since the last line as `count`. The per-try DEBUG line stays for the full
+/// chain; this WARN is what makes the lag visible at the default level. Returns `Some(count)`
+/// when this call logged (and `None` when it folded) so the unit test can watch the rate
+/// limiter without a live engine or a log subscriber. Called from the overload arm only
+/// (rare by definition: the source or target just overloaded).
+fn note_overload(
+    metrics: &Metrics,
+    what: &str,
+    policy: &Policy,
+    attempt: u32,
+    e: &anyhow::Error,
+) -> Option<u64> {
+    let now = Instant::now();
+    let key = (Arc::as_ptr(&metrics.view_stats) as usize, what.to_owned());
+    let mut map = metrics::lock(&OVERLOAD_LOG);
+    let due = match map.get_mut(&key) {
+        Some((_, slot)) => overload_log_gate(slot, now),
+        None => {
+            if map.len() >= OVERLOAD_LOG_MAX {
+                // Never taken with the fixed key set; bounds the table if that ever changes.
+                let oldest = map
+                    .iter()
+                    .min_by_key(|(_, (_, slot))| slot.0)
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest {
+                    map.remove(&k);
+                }
+            }
+            let entry = map
+                .entry(key)
+                .or_insert_with(|| (metrics.view_stats.clone(), (None, 0)));
+            overload_log_gate(&mut entry.1, now)
+        }
+    };
+    let count = due?;
+    warn!(
+        policy = policy.name,
+        attempt,
+        count,
+        "{what}: {}; retry {attempt} of {}",
+        e.root_cause(),
+        policy.attempts
+    );
+    Some(count)
+}
+
 /// Runs `op` until it succeeds, the error is not transient, or `attempts` are spent; sleeps
 /// `backoff(attempt)` between tries and beats the liveness heartbeat each round so a retry
 /// loop cannot starve /livez. `op` must be idempotent (see each call site's note).
@@ -825,6 +923,7 @@ where
                 attempt += 1;
                 Metrics::add(&metrics.supervisor_retries, 1);
                 debug!("{what}: {e:#}; retry {attempt} of {}", policy.attempts);
+                note_overload(metrics, what, &policy, attempt, &e);
                 metrics.beat();
                 tokio::time::sleep(backoff(attempt, policy.base, policy.cap, policy.jitter)).await;
             }
@@ -860,6 +959,7 @@ where
                 attempt += 1;
                 Metrics::add(&metrics.supervisor_retries, 1);
                 debug!("{what}: {e:#}; retry {attempt} of {}", policy.attempts);
+                note_overload(metrics, what, &policy, attempt, &e);
                 metrics.beat();
                 tokio::time::sleep(backoff(attempt, policy.base, policy.cap, policy.jitter)).await;
             }
@@ -1457,6 +1557,139 @@ mod tests {
         assert!(
             metrics::lock(&ep.writing).is_empty(),
             "a finished op is removed from the record, guard or no guard"
+        );
+    }
+
+    /// The overload WARN is rate limited per op (the `the_first_statement_dml_line_logs_at_once`
+    /// shape): the first try for a `what` logs at once — an entry that has never logged has no
+    /// time to compare against, which keeps the clock off the path where subtracting the
+    /// interval from `now` would panic below the monotonic clock's origin (review C-03) — and
+    /// the tries inside the interval fold into the line that follows them (#260: the counter is
+    /// the evidence, the WARN is the trace; this pins the interval itself, which the integration
+    /// test cannot wait 60 s for).
+    #[test]
+    fn the_first_overload_line_logs_at_once() {
+        let t0 = Instant::now();
+        let mut slot = (None, 0u64); // an op that never warned
+        assert_eq!(
+            overload_log_gate(&mut slot, t0),
+            Some(1),
+            "the first overloaded try logs at once, whatever the host's uptime"
+        );
+        assert_eq!(slot, (Some(t0), 0), "the line stamps its op");
+        assert_eq!(
+            overload_log_gate(&mut slot, t0 + Duration::from_secs(59)),
+            None,
+            "a try inside the interval folds instead of logging"
+        );
+        assert_eq!(
+            slot,
+            (Some(t0), 1),
+            "the folded try waits for the next line"
+        );
+        assert_eq!(
+            overload_log_gate(&mut slot, t0 + OVERLOAD_LOG_INTERVAL),
+            Some(2),
+            "the line that follows carries the folded try too"
+        );
+        assert_eq!(slot, (Some(t0 + OVERLOAD_LOG_INTERVAL), 0));
+        assert_eq!(
+            overload_log_gate(&mut slot, t0 + OVERLOAD_LOG_INTERVAL * 2),
+            Some(1),
+            "a quiet interval reports one try"
+        );
+    }
+
+    /// The counters stay the exact evidence while the WARN folds (#260): one full policy run
+    /// reports every overloaded try and every retry in the counters, and a second run on the
+    /// same `what` inside the interval advances the counters just the same while its lines
+    /// fold. The `retrying_mut` arm is the other half of the pair and shares this code path.
+    #[tokio::test]
+    async fn retrying_counts_every_try_while_the_warn_folds() {
+        let metrics = Metrics::default();
+        let policy = Policy {
+            name: "unit",
+            attempts: 3,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(1),
+            jitter: false,
+        };
+        // A unique `what` per test: the rate-limit table is a process-wide static and the unit
+        // tests run in parallel.
+        let what = "unit: the folding op";
+        let failing =
+            || Err(anyhow::Error::new(Timeout(Duration::from_millis(1))).context("write op"));
+        let e: Result<()> = retrying(&metrics, what, policy, || {
+            let failing = failing();
+            async move { failing }
+        })
+        .await;
+        assert!(e.is_err(), "the last try returns the error");
+        assert_eq!(Metrics::get(&metrics.supervisor_overload_errors), 4);
+        assert_eq!(Metrics::get(&metrics.supervisor_retries), 3);
+        let _: Result<()> = retrying(&metrics, what, policy, || {
+            let failing = failing();
+            async move { failing }
+        })
+        .await;
+        assert_eq!(
+            Metrics::get(&metrics.supervisor_overload_errors),
+            8,
+            "the folded run still counts every try"
+        );
+        assert_eq!(Metrics::get(&metrics.supervisor_retries), 6);
+        // The `retrying_mut` arm likewise.
+        let mut state = 0u32;
+        let _: Result<()> = retrying_mut(
+            &metrics,
+            "unit: the folding mut op",
+            policy,
+            &mut state,
+            |s| {
+                Box::pin(async move {
+                    *s += 1;
+                    Err(anyhow::Error::new(Timeout(Duration::from_millis(1))).context("write op"))
+                })
+            },
+        )
+        .await;
+        assert_eq!(state, 4, "every try got the state");
+        assert_eq!(Metrics::get(&metrics.supervisor_overload_errors), 12);
+        assert_eq!(Metrics::get(&metrics.supervisor_retries), 9);
+    }
+
+    /// Rate limiting is per engine (#260's integration proof depends on it): each engine has
+    /// its own log file, so one engine's line must never fold into another engine's window —
+    /// the supervisor suite's sibling tests overload the same `what` ("writing to target
+    /// source") in the same process. `note_overload` says which calls logged (`Some`) and
+    /// which folded (`None`).
+    #[test]
+    fn the_overload_warn_rate_limits_per_engine_not_per_process() {
+        let policy = Policy {
+            name: "unit",
+            attempts: 3,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(1),
+            jitter: false,
+        };
+        let e = anyhow::Error::new(Timeout(Duration::from_millis(1))).context("write op");
+        let what = "unit: per-engine trace";
+        let a = Metrics::default();
+        let b = Metrics::default();
+        assert_eq!(
+            note_overload(&a, what, &policy, 1, &e),
+            Some(1),
+            "the first overloaded try of the first engine logs"
+        );
+        assert_eq!(
+            note_overload(&a, what, &policy, 2, &e),
+            None,
+            "its next try inside the interval folds"
+        );
+        assert_eq!(
+            note_overload(&b, what, &policy, 1, &e),
+            Some(1),
+            "a second engine in the same process is rate limited on its own, for its own log"
         );
     }
 }

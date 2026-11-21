@@ -439,6 +439,121 @@ fn sup_timed_out_writes_are_fenced() {
     });
 }
 
+/// #260 (readiness review N-02's defect class): an op stuck behind a degraded target lags for
+/// minutes with no line at the default level. Same shape as `sup_timed_out_writes_are_fenced`
+/// (the view table locked, a 1 s op timeout), but the proof is the operator's trace: every try
+/// still counts (`supervisor_overload_errors`, `supervisor_retries`) while the overload WARN
+/// itself is rate limited — one line per op class per 60 s with the folded tries, not one per
+/// try (the run is kept well inside one interval, and the interval logic is pinned by the
+/// `overload_log_gate` unit test in `src/supervisor.rs`). Red before the WARN existed: the
+/// counters rose, the log stayed silent at the default level.
+#[test]
+fn sup_overload_retries_leave_a_visible_trace() {
+    scenario("sup_trace", |ctx| async move {
+        let db = ctx.new_db("sup_trace").await?;
+        setup(&db).await?;
+        let specs: Vec<ViewSpec> = specs(None)
+            .into_iter()
+            .filter(|s| s.name == "s_ctr")
+            .collect();
+        let ov = [
+            ("LAZYVIEW_SUPERVISOR", "fixed"),
+            ("LAZYVIEW_TARGET_TIMEOUT_MS", "1000"),
+        ];
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &ov).await?;
+        verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+        let before = eng.snapshot();
+        let mut lock = db.conn().await?;
+        exec(&mut lock, "START TRANSACTION").await?;
+        let _: Vec<mysql_async::Row> = lock
+            .query("SELECT id FROM s_ctr WHERE id <= 10 FOR UPDATE")
+            .await?;
+        // Two flushes against the held row locks: each write op burns its full policy (4
+        // timed-out tries), so the counters advance far past one interval's worth of tries
+        // while the WARN folds them. The phase is timed: the rate-limit assertion holds only
+        // inside one 60 s interval, and an environment too slow for that says so — a real
+        // environment (this scenario's own sibling) finishes in seconds.
+        let phase_start = std::time::Instant::now();
+        let mut c = db.conn().await?;
+        for round in 0..2u64 {
+            exec(
+                &mut c,
+                &format!(
+                    "UPDATE ctr SET seq = seq + {}, v = v + 1 WHERE id <= 10",
+                    1000 * (round + 1)
+                ),
+            )
+            .await?;
+            // Wait for one full policy run of the write op (attempts + the returning try), so
+            // COMMIT cannot land mid-op and shorten the run the counters must show.
+            let m = eng.metrics.clone();
+            let seen = m.snapshot().supervisor_overload_errors + 4;
+            wait_until(
+                "a full policy run of overloaded writes",
+                Duration::from_secs(60),
+                move || {
+                    let m = m.clone();
+                    async move { Ok(m.snapshot().supervisor_overload_errors >= seen) }
+                },
+            )
+            .await?;
+        }
+        let phase = phase_start.elapsed();
+        exec(&mut lock, "COMMIT").await?;
+        lock.disconnect().await.ok();
+        verify(&ctx, &mut eng, &db, &specs, "after the lock").await?;
+        let d = eng.snapshot().since(&before);
+        ctx.log(format!(
+            "trace: {phase:?} of locked target: {}",
+            fmt_snapshot(&d)
+        ));
+        ensure!(
+            phase < Duration::from_secs(55),
+            "the overloaded phase ran {phase:?}, past one rate-limit interval: too slow to \
+             prove the rate limit here (the gate logic is pinned in src/supervisor.rs)"
+        );
+        ensure!(
+            d.supervisor_retries >= 3,
+            "the first policy run must count all 3 of its retries: {}",
+            d.supervisor_retries
+        );
+        ensure!(
+            d.supervisor_overload_errors > d.supervisor_retries,
+            "every policy run errors once more than it retries (its last try returns): errors \
+             {} retries {}",
+            d.supervisor_overload_errors,
+            d.supervisor_retries
+        );
+        // The trace itself: exactly one WARN line for the timed-out op class while the counters
+        // say several policy runs happened. The per-try line stays at DEBUG with the full
+        // chain; the WARN is what an operator sees at the default level.
+        let log = std::fs::read_to_string(&eng.log_path)?;
+        let warns = log
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("; retry ") && l.contains(" of "))
+            .count();
+        ensure!(
+            warns == 1,
+            "expected exactly one rate-limited overload WARN line, found {warns} \
+             (counters: errors {} retries {})",
+            d.supervisor_overload_errors,
+            d.supervisor_retries
+        );
+        let debugs = log
+            .lines()
+            .filter(|l| l.contains("DEBUG") && l.contains("; retry ") && l.contains(" of "))
+            .count();
+        ensure!(
+            debugs >= 6,
+            "the per-try DEBUG chain is gone: {debugs} lines for {} retries",
+            d.supervisor_retries
+        );
+        c.disconnect().await.ok();
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
 /// Crash consistency (invariant I2): the engine is killed at random points while concurrent
 /// refreshes are in flight under load, restarted in resume mode each time, and the views
 /// converge: the saved position never passed a change that was not applied.
