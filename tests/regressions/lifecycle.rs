@@ -371,7 +371,9 @@ fn reg_crash_with_stale_full_view() {
 
 /// A server identity that cannot be read keeps the resume guard: the read is repeated and the
 /// saved position refused (it used to read as `""`, leaving the "written by another server"
-/// check off for the whole run).
+/// check off for the whole run). A cursor that carries its GTID set is decided by the adoption
+/// rules instead: with this server's own state covering the set, it resumes by GTID even while
+/// the name is unreadable (ruling 4).
 #[test]
 fn reg_unreadable_identity_keeps_resume_guard() {
     scenario("reg_identity_blip", |ctx| async move {
@@ -393,16 +395,38 @@ fn reg_unreadable_identity_keeps_resume_guard() {
             "no saved identity: {saved:?}"
         );
         // Failover stand-in: the saved position names another server. With the hook the first
-        // identity read of the next start fails; the retry must still read this server.
+        // identity read of the next start fails; the retry must still read this server. A
+        // cursor that carries a GTID set is decided by the adoption rules instead (ruling 4:
+        // this server's own executed state is the proof, not its name): it resumes without a
+        // stop and without a rebuild, so the legs below branch on what the row carries.
         let foreign = "UPDATE _lazyview_status SET server_identity = 'other-server'";
         exec(&mut c, foreign).await?;
-        let eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_FAIL_IDENTITY", "1")])?;
-        match eng.wait_finished(Duration::from_secs(60)).await? {
-            Err(e) if e.contains("other-server") => {}
-            other => bail!("repeated read: expected a refusal naming other-server, got {other:?}"),
+        let cursor = scalar(&mut c, "SELECT binlog_cursor FROM _lazyview_status").await?;
+        let carries_set = cursor.as_deref().is_some_and(|s| s.contains("[g="));
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_FAIL_IDENTITY", "1")])?;
+        if carries_set {
+            wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                "unreadable identity, saved set covered: resumed by GTID",
+            )
+            .await?;
+            eng.stop().await?;
+        } else {
+            match eng.wait_finished(Duration::from_secs(60)).await? {
+                Err(e) if e.contains("other-server") => {}
+                other => {
+                    bail!("repeated read: expected a refusal naming other-server, got {other:?}")
+                }
+            }
         }
         // Asked to rebuild instead of failing, the run refuses the position (every view is
-        // rebuilt) and goes on streaming, equal to the oracle.
+        // rebuilt) and goes on streaming, equal to the oracle. A covered set is adopted
+        // instead: resume, no rebuild asked for.
+        exec(&mut c, foreign).await?;
         let mut eng = ctx.start_engine(
             &db,
             &[
@@ -410,32 +434,52 @@ fn reg_unreadable_identity_keeps_resume_guard() {
                 ("LAZYVIEW_ON_MISSING_BINLOG", "rebuild"),
             ],
         )?;
-        // The state rows still say `ready` from the run before: wait for the rebuild itself.
-        wait_until(
-            "the foreign position refused: every view rebuilt",
-            t_ready(),
-            || {
-                let s = eng.snapshot();
-                async move { Ok(s.full_rebuilds >= 1) }
-            },
-        )
-        .await?;
+        if !carries_set {
+            // The state rows still say `ready` from the run before: wait for the rebuild itself.
+            wait_until(
+                "the foreign position refused: every view rebuilt",
+                t_ready(),
+                || {
+                    let s = eng.snapshot();
+                    async move { Ok(s.full_rebuilds >= 1) }
+                },
+            )
+            .await?;
+        }
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
         verify(
             &ctx,
             &mut eng,
             &db,
             &specs,
-            "after refusing a foreign position",
+            if carries_set {
+                "after adopting a foreign position by GTID"
+            } else {
+                "after refusing a foreign position"
+            },
         )
         .await?;
         eng.stop().await?;
-        // Without the hook the guard still fires: the same foreign identity, nothing injected.
+        // Without the hook the guard still fires: the same foreign identity, nothing injected
+        // — unless the set covers, which is the guard the adoption rules now read.
         exec(&mut c, foreign).await?;
-        let eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_FAIL_IDENTITY", "0")])?;
-        match eng.wait_finished(Duration::from_secs(60)).await? {
-            Err(e) if e.contains("other-server") => {}
-            other => bail!("no hook: expected a refusal naming other-server, got {other:?}"),
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_FAIL_IDENTITY", "0")])?;
+        if carries_set {
+            wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                "no hook, saved set covered: resumed by GTID",
+            )
+            .await?;
+            eng.stop().await?;
+        } else {
+            match eng.wait_finished(Duration::from_secs(60)).await? {
+                Err(e) if e.contains("other-server") => {}
+                other => bail!("no hook: expected a refusal naming other-server, got {other:?}"),
+            }
         }
         Ok(())
     });

@@ -218,6 +218,35 @@ pub async fn gtid_covers(conn: &mut mysql_async::Conn, saved: &Cursor) -> anyhow
     }
 }
 
+/// One flavor's set text into the shared interval shape ([`mysql::GtidSet`]): the grammar is
+/// the flavor's (`mysql.rs` and `maria.rs` each own their `parse_gtid_set`), the shape is
+/// shared so the engine's comparisons need no branch.
+pub(crate) fn parse_set(flavor: Flavor, text: &str) -> mysql::GtidSet {
+    match flavor {
+        Flavor::MySql | Flavor::Percona => mysql::parse_gtid_set(text),
+        Flavor::MariaDb => maria::parse_gtid_set(text),
+    }
+}
+
+/// Merge one stream GTID (`uuid:gno` / `uuid:tag:gno`, or `domain-server-seq`) into the
+/// consumed set — the engine's per-committed-transaction call. The grammar is the flavor's;
+/// the cost note lives with each merge (in-place interval merge, allocation only for a
+/// first-time source id). `false` = not this flavor's grammar: the set is left untouched.
+pub(crate) fn merge_gtid(flavor: Flavor, set: &mut mysql::GtidSet, gtid: &str) -> bool {
+    match flavor {
+        Flavor::MySql | Flavor::Percona => mysql::merge_gtid(set, gtid),
+        Flavor::MariaDb => maria::merge_gtid(set, gtid),
+    }
+}
+
+/// The consumed set in the flavor's own set grammar — the `[g=…]` text a cursor carries.
+pub(crate) fn render_set(flavor: Flavor, set: &mysql::GtidSet) -> String {
+    match flavor {
+        Flavor::MySql | Flavor::Percona => mysql::render_set(set),
+        Flavor::MariaDb => maria::render_list(set),
+    }
+}
+
 /// The GTID state a source reports about itself, read once at connect (the network edge, in
 /// [`crate::binlog`]) and interpreted by the flavor modules. `None` means the server has no such
 /// variable, not that it is empty: MariaDB has no `gtid_mode`, MySQL/Percona no
@@ -869,5 +898,66 @@ mod tests {
                 "{bad:?} refused with the wrong words: {e:#}"
             );
         }
+    }
+
+    /// PR D: the engine's per-transaction merge (`source::merge_gtid`) and the render back to
+    /// cursor text (`source::render_set`), per flavor. The merge accepts exactly the stream
+    /// event's spellings and refuses anything else without touching the set (the safe
+    /// under-claim); the render must round-trip through the same flavor's parse.
+    #[test]
+    fn gtid_merge_and_render_round_trip() {
+        use super::{merge_gtid, render_set};
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        // MySQL family: sequential gnos extend in place, a repeat is a no-op, a tagged event
+        // merges under its uuid, two intervals render as MySQL prints them.
+        let mut set = mysql::GtidSet::new();
+        for g in [
+            format!("{u}:1"),
+            format!("{u}:2"),
+            format!("{u}:2"),
+            format!("{u}:3:7"), // tagged: uuid:tag:gno
+            u.to_uppercase().to_string() + ":9",
+        ] {
+            assert!(merge_gtid(Flavor::MySql, &mut set, &g), "{g}");
+        }
+        let junk = [format!("{u}:x"), format!("{u}:")];
+        for bad in [
+            "".to_string(),
+            "u:1".into(),
+            "nonsense".into(),
+            junk[0].clone(),
+            junk[1].clone(),
+        ] {
+            assert!(
+                !merge_gtid(Flavor::MySql, &mut set, &bad),
+                "{bad:?} accepted"
+            );
+        }
+        let text = render_set(Flavor::MySql, &set);
+        assert_eq!(text, format!("{u}:1-2,{u}:7,{u}:9"));
+        // Render → parse is the identity on the intervals.
+        assert_eq!(mysql::parse_gtid_set(&text), set);
+        // MariaDB: the `domain-server-seq` event text merges densely per pair; the render is
+        // the explicit-window form the parse (and `SET @slave_connect_state`) reads back.
+        let mut set = mysql::GtidSet::new();
+        for g in ["0-1-1", "0-1-2", "0-1-3", "1-2-5"] {
+            assert!(merge_gtid(Flavor::MariaDb, &mut set, g), "{g}");
+        }
+        for bad in ["", "0-1", "0-1-x", "0-1-2-3", "a-b-c"] {
+            assert!(
+                !merge_gtid(Flavor::MariaDb, &mut set, bad),
+                "{bad:?} accepted"
+            );
+        }
+        assert_eq!(render_set(Flavor::MariaDb, &set), "0-1-1-3,1-2-5-5");
+        assert_eq!(
+            maria::parse_gtid_set(&render_set(Flavor::MariaDb, &set)),
+            set
+        );
+        // A reader that joined mid-stream keeps a window that does not start at 1: the render
+        // says exactly that (no high-water over-claim).
+        let mut set = mysql::GtidSet::new();
+        assert!(merge_gtid(Flavor::MariaDb, &mut set, "0-1-57"));
+        assert_eq!(render_set(Flavor::MariaDb, &set), "0-1-57-57");
     }
 }

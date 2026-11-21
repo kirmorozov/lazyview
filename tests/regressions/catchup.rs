@@ -552,21 +552,28 @@ fn reg_cascade_traced_through_the_parent() {
 }
 
 /// E8: a saved position belongs to the server that wrote it (`_lazyview_status.server_identity`:
-/// `@@server_uuid`, MariaDB server id + GTID domain). Restored onto or failed over to another
-/// server, the same file name may hold other events: that goes through
-/// LAZYVIEW_ON_MISSING_BINLOG (fail by default, rebuild on request) instead of replaying them.
+/// `@@server_uuid`, MariaDB server id + GTID domain) — until PR D: a cursor that carries a
+/// GTID set is verified against the new server's own state and RESUMES there (adoption rules,
+/// review A-01's fix); the stop through LAZYVIEW_ON_MISSING_BINLOG is the pre-GTID behavior,
+/// kept for a source whose saved cursor carries no set (`gtid_mode=OFF`, or a pre-GTID text).
 #[test]
 fn reg_saved_position_from_another_server() {
     scenario("reg_identity", |ctx| async move {
         let specs = vec![join_view()];
-        let (db, eng) = setup(&ctx, "reg_identity", &[], &specs, &[]).await?;
-        eng.stop().await?;
+        let (db, mut eng) = setup(&ctx, "reg_identity", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
+        // One foreign transaction while the engine streams: a GTID source then carries its
+        // set on the saved cursor, which is what the adoption rules ask about.
+        exec(&mut c, "UPDATE customers SET name = 'seen' WHERE id = 1").await?;
+        verify(&ctx, &mut eng, &db, &specs, "first update").await?;
+        eng.stop().await?;
         let saved = scalar(&mut c, "SELECT server_identity FROM _lazyview_status").await?;
         ensure!(
             saved.as_deref().is_some_and(|s| !s.is_empty()),
             "no server identity saved: {saved:?}"
         );
+        let cursor = scalar(&mut c, "SELECT binlog_cursor FROM _lazyview_status").await?;
+        let carries_set = cursor.as_deref().is_some_and(|s| s.contains("[g="));
         exec(
             &mut c,
             "UPDATE _lazyview_status SET server_identity = 'another-server'",
@@ -578,9 +585,32 @@ fn reg_saved_position_from_another_server() {
         )
         .await?;
         let eng = ctx.start_engine(&db, &[])?;
-        match eng.wait_finished(Duration::from_secs(60)).await? {
-            Err(e) if e.contains("another-server") => {}
-            other => bail!("expected a failure naming the saved server, got {other:?}"),
+        if carries_set {
+            // Resume by GTID on the "other" server: no stop, no rebuild, and the row written
+            // during the switch arrives through the stream.
+            let before = eng.snapshot();
+            let mut eng = eng;
+            wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                "resumed on another server by GTID",
+            )
+            .await?;
+            let d = eng.snapshot().since(&before);
+            ensure!(
+                d.full_rebuilds == 0,
+                "the adoption rules rebuilt instead of resuming: {}",
+                fmt_snapshot(&d)
+            );
+            eng.stop().await?;
+        } else {
+            match eng.wait_finished(Duration::from_secs(60)).await? {
+                Err(e) if e.contains("another-server") => {}
+                other => bail!("expected a failure naming the saved server, got {other:?}"),
+            }
         }
         let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_ON_MISSING_BINLOG", "rebuild")])?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
