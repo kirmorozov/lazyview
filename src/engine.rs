@@ -895,6 +895,13 @@ struct Engine {
     /// the saved position reaches it; `None` when the set came from the saved cursor (then it
     /// is complete up to the saved position by construction) or there is no set.
     gtid_seed_hiw: Option<Position>,
+    /// The seed's over-claim can never be proven for this run (see the seeding block of `run`):
+    /// the start position is ahead of what the server had logged when its state was read, so no
+    /// stream from it delivers the transactions the seed claims. The set then rides no save and
+    /// anchors no dump for the whole run — [`Self::executed_gtid_text`] answers `None` and the
+    /// file/pos rules answer alone, which is how a position this server never wrote is caught by
+    /// the server's own dump error instead of being resumed over.
+    gtid_seed_unproven: bool,
     /// The read node role probe (`mysql::read_node`) of the node behind `src`: `Some(true)`
     /// makes the commit-order fence row — a writer-side mechanism — skip; visibility is then
     /// the GTID wait or the snapshot position. `None` until probed on this connection.
@@ -1980,6 +1987,7 @@ impl Engine {
             executed_text: None,
             executed_dirty: false,
             gtid_seed_hiw: None,
+            gtid_seed_unproven: false,
             read_node: None,
             stream_by_gtid: false,
             xa_orphan_reconnect: false,
@@ -2197,7 +2205,20 @@ impl Engine {
                         // was committed by now, hence is logged at or before this position.
                         let hiw = binlog::current_position(&mut e.src).await?;
                         e.executed = seed;
-                        Some(hiw)
+                        // A start ahead of that mark is a position this server never wrote (a
+                        // hand-edited or salvaged status row, a source rolled back behind its
+                        // own saved cursor). No stream started there delivers the transactions
+                        // between the mark and the start, so the gate below could never be
+                        // consumed: the seed would ride saves and anchor dumps with its
+                        // over-claim unproven, and a resume would skip what the views never
+                        // applied. Such a set is unusable for the whole run; the file/pos dump
+                        // is what the operator needs to hear about, in the server's own words.
+                        if start.to_position() > hiw {
+                            e.gtid_seed_unproven = true;
+                            None
+                        } else {
+                            Some(hiw)
+                        }
                     }
                     None => None,
                 }
@@ -4647,6 +4668,10 @@ impl Engine {
                 self.executed_text = None;
                 self.executed_dirty = true;
                 self.gtid_seed_hiw = None;
+                // The re-anchor is a fresh start at the snapshot, so the old run's verdict on
+                // the seed goes with the old anchor: the seed read below is taken after the new
+                // boundary and judged again by the same rule.
+                self.gtid_seed_unproven = false;
                 self.xa_gap_no_gtid_dump = false;
                 let st = binlog::gtid_state(&mut self.src).await?;
                 if let Some(g) = st.executed.as_deref().filter(|g| !g.is_empty()) {
@@ -8317,10 +8342,11 @@ impl Engine {
     /// The consumed set as the flavor's canonical `[g=…]` text, rendered only when a merge has
     /// changed it (ruling 6: once per flush where a cursor is persisted or compared, never on
     /// the event path); `None` until the reader has consumed a GTID — a pre-GTID cursor text,
-    /// byte for byte.
+    /// byte for byte. `None` for the whole run too when the seed's claim could not be proven
+    /// (`gtid_seed_unproven`): an unproven set must ride no save and anchor no dump.
     fn executed_gtid_text(&mut self) -> Option<String> {
         if self.executed_dirty {
-            self.executed_text = if self.executed.is_empty() {
+            self.executed_text = if self.executed.is_empty() || self.gtid_seed_unproven {
                 None
             } else {
                 Some(source::render_set(self.flavor, &self.executed))
