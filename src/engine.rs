@@ -5055,8 +5055,16 @@ impl Engine {
                         }
                         // Prepared before the position we resumed from (positions are never
                         // saved past an open XA PREPARE unless it stayed unresolved for longer
-                        // than XA_PIN_MAX): its rows are unknown, rebuild everything.
-                        warn!(%xid, "XA COMMIT for a transaction prepared before this run; rebuilding all views");
+                        // than XA_PIN_MAX): its rows are unknown here. They became visible to
+                        // a read only at this commit — after the run's start snapshot — so
+                        // the same whole-view refresh `accumulate::mark_all` gives the #167
+                        // gap window is exact: `refresh` reads the source once and applies it
+                        // in place (the Global and the unit branches). An incremental view
+                        // never falls back to a rebuild here; a `Mode::Full` view still
+                        // rebuilds, which is what a full mode is by definition.
+                        // Cold path (one unknown commit): nothing added per binlog event, no
+                        // allocation on the hot path; one counter add per view per commit.
+                        warn!(%xid, "XA COMMIT for a transaction prepared before this run; refreshing all views");
                         for s in self.slots.iter_mut() {
                             for (d, since) in s
                                 .live
@@ -5064,9 +5072,13 @@ impl Engine {
                                 .map(|l| (&mut l.dirty, &mut l.since))
                                 .chain(s.next.iter_mut().map(|n| (&mut n.dirty, &mut n.since)))
                             {
-                                d.rebuild = true;
                                 d.all = true;
                                 since.get_or_insert_with(|| before.clone());
+                            }
+                            // Once per commit for this view (the tally folds into /stats at
+                            // the next flush), not per live+next buffer, never per event.
+                            if let Some(l) = s.live.as_mut() {
+                                l.dirty.tally.xa_unknown_commits += 1;
                             }
                         }
                         self.first_dirty.get_or_insert_with(Instant::now);

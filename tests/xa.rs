@@ -4,7 +4,7 @@
 
 mod common;
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use common::workload::{ecommerce_views, names, run_batches, setup_ecommerce, Sizes, Workload};
 use common::*;
 
@@ -118,6 +118,107 @@ fn xa_transactions() {
         run_batches(&mut c, &mut wl, scaled(20)).await?;
         verify(&ctx, &mut eng, &db, &specs, "normal writes after XA").await?;
         assert_ready(&mut c, &names(&specs)).await?;
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// #79: an `XA COMMIT` whose `XA PREPARE` happened before this run started (the engine
+/// restarted in rebuild start mode, so the start position is past the prepared branch and
+/// its rows are invisible to the start snapshot). The views must read their whole source
+/// again — a refresh — and an incremental view must never be rebuilt for it.
+#[test]
+fn xa_commit_prepared_before_start() {
+    scenario("xa_late_commit", |ctx| async move {
+        let db = ctx.new_db("xa_late").await?;
+        let _ids = setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::tiny()).await?;
+        let keep = [
+            "v_paid_orders",
+            "v_order_lines",
+            "v_status_counts",
+            "v_global_orders",
+            "v_customer_stats",
+            "v_orders_left",
+            "v_distinct_methods",
+        ];
+        let specs: Vec<ViewSpec> = ecommerce_views()
+            .into_iter()
+            .filter(|v| keep.contains(&v.name.as_str()))
+            .collect();
+        let mut c = db.conn().await?;
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_BATCH_WINDOW_MS", "50")])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+
+        // A branch prepared and left unresolved, then normal writes that move the applied
+        // position past its prepare.
+        let mut xc = db.conn().await?;
+        exec_all(&mut xc, &xa_dml("xl", 800_007, 8_000_070, 8_000_070, 1)).await?;
+        exec(&mut xc, "XA PREPARE 'xl'").await?;
+        // The preparing session goes away (as in `xa_transactions` case 6): the branch stays
+        // prepared (it is in the binlog), and MariaDB only lets another session resolve it
+        // once its own session is gone.
+        xc.disconnect().await.ok();
+        exec(&mut c, "INSERT INTO orders (id, customer_id, status, created_at) VALUES (800700, 2, 'paid', '2024-03-04 00:00:00')").await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "XA prepared before the restart",
+        )
+        .await
+        .context("prepared XA data leaked or catch-up stalled")?;
+        eng.stop().await?;
+
+        // Restart in rebuild start mode: the engine starts at the source's current position,
+        // so this run never saw the `XA PREPARE` and the branch's rows are invisible to the
+        // start snapshot (it is still prepared). The coming commit is the #79 case: an
+        // `XA COMMIT` with no in-run entry for its xid.
+        let mut eng = ctx.start_engine(
+            &db,
+            &[
+                ("LAZYVIEW_START_MODE", "rebuild"),
+                ("LAZYVIEW_BATCH_WINDOW_MS", "50"),
+            ],
+        )?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(&ctx, &mut eng, &db, &specs, "restarted, XA still prepared").await?;
+        let f0 = eng.snapshot();
+        let mut other = db.conn().await?;
+        exec(&mut other, "XA COMMIT 'xl'").await?;
+        eng.wait_caught_up(&mut c, t_catchup()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "XA COMMIT prepared before this run",
+        )
+        .await
+        .context("the whole-view refresh did not apply the committed rows")?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            d.full_rebuilds == 0,
+            "the unknown XA COMMIT rebuilt a view instead of refreshing it: {d:?}"
+        );
+        ensure!(
+            d.units_refreshed >= specs.len() as u64,
+            "no whole-view refresh ran after the unknown XA COMMIT (units_refreshed {}): {d:?}",
+            d.units_refreshed
+        );
+        for name in names(&specs) {
+            let s = eng.stats_of(&db, name)?;
+            ensure!(
+                s.xa_unknown_commits >= 1 && s.source_queries >= 1,
+                "view {name}: the unknown XA COMMIT did not refresh its whole source \
+                 (xa_unknown_commits {}, source_queries {})",
+                s.xa_unknown_commits,
+                s.source_queries
+            );
+        }
         eng.stop().await?;
         Ok(())
     });

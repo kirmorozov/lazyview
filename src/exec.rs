@@ -576,6 +576,7 @@ impl Dedup {
             images_absorbed: s.items_absorbed,
             cascade_rows: s.cascade_rows,
             cascade_gaps: s.cascade_gaps,
+            xa_unknown_commits: 0,
         }
     }
 

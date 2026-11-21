@@ -62,6 +62,10 @@ pub struct Tally {
     pub cascade_rows: u64,
     /// Parent changes replayed from before the startup seed (a cache gap).
     pub cascade_gaps: u64,
+    /// Unknown `XA COMMIT`s (prepared before this run) that made this view read and apply
+    /// its whole source again (the `XaEnd` arm, `src/engine.rs`). Counted once per commit,
+    /// never per binlog event.
+    pub xa_unknown_commits: u64,
 }
 
 impl Tally {
@@ -94,6 +98,7 @@ impl Tally {
         self.images_absorbed += o.images_absorbed;
         self.cascade_rows += o.cascade_rows;
         self.cascade_gaps += o.cascade_gaps;
+        self.xa_unknown_commits += o.xa_unknown_commits;
     }
 }
 
@@ -285,6 +290,7 @@ impl ViewStats {
             images_absorbed: self.tally.images_absorbed,
             cascade_rows: self.tally.cascade_rows,
             cascade_gaps: self.tally.cascade_gaps,
+            xa_unknown_commits: self.tally.xa_unknown_commits,
             cascade_cached_rows: self.cascade_cached_rows,
             entities_updated: self.updated,
             rows_inserted: r.inserted,
@@ -337,6 +343,9 @@ macro_rules! view_snapshot_fields {
             /// Parent changes replayed from before the startup seed (a cache gap).
             cascade_gaps: u64, json "cascade_gaps",
                 series ("cascade_gaps", "Parent changes replayed from before the startup seed.", true);
+            /// Unknown `XA COMMIT`s (prepared before this run) that refreshed the whole view.
+            xa_unknown_commits: u64, json "xa_unknown_commits",
+                series ("xa_unknown_commits", "Unknown XA COMMITs (prepared before this run) that refreshed the whole view.", true);
             /// Rows kept in the live version's in-memory cascade cache.
             cascade_cached_rows: u64, json "cascade_cached_rows",
                 series ("cascade_cached_rows", "Rows kept in the live version's in-memory cascade cache.", false);
