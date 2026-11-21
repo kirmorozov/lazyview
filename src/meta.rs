@@ -685,6 +685,107 @@ mod tests {
         }
     }
 
+    /// #278 — `meta_def_row_carries_follow_up_statements` of the RED-TEST list
+    /// (tmp/out/lvs-indexes/plan/expectations.md; owner rulings D1, D8). The follow-up statements
+    /// of D1 (`CREATE [UNIQUE|FULLTEXT] INDEX … ON <view>(cols)`, and D4's generated-column
+    /// statement) must have a home in the store, the `CREATE_*`/`MIGRATIONS`/`REQUIRED` invariant
+    /// above must cover that home, and `effective_definition` must hand the whole script to the
+    /// planner — all of it **storage-independent** (Q1 is OPEN: the same `definition` cell or a
+    /// companion `_lazyview_ddl(definition_id, seq, statement)` table; this test passes under
+    /// either, and refuses only the absence of a home).
+    ///
+    /// INTENTIONALLY RED (owner ruling D8): it fails today because `_lazyview` has exactly the
+    /// columns of src/meta.rs:20-30 and `DefRow` exactly the fields of src/meta.rs:319-328 — there
+    /// is nowhere to keep a follow-up statement. Do not weaken, skip or delete it; breakdown.md P4
+    /// turns it green.
+    #[test]
+    fn meta_def_row_carries_follow_up_statements() {
+        // (a) the definition/statement table as the user writes it: the CREATE VIEW and its
+        // follow-up statements (form S), pinned to H1 of expectations.md.
+        let view = "CREATE VIEW item_totals AS SELECT owner_id, SUM(amount) AS total, \
+                    COUNT(*) AS n FROM items GROUP BY owner_id";
+        let decl = "CREATE INDEX i_total ON item_totals (total)";
+        let (a, row) = {
+            let definition = format!("{view}; {decl};");
+            let row = DefRow {
+                id: 7,
+                name: Some("item_totals".to_string()),
+                definition,
+                targets: vec![SOURCE_TARGET.to_string()],
+                enabled: true,
+                rebuild: false,
+            };
+            (format!("{view}; {decl};"), row)
+        };
+
+        // (c) 1: the store has a home for the follow-up statements — a column of `_lazyview` (in
+        // `CREATE_DEFS`, or added by `MIGRATIONS`, as the Q1 cell/storage variant), or a companion
+        // table with such a column. Whatever it is called, it must be named for what it holds.
+        fn holds(c: &str) -> bool {
+            let c = c.to_ascii_lowercase();
+            c.contains("statement")
+                || c.contains("statements")
+                || c.contains("index")
+                || c.contains("ddl")
+        }
+        let mut home: Vec<String> = create_cols(CREATE_DEFS)
+            .into_iter()
+            .filter(|c| holds(c))
+            .collect();
+        home.extend(
+            MIGRATIONS
+                .iter()
+                .filter(|(t, c, _)| *t == DEFS && holds(c))
+                .map(|(_, c, _)| (*c).to_string()),
+        );
+        home.extend(
+            [CREATE_STATE, CREATE_STATUS, CREATE_OVERVIEW]
+                .iter()
+                .flat_map(|c| create_cols(c))
+                .filter(|c| holds(c)),
+        );
+        assert!(
+            !home.is_empty(),
+            "#278 (a)/(c): the follow-up statements of D1 have no home in the store — no column \
+             of `{DEFS}` (nor a migrated one, nor a companion table) keeps them, so the \
+             declaration of `{decl}` cannot survive a restart (src/meta.rs:20-30, 58-96)"
+        );
+        // (c) 2: the operations run must refuse to start without that home (src/meta.rs:120-164,
+        // 189): `REQUIRED` names every column `ensure`/`lazyview setup` creates or migrates.
+        let required = REQUIRED
+            .iter()
+            .find(|(t, _)| *t == DEFS)
+            .map(|(_, cols)| cols.to_vec())
+            .unwrap_or_default();
+        assert!(
+            home.iter().any(|h| required.iter().any(|r| r == h)),
+            "#278 (c): the store's home for the follow-up statements {home:?} is not in `REQUIRED`, \
+             so the engine would start on a schema without it"
+        );
+        // (c) 3: the whole script is what the planner is handed — `effective_definition` is the
+        // single funnel (src/meta.rs:349-361) and must not drop the declarations; the parse must
+        // accept the script (the grammar half of P4) and keep the declared index.
+        let eff = row.effective_definition();
+        assert!(
+            eff.contains("CREATE VIEW item_totals"),
+            "#278 (c): effective_definition lost the CREATE VIEW of {a}: {eff}"
+        );
+        assert!(
+            eff.contains(decl),
+            "#278 (c): effective_definition lost the follow-up statement `{decl}` of {a}: {eff}"
+        );
+        assert!(
+            format!("{row:?}").contains(decl),
+            "#278 (c): `DefRow` does not carry the follow-up statements of {a} (src/meta.rs:319-328)"
+        );
+        crate::analyze::parse_definition(&eff).unwrap_or_else(|e| {
+            panic!(
+                "#278 (c): the script of (a) does not reach the planner as one definition \
+                 (SINGLE_SELECT, src/analyze/parse.rs:208): {e:#}\n  (a): {a}"
+            )
+        });
+    }
+
     /// The fence DDL in `create_fence` mirrors `src/fence.rs`'s private `create_sql` (the file
     /// is copy-set); both texts stay in sync with what `verify` requires.
     #[test]

@@ -396,3 +396,457 @@ fn multiple_statements_and_odd_input() {
         names(&[("", "a")])
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #278 — user-declared secondary indexes: the RED-TEST list's grammar half
+// (tmp/out/lvs-indexes/plan/expectations.md → RED-TEST LIST → Unit; owner rulings D1, D4, D8).
+//
+// These tests are INTENTIONALLY RED (owner ruling D8: expectations → plan → failing tests →
+// implementation). They must not be weakened, skipped or deleted to make CI green: the
+// implementation PRs (breakdown.md P4/P5) turn them green. Every case keeps the (a)/(b)/(c)
+// labels of its expectations.md row: (a) the definition/statement table as the user writes it,
+// (b) the original db (pinned corpora `A`/`B` — nothing invented), (c) the resulting view-table
+// DDL, asserted here at the grammar level (the integration half is tests/indexes.rs).
+// ---------------------------------------------------------------------------------------------
+
+/// (a) of a #278 case: the `definition` cell as the user writes it (form S) — the `CREATE VIEW`
+/// plus its free-standing follow-up statements (D1: "follow up statements, as if someone would
+/// write them manually"), split at top-level `;`.
+fn script(view: &str, select: &str, decls: &[&str]) -> String {
+    let mut s = format!("CREATE VIEW {view} AS {select}");
+    for d in decls {
+        s.push_str("; ");
+        s.push_str(d);
+    }
+    s.push(';');
+    s
+}
+
+/// The pinned corpora of expectations.md ("Corpora (pinned, existing only)"): `B`'s `items` is
+/// what H1/H4 aggregate, `A`'s `entities` what H2/H8 project. Only their column names appear in
+/// the (a) scripts below; the data itself belongs to the integration half (tests/indexes.rs).
+const SEL_TOTALS: &str = "SELECT owner_id, SUM(amount) AS total, COUNT(*) AS n \
+                          FROM items GROUP BY owner_id";
+const SEL_STATUS: &str = "SELECT id, grp, status FROM entities";
+const SEL_NAMES: &str = "SELECT id, name FROM entities";
+
+/// (c) probe for the parse cases: everything the definition parse keeps of `def`. A correct
+/// implementation must expose the declared index — its name, its kind and its columns in order —
+/// on the parse result it hands the planner, so the parse result's own rendering is the honest
+/// probe of "the parse kept the declaration". Until the declaration AST exists there is nothing
+/// else to look at: `src/ddl.rs:498-511` (`index_target`) keeps only the table after the first
+/// top-level `ON` and throws name, kind and columns away, and `parse_definition`
+/// (src/analyze/parse.rs:208 `SINGLE_SELECT`) refuses a script with a second statement at all.
+fn kept(def: &str) -> String {
+    match crate::analyze::parse_definition(def) {
+        Ok(p) => format!("{p:?}"),
+        Err(e) => format!("PARSE ERROR: {e:#}"),
+    }
+}
+
+/// The error text of a refused definition, or `""` when it parses.
+fn refusal(def: &str) -> String {
+    match crate::analyze::parse_definition(def) {
+        Ok(_) => String::new(),
+        Err(e) => format!("{e:#}"),
+    }
+}
+
+/// `hay` mentions `needle` (case-insensitively).
+fn mentions(hay: &str, needle: &str) -> bool {
+    hay.to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+/// H1, H2, H3, H4 (a)→(c): `CREATE [UNIQUE|FULLTEXT] INDEX <name> ON <view>(cols)` as a
+/// follow-up statement is recognized into `{ name, unique/fulltext, table, cols in order }`.
+///
+/// RED today because no index AST exists (`src/ddl.rs:498-511` discards name/kind/columns, and
+/// there is no other index parser in `src/`), so none of the declaration survives the parse.
+#[test]
+fn parses_index_declarations() {
+    for (case, view, select, decl, name, cols, kind) in [
+        (
+            "H1",
+            "item_totals",
+            SEL_TOTALS,
+            "CREATE INDEX i_total ON item_totals (total)",
+            "i_total",
+            vec!["total"],
+            "",
+        ),
+        (
+            "H2",
+            "entity_status",
+            SEL_STATUS,
+            "CREATE UNIQUE INDEX u_status_grp ON entity_status (status, grp)",
+            "u_status_grp",
+            vec!["status", "grp"],
+            "unique",
+        ),
+        (
+            "H3",
+            "entity_names",
+            SEL_NAMES,
+            "CREATE FULLTEXT INDEX ft_name ON entity_names (name)",
+            "ft_name",
+            vec!["name"],
+            "fulltext",
+        ),
+        (
+            "H4",
+            "item_totals",
+            SEL_TOTALS,
+            "CREATE INDEX i_tot_ent ON item_totals (total, owner_id)",
+            "i_tot_ent",
+            vec!["total", "owner_id"],
+            "",
+        ),
+    ] {
+        let def = script(view, select, &[decl]);
+        let kept = kept(&def);
+        assert!(
+            !kept.starts_with("PARSE ERROR"),
+            "{case} (a) is refused outright: {kept}\n  (a): {def}\n  (c): the view table carries \
+             {name} over ({}) — impossible while the declaration does not parse",
+            cols.join(", "),
+        );
+        assert!(
+            mentions(&kept, name),
+            "{case} (c): the parse does not keep the declared index name `{name}`: {kept}"
+        );
+        assert!(
+            mentions(&kept, "CREATE INDEX")
+                || mentions(&kept, "CREATE UNIQUE INDEX")
+                || mentions(&kept, "CREATE FULLTEXT INDEX"),
+            "{case} (a): the follow-up statement itself is gone from the parse result: {kept}"
+        );
+        if !kind.is_empty() {
+            assert!(
+                mentions(&kept, kind),
+                "{case} (c): the declared kind `{kind}` is not recorded: {kept}"
+            );
+        }
+        // (c) asserts the column set in SEQ_IN_INDEX order, so a parse that keeps them in another
+        // order (or only one of them) is a failure — H4: "(owner_id, total) fails the test".
+        let mut at = 0usize;
+        for c in &cols {
+            let found = kept.to_ascii_lowercase()[at..]
+                .find(&c.to_ascii_lowercase())
+                .map(|i| at + i);
+            assert!(
+                found.is_some(),
+                "{case} (c): column `{c}` of the declared key is missing, or out of order, in {kept}"
+            );
+            at = found.unwrap() + 1;
+        }
+    }
+}
+
+/// H1-H4, E2 (a): one `CREATE VIEW` and its follow-up `CREATE INDEX` statements are ONE script —
+/// split at top-level `;`, with comments and `;` whitespace ignored (D1, form S of
+/// expectations.md).
+///
+/// RED today because `SINGLE_SELECT` (src/analyze/parse.rs:208) rejects anything but one
+/// statement, so the script of every case below is refused before anything is recognized.
+#[test]
+fn index_declaration_after_create_view_is_one_script() {
+    let cases = [
+        (
+            "H1",
+            script(
+                "item_totals",
+                SEL_TOTALS,
+                &["CREATE INDEX i_total ON item_totals (total)"],
+            ),
+        ),
+        (
+            "H4",
+            script(
+                "item_totals",
+                SEL_TOTALS,
+                &["CREATE INDEX i_tot_ent ON item_totals (total, owner_id)"],
+            ),
+        ),
+        // E2 (a): "the follow-up statement written twice".
+        (
+            "E2",
+            script(
+                "item_totals",
+                SEL_TOTALS,
+                &[
+                    "CREATE INDEX i_total ON item_totals (total)",
+                    "CREATE INDEX i_total ON item_totals (total)",
+                ],
+            ),
+        ),
+    ];
+    for (case, def) in cases {
+        let kept = kept(&def);
+        assert!(
+            !kept.starts_with("PARSE ERROR"),
+            "{case} (a): a CREATE VIEW with its follow-up CREATE INDEX statements is one script \
+             (D1), it is refused: {kept}"
+        );
+        assert!(
+            mentions(&kept, "i_total") || mentions(&kept, "i_tot_ent"),
+            "{case} (c): the declaration of the second statement is not kept: {kept}"
+        );
+    }
+    // (a) with the comments and whitespace a hand-written cell has: `-- note`, `/* */`, `#`,
+    // and blank lines between the statements (the same G2 handling of src/analyze/parse.rs:216-231).
+    let commented =
+        "CREATE VIEW item_totals AS SELECT owner_id, SUM(amount) AS total, COUNT(*) AS n \
+                     FROM items GROUP BY owner_id;\n  -- declared later, by hand\n \
+                     /* a block comment */\nCREATE INDEX i_total ON item_totals (total);\n#\n";
+    let kept = kept(commented);
+    assert!(
+        !kept.starts_with("PARSE ERROR"),
+        "H1 (a): comments and whitespace between the statements of the script break it: {kept}"
+    );
+    assert!(mentions(&kept, "i_total"), "H1 (c): {kept}");
+}
+
+/// E8 (a)→(c): the unsupported index forms are refused at PARSE, each error naming the statement
+/// and the offending construct, and nothing of them reaching the target. The rule is the same on
+/// every flavor ("MySQL 8.0 *would* accept the functional index while MariaDB would not"): reject
+/// all of these at parse everywhere, so one definition means one thing.
+///
+/// RED today because nothing parses these statements at all, so no error names any construct.
+#[test]
+fn rejects_expression_prefix_and_method_index() {
+    for (what, decl) in [
+        (
+            "expression (functional) index",
+            "CREATE INDEX i_up ON item_totals ((UPPER(total)))",
+        ),
+        (
+            "prefix length",
+            "CREATE INDEX i_pre ON item_totals (total(4))",
+        ),
+        (
+            "USING method clause",
+            "CREATE INDEX i_h ON item_totals (total) USING HASH",
+        ),
+        (
+            "WITH storage options",
+            "CREATE INDEX i_o ON item_totals (total) WITH (fillfactor=70)",
+        ),
+        (
+            "SPATIAL index",
+            "CREATE SPATIAL INDEX i_sp ON item_totals (total)",
+        ),
+        (
+            "partial-index WHERE clause",
+            "CREATE INDEX i_e ON item_totals (total) WHERE total > 0",
+        ),
+    ] {
+        let def = script("item_totals", SEL_TOTALS, &[decl]);
+        let err = refusal(&def);
+        assert!(
+            !err.is_empty(),
+            "E8 (c): `{decl}` must be refused, it was accepted"
+        );
+        assert!(
+            mentions(&err, "CREATE INDEX") || mentions(&err, decl),
+            "E8 (c): the error must name the statement it refuses (`{decl}`); it says: {err}"
+        );
+        assert!(
+            mentions(&err, what.split(' ').next().unwrap()),
+            "E8 (c): the error must name the offending construct ({what}); it says: {err}"
+        );
+        assert!(
+            mentions(&err, "supported") || mentions(&err, "support"),
+            "E8 (c): the error must state the supported subset; it says: {err}"
+        );
+    }
+}
+
+/// E8 (a) tail (c): trailing garbage after the closing `)` is refused the way `parse_sql` refuses
+/// anything that does not end at EOF (src/analyze.rs:52-58).
+///
+/// RED today: there is no such parser, so the trailing garbage is never even looked at.
+#[test]
+fn rejects_unterminated_or_trailing_garbage_index() {
+    for (what, decl) in [
+        (
+            "trailing garbage",
+            "CREATE INDEX i_total ON item_totals (total) GARBAGE",
+        ),
+        (
+            "trailing comma",
+            "CREATE INDEX i_total ON item_totals (total,)",
+        ),
+        (
+            "unclosed column list",
+            "CREATE INDEX i_total ON item_totals (total",
+        ),
+        ("missing ON", "CREATE INDEX i_total (total)"),
+        ("missing column list", "CREATE INDEX i_total ON item_totals"),
+    ] {
+        let def = script("item_totals", SEL_TOTALS, &[decl]);
+        let err = refusal(&def);
+        assert!(
+            !err.is_empty(),
+            "E8 (c): `{decl}` must be refused, it was accepted"
+        );
+        assert!(
+            mentions(&err, "CREATE INDEX") || mentions(&err, "index"),
+            "E8 (c): the {what} error must say which statement it refuses; it says: {err}"
+        );
+    }
+}
+
+/// E3 (a)→(c), and E10: an index over a column the view does not define — and, for E3, one whose
+/// generated-column declaration is missing — is refused where the error names the column. The
+/// engine must not invent the column (D4 requires the explicit column statement).
+///
+/// RED today: there is no cross-check between a declared index and the view's columns.
+#[test]
+fn rejects_index_on_undeclared_column() {
+    for (case, view, select, decl, column) in [
+        // E10 (a): `nope` is not a column of the view at all.
+        (
+            "E10",
+            "item_totals",
+            SEL_TOTALS,
+            "CREATE INDEX i_nope ON item_totals (nope)",
+            "nope",
+        ),
+        // E3 (a): H8's script with the `ADD COLUMN sig …` statement removed.
+        (
+            "E3",
+            "entity_status",
+            SEL_STATUS,
+            "CREATE INDEX i_sig ON entity_status (sig)",
+            "sig",
+        ),
+    ] {
+        let def = script(view, select, &[decl]);
+        let err = refusal(&def);
+        assert!(
+            !err.is_empty(),
+            "{case} (c): `{decl}` must be refused, it was accepted"
+        );
+        assert!(
+            mentions(&err, column),
+            "{case} (c): the error must name the column `{column}` it refuses; it says: {err}"
+        );
+    }
+    // The view's own columns must stay acceptable (so the refusal above cannot be earned by
+    // refusing everything): H1's declaration over `total` is legal.
+    assert!(
+        refusal(&script(
+            "item_totals",
+            SEL_TOTALS,
+            &["CREATE INDEX i_total ON item_totals (total)"]
+        ))
+        .is_empty(),
+        "H1 (c): a declaration over a real view column must parse"
+    );
+}
+
+/// A declared index in the engine's own namespace, or over one of its columns, is refused: the
+/// `_lv_*` set is the engine's (`unit_index`/`row_index`/`lineage_indexes`/`partial_indexes`,
+/// src/target/mod.rs:754-873) and the `_lv_`-invisible columns stay invisible
+/// (src/target/mysql.rs:107-109). Part of H6's (c) "dropping or renaming any `_lv_*` index is a
+/// test failure".
+///
+/// RED today: no such rule exists in any parser.
+#[test]
+fn rejects_index_over_engine_namespace() {
+    for (what, decl) in [
+        (
+            "an index name in the engine's namespace",
+            "CREATE INDEX _lv_row ON item_totals (total)",
+        ),
+        (
+            "an index name in the engine's namespace",
+            "CREATE INDEX _lv_sneaky ON item_totals (total)",
+        ),
+        (
+            "a column of the engine",
+            "CREATE INDEX i_lv ON item_totals (_lv_row)",
+        ),
+    ] {
+        let def = script("item_totals", SEL_TOTALS, &[decl]);
+        let err = refusal(&def);
+        assert!(
+            !err.is_empty(),
+            "(c): {what} (`{decl}`) must be refused, it was accepted"
+        );
+        assert!(
+            mentions(&err, "_lv"),
+            "(c): the error must name the reserved `{what}` namespace `_lv_*`; it says: {err}"
+        );
+    }
+}
+
+/// E9 (c): one decided, named refusal per (index kind, target product) pair that cannot be built
+/// — FULLTEXT is refused by name on a PostgreSQL target and accepted on MySQL/Percona/MariaDB.
+/// The table the plan names is `Mysql | Percona | MariaDb | Postgres`; the refusal must be answerable
+/// per product, not per family.
+///
+/// RED today for the reason the plan's table gives: `src/target/mod.rs:23-26` — the target's
+/// `Kind` is [`crate::dialect::Family`] (`Mysql | Postgres`) alone, so `mariadb://` answers
+/// `Mysql` exactly like `mysql://` and no seam can tell the products (still less Percona) apart to
+/// answer "can this flavor build this kind of index?". The behaviour half of E9 is asserted
+/// end-to-end by `idx_fulltext_refused_on_pg` / `idx_fulltext_where_supported` in tests/indexes.rs.
+#[test]
+fn index_kind_supported_per_flavor() {
+    use crate::target::Kind;
+    let mysql = Kind::from_dsn("mysql://u@h/db").expect("mysql:// is a target");
+    let maria =
+        Kind::from_dsn("mariadb://u@h/db").expect("mariadb:// is a target (D5: MariaDB IN)");
+    assert_ne!(
+        mysql, maria,
+        "E9 (c): a per-flavor capability gate needs the target to name its product: `mariadb://` \
+         and `mysql://` both answer {mysql:?} today (src/target/mod.rs:23-26), so FULLTEXT (which \
+         MariaDB and MySQL answer differently, online-ddl-research.md items 1 and 6) cannot be \
+         decided per product"
+    );
+    // D2 + the D5 flag: ClickHouse is last on the roadmap and no target exists for it
+    // (src/target/mod.rs:18-19) — no expectation below is written for it, so it must stay refused.
+    assert!(
+        Kind::from_dsn("clickhouse://u@h/db").is_err(),
+        "D2 (c): a clickhouse:// target must not answer as a flavor while no target module exists"
+    );
+}
+
+/// H8 (a)→(c), D4: a virtual (and stored) generated column declared the same way as an index —
+/// an explicit follow-up statement, "appended alter statement with create virtual or stored
+/// column" — parses, and VIRTUAL/STORED is recorded (nothing in `src/` renders or parses a
+/// generated column today, src/target/mysql.rs:100-111). The verb's exact spelling is Q1b/OPEN;
+/// the shape below is D4's own wording, and the column is NOT a projection column of the view.
+///
+/// RED today: `SINGLE_SELECT` refuses the script outright.
+#[test]
+fn generated_column_declaration_parses() {
+    for (kind, verb) in [("virtual", "VIRTUAL"), ("stored", "STORED")] {
+        let decl = format!(
+            "ALTER TABLE entity_status ADD COLUMN sig VARCHAR(32) AS (CONCAT(status, '-', grp)) {verb}"
+        );
+        let def = script(
+            "entity_status",
+            SEL_STATUS,
+            &[&decl, "CREATE INDEX i_sig ON entity_status (sig)"],
+        );
+        let kept = kept(&def);
+        assert!(
+            !kept.starts_with("PARSE ERROR"),
+            "H8 (a): the generated-column statement `{decl}` is refused: {kept}"
+        );
+        assert!(
+            mentions(&kept, "sig"),
+            "H8 (c): the declared column `sig` is not kept: {kept}"
+        );
+        assert!(
+            mentions(&kept, verb),
+            "H8 (c): the generated-column kind {kind} is not recorded: {kept}"
+        );
+        assert!(
+            mentions(&kept, "i_sig"),
+            "H8 (c): the index over the declared column is not kept: {kept}"
+        );
+    }
+}
