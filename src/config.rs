@@ -73,6 +73,36 @@ pub const DEFAULT_LOCK_WAIT_S: u64 = 60;
 /// and left to the next full rebuild (A-05, N-01), never retried on the binlog loop (N-02).
 pub const DEFAULT_SWAP_LOCK_WAIT_S: u64 = 5;
 
+/// Whether this build honours the `LAZYVIEW_TEST_*` hooks. They belong to the integration
+/// suites, which cargo always builds in the dev profile (`debug_assertions` on), so the tests
+/// keep every hook; a shipped binary has no test that could set one and reads none of them
+/// (readiness S-04: test functionality must not ride in the release binary). A release build
+/// that sees one set ignores it and says so once, at debug level, in [`test_hook_get`].
+#[cfg(debug_assertions)]
+const TEST_HOOKS_ON: bool = true;
+#[cfg(not(debug_assertions))]
+const TEST_HOOKS_ON: bool = false;
+
+/// The lookup of a setting, gated for the test hooks: a key outside the `LAZYVIEW_TEST` prefix
+/// is the plain lookup, and inside it a build without hooks answers `None` — every hook then
+/// keeps the value it has when its variable is unset — after one debug line naming what was
+/// ignored. The rule is the name, not a list, so a hook added later is gated with it.
+///
+/// `test_hooks` is [`TEST_HOOKS_ON`]; it is a parameter only so a debug build can exercise both
+/// arms of a gate its own profile would always take.
+fn test_hook_get(
+    test_hooks: bool,
+    get: &impl Fn(&str) -> Option<String>,
+    key: &str,
+) -> Option<String> {
+    let v = get(key);
+    if test_hooks || v.is_none() || !key.starts_with("LAZYVIEW_TEST") {
+        return v;
+    }
+    tracing::debug!("{key} is a test hook: ignored by a build without them");
+    None
+}
+
 /// `min(4, max(1, cores / 4))`.
 pub fn default_cpu_workers() -> usize {
     let cores = std::thread::available_parallelism()
@@ -81,6 +111,9 @@ pub fn default_cpu_workers() -> usize {
     (cores / 4).clamp(1, 4)
 }
 
+/// The engine's settings, all from the environment. The `test_*` fields are the test hooks
+/// (`LAZYVIEW_TEST_*`): only a build with hooks reads them, so a shipped binary runs on the
+/// defaults (`TEST_HOOKS_ON`, `test_hook_get`).
 #[derive(Debug, Clone)]
 pub struct Config {
     pub dsn: String,
@@ -235,6 +268,11 @@ impl Config {
         get: impl Fn(&str) -> Option<String>,
         read: &mut dyn FnMut(&std::path::Path) -> Option<u64>,
     ) -> Result<Config> {
+        // Every read below of a `LAZYVIEW_TEST_*` hook — the delays, the injected failures, the
+        // byte budgets, the role DSNs, the lock wait — goes through the gate, which leaves a
+        // build without hooks (a release build: readiness S-04) with the defaults those
+        // variables have when unset. The name is the rule, so no hook can be missed here.
+        let get = |k: &str| test_hook_get(TEST_HOOKS_ON, &get, k);
         // Endpoints reached without TLS, named in a WARN at startup (see CleartextEndpoint).
         let mut cleartext: Vec<CleartextEndpoint> = Vec::new();
         let dsn = connection(&get, "LAZYVIEW", false, Some(("source", &mut cleartext)))?.ok_or_else(|| {
@@ -1008,6 +1046,56 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Readiness S-04 (test hooks in the release binary): the `LAZYVIEW_TEST_*` variables belong
+    /// to the suites, which cargo builds in the dev profile — the profile that has the hooks, and
+    /// so the one this test runs in. Both arms of the gate are checked by handing `test_hook_get`
+    /// the flag `from_lookup_with_mem_read` takes from `TEST_HOOKS_ON`: with hooks it is the plain
+    /// lookup, without them every hook reads as unset while an operator setting passes unchanged.
+    #[test]
+    fn a_build_without_hooks_ignores_them() {
+        let dsn = "mysql://lv@db:3306/app";
+        let env: HashMap<String, String> = [
+            ("LAZYVIEW_DSN", dsn),
+            ("LAZYVIEW_PLAN_TIMEOUT_MS", "1500"),
+            ("LAZYVIEW_TEST_PLAN_DELAY", "/*slow:x*/:250"),
+            ("LAZYVIEW_TEST_BUILD_HOLD_BYTES", "1700000"),
+            ("LAZYVIEW_TEST_LOCK_WAIT_S", "2"),
+            ("LAZYVIEW_TEST_QUERY_DSN", "mysql://lv@other:3306/app"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let get = |k: &str| env.get(k).cloned();
+        assert_eq!(
+            test_hook_get(true, &get, "LAZYVIEW_TEST_PLAN_DELAY"),
+            Some("/*slow:x*/:250".to_string()),
+        );
+        for hook in [
+            "LAZYVIEW_TEST_PLAN_DELAY",
+            "LAZYVIEW_TEST_BUILD_HOLD_BYTES",
+            "LAZYVIEW_TEST_LOCK_WAIT_S",
+            "LAZYVIEW_TEST_QUERY_DSN",
+        ] {
+            assert_eq!(test_hook_get(false, &get, hook), None, "{hook}");
+        }
+        for setting in ["LAZYVIEW_DSN", "LAZYVIEW_PLAN_TIMEOUT_MS"] {
+            assert_eq!(
+                test_hook_get(false, &get, setting),
+                get(setting),
+                "{setting} is not a hook"
+            );
+        }
+        // The gate is the read path of the whole parse, so a build without hooks is the parse
+        // that has never seen a hook: the defaults where the hooks point, and one endpoint.
+        let c = Config::from_lookup_with_mem_read(|k| test_hook_get(false, &get, k), &mut |_| None)
+            .unwrap();
+        assert_eq!(c.test_plan_delay, None);
+        assert_eq!(c.test_build_hold_bytes, None);
+        assert_eq!(c.lock_wait_s, DEFAULT_LOCK_WAIT_S);
+        assert_eq!(c.test_query_dsn.as_deref(), Some(dsn));
+        assert_eq!(c.plan_timeout, Duration::from_millis(1500));
     }
 
     /// The total memory budget (review R-01 / N-06): the cgroup limit becomes every byte
