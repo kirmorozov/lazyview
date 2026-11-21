@@ -425,6 +425,58 @@ pub(crate) fn parse_gtid_set(text: &str) -> mysql::GtidSet {
     set
 }
 
+/// MariaDB's merge of one transaction's GTID (`domain-server-seq`, the text
+/// [`gtid`] renders from the stream's event) into the consumed set: the engine's call once per
+/// committed transaction. The key is the `domain-server` pair, the value one number — a known
+/// pair costs no allocation (map lookup + the in-place fast path of `mysql::merge_interval`),
+/// only a first-time pair allocates its key. A token that is not a well-formed
+/// `digits-digits-digits` returns `false` and changes nothing (dropped, never guessed).
+pub(crate) fn merge_gtid(set: &mut mysql::GtidSet, gtid: &str) -> bool {
+    let mut f = gtid.trim().split('-');
+    let (Some(dom), Some(server), Some(seq), None) = (f.next(), f.next(), f.next(), f.next())
+    else {
+        return false;
+    };
+    let (Ok(d), Ok(s), Ok(n)) = (
+        dom.trim().parse::<u32>(),
+        server.trim().parse::<u32>(),
+        seq.trim().parse::<u64>(),
+    ) else {
+        return false;
+    };
+    let key = format!("{d}-{s}");
+    match set.get_mut(key.as_str()) {
+        Some(ivals) => mysql::merge_interval(ivals, n, n),
+        None => {
+            let mut ivals = Vec::with_capacity(1);
+            mysql::merge_interval(&mut ivals, n, n);
+            set.insert(key, ivals);
+        }
+    }
+    true
+}
+
+/// The consumed set as MariaDB gtid-list text: each interval its explicit window
+/// `domain-server-lo-hi` (a bare `domain-server-n` would mean the high-water mark `1..=n`,
+/// and the engine's intervals need not start at 1 when the reader joined mid-stream).
+/// The shape [`parse_gtid_set`] and `SET @slave_connect_state` both read. std only.
+pub(crate) fn render_list(set: &mysql::GtidSet) -> String {
+    let mut out = String::new();
+    for (pair, ivals) in set {
+        for (lo, hi) in ivals {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(pair);
+            out.push('-');
+            out.push_str(&lo.to_string());
+            out.push('-');
+            out.push_str(&hi.to_string());
+        }
+    }
+    out
+}
+
 /// MariaDB's GTID dump: the `domain-server-seq` list of the start cursor's `[g=…]` text, in the
 /// shape `SET @slave_connect_state` (and `mariadb-binlog -j`) take.
 ///

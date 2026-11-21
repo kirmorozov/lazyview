@@ -120,6 +120,78 @@ fn wants_gtid_tip(aurora: bool, gtid_mode: Option<&str>) -> bool {
     !aurora && gtid_mode.is_some_and(|g| !g.eq_ignore_ascii_case("ON"))
 }
 
+/// The verdict of [`adopt_decision`] on resuming a saved cursor on a server other than the one
+/// that wrote it.
+enum Adopt {
+    /// The server's GTID state makes the cursor valid: open the stream by GTID, and log the
+    /// identity change as an INFO (a failover is an event, not an error).
+    Resume,
+    /// Stop cleanly; the string names why (and the caller's `on_missing_binlog` policy appends
+    /// the operator's rebuild path). Never a silent resume, never an automatic rebuild.
+    Stop(String),
+}
+
+/// The adoption rules of the resume-by-GTID plan (§2.4), lv-super's ruling 4 as law: a saved
+/// cursor is valid on another server ONLY when its GTID state proves the server has what the
+/// reader consumed and kept everything the reader will still ask for. `saved` is the cursor's
+/// `[g=…]` text (`None`: written before lazyview's GTID cursor or by a `gtid_mode=OFF` server —
+/// the upgrade case, where no server but its own can be trusted with the file/pos); `st` is
+/// what this server reports about itself (`binlog::gtid_state`). Pure — the truth table is
+/// tested without a server.
+fn adopt_decision(flavor: source::Flavor, saved: Option<&str>, st: &source::GtidState) -> Adopt {
+    let Some(saved_text) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Adopt::Stop(
+            "the saved cursor carries no GTID set, so no other server can be verified against \
+             it; turn GTIDs on at the source (MySQL/Percona: gtid_mode=ON and \
+             enforce_gtid_consistency=ON — the cursor may also predate lazyview's GTID cursor) \
+             or accept an explicit rebuild (LAZYVIEW_ON_MISSING_BINLOG=rebuild or \
+             LAZYVIEW_START_MODE=rebuild)"
+                .to_string(),
+        );
+    };
+    if flavor.is_mysql_family()
+        && st
+            .mode
+            .as_deref()
+            .is_some_and(|m| !m.eq_ignore_ascii_case("ON"))
+    {
+        let mode = st.mode.as_deref().unwrap_or("OFF");
+        return Adopt::Stop(format!(
+            "this server runs gtid_mode={mode}, so it cannot answer whether it holds the saved \
+             state (a failover needs GTIDs on across the topology: gtid_mode=ON and \
+             enforce_gtid_consistency=ON; or accept an explicit rebuild with \
+             LAZYVIEW_ON_MISSING_BINLOG=rebuild or LAZYVIEW_START_MODE=rebuild)"
+        ));
+    }
+    let saved = source::parse_set(flavor, saved_text);
+    let executed = st
+        .executed
+        .as_deref()
+        .or(st.binlog_state.as_deref())
+        .unwrap_or_default();
+    let executed = source::parse_set(flavor, executed);
+    if !mysql::gtid_subset(&saved, &executed) {
+        let missing = source::render_set(flavor, &mysql::gtid_missing(&saved, &executed));
+        return Adopt::Stop(format!(
+            "this server has not executed what the saved state consumed (it is missing {missing}, \
+             bounded): the source is older than the views (a restore from an older dump?) or it \
+             replicates without log_replica_updates/wsrep_gtid_mode; accept an explicit rebuild \
+             with LAZYVIEW_ON_MISSING_BINLOG=rebuild or LAZYVIEW_START_MODE=rebuild"
+        ));
+    }
+    let purged = source::parse_set(flavor, st.purged.as_deref().unwrap_or_default());
+    if !mysql::gtid_subset(&purged, &saved) {
+        let missing = source::render_set(flavor, &mysql::gtid_missing(&purged, &saved));
+        return Adopt::Stop(format!(
+            "the source has purged past the saved resume point: its gtid_purged holds {missing}, \
+             which the saved state never consumed (the clean stop before the server's own dump \
+             error); accept an explicit rebuild with LAZYVIEW_ON_MISSING_BINLOG=rebuild or \
+             LAZYVIEW_START_MODE=rebuild"
+        ));
+    }
+    Adopt::Resume
+}
+
 /// Startup warnings for the source's `binlog-do-db` / `binlog-ignore-db` filters: they name the
 /// table's own schema, so an excluded schema is invisible in the binlog. lazyview's schema
 /// (`schema`, the metadata connection's, where the metadata tables and the commit fence live)
@@ -578,6 +650,11 @@ struct XaTxn {
     prepared_at: Instant,
     /// Unresolved for longer than [`XA_PIN_MAX`]: no longer holds back the saved position.
     unpinned: bool,
+    /// The GTID its stream event carried, held here (not in the engine's consumed set) until
+    /// the XA COMMIT proves the whole transaction read: only then does it join the set a GTID
+    /// dump anchors on (the end-of-transaction step moves it in, `Item::XaEnd` merges or
+    /// drops it).
+    gtid: Option<String>,
 }
 
 /// An XA transaction left prepared longer than this stops holding back the saved position
@@ -788,6 +865,51 @@ struct Engine {
     /// rows over, which `rebuild_routes` wires up; the flush below runs it once.
     core_shape_routes: bool,
     last_gtid: Option<String>,
+    /// The GTID of the transaction being read, whose commit has not arrived yet: merged into
+    /// the consumed set by `end_txn` (the commit proves the whole transaction was read — an
+    /// undecodable event or a lost connection stops the stream before it, and the dump must
+    /// come back to that transaction, never resume past it). An XA transaction moves it to
+    /// [`XaTxn::gtid`] at `Item::XaStart` and gets it merged only at its XA COMMIT.
+    pending_gtid: Option<String>,
+    /// An XA COMMIT was read for a transaction this run never saw prepared: its rows are a
+    /// gap the consumed set cannot name, so the stream anchors on file and position (the GTID
+    /// dump of a set that under-claims would replay it on every connect).
+    xa_gap_no_gtid_dump: bool,
+    /// Reading an XA transaction (between `XA START` and its prepare): its GTID belongs to
+    /// [`XaTxn::gtid`], not to the ordinary end-of-transaction merge.
+    in_xa_txn: bool,
+    /// The transactions this reader has **consumed** from the stream, as sorted disjoint
+    /// intervals per source id (the plan's §2.2 shape): merged once per committed transaction
+    /// on `Item::Gtid` (in place — the only per-transaction cost), never re-rendered there.
+    /// Rendered only where a cursor is persisted or a fence waits (ruling 6).
+    executed: source::mysql::GtidSet,
+    /// Render cache for `executed`: dirtied by a merge, rebuilt on the first reader that needs
+    /// the text in a flush (the position save, the fence), never on the event path.
+    executed_text: Option<String>,
+    executed_dirty: bool,
+    /// High-water mark of the seeding read (see the seeding block of `run`): the stream must
+    /// consume through this position before the set may be persisted or anchor a dump. A set
+    /// seeded from the server's executed state also claims transactions committed after the
+    /// start position was read but not yet delivered by the stream; claiming those in a save
+    /// or a dump early would let a resume skip transactions it never applied. Cleared once
+    /// the saved position reaches it; `None` when the set came from the saved cursor (then it
+    /// is complete up to the saved position by construction) or there is no set.
+    gtid_seed_hiw: Option<Position>,
+    /// The read node role probe (`mysql::read_node`) of the node behind `src`: `Some(true)`
+    /// makes the commit-order fence row — a writer-side mechanism — skip; visibility is then
+    /// the GTID wait or the snapshot position. `None` until probed on this connection.
+    read_node: Option<bool>,
+    /// Whether the current stream round opened by GTID dump (`connect_gtid` with a set): an
+    /// XA COMMIT that arrives without its prepared transaction over such a dump is the
+    /// server's own redelivery artifact (it does not resend the body of a transaction it
+    /// logged prepared before this connect), not a failover to answer with rebuilds.
+    stream_by_gtid: bool,
+    /// An orphan XA COMMIT was seen over a GTID dump and the stream must re-read by position
+    /// (set by `XaEnd`, consumed by the stream loop as a reconnect).
+    xa_orphan_reconnect: bool,
+    /// The orphan rollback is owed once per run: a second orphan says the position re-read
+    /// cannot attribute the transaction either, and the rebuild rule of `XaEnd` answers.
+    xa_orphan_rollback: bool,
     /// The server reports the binlog position of a consistent snapshot (see `fence`); `None`
     /// until tried.
     snapshot_fence: Option<bool>,
@@ -1851,6 +1973,17 @@ impl Engine {
             first_dirty: None,
             core_shape_routes: false,
             last_gtid: None,
+            pending_gtid: None,
+            xa_gap_no_gtid_dump: false,
+            in_xa_txn: false,
+            executed: source::mysql::GtidSet::new(),
+            executed_text: None,
+            executed_dirty: false,
+            gtid_seed_hiw: None,
+            read_node: None,
+            stream_by_gtid: false,
+            xa_orphan_reconnect: false,
+            xa_orphan_rollback: true,
             snapshot_fence: None,
             snapshot_watermark: info.flavor.snapshot_position_is_watermark(),
             commit_fence: None,
@@ -1982,12 +2115,28 @@ impl Engine {
         } else if let Some(saved) =
             saved_identity.filter(|s| !identity.is_empty() && *s != identity)
         {
-            Some((
-                format!(
-                    "saved binlog position {start} was written by server {saved}, but the source is server {identity} (failover, restore or RESET MASTER?)"
-                ),
-                false,
-            ))
+            // A different server (promotion, restore, rebuilt copy): the saved `file:pos`
+            // means nothing here, but the GTID state can make the cursor valid on it — the
+            // adoption rules of the resume-by-GTID plan (and lv-super's ruling 4: resume ONLY
+            // when the saved set is a subset of this server's executed set, never otherwise).
+            // A failed question is an error, never a silent verdict either way.
+            let st = binlog::gtid_state(&mut e.src).await?;
+            match adopt_decision(e.flavor, start.gtid(), &st) {
+                Adopt::Resume => {
+                    info!(
+                        "resuming on server {identity}: its GTID state covers the saved set of \
+                         {start} (written by server {saved}); the stream opens by GTID"
+                    );
+                    None
+                }
+                Adopt::Stop(why) => Some((
+                    format!(
+                        "saved binlog position {start} was written by server {saved}, but the \
+                         source is server {identity} (failover, restore or RESET MASTER?): {why}"
+                    ),
+                    false,
+                )),
+            }
         } else if !source::can_resume(&mut e.src, &start).await? {
             Some((
                 format!("saved binlog position {start} is no longer available on the server"),
@@ -2022,6 +2171,43 @@ impl Engine {
         if !identity.is_empty() {
             meta::save_identity(&mut e.meta, &e.cfg.instance_id, &identity).await?;
         }
+        // Seed the consumed set (ruling 6: once per run, never on the event path). A resumed
+        // cursor brings its own: it was only ever persisted at the stream's own boundary, so
+        // it is complete up to the saved position and every later save and dump extends from
+        // it. A start with no saved set (first run, or a re-anchor at a snapshot) must seed
+        // from the server or the set would under-claim everything committed before the stream
+        // opened — those transactions are in the builds' snapshot, and a GTID dump anchored on
+        // an under-claiming set would redeliver and re-apply them. The state is read after the
+        // start position was taken, so it can only over-claim transactions committed at or
+        // after that read: those sit after `start`, the stream delivers them and merges them at
+        // commit anyway, and until the saved position reaches `gtid_seed_hiw` the set rides no
+        // save and anchors no dump. Empty/absent executed state (GTIDs off, pre-GTID cursor,
+        // fresh server) seeds nothing: the file/pos and identity rules answer alone.
+        e.gtid_seed_hiw = match start.gtid() {
+            Some(g) => {
+                e.executed = source::parse_set(e.flavor, g);
+                None
+            }
+            None => {
+                let st = binlog::gtid_state(&mut e.src).await?;
+                match st.executed.as_deref().filter(|g| !g.is_empty()) {
+                    Some(g) => {
+                        let seed = source::parse_set(e.flavor, g);
+                        // The high-water read comes last: every transaction the seed claims
+                        // was committed by now, hence is logged at or before this position.
+                        let hiw = binlog::current_position(&mut e.src).await?;
+                        e.executed = seed;
+                        Some(hiw)
+                    }
+                    None => None,
+                }
+            }
+        };
+        e.executed_text = None;
+        e.executed_dirty = true;
+        // The status row already holds this cursor: `persisted` starts from it, so a save held
+        // below the boundary keeps the set the row carries instead of losing it.
+        e.persisted = start.clone();
         e.boundary = start.clone();
         // Read the definitions only now that `start` is fixed: a definition committed while the engine
         // starts is then in this snapshot, in the stream from `start`, or both (reloading an unchanged
@@ -2529,6 +2715,8 @@ impl Engine {
                 // fence table).
                 self.commit_fence = None;
                 self.commit_fenced = None;
+                // …and the read-node role: a failover may have moved the endpoint.
+                self.read_node = None;
                 // and re-probes the consistent snapshot: a verdict made on the dead connection
                 // must not survive the reconnect.
                 self.snapshot_fence = None;
@@ -3863,6 +4051,42 @@ impl Engine {
             // never the empty one that `pending_floor` ignores.
             self.dedup.core.rewound(pos.clone());
             self.metrics.beat();
+            // The dump is anchored on the consumed GTID set whenever the reader has one: the
+            // server starts after the set lazyview proved it applied-read, which survives a
+            // rotation, a lost file and (with the start of `run`) a promoted node. Without a
+            // set (GTIDs off, pre-GTID cursor) this is the file/pos dump, exactly as before.
+            // Two conditions hold the anchor back to file/pos, because a wrong set is the one
+            // outcome the resume bar forbids: an unattributable XA COMMIT (`XaEnd`'s gap), and
+            // a MySQL-family set that does not yet contain everything this server has PURGED —
+            // such a dump the server refuses outright ("the source purged required binary
+            // logs"); the file/pos request fails instead with the error the `on_missing_binlog`
+            // policy was written to speak. (Cost note: one status read per connect attempt,
+            // on the connect path; the event path gains nothing.) A third condition holds the
+            // anchor back: a seeding read whose high-water mark the stream has not consumed
+            // through yet — that set claims transactions after `pos` it has not applied, and a
+            // dump anchored on it would skip exactly those.
+            let mut gtid = if self.gtid_seed_hiw.is_some() {
+                None
+            } else {
+                self.executed_gtid_text()
+            };
+            if gtid.is_some() && !self.xa_gap_no_gtid_dump && self.flavor.is_mysql_family() {
+                let purged_ok = match binlog::gtid_state(&mut self.src).await {
+                    Ok(st) => {
+                        let purged =
+                            source::parse_set(self.flavor, st.purged.as_deref().unwrap_or(""));
+                        mysql::gtid_subset(&purged, &self.executed)
+                    }
+                    // Cannot ask, cannot anchor: a set checked against nothing is no check.
+                    Err(_) => false,
+                };
+                if !purged_ok {
+                    gtid = None;
+                }
+            } else if gtid.is_some() && self.xa_gap_no_gtid_dump {
+                gtid = None;
+            }
+            self.stream_by_gtid = gtid.is_some();
             // A connect is a repeat (the reader resumes from `boundary`, and delete-before-
             // insert tolerates re-applied events): the one helper with Policy::CONNECT, and no
             // nested retry inside BinlogReader::connect.
@@ -3873,11 +4097,12 @@ impl Engine {
                 || async {
                     tokio::time::timeout(
                         BINLOG_CONNECT_TIMEOUT,
-                        BinlogReader::connect(
+                        BinlogReader::connect_gtid(
                             self.binlog_opts.clone(),
                             self.cfg.server_id,
                             self.flavor,
                             &pos,
+                            gtid.as_deref(),
                             self.cfg.heartbeat,
                         ),
                     )
@@ -4001,6 +4226,14 @@ impl Engine {
                                 error!("processing binlog event: {e:#}");
                             }
                             return Err(e);
+                        }
+                        if self.xa_orphan_reconnect {
+                            // The orphan XA COMMIT answered: re-read from the saved position,
+                            // where the transaction's PREPARE is (a connect is a repeat the
+                            // delete-before-insert application tolerates).
+                            self.xa_orphan_reconnect = false;
+                            end = Some(StreamEnd::Transient);
+                            break;
                         }
                     }
                     Some(Ok(None)) => {
@@ -4403,6 +4636,27 @@ impl Engine {
                     self.flavor,
                     &binlog::current_position(&mut self.src).await?,
                 );
+                // A rebuild anchors at the snapshot: the consumed set restarts from there
+                // (resuming by an older set would claim transactions the rebuild covers). The
+                // seed is the state this server reports now — read after the new boundary —
+                // held off saves and dumps by its high-water mark until the stream delivers
+                // everything it over-claims (same race, same gate as the start seeding). The
+                // XA gap that barred the dump belonged to the old anchor: the snapshot covers
+                // that transaction too, so the bar goes away with the re-anchor.
+                self.executed = source::mysql::GtidSet::new();
+                self.executed_text = None;
+                self.executed_dirty = true;
+                self.gtid_seed_hiw = None;
+                self.xa_gap_no_gtid_dump = false;
+                let st = binlog::gtid_state(&mut self.src).await?;
+                if let Some(g) = st.executed.as_deref().filter(|g| !g.is_empty()) {
+                    let seed = source::parse_set(self.flavor, g);
+                    let hiw = binlog::current_position(&mut self.src).await?;
+                    self.executed = seed;
+                    self.executed_text = None;
+                    self.executed_dirty = true;
+                    self.gtid_seed_hiw = Some(hiw);
+                }
                 let ids: Vec<u64> = self.slots.iter().map(|s| s.def_id).collect();
                 for id in ids {
                     self.schedule_replan(id, false, false);
@@ -4447,6 +4701,13 @@ impl Engine {
         }
         match item {
             Item::Gtid { gtid } => {
+                // Once per transaction (the GTID event opens every one). The set is not
+                // touched here — the number joins it only when the transaction's commit event
+                // proves it fully read (`end_txn`, ruling 6's cost note: no merge, no render,
+                // no set-string rebuild on this path; the one new cost per transaction is a
+                // ~50-byte String clone because both `last_gtid` and the pending slot need
+                // the text).
+                self.pending_gtid = Some(gtid.clone());
                 self.last_gtid = Some(gtid);
                 self.in_txn = true;
             }
@@ -4695,6 +4956,7 @@ impl Engine {
             }
             Item::XaStart { xid } => {
                 self.in_txn = true;
+                self.in_xa_txn = true;
                 self.xa_current = Some((
                     xid,
                     XaTxn {
@@ -4704,6 +4966,9 @@ impl Engine {
                         other_tables: HashSet::new(),
                         prepared_at: Instant::now(),
                         unpinned: false,
+                        // The GTID belongs to the XA transaction, not to the ordinary
+                        // end-of-transaction merge: it waits here for the XA COMMIT.
+                        gtid: self.pending_gtid.take(),
                     },
                 ));
             }
@@ -4719,11 +4984,46 @@ impl Engine {
                 self.after_boundary();
             }
             Item::XaEnd { xid, commit, pos } => {
+                // An ordinary transaction may be mid-read here (XA COMMIT is a separate
+                // event): its number merges at its own commit, not at this one.
+                let carry = self.pending_gtid.take();
                 let before = self.end_txn(pos);
+                self.pending_gtid = carry;
                 match self.xa_pending.remove(&xid) {
-                    Some(xa) if commit => self.xa_committed(&xid, xa),
+                    Some(mut xa) if commit => {
+                        // The XA COMMIT read: its transaction is fully seen, its number joins
+                        // the consumed set now (a rollback drops it: the set under-claims, and
+                        // an under-claiming dump only ever re-reads).
+                        if let Some(g) = xa.gtid.take() {
+                            if source::merge_gtid(self.flavor, &mut self.executed, &g) {
+                                self.executed_dirty = true;
+                            }
+                        }
+                        self.xa_committed(&xid, xa)
+                    }
                     Some(_) => {}
                     None if commit => {
+                        // Its number is one the consumed set cannot name either: the stream
+                        // anchors on file and position from here (a GTID dump would replay
+                        // this commit on every connect).
+                        self.xa_gap_no_gtid_dump = true;
+                        if self.stream_by_gtid && self.xa_orphan_rollback {
+                            // The dump's own artifact, not a failover: the server does not
+                            // redeliver the body of a transaction it logged prepared before
+                            // this connect, so over a GTID dump the COMMIT alone can reach a
+                            // run that never saw the PREPARE. Answer with a position re-read,
+                            // not with rebuilds: the saved position never passes an open XA
+                            // PREPARE (the pins hold it), so from there the PREPARE comes back
+                            // and this commit is attributed — no view is rebuilt, the rows are
+                            // fed as the transaction's own. The sticky flag above keeps the set
+                            // off every later save and dump. (Cost note: one extra reconnect,
+                            // once per run; the second orphan keeps the rebuild rule.)
+                            info!(%xid, "an XA COMMIT arrived without its prepared transaction over a GTID dump; re-reading the stream by position");
+                            self.xa_orphan_rollback = false;
+                            self.boundary = self.persisted.clone();
+                            self.xa_orphan_reconnect = true;
+                            return Ok(());
+                        }
                         // Prepared before the position we resumed from (positions are never
                         // saved past an open XA PREPARE unless it stayed unresolved for longer
                         // than XA_PIN_MAX): its rows are unknown, rebuild everything.
@@ -4842,6 +5142,22 @@ impl Engine {
     /// for every transaction, so they are forgotten here.
     fn end_txn(&mut self, pos: Position) -> Position {
         self.in_txn = false;
+        // The commit arrived: the whole transaction was read (the stream is sequential), so
+        // its number joins the consumed set — once per transaction, the in-place fast path of
+        // `mysql::merge_interval`, allocation only for a first-time source id (ruling 6). An
+        // XA transaction's number waits in its `XaTxn` for the XA COMMIT instead.
+        if let Some(g) = self.pending_gtid.take() {
+            if self.in_xa_txn {
+                if let Some((_, xa)) = self.xa_current.as_mut() {
+                    if xa.gtid.is_none() {
+                        xa.gtid = Some(g);
+                    }
+                }
+            } else if source::merge_gtid(self.flavor, &mut self.executed, &g) {
+                self.executed_dirty = true;
+            }
+        }
+        self.in_xa_txn = false;
         self.table_ids.clear();
         self.dedup.boundary(&pos, Instant::now());
         std::mem::replace(&mut self.boundary, Cursor::from_position(self.flavor, &pos))
@@ -5973,9 +6289,14 @@ impl Engine {
     /// flavor's answer too: `snapshot_watermark` says whether waiting on the consistent-snapshot
     /// position proves anything (`Flavor::snapshot_position_is_watermark`).
     async fn fence(&mut self) -> bool {
-        // MySQL / Percona with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET` (see `mysql::gtid_wait`).
+        // MySQL / Percona with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET` (see `mysql::gtid_wait`) on
+        // the whole tracked set, not just the last transaction read (ruling 7): on a
+        // multi-source topology (Galera, PXC, GR) the node must execute transactions of many
+        // source ids, and waiting on only the last one approves reads that still miss others.
+        // The set renders once per flush (the text is cached until the next merge).
         if self.flavor.is_mysql_family() {
-            if let Some(g) = self.last_gtid.clone() {
+            let target = self.executed_gtid_text().or_else(|| self.last_gtid.clone());
+            if let Some(g) = target {
                 let r = mysql::gtid_wait(&mut self.src, &g).await;
                 self.metrics.beat();
                 match r {
@@ -6043,48 +6364,56 @@ impl Engine {
         // file calls): one row of our own, committed after every transaction read. It runs
         // whenever the consistent-snapshot wait is not the fence in force: the flavor says its
         // position is no watermark (the MySQL family), or the server ruled itself out by
-        // reporting none. The engine keeps only the caches and the
-        // `LAZYVIEW_VISIBILITY_DELAY_MS` fallback.
+        // reporting none. It is a WRITER-side mechanism: on a read-only node (the role probe of
+        // `mysql::read_node`, asked once per connection) the row could not be written — the
+        // wait then falls through to the visibility delay exactly as on a server that rules the
+        // mechanism out, and with GTIDs on the wait above already returned. The engine keeps
+        // only the caches and the `LAZYVIEW_VISIBILITY_DELAY_MS` fallback.
         if (self.snapshot_fence == Some(false) || !self.snapshot_watermark)
             && self.boundary.is_some()
         {
-            let mut state = FenceState {
-                snapshot: self.snapshot_fence,
-                commit_order: self.commit_fence,
-                committed: self.commit_fenced.clone(),
-            };
-            let fallback = self.fallback_wait();
-            let mut report = crate::source::FenceReport::default();
-            match mysql::commit_order(
-                &mut self.src,
-                &self.boundary.to_position(),
-                &self.cfg.instance_id,
-                &fallback,
-                &mut state,
-                &mut report,
-                &mut || self.metrics.beat(),
-            )
-            .await
-            {
-                Ok(mysql::CommitStep::Written) => {
-                    self.keep_fence_state(state);
-                    if let Some(w) = report.fence_warn {
-                        self.warn_fence(w);
+            if self.read_node.is_none() {
+                self.read_node = mysql::read_node(&mut self.src).await.ok();
+            }
+            if self.read_node != Some(true) {
+                let mut state = FenceState {
+                    snapshot: self.snapshot_fence,
+                    commit_order: self.commit_fence,
+                    committed: self.commit_fenced.clone(),
+                };
+                let fallback = self.fallback_wait();
+                let mut report = crate::source::FenceReport::default();
+                match mysql::commit_order(
+                    &mut self.src,
+                    &self.boundary.to_position(),
+                    &self.cfg.instance_id,
+                    &fallback,
+                    &mut state,
+                    &mut report,
+                    &mut || self.metrics.beat(),
+                )
+                .await
+                {
+                    Ok(mysql::CommitStep::Written) => {
+                        self.keep_fence_state(state);
+                        if let Some(w) = report.fence_warn {
+                            self.warn_fence(w);
+                        }
+                        return true;
                     }
-                    return true;
-                }
-                Ok(mysql::CommitStep::RuledOut) => {
-                    self.keep_fence_state(state);
-                    if let Some(w) = report.fence_warn {
-                        self.warn_fence(w);
+                    Ok(mysql::CommitStep::RuledOut) => {
+                        self.keep_fence_state(state);
+                        if let Some(w) = report.fence_warn {
+                            self.warn_fence(w);
+                        }
                     }
-                }
-                Err(e) => {
-                    self.keep_fence_state(state);
-                    if binlog::is_transient(&e) {
-                        self.heal_src().await;
+                    Err(e) => {
+                        self.keep_fence_state(state);
+                        if binlog::is_transient(&e) {
+                            self.heal_src().await;
+                        }
+                        return false;
                     }
-                    return false;
                 }
             }
         }
@@ -7985,6 +8314,22 @@ impl Engine {
     /// longer than [`XA_PIN_MAX`]. The boundary is a real resume point (`Cursor::is_some`), so
     /// it needs no guard here; [`meta::load_position`] is the one place that can hand back no
     /// cursor at all (nothing saved yet, or a row of an older build).
+    /// The consumed set as the flavor's canonical `[g=…]` text, rendered only when a merge has
+    /// changed it (ruling 6: once per flush where a cursor is persisted or compared, never on
+    /// the event path); `None` until the reader has consumed a GTID — a pre-GTID cursor text,
+    /// byte for byte.
+    fn executed_gtid_text(&mut self) -> Option<String> {
+        if self.executed_dirty {
+            self.executed_text = if self.executed.is_empty() {
+                None
+            } else {
+                Some(source::render_set(self.flavor, &self.executed))
+            };
+            self.executed_dirty = false;
+        }
+        self.executed_text.clone()
+    }
+
     async fn persist_position(&mut self, force: bool) -> Result<()> {
         // The leadership gate (ruling 1): the saved position is a row of the coordination store,
         // and an instance whose lock it cannot prove does not own it — the replacement writes it
@@ -8020,17 +8365,42 @@ impl Engine {
             self.last_persist = Instant::now();
             return Ok(());
         }
+        // Attach the GTID state (ruling 6: the render lives here and at the fence, not on the
+        // event path). The set may only ride a position that covers it: while the save is held
+        // below the boundary (pending rows, an XA pin) the merged set has already run ahead of
+        // `pos`, and an over-claiming set would let a GTID resume skip un-applied transactions
+        // — so the save keeps the set it last carried, and the grown set is saved with the
+        // position that catches up to it. A seed from the server's state is held back the same
+        // way until the stream has consumed through its high-water mark (`gtid_seed_hiw`):
+        // until then the set claims transactions that sit after `pos` and have not been
+        // delivered, and a below-that save must read as no set at all, not as a stale one.
+        if self.gtid_seed_hiw.as_ref().is_some_and(|h| pos >= *h) {
+            self.gtid_seed_hiw = None;
+        }
+        // A set that failed to attribute an XA COMMIT under-claims: the dump gate already
+        // refuses it, and so must the save — a cursor keeping it would let the NEXT process
+        // anchor a dump on it and redeliver that commit as "prepared before this run" (which
+        // rebuilds every view, once per restart). Shed it and the file/pos rules answer.
+        let gtid = if self.xa_gap_no_gtid_dump {
+            None
+        } else if self.gtid_seed_hiw.is_none() && pos == self.boundary.to_position() {
+            self.executed_gtid_text()
+        } else if self.gtid_seed_hiw.is_none() && !self.executed.is_empty() {
+            self.persisted.gtid().map(str::to_string)
+        } else {
+            None
+        };
         self.persist_needed = true;
         meta::save_position(
             &mut self.meta,
             &self.cfg.instance_id,
-            &Cursor::from_position(self.flavor, &pos),
+            &Cursor::from_position(self.flavor, &pos).with_gtid(gtid.clone()),
             self.leader.epoch,
         )
         .await?;
         // Held back: save again once the pending changes are applied.
         self.persist_needed = pos < self.boundary.to_position();
-        self.persisted = Cursor::from_position(self.flavor, &pos);
+        self.persisted = Cursor::from_position(self.flavor, &pos).with_gtid(gtid);
         self.last_persist = Instant::now();
         Ok(())
     }
@@ -9307,6 +9677,131 @@ mod managed_service_tests {
         assert!(!wants_gtid_tip(false, Some("on")));
         assert!(!wants_gtid_tip(false, None));
         assert!(!wants_gtid_tip(true, Some("OFF")));
+    }
+
+    /// The adoption truth table of plan §2.4 (lv-super ruling 4, binding): resume ONLY when
+    /// `saved ⊆ executed` and `purged ⊆ saved`; every other case is a clean stop naming the
+    /// reason — never a silent resume, never an automatic rebuild.
+    #[test]
+    fn adoption_truth_table() {
+        use source::{Flavor, GtidState};
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let v = "c80aa942-1111-2222-3333-c80aa9429562";
+        let st = |mode: Option<&str>, executed: Option<&str>, purged: Option<&str>| GtidState {
+            mode: mode.map(str::to_string),
+            executed: executed.map(str::to_string),
+            purged: purged.map(str::to_string),
+            binlog_state: None,
+        };
+        // The promoted replica: everything consumed is executed, nothing purged is missing.
+        assert!(matches!(
+            adopt_decision(
+                Flavor::MySql,
+                Some(&format!("{u}:1-10:12,{v}:3")),
+                &st(
+                    Some("ON"),
+                    Some(&format!("{u}:1-20,{v}:1-5")),
+                    Some(&format!("{u}:1-5")),
+                ),
+            ),
+            Adopt::Resume
+        ));
+        // The new server lacks a consumed source id at all: lossy failover — stop, naming it.
+        match adopt_decision(
+            Flavor::MySql,
+            Some(&format!("{u}:1-10,{v}:3")),
+            &st(Some("ON"), Some(&format!("{u}:1-20")), None),
+        ) {
+            Adopt::Stop(w) => {
+                assert!(w.contains(v) && w.contains(":3"), "{w}");
+            }
+            Adopt::Resume => panic!("a server that never executed a consumed sid must not resume"),
+        }
+        // A gap inside a consumed sid (restored older than the saved state): stop, naming the
+        // missing range.
+        match adopt_decision(
+            Flavor::MySql,
+            Some(&format!("{u}:1-10")),
+            &st(Some("ON"), Some(&format!("{u}:1-5")), None),
+        ) {
+            Adopt::Stop(w) => assert!(w.contains(&format!("{u}:6-10")), "{w}"),
+            Adopt::Resume => panic!("an older restore must not resume"),
+        }
+        // Purged past the saved state: the pre-check stops before the server's dump error.
+        match adopt_decision(
+            Flavor::MySql,
+            Some(&format!("{u}:1-10")),
+            &st(
+                Some("ON"),
+                Some(&format!("{u}:1-20")),
+                Some(&format!("{u}:1-15")),
+            ),
+        ) {
+            Adopt::Stop(w) => {
+                assert!(
+                    w.contains("purged") && w.contains(&format!("{u}:11-15")),
+                    "{w}"
+                );
+            }
+            Adopt::Resume => panic!("a purged resume point must stop cleanly"),
+        }
+        // The upgrade case: a pre-GTID cursor on a new server cannot be verified — stop with
+        // both operator paths in the message.
+        for no_set in [None, Some(""), Some("   ")] {
+            match adopt_decision(
+                Flavor::MySql,
+                no_set,
+                &st(Some("ON"), Some(&format!("{u}:1-9")), None),
+            ) {
+                Adopt::Stop(w) => {
+                    assert!(w.contains("gtid_mode=ON"), "{w}");
+                    assert!(w.contains("LAZYVIEW_ON_MISSING_BINLOG=rebuild"), "{w}");
+                }
+                Adopt::Resume => panic!("a cursor without a set never verifies on a new server"),
+            }
+        }
+        // GTIDs off (and a transitional mode): the server cannot answer — stop naming gtid_mode.
+        for mode in ["OFF", "OFF_PERMISSIVE", "ON_PERMISSIVE"] {
+            match adopt_decision(
+                Flavor::MySql,
+                Some(&format!("{u}:1-10")),
+                &st(Some(mode), Some(""), Some("")),
+            ) {
+                Adopt::Stop(w) => assert!(w.contains(&format!("gtid_mode={mode}")), "{w}"),
+                Adopt::Resume => panic!("a non-ON gtid_mode must not resume by set"),
+            }
+        }
+        // MariaDB: the pair list over `gtid_binlog_state`, same bar.
+        assert!(matches!(
+            adopt_decision(
+                Flavor::MariaDb,
+                Some("0-1-10,0-2-5"),
+                &GtidState {
+                    mode: None,
+                    executed: None,
+                    purged: Some("0-1-3".into()),
+                    binlog_state: Some("0-1-12,0-2-7".into()),
+                },
+            ),
+            Adopt::Resume
+        ));
+        match adopt_decision(
+            Flavor::MariaDb,
+            Some("0-1-10,0-2-5"),
+            &GtidState {
+                mode: None,
+                executed: None,
+                purged: None,
+                binlog_state: Some("0-1-12".into()), // the 0-2 pair was never written here
+            },
+        ) {
+            Adopt::Stop(w) => assert!(w.contains("0-2-1-5"), "{w}"),
+            Adopt::Resume => panic!("a missing pair must stop cleanly"),
+        }
+        // The named difference is bounded interval math, including a hole inside a range.
+        let s = |t: &str| source::parse_set(Flavor::MySql, t);
+        let miss = source::mysql::gtid_missing(&s("u:1-10"), &s("u:1-5:8"));
+        assert_eq!(source::mysql::render_set(&miss), "u:6-7,u:9-10");
     }
 
     /// A-02: the wait before a reconnect is the network's schedule for a network fault and the
