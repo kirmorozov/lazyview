@@ -142,6 +142,12 @@ pub struct Config {
     pub write_batch_bytes: usize,
     pub server_id: u32,
     pub instance_id: String,
+    /// `LAZYVIEW_OTEL=off|otlp` (default **off**): the one bespoke telemetry switch — an ambient
+    /// collector on the network changes nothing. Anything but `otlp` (a typo included) is off, so a
+    /// misspelled switch cannot silently start sending telemetry; the value is WARNed, and startup
+    /// does not fail on it. Everything else is the standard OTel environment (`OTEL_*`), which
+    /// [`crate::otel`] reads by itself.
+    pub otel_switch: crate::otel::Switch,
     pub drop_removed: bool,
     pub on_missing_binlog: MissingBinlog,
     pub heartbeat: Duration,
@@ -301,6 +307,23 @@ impl Config {
         // the MySQL-only DSN parser).
         let source_family = crate::dialect::Family::from_source_dsn(&dsn)?;
         let instance_id = get("LAZYVIEW_INSTANCE_ID").unwrap_or_else(|| "default".into());
+        // The telemetry switch, read once and here only: `crate::otel` is copy-set code and takes
+        // it as a parameter, so the same module serves lazy-wire-fire's own (`LAZYWF_OTEL`). A
+        // value that is neither `off` nor `otlp` is off — and says so, because a typo that quietly
+        // disabled telemetry is worse than a loud startup.
+        let otel_raw = get("LAZYVIEW_OTEL");
+        let otel_switch = crate::otel::Switch::parse(otel_raw.as_deref());
+        if otel_raw
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty() && !otel_switch.is_on())
+        {
+            let v = otel_raw.as_deref().unwrap_or_default();
+            if !v.trim().eq_ignore_ascii_case("off") {
+                tracing::warn!(
+                    "LAZYVIEW_OTEL={v} is not understood; telemetry stays off (the values are off and otlp)"
+                );
+            }
+        }
         let num = |k: &str, d: u64| -> Result<u64> {
             match get(k) {
                 Some(v) => v
@@ -505,6 +528,7 @@ impl Config {
             .max(1024) as usize,
             server_id,
             instance_id,
+            otel_switch,
             drop_removed: flag("LAZYVIEW_DROP_REMOVED", true)?,
             on_missing_binlog,
             build_concurrency: num("LAZYVIEW_BUILD_CONCURRENCY", 2)?.max(1) as usize,
@@ -977,6 +1001,39 @@ mod tests {
             ("LAZYVIEW_TEST_LOCK_DSN", "postgres://lv@db:5432/app"),
         ])
         .is_err());
+    }
+
+    /// The telemetry switch: off is the default, `otlp` is the only value that turns it on, and a
+    /// value that is neither (a typo, an empty one) is off rather than an error — telemetry must
+    /// never start because of a misspelling, and never fail a startup either.
+    #[test]
+    fn otel_switch_is_off_unless_it_says_otlp() {
+        use crate::otel::Switch;
+        let dsn = "mysql://lv@db:3306/app";
+        assert_eq!(
+            cfg(&[("LAZYVIEW_DSN", dsn)]).unwrap().otel_switch,
+            Switch::Off,
+            "no switch, no telemetry: an ambient collector changes nothing"
+        );
+        for on in ["otlp", "OTLP", " otlp "] {
+            assert_eq!(
+                cfg(&[("LAZYVIEW_DSN", dsn), ("LAZYVIEW_OTEL", on)])
+                    .unwrap()
+                    .otel_switch,
+                Switch::Otlp,
+                "{on} turns it on"
+            );
+        }
+        for off in ["", "  ", "off", "OFF", "otlp-x", "1", "grpc"] {
+            assert_eq!(
+                cfg(&[("LAZYVIEW_DSN", dsn), ("LAZYVIEW_OTEL", off)])
+                    .unwrap()
+                    .otel_switch,
+                Switch::Off,
+                "{off:?} is not the value that turns it on"
+            );
+        }
+        assert_eq!(Switch::parse(None), Switch::Off);
     }
 
     /// The leadership lock's lease (review A-06): the two settings, their floors, and the rule

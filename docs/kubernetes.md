@@ -251,6 +251,35 @@ The secret is fetched at startup, once per password reference; a rotation theref
 credentials, so no `AWS_*` variable in the ConfigMap can point the pod at someone else's account
 beyond what the node identity already allows.
 
+## OpenTelemetry
+
+Tracing is off until you switch it on, and switching it on is environment only: there is no manifest
+to add and no right to grant. lazyview is a *client* of your collector, and the
+[network policy](#deploy) restricts ingress only, so egress to a collector needs no new rule.
+
+```yaml
+# base/config.env, or your overlay's
+LAZYVIEW_OTEL=otlp
+OTEL_EXPORTER_OTLP_ENDPOINT=http://opentelemetry-collector.observability.svc.cluster.local:4317
+# OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer%20…   a managed collector's auth header
+# OTEL_TRACES_SAMPLER=parentbased_traceidratio           sample a share of the runs
+# OTEL_TRACES_SAMPLER_ARG=0.05
+```
+
+* The spans, the attributes, and the rule that no span carries a row value:
+  [configuration → OpenTelemetry](configuration.md#opentelemetry). Off (the default) costs nothing:
+  no provider and no exporter exist in the process at all.
+* **OTLP/gRPC only** (4317 by default). `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` is refused with one
+  `WARN` and tracing stays off rather than exporting over a second HTTP stack.
+* `service.instance.id` is `LAZYVIEW_INSTANCE_ID`, so the active pod and its standbys are told apart,
+  and `lazyview.epoch.takeover` marks the moment the fencing epoch moved to a replica (see
+  [rollouts and standby](#rollouts-drains-and-standby)).
+* No collector ships with these manifests: point the endpoint at the cluster's own (the OpenTelemetry
+  Operator, or a collector Deployment of yours). A `components/opentelemetry-collector` component comes
+  with the metrics and logs signals; until then the endpoint above is the whole wiring.
+* A collector that is away costs a `WARN` at most once a minute: it never blocks a flush, a probe or a
+  rollout. `/metrics` and `components/prometheus` are unchanged and do not depend on the switch.
+
 ## Metrics
 
 `lazyview-metrics` also publishes pods that are not ready, so standbys and pods that are still

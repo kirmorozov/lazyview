@@ -39,6 +39,19 @@ thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# Opt-in OpenTelemetry (`LAZYVIEW_OTEL=otlp`, src/otel.rs, docs/configuration.md "OpenTelemetry").
+# The official SDK (owner 2026-11-14; the naming and the copy-set terms are the lwf agreement in
+# tmp/out/lwf-coordination/otel-agreement.md). Versions are pinned here and announced to lwf, whose
+# verbatim copy of `src/otel.rs` aligns on them; OTLP/gRPC rides the same tonic/prost lazy-wire-fire
+# uses. `default-features = false` everywhere: the OTLP http/* transports (reqwest + prost) are not
+# taken on — `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` is refused with one WARN (src/otel.rs) —
+# and `metrics` / `logs` arrive with their own PRs. `rt-tokio` is not needed: the SDK's batch
+# processor runs on its own thread (`futures_executor::block_on`), the provider is built inside the
+# engine's runtime, as tonic requires.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "grpc-tonic"] }
+opentelemetry-semantic-conventions = { version = "0.33.1", default-features = false }
 # Resolved secret references (`src/secrets.rs`) are cleared when the last handle drops. The
 # crate is already in the tree (rustls, tls_codec), so this names an existing dependency.
 zeroize = "1"

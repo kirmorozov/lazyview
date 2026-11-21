@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::binlog::connect::product;
+use crate::otel;
 use crate::source::mysql::{
     classify_query, dump_sids, mysql_gtid, time2_twin, tme_name, xa_prepare_event, Payload,
     QueryKind, Time2Twin,
@@ -152,12 +153,39 @@ impl Tracker {
     }
 }
 
+/// The flavor's name for a span attribute: a stable, bounded label (an attribute value is never a
+/// row value, and never a name the source made up).
+fn flavor_name(f: Flavor) -> &'static str {
+    match f {
+        Flavor::MySql => "mysql",
+        Flavor::Percona => "percona",
+        Flavor::MariaDb => "mariadb",
+    }
+}
+
 pub struct BinlogReader {
     stream: BinlogStream,
     t: Tracker,
     server_id: u32,
     /// First event read by `connect` (the stream is validated there) when it is not a rotate.
     pending: Option<Event>,
+    /// The span of the batch being read (the events since the last [`BinlogReader::end_read_batch`],
+    /// which is what the consumer flushes on). `None` while no event of the batch has been read —
+    /// and always `None` with telemetry off, where [`crate::otel`] holds no provider at all.
+    batch: Option<otel::Span>,
+    /// Events and row events counted into `batch` (span attributes, written at the batch's end).
+    batch_events: u64,
+    batch_rows: u64,
+    /// The span of the transaction being read, opened with its first event and ended at its
+    /// boundary. The value the seam stamps: what a delivery span links to (agreement §3).
+    tx: Option<otel::Span>,
+    /// The transaction's GTID and its event/row counts, for its span's attributes.
+    tx_gtid: Option<String>,
+    tx_events: u64,
+    tx_rows: u64,
+    /// The parent the consumer supplied for the batch spans ([`BinlogReader::set_parent`]): the
+    /// embedder's own read-loop span, so a copied reader hangs its spans under it.
+    parent: Option<otel::TraceParent>,
 }
 
 impl BinlogReader {
@@ -267,6 +295,14 @@ impl BinlogReader {
             t: Tracker::new(flavor, from),
             server_id,
             pending: None,
+            batch: None,
+            batch_events: 0,
+            batch_rows: 0,
+            tx: None,
+            tx_gtid: None,
+            tx_events: 0,
+            tx_rows: 0,
+            parent: None,
         };
         // Validate the request: the server answers with a fake ROTATE or an error (e.g. 1236).
         let first = tokio::time::timeout(Duration::from_secs(30), reader.stream.next())
@@ -333,6 +369,7 @@ impl BinlogReader {
     /// Cancel-safe: dropping the future before it completes loses no event.
     pub async fn next(&mut self) -> Result<Option<Item>> {
         if let Some(item) = self.t.queued.take() {
+            self.otel_read(&item);
             return Ok(Some(item));
         }
         let ev = match self.pending.take() {
@@ -346,7 +383,9 @@ impl BinlogReader {
                 }
             }
         };
-        self.t.map_event(ev).map(Some)
+        let item = self.t.map_event(ev)?;
+        self.otel_read(&item);
+        Ok(Some(item))
     }
 
     /// Decodes the rows of a `Rows` item: `(before, after)` images.
@@ -362,6 +401,129 @@ impl BinlogReader {
         event: &Event,
     ) -> Result<Vec<(Option<BinlogRow>, Option<BinlogRow>)>> {
         self.t.rows(table_id, event)
+    }
+
+    /// The parent for the batch spans this reader opens: the embedder's own read-loop span, so a
+    /// verbatim copy of this reader hangs its spans under whatever the host is doing. `None` (the
+    /// default) makes them roots.
+    pub fn set_parent(&mut self, parent: Option<otel::TraceParent>) {
+        self.parent = parent;
+    }
+
+    /// The read batch's own span, as a parent: what a consumer hangs the work it does with the
+    /// batch (its flush) under. `None` with telemetry off, or before the batch's first event.
+    pub fn read_batch_parent(&self) -> Option<otel::TraceParent> {
+        self.batch.as_ref().and_then(otel::Span::trace_parent)
+    }
+
+    /// The `traceparent` of the transaction being read — **the value the shared-core seam
+    /// propagates** (agreement §3). The consumer collects it beside the rows it marks (capped, per
+    /// view) and turns it into span LINKS on the delivery it merges those rows into, in this
+    /// process or, for the embedder, in another one. `None` when telemetry is off or the
+    /// transaction was not sampled: the unset path carries nothing.
+    pub fn tx_parent(&self) -> Option<otel::TraceParent> {
+        self.tx.as_ref().and_then(otel::Span::trace_parent)
+    }
+
+    /// Ends the read batch and the transaction inside it; the next event opens the next batch.
+    /// The consumer calls this when it flushes — the batch is the unit a flush applies. A no-op
+    /// with telemetry off, and dropping the reader ends whatever is open.
+    pub fn end_read_batch(&mut self) {
+        if !otel::enabled() {
+            return;
+        }
+        self.otel_end_tx();
+        self.batch = None;
+        self.batch_events = 0;
+        self.batch_rows = 0;
+    }
+
+    /// The telemetry of one read event: opens the batch's span, opens the transaction's span
+    /// inside it, and ends that one at the transaction's boundary.
+    ///
+    /// This is where the seam's `traceparent` is **stamped at read time**: inside the reader, not
+    /// in a host's glue, so the embedder's byte-identical copy stamps it too and its delivery spans
+    /// can link to a row event that has since passed through the dedup core (agreement §3 — lazywf
+    /// cannot patch a vendored file, so the stamping has to live here).
+    ///
+    /// Cost when telemetry is off: this function's `enabled()` test and nothing else — no span, no
+    /// `String`, no field touched per event (measured, not asserted: `tests/otel_off_free.rs`).
+    fn otel_read(&mut self, item: &Item) {
+        if !otel::enabled() {
+            return;
+        }
+        // A heartbeat, or an event carrying nothing this code reads, is no work of ours: it opens no
+        // span and is counted into none (the caller still gets it back, of course).
+        if matches!(item, Item::Heartbeat | Item::Other) {
+            return;
+        }
+        if self.batch.is_none() {
+            let at = self.t.pos.to_string();
+            let flavor = flavor_name(self.t.flavor);
+            let parent = self.parent;
+            self.batch = Some(otel::span(otel::span::BINLOG_READ_BATCH, |a| {
+                a.str(otel::attr::SOURCE_POSITION, at);
+                a.str(otel::attr::SOURCE_FLAVOR, flavor);
+                if let Some(p) = parent {
+                    a.parent_from(&p);
+                }
+            }));
+            self.batch_events = 0;
+            self.batch_rows = 0;
+        }
+        self.batch_events += 1;
+        if self.tx.is_none() {
+            let at = self.t.pos.to_string();
+            let parent = self.batch.as_ref().and_then(otel::Span::trace_parent);
+            self.tx = Some(otel::span(otel::span::BINLOG_TRANSACTION, |a| {
+                a.str(otel::attr::SOURCE_POSITION, at);
+                if let Some(p) = parent {
+                    a.parent_from(&p);
+                }
+            }));
+            self.tx_events = 0;
+            self.tx_rows = 0;
+            self.tx_gtid = None;
+        }
+        let boundary = match item {
+            Item::Gtid { gtid } => {
+                self.tx_gtid = Some(gtid.clone());
+                false
+            }
+            Item::Rows { .. } => {
+                self.tx_rows += 1;
+                self.batch_rows += 1;
+                false
+            }
+            // The resumable boundaries: the transaction is over (an XA PREPARE is one too — its
+            // rows are durable, and reading restarts here after a restart).
+            Item::Commit { .. }
+            | Item::Statement { .. }
+            | Item::XaEnd { .. }
+            | Item::XaPrepare { .. } => true,
+            Item::TableMap { .. } | Item::XaStart { .. } | Item::Incident { .. } => false,
+            // Returned above: no transaction of theirs is ever open here.
+            Item::Heartbeat | Item::Other => false,
+        };
+        self.tx_events += 1;
+        if boundary {
+            self.otel_end_tx();
+        }
+    }
+
+    /// Ends the transaction's span with what is only known at its end: the counts and the GTID.
+    fn otel_end_tx(&mut self) {
+        if let Some(mut s) = self.tx.take() {
+            s.set_u64(otel::attr::EVENTS, self.tx_events);
+            s.set_u64(otel::attr::ROWS, self.tx_rows);
+            if let Some(g) = self.tx_gtid.take() {
+                s.set_str(otel::attr::SOURCE_GTID, g);
+            }
+            // Where replay would restart: the boundary the tracker just reached.
+            s.set_str(otel::attr::SOURCE_POSITION, self.t.pos.to_string());
+        } // dropping the handle is what ends the span
+        self.tx_events = 0;
+        self.tx_rows = 0;
     }
 
     pub async fn close(self) -> Result<()> {

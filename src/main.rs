@@ -37,6 +37,14 @@ COMMON SETTINGS:
   LAZYVIEW_HEALTH_TOKEN=<token> (gates /metrics and /stats)
   LAZYVIEW_LOG_FORMAT=text|json   RUST_LOG=info
 
+ TELEMETRY (off until you turn it on):
+   LAZYVIEW_OTEL=otlp    export spans over OTLP/gRPC (any other value, `off`, stays off)
+                         the rest is the standard OpenTelemetry environment, read as the
+                         specification names it: OTEL_EXPORTER_OTLP_ENDPOINT, its _HEADERS and
+                         _PROTOCOL (grpc only), OTEL_TRACES_SAMPLER and its _ARG,
+                         OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES, OTEL_SDK_DISABLED,
+                         OTEL_TRACES_EXPORTER=none. `/metrics` (Prometheus) is unchanged.
+
 Then: INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW v AS SELECT ...');
 See README.md for everything else.
 ";

@@ -34,6 +34,7 @@ use crate::lookback::Lookback;
 use crate::meta::{self, StateUpdate, SOURCE_TARGET};
 use crate::metrics::Metrics;
 use crate::mv::{self, BuildTarget, Layout};
+use crate::otel;
 use crate::plan_swap;
 use crate::source::{self, mysql, Cursor, FenceState, SourceCaps};
 use crate::supervisor::{self, Supervisor};
@@ -44,6 +45,12 @@ use mysql_async::binlog::value::BinlogValue;
 
 /// The once-a-minute clocks of the `Engine::core_events` warnings (guard R1 c; one per warning).
 static LAST_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+
+/// The batch-wide bucket of [`Engine::otel_links`]: the source transactions that came through the
+/// dedup core, which the engine cannot attribute to a view without a lookup the event path does not
+/// pay. The flush span links these; a view's refresh span links its own slot. `usize::MAX` is never
+/// a slot index, so the two never collide.
+const OTEL_CORE: usize = usize::MAX;
 
 /// Run the service until `shutdown` turns true (or, for `once`, until done). With
 /// `cfg.sync == false` this is the setup and migration run (`lazyview setup`): create and
@@ -92,6 +99,9 @@ async fn run_engine(
         engine.stream(start, shutdown).await
     }
     .await;
+    // The last spans go out on the exit path, bounded by a timeout so a collector that has gone
+    // cannot hold a shutdown open. A no-op with telemetry off.
+    otel::shutdown();
     r.map_err(|e| with_access_hint(e, &user, &schema))
 }
 
@@ -1449,6 +1459,15 @@ struct Engine {
     /// (slot, targets written) of every live refresh of the flush in progress (`note_refresh`
     /// fills it, `flush_draining` reads it once when the flush is through, #215).
     flush_wrote: Vec<(usize, Vec<String>)>,
+    /// The source transactions whose spans this batch's events were read under, per view slot:
+    /// the span LINKS of the flush (agreement §3 — N events merge into one delivery, so they are
+    /// links and never parenting). A capped sidecar here rather than a field of the dedup core's
+    /// pending-key entry, which is what leaves lwf's ~19 B/key budget untouched; with telemetry off
+    /// nothing is ever written to it (`otel::enabled()` gates every insert) and the map stays empty.
+    otel_links: HashMap<usize, Vec<otel::TraceParent>>,
+    /// The read batch's span, as the parent of this batch's flush span
+    /// ([`BinlogReader::read_batch_parent`], refreshed as the batch is read).
+    otel_batch: Option<otel::TraceParent>,
     /// Live views refreshed since `refreshed_at` was last bumped.
     refreshed: HashSet<String>,
     last_touch: Instant,
@@ -2663,6 +2682,8 @@ impl Engine {
             ready_logged: false,
             lag_budget_warned: false,
             flush_wrote: Vec::new(),
+            otel_links: HashMap::new(),
+            otel_batch: None,
             refreshed: HashSet::new(),
             last_touch: Instant::now(),
             last_stats: (Instant::now(), Default::default()),
@@ -2890,6 +2911,17 @@ impl Engine {
         // is no real position, so the first save moves them.
         e.persisted = start.clone();
         e.persisted_at = row_at;
+        // Telemetry is opt-in (`LAZYVIEW_OTEL`, default off) and starts here, once the source's
+        // identity is known: the resource carries it, and everything the copy-set module may not
+        // read for itself arrives as a parameter of `init` (see `src/otel.rs`'s header). Off — the
+        // default, and any value but `otlp` — this builds no provider and no exporter at all.
+        otel::init(&otel::Host {
+            switch: e.cfg.otel_switch,
+            service_name: "lazyview",
+            service_version: env!("CARGO_PKG_VERSION"),
+            instance_id: &e.cfg.instance_id,
+            source: (!identity.is_empty()).then_some(identity.as_str()),
+        });
         e.boundary = start.clone();
         // Read the definitions only now that `start` is fixed: a definition committed while the engine
         // starts is then in this snapshot, in the stream from `start`, or both (reloading an unchanged
@@ -5294,6 +5326,27 @@ impl Engine {
         // Everything fed so far (the binlog read position) is what this flush applies: the
         // position the targets will have applied when it is through (#215, see below).
         let applied = self.boundary.to_position();
+        // One span per flush (agreement §1): the fence, the refreshes, the writes and the position
+        // save of one batch. A child of the reader's read-batch span, linked to the source
+        // transactions this batch delivered through the dedup core — the per-view ones go to each
+        // view's own refresh span. Built only when telemetry is on; off, `otel_batch` stays `None`
+        // and every span call below is one atomic load.
+        let mut otel_flush = if otel::enabled() {
+            let parent = reader.read_batch_parent();
+            let links = self.otel_links.remove(&OTEL_CORE).unwrap_or_default();
+            let epoch = self.leader.epoch;
+            Some(otel::span(otel::span::VIEW_FLUSH, |a| {
+                a.u64(otel::attr::EPOCH, epoch);
+                a.u64(otel::attr::LINKS, links.len() as u64);
+                a.links(&links);
+                if let Some(p) = parent {
+                    a.parent_from(&p);
+                }
+            }))
+        } else {
+            None
+        };
+        self.otel_batch = otel_flush.as_ref().and_then(otel::Span::trace_parent);
         let r = {
             let flush = self.flush();
             tokio::pin!(flush);
@@ -5345,6 +5398,17 @@ impl Engine {
         if r.is_ok() && read_any {
             self.mark_behind_targets(&applied, reader.position(), drained.bytes);
         }
+        if let Some(s) = otel_flush.as_mut() {
+            match &r {
+                Ok(()) => s.ok(),
+                Err(_) => s.fail("flush"),
+            }
+        }
+        // The batch's spans are above, so its links have gone with them; the next event the reader
+        // hands back opens the next read batch (and with telemetry off both lines touch nothing).
+        self.otel_batch = None;
+        self.otel_links.clear();
+        reader.end_read_batch();
         r
     }
 
@@ -5820,6 +5884,23 @@ impl Engine {
                     self.clock.fed_ts = ts;
                 }
                 self.clock.at_head = false;
+                // Telemetry (agreement §3): the source transaction this row event was read under,
+                // remembered per view it marks; those become the span LINKS of the view's refresh
+                // span (N transactions merge into one delivery, so links and never parents). The
+                // core's own consumers have no slot to name here — the engine would need a lookup
+                // the event path does not do — so their transactions are linked by the batch, from
+                // the flush span (`CORE_SLOT`). Off, `tx_parent()` is `None` and this is the whole
+                // cost: no map entry, no `Vec`, nothing per entry (`tests/otel_off_free.rs`).
+                if let Some(p) = reader.tx_parent() {
+                    if let Some(route) = &route {
+                        for r in route.iter() {
+                            self.otel_note_link(r.slot, p);
+                        }
+                    }
+                    if src.is_some() {
+                        self.otel_note_link(OTEL_CORE, p);
+                    }
+                }
                 let since = self.boundary.to_position();
                 if let Some(route) = &route {
                     self.mark_any(route, &since);
@@ -6278,6 +6359,45 @@ impl Engine {
             None => self.lag_budget_warned = false,
         }
         Ok(())
+    }
+
+    /// Remembers that a row of source transaction `p` marked view `slot`, for that view's refresh
+    /// span's LINKS (agreement §3). Capped at [`otel::MAX_LINKS`] per view, so a batch that touched
+    /// a view a million times costs a bounded `Vec`, and only ever with telemetry on.
+    fn otel_note_link(&mut self, slot: usize, p: otel::TraceParent) {
+        let v = self.otel_links.entry(slot).or_default();
+        if v.len() < otel::MAX_LINKS {
+            v.push(p);
+        }
+    }
+
+    /// The `lazyview.view.refresh` span of one view's refresh: a child of this batch's flush span,
+    /// linked to the source transactions whose rows marked this view. `None` — with nothing built,
+    /// no `String`, no `Vec` — whenever telemetry is off, which is the whole off-is-free cost
+    /// (one atomic load; `tests/otel_off_free.rs`).
+    fn otel_refresh_span(&mut self, i: usize, st: &LiveRefresh) -> Option<otel::Span> {
+        if !otel::enabled() {
+            return None;
+        }
+        let parent = self.otel_batch;
+        let links = self.otel_links.remove(&i).unwrap_or_default();
+        let (def_id, name, targets) = (st.def_id, st.name.clone(), st.targets.len() as u64);
+        let (mode, _) = mode_name(&st.plan);
+        let forced = st.dirty.all;
+        let keys = pending_ids(&st.dirty, &st.plan);
+        Some(otel::span(otel::span::VIEW_REFRESH, |a| {
+            a.u64(otel::attr::VIEW_ID, def_id);
+            a.str(otel::attr::VIEW_NAME, name);
+            a.str(otel::attr::MODE, mode);
+            a.u64(otel::attr::TARGETS, targets);
+            a.u64(otel::attr::KEYS, keys);
+            a.bool(otel::attr::FORCED, forced);
+            a.u64(otel::attr::LINKS, links.len() as u64);
+            a.links(&links);
+            if let Some(p) = parent {
+                a.parent_from(&p);
+            }
+        }))
     }
 
     /// Routes that need no row image: any row marks the version stale.
@@ -8392,6 +8512,7 @@ impl Engine {
         let Some(mut st) = self.live_begin(i).await else {
             return;
         };
+        let mut otel_refresh = self.otel_refresh_span(i, &st);
         let r = self
             .refresh(
                 &st.plan,
@@ -8403,6 +8524,13 @@ impl Engine {
                 st.since.as_ref(),
             )
             .await;
+        if let Some(s) = otel_refresh.as_mut() {
+            match &r {
+                Ok(x) if x.failed.is_empty() => s.ok(),
+                Ok(_) => s.fail("target"),
+                Err(_) => s.fail("refresh"),
+            }
+        }
         self.live_end(i, st, r).await;
     }
 
@@ -9145,6 +9273,10 @@ impl Engine {
     /// every view's chunk reads and writes together on the shared pools, then each result.
     async fn refresh_all_live(&mut self) {
         let mut started = Vec::new();
+        // The per-view spans, in `started`'s order: opened as each view's work is prepared and ended
+        // with its result below. Supervised refreshes run concurrently, so a view's span is a child
+        // of the flush span, not of another view's.
+        let mut spans: Vec<Option<otel::Span>> = Vec::new();
         for i in 0..self.slots.len() {
             let Some(mut st) = self.live_begin(i).await else {
                 continue;
@@ -9160,7 +9292,9 @@ impl Engine {
                     st.since.as_ref(),
                 )
                 .await;
+            let span = self.otel_refresh_span(i, &st);
             started.push((i, st, p));
+            spans.push(span);
         }
         if started.is_empty() {
             return;
@@ -9174,12 +9308,19 @@ impl Engine {
         }))
         .await;
         self.metrics.beat();
-        for ((i, mut st, p), out) in started.into_iter().zip(outs) {
+        for (n, ((i, mut st, p), out)) in started.into_iter().zip(outs).enumerate() {
             let r = match (p, out) {
                 (Ok(p), Some(out)) => finish_refresh(&mut st.dirty, p, out),
                 (Err(e), _) => Err(e),
                 (Ok(_), None) => unreachable!("every prepared refresh ran"),
             };
+            if let Some(Some(s)) = spans.get_mut(n) {
+                match &r {
+                    Ok(x) if x.failed.is_empty() => s.ok(),
+                    Ok(_) => s.fail("target"),
+                    Err(_) => s.fail("refresh"),
+                }
+            }
             self.live_end(i, st, r).await;
         }
     }
@@ -9392,11 +9533,34 @@ impl Engine {
         let ts = self.targets[t].schema.clone();
         let metrics = self.metrics.clone();
         let timeout = self.cfg.target_timeout;
-        self.target_conn(t)
-            .await
-            .with_context(|| format!("target {t}"))?;
+        // One span per batch of statements written to one target, a child of this batch's flush
+        // span. Not of a view's refresh span: under the supervisor the refreshes of several views
+        // (and several targets) run together, so a write belongs to the flush. Off: nothing built.
+        let mut otel_write = if otel::enabled() {
+            let parent = self.otel_batch;
+            let name = t.to_owned();
+            let rows = new.rows as u64;
+            Some(otel::span(otel::span::TARGET_WRITE_BATCH, |a| {
+                a.str(otel::attr::TARGET_NAME, name);
+                a.u64(otel::attr::ROWS, rows);
+                if let Some(p) = parent {
+                    a.parent_from(&p);
+                }
+            }))
+        } else {
+            None
+        };
+        if let Err(e) = self.target_conn(t).await.map(|_| ()) {
+            if let Some(s) = otel_write.as_mut() {
+                s.fail("connect");
+            }
+            return Err(e).with_context(|| format!("target {t}"));
+        }
         let target = self.targets.get_mut(t).unwrap();
         let (Some(c), Some(w)) = (target.conn.as_mut(), target.write) else {
+            if let Some(s) = otel_write.as_mut() {
+                s.fail("target");
+            }
             bail!("internal: target {t} has no connection");
         };
         let r = match tokio::time::timeout(
@@ -9406,13 +9570,29 @@ impl Engine {
         .await
         {
             Ok(r) => r,
-            Err(_) => Err(anyhow!("timed out after {timeout:?}")),
+            Err(_) => {
+                if let Some(s) = otel_write.as_mut() {
+                    s.fail("timeout");
+                }
+                Err(anyhow!("timed out after {timeout:?}"))
+            }
         };
-        r.map_err(|e| {
+        let r = r.map_err(|e| {
             // Drop the connection so the next attempt reconnects.
             self.targets.get_mut(t).unwrap().conn = None;
             e.context(format!("target {t}"))
-        })
+        });
+        if let Some(s) = otel_write.as_mut() {
+            match &r {
+                Ok(a) => {
+                    s.set_u64(otel::attr::ROWS, a.inserted);
+                    s.set_u64(otel::attr::KEYS, a.units_changed);
+                    s.ok();
+                }
+                Err(_) => s.fail("target"),
+            }
+        }
+        r
     }
 
     /// Resolves the buffered row images to units.
@@ -10168,6 +10348,21 @@ impl Engine {
                 backlog,
                 "the status row's whole cursor goes: position and set in one statement"
             );
+            // One span per save of the replay position: a child of the flush that asked for it (a root
+            // when the engine saved at startup). Off: nothing built. An interval whose rewrite the price
+            // refused builds no span either — there was no save to trace.
+            let mut otel_persist = if otel::enabled() {
+                let parent = self.otel_batch;
+                let epoch = self.leader.epoch;
+                Some(otel::span(otel::span::POSITION_PERSIST, |a| {
+                    a.u64(otel::attr::EPOCH, epoch);
+                    if let Some(p) = parent {
+                        a.parent_from(&p);
+                    }
+                }))
+            } else {
+                None
+            };
             let began = Instant::now();
             let saved = meta::save_position(
                 &mut self.meta,
@@ -10175,7 +10370,17 @@ impl Engine {
                 &wanted,
                 self.leader.epoch,
             )
-            .await?;
+            .await;
+            if let Some(s) = otel_persist.as_mut() {
+                match &saved {
+                    Ok(_) => {
+                        s.set_str(otel::attr::SOURCE_POSITION, pos.to_string());
+                        s.ok();
+                    }
+                    Err(_) => s.fail("meta"),
+                }
+            }
+            let saved = saved?;
             let took = began.elapsed();
             // Measured on the real link, which is the only clock the price can use: this statement's
             // own bytes are one of the two rates a cursor rewrite is priced with.

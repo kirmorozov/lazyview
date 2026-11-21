@@ -904,19 +904,34 @@ async fn connect_setup(opts: &Opts, setup: &[String], deadline: Option<Duration>
 /// position write of an instance that still believes it is the leader fails
 /// (`meta::save_position`), and read our epoch back.
 async fn bump_epoch(conn: &mut Conn, instance_id: &str) -> Result<u64> {
-    conn.exec_drop(
-        "INSERT INTO `_lazyview_status` (`instance_id`, `binlog_file`, `binlog_pos`, `epoch`) VALUES (?, '', 0, 1) \
-         ON DUPLICATE KEY UPDATE `epoch` = `epoch` + 1",
-        (instance_id,),
-    )
-    .await?;
-    let epoch: Option<u64> = conn
-        .exec_first(
-            "SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
+    // The epoch moving to this instance is the moment a takeover trace hangs on: one span over the
+    // bump and the read-back. Its only attribute is the epoch itself — a name, an id, a count
+    // (`crate::otel`'s rule that no span carries anything a customer wrote).
+    let mut s = crate::otel::span(crate::otel::span::EPOCH_TAKEOVER, |_| {});
+    let r = async {
+        conn.exec_drop(
+            "INSERT INTO `_lazyview_status` (`instance_id`, `binlog_file`, `binlog_pos`, `epoch`) VALUES (?, '', 0, 1) \
+             ON DUPLICATE KEY UPDATE `epoch` = `epoch` + 1",
             (instance_id,),
         )
         .await?;
-    Ok(epoch.unwrap_or(1))
+        let epoch: Option<u64> = conn
+            .exec_first(
+                "SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
+                (instance_id,),
+            )
+            .await?;
+        Ok(epoch.unwrap_or(1))
+    }
+    .await;
+    match &r {
+        Ok(epoch) => {
+            s.set_u64(crate::otel::attr::EPOCH, *epoch);
+            s.ok();
+        }
+        Err(_) => s.fail("meta"),
+    }
+    r
 }
 
 /// Takes the lock again on a new metadata connection after the previous one was lost (the

@@ -217,6 +217,7 @@ the source plus 1 + `LAZYVIEW_MAX_TARGET_CONCURRENCY` on each other target, besi
 | `RUST_LOG` | `info` | log filter, for example `debug` or `lazyview=debug,warn`. `info` logs lifecycle events and problems only |
 | `LAZYVIEW_LOG_FORMAT` | `text` | `json` writes one JSON object per line |
 | `NO_COLOR` | — | set to anything to disable colored output (colors are only used on a terminal anyway) |
+| `LAZYVIEW_OTEL` | `off` | `otlp` exports spans to an OpenTelemetry collector over OTLP/gRPC; anything else (a typo included) stays off. See [OpenTelemetry](#opentelemetry) |
 
 The endpoints are described in [operations](operations.md#health-endpoints).
 
@@ -228,6 +229,93 @@ The endpoints are described in [operations](operations.md#health-endpoints).
 Before 0.1.0 the default was `0.0.0.0:8080`. An endpoint that describes the workload should not be
 published by default, so it now binds loopback. Anything that scraped it from outside the container
 or the pod must set `LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080` (the manifests in `deploy/k8s` already do).
+
+## OpenTelemetry
+
+Tracing is opt-in and off by default: `LAZYVIEW_OTEL` is the only switch, and an ambient collector on
+the network changes nothing.
+
+| value | effect |
+|---|---|
+| unset, `off`, anything else | no tracer provider and no exporter are ever built. The instrumented paths are one atomic load each and allocate nothing — `tests/otel_off_free.rs` counts the allocations and fails if that stops being true |
+| `otlp` | spans are exported to a collector over OTLP/gRPC |
+
+A value that is neither (`LAZYVIEW_OTEL=1`, `otel`) is off, and a `WARN` says so: a misspelling must
+not quietly disable telemetry, and must not fail a start either.
+
+Everything else is the standard OpenTelemetry environment — the same names every language's SDK
+reads, so one collector setup serves them all. lazyview invents no names of its own here.
+
+| variable | default | meaning |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | the collector. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` overrides it for traces alone |
+| `OTEL_EXPORTER_OTLP_HEADERS` | — | `k1=v1,k2=v2` added to every export (an auth header for a managed collector). `OTEL_EXPORTER_OTLP_TRACES_HEADERS` for traces alone |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | **`grpc` only.** `http/protobuf` and `http/json` are refused with one `WARN` and tracing stays off: gRPC is the transport the embedder of the copy set already carries, and the HTTP one would add a second HTTP stack to a binary that has no other use for it |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | head sampling: `always_on`, `always_off`, `traceidratio`, `parentbased_traceidratio`, and the `parentbased_always_*` forms |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | the ratio for the two `*ratio` samplers, `0.0`–`1.0` |
+| `OTEL_SERVICE_NAME` | `lazyview` | `service.name` of the resource; wins over the default |
+| `OTEL_RESOURCE_ATTRIBUTES` | — | `k1=v1,k2=v2` added to the resource (`deployment.environment.name=prod`); keys lazyview sets itself keep the programmatic value, as the specification orders it |
+| `OTEL_SDK_DISABLED` | — | `true` disables telemetry even with the switch on |
+| `OTEL_TRACES_EXPORTER` | `otlp` | `none` disables spans alone (the per-signal switch, for a collector that carries the other signals); any other name but `otlp` is refused with a `WARN` |
+| `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | SDK defaults | the span limits, honoured as the specification names them |
+
+The resource carries `service.name` (`lazyview`), `service.version`, `service.instance.id`
+(`LAZYVIEW_INSTANCE_ID`) and `lazyview.source.server` (the source's server identity — a name, never a
+DSN), plus `telemetry.sdk.*`.
+
+### What is traced
+
+Spans, one per unit of work, with the attributes a backend groups on. `lazyview.binlog.*` are opened
+by the copy set ([`src/binlog/stream.rs`](https://github.com/kirmorozov/lazyview/blob/main/src/binlog/stream.rs));
+the rest by the engine and the coordinator.
+
+| span | one per | attributes |
+|---|---|---|
+| `lazyview.binlog.read_batch` | the events read between two flushes | `lazyview.source.position`, `lazyview.source.flavor`, `lazyview.events`, `lazyview.rows` |
+| `lazyview.binlog.transaction` | one source transaction read | `lazyview.source.position`, `lazyview.source.gtid`, `lazyview.events`, `lazyview.rows` |
+| `lazyview.view.flush` | one engine flush | `lazyview.epoch`, `lazyview.links`, `lazyview.outcome` |
+| `lazyview.view.refresh` | one view brought up to date | `lazyview.view.id`, `lazyview.view.name`, `lazyview.mode`, `lazyview.keys`, `lazyview.targets`, `lazyview.forced`, `lazyview.links`, `lazyview.outcome` |
+| `lazyview.target.write_batch` | one batch of statements to one target | `lazyview.target.name`, `lazyview.rows`, `lazyview.keys`, `lazyview.outcome` |
+| `lazyview.position.persist` | one save of the replay position | `lazyview.epoch`, `lazyview.source.position`, `lazyview.outcome` |
+| `lazyview.epoch.takeover` | one leadership takeover | `lazyview.epoch`, `lazyview.outcome` |
+
+`lazyview.outcome` is one of `success`, `error`, `timeout`, so a dashboard can count failures without
+matching on message text. Failures also set the span's status.
+
+**No span carries anything a customer wrote.** Attribute values are names, ids, counts, positions and
+outcomes: never a row value, never a key, never a statement, never a DSN or a credential. `Span::fail`
+takes a `&'static str` error class (`"timeout"`, `"target"`, `"meta"`) rather than an error's text for
+exactly that reason.
+
+A flush and a refresh **link** the source transactions whose rows they merged, they are not parented
+by them: `N` transactions merge into one delivery, and a parent–child relation would make a span of
+one row event the ancestor of everything that row ever touched. A batch links at most
+`otel::MAX_LINKS` (16) of them, which is why the parents live on the reader (one per transaction) and
+in a capped sidecar in the engine rather than in the dedup core's pending-key entry.
+
+Telemetry never breaks the pipeline: a bad `OTEL_*` value, an unsupported protocol or an unreachable
+collector leaves tracing off with one `WARN`, and an export that fails afterwards is counted
+(`/metrics`' `lazyview_otel_export_errors_total` will report it once metrics land) and `WARN`ed about
+at most once a minute. The last spans are flushed on the exit path, bounded by 3 s so a collector that
+has gone cannot hold a shutdown open.
+
+### Why an embedder sees the same traces
+
+`src/otel.rs`, `src/otel/**` and the binlog reader are copied verbatim by
+[lazy-wire-fire](https://github.com/kirmorozov/lazy-wire-fire) (its copy set). The `traceparent` of a
+source transaction is therefore stamped **inside the reader**, at read time, and handed out by
+`BinlogReader::tx_parent()`: a copied reader stamps it too, and the delivery it later merges those
+rows into can link back to the transaction — in the same process or another one. The module reads no
+`LAZYVIEW_*` variable and imports nothing outside the copy set: the host's own settings arrive as
+parameters of `otel::init`, which is how lazy-wire-fire feeds its own (`LAZYWF_OTEL`).
+
+### Prometheus, and the other two signals
+
+`/metrics` is untouched: it stays the pull-based Prometheus endpoint it always was (see
+[health and logging](#health-and-logging)), and it does not depend on this switch. OTLP *metrics* (over
+the same fields `/metrics` and `/stats` read) and the `tracing` → OTLP *logs* bridge arrive in their
+own changes on this module's once-cell and resource; `OTEL_METRICS_EXPORTER` and `OTEL_LOGS_EXPORTER`
+are read there. For Kubernetes, see [the collector side](kubernetes.md#opentelemetry).
 
 ## TLS
 
