@@ -702,8 +702,8 @@ mod tests {
     fn meta_def_row_carries_follow_up_statements() {
         // (a) the definition/statement table as the user writes it: the CREATE VIEW and its
         // follow-up statements (form S), pinned to H1 of expectations.md.
-        let view = "CREATE VIEW item_totals AS SELECT entity_id, SUM(amount) AS total, \
-                    COUNT(*) AS n FROM items GROUP BY entity_id";
+        let view = "CREATE VIEW item_totals AS SELECT owner_id, SUM(amount) AS total, \
+                    COUNT(*) AS n FROM items GROUP BY owner_id";
         let decl = "CREATE INDEX i_total ON item_totals (total)";
         let (a, row) = {
             let definition = format!("{view}; {decl};");
