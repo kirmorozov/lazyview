@@ -236,7 +236,7 @@ fn cte_bad_definitions_fail_once() {
 
 // --- G1: a semi-join or scalar subquery joins its table only over key-exact equalities.
 
-/// (the name the engine records, a definition inserted without a name).
+/// (the name the engine derives from the definition, a definition inserted without a name).
 const COMMENTED_DEFINITIONS: &[(&str, &str)] = &[
     (
         "g2_cmt",
@@ -297,14 +297,22 @@ async fn run_commented_definitions(ctx: &Ctx) -> Result<()> {
     let bare = scalar_i64(&mut c, "SELECT LAST_INSERT_ID()").await? as u64;
     for ((name, _), id) in COMMENTED_DEFINITIONS.iter().zip(&ids) {
         wait_def_state(&mut c, &mut eng, *id, "ready", t_ready()).await?;
+        // The name the comment or the byte-order mark could not hide is the one the engine serves
+        // the definition under ...
+        anyhow::ensure!(
+            def_ready_as(&mut c, *id, name).await?,
+            "{name}: the engine does not serve it under the name its own definition gives"
+        );
+        // ... and it is derived on every read: the service never writes it into the table the
+        // management user owns, so the row keeps `name` NULL.
         let recorded = scalar(
             &mut c,
             &format!("SELECT name FROM _lazyview WHERE id = {id}"),
         )
         .await?;
         anyhow::ensure!(
-            recorded.as_deref() == Some(*name),
-            "{name}: _lazyview.name is {recorded:?}"
+            recorded.is_none(),
+            "{name}: the service wrote a name into the definitions table: {recorded:?}"
         );
     }
     let st = wait_def_state(&mut c, &mut eng, bare, "error", t_ready()).await?;
@@ -313,7 +321,7 @@ async fn run_commented_definitions(ctx: &Ctx) -> Result<()> {
         msg.contains("the definition needs a name: set `_lazyview.name`, or write CREATE VIEW name AS SELECT"),
         "bare SELECT without a name: {msg}"
     );
-    // A restart plans the definitions again, now with their recorded names.
+    // A restart plans the definitions again, deriving their names from the definitions anew.
     eng.stop().await?;
     let mut eng = ctx.start_engine(
         &db,
