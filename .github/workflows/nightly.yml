@@ -37,3 +37,13 @@ jobs:
     permissions:
       contents: read
       issues: write
+      # The nightly is ci.yml called as a reusable workflow, so this caller sets the GITHUB_TOKEN
+      # permission ceiling for the whole called graph, and GitHub checks every job in that graph
+      # against it at startup (a `if`-skipped job counts). ci.yml's `image` and `release` jobs ask
+      # for these three scopes to publish and attest; the schedule skips them (the nightly runs
+      # only the soak jobs), but without the ceiling granted here the whole run is rejected before
+      # any job starts as `startup_failure` with "The nested job 'image' is requesting
+      # '… packages: write …', but is only allowed '… packages: none …'". No soak job uses them.
+      packages: write
+      attestations: write
+      id-token: write
