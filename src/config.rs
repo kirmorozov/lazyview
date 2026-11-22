@@ -204,6 +204,17 @@ pub struct Config {
     /// (`Engine::src`: lookups, refresh SELECTs, catalog), of the supervised source reads and
     /// of the per-build source reads. Unset ⇒ `Config::dsn`.
     pub test_query_dsn: Option<String>,
+    /// The optional **read endpoint** (read-endpoint plan PR G, owner 2026-11-17): the query
+    /// role — every SELECT lazyview issues against the source (lookups, refresh reads, the
+    /// build's one big SELECT) — connects here, fenced by the stream position it needs (see
+    /// `Engine::read_barrier`). Binlog, metadata and every write stay on `dsn`. Unset ⇒ the
+    /// query role is `LAZYVIEW_DSN` (today, byte for byte). The role's TLS mode is
+    /// `LAZYVIEW_READ_TLS` (the `role_dsn` convention).
+    pub read_dsn: Option<String>,
+    /// How long one read batch may wait for the read endpoint to reach the stream position it
+    /// needs (ms). Only consulted when `read_dsn` is set; a failed wait fails the read, it is
+    /// never a silent stale read. Default 5000, the parity of the writer fence's fixed 5 s.
+    pub read_max_lag_ms: u64,
     /// Test hook `LAZYVIEW_TEST_META_DSN=<dsn>`: the DSN of the metadata connection (the
     /// catalog writes, the fencing epoch). Unset ⇒ `Config::dsn`.
     pub test_meta_dsn: Option<String>,
@@ -435,6 +446,14 @@ impl Config {
         let test_binlog_dsn = role_dsn("LAZYVIEW_TEST_BINLOG")?;
         let test_query_dsn = role_dsn("LAZYVIEW_TEST_QUERY")?;
         let test_meta_dsn = role_dsn("LAZYVIEW_TEST_META")?;
+        // The optional read endpoint (PR G): `LAZYVIEW_READ_DSN` moves the query role to a
+        // reader; unlike the test hooks it defaults to `None` (unset ⇒ no second endpoint is
+        // ever opened, and the reader is refused at connect unless it can be fenced exactly).
+        let read_dsn = role_dsn_opt("LAZYVIEW_READ")?;
+        let read_max_lag_ms = num("LAZYVIEW_READ_MAX_LAG_MS", 5000)?;
+        if read_dsn.is_some() && read_max_lag_ms == 0 {
+            bail!("LAZYVIEW_READ_MAX_LAG_MS must be greater than 0 when LAZYVIEW_READ_DSN is set: a read must be able to wait for the reader (0 would answer from a lagging replica without waiting)");
+        }
         // The lock's own endpoint stays where the epoch row it fences is, so an unset hook means
         // "the metadata connection's server", and the engine falls back that way
         // (`test_lock_dsn` ⇒ `test_meta_dsn` ⇒ `dsn`); `None` here says nothing was set.
@@ -506,6 +525,8 @@ impl Config {
             test_undecodable_rows: num("LAZYVIEW_TEST_UNDECODABLE_ROWS", 0)? as u32,
             test_binlog_dsn,
             test_query_dsn,
+            read_dsn,
+            read_max_lag_ms,
             test_meta_dsn,
             test_lock_dsn,
             lock_wait_s: num("LAZYVIEW_TEST_LOCK_WAIT_S", DEFAULT_LOCK_WAIT_S)?.max(1),
@@ -1214,6 +1235,49 @@ mod tests {
                 "{dsn}"
             );
         }
+    }
+
+    #[test]
+    fn read_endpoint_settings_truth_table() {
+        // Unset ⇒ no second endpoint is ever opened, and the lag bound carries its default
+        // (5000: the parity of the writer fence's fixed 5 s) but is never consulted.
+        let c = cfg(&[("LAZYVIEW_DSN", "mysql://lv:p@h:3306/db")]).unwrap();
+        assert_eq!(c.read_dsn, None);
+        assert_eq!(c.read_max_lag_ms, 5000);
+        // Set ⇒ the query role's endpoint, read exactly the way LAZYVIEW_DSN is read:
+        // `mariadb://` is the alias there and `LAZYVIEW_READ_TLS` that hook's TLS mode
+        // (`connection` rewrites the alias to `mysql://` and splices the TLS parameters in).
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "mysql://lv:p@h:3306/db"),
+            ("LAZYVIEW_READ_DSN", "mariadb://lv:p@r:3306/db"),
+            ("LAZYVIEW_READ_TLS", "required"),
+            ("LAZYVIEW_READ_MAX_LAG_MS", "250"),
+        ])
+        .unwrap();
+        let d = c.read_dsn.as_deref().unwrap();
+        assert!(d.contains("lv:p@r:3306/db"), "{d}");
+        assert!(d.contains("require_ssl=true"), "{d}");
+        assert_eq!(c.read_max_lag_ms, 250);
+        // A zero bound with a read endpoint is refused: the read would answer from a lagging
+        // replica without ever waiting (never a silent stale read).
+        let e = cfg(&[
+            ("LAZYVIEW_DSN", "mysql://lv:p@h:3306/db"),
+            ("LAZYVIEW_READ_DSN", "mysql://lv:p@r:3306/db"),
+            ("LAZYVIEW_READ_MAX_LAG_MS", "0"),
+        ])
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("LAZYVIEW_READ_MAX_LAG_MS must be greater than 0"),
+            "{e}"
+        );
+        // A zero bound without a read endpoint is inert (never consulted).
+        let c = cfg(&[
+            ("LAZYVIEW_DSN", "mysql://lv:p@h:3306/db"),
+            ("LAZYVIEW_READ_MAX_LAG_MS", "0"),
+        ])
+        .unwrap();
+        assert_eq!(c.read_max_lag_ms, 0);
     }
 
     #[test]

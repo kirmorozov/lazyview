@@ -50,12 +50,142 @@ pub(crate) fn snapshot_position_is_watermark() -> bool {
 /// 5 s by the server itself. `Ok(Some(Some(0)))`: visible; `Ok(Some(Some(_)))`: timed out; the
 /// caller owns the meaning (see [`crate::source::fence`]).
 pub(crate) async fn gtid_wait(conn: &mut Conn, gtid: &str) -> Result<Option<Option<i64>>> {
+    gtid_wait_timeout(conn, gtid, 5).await
+}
+
+/// The same wait with the caller's cap (read-endpoint plan PR G): `ceil_s` is the operator's
+/// `LAZYVIEW_READ_MAX_LAG_MS` in whole seconds, asked of the server itself — the wait is one
+/// statement per read batch, never a client loop. `gtid_wait` above stays the 5 s wrapper (the
+/// writer fence's own bound, and lazy-wire-fire's mirror).
+pub(crate) async fn gtid_wait_timeout(
+    conn: &mut Conn,
+    gtid: &str,
+    ceil_s: u64,
+) -> Result<Option<Option<i64>>> {
     Ok(conn
         .exec_first(
-            "SELECT WAIT_FOR_EXECUTED_GTID_SET(?, 5)",
-            (gtid.to_string(),),
+            "SELECT WAIT_FOR_EXECUTED_GTID_SET(?, ?)",
+            (gtid.to_string(), ceil_s as i64),
         )
         .await?)
+}
+
+/// A `SELECT @@...` whose variable the server may not know (Galera and Group Replication ship
+/// theirs only with the feature): `None` on `ER_UNKNOWN_SYSTEM_VARIABLE`, every other failure
+/// still an error (fail-closed: a missing answer is never read as a passing check).
+pub(crate) async fn var_opt(conn: &mut Conn, sql: &str) -> Result<Option<String>> {
+    match conn.query_first::<Option<String>, _>(sql).await {
+        Ok(v) => Ok(v.flatten()),
+        Err(mysql_async::Error::Server(e)) if e.code == ER_UNKNOWN_SYSTEM_VARIABLE => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(sql.to_string())),
+    }
+}
+
+const ER_UNKNOWN_SYSTEM_VARIABLE: u16 = 1193;
+
+/// The read-endpoint pre-flight of the MySQL family (PR G §6), on the read connection, asked
+/// only when `LAZYVIEW_READ_DSN` is set. It refuses, never warns: an unfenceable reader would
+/// serve stale rows with no signal. `ceil_s` is unused here (the MySQL wait is always timed);
+/// the Galera flavors take it for their session guard.
+pub(crate) async fn read_preflight(conn: &mut Conn, _ceil_s: u64) -> Result<()> {
+    // GTIDs on: the fence is the timed GTID wait; without GTIDs a replica cannot be fenced
+    // exactly, and the timing fallbacks are writer-node mechanisms (never tried for a reader).
+    let mode = var_opt(conn, "SELECT CAST(@@GLOBAL.gtid_mode AS CHAR)").await?;
+    if mode.as_deref() != Some("ON") {
+        bail!(
+            "the read endpoint is refused: gtid_mode is {} (must be ON) — a replica without \
+             GTIDs cannot be fenced exactly; unset LAZYVIEW_READ_DSN or enable GTIDs on the reader",
+            mode.as_deref().unwrap_or("<absent>")
+        );
+    }
+    // The wait itself, with timeout 0 (PR G §6.3): self-checking — function existence, grants
+    // and GTID mode all answer through it, in the server's own words.
+    let r: Option<Option<i64>> = conn
+        .exec_first(
+            "SELECT WAIT_FOR_EXECUTED_GTID_SET(@@GLOBAL.gtid_executed, 0)",
+            (),
+        )
+        .await
+        .context("the read endpoint cannot run WAIT_FOR_EXECUTED_GTID_SET")?;
+    match r {
+        Some(Some(_)) => {}
+        Some(None) | None => bail!(
+            "the read endpoint is refused: WAIT_FOR_EXECUTED_GTID_SET answered NULL (GTID state \
+             unreadable) — unset LAZYVIEW_READ_DSN"
+        ),
+    }
+    // Galera family (PXC runs it too, §3.4): the session-causal guard must exist, and the set
+    // must be cluster-continuous, or the timed wait means nothing across writers.
+    if var_opt(conn, "SELECT CAST(@@GLOBAL.wsrep_on AS CHAR)")
+        .await?
+        .as_deref()
+        == Some("1")
+    {
+        if var_opt(conn, "SELECT CAST(@@GLOBAL.wsrep_sync_wait AS CHAR)")
+            .await?
+            .is_none()
+        {
+            bail!(
+                "the read endpoint is refused: a Galera node without wsrep_sync_wait cannot \
+                   give session-causal reads"
+            );
+        }
+        if var_opt(conn, "SELECT CAST(@@GLOBAL.wsrep_gtid_mode AS CHAR)")
+            .await?
+            .as_deref()
+            != Some("ON")
+        {
+            bail!(
+                "the read endpoint is refused: wsrep_gtid_mode is not ON, so the executed \
+                   GTID set is not cluster-continuous and the timed wait cannot cover the other \
+                   writers (PR G §3.4)"
+            );
+        }
+    }
+    // Group Replication: the member must be ONLINE, or reads stall the moment the guard is set.
+    if var_opt(
+        conn,
+        "SELECT CAST(@@GLOBAL.group_replication_consistency AS CHAR)",
+    )
+    .await?
+    .is_some()
+    {
+        let online: Option<String> = conn
+            .exec_first(
+                "SELECT CAST(member_state AS CHAR) FROM performance_schema.replication_group_members \
+                 WHERE member_id = @@GLOBAL.server_uuid",
+                (),
+            )
+            .await
+            .context("the read endpoint is in a group but its membership is unreadable")?
+            .flatten();
+        if online.as_deref() != Some("ONLINE") {
+            bail!(
+                "the read endpoint is refused: this Group Replication member is {} \
+                 (must be ONLINE)",
+                online.as_deref().unwrap_or("<absent>")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Prepares the read connection (PR G §3, Group Replication row): the session guard makes
+/// every read after the batch's GTID wait see at least what the barrier approved, server-side
+/// (the secondary's applier drain). Asked once at connect — no statement per batch, none per
+/// event. Non-group servers do not know the variable: nothing to set.
+pub(crate) async fn init_read_session(conn: &mut Conn, _ceil_s: u64) -> Result<()> {
+    if var_opt(
+        conn,
+        "SELECT CAST(@@GLOBAL.group_replication_consistency AS CHAR)",
+    )
+    .await?
+    .is_some()
+    {
+        conn.query_drop("SET SESSION group_replication_consistency = 'BEFORE'")
+            .await?;
+    }
+    Ok(())
 }
 
 /// What the commit-order fence step concluded (see [`commit_order`]).

@@ -792,11 +792,129 @@ fn stream_pause(end: Option<StreamEnd>, delivered: bool, streak: u32) -> Duratio
     }
 }
 
+/// The read endpoint in effect (read-endpoint plan PR G, owner 2026-11-17): the query role on
+/// another server, fenced by the stream position it needs. `None` = today: the query role is
+/// `LAZYVIEW_DSN`, the writer's own timing fallbacks stand, and no barrier is ever asked
+/// (`read_barrier` answers without touching the server).
+struct ReadRole {
+    /// `host:port` of the endpoint, as every read error and the startup refusal name it.
+    endpoint: String,
+    /// The operator's bound for one batch wait, ms (`LAZYVIEW_READ_MAX_LAG_MS`).
+    bound_ms: u64,
+    /// The writer-side connection: the probe view (DDL) and the writer checks that a read-only
+    /// replica refuses stay here (PR G §2: the read connection carries read-only statements
+    /// only; a replica without GTIDs never got this far — §6 refused it at connect).
+    ctrl: Conn,
+    /// The writer's endpoint: a build task connects its own writer session from it.
+    ctrl_opts: Opts,
+}
+
+impl ReadRole {
+    /// The bound in whole seconds, rounded up, floor 1: the wait's own timeout argument.
+    fn ceil_s(&self) -> u64 {
+        self.bound_ms.div_ceil(1000).max(1)
+    }
+}
+
+/// What a build must do on the read endpoint (PR G §3.3; Q-O2: the build's one big SELECT
+/// rides the reader too): open its read connection with the flavor's guard, wait once for the
+/// position the engine had consumed at spawn, then run the seed and the fill on it. The probe
+/// DDL runs on the writer (`ctrl_opts`): a read-only replica refuses it (R-03), and PR G adds
+/// no writes to the source.
+struct ReadBarrier {
+    target: Option<String>,
+    ceil_s: u64,
+    bound_ms: u64,
+    endpoint: String,
+    ctrl_opts: Opts,
+    flavor: Flavor,
+}
+
+/// The wait target of one read batch (PR G §3): the executed GTID set, falling back to the
+/// last transaction read (the single-stream floor). `None` — no wait at all — when there is no
+/// read endpoint (today: the flush's own `fence()` is the only wait and it never runs here) or
+/// nothing has been consumed yet (a build started before the stream carries no position it
+/// could be late for). Pure, so "unset ⇒ no barrier call" is unit-testable.
+fn read_wait_target(
+    read_role: bool,
+    executed: Option<&str>,
+    last_gtid: Option<&str>,
+) -> Option<String> {
+    if !read_role {
+        return None;
+    }
+    executed
+        .filter(|t| !t.is_empty())
+        .or_else(|| last_gtid.filter(|t| !t.is_empty()))
+        .map(str::to_string)
+}
+
+/// The bounded set text of an error (PR G §5: "the needed position (set text, bounded)").
+fn bounded_set_text(t: &str) -> &str {
+    if t.len() <= 256 {
+        return t;
+    }
+    let mut end = 256;
+    while !t.is_char_boundary(end) {
+        end -= 1;
+    }
+    &t[..end]
+}
+
+/// The read error of PR G §5: the endpoint, the position (bounded), the bound, the operator's
+/// path; the view keeps its current state and the supervisor retries. Pure, so the table of
+/// these texts is unit-tested.
+fn lag_error(endpoint: &str, target: &str, bound_ms: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the read endpoint {endpoint} did not reach the stream position within the {bound_ms} \
+         ms bound (LAZYVIEW_READ_MAX_LAG_MS); needed: {}{} — the view keeps serving its current \
+         state; check the applier (`SHOW REPLICA STATUS` on {endpoint}) or unset \
+         LAZYVIEW_READ_DSN",
+        bounded_set_text(target),
+        if target.len() > 256 {
+            " […truncated]"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The one statement of a read batch: the flavor's timed GTID wait (server-side wait, never a
+/// client loop) capped at the operator's bound. Any answer but "executed" is the §5 error,
+/// with the server's own words when it spoke. One round trip per batch on a connection that
+/// issues the batch's SELECTs anyway; nothing per binlog event.
+async fn wait_for_read_position(
+    conn: &mut Conn,
+    flavor: Flavor,
+    target: &str,
+    ceil_s: u64,
+    endpoint: &str,
+    bound_ms: u64,
+) -> Result<()> {
+    let r = match flavor {
+        Flavor::MySql => mysql::gtid_wait_timeout(conn, target, ceil_s).await,
+        Flavor::Percona => source::percona::gtid_wait(conn, target, ceil_s).await,
+        Flavor::MariaDb => source::maria::gtid_wait(conn, target, ceil_s).await,
+    };
+    match r {
+        Ok(Some(Some(0))) => Ok(()),
+        Ok(Some(Some(n))) => Err(lag_error(endpoint, target, bound_ms).context(format!(
+            "the wait timed out at {ceil_s} s (the server answered {n})"
+        ))),
+        Ok(_) => Err(lag_error(endpoint, target, bound_ms)
+            .context("the wait answered NULL (GTID state unreadable on the read endpoint)")),
+        Err(e) => Err(lag_error(endpoint, target, bound_ms).context(format!("{e:#}"))),
+    }
+}
+
 struct Engine {
     cfg: Config,
     metrics: Arc<Metrics>,
     /// The source-read role: `Engine::src`, the supervised source reads, the per-build reads.
+    /// With `LAZYVIEW_READ_DSN` set this is the **read endpoint** (PR G); otherwise the writer.
     query_opts: Opts,
+    /// The read endpoint in effect; `None` = today (see [`ReadRole`]).
+    read_role: Option<ReadRole>,
     /// The metadata role: the catalog writes, the fencing epoch, the leadership lock.
     meta_opts: Opts,
     /// The binlog dump role: the one connection that reads the stream.
@@ -1339,6 +1457,15 @@ async fn connect_target(
 /// role's own DSN when the network test sets one, `LAZYVIEW_DSN` otherwise. The hooks default
 /// to `Config::dsn` in `config::Config::from_lookup`, so an unset hook leaves every role on the
 /// service's single source endpoint; the `unwrap_or` only covers a hand-built `Config`.
+/// Two endpoints are the same server and schema when host, port and database match: the shape
+/// of the `LAZYVIEW_READ_DSN` refusal at connect (PR G §2 — misconfigured clusters are refused,
+/// not warned; the server-identity check at start closes the same-name-different-host gap).
+fn same_endpoint(a: &Opts, b: &Opts) -> bool {
+    a.ip_or_hostname() == b.ip_or_hostname()
+        && a.tcp_port() == b.tcp_port()
+        && a.db_name() == b.db_name()
+}
+
 fn role_opts(role: Option<&str>, dsn: &str) -> Result<Opts> {
     binlog::replica_opts(role.unwrap_or(dsn))
 }
@@ -1740,18 +1867,44 @@ impl Engine {
         // The three source roles each connect on their own DSN (the chaos plan's F4). Unset,
         // every one of them is LAZYVIEW_DSN, so a run without the hooks opens exactly what it
         // opened before: one endpoint, three connections to it.
-        let query_opts = role_opts(cfg.test_query_dsn.as_deref(), &cfg.dsn)?;
+        // The chaos hook still wins when set (existing chaos routing untouched); `LAZYVIEW_READ_DSN`
+        // is the cluster-reader posture of PR G: the query role alone moves, the binlog, the
+        // metadata and every write stay on LAZYVIEW_DSN. Unset ⇒ identical to today.
+        let query_opts = role_opts(
+            cfg.test_query_dsn.as_deref().or(cfg.read_dsn.as_deref()),
+            &cfg.dsn,
+        )?;
         let meta_opts = role_opts(cfg.test_meta_dsn.as_deref(), &cfg.dsn)?;
         let binlog_opts = role_opts(cfg.test_binlog_dsn.as_deref(), &cfg.dsn)?;
+        // Refused at connect, not warned (PR G §2): a read endpoint that is also the writer or
+        // the metadata server makes the split pointless and the fence self-referential.
+        let read_label = if cfg.read_dsn.is_some() {
+            let label = format!("{}:{}", query_opts.ip_or_hostname(), query_opts.tcp_port());
+            let writer = role_opts(None, &cfg.dsn)?;
+            for (name, o) in [
+                ("the source (LAZYVIEW_DSN)", &writer),
+                ("the metadata role", &meta_opts),
+            ] {
+                if same_endpoint(&query_opts, o) {
+                    bail!(
+                        "LAZYVIEW_READ_DSN ({label}) points at {name}: a read endpoint that also \
+                         receives lazyview's writes makes the split pointless and the fence \
+                         self-referential"
+                    );
+                }
+            }
+            label
+        } else {
+            String::new()
+        };
+        let src_label = if cfg.read_dsn.is_some() {
+            format!("read endpoint {read_label} (LAZYVIEW_READ_DSN)")
+        } else {
+            "source database".to_string()
+        };
         let schema = target::mysql::schema_of(&src_opts, "LAZYVIEW_DSN")?;
-        let Some(mut src) = connect_wait(
-            &query_opts,
-            "source database",
-            &metrics,
-            shutdown,
-            cfg.lock_wait_s,
-        )
-        .await?
+        let Some(mut src) =
+            connect_wait(&query_opts, &src_label, &metrics, shutdown, cfg.lock_wait_s).await?
         else {
             return Ok(None);
         };
@@ -1762,8 +1915,6 @@ impl Engine {
             query_opts.ip_or_hostname(),
             query_opts.tcp_port()
         );
-        managed_service_checks(&mut src).await;
-        binlog_filter_checks(&mut src, &schema, query_opts.db_name()).await;
         let Some(mut meta_conn) = connect_wait(
             &meta_opts,
             "source database",
@@ -1775,6 +1926,68 @@ impl Engine {
         else {
             return Ok(None);
         };
+        // The read endpoint in effect (PR G): the server's own answers decide (§6), on the read
+        // connection itself — grants, the wait function and the GTID state all answer through
+        // it, in the server's own words; identity decides too (a reader that is the writer or
+        // the metadata server in disguise is refused); and the writer-side checks that a
+        // read-only replica cannot answer (its binlog filters, its service checks: properties
+        // of the server the stream comes from) move to a writer connection. Without the
+        // setting, nothing here runs and today's checks stay where they were.
+        let mut read_role = None;
+        if cfg.read_dsn.is_some() {
+            let ctrl_opts = role_opts(None, &cfg.dsn)?;
+            let mut ctrl = connect_source(&ctrl_opts, cfg.lock_wait_s, &metrics)
+                .await
+                .with_context(|| {
+                    "connecting to the source (LAZYVIEW_DSN) for the read split: the probe \
+                         DDL and the writes stay on the writer"
+                        .to_string()
+                })?;
+            let winfo = binlog::server_info(&mut ctrl).await?;
+            if winfo.flavor != info.flavor {
+                bail!(
+                    "the read endpoint runs {}, the source runs {}: the stream is read on the \
+                     source and the SELECTs on the reader must agree on the flavor",
+                    info.version,
+                    winfo.version
+                );
+            }
+            managed_service_checks(&mut ctrl).await;
+            binlog_filter_checks(&mut ctrl, &schema, ctrl_opts.db_name()).await;
+            let reader_id = server_identity(&mut src, info.flavor, None, 1).await?;
+            let meta_id = server_identity(&mut meta_conn, info.flavor, None, 1).await?;
+            if reader_id == meta_id {
+                bail!(
+                    "LAZYVIEW_READ_DSN points at the metadata server (same server identity): \
+                     the read endpoint must be a different server (PR G §2)"
+                );
+            }
+            let writer_id = server_identity(&mut ctrl, info.flavor, None, 1).await?;
+            if reader_id == writer_id {
+                bail!(
+                    "LAZYVIEW_READ_DSN points at the source server under another name (same \
+                     server identity): the split must be a real second server (PR G §2)"
+                );
+            }
+            let ceil_s = cfg.read_max_lag_ms.div_ceil(1000).max(1);
+            source::read_preflight(&mut src, info.flavor, ceil_s).await?;
+            source::init_read_session(&mut src, info.flavor, ceil_s).await?;
+            let endpoint = read_label;
+            info!(
+                "reads run on {endpoint} ({} ms bound); the stream, the metadata and every \
+                 write stay on the source",
+                cfg.read_max_lag_ms
+            );
+            read_role = Some(ReadRole {
+                endpoint,
+                bound_ms: cfg.read_max_lag_ms,
+                ctrl,
+                ctrl_opts,
+            });
+        } else {
+            managed_service_checks(&mut src).await;
+            binlog_filter_checks(&mut src, &schema, query_opts.db_name()).await;
+        }
         // Two runs (owner 2026-11-16): the operations run (the default) never issues DDL on
         // lazyview's own tables — it checks them through information_schema with SELECT rights
         // and refuses to start with a `SetupRequired` error (exit code 2) naming `lazyview
@@ -1941,6 +2154,7 @@ impl Engine {
             cfg,
             metrics,
             query_opts,
+            read_role,
             meta_opts,
             binlog_opts,
             schema,
@@ -2745,6 +2959,32 @@ impl Engine {
                 // and re-probes the consistent snapshot: a verdict made on the dead connection
                 // must not survive the reconnect.
                 self.snapshot_fence = None;
+                // The read endpoint (PR G): the session guard rides the connection, so it is
+                // re-set on the new one; if it cannot come back the batch's GTID wait remains
+                // the freshness bound (never a silent stale read), so this heal warns rather
+                // than fails. The writer-side connection of the split heals too: the probe
+                // DDL needs it, and a failover may have moved the endpoint under us.
+                if let Some(rr) = self.read_role.as_mut() {
+                    let ceil_s = rr.ceil_s();
+                    if let Err(e) =
+                        source::init_read_session(&mut self.src, self.flavor, ceil_s).await
+                    {
+                        warn!("the read endpoint's session guard could not be restored: {e:#}");
+                    }
+                    // A probe of the writer connection (rare path: heals only): a dead one is
+                    // replaced, the probe DDL needs it alive.
+                    if rr.ctrl.query_drop("SELECT 1").await.is_err() {
+                        match connect_source(&rr.ctrl_opts, self.cfg.lock_wait_s, &self.metrics)
+                            .await
+                        {
+                            Ok(c) => rr.ctrl = c,
+                            Err(e) => warn!(
+                                "the writer connection of the read split is still unreachable: {}",
+                                e.root_cause()
+                            ),
+                        }
+                    }
+                }
                 info!("reconnected to source database");
             }
             Err(e) => warn!("source database still unreachable: {}", e.root_cause()),
@@ -3296,7 +3536,12 @@ impl Engine {
         if candidates.is_empty() {
             return Ok(targets);
         }
-        let mut layout = mv::probe(&mut self.src, &self.schema, plan).await?;
+        // The probe is DDL (a `CREATE OR REPLACE VIEW` read back): it stays on the writer
+        // connection, where a read-only replica cannot refuse it (PR G §2, R-03).
+        let mut layout = match &mut self.read_role {
+            Some(rr) => mv::probe(&mut rr.ctrl, &self.schema, plan).await?,
+            None => mv::probe(&mut self.src, &self.schema, plan).await?,
+        };
         // The index budget of this view's tables: the tightest of the targets it has (T3.1).
         layout.key_budget = target::min_key_budget(
             targets
@@ -3333,10 +3578,19 @@ impl Engine {
         // statement of a resume; where the server reports no snapshot position the window keeps
         // the wider shape of the position read after the seed. (The Cascade arm of feed_rows
         // clears gap_until once the log passes it.)
+        // One wait before the seed (PR G §3.4): the cache is built from reads on the read
+        // connection. The gap window then ends at a position of the **source's** binlog: the
+        // reader's own snapshot coordinates name its relaying log, never the writer's stream,
+        // so under the read split the window keeps the wider shape of the position read after
+        // the seed — on the writer connection.
+        self.read_barrier().await?;
         let (mut cache, seed_pos) = seed_cache_at_snapshot(&mut self.src, plan).await?;
-        cache.gap_until = Some(match seed_pos {
+        cache.gap_until = Some(match seed_pos.filter(|_| self.read_role.is_none()) {
             Some(p) => p,
-            None => binlog::current_position(&mut self.src).await?,
+            None => match &mut self.read_role {
+                Some(rr) => binlog::current_position(&mut rr.ctrl).await?,
+                None => binlog::current_position(&mut self.src).await?,
+            },
         });
         let rest: Vec<String> = targets
             .iter()
@@ -3472,6 +3726,22 @@ impl Engine {
             .as_ref()
             .filter(|(marker, _)| self.slots[idx].definition.contains(marker.as_str()))
             .map(|(_, d)| *d);
+        // The read endpoint's build (PR G §3.3; Q-O2): one wait for the position the engine
+        // had consumed at spawn, before the seed and the one big SELECT, on the read
+        // connection; the probe DDL runs on a writer session of its own. `None` ⇒ today:
+        // one connection, no wait.
+        let rb_target = self
+            .executed_gtid_text()
+            .or_else(|| self.last_gtid.clone())
+            .filter(|t| !t.is_empty());
+        let rb = self.read_role.as_ref().map(|rr| ReadBarrier {
+            target: rb_target,
+            ceil_s: rr.ceil_s(),
+            bound_ms: rr.bound_ms,
+            endpoint: rr.endpoint.clone(),
+            ctrl_opts: rr.ctrl_opts.clone(),
+            flavor: self.flavor,
+        });
         let task = tokio::spawn(build_task(
             self.query_opts.clone(),
             self.schema.clone(),
@@ -3487,6 +3757,7 @@ impl Engine {
             (def_id, generation),
             swap,
             test_delay,
+            rb,
         ));
         if routine {
             debug!(view = %name, "rebuilding");
@@ -6328,6 +6599,44 @@ impl Engine {
         self.stats_tx.send(views);
     }
 
+    /// The read endpoint's batch wait on this connection (PR G §3): `Ok(())` lets the batch's
+    /// reads run; `Err` is the §5 error (endpoint, bounded position, bound, operator's path) —
+    /// the caller fails the attempt, never reads stale, never rebuilds. No-op with no read
+    /// endpoint: zero statements, zero allocations (the set text is the flush's cached render,
+    /// borrowed into one prepared statement by the wait itself).
+    async fn read_barrier(&mut self) -> Result<()> {
+        let Some(t) = read_wait_target(
+            self.read_role.is_some(),
+            self.executed_gtid_text().as_deref(),
+            self.last_gtid.as_deref(),
+        ) else {
+            return Ok(());
+        };
+        self.read_wait_on(&t).await
+    }
+
+    /// One timed wait on the read connection for the given position. The transient heal rides
+    /// the engine's policy (`heal_src`), as the writer fence's does.
+    async fn read_wait_on(&mut self, target: &str) -> Result<()> {
+        let (endpoint, ceil_s, bound_ms) = {
+            let rr = self
+                .read_role
+                .as_ref()
+                .expect("read barrier asked without a read endpoint");
+            (rr.endpoint.clone(), rr.ceil_s(), rr.bound_ms)
+        };
+        self.metrics.beat();
+        wait_for_read_position(
+            &mut self.src,
+            self.flavor,
+            target,
+            ceil_s,
+            &endpoint,
+            bound_ms,
+        )
+        .await
+    }
+
     /// Waits until the transactions read from the binlog are visible to readers: binlog events
     /// are shipped before the engine commit completes.
     fn exact_fence(&self) -> bool {
@@ -6346,6 +6655,31 @@ impl Engine {
     /// flavor's answer too: `snapshot_watermark` says whether waiting on the consistent-snapshot
     /// position proves anything (`Flavor::snapshot_position_is_watermark`).
     async fn fence(&mut self) -> bool {
+        // Read endpoint (PR G §3.1): the one wait of the flush is the executed **set** at the
+        // operator's bound, on the read connection (visibility is a server property: one wait
+        // covers every read of the flush, the supervised pool included — it shares the
+        // endpoint). The timing fallbacks below (`LAZYVIEW_VISIBILITY_DELAY_MS`, the commit-
+        // order row, the snapshot wait) are writer-node mechanisms and are NEVER taken for a
+        // reader: a failed wait fails the reads of this flush (everything stays buffered for
+        // the next one), it never answers from rows the reader has not applied.
+        if self.read_role.is_some() {
+            let t = read_wait_target(
+                true,
+                self.executed_gtid_text().as_deref(),
+                self.last_gtid.as_deref(),
+            );
+            let Some(g) = t else { return true };
+            match self.read_wait_on(&g).await {
+                Ok(()) => return true,
+                Err(e) => {
+                    if binlog::is_transient(&e) {
+                        self.heal_src().await;
+                    }
+                    warn!("read endpoint not caught up: {e:#}");
+                    return false;
+                }
+            }
+        }
         // MySQL / Percona with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET` (see `mysql::gtid_wait`) on
         // the whole tracked set, not just the last transaction read (ruling 7): on a
         // multi-source topology (Galera, PXC, GR) the node must execute transactions of many
@@ -7514,6 +7848,9 @@ impl Engine {
                 return Ok(Refreshed::default());
             }
             let fresh = self.caps.fresh_snapshot;
+            // One wait per whole-view read (PR G §3.2): the read endpoint must have applied
+            // the set the engine consumed, at the bound, before any row is read.
+            self.read_barrier().await?;
             let rows =
                 mv::read_source(&mut self.src, plan, layout, None, &self.metrics, fresh).await?;
             work.source_queries += 1;
@@ -7545,6 +7882,9 @@ impl Engine {
             // not a rebuild, and the other buffered units are subsumed by it, so the buffer
             // clears with it (a failed target is retried as a whole refresh by `retry_lag`).
             let fresh = self.caps.fresh_snapshot;
+            // One wait per whole-view read (PR G §3.2): the read endpoint must have applied
+            // the set the engine consumed, at the bound, before any row is read.
+            self.read_barrier().await?;
             let rows =
                 mv::read_source(&mut self.src, plan, layout, None, &self.metrics, fresh).await?;
             work.source_queries += 1;
@@ -7619,6 +7959,9 @@ impl Engine {
         }
         for chunk in chunks {
             self.metrics.beat();
+            // One wait per chunk (PR G §3.2): the chunking is `cfg.query_chunk`, the wait is
+            // the chunk's one statement on the read connection.
+            self.read_barrier().await?;
             let rows = mv::read_source(
                 &mut self.src,
                 plan,
@@ -8965,6 +9308,7 @@ async fn build_task(
     (def_id, generation): (u64, u64),
     swap: bool,
     test_delay: Option<Duration>,
+    read_barrier: Option<ReadBarrier>,
 ) {
     let result = async {
         let _permit = slots.acquire_owned().await?;
@@ -8972,12 +9316,35 @@ async fn build_task(
             tokio::time::sleep(d).await;
         }
         let mut src = connect_source(&src_opts, lock_wait_s, &metrics).await?;
-        let mut layout = mv::probe(&mut src, &src_schema, &plan).await?;
+        // The read split (PR G §2, §3.3): the probe DDL runs on a writer session, the seed and
+        // the one big SELECT run on the read connection with the flavor's guard set, after the
+        // build's single wait for the position the engine had consumed at spawn. Without the
+        // split: one connection, today's shape, no wait, no extra connect.
+        let mut ctrl: Option<Conn> = None;
+        if let Some(rb) = &read_barrier {
+            source::init_read_session(&mut src, rb.flavor, rb.ceil_s).await?;
+            ctrl = Some(connect_source(&rb.ctrl_opts, lock_wait_s, &metrics).await?);
+        }
+        let mut layout = match &mut ctrl {
+            Some(c) => mv::probe(c, &src_schema, &plan).await?,
+            None => mv::probe(&mut src, &src_schema, &plan).await?,
+        };
         // The index budget of this view's tables: the tightest of the targets it is built into
         // (T3.1); a MySQL-only view keeps the 3072 bytes every build used before PostgreSQL targets.
         layout.key_budget = target::min_key_budget(targets.iter().map(|s| s.kind));
         // The cascade cache is read on the source before the table is filled, so that no
         // cascade falls between the two reads: the binlog this version replays holds the rest.
+        // The build's one wait (PR G §3.3, R-03 "Remains": the build is one SELECT) is asked
+        // once here, before the seed and the fill: the position the engine had consumed when
+        // the build was spawned, at the operator's bound. Miss it and the build fails clean
+        // (the supervisor retries it) — never stale rows, never a silent source fallback.
+        if let Some(rb) = &read_barrier {
+            if let Some(t) = rb.target.as_deref() {
+                wait_for_read_position(&mut src, rb.flavor, t, rb.ceil_s, &rb.endpoint, rb.bound_ms)
+                    .await
+                    .with_context(|| format!("the build of `{name}` cannot read its source"))?;
+            }
+        }
         let cache = seed_cache(&mut src, &plan).await?;
         // Each target is prepared on its own: one that fails is reported, the others built.
         let mut conns = Vec::new();
@@ -9031,6 +9398,9 @@ async fn build_task(
             }
         }
         for (c, _, _) in conns {
+            let _ = c.disconnect().await;
+        }
+        if let Some(c) = ctrl {
             let _ = c.disconnect().await;
         }
         let _ = src.disconnect().await;
@@ -9087,6 +9457,80 @@ mod role_dsn_tests {
         // `Config` refuses a `postgres://` one earlier, with its own message.
         assert!(role_opts(Some("not a dsn"), dsn).is_err());
         assert!(role_opts(Some("postgres://a@b/d"), dsn).is_err());
+    }
+
+    /// The read endpoint's batch wait (PR G): unset, no barrier call is ever made — the target
+    /// is `None` whatever the position state is (the writer's own `fence()` stays the only
+    /// wait, and it is not asked here). Set, it waits for the executed set, falling back to
+    /// the last transaction read (the single-stream floor); with nothing consumed yet there is
+    /// no position to be late for.
+    #[test]
+    fn the_read_barrier_waits_only_for_the_read_endpoint() {
+        // Unset ⇒ no wait, ever.
+        assert_eq!(
+            read_wait_target(false, Some("uuid:1-5"), Some("uuid:5")),
+            None
+        );
+        assert_eq!(read_wait_target(false, None, None), None);
+        // Set: the executed set wins (multi-sid safe, ruling 7).
+        assert_eq!(
+            read_wait_target(true, Some("a:1-5,b:1-2"), Some("b:2")).as_deref(),
+            Some("a:1-5,b:1-2")
+        );
+        // Set, set not yet rendered (empty): the single-stream floor.
+        assert_eq!(
+            read_wait_target(true, Some(""), Some("a:9")).as_deref(),
+            Some("a:9")
+        );
+        // Set, nothing consumed yet (a build before the stream): no wait.
+        assert_eq!(read_wait_target(true, None, None), None);
+        assert_eq!(read_wait_target(true, Some(""), Some("")).as_deref(), None);
+    }
+
+    /// The §5 error table: the endpoint, the position (bounded), the bound, the operator's
+    /// path — and the same text shape for a huge set, truncated, never the whole thing.
+    #[test]
+    fn the_lag_error_names_the_endpoint_the_position_the_bound_and_the_fix() {
+        let e = lag_error("reader:3306", "01ae:1-17", 5000).to_string();
+        for want in [
+            "reader:3306",
+            "01ae:1-17",
+            "5000 ms",
+            "LAZYVIEW_READ_MAX_LAG_MS",
+            "SHOW REPLICA STATUS",
+            "unset LAZYVIEW_READ_DSN",
+            "keeps serving its current state",
+        ] {
+            assert!(e.contains(want), "missing {want} in: {e}");
+        }
+        // A cluster set is bounded in the message.
+        let big = "01ae:".to_string() + &"1-100000,".repeat(100);
+        let e = lag_error("reader:3306", &big, 250).to_string();
+        assert!(e.contains("[…truncated]"), "{e}");
+        assert!(e.len() < big.len() + 600, "{:?}", e.len());
+        // Bounding cuts at a char boundary (the set text is ASCII; the ellipsis proves the
+        // path ran through a multi-byte-safe slice).
+        assert!(bounded_set_text(&big).len() <= 256);
+    }
+
+    /// The connect refusal of PR G §2: host, port and database must all differ from the
+    /// writer's and the metadata role's endpoint.
+    #[test]
+    fn the_read_endpoint_must_be_another_server() {
+        let dsn = "mysql://lv:p@db:3306/app";
+        let w = role_opts(None, dsn).unwrap();
+        let same_host = role_opts(Some("mysql://lv:p@db:3306/app"), dsn).unwrap();
+        assert!(same_endpoint(&same_host, &w));
+        let other_port = role_opts(Some("mysql://lv:p@db:3307/app"), dsn).unwrap();
+        assert!(
+            !same_endpoint(&other_port, &w),
+            "another port is another endpoint"
+        );
+        let other_db = role_opts(Some("mysql://lv:p@db:3306/other"), dsn).unwrap();
+        assert!(
+            !same_endpoint(&other_db, &w),
+            "another database is another endpoint"
+        );
     }
 
     /// The lock's own endpoint (review A-06): unset, it is the metadata server's, because the lock

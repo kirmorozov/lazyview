@@ -16,6 +16,13 @@
 /// [`crate::source::mysql::preflight`], which Percona reaches through this file.
 pub(crate) use crate::source::mysql::preflight;
 
+/// The read endpoint (PR G): Percona takes every MySQL-family answer — the timed
+/// `WAIT_FOR_EXECUTED_GTID_SET` (`gtid_wait_timeout`), the pre-flight (whose Galera arm is what
+/// PXC runs) and the read-session init — through this file (lead decision Q2).
+pub(crate) use crate::source::mysql::{
+    gtid_wait_timeout as gtid_wait, init_read_session, read_preflight,
+};
+
 /// Whether a server whose `VERSION()` looks like MySQL's is in fact Percona: its `VERSION()`
 /// carries no product name (`8.4.11-11`), so `@@GLOBAL.version_comment`
 /// (`Percona Server (GPL), Release 11, Revision …`) is what names it. Reading that variable is

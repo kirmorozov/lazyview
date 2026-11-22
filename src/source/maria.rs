@@ -544,6 +544,89 @@ pub(crate) async fn prepare_dump(conn: &mut Conn, list: &str) -> Result<()> {
 /// `@@GLOBAL.gtid_binlog_state` include `saved`? Compared in flavor code over the parsed lists
 /// (MariaDB has no server-side subset function to hand the question to), reusing the shared
 /// interval rule through `mysql.rs`. A cursor with no set covers trivially.
+/// MariaDB's GTID visibility wait (read-endpoint plan PR G, sibling of
+/// [`mysql::gtid_wait`]): `MASTER_GTID_WAIT(<domain-server-seq list>, <ceil_s>)` — the wait is
+/// one statement per read batch, timed by the server itself, never a client loop. `Ok(Some(Some(0)))`:
+/// visible; anything else means "not approved", the caller owns the meaning (fail-closed).
+pub(crate) async fn gtid_wait(
+    conn: &mut Conn,
+    list: &str,
+    ceil_s: u64,
+) -> Result<Option<Option<i64>>> {
+    Ok(conn
+        .exec_first(
+            "SELECT MASTER_GTID_WAIT(?, ?)",
+            (list.to_string(), ceil_s as i64),
+        )
+        .await?)
+}
+
+/// The read-endpoint pre-flight of MariaDB (PR G §6), on the read connection, asked only when
+/// `LAZYVIEW_READ_DSN` is set. Refuses, never warns: an unfenceable reader would serve stale
+/// rows with no signal.
+pub(crate) async fn read_preflight(conn: &mut Conn, _ceil_s: u64) -> Result<()> {
+    // The wait itself, with timeout 0 (§6.3): function existence, grants and the GTID state all
+    // answer through it in the server's own words. `0-0-0` in the node's own domain id is
+    // trivially executed, so a healthy node answers 0.
+    let r: Option<Option<i64>> = conn
+        .exec_first(
+            "SELECT MASTER_GTID_WAIT(CONCAT(@@server_id, '-0-0'), 0)",
+            (),
+        )
+        .await
+        .context("the read endpoint cannot run MASTER_GTID_WAIT (grants? GTIDs?)")?;
+    match r {
+        Some(Some(0)) => {}
+        Some(Some(n)) => bail!(
+            "the read endpoint is refused: MASTER_GTID_WAIT answered {n} for a position it \
+             should already have — unset LAZYVIEW_READ_DSN"
+        ),
+        Some(None) | None => bail!(
+            "the read endpoint is refused: MASTER_GTID_WAIT answered NULL (GTID state unreadable) \
+             — a replica without GTIDs cannot be fenced exactly; unset LAZYVIEW_READ_DSN"
+        ),
+    }
+    // Galera (§6.4): the session-causal guard must exist; `init_read_session` sets it per read
+    // connection below.
+    if mysql::var_opt(conn, "SELECT CAST(@@GLOBAL.wsrep_on AS CHAR)")
+        .await?
+        .as_deref()
+        == Some("1")
+        && mysql::var_opt(conn, "SELECT CAST(@@GLOBAL.wsrep_sync_wait AS CHAR)")
+            .await?
+            .is_none()
+    {
+        bail!(
+            "the read endpoint is refused: a Galera node without wsrep_sync_wait cannot \
+                   give session-causal reads"
+        );
+    }
+    Ok(())
+}
+
+/// Prepares the read connection (PR G §3, Galera row): `wsrep_sync_wait=1` gives every read on
+/// it session-causal (monotonic) reads, server-side. The read connection carries nothing but
+/// read batches (PR G §2), so asking it once per connection is exactly the plan's "for the
+/// duration of one read batch" — zero statements per batch, zero per event. The provider's own
+/// bound is asked of `wsrep_sync_wait_timeout`; where the server does not know that variable the
+/// provider default stays (the batch's GTID wait above remains the freshness bound — a stalled
+/// applier hangs the read, it never answers stale).
+pub(crate) async fn init_read_session(conn: &mut Conn, ceil_s: u64) -> Result<()> {
+    if mysql::var_opt(conn, "SELECT CAST(@@GLOBAL.wsrep_on AS CHAR)")
+        .await?
+        .as_deref()
+        == Some("1")
+    {
+        conn.query_drop("SET SESSION wsrep_sync_wait = 1").await?;
+        // The bound is asked, not demanded: an older provider without the variable keeps its
+        // own default (see the doc line above).
+        let _ = conn
+            .query_drop(format!("SET SESSION wsrep_sync_wait_timeout = {ceil_s}"))
+            .await;
+    }
+    Ok(())
+}
+
 pub(crate) async fn gtid_covers(conn: &mut Conn, saved: Option<&str>) -> Result<bool> {
     let Some(saved) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(true);

@@ -277,6 +277,39 @@ pub enum Flavor {
     Percona,
 }
 
+/// The read-endpoint pre-flight (read-endpoint plan PR G §6), on the read connection, asked
+/// only when `LAZYVIEW_READ_DSN` is set. Refuses (never warns) a reader that cannot be fenced
+/// exactly: GTIDs plus the flavor's own timed GTID wait, the Galera extras where the node runs
+/// Galera, the group membership where it runs Group Replication. The rules are the flavor's;
+/// the engine asks this once at connect, never on the event path.
+pub(crate) async fn read_preflight(
+    conn: &mut mysql_async::Conn,
+    flavor: Flavor,
+    ceil_s: u64,
+) -> anyhow::Result<()> {
+    match flavor {
+        Flavor::MySql => mysql::read_preflight(conn, ceil_s).await,
+        Flavor::Percona => percona::read_preflight(conn, ceil_s).await,
+        Flavor::MariaDb => maria::read_preflight(conn, ceil_s).await,
+    }
+}
+
+/// Prepares a read connection (PR G §3): the flavor's session guard for its topology (GR's
+/// `group_replication_consistency='BEFORE'`, Galera's `wsrep_sync_wait=1`), asked once per
+/// connection. The read connection carries read-only statements; the writes (the probe view,
+/// the fence row) stay on the writer connection.
+pub(crate) async fn init_read_session(
+    conn: &mut mysql_async::Conn,
+    flavor: Flavor,
+    ceil_s: u64,
+) -> anyhow::Result<()> {
+    match flavor {
+        Flavor::MySql => mysql::init_read_session(conn, ceil_s).await,
+        Flavor::Percona => percona::init_read_session(conn, ceil_s).await,
+        Flavor::MariaDb => maria::init_read_session(conn, ceil_s).await,
+    }
+}
+
 impl Flavor {
     /// Flavor from a `VERSION()` string (`10.11.14-MariaDB-log` → MariaDB). Percona's
     /// `VERSION()` is indistinguishable from MySQL's, so it takes [`from_version_comment`].
