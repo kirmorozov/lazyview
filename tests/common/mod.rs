@@ -8,6 +8,9 @@
 
 #![allow(dead_code, unused_imports)]
 
+// The steady-state throughput bench of PR3: the neutral tables, the five view shapes, the seeded
+// write plans and the SQL-side comparison (tests/bench_throughput.rs).
+pub mod benchwork;
 // The engine as its own process: spawn the real binary, its health endpoints, /proc CPU+RSS, real
 // signals, and the seeded kill-point picker (plan tmp/out/lvs-perf/plan/breakdown.md PR1).
 pub mod engineproc;
