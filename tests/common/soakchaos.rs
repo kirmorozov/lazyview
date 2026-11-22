@@ -376,6 +376,17 @@ pub struct ChaosRun<'a> {
     pub seed: u64,
     /// The event's index in the seeded schedule (`toxi{i}` labels, T7).
     pub toxi_i: usize,
+    /// Statements the `EngineCrash` event runs **while the engine is dead**, between the kill and
+    /// the restart: the #167 window batch of
+    /// [`super::soakwork::SoakWorkload::cascade_in_window`], the one the `EngineStop` event already
+    /// runs while stopped. The dead engine cannot apply them, so the saved position stays behind
+    /// every statement and the resume is *known* to replay a mapped-cascade parent change instead
+    /// of whatever the paced writers happened to emit before the kill landed (#319). Non-empty also
+    /// anchors the kill on the engine rather than the clock: the engine is first waited out to a
+    /// caught-up point (`applied()` past what the source holds, the same observable
+    /// `wait_caught_up` uses). Empty — the soak's shape — is the plain kill-9 at the scheduled
+    /// instant, which is what made a pinned replay a lottery on host throughput.
+    pub crash_window: &'a [String],
 }
 
 impl ChaosRun<'_> {
@@ -438,8 +449,38 @@ pub async fn run_event(
         // engine like `kill -9`, start it again, and it must be alive, streaming, and resumed
         // from the position it saved in `_lazyview_status`.
         Chaos::EngineCrash => {
+            // #319: a run that names its `crash_window` does not kill the engine at a wall-clock
+            // instant. The kill waits for an engine-observable point — the engine has applied
+            // everything the source holds, the same test `wait_caught_up` makes — so the position
+            // the cut falls on is the same one every run of the scenario, and what the resume
+            // replays is the batch below rather than a sample of the writers' pace.
+            if !run.crash_window.is_empty() {
+                let mut c = run.src.conn().await?;
+                eng.wait_caught_up_rounds(&mut c, t_catchup(), 3)
+                    .await
+                    .with_context(|| {
+                        format!("{what}: the engine never reached a caught-up point to crash at")
+                    })?;
+                c.disconnect().await.ok();
+            }
             let before = saved_position(run.src).await?;
             eng.crash().await?;
+            // The window batch, run while the engine is dead (each statement its own transaction,
+            // the clean-stop shape of `regressions/catchup.rs:209`, so the seed read can land
+            // between any two of them): the saved position is behind every statement, so the seed
+            // read at resume has already moved their children and the parent events replay against
+            // that cache — the #167 shape, by construction and not as a lottery on how many
+            // statements the writers had reached (`cascade_in_window`, PR 8, is the same batch the
+            // `EngineStop` event runs while the engine is stopped).
+            if !run.crash_window.is_empty() {
+                let mut c = run.src.conn().await?;
+                for stmt in run.crash_window {
+                    exec(&mut c, stmt)
+                        .await
+                        .with_context(|| format!("{what}: the window cascade: {stmt}"))?;
+                }
+                c.disconnect().await.ok();
+            }
             eng = run.start_engine()?;
             wait_streaming(&mut eng).await?;
             let mut c = run.src.conn().await?;

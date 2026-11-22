@@ -12,6 +12,7 @@
 #
 # EVERY ENTRY IS TEMPORARY AND OWNER-APPROVED (one owner decision per entry, never a bulk allowance)
 # and the fix PR for its issue MUST delete the entry here: this file is not a place to park a
-# failing test. Entry #319 was approved by the owner on 2026-11-22 for the timing-dependent
-# cascade-seed replay failure that has kept main red since 0225453; #319's fix PR removes it.
-pinned::reg_cascade_refusal_seed_replay #319
+# failing test. Empty today. The one entry it had, `pinned::reg_cascade_refusal_seed_replay #319`
+# (owner-approved on 2026-11-22 for the cascade-seed replay that kept main red since 0225453), went
+# with the test fix: that crash now runs at the engine's own caught-up point with a seeded window
+# batch, instead of at a wall-clock instant with whatever the writers had emitted.

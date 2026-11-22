@@ -328,6 +328,9 @@ async fn soak_run(
                 attribution: &mut attribution,
                 seed,
                 toxi_i: done - 1,
+                // The soak keeps the plain kill-9 at the scheduled instant: its own coverage of the
+                // #167 window is the `EngineStop` event's seeded batch (`soakchaos.rs`).
+                crash_window: &[],
             };
             let (row, next) = run_event(&mut run, eng, kind, at).await?;
             eng = next;

@@ -1764,6 +1764,21 @@ async fn replay_check(
 /// that ever changes), the same checks. Fail-before/pass-after: red on origin/main at d885d74..
 /// (the extra `sets_items` rows survive the checks), green with the partial-cache whole-view
 /// mark in `feed_mapped_cascade` / `drain`.
+///
+/// Two things make the replay actually reproducible (#319), and both are load-bearing:
+///
+/// * **The workload seed is pinned, on purpose.** `SEED` is the shape the live finding left, so it
+///   is a `const` and not the harness seed: `LAZYVIEW_TEST_SEED` reaches `Ctx.seed` and the panic
+///   text only (`mod.rs::base_seed`), never this scenario, and the number the harness prints as
+///   `base seed` for the `regressions` binary is a different one per process. A CI log's base seed
+///   is not a key to reproduce this test with — say so in a report rather than chasing it.
+/// * **The crash is anchored on the engine, and the window is a batch.** `run_event` waits for the
+///   engine's own caught-up point before the kill and runs
+///   [`crate::common::soakwork::SoakWorkload::cascade_in_window`] while the engine is dead, so the
+///   resume window holds a mapped-cascade parent change every run. Killing at the wall-clock instant
+///   instead made the window a sample of the writers' pace (`soakwork.rs::run_paced` paces against
+///   `Instant::now()`), so `cascade_gaps` was 0 on a loaded runner and the run was red on nothing
+///   but timing.
 #[test]
 fn reg_cascade_refusal_seed_replay() {
     scenario("reg_casc_seed167", |ctx| async move {
@@ -1775,6 +1790,15 @@ fn reg_cascade_refusal_seed_replay() {
                 && matches!(events[0].1, crate::common::soakchaos::Chaos::EngineCrash),
             "the pinned smoke schedule for seed {SEED:#x} changed: {events:?}"
         );
+        // #319, said where a reader of a red run looks for a key to reproduce with: the `base seed`
+        // this process prints is not one. The harness seed reaches the schema suffix and the panic
+        // text only; everything that shapes this replay uses the pinned `SEED`.
+        ctx.log(format!(
+            "workload pinned to seed {SEED:#x} (harness base seed {:#x}, Ctx.seed {:#x}: neither \
+             shapes the workload)",
+            crate::common::base_seed(),
+            ctx.seed
+        ));
         let specs = crate::common::soakwork::soak_views();
         let targets = std::collections::HashMap::new();
         let db = ctx.new_db("reg_casc_seed167").await?;
@@ -1794,6 +1818,17 @@ fn reg_cascade_refusal_seed_replay() {
         let (mut txs, mut hs) = spawn_replay_writers(&db, &ids, SEED, n_writers, per_writer).await;
         let mut next_check = began + std::time::Duration::from_secs(60);
         let mut done = 0usize;
+        // The window this replay asserts on (#319). `cascade_in_window` (PR 8) is the seeded #167
+        // batch the `EngineStop` chaos event already runs while its engine is stopped: an
+        // `ON UPDATE CASCADE` key move, a child delete and the `ON DELETE CASCADE` parent delete,
+        // each its own transaction, on ids far above the writers' range. `run_event` runs it after
+        // the kill and before the restart, where the dead engine cannot apply it, so the resume
+        // replays a mapped-cascade parent change from inside the gap window by construction — which
+        // is exactly what `cascade_gaps >= 1` below asserts. Before that, whether the second or so
+        // between the kill and the restart held a parent change at all was a question about the
+        // host's throughput, and the test was red when it did not.
+        let window =
+            crate::common::soakwork::SoakWorkload::cascade_in_window(SEED, events[0].0.as_secs());
         // One crash event, then checks every 60 s and a final one — the smoke's loop
         // (`soak.rs::soak_run`) narrowed to this schedule.
         loop {
@@ -1818,6 +1853,10 @@ fn reg_cascade_refusal_seed_replay() {
                     attribution: &mut attribution,
                     seed: SEED,
                     toxi_i: done - 1,
+                    // The #167 window batch, run while the engine is dead, and with it the engine's
+                    // own caught-up point as the moment of the kill (#319): the window this test
+                    // asserts on is the batch, not a sample of the writers' pace.
+                    crash_window: &window,
                 };
                 let (row, next) =
                     crate::common::soakchaos::run_event(&mut run, eng, kind, at).await?;
@@ -1882,10 +1921,14 @@ fn reg_cascade_refusal_seed_replay() {
             failed.join(" | ")
         );
         let s = eng.stats_of(&db, "wc_child_only")?;
+        // The window is no longer a matter of luck (#319): the seeded batch runs while the engine is
+        // dead, so its `sets` parent changes always sit between the saved position and the seed read.
+        // A 0 here therefore means the map route replayed them without entering its gap window — an
+        // engine finding, not a flavour on which "the reproduction did not fire".
         ensure!(
             s.cascade_gaps >= 1,
-            "the resume replay window never ran on the map route (no cascade gap on \
-             `wc_child_only`): {s:?} — the reproduction did not fire on this flavor"
+            "the seeded window's parent changes were replayed without a single cascade gap on \
+             `wc_child_only` (the `cascade_in_window` batch never reached the map route): {s:?}"
         );
         // The remedy is the whole-view refresh of the window, never a rebuild of the view:
         // `wc_child_only` is incremental, so its heal shows up as a `whole` and no build.
@@ -2049,6 +2092,11 @@ fn reg_cascade_window_seed_replay() {
             attribution: &mut attribution,
             seed: SEED,
             toxi_i: 0,
+            // Left as the schedule runs it for the soak: this replay asserts the budget
+            // (`whole_view_refreshes <= 1`, no rebuild) and the oracle, and both hold whether or not
+            // the window happened to hold a parent change. Making its window a batch too is the
+            // obvious follow-up (#319); it is not this test's claim.
+            crash_window: &[],
         };
         let (row, mut eng) =
             crate::common::soakchaos::run_event(&mut run, eng, events[0].1, events[0].0).await?;
