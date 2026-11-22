@@ -1,0 +1,30 @@
+lazyview {{ include "lazyview.version" . }} is installed as release {{ .Release.Name }} in namespace
+{{ .Release.Namespace }}.
+
+  Deployment    {{ include "lazyview.fullname" . }}          {{ .Values.replicas }} replica(s), instance id {{ .Values.instanceId | quote }}
+  Service       {{ include "lazyview.metricsServiceName" . }}:{{ .Values.service.port }}  (only /metrics: scrape it, nothing else)
+  ConfigMap     {{ include "lazyview.configMapName" . }}    (non-secret settings; credentials are NOT in it)
+  Secret        {{ .Values.secret.existingSecret }}          (you created this: the chart only names it)
+{{ if .Values.pdb.enabled }}  PDB           {{ include "lazyview.fullname" . }}
+{{ end }}{{ if .Values.networkPolicy.enabled }}  NetworkPolicy {{ include "lazyview.fullname" . }}          (only {{ len .Values.networkPolicy.allowFromNamespaces }} namespace(s) may reach :{{ .Values.containerPort }})
+{{ end }}{{ if .Values.prometheus.enabled }}  Prometheus    ServiceMonitor {{ .Values.prometheus.serviceMonitor.enabled }}, alert rules {{ .Values.prometheus.rules.enabled }}
+{{ end }}{{ if .Values.otel.enabled }}  OpenTelemetry on: declarative config from {{ (include "lazyview.otel.source" . | fromYaml).type }}
+              {{ include "lazyview.otel.configFile" . }}  (OTEL_CONFIG_FILE; unset means telemetry off)
+{{ else }}  OpenTelemetry off: the pods carry no OTEL_CONFIG_FILE, so no telemetry path is initialised
+{{ end }}
+Two things to check now:
+
+  1. The credentials Secret must exist and be readable, then start the pods:
+       kubectl -n {{ .Release.Namespace }} get secret {{ .Values.secret.existingSecret }}
+       kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "lazyview.fullname" . }}
+     The `setup` initContainer creates and migrates lazyview's own tables on every pod start, so a
+     rollout with a new image is also the upgrade step.
+
+  2. The logs of both runs, and what the instance is doing:
+       kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/name={{ include "lazyview.name" . }} --prefix \
+         | grep -E 'standing by|took over|streaming'
+
+With more than one replica, every pod shares LAZYVIEW_INSTANCE_ID ({{ .Values.instanceId | quote }}):
+one holds the named lock on the source and streams the binlog, the others are hot standbys. To run a
+second, independent lazyview in the same namespace, install a second release with its own
+instanceId — never edit the ConfigMap of this one.

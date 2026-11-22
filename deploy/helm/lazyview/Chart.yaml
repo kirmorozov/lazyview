@@ -1,0 +1,21 @@
+apiVersion: v2
+name: lazyview
+description: "Materialized views for MySQL and MariaDB: lazyview reads the binlog and keeps plain tables current. Single active instance, hot standby, Prometheus rules."
+type: application
+# The chart and the application it ships are released together: bump version and appVersion in
+# the same commit, so `helm show chart` and the rendered `app.kubernetes.io/version` agree.
+version: 0.1.0
+# The lazyview release these manifests are written for; image.tag defaults to it.
+appVersion: "0.1.0"
+# policy/v1 PDBs with unhealthyPodEvictionPolicy, the restricted Pod Security Standard and the
+# autoscaling/v2-free manifests this chart renders.
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - mysql
+  - mariadb
+  - materialized-views
+  - binlog
+  - replication
+home: https://github.com/kirmorozov/lazyview
+sources:
+  - https://github.com/kirmorozov/lazyview

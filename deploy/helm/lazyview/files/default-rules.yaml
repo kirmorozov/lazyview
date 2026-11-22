@@ -1,0 +1,100 @@
+# The chart's own alert rules: the same set as deploy/k8s/components/prometheus/prometheusrule.yaml,
+# which alerts on what the probes deliberately ignore (a restart would not fix those).
+#
+# This file lives under files/ rather than templates/ on purpose: Helm does not process files/, so
+# the Prometheus template expansions ({{ $labels.job }}) stay literal instead of being read as Go
+# template actions. templates/prometheusrule.yaml loads it with .Files.Get, substitutes the two
+# __LV_*__ selector tokens below with the names THIS release renders, and renders it under spec:;
+# set prometheus.rules.groups to replace these rules with your own.
+#
+# The selectors are exact names, not a substring match, so a differently named deployment can never
+# answer for this one and a rule can never go silent when nameOverride / fullnameOverride produce a
+# name that does not contain "lazyview". The `job` label of a scraped pod is the name of the Service
+# the ServiceMonitor selects, which is what __LV_METRICS_SERVICE__ becomes.
+groups:
+  - name: lazyview
+    rules:
+      - alert: LazyviewDown
+        # Pods exist but none answers the scrape (crash loop, image pull or configuration
+        # errors: the Service also publishes pods that are not ready).
+        expr: max by (namespace, job) (up{job="__LV_METRICS_SERVICE__"}) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: No lazyview pod of {{ $labels.job }} in {{ $labels.namespace }} can be scraped.
+      - alert: LazyviewUnavailable
+        # No pod is Ready, including pods that never got an IP (Pending, unschedulable), which
+        # LazyviewDown cannot see. Needs kube-state-metrics (part of kube-prometheus-stack).
+        expr: max by (namespace, deployment) (kube_deployment_status_replicas_available{deployment="__LV_DEPLOYMENT__"}) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Deployment {{ $labels.deployment }} in {{ $labels.namespace }} has no available pod.
+      - alert: LazyviewNotScraped
+        # Cluster-wide: Prometheus has no lazyview target at all (e.g. the ServiceMonitor lacks
+        # the `release` label kube-prometheus-stack selects on).
+        expr: absent(up{job="__LV_METRICS_SERVICE__"})
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Prometheus scrapes no lazyview target.
+      - alert: LazyviewNotStreaming
+        # Pods are scraped but none holds the lock and streams the binlog: database unreachable,
+        # missing grants, purged binlog, a takeover still booting, or the lock still held by the
+        # session of a pod whose node died (see the note on replicas in values.yaml).
+        expr: max by (namespace, job) (lazyview_streaming) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: No lazyview pod of {{ $labels.job }} in {{ $labels.namespace }} is streaming the binlog.
+      - alert: LazyviewViewsInError
+        expr: max by (namespace, job) (lazyview_views_error) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} lazyview view(s) of {{ $labels.job }} in {{ $labels.namespace }} in error"
+          description: "SELECT name, target, last_error FROM _lazyview_state WHERE state = 'error'"
+      - alert: LazyviewViewsNotLive
+        # Views without a live version for 2 h (initial build very slow or stuck). The
+        # Kubernetes readiness probe ignores first builds (building=ok); this alert does not.
+        expr: max by (namespace, job) (lazyview_views - lazyview_views_ready - lazyview_views_error) > 0
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} lazyview view(s) of {{ $labels.job }} in {{ $labels.namespace }} have no live table yet."
+      - alert: LazyviewRefreshFailing
+        # A view whose refresh fails on every attempt keeps its live version and stays
+        # `ready` (a failed refresh is retried with backoff, never re-planned or rebuilt —
+        # owner rule), so LazyviewViewsInError cannot see it and /readyz stays green: this
+        # gauge is the alert signal for that state (review A-03, O-02). The threshold 3 is
+        # REFRESH_ERROR_SHOWN_AFTER (src/engine.rs) — the same streak at which the engine
+        # writes `_lazyview_state.last_error`; `for: 2m` is longer than the 30 s cap of the
+        # refresh retry backoff (src/engine.rs, supervisor::backoff on Policy::READS), so an
+        # attempt that clears on its first retry never alerts. Both are engine settings, not
+        # guesses; tune them together with the engine knobs they mirror.
+        expr: max by (namespace, job, view) (lazyview_view_refresh_failures) >= 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "View {{ $labels.view }} of {{ $labels.job }} in {{ $labels.namespace }} has failed {{ $value }} refreshes in a row: it is stale while showing ready."
+          description: "SELECT name, target, state, last_error, refreshed_at FROM _lazyview_state WHERE CONCAT('<schema>.', name) = '{{ $labels.view }}' (the label is schema.view; last_error is filled from the 3rd failure)"
+      - alert: LazyviewRefreshErrors
+        # Backstop for the rule above: `refresh_errors` (src/metrics.rs) counts every failed
+        # refresh attempt instance-wide, so a failure that never builds a streak on one view
+        # (views rotating, restarts clearing the streak) still surfaces. The 30 m window
+        # covers a full pass of the retry ladder to its 30 s cap (src/engine.rs); for: 30m
+        # asks the instance to keep failing across two windows, so one transient blip
+        # (a brief target outage cleared on retry 1) never alerts.
+        expr: increase(lazyview_refresh_errors_total[30m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "lazyview instance {{ $labels.job }} in {{ $labels.namespace }} keeps failing refreshes ({{ $value }} in the last 30 m)."

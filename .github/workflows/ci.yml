@@ -9,8 +9,8 @@ name: ci
 #   heavy  = code and not a draft PR: the integration cells and the other server jobs run
 #   full   = a push, a tag, a manual run, or a PR labelled `ci:full`: the COMPREHENSIVE set
 #   DOCS-ONLY pull_request -> lint + `unit tests` (which has nothing to run and says so): minutes.
-#   DRAFT pull_request     -> lint, unit tests (from the build-tests artifact), deny, features. No
-#                             server, no container. Workers push WIP at least every 60 min (host rule).
+#   DRAFT pull_request     -> lint, helm, unit tests (from the build-tests artifact), deny, features.
+#                             No server, no container. Workers push WIP at least every 60 min (host rule).
 #   pull_request (ready)   -> the FAST tier: the same, plus the integration cells of the LATEST LTS of
 #                             each family only (mysql97, percona97, mariadb123: one 3-server group,
 #                             shards A-E) without the slow tests of tests/slow-tier.txt, and the
@@ -26,8 +26,9 @@ name: ci
 #                             at most one waits, a newer merge replaces the waiting run, a started run
 #                             is never cancelled. A red here is handled at once: an issue with an
 #                             owner, fix forward or revert the same day.
-# The jobs: lint, unit,
-# e2e, deny (cargo-deny advisories + licenses), features (the optional cargo features built and
+# The jobs: lint, helm (deploy/helm/lazyview: `helm lint --strict` and the render checks of
+# scripts/helm-render-check.sh, offline, no cluster; the chart is the k8s deployment path of record),
+# unit, e2e, deny (cargo-deny advisories + licenses), features (the optional cargo features built and
 # tested; their clippy runs sit in `lint`), scan-image (trivy), the integration matrix,
 # integration-multi, integration-pg (PostgreSQL
 # as a TARGET: every supported major, on the baseline source mysql84), integration-pg-multi (the same
@@ -227,6 +228,27 @@ jobs:
         # through the same script (scripts/chaos-gate.sh --self-test) so the gate cannot regress to
         # hiding a red again. No cargo, no servers: it is the gate checking its own eyes.
         run: scripts/chaos-gate.sh --self-test
+
+  helm:
+    name: helm chart (lint + render)
+    # The cheap deploy check: no toolchain, no cluster, no network. `helm` is preinstalled on the
+    # ubuntu-24.04 runner image (Package Management), and the version prints first so an image that
+    # ever drops it fails here with a name instead of an unknown-command error.
+    needs: scope
+    if: needs.scope.outputs.code == 'true'  # a docs-only PR changes no chart (`scope` decides, like deny/features)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: helm version
+        run: helm version
+      # helm lint --strict plus helm template over the otel / prometheus / networkPolicy on-off
+      # matrix, asserting the probe path tests/health.rs pins, that no credential reaches the
+      # rendered ConfigMap, and that OTEL_CONFIG_FILE is present if and only if otel.enabled.
+      - name: lint and render the chart
+        run: scripts/helm-render-check.sh
 
   unit:
     # The lib and bin unit tests, RUN from the build-tests artifact (owner 2026-11-27: "builds
@@ -1619,7 +1641,7 @@ jobs:
     # already report success; the known-red gate inside the cells already turns declared reds into
     # success; publish/release/soak-smoke/report are not here (not part of a PR's verdict).
     name: ci ok
-    needs: [scope, lint, unit, deny, features, build-tests, integration, integration-multi, integration-pg, integration-pg-multi, integration-pgsrc, e2e, scan-image, soak-pr]
+    needs: [scope, lint, helm, unit, deny, features, build-tests, integration, integration-multi, integration-pg, integration-pg-multi, integration-pgsrc, e2e, scan-image, soak-pr]
     if: ${{ always() && github.event_name != 'schedule' && github.event_name != 'workflow_call' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5

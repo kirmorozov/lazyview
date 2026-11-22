@@ -1,0 +1,210 @@
+{{- include "lazyview.validate" . -}}
+{{/*
+The counterpart of deploy/k8s/base/deployment.yaml. The semantics (why these probes, why this
+strategy, what a drain and a takeover cost) are the base's, kept here so `helm get manifest`
+explains itself; the reference prose lives in docs/kubernetes.md.
+
+One replica is the model: a single instance that exits on fatal errors, is restarted by Kubernetes
+and resumes from the saved binlog position. With replicas: 2 the new pod starts next to the old one
+as a hot standby and takes the MySQL named lock when the old one stops.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lazyview.fullname" . }}
+  labels:
+    {{- include "lazyview.componentLabels" (dict "root" . "component" "replicator") | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicas }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  progressDeadlineSeconds: {{ .Values.progressDeadlineSeconds }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "lazyview.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lazyview.componentLabels" (dict "root" . "component" "replicator") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # The ConfigMap has a stable name (a Helm-managed object cannot take the generator's
+        # content hash), so a configuration change rolls the pods through this checksum.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if and .Values.otel.enabled (not .Values.otel.existingSecret) (not .Values.otel.existingConfigMap) }}
+        # The same for an inline declarative config: editing it must restart the pods.
+        checksum/otel-config: {{ include (print $.Template.BasePath "/otel-config.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      restartPolicy: Always
+      serviceAccountName: {{ include "lazyview.serviceAccountName" . }}
+      # lazyview does not talk to the Kubernetes API: no token is mounted.
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Required: service links would inject LAZYVIEW_PORT=tcp://… (for a Service named
+      # `lazyview`) or LAZYVIEW_TARGET_*_SERVICE_HOST variables, which lazyview reads as config.
+      enableServiceLinks: false
+      # SIGTERM: stop reading the binlog, flush buffered changes, save the position, release the
+      # lock. A kill after the grace period is safe too (changes since the saved position are
+      # re-applied idempotently), it only means more work for the next instance.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or .Values.affinity .Values.podAntiAffinity (and (not .Values.affinity) .Values.spreadAcrossNodes) }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else if .Values.podAntiAffinity }}
+        podAntiAffinity:
+          {{- toYaml .Values.podAntiAffinity | nindent 10 }}
+        {{- else if .Values.spreadAcrossNodes }}
+        # Active and standby on different nodes when possible, so one node failure never takes
+        # both (see the node failure note under `replicas` for how long the takeover then takes).
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "lazyview.selectorLabels" . | nindent 20 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.setup.enabled }}
+      # Two runs (docs/operations.md#the-two-runs): this one creates and migrates lazyview's own
+      # tables (definitions, state, status, fence) and validates every enabled definition; the
+      # operations run below never issues DDL on those tables (it refuses to start and names
+      # `lazyview setup`, exit code 2). Idempotent, and it runs on every pod start: that is also
+      # the upgrade step, so a new image migrates the tables before it serves. A failed setup fails
+      # the pod, which the rollout reports (`kubectl rollout undo deployment/<release>`).
+      initContainers:
+        - name: setup
+          image: {{ include "lazyview.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- toYaml .Values.setup.args | nindent 12 }}
+          envFrom:
+            {{- include "lazyview.envFrom" (dict "root" . "setup" true) | nindent 12 }}
+          {{- if or .Values.extraEnv .Values.otel.enabled }}
+          env:
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.otel.enabled }}
+            {{- include "lazyview.otel.env" . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.setup.resources | nindent 12 }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or .Values.extraVolumeMounts .Values.otel.enabled }}
+          volumeMounts:
+            {{- if .Values.otel.enabled }}
+            {{- include "lazyview.otel.volumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+      {{- end }}
+      containers:
+        - name: lazyview
+          # Distroless static image, runs as 65532, no shell (see Dockerfile). `edge` is the latest
+          # build of main; pin a release tag, a sha-<commit> tag or a digest
+          # (`image.repository` + `image.digest`).
+          image: {{ include "lazyview.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            {{- include "lazyview.envFrom" (dict "root" . "setup" false) | nindent 12 }}
+          {{- if or .Values.extraEnv .Values.otel.enabled }}
+          env:
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.otel.enabled }}
+            # Unset means telemetry off (the contract of OTEL_CONFIG_FILE), so this variable is
+            # rendered only when otel.enabled.
+            {{- include "lazyview.otel.env" . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          {{- if .Values.probes.enabled }}
+          # 60 s for the process to start serving; the boot itself is guarded by liveness.
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path | quote }}
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          # Restarts about 30 s after the stall limit is reached (LAZYVIEW_LIVENESS_STALL_SECS).
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path | quote }}
+              port: http
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          # The parameters are what makes rollouts and drains work; tests/health.rs pins this path.
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path | quote }}
+              port: http
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            successThreshold: {{ .Values.probes.readiness.successThreshold }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or .Values.extraVolumeMounts .Values.otel.enabled }}
+          volumeMounts:
+            {{- if .Values.otel.enabled }}
+            {{- include "lazyview.otel.volumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.extraVolumes .Values.otel.enabled }}
+      volumes:
+        {{- if .Values.otel.enabled }}
+        {{- include "lazyview.otel.volume" . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}

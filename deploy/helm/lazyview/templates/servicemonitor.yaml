@@ -1,0 +1,45 @@
+{{/*
+Needs the Prometheus Operator (the monitoring.coreos.com CRDs), which is why it sits behind
+`prometheus.enabled`: a cluster without the operator installs the chart without these objects.
+*/}}
+{{- if and .Values.prometheus.enabled .Values.prometheus.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "lazyview.fullname" . }}
+  labels:
+    {{- include "lazyview.componentLabels" (dict "root" . "component" "metrics") | nindent 4 }}
+    {{- with .Values.prometheus.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Selects the metrics Service of this release by label (its own selector is name and instance
+  # only, as in the base). kube-prometheus-stack only picks up ServiceMonitors carrying its
+  # `release: <name>` label by default: add it under prometheus.serviceMonitor.labels.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "lazyview.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: metrics
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    # Every pod behind the Service, active and standby alike (publishNotReadyAddresses).
+    - port: http
+      path: /metrics
+      interval: {{ .Values.prometheus.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.prometheus.serviceMonitor.scrapeTimeout }}
+      {{- with .Values.prometheus.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.prometheus.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

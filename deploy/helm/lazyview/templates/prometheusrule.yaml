@@ -1,0 +1,44 @@
+{{/*
+The alert rules of components/prometheus, behind the same `prometheus.enabled` switch as the
+ServiceMonitor (each is separately optional through its own `enabled`). Needs the Prometheus
+Operator CRDs.
+*/}}
+{{- if and .Values.prometheus.enabled .Values.prometheus.rules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "lazyview.fullname" . }}
+  labels:
+    {{- include "lazyview.componentLabels" (dict "root" . "component" "metrics") | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    {{- if .Values.prometheus.rules.groups }}
+    {{- toYaml .Values.prometheus.rules.groups | nindent 4 }}
+    {{- else }}
+    {{- $rules := .Files.Get "files/default-rules.yaml" }}
+    {{- if not $rules }}
+    {{- fail "files/default-rules.yaml is missing from the chart (it holds the default alert rules)" }}
+    {{- end }}
+    {{/*
+    The rules are not a template (they carry Prometheus `{{ $labels.x }}` expansions), so they live
+    under files/ and name this release through these two tokens. Exact names, never a substring
+    match: a rule that also matches another release can hide its own outage, and a rule that stops
+    matching when nameOverride / fullnameOverride drops "lazyview" from the names is a down alert
+    that never fires.
+    */}}
+    {{- $rules = $rules | replace "__LV_METRICS_SERVICE__" (include "lazyview.metricsServiceName" .)
+             | replace "__LV_DEPLOYMENT__" (include "lazyview.fullname" .) }}
+    {{- if contains "__LV_" $rules }}
+    {{- fail "an alert-rule selector token (__LV_…) was not substituted: files/default-rules.yaml and templates/prometheusrule.yaml disagree" }}
+    {{- end }}
+    {{- $groups := (fromYaml $rules).groups }}
+    {{- if not $groups }}
+    {{- fail "files/default-rules.yaml must define a non-empty `groups` list" }}
+    {{- end }}
+    {{- toYaml $groups | nindent 4 }}
+    {{- end }}
+{{- end }}
