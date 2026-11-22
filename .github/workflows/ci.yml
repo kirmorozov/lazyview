@@ -11,7 +11,12 @@ name: ci
 # the toxiproxy daemon: the job's own server family reached through it (compose profile `chaos`), its
 # scenarios required (scripts/chaos-gate.sh fails the step on any failure tests/chaos-known-red.txt
 # does not list, and prints the listed ones in the job summary), the toxi self-tests required. The
-# chaos_tgt_pg_ scenarios run once, where the PostgreSQL target sits next to a daemon: integration-pg
+# plain integration suites of those jobs are gated by the same script, on
+# tests/integration-known-red.txt: an unlisted failure fails the step, a listed one still runs,
+# passes the step and shows in the job summary with its issue. Every entry there is temporary,
+# owner-approved, and deleted by the PR that fixes its issue.
+# The chaos_tgt_pg_ scenarios run once, where the PostgreSQL target sits next to a daemon:
+# integration-pg
 # (integration-pg-multi pins that target and rotates the sources, so the faults are not paid for
 # twice; its legs are the targets_pg_ gates).
 # The soak jobs (bottom of the file): `soak-pr`, a bounded 5-minute smoke on mysql84, runs on
@@ -262,7 +267,22 @@ jobs:
         # --no-fail-fast: run every suite and report all failures, not just the first.
         # The chaos binary (chaos_* scenarios + selftest_toxi_*) runs for real in its own steps
         # below (strict there); filtered out here so it never runs twice.
-        run: cargo test --locked --no-fail-fast --test '*' -- --test-threads=1 --skip targets_pg_ --skip chaos_ --skip selftest_toxi_
+        # The gate below is scripts/chaos-gate.sh with tests/integration-known-red.txt, used exactly
+        # as the chaos steps use it: any failing test this file does not list FAILS the step (a
+        # ::error:: per test names the file to fix), and the one listed test
+        # (pinned::reg_cascade_refusal_seed_replay, #319) still runs and is reported in the job
+        # summary with its issue. No continue-on-error, no skip, no retry; the entry is temporary
+        # and owner-approved (2026-11-22) and #319's fix PR deletes it, and with the file empty this
+        # step is strict exactly as it stands. The gate's SKIP guard is chaos-specific, so the skip
+        # discipline of this step stays what LAZYVIEW_TEST_STRICT above already enforces.
+        # --color never: the gate's greps read these lines as plain text. The exit status of cargo
+        # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
+        run: |
+          set +o pipefail
+          cargo test --locked --no-fail-fast --test '*' -- --test-threads=1 --color never \
+            --skip targets_pg_ --skip chaos_ --skip selftest_toxi_ 2>&1 | tee integration-tests.log
+          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "$FLAVOR integration" \
+            integration-tests.log tests/integration-known-red.txt
       # The chaos binary over the toxiproxy daemon (compose profile `chaos`, started above): the
       # harness arms real network faults between the engines and this job's server. always() so a
       # suite failing above never hides these results; a dead daemon or a lost opt-in env fails

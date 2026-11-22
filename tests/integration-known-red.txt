@@ -1,0 +1,17 @@
+# Integration tests of the `integration tests` step of .github/workflows/ci.yml (the
+# `--skip chaos_` run of `--test '*'` in every MySQL-family job) that may still fail without
+# blocking a CI run: one "<test name> #<open issue>" per line, the shape of
+# tests/chaos-known-red.txt. Blank lines and `#` comment lines are ignored; the name is the test
+# exactly as cargo prints it, module path included (`pinned::…`, `definitions::…`).
+#
+# scripts/chaos-gate.sh reads this file in that step (--label "$FLAVOR integration"): a failure
+# listed here passes the step and is written to the job summary with its issue, an unlisted one
+# fails it with a ::error:: naming the file to fix. So this list is the only thing between a new
+# integration regression and a red job. The test still RUNS and is reported: no continue-on-error,
+# no skip, no retry anywhere, and with this file empty the step is strict exactly as it stands.
+#
+# EVERY ENTRY IS TEMPORARY AND OWNER-APPROVED (one owner decision per entry, never a bulk allowance)
+# and the fix PR for its issue MUST delete the entry here: this file is not a place to park a
+# failing test. Entry #319 was approved by the owner on 2026-11-22 for the timing-dependent
+# cascade-seed replay failure that has kept main red since 0225453; #319's fix PR removes it.
+pinned::reg_cascade_refusal_seed_replay #319
