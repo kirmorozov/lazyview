@@ -66,6 +66,10 @@ pub struct Tally {
     /// its whole source again (the `XaEnd` arm, `src/engine.rs`). Counted once per commit,
     /// never per binlog event.
     pub xa_unknown_commits: u64,
+    /// Flushes in which a row the cascade cache keeps, or a cascade parent's row, arrived in an
+    /// image the view cannot read (a short image, a partial JSON update): counted once per view
+    /// per flush, because the remedy is one whole-view refresh, never a rebuild.
+    pub cascade_short_images: u64,
 }
 
 impl Tally {
@@ -99,6 +103,7 @@ impl Tally {
         self.cascade_rows += o.cascade_rows;
         self.cascade_gaps += o.cascade_gaps;
         self.xa_unknown_commits += o.xa_unknown_commits;
+        self.cascade_short_images += o.cascade_short_images;
     }
 }
 
@@ -291,6 +296,7 @@ impl ViewStats {
             cascade_rows: self.tally.cascade_rows,
             cascade_gaps: self.tally.cascade_gaps,
             xa_unknown_commits: self.tally.xa_unknown_commits,
+            cascade_short_images: self.tally.cascade_short_images,
             cascade_cached_rows: self.cascade_cached_rows,
             entities_updated: self.updated,
             rows_inserted: r.inserted,
@@ -346,6 +352,9 @@ macro_rules! view_snapshot_fields {
             /// Unknown `XA COMMIT`s (prepared before this run) that refreshed the whole view.
             xa_unknown_commits: u64, json "xa_unknown_commits",
                 series ("xa_unknown_commits", "Unknown XA COMMITs (prepared before this run) that refreshed the whole view.", true);
+            /// Flushes that found a kept child row or a cascade parent image the view cannot read.
+            cascade_short_images: u64, json "cascade_short_images",
+                series ("cascade_short_images", "Flushes that refreshed the whole view because a row image omitted a column the view reads.", true);
             /// Rows kept in the live version's in-memory cascade cache.
             cascade_cached_rows: u64, json "cascade_cached_rows",
                 series ("cascade_cached_rows", "Rows kept in the live version's in-memory cascade cache.", false);
