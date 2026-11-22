@@ -198,7 +198,12 @@ fn adopt_decision(flavor: source::Flavor, saved: Option<&str>, st: &source::Gtid
 /// (`schema`, the metadata connection's, where the metadata tables and the commit fence live)
 /// must be binlogged, and so must the source DSN's default schema when it differs from it
 /// (source reads). The filters are read once; an unreadable status is debug-logged, not warned.
-async fn binlog_filter_checks(conn: &mut Conn, schema: &str, source_schema: Option<&str>) {
+async fn binlog_filter_checks(
+    conn: &mut Conn,
+    schema: &str,
+    defs_schema: &str,
+    source_schema: Option<&str>,
+) {
     let (do_db, ignore_db) = match binlog::binlog_filters(conn).await {
         Ok(f) => f,
         Err(e) => {
@@ -224,6 +229,18 @@ async fn binlog_filter_checks(conn: &mut Conn, schema: &str, source_schema: Opti
                  never reach lazyview"
             );
         }
+    }
+    // The definitions table may live in a schema of its own: a definition the management user
+    // changes there is noticed through the binlog, so a filter that drops that schema means the
+    // service only sees the definitions at the next restart.
+    if defs_schema != schema && excluded(defs_schema) {
+        warn!(
+            "binlog-do-db / binlog-ignore-db exclude the definitions schema {defs_schema}: \
+             changes to {defs_schema}.`{}` are not binlogged to lazyview, so a new or edited \
+             definition is noticed only when the service restarts; remove the filter or include \
+             {defs_schema}",
+            meta::DEFS
+        );
     }
 }
 
@@ -834,9 +851,16 @@ struct Slot {
     refresh_failures: u32,
     /// Re-plan once the build in flight is done (its source data was replaced meanwhile).
     replan_after: bool,
-    /// `_lazyview.rebuild` was set when the binlog was here: cleared once a build started at or
+    /// A rebuild was asked for when the binlog was here: cleared once a build started at or
     /// after this position is live.
     rebuild_asked: Option<Position>,
+    /// The `_lazyview.rebuild` value this view's live tables were built from: any other value in
+    /// the definitions table asks for one rebuild (`src/meta.rs: serve_rebuild`). Read from
+    /// `_lazyview_state` at startup, written back there when a requested build is live.
+    rebuild_served: u64,
+    /// The counter value of the rebuild in flight, acknowledged in `_lazyview_state` when the
+    /// build is live. `None`: no request being served.
+    rebuild_ack: Option<u64>,
     /// Hash of the definition whose planning timed out: not planned again until it changes.
     plan_timed_out: Option<String>,
     /// Refresh results and builds since the last hand-over to `/stats` (see `publish_stats`).
@@ -1253,6 +1277,11 @@ struct Engine {
     /// The binlog dump role: the one connection that reads the stream.
     binlog_opts: Opts,
     schema: String,
+    /// The schema that holds `_lazyview` (the definitions): `LAZYVIEW_DEFINITIONS_DATABASE`, or
+    /// `schema` when unset (the simple setup). In the advanced setup the service account has SELECT
+    /// there and nothing else, so nothing may write `_lazyview` from here; everything that reads or
+    /// watches the definitions table follows this field.
+    defs_schema: String,
     flavor: Flavor,
     /// Source capabilities, detected from the flavor once at connect.
     caps: SourceCaps,
@@ -1267,6 +1296,17 @@ struct Engine {
     slots: Vec<Slot>,
     /// View name → id of every enabled definition (chained views wait for these).
     def_names: HashMap<String, u64>,
+    /// See [`Engine::index_definitions`]: folded name → (owner id, the name as written).
+    def_owners: HashMap<String, (u64, String)>,
+    /// `_lazyview.rebuild` last served per definition id, read from `_lazyview_state` at startup
+    /// and kept current by [`meta::serve_rebuild`]: the request is a value this map does not hold.
+    /// A cache of the service's own rows, so no reload pays a query for it.
+    rebuild_served_map: HashMap<u64, u64>,
+    /// The name each definition had in `_lazyview_state` at startup, by definition id. The name of
+    /// a definition the parser rejects comes from nowhere else (the service never writes
+    /// `_lazyview.name`), and without it its state row and its last good table would be treated as
+    /// leftovers of a rename. Same read as [`Engine::rebuild_served_map`], so it costs no query.
+    prior_names: HashMap<u64, String>,
     /// Tables we have created and own: (name, target) → definition hash.
     owned: HashMap<(String, String), String>,
     routes: HashMap<TableRef, Arc<Vec<RouteT>>>,
@@ -2325,6 +2365,19 @@ impl Engine {
             "source database".to_string()
         };
         let schema = target::mysql::schema_of(&src_opts, "LAZYVIEW_DSN")?;
+        // The definitions schema (the advanced setup of S-02 / S-03): LAZYVIEW_DEFINITIONS_DATABASE
+        // when set, otherwise the service's own schema, which is the simple setup unchanged. The
+        // definitions table is the management user's: this process only reads and watches it.
+        let defs_schema = cfg
+            .definitions_database
+            .clone()
+            .unwrap_or_else(|| schema.clone());
+        if defs_schema != schema {
+            info!(
+                "definitions table `{defs_schema}`.`{}` (the service reads it only)",
+                meta::DEFS
+            );
+        }
         let Some(mut src) =
             connect_wait(&query_opts, &src_label, &metrics, shutdown, cfg.lock_wait_s).await?
         else {
@@ -2375,7 +2428,7 @@ impl Engine {
                 );
             }
             managed_service_checks(&mut ctrl).await;
-            binlog_filter_checks(&mut ctrl, &schema, ctrl_opts.db_name()).await;
+            binlog_filter_checks(&mut ctrl, &schema, &defs_schema, ctrl_opts.db_name()).await;
             let reader_id = server_identity(&mut src, info.flavor, None, 1).await?;
             let meta_id = server_identity(&mut meta_conn, info.flavor, None, 1).await?;
             if reader_id == meta_id {
@@ -2408,7 +2461,7 @@ impl Engine {
             });
         } else {
             managed_service_checks(&mut src).await;
-            binlog_filter_checks(&mut src, &schema, query_opts.db_name()).await;
+            binlog_filter_checks(&mut src, &schema, &defs_schema, query_opts.db_name()).await;
         }
         // Two runs (owner 2026-11-16): the operations run (the default) never issues DDL on
         // lazyview's own tables — it checks them through information_schema with SELECT rights
@@ -2417,9 +2470,9 @@ impl Engine {
         // owns all DDL on them. View tables in the targets are not lazyview's own tables: their
         // DDL stays in the operations run.
         if cfg.sync {
-            meta::verify(&mut meta_conn, &schema).await?;
+            meta::verify(&mut meta_conn, &schema, &defs_schema).await?;
         } else {
-            meta::ensure(&mut meta_conn, &schema).await?;
+            meta::ensure(&mut meta_conn, &schema, &defs_schema).await?;
         }
         // The leadership state, published by the beat task below and read by every write gate
         // (ruling 1): the engine holds the receiver, the task the sender. Open before the
@@ -2580,6 +2633,7 @@ impl Engine {
             meta_opts,
             binlog_opts,
             schema,
+            defs_schema,
             flavor: info.flavor,
             caps: info.flavor.detect(),
             server_version: info.version.clone(),
@@ -2589,6 +2643,9 @@ impl Engine {
             catalog: Catalog::default(),
             slots: Vec::new(),
             def_names: HashMap::new(),
+            def_owners: HashMap::new(),
+            rebuild_served_map: HashMap::new(),
+            prior_names: HashMap::new(),
             owned,
             routes: HashMap::new(),
             route_need: HashMap::new(),
@@ -2673,7 +2730,7 @@ impl Engine {
         };
 
         if !e.cfg.sync {
-            let defs = meta::load_definitions(&mut e.meta).await?;
+            let defs = meta::load_definitions(&mut e.meta, &e.defs_schema).await?;
             // Validate definitions only (usable in CI: non-zero exit on any problem).
             let mut bad = 0;
             let mut names: HashMap<String, u64> = HashMap::new();
@@ -2895,14 +2952,14 @@ impl Engine {
         // starts is then in this snapshot, in the stream from `start`, or both (reloading an unchanged
         // definition is a no-op). Read before the position, a commit in between was in neither and its
         // view was never built.
-        let defs = meta::load_definitions(&mut e.meta).await?;
+        let defs = meta::load_definitions(&mut e.meta, &e.defs_schema).await?;
         e.load_slots(defs, !rebuild_all).await?;
         e.rebuild_routes();
 
         if e.slots.is_empty() {
             info!(
                 "no views defined yet; add one with: INSERT INTO `{}`.`_lazyview` (definition) VALUES ('CREATE VIEW my_view AS SELECT ...')",
-                e.schema
+                e.defs_schema
             );
         }
         if e.cfg.start_mode == StartMode::Once {
@@ -3286,42 +3343,38 @@ impl Engine {
         }
     }
 
-    /// The view name in a `CREATE VIEW` definition is the source of truth: `_lazyview.name` is
-    /// filled in or updated to it (a renaming definition renames the view online). A bare SELECT
-    /// takes its name from `name`, so the two always agree then.
+    /// The view name comes from the definition: a `CREATE VIEW` names its view (a renaming
+    /// definition renames the view online), a bare SELECT takes `_lazyview.name`. The service never
+    /// writes `_lazyview` — the name is derived every time the row is read — so a change of a
+    /// definition stays the management user's, which the database's audit log attributes. Two
+    /// definitions that resolve to the same name: the later one (by id) goes to `error` with a
+    /// clear `last_error`, the visible outcome the table's unique key gave through ER 1062.
     async fn check_name(&mut self, d: &meta::DefRow, plan: &ViewPlan) -> Result<()> {
-        if d.name.as_deref() == Some(plan.name.as_str()) {
-            return Ok(());
-        }
-        match meta::set_name(&mut self.meta, d.id, &plan.name).await {
-            Ok(()) => Ok(()),
-            Err(e) if server_code(&e) == Some(1062) => {
-                let other = meta::definition_named(&mut self.meta, &plan.name)
-                    .await
-                    .ok()
-                    .flatten();
-                match other {
-                    Some((other_id, other)) if other != plan.name => Err(CaseClash {
+        // The lowest id that resolves to the name owns it (see `index_definitions`).
+        if let Some((owner_id, owner_name)) =
+            self.def_owners.get(&plan.name.to_lowercase()).cloned()
+        {
+            if owner_id != d.id {
+                if owner_name != plan.name {
+                    // Letter case alone is the same name to lazyview, as the case-insensitive
+                    // unique key of `_lazyview.name` always made it.
+                    return Err(CaseClash {
                         name: plan.name.clone(),
                         id: d.id,
-                        other,
-                        other_id,
+                        other: owner_name,
+                        other_id: owner_id,
                     }
-                    .into()),
-                    other => bail!(
-                        "name `{}` already used by row #{}",
-                        plan.name,
-                        other
-                            .map(|(i, _)| i.to_string())
-                            .unwrap_or_else(|| "?".into())
-                    ),
+                    .into());
                 }
-            }
-            Err(e) => {
-                warn!("recording _lazyview.name for #{}: {e:#}", d.id);
-                Ok(())
+                bail!(
+                    "name `{}` already used by row #{owner_id}: rename this view, or remove the \
+                     other definition with DELETE FROM {} WHERE id = {owner_id}",
+                    plan.name,
+                    meta::defs_table(&self.defs_schema)
+                );
             }
         }
+        Ok(())
     }
 
     /// Earliest time a routine full rebuild of this slot may start (rebuilds of full-mode views,
@@ -3678,17 +3731,25 @@ impl Engine {
         }
     }
 
-    /// Indexes the view names of the enabled definitions.
+    /// The view name of each definition: name → id (what a chained view resolves against), and the
+    /// letter-case-folded name → (its owner, the name as written). An owner is the lowest
+    /// `_lazyview.id` whose definition resolves to that name, the first-wins rule the table's unique
+    /// key imposed before the service stopped writing names; names that differ only in letter case
+    /// are one name to lazyview, as that key's collation made them.
     fn index_definitions(&mut self, defs: &[meta::DefRow]) {
-        self.def_names = defs
-            .iter()
-            .filter(|d| d.enabled)
-            .filter_map(|d| {
-                analyze::parse_definition(&d.effective_definition())
-                    .ok()
-                    .map(|p| (p.name, d.id))
-            })
-            .collect();
+        self.def_names.clear();
+        self.def_owners.clear();
+        for d in defs.iter().filter(|d| d.enabled) {
+            let Ok(p) = analyze::parse_definition(&d.effective_definition()) else {
+                continue;
+            };
+            self.def_names.insert(p.name.clone(), d.id);
+            let key = p.name.to_lowercase();
+            let owned = self.def_owners.get(&key).is_none_or(|(id, _)| *id > d.id);
+            if owned {
+                self.def_owners.insert(key, (d.id, p.name.clone()));
+            }
+        }
     }
 
     /// Plans definition `d` for slot `idx`, name checks included. Failures and waits are
@@ -3734,10 +3795,33 @@ impl Engine {
     }
 
     /// Initial slot creation at startup. With `resume`, valid existing tables become live (per
-    /// target; the others are built).
+    /// target; the others are built). The rebuild counter already served is read once here from
+    /// `_lazyview_state` — per start, never per definition reload or binlog event.
     async fn load_slots(&mut self, defs: Vec<meta::DefRow>, resume: bool) -> Result<()> {
         let defs: Vec<meta::DefRow> = defs.into_iter().filter(|d| d.enabled).collect();
         self.index_definitions(&defs);
+        // One read of the service's own state rows feeds both caches: per start, never per
+        // definition reload or binlog event.
+        let states = meta::load_state(&mut self.meta).await.unwrap_or_default();
+        let mut served: HashMap<u64, u64> = HashMap::new();
+        let mut prior: HashMap<u64, String> = HashMap::new();
+        for ((name, _), r) in states {
+            // The lowest value served among the view's targets: a target that has not been
+            // built from the request yet keeps the request pending.
+            let e = served.entry(r.definition_id).or_insert(u64::MAX);
+            *e = (*e).min(r.rebuild_served);
+            // Among a definition's state rows the name is the same; a leftover `#<id>` row (a
+            // definition that did not parse) never wins over the real name.
+            match prior.get_mut(&r.definition_id) {
+                Some(p) if p.starts_with('#') && !name.starts_with('#') => *p = name,
+                Some(_) => {}
+                None => {
+                    prior.insert(r.definition_id, name);
+                }
+            }
+        }
+        self.rebuild_served_map = served;
+        self.prior_names = prior;
         for d in &defs {
             let idx = self.new_slot(d);
             let Some(plan) = self.plan_slot(idx, d).await else {
@@ -3745,9 +3829,10 @@ impl Engine {
             };
             self.slots[idx].name = plan.name.clone();
             let mut build = d.targets.clone();
-            if d.rebuild {
-                info!(view = %plan.name, "rebuild requested (_lazyview.rebuild = 1)");
+            if d.rebuild != self.slots[idx].rebuild_served {
+                info!(view = %plan.name, "rebuild requested (_lazyview.rebuild = {})", d.rebuild);
                 self.slots[idx].rebuild_asked = Some(self.boundary.to_position());
+                self.slots[idx].rebuild_ack = Some(d.rebuild);
             } else if resume {
                 match self.try_resume(idx, &plan).await {
                     Ok(rest) => build = rest,
@@ -3855,15 +3940,18 @@ impl Engine {
     fn new_slot(&mut self, d: &meta::DefRow) -> usize {
         let def = d.effective_definition();
         let parsed = analyze::parse_definition(&def).ok();
+        // A definition that does not parse (any more) keeps the name it had — in its own row, or
+        // in the state row the last run left — so its last good table stays (it is in error, not
+        // deleted) and its error is visible under the name users know it by.
+        let name = parsed
+            .as_ref()
+            .map(|p| p.name.clone())
+            .or_else(|| d.name.clone())
+            .or_else(|| self.prior_names.get(&d.id).cloned())
+            .unwrap_or_else(|| format!("#{}", d.id));
         self.slots.push(Slot {
             def_id: d.id,
-            // A definition that does not parse (any more) keeps the name recorded in
-            // `_lazyview.name`, so its last good table stays (it is in error, not deleted).
-            name: parsed
-                .as_ref()
-                .map(|p| p.name.clone())
-                .or_else(|| d.name.clone())
-                .unwrap_or_else(|| format!("#{}", d.id)),
+            name,
             wanted: parsed
                 .map(|p| analyze::referenced_tables(&p.query, &self.schema))
                 .unwrap_or_default(),
@@ -3885,6 +3973,8 @@ impl Engine {
             refresh_failures: 0,
             replan_after: false,
             rebuild_asked: None,
+            rebuild_served: self.rebuild_served_map.get(&d.id).copied().unwrap_or(0),
+            rebuild_ack: None,
             plan_timed_out: None,
             stats: Default::default(),
             applied_ts: 0,
@@ -4273,7 +4363,7 @@ impl Engine {
     /// Re-reads `_lazyview` and reconciles slots: new, changed, renamed, retargeted, removed.
     async fn reload_definitions(&mut self) -> Result<()> {
         Metrics::add(&self.metrics.definition_reloads, 1);
-        let defs = meta::load_definitions(&mut self.meta).await?;
+        let defs = meta::load_definitions(&mut self.meta, &self.defs_schema).await?;
         let enabled: HashMap<u64, meta::DefRow> = defs
             .into_iter()
             .filter(|d| d.enabled)
@@ -4318,9 +4408,10 @@ impl Engine {
                 Some(idx) => {
                     let s = &self.slots[idx];
                     if s.hash == hash && s.targets == d.targets {
-                        if d.rebuild && s.rebuild_asked.is_none() {
-                            info!(view = %s.name, "rebuild requested (_lazyview.rebuild = 1)");
+                        if d.rebuild != s.rebuild_served && s.rebuild_asked.is_none() {
+                            info!(view = %s.name, "rebuild requested (_lazyview.rebuild = {})", d.rebuild);
                             self.slots[idx].rebuild_asked = Some(self.boundary.to_position());
+                            self.slots[idx].rebuild_ack = Some(d.rebuild);
                             // Also plans a definition again whose planning timed out.
                             self.slots[idx].plan_timed_out = None;
                             self.schedule_replan(id, false, false);
@@ -4333,8 +4424,9 @@ impl Engine {
             };
             let is_new = self.slots[idx].live.is_none() && self.slots[idx].next.is_none();
             let s = &mut self.slots[idx];
-            if d.rebuild && s.rebuild_asked.is_none() {
+            if d.rebuild != s.rebuild_served && s.rebuild_asked.is_none() {
                 s.rebuild_asked = Some(self.boundary.to_position());
+                s.rebuild_ack = Some(d.rebuild);
             }
             s.definition = d.effective_definition();
             s.hash = hash;
@@ -5598,15 +5690,19 @@ impl Engine {
                     }
                 }
                 // Our own tables: the commit fence's rows are not a foreign change, and no view
-                // reads them.
-                if !(key.0 == self.schema
+                // reads them. The definitions table counts as ours for this even where the
+                // service may only read it (the schema follows `LAZYVIEW_DEFINITIONS_DATABASE`).
+                if !((key.0 == self.schema
                     && (key.1 == meta::STATUS || key.1 == meta::STATE || key.1 == mysql::table()))
+                    || (key.0 == self.defs_schema && key.1 == meta::DEFS))
                 {
                     self.txn_foreign = true;
                 }
                 // The definitions table and the commit fence's table are ours: no view reads
                 // them, both are remembered without a route.
-                if key.0 == self.schema && (key.1 == meta::DEFS || key.1 == mysql::table()) {
+                if (key.0 == self.defs_schema && key.1 == meta::DEFS)
+                    || (key.0 == self.schema && key.1 == mysql::table())
+                {
                     self.table_ids.insert(table_id, (key, None, None, None));
                     return Ok(());
                 }
@@ -5755,7 +5851,7 @@ impl Engine {
                 let Some((key, route, src, need)) = self.table_ids.get(&table_id).cloned() else {
                     return Ok(());
                 };
-                if key.0 == self.schema && key.1 == meta::DEFS {
+                if key.0 == self.defs_schema && key.1 == meta::DEFS {
                     self.defs_dirty = true;
                     self.first_dirty.get_or_insert_with(Instant::now);
                     return Ok(());
@@ -6867,7 +6963,8 @@ impl Engine {
             } else {
                 self.catalog.invalidate(t);
             }
-            if t.0 == self.schema && (t.1 == meta::DEFS || t.1 == "*") {
+            if (t.0 == self.schema || t.0 == self.defs_schema) && (t.1 == meta::DEFS || t.1 == "*")
+            {
                 self.defs_dirty = true;
             }
         }
@@ -8286,11 +8383,24 @@ impl Engine {
             if s.stale_since.as_ref().is_some_and(|p| *p <= n.started) {
                 s.stale_since = None;
             }
-            // So does a rebuild asked for with `_lazyview.rebuild = 1`: the request is done.
+            // So does a rebuild asked for with `UPDATE _lazyview SET rebuild = rebuild + 1`: the
+            // request is acknowledged in the service's own state rows — `_lazyview` is never
+            // written here, so the request, and the audit trail of every definition change, stays
+            // the management user's. Cost: one UPDATE per view per served request, on this
+            // build-completion path, never per binlog event.
             if s.rebuild_asked.as_ref().is_some_and(|p| *p <= n.started) {
+                let served = s.rebuild_ack.take();
                 s.rebuild_asked = None;
-                if let Err(e) = meta::clear_rebuild(&mut self.meta, def_id).await {
-                    warn!(view = %n.name, "clearing _lazyview.rebuild: {e:#}");
+                if let Some(v) = served {
+                    if let Err(e) =
+                        meta::serve_rebuild(&mut self.meta, &n.name, &n.targets, v).await
+                    {
+                        warn!(view = %n.name, "acknowledging _lazyview.rebuild: {e:#}");
+                    } else {
+                        self.rebuild_served_map.insert(def_id, v);
+                        let s = &mut self.slots[i];
+                        s.rebuild_served = v;
+                    }
                 }
             }
             let s = &mut self.slots[i];

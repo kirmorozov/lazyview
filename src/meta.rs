@@ -1,5 +1,15 @@
 //! Service metadata tables in the source schema: definitions, per-table state, binlog position.
-//! Created and migrated (additively, idempotently) at startup.
+//! Created and migrated (additively, idempotently) by the setup run (`lazyview setup`).
+//!
+//! Two accounts, two schemas (owner 2026-11-15: "we need to separate status table from definition.
+//! to limit write scope for the service"): `_lazyview` holds the definitions and is written by the
+//! management user alone, so the database's audit log attributes every change of a definition to a
+//! person. The service account reads it (`SELECT` only) and writes only lazyview's own status
+//! tables — `_lazyview_state`, `_lazyview_status`, the commit fence. `LAZYVIEW_DEFINITIONS_DATABASE`
+//! puts the definitions in a schema of their own; unset it is `LAZYVIEW_DATABASE` and the simple
+//! setup is unchanged. The service never writes `_lazyview`: the view name is derived from the
+//! definition (never stored back) and a rebuild request is acknowledged in
+//! `_lazyview_state.rebuild_served`.
 
 use std::collections::HashMap;
 
@@ -51,12 +61,15 @@ const CREATE_DEFS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview` (
   `definition` MEDIUMTEXT NOT NULL,
   `targets` VARCHAR(255) NULL DEFAULT NULL,
   `enabled` TINYINT(1) NOT NULL DEFAULT 1,
-  `rebuild` TINYINT(1) NOT NULL DEFAULT 0,
+  `rebuild` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY `uq_lazyview_name` (`name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
 
+/// The per-view, per-target state, upserted by the service. `rebuild_served` holds the
+/// `_lazyview.rebuild` value this view and target were last built from: any value above it is a
+/// rebuild request, and this table is the only one the service writes (see `serve_rebuild`).
 const CREATE_STATE: &str = "CREATE TABLE IF NOT EXISTS `_lazyview_state` (
   `name` VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
   `target` VARCHAR(64) NOT NULL,
@@ -66,6 +79,7 @@ const CREATE_STATE: &str = "CREATE TABLE IF NOT EXISTS `_lazyview_state` (
   `detail` VARCHAR(255) NULL,
   `state` VARCHAR(16) NOT NULL,
   `managed` TINYINT(1) NOT NULL DEFAULT 0,
+  `rebuild_served` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `last_error` TEXT NULL,
   `refreshed_at` TIMESTAMP(3) NULL,
   `updated_at` TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -94,7 +108,10 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     (
         DEFS,
         "rebuild",
-        "TINYINT(1) NOT NULL DEFAULT 0 AFTER `enabled`",
+        // A counter, not a flag: the request is `UPDATE _lazyview SET rebuild = rebuild + 1` and
+        // the service acknowledges it in `_lazyview_state.rebuild_served`. `ensure` also widens an
+        // existing TINYINT (see the widening below).
+        "BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER `enabled`",
     ),
     (
         DEFS,
@@ -125,13 +142,38 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     (STATUS, "server_identity", "VARCHAR(255) NULL AFTER `epoch`"),
     (STATE, "route", "VARCHAR(16) NULL AFTER `detail`"),
     (STATE, "access", "TEXT NULL AFTER `route`"),
+    (
+        STATE,
+        "rebuild_served",
+        "BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER `managed`",
+    ),
 ];
 
-/// One-stop status: every definition with its per-target state.
-const CREATE_OVERVIEW: &str = "CREATE OR REPLACE SQL SECURITY INVOKER VIEW `_lazyview_overview` AS
+/// The definitions table, always schema-qualified: in the advanced setup it lives in a schema of
+/// its own where the service account has SELECT only, so a name that would resolve through the
+/// connection's default schema could read a different table. `defs_schema` is
+/// `LAZYVIEW_DEFINITIONS_DATABASE`, or `LAZYVIEW_DATABASE` when unset (the simple setup).
+pub fn defs_table(defs_schema: &str) -> String {
+    format!("`{}`.`{}`", defs_schema.replace('`', "``"), DEFS)
+}
+
+/// `CREATE_DEFS` with the table name qualified (its only occurrence is the created table).
+fn create_defs(defs_schema: &str) -> String {
+    CREATE_DEFS.replacen(&format!("`{DEFS}`"), &defs_table(defs_schema), 1)
+}
+
+/// One-stop status: every definition with its per-target state. The definitions table is
+/// qualified: it may live in the definitions schema, the view itself is created in the service's
+/// own schema next to the status tables.
+fn create_overview(defs_schema: &str) -> String {
+    format!(
+        "CREATE OR REPLACE SQL SECURITY INVOKER VIEW `_lazyview_overview` AS
 SELECT d.`id`, COALESCE(d.`name`, s.`name`, CONCAT('#', d.`id`)) AS `name`, s.`target`, d.`enabled`, s.`state`, s.`mode`,
        s.`detail`, s.`route`, s.`access`, s.`last_error`, s.`refreshed_at`, d.`updated_at` AS `definition_updated_at`, d.`definition`
-FROM `_lazyview` d LEFT JOIN `_lazyview_state` s ON s.`definition_id` = d.`id`";
+FROM {} d LEFT JOIN `_lazyview_state` s ON s.`definition_id` = d.`id`",
+        defs_table(defs_schema)
+    )
+}
 
 /// The commit-fence table (`src/fence.rs`) is lazyview's own table too: `setup` creates it and
 /// the operations run only checks for it (`verify` below). The DDL text mirrors the private
@@ -176,6 +218,7 @@ const REQUIRED: &[(&str, &[&str])] = &[
             "access",
             "state",
             "managed",
+            "rebuild_served",
             "last_error",
             "refreshed_at",
             "updated_at",
@@ -214,43 +257,110 @@ impl std::fmt::Display for SetupRequired {
 
 impl std::error::Error for SetupRequired {}
 
-/// Read-only pre-flight for the operations run: checks through `information_schema` (SELECT
-/// rights only, no DDL) that every table and column this build needs exists. A missing one is
-/// a startup error naming the fix. The convenience view `_lazyview_overview` is not required
-/// (it is a `setup` nicety).
-pub async fn verify(conn: &mut Conn, schema: &str) -> Result<()> {
-    let fence = crate::fence::table();
-    let mut need: Vec<(&str, &[&str])> = REQUIRED.to_vec();
-    need.push((fence, &["id", "n"]));
-    let present: Vec<String> = conn
-        .exec(
-            "SELECT CAST(TABLE_NAME AS CHAR) FROM information_schema.TABLES WHERE \
-             TABLE_SCHEMA = ? AND TABLE_NAME IN (?, ?, ?, ?)",
-            (schema, DEFS, STATE, STATUS, fence),
+/// Whether an error is the server refusing a statement for lack of a privilege (1044 database,
+/// 1142 table, 1143 column): the account that ran it is not the setup account.
+fn access_denied(e: &mysql_async::Error) -> bool {
+    matches!(
+        e,
+        mysql_async::Error::Server(s) if matches!(s.code, 1044 | 1142 | 1143)
+    )
+}
+
+/// The schema of a table this build needs: the definitions table is the management user's and may
+/// live in a schema of its own; every other table is lazyview's own, in its schema.
+fn table_schema<'a>(table: &str, schema: &'a str, defs_schema: &'a str) -> &'a str {
+    if table == DEFS {
+        defs_schema
+    } else {
+        schema
+    }
+}
+
+/// Presence of one table, read through `information_schema` (SELECT rights only, no DDL).
+async fn table_present(conn: &mut Conn, schema: &str, table: &str) -> Result<bool> {
+    let n: Option<u64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            (schema, table),
         )
         .await?;
+    Ok(n.unwrap_or(0) > 0)
+}
+
+/// Runs one piece of lazyview's own DDL (the setup run only). An account without the right to run
+/// it gets an error naming the setup run rather than the server's privilege error, and never a
+/// silent skip: MySQL checks the CREATE privilege even when `IF NOT EXISTS` would make the
+/// statement a no-op, so `ensure` asks `information_schema` first and runs the DDL only where a
+/// table or a column is really missing.
+async fn own_ddl(conn: &mut Conn, schema: &str, table: &str, sql: &str) -> Result<()> {
+    match conn.query_drop(sql).await {
+        Ok(()) => Ok(()),
+        Err(e) if access_denied(&e) => Err(SetupRequired(vec![if table == DEFS {
+            format!(
+                "no right to create or alter {} — the definitions table belongs to the \
+                 management user's schema: run `lazyview setup` with the setup account, which has \
+                 CREATE, ALTER and INDEX there",
+                defs_table(schema)
+            )
+        } else {
+            format!("no right to create or alter `{schema}`.`{table}`")
+        }])
+        .into()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read-only pre-flight for the operations run: checks through `information_schema` (SELECT
+/// rights only, no DDL) that every table and column this build needs exists — the definitions
+/// table in `defs_schema`, lazyview's own tables in `schema`. A missing one is a startup error
+/// naming the fix. The convenience view `_lazyview_overview` is not required (it is a `setup`
+/// nicety).
+pub async fn verify(conn: &mut Conn, schema: &str, defs_schema: &str) -> Result<()> {
+    let fence = crate::fence::table();
+    let mut need: Vec<(&str, &str, &[&str])> = REQUIRED
+        .iter()
+        .map(|(table, cols)| (table_schema(table, schema, defs_schema), *table, *cols))
+        .collect();
+    need.push((schema, fence, &["id", "n"]));
     let mut missing: Vec<String> = Vec::new();
-    for (table, cols) in &need {
-        if !present.iter().any(|t| t == table) {
-            missing.push(format!("table `{table}` is missing"));
+    for (sch, table, cols) in need {
+        if !table_present(conn, sch, table).await? {
+            missing.push(format!("table `{sch}`.`{table}` is missing"));
             continue;
         }
         let have: Vec<String> = conn
             .exec(
                 "SELECT CAST(COLUMN_NAME AS CHAR) FROM information_schema.COLUMNS WHERE \
                  TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-                (schema, *table),
+                (sch, table),
             )
             .await?;
-        for col in *cols {
+        for col in cols.iter() {
             if !have.iter().any(|c| c == col) {
-                missing.push(format!("`{table}`.{col} is missing"));
+                missing.push(format!("`{sch}`.`{table}`.{col} is missing"));
+            }
+        }
+        if table == DEFS {
+            // `rebuild` must be the counter the request grows (`SET rebuild = rebuild + 1`): a
+            // TINYINT from before this build stops asking once it saturates.
+            let ty: Option<Option<String>> = conn
+                .exec_first(
+                    "SELECT LOWER(DATA_TYPE) FROM information_schema.COLUMNS WHERE \
+                     TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'rebuild'",
+                    (sch, table),
+                )
+                .await?;
+            if !ty.flatten().is_some_and(|t| t.starts_with("bigint")) {
+                missing.push(format!(
+                    "{}.rebuild is not a counter yet (widening migration)",
+                    defs_table(sch)
+                ));
             }
         }
     }
     // State rows are keyed case-sensitively (`Lz_Case` and `lz_case` are different views):
     // `ensure` fixes the collation, the operations run only checks it.
-    if present.iter().any(|t| t == STATE) {
+    if table_present(conn, schema, STATE).await? {
         let collation: Option<Option<String>> = conn
             .exec_first(
                 "SELECT CAST(COLLATION_NAME AS CHAR) FROM information_schema.COLUMNS WHERE \
@@ -286,22 +396,68 @@ pub async fn verify(conn: &mut Conn, schema: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
-    for ddl in [CREATE_DEFS, CREATE_STATE, CREATE_STATUS] {
-        conn.query_drop(ddl).await?;
+/// Creates and migrates lazyview's own tables: the setup run (`lazyview setup`) is the only run
+/// that calls it (the operations run checks instead — see [`verify`]). `_lazyview` is created in
+/// `defs_schema`, where the setup account holds the DDL rights; the status tables, the commit
+/// fence and the convenience view stay in `schema`, the service's own schema.
+pub async fn ensure(conn: &mut Conn, schema: &str, defs_schema: &str) -> Result<()> {
+    if !table_present(conn, defs_schema, DEFS).await? {
+        own_ddl(conn, defs_schema, DEFS, &create_defs(defs_schema)).await?;
     }
-    conn.query_drop(create_fence()).await?;
+    let fence = crate::fence::table();
+    for (table, sql) in [
+        (STATE, CREATE_STATE.to_string()),
+        (STATUS, CREATE_STATUS.to_string()),
+        (fence, create_fence()),
+    ] {
+        if !table_present(conn, schema, table).await? {
+            own_ddl(conn, schema, table, &sql).await?;
+        }
+    }
     for (table, col, def) in MIGRATIONS {
+        let sch = table_schema(table, schema, defs_schema);
         let n: Option<u64> = conn
             .exec_first(
                 "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
-                (schema, *table, *col),
+                (sch, *table, *col),
             )
             .await?;
         if n == Some(0) {
-            conn.query_drop(format!("ALTER TABLE `{table}` ADD COLUMN `{col}` {def}"))
-                .await?;
+            let sql = if *table == DEFS {
+                format!("ALTER TABLE {} ADD COLUMN `{col}` {def}", defs_table(sch))
+            } else {
+                format!("ALTER TABLE `{table}` ADD COLUMN `{col}` {def}")
+            };
+            own_ddl(conn, sch, table, &sql).await?;
         }
+    }
+    // `rebuild` widened from the first release's TINYINT(1) to a counter: the request grows it
+    // (`UPDATE _lazyview SET rebuild = rebuild + 1`, the management user's statement) and the
+    // service acknowledges it in `_lazyview_state.rebuild_served`, so the value must keep growing
+    // and never saturate. Additive only, and idempotent: the ALTER runs while the column is not a
+    // BIGINT yet. A request left by the old version (`rebuild = 1`, never served) is still served
+    // once, because a new `rebuild_served` row starts at 0. This is DDL on the definitions table:
+    // it belongs to the setup account, and the operations run only checks it (`verify` above).
+    let rebuild_type: Option<Option<String>> = conn
+        .exec_first(
+            "SELECT LOWER(DATA_TYPE) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'rebuild'",
+            (defs_schema, DEFS),
+        )
+        .await?;
+    if !rebuild_type
+        .flatten()
+        .is_some_and(|t| t.starts_with("bigint"))
+    {
+        own_ddl(
+            conn,
+            defs_schema,
+            DEFS,
+            &format!(
+                "ALTER TABLE {} MODIFY `rebuild` BIGINT UNSIGNED NOT NULL DEFAULT 0",
+                defs_table(defs_schema)
+            ),
+        )
+        .await?;
     }
     // `binlog_cursor` widened to MEDIUMTEXT for the resume-by-GTID plan: the cursor text can carry
     // a whole GTID set (`file:pos[g=…]`), which a few thousand writers could push past VARCHAR(255)
@@ -343,13 +499,21 @@ pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
     }
     let idx: Option<u64> = conn
         .exec_first(
-            "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_lazyview' AND INDEX_NAME = 'uq_lazyview_name'",
-            (schema,),
+            "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'uq_lazyview_name'",
+            (defs_schema, DEFS),
         )
         .await?;
     if idx == Some(0) {
-        conn.query_drop("ALTER TABLE `_lazyview` ADD UNIQUE KEY `uq_lazyview_name` (`name`)")
-            .await?;
+        own_ddl(
+            conn,
+            defs_schema,
+            DEFS,
+            &format!(
+                "ALTER TABLE {} ADD UNIQUE KEY `uq_lazyview_name` (`name`)",
+                defs_table(defs_schema)
+            ),
+        )
+        .await?;
     }
     // Recreate the convenience view only when it is missing or outdated (avoids DDL per start).
     let current: Option<Option<String>> = conn
@@ -358,13 +522,19 @@ pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
             (schema,),
         )
         .await?;
+    // The definitions schema is named in the view text, so a view built for another one counts
+    // as outdated.
     let up_to_date = current
         .flatten()
-        .map(|d| (d.contains("`d`.`name`") || d.contains("d.name")) && d.contains("route"))
+        .map(|d| {
+            (d.contains("`d`.`name`") || d.contains("d.name"))
+                && d.contains("route")
+                && d.contains(&format!("`{}`", defs_schema.replace('`', "``")))
+        })
         .unwrap_or(false);
     if !up_to_date {
         // A convenience only: never fatal.
-        if let Err(e) = conn.query_drop(CREATE_OVERVIEW).await {
+        if let Err(e) = conn.query_drop(create_overview(defs_schema)).await {
             tracing::warn!("cannot create _lazyview_overview: {e}");
         }
     }
@@ -379,8 +549,10 @@ pub struct DefRow {
     pub definition: String,
     pub targets: Vec<String>,
     pub enabled: bool,
-    /// `rebuild = 1`: rebuild the view once (cleared by lazyview when the new table is live).
-    pub rebuild: bool,
+    /// The rebuild counter: any value different from `_lazyview_state.rebuild_served` asks for one
+    /// rebuild, which the service acknowledges there (never here). The request is
+    /// `UPDATE _lazyview SET rebuild = rebuild + 1`, the management user's statement.
+    pub rebuild: u64,
 }
 
 pub fn parse_targets(s: Option<&str>) -> Vec<String> {
@@ -417,42 +589,41 @@ impl DefRow {
     }
 }
 
-/// Records the view name of a `CREATE VIEW` definition in `name` (filled in for rows inserted
-/// without one, updated when the definition renames the view). Fails with ER 1062 when another
-/// row uses the name.
-pub async fn set_name(conn: &mut Conn, id: u64, name: &str) -> Result<()> {
+/// Acknowledges a rebuild request: records in `_lazyview_state` the `_lazyview.rebuild` value the
+/// view's targets were built from (`serve_rebuild` is the whole acknowledgment — the service never
+/// writes `_lazyview`, so every change of a definition stays the management user's and the
+/// database's audit log attributes it).
+///
+/// Cost: one UPDATE per view per served request, on the build-completion path — never per binlog
+/// event. The `<> ?` guard keeps it from rewriting a row that already carries the value.
+pub async fn serve_rebuild(
+    conn: &mut Conn,
+    name: &str,
+    targets: &[String],
+    served: u64,
+) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let marks = vec!["?"; targets.len()].join(",");
+    let mut params: Vec<mysql_async::Value> = Vec::with_capacity(targets.len() + 3);
+    params.push(served.into());
+    params.push(name.into());
+    params.extend(targets.iter().map(|t| t.as_str().into()));
+    params.push(served.into());
     conn.exec_drop(
-        "UPDATE `_lazyview` SET `name` = ? WHERE `id` = ? AND NOT (`name` <=> ?)",
-        (name, id, name),
+        format!(
+            "UPDATE `_lazyview_state` SET `rebuild_served` = ? WHERE `name` = ? AND `target` IN ({marks}) AND `rebuild_served` <> ?"
+        ),
+        Params::Positional(params),
     )
     .await?;
     Ok(())
 }
 
-/// Clears the `rebuild` request of definition `id` (its rebuilt table is live). Leaves
-/// `updated_at` alone: the definition did not change.
-pub async fn clear_rebuild(conn: &mut Conn, id: u64) -> Result<()> {
-    conn.exec_drop(
-        "UPDATE `_lazyview` SET `rebuild` = 0, `updated_at` = `updated_at` WHERE `id` = ? AND `rebuild` <> 0",
-        (id,),
-    )
-    .await?;
-    Ok(())
-}
-
-/// The id and the name of the `_lazyview` row named `name` (the key ignores letter case).
-pub async fn definition_named(conn: &mut Conn, name: &str) -> Result<Option<(u64, String)>> {
-    Ok(conn
-        .exec_first(
-            "SELECT `id`, CAST(`name` AS CHAR) FROM `_lazyview` WHERE `name` = ?",
-            (name,),
-        )
-        .await?)
-}
-
-pub async fn load_definitions(conn: &mut Conn) -> Result<Vec<DefRow>> {
+pub async fn load_definitions(conn: &mut Conn, defs_schema: &str) -> Result<Vec<DefRow>> {
     let rows: Vec<(u64, Option<String>, String, Option<String>, i64, i64)> = conn
-        .query("SELECT `id`, CAST(`name` AS CHAR), CAST(`definition` AS CHAR), CAST(`targets` AS CHAR), `enabled`, `rebuild` FROM `_lazyview` ORDER BY `id`")
+        .query(format!("SELECT `id`, CAST(`name` AS CHAR), CAST(`definition` AS CHAR), CAST(`targets` AS CHAR), `enabled`, `rebuild` FROM {} ORDER BY `id`", defs_table(defs_schema)))
         .await?;
     Ok(rows
         .into_iter()
@@ -462,7 +633,7 @@ pub async fn load_definitions(conn: &mut Conn) -> Result<Vec<DefRow>> {
             definition,
             targets: parse_targets(targets.as_deref()),
             enabled: enabled != 0,
-            rebuild: rebuild != 0,
+            rebuild: rebuild.max(0) as u64,
         })
         .collect())
 }
@@ -476,15 +647,18 @@ pub struct StateRow {
     pub managed: bool,
     /// The access plan EXPLAIN text written with the state (NULL before the column existed).
     pub access: Option<String>,
+    /// The `_lazyview.rebuild` value this view and target were last built from: a definition whose
+    /// counter differs from it asks for one rebuild (see [`serve_rebuild`]).
+    pub rebuild_served: u64,
 }
 
 pub async fn load_state(conn: &mut Conn) -> Result<HashMap<(String, String), StateRow>> {
-    let rows: Vec<(String, String, u64, String, String, i64, Option<String>)> = conn
-        .query("SELECT `name`, `target`, `definition_id`, `definition_hash`, `state`, `managed`, `access` FROM `_lazyview_state`")
+    let rows: Vec<(String, String, u64, String, String, i64, Option<String>, i64)> = conn
+        .query("SELECT `name`, `target`, `definition_id`, `definition_hash`, `state`, `managed`, `access`, `rebuild_served` FROM `_lazyview_state`")
         .await?;
     Ok(rows
         .into_iter()
-        .map(|(n, t, id, hash, state, managed, access)| {
+        .map(|(n, t, id, hash, state, managed, access, served)| {
             (
                 (n, t),
                 StateRow {
@@ -493,6 +667,7 @@ pub async fn load_state(conn: &mut Conn) -> Result<HashMap<(String, String), Sta
                     state,
                     managed: managed != 0,
                     access,
+                    rebuild_served: served.max(0) as u64,
                 },
             )
         })
@@ -1044,6 +1219,32 @@ mod tests {
         assert!(sql.contains("`n` BIGINT UNSIGNED NOT NULL"));
     }
 
+    /// The definitions table is always named with its schema (the service account may have SELECT
+    /// only there), the service's own tables stay in the connection's schema.
+    #[test]
+    fn definitions_table_is_schema_qualified() {
+        assert_eq!(defs_table("ctl"), "`ctl`.`_lazyview`");
+        assert_eq!(defs_table("a`b"), "`a``b`.`_lazyview`");
+        let ddl = create_defs("ctl");
+        assert!(
+            ddl.starts_with("CREATE TABLE IF NOT EXISTS `ctl`.`_lazyview` ("),
+            "{ddl}"
+        );
+        assert!(ddl.contains("`rebuild` BIGINT UNSIGNED NOT NULL DEFAULT 0"));
+        let view = create_overview("ctl");
+        assert!(
+            view.contains("FROM `ctl`.`_lazyview` d LEFT JOIN `_lazyview_state` s"),
+            "{view}"
+        );
+        assert!(!view.contains("`ctl`.`_lazyview_state`"));
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|(t, c, _)| *t == STATE && *c == "rebuild_served"),
+            "rebuild_served must arrive as an additive migration"
+        );
+    }
+
     #[test]
     fn effective_definition() {
         let row = |name: Option<&str>, def: &str| DefRow {
@@ -1052,7 +1253,7 @@ mod tests {
             definition: def.to_string(),
             targets: vec![],
             enabled: true,
-            rebuild: false,
+            rebuild: 0,
         };
         assert_eq!(
             row(Some("v"), " SELECT 1 ").effective_definition(),

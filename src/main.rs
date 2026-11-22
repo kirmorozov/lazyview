@@ -23,6 +23,9 @@ USAGE:
 CONNECTION (either):
   LAZYVIEW_HOST, LAZYVIEW_PORT (3306), LAZYVIEW_USER, LAZYVIEW_PASSWORD, LAZYVIEW_DATABASE
   LAZYVIEW_DSN=mysql://user:pass@host:3306/database      (mariadb:// accepted)
+  LAZYVIEW_DEFINITIONS_DATABASE=<schema>   advanced setup: the schema that holds _lazyview,
+                         where the service account then needs SELECT only; unset it is
+                         LAZYVIEW_DATABASE (the simple setup)
   LAZYVIEW_TLS=disabled|required|verify-full   LAZYVIEW_TLS_CA=/path/ca.pem (private CA)
   A password (or the health token below) may be a reference instead of a value:
   file:///abs/path, aws-secret://<secret-id>[#<json-field>] (with --features aws-secrets),
@@ -38,6 +41,9 @@ COMMON SETTINGS:
   LAZYVIEW_LOG_FORMAT=text|json   RUST_LOG=info
 
 Then: INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW v AS SELECT ...');
+     (the definitions are the management user's table: the service only reads it)
+Rebuild one view online: UPDATE _lazyview SET rebuild = rebuild + 1 WHERE ... ;
+     (the service acknowledges each new value in _lazyview_state.rebuild_served)
 See README.md for everything else.
 ";
 

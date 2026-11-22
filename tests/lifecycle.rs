@@ -890,7 +890,8 @@ async fn name_of(dsn: &str, id: u64) -> Result<Option<String>> {
 }
 
 /// `_lazyview.name`: definitions by name with a bare SELECT, UPDATE / DELETE by name, duplicate
-/// names rejected by the table, name ≠ view name → error, NULL name backfilled.
+/// names rejected by the table, name ≠ view name → the definition wins and the row is left alone,
+/// a CREATE VIEW name another row uses → error naming that row.
 #[test]
 fn lifecycle_named_definitions() {
     scenario("lc_named", |ctx| async move {
@@ -972,13 +973,16 @@ fn lifecycle_named_definitions() {
             ),
         }
 
-        // Name ≠ the definition's view name: the CREATE VIEW name wins and `name` follows it.
+        // Name ≠ the definition's view name: the CREATE VIEW name wins, and `_lazyview.name` is
+        // left exactly as the management user wrote it — the name is derived from the definition on
+        // every read and never written back (the table is the management user's, so the database's
+        // audit log keeps every change as theirs).
         exec(&mut c, "INSERT INTO _lazyview (name, definition) VALUES ('v_a', 'CREATE VIEW v_b AS SELECT id FROM orders')").await?;
         let renamed = scalar_i64(&mut c, "SELECT LAST_INSERT_ID()").await? as u64;
         wait_ready(&mut c, &mut eng, &["v_b"], t_ready()).await?;
         ensure!(
-            name_of(&db.dsn, renamed).await?.as_deref() == Some("v_b"),
-            "_lazyview.name not updated to the CREATE VIEW name"
+            name_of(&db.dsn, renamed).await?.as_deref() == Some("v_a"),
+            "the service rewrote _lazyview.name"
         );
         ensure!(
             !table_exists(&mut c, "v_a").await?,
@@ -1000,19 +1004,19 @@ fn lifecycle_named_definitions() {
             "v_c materialized despite the duplicate CREATE VIEW name"
         );
 
-        // CREATE VIEW with NULL name → name backfilled.
+        // CREATE VIEW with a NULL name: the view is built under the name its own statement gives,
+        // and the row keeps `name` NULL (the name is derived per read, never stored back).
         let v3 = ViewSpec::new(
             "v_backfilled",
             Kind::Incremental,
             "SELECT id, name FROM customers WHERE id % 2 = 1",
         );
         let id3 = add_definition(&mut c, &v3.definition, None).await?;
-        wait_until("name backfilled from the CREATE VIEW", t_ready(), || {
-            let dsn = db.dsn.clone();
-            async move { Ok(name_of(&dsn, id3).await?.as_deref() == Some("v_backfilled")) }
-        })
-        .await?;
         wait_ready(&mut c, &mut eng, &["v_backfilled"], t_ready()).await?;
+        ensure!(
+            name_of(&db.dsn, id3).await?.is_none(),
+            "the service wrote the derived name into _lazyview"
+        );
 
         // DELETE … WHERE name = → dropped.
         exec(&mut c, "DELETE FROM _lazyview WHERE name = 'v_named'").await?;
@@ -1034,7 +1038,8 @@ fn lifecycle_named_definitions() {
 }
 
 /// Upgrade path: a pre-existing minimal `_lazyview(id, definition, enabled)` (no name / targets /
-/// timestamps) is migrated on start, names are backfilled and the views get built.
+/// timestamps) is migrated on start, the views get built under the names their definitions give,
+/// and `name` stays NULL (the service never writes the table).
 #[test]
 fn lifecycle_metadata_upgrade_from_minimal_table() {
     scenario("lc_upgrade", |ctx| async move {
@@ -1083,7 +1088,8 @@ fn lifecycle_metadata_upgrade_from_minimal_table() {
                 "_lazyview not migrated: no column {needed} in {cols:?}"
             );
         }
-        // Names are backfilled once a definition plans; the disabled one (#3) is never planned.
+        // The names stay NULL: they are derived from the definitions on every read, and the
+        // definitions table is the management user's. The disabled one (#3) is never planned.
         let named = rows(
             &mut c,
             "SELECT id, name FROM _lazyview WHERE enabled = 1 ORDER BY id",
@@ -1091,11 +1097,8 @@ fn lifecycle_metadata_upgrade_from_minimal_table() {
         .await?;
         let got: Vec<Option<String>> = named.iter().map(|r| r[1].clone()).collect();
         ensure!(
-            got == vec![
-                Some("v_paid_orders".to_string()),
-                Some("v_status_counts".to_string())
-            ],
-            "names not backfilled: {named:?}"
+            got == vec![None, None],
+            "the service wrote derived names into _lazyview: {named:?}"
         );
         ensure!(
             !table_exists(&mut c, "v_disabled").await?,
@@ -1465,7 +1468,8 @@ fn lifecycle_state_carries_route_and_access() {
         exec(
             &mut c,
             &format!(
-                "UPDATE _lazyview SET definition = {} WHERE name = {}",
+                "UPDATE _lazyview SET definition = {} WHERE id = \
+                 (SELECT definition_id FROM `_lazyview_state` WHERE `name` = {} LIMIT 1)",
                 q(&new_a.definition),
                 q(&new_a.name)
             ),

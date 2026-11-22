@@ -163,11 +163,7 @@ fn reg_swap_bg_abandoned_swap_rearms_the_next_rebuild() {
             ],
         )?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-        exec(
-            &mut c,
-            "UPDATE _lazyview SET rebuild = 1 WHERE name = 'r_locked'",
-        )
-        .await?;
+        request_rebuild(&mut c, "r_locked").await?;
         let r = async {
             // The swap is waiting, and cannot succeed while the reader is open: the OTHER view is
             // refreshed promptly all the same. A loop that waits for the table lock stalls these.
@@ -218,7 +214,7 @@ fn reg_swap_bg_abandoned_swap_rearms_the_next_rebuild() {
         // to ask for the swap again (the re-armed rebuild), or the flag stays set forever.
         exec(&mut reader, "COMMIT").await?;
         r?;
-        wait_rebuild_flag_cleared(&mut c, &mut eng, "r_locked").await?;
+        wait_rebuild_served(&mut c, &mut eng, "r_locked").await?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
         verify(
             &ctx,
@@ -291,9 +287,12 @@ fn reg_dependent_of_view_in_error_shows_its_error() {
             "the troubleshooting query lists {listed} of the 3 views in error"
         );
         // Fixing the upstream builds the whole chain.
+        let bad = definition_id(&mut c, "lz_bad").await?;
         exec(
             &mut c,
-            "UPDATE _lazyview SET definition = 'SELECT id, status FROM orders' WHERE name = 'lz_bad'",
+            &format!(
+                "UPDATE `_lazyview` SET definition = 'SELECT id, status FROM orders' WHERE `id` = {bad}"
+            ),
         )
         .await?;
         let specs = vec![
@@ -431,34 +430,57 @@ fn reg_failed_build_keeps_planned_mode() {
 
 /// `_lazyview.rebuild` of view `name` (0 once lazyview has done the requested rebuild).
 async fn rebuild_flag(c: &mut mysql_async::Conn, name: &str) -> Result<i64> {
-    typed_exec_first(c, "SELECT rebuild FROM _lazyview WHERE name = ?", (name,))
-        .await?
-        .context("no _lazyview row")
+    // The definitions table keeps no view name of its own (the service never writes it): the row
+    // is found through the state row, which carries the name the definition resolves to.
+    typed_exec_first(
+        c,
+        "SELECT rebuild FROM _lazyview WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = ? LIMIT 1)",
+        (name,),
+    )
+    .await?
+    .context("no _lazyview row")
 }
 
-/// Waits until lazyview cleared `_lazyview.rebuild` of `name`.
-async fn wait_rebuild_flag_cleared(
+/// The `_lazyview_state.rebuild_served` value of view `name`: the lowest among its targets, since
+/// a target not built from the request yet keeps the request pending.
+async fn rebuild_served(c: &mut mysql_async::Conn, name: &str) -> Result<i64> {
+    typed_exec_first(
+        c,
+        "SELECT MIN(rebuild_served) FROM _lazyview_state WHERE name = ?",
+        (name,),
+    )
+    .await?
+    .context("no _lazyview_state row")
+}
+
+/// Waits until lazyview acknowledged the rebuild request: it never writes `_lazyview` (the counter
+/// is the management user's), so it is served when `_lazyview_state.rebuild_served` has reached
+/// `_lazyview.rebuild`.
+async fn wait_rebuild_served(
     c: &mut mysql_async::Conn,
     eng: &mut Engine,
     name: &str,
 ) -> Result<()> {
     let t = std::time::Instant::now();
-    while rebuild_flag(c, name).await? != 0 {
+    loop {
+        if rebuild_flag(c, name).await? == rebuild_served(c, name).await? {
+            return Ok(());
+        }
         eng.check_alive()?;
         ensure!(
             t.elapsed() < t_ready(),
-            "{name}: _lazyview.rebuild still set after {:?}",
+            "{name}: rebuild request not served after {:?}",
             t_ready()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(())
 }
 
 /// There was no way to rebuild one view (hand edits of its table are not noticed, and the
 /// tricks a user tries, `SET definition = definition`, do nothing). `UPDATE _lazyview SET
-/// rebuild = 1` rebuilds that view online and is cleared once the new table is live, also when
-/// set while lazyview is stopped; the other views are left alone.
+/// rebuild = rebuild + 1` (the management user's statement) rebuilds that view online and is
+/// acknowledged in `_lazyview_state.rebuild_served`, also when set while lazyview is stopped; the
+/// other views are left alone.
 #[test]
 fn reg_rebuild_flag_rebuilds_one_view() {
     scenario("reg_rebuild_flag", |ctx| async move {
@@ -483,23 +505,22 @@ fn reg_rebuild_flag_rebuilds_one_view() {
         for restart in [false, true] {
             // A hand edit lazyview cannot notice.
             exec(&mut c, "DELETE FROM r_counts WHERE customer_id = 1").await?;
-            let ask = "UPDATE _lazyview SET rebuild = 1 WHERE name = 'r_counts'";
             let updated_sql =
-                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE name = 'r_counts'";
+                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = 'r_counts' LIMIT 1)";
             let updated: Option<String> = if restart {
                 // Set while lazyview is stopped: the restart rebuilds instead of resuming.
                 let running = eng;
                 running.stop().await?;
-                exec(&mut c, ask).await?;
+                request_rebuild(&mut c, "r_counts").await?;
                 let u = typed_first(&mut c, updated_sql).await?;
                 eng = ctx.start_engine(&db, &[])?;
                 u
             } else {
-                exec(&mut c, ask).await?;
+                request_rebuild(&mut c, "r_counts").await?;
                 typed_first(&mut c, updated_sql).await?
             };
             let before = eng.snapshot();
-            wait_rebuild_flag_cleared(&mut c, &mut eng, "r_counts").await?;
+            wait_rebuild_served(&mut c, &mut eng, "r_counts").await?;
             wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
             let what = if restart { "restart" } else { "running" };
             verify(
@@ -518,7 +539,7 @@ fn reg_rebuild_flag_rebuilds_one_view() {
             );
             let after: Option<String> = typed_first(
                 &mut c,
-                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE name = 'r_counts'",
+                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = 'r_counts' LIMIT 1)",
             )
             .await?;
             ensure!(
@@ -599,9 +620,7 @@ fn reg_case_only_name_clash() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_case_clash", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
-        let first: u64 = typed_first(&mut c, "SELECT id FROM _lazyview WHERE name = 'Lz_Case'")
-            .await?
-            .context("no Lz_Case row")?;
+        let first = definition_id(&mut c, "Lz_Case").await?;
         exec(
             &mut c,
             "INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW lz_case AS SELECT id, customer_id FROM orders')",

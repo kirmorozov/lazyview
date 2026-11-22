@@ -2271,7 +2271,7 @@ async fn run_in_db(
             a.orders, a.customers, a.items, a.sessions
         ),
     );
-    lazyview::meta::ensure(&mut c, db).await?;
+    lazyview::meta::ensure(&mut c, db, db).await?;
     for v in &views {
         exec(
             &mut c,

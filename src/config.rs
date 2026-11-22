@@ -133,6 +133,14 @@ pub struct Config {
     pub targets: BTreeMap<String, String>,
     pub start_mode: StartMode,
     pub sync: bool,
+    /// `LAZYVIEW_DEFINITIONS_DATABASE`: the schema that holds `_lazyview`, the definitions table.
+    /// Unset it is the DSN's own database, so the simple setup is unchanged. Set, that schema
+    /// holds `_lazyview` only and the service account has SELECT there and nothing else: every
+    /// change of a definition is then the management user's, which the database's audit log
+    /// attributes (S-02 / S-03, owner 2026-11-15: "we need to separate status table from
+    /// definition. to limit write scope for the service"). The status tables and the view tables
+    /// stay in the service's own schema.
+    pub definitions_database: Option<String>,
     pub batch_window: Duration,
     pub batch_max_keys: usize,
     pub query_chunk: usize,
@@ -494,6 +502,9 @@ impl Config {
             targets,
             start_mode,
             sync: flag("LAZYVIEW_SYNC", true)?,
+            definitions_database: get("LAZYVIEW_DEFINITIONS_DATABASE")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             batch_window: Duration::from_millis(num("LAZYVIEW_BATCH_WINDOW_MS", 200)?),
             batch_max_keys: num("LAZYVIEW_BATCH_MAX_KEYS", 50_000)? as usize,
             query_chunk,
