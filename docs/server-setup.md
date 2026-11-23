@@ -49,6 +49,31 @@ source schema never reach lazyview at all. The filters are startup options:
 changing them needs a server restart, then restart lazyview to clear the
 warning.
 
+How the check works, and what it covers: the two checks run once, at startup, from `Engine::start`
+(`src/engine.rs:1858`). The two lists are columns 2 and 3 of that same status statement
+(`binlog_filters`, `src/binlog/probe.rs:53`, exported at `src/binlog.rs:63`). A schema counts as
+excluded when a non-empty `binlog-do-db` leaves it out, or when `binlog-ignore-db` names it
+(`schema_filtered`, `src/binlog/probe.rs:87`) — comma-separated lists, spaces around the entries
+ignored, names compared exactly and case-sensitively, as the server compares database names on the
+platform; the unit test `schema_filtered_by_binlog_filters` (`src/binlog/tests.rs:686`) pins those
+cases. A server whose status cannot be read is debug-logged rather than warned
+(`src/engine.rs:203-209`): the filters are one possible reason for missing changes, not something a
+run needs in order to start.
+
+| excluded schema | what stops arriving | what to do |
+|---|---|---|
+| lazyview's own (`LAZYVIEW_DATABASE`) | its metadata and visibility-fence writes are not binlogged, so the fence cannot prove visibility | remove the filter or include the schema |
+| a source schema (the source DSN's default, when it differs from it) | changes to tables in that schema never reach lazyview | remove the filter or include the schema |
+
+Both are branches of `binlog_filter_checks` (`src/engine.rs:200`), and only the first of the two
+warnings names the remedy: it ends `remove the filter or include {schema}`
+(`src/engine.rs:213-217`), while the other stops at `changes to tables in {s} never reach
+lazyview` (`src/engine.rs:221-224`). The server asked is the one whose binlog lazyview reads, the
+writer: the control connection when `LAZYVIEW_READ_DSN` moves the `SELECT`s to a replica
+(`src/engine.rs:1956`), the source connection when there is no read split (`:1989`). A replica is
+not asked — its own status statement speaks for its own log, and these are writer-side checks,
+"properties of the server the stream comes from" (`src/engine.rs:1929-1935`).
+
 ### sql_mode
 
 lazyview's own sessions reset the parts of the server's `sql_mode` that change how SQL text is
