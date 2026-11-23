@@ -386,7 +386,8 @@ pub struct ChaosRun<'a> {
     /// (`soakcheck::set_writers`, the same call `quiesce_and_check` makes around every event's
     /// check), the engine is waited out to a caught-up point (`applied()` past what the source
     /// holds, the same observable `wait_caught_up` uses), and the writers are turned back on once the
-    /// engine has restarted. The pause is what makes the anchor reachable at all: `run_paced` paces
+    /// restarted engine has reported itself streaming (`wait_streaming`) and before `wait_ready`, which
+    /// like `wait_flushed` needs them producing. The pause is what makes the anchor reachable at all: `run_paced` paces
     /// against the wall clock, so a loaded engine is never at the head for three rounds and the wait
     /// alone would fail a run at `LAZYVIEW_TEST_SOAK_TPS=400`. Empty — the soak's shape — is the
     /// plain kill-9 at the scheduled instant, which is what made a pinned replay a lottery on host
@@ -512,18 +513,18 @@ pub async fn run_event(
                 c.disconnect().await.ok();
             }
             eng = run.start_engine()?;
-            // The writers come back once the engine is streaming, not before. Resuming them at the
-            // restart instead lets their catch-up burst — `run_paced` chases its own schedule, so a
-            // pause of t at TPS 400 is ~400·t rows to write as fast as it can — land on an engine that
-            // is still connecting and taking its snapshot. That is what a red run looked like at
-            // `70e138a`: `fix5-m97-tps400/a2-135857Z` died on `timed out after 180s waiting for the
-            // engine streaming again` with the pause logged 13 s earlier. Streaming first, then traffic,
-            // and everything below still sees live writers: `wait_ready` here and `wait_flushed` at the
-            // end of the event both depend on the writers producing.
+            wait_streaming(&mut eng).await?;
+            // The writers come back only once the engine reports itself streaming. Releasing them at
+            // the restart instead lets their catch-up burst — `run_paced` chases its own schedule, so a
+            // pause of t at TPS 400 is ~400·t rows written as fast as the connection allows — land on an
+            // engine that is still connecting and snapshotting. That is the most likely cause of the one
+            // TPS-400 red this branch owns: `fix5-m97-tps400/a2-135857Z` died on `timed out after 180s
+            // waiting for the engine streaming again`, with the pause logged 13 s earlier. Below
+            // `wait_streaming` and above `wait_ready`, because `wait_ready` here and `wait_flushed` at
+            // the end of the event both need live writers producing.
             if anchored {
                 crate::common::soakcheck::set_writers(run.writers, false);
             }
-            wait_streaming(&mut eng).await?;
             let mut c = run.src.conn().await?;
             wait_ready(&mut c, &mut eng, &names(run.specs), t_ready()).await?;
             c.disconnect().await.ok();
