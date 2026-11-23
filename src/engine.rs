@@ -446,6 +446,31 @@ fn connect_retry_delay(n: u32) -> Duration {
     supervisor::backoff(n, p.base, p.cap, p.jitter)
 }
 
+/// Part B (lv-super ruling 2026-11-22): counts one failed write to a target by error class on
+/// `/metrics` (`lazyview_target_write_err_*_total`), for a PostgreSQL-family target only — the
+/// MySQL family has no down-observable yet, which is the open question `05-target-down-observ`, and
+/// the suite's MySQL legs must read the same metrics as before. Observability, never policy: no
+/// retry, backoff or `lag_due` decision reads it. One count per failed write ATTEMPT, never per row
+/// and never per binlog event; its two callers are the flush's and the lag retry's own per-target
+/// failure reports, both off the event path.
+///
+/// A free function, not a method: its callers hold a mutable borrow of the engine's slots (the
+/// target map and the metrics are separate fields, so they stay readable beside it).
+fn note_target_write_err(
+    targets: &BTreeMap<String, Target>,
+    metrics: &Metrics,
+    t: &str,
+    e: &anyhow::Error,
+) {
+    if !targets
+        .get(t)
+        .is_some_and(|tg| tg.kind == target::Kind::Postgres)
+    {
+        return;
+    }
+    metrics.target_write_err(target::WriteErr::classify(e));
+}
+
 /// Consecutive failed refreshes of a live view after which its state rows show the error (it is
 /// retried with backoff all the same, never re-planned or rebuilt).
 const REFRESH_ERROR_SHOWN_AFTER: u32 = 3;
@@ -8411,6 +8436,7 @@ impl Engine {
         self.flush_wrote.push((i, targets.to_vec()));
         // Targets that missed this refresh (or earlier ones) get the units later.
         for (t, e) in &r.failed {
+            note_target_write_err(&self.targets, &self.metrics, t, e);
             warn!(view = %name, target = %t, "write failed: {e:#}; retrying");
             l.behind.remove(t.as_str());
             l.lag.entry(t.clone()).or_insert(Lag {
@@ -8844,6 +8870,28 @@ impl Engine {
         true
     }
 
+    /// Part B (lv-super ruling 2026-11-22): the gate of the whole of it — PostgreSQL-family
+    /// targets only. Whether the MySQL side gets the same down signal is the open question
+    /// `05-target-down-observ`, so the MySQL legs of the suite expose exactly the metrics they
+    /// always did. Observability, never policy: no retry, backoff or `lag_due` decision reads any
+    /// of it, so a wrong label costs a label and nothing else.
+    fn target_is_pg(&self, t: &str) -> bool {
+        self.targets
+            .get(t)
+            .is_some_and(|tg| tg.kind == target::Kind::Postgres)
+    }
+
+    /// Whether any view still holds `t` down (a `lag` entry whose retry reported it down): the
+    /// gauge of a target is one number for the whole engine, so it goes back to 0 only when the
+    /// LAST view's catch-up proves the peer answers.
+    fn target_held_down(&self, t: &str) -> bool {
+        self.slots.iter().any(|s| {
+            s.live
+                .as_ref()
+                .is_some_and(|l| l.lag.get(t).is_some_and(|g| g.down))
+        })
+    }
+
     /// The tail of one lagging target's retry, shared by both paths (the accounting of
     /// [`Self::retry_lag`], unchanged): caught up, or behind at its `retry_at` backoff, and
     /// reported down once its failures reach [`LAG_MAX_FAILURES`]. The group is taken out of the
@@ -8939,6 +8987,17 @@ impl Engine {
                 if was_down {
                     self.slots[i].down.remove(&t);
                     self.rebuild_routes();
+                    // Part B: the matching one line, when the LAST view that held this target down
+                    // saw its owed set written — the same authority the gauge reads, so the pair of
+                    // lines (down / answers again) is what `/metrics` shows as 1 / 0.
+                    if self.target_is_pg(&t)
+                        && !self.target_held_down(&t)
+                        && self.metrics.set_target_down(&t, false, "")
+                    {
+                        warn!(view = %name, target = %t,
+                              "target answers again: the changes kept for it were written \
+                               (lazyview_target_down back to 0)");
+                    }
                 }
             }
             Ok(r) => {
@@ -8956,6 +9015,22 @@ impl Engine {
                     l.targets.retain(|x| *x != t);
                     self.target_down(i, &name, &t, Some(&plan), &e).await;
                     self.rebuild_routes();
+                    // Part B: the crossing, reported once per target (not once per failed write,
+                    // and not once per view — `set_target_down` answers only for the first). The
+                    // state row and the "retrying in" line are `target_down`'s; this is the
+                    // operator's signal that the DATABASE is not answering, with the class of the
+                    // write that proved it, and the gauge `/metrics` renders.
+                    if self.target_is_pg(&t) {
+                        let class = target::WriteErr::classify(&e);
+                        if self.metrics.set_target_down(&t, true, class.as_str()) {
+                            warn!(view = %name, target = %t, failures = g.failures,
+                                  class = class.as_str(),
+                                  "target is down: no write reached it \
+                                   (last error class {class:?}: {e:#}); its changes stay buffered \
+                                   and its catch-up is retried at the connect backoff \
+                                   (lazyview_target_down back to 1)");
+                        }
+                    }
                 }
                 g.retry_at = Instant::now() + connect_retry_delay(g.failures);
                 if let Some(l) = self.slots[i].live.as_mut() {
