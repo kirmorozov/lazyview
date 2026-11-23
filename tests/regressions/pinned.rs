@@ -1772,13 +1772,15 @@ async fn replay_check(
 ///   text only (`mod.rs::base_seed`), never this scenario, and the number the harness prints as
 ///   `base seed` for the `regressions` binary is a different one per process. A CI log's base seed
 ///   is not a key to reproduce this test with — say so in a report rather than chasing it.
-/// * **The crash is anchored on the engine, and the window is a batch.** `run_event` waits for the
-///   engine's own caught-up point before the kill and runs
+/// * **The crash is anchored on the engine, and the window is a batch.** `run_event` quiesces the
+///   paced writers, waits for the engine's own caught-up point before the kill, and runs
 ///   [`crate::common::soakwork::SoakWorkload::cascade_in_window`] while the engine is dead, so the
-///   resume window holds a mapped-cascade parent change every run. Killing at the wall-clock instant
-///   instead made the window a sample of the writers' pace (`soakwork.rs::run_paced` paces against
-///   `Instant::now()`), so `cascade_gaps` was 0 on a loaded runner and the run was red on nothing
-///   but timing.
+///   resume window holds a mapped-cascade parent change every run; the writers are turned back on as
+///   the engine comes up. Killing at the wall-clock instant instead made the window a sample of the
+///   writers' pace (`soakwork.rs::run_paced` paces against `Instant::now()`), so `cascade_gaps` was 0
+///   on a loaded runner and the run was red on nothing but timing. Quiescing for the wait is not
+///   optional: that same pacing means a loaded engine is never at the head long enough for the
+///   caught-up test to pass, so an unquiesced anchor fails the run instead of anchoring it.
 #[test]
 fn reg_cascade_refusal_seed_replay() {
     scenario("reg_casc_seed167", |ctx| async move {
