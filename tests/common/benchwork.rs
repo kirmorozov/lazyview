@@ -453,6 +453,20 @@ pub async fn columns(c: &mut Conn, schema: &str, table: &str) -> Result<Vec<Stri
         .collect())
 }
 
+/// The two aggregates of one shape row, read out of what the server answered. Moved here verbatim
+/// from `shape_of` so the row can be fed to it by a unit test; the way it reads a row it cannot
+/// parse is the subject of #338, which the test beside this module shows is wrong.
+fn shape_row(_table: &str, rs: &[Vec<Option<String>>]) -> Result<(i64, u64)> {
+    let r = rs.first().and_then(|r| r.first()).cloned().flatten();
+    let n: i64 = r.as_deref().unwrap_or("0").parse().unwrap_or(0);
+    let h: u64 = rs
+        .first()
+        .and_then(|r| r.get(1).cloned().flatten())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    Ok((n, h))
+}
+
 /// `COUNT(*)` plus an order-independent checksum of the same columns, both computed inside the
 /// server: exactly one row crosses the wire, so the harness never holds a view in memory.
 async fn shape_of(c: &mut Conn, table: &str, cols: &[String]) -> Result<(i64, u64)> {
@@ -469,14 +483,7 @@ async fn shape_of(c: &mut Conn, table: &str, cols: &[String]) -> Result<(i64, u6
         ),
     )
     .await?;
-    let r = rs.first().and_then(|r| r.first()).cloned().flatten();
-    let n: i64 = r.as_deref().unwrap_or("0").parse().unwrap_or(0);
-    let h: u64 = rs
-        .first()
-        .and_then(|r| r.get(1).cloned().flatten())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    Ok((n, h))
+    shape_row(table, &rs)
 }
 
 /// One view of the source leg equals its oracle: same row count, same checksum. Called after every
