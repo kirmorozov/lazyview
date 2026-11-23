@@ -497,6 +497,98 @@ impl CatchUp {
     }
 }
 
+/// The rule of the `ready`/`rebuilt` waits of issue #231, as a state machine over
+/// (`now`, a signature of what those waits observe), so its arithmetic is testable without an
+/// engine and without a server — the shape [`CatchUp`] established for #248.
+///
+/// A build is **progressing** when either channel moves: a state row of a view the wait names
+/// (`state`, `refreshed_at`, `definition_id`, `definition_hash`, target — the fields the swap
+/// and the refresh stamp) **or** the engine's `applied()` position. The build task runs off the
+/// binlog loop on its own connection (refined review A-04) while the loop keeps applying, so a
+/// building view shows up on one channel or the other for as long as it is honestly working;
+/// what no live engine can do is go silent on **both** for longer than
+/// [`engine_bounds::stall`] accounts for — one failed `Policy::CONNECT` run (the stream
+/// reconnecting) plus one timed-out statement of the flush (the source read or target write
+/// the catch-up behind the build waits on). `t_ready()` stays the **floor**: an engine that
+/// finishes in time is held to exactly what it is held to today, and the wait that extends
+/// prints its elapsed and tick count — the review's unmeasured build length (N-04), measured.
+pub struct ReadyProgress {
+    what: String,
+    floor: Duration,
+    stall: Duration,
+    start: Instant,
+    last_advance: Instant,
+    last_sig: Option<String>,
+    ticks: u64,
+}
+
+impl ReadyProgress {
+    /// `what` names the views in every failure; `floor` is the fixed bound a healthy engine is
+    /// held to (its `t_ready()`); `stall` the engine's own bound on one silent stretch on both
+    /// channels ([`engine_bounds::stall`]). As in [`CatchUp::new`], the bound never comes out
+    /// shorter than the wait its caller asked for.
+    pub fn new(
+        start: Instant,
+        floor: Duration,
+        stall: Duration,
+        what: impl Into<String>,
+    ) -> ReadyProgress {
+        ReadyProgress {
+            what: what.into(),
+            floor,
+            stall: stall.max(floor),
+            start,
+            last_advance: start,
+            last_sig: None,
+            ticks: 0,
+        }
+    }
+
+    /// One sample of the clock and of the observed signature (see [`CatchUp::sample`] for the
+    /// same rule on `applied` alone). The **first** signature is not progress: the stall clock
+    /// starts when the caller started waiting, so a view that was already silent when the wait
+    /// began is measured from then.
+    pub fn sample(&mut self, now: Instant, sig: &str) -> CatchUpVerdict {
+        match &self.last_sig {
+            None => self.last_sig = Some(sig.to_string()),
+            Some(p) if p != sig => {
+                self.last_advance = now;
+                self.last_sig = Some(sig.to_string());
+                self.ticks += 1;
+            }
+            Some(_) => {}
+        }
+        let stalled = now.saturating_duration_since(self.last_advance);
+        if stalled <= self.stall {
+            return CatchUpVerdict::Waiting;
+        }
+        let elapsed = now.saturating_duration_since(self.start);
+        CatchUpVerdict::Failed(format!(
+            "the {} did not move its state rows nor advance `applied` for {stalled:?}, past \
+             the {:?} a living engine can account for ({} progress tick(s) so far, floor {:?}, \
+             {elapsed:?} elapsed): one failed connect cycle of {:?} plus one timed-out statement \
+             of {:?}",
+            self.what,
+            self.stall,
+            self.ticks,
+            self.floor,
+            engine_bounds::connect_cycle(),
+            engine_bounds::statement_op(engine_bounds::default_target_timeout()),
+        ))
+    }
+
+    /// Progress ticks so far — reported by the ready waits when they run past their floor, so
+    /// the unmeasured build length (review N-04) is measured in every flake-adjacent run.
+    pub fn ticks(&self) -> u64 {
+        self.ticks
+    }
+
+    /// The floor the wait was given (what a healthy engine is held to).
+    pub fn floor(&self) -> Duration {
+        self.floor
+    }
+}
+
 /// Waits until the engine is caught up and idle, so a following step or measurement starts a new
 /// batch window (two catch-ups on one connection around one fixed idle sleep).
 pub async fn quiesce(engine: &mut Engine, db: &Db) -> Result<()> {
@@ -667,6 +759,10 @@ pub fn is_cadence_rebuilt(spec: &ViewSpec) -> bool {
 /// Default timeouts (scaled). `t_catchup` is a **floor** for the catch-up waits of #248:
 /// [`Engine::wait_applied_progressive`] holds a healthy engine to exactly this and lets only the
 /// engine's own numbers ([`engine_bounds`]) take it longer; every other wait ends at it.
+/// `t_ready` is the same kind of **floor** for the ready/rebuilt waits of #231:
+/// [`wait_ready`](crate::common::wait_ready) and [`wait_rebuilt`](crate::common::wait_rebuilt)
+/// hold a healthy engine to exactly this and let only observable progress (state rows moving,
+/// `applied` advancing) past it, bounded by [`engine_bounds::stall`].
 pub fn t_ready() -> Duration {
     Duration::from_secs_f64(180.0 * scale().max(1.0))
 }
@@ -814,6 +910,102 @@ mod tests {
         ));
         assert!(matches!(
             rule.sample(start + Duration::from_secs(601), None),
+            CatchUpVerdict::Failed(_)
+        ));
+    }
+
+    // ---- the ready/rebuilt rule of #231, scripted: fake state rows, no engine, no sleep ----
+
+    /// The premise of #231 in the same shape as #248's: the engine's own bound on a *building*
+    /// view (silent on both channels) is more than the fixed 180 s it was held to, and it is the
+    /// same for every flavor.
+    #[test]
+    fn the_engine_own_bound_exceeds_the_old_fixed_ready_guess() {
+        let stall = engine_bounds::stall(engine_bounds::default_target_timeout());
+        assert!(
+            stall > t_ready(),
+            "{stall:?} vs the fixed {:?}: if the engine's numbers came down to this, the \
+             progress rule is dead weight and #231's premise needs re-reading",
+            t_ready()
+        );
+    }
+
+    /// Fake state rows that keep moving (a `refreshed_at` stamp, then a `definition_id` swap,
+    /// and `applied` advancing in the tail of the signature) are never cut off at the floor —
+    /// the case the old fixed deadline got wrong when the throttled host stretched a build.
+    #[test]
+    fn slowly_progressing_state_rows_outlive_the_ready_floor() {
+        let start = Instant::now();
+        let stall = engine_bounds::stall(engine_bounds::default_target_timeout());
+        let mut rule = ReadyProgress::new(start, Duration::from_secs(180), stall, "view vm_x");
+        let step = Duration::from_secs(30);
+        for n in 1..=30u64 {
+            // 15 minutes of steady progress: 5× the floor. Two channels tick alternately: the
+            // state row (refreshed_at / definition_id) and the applied position in the tail.
+            let sig = if n % 2 == 0 {
+                format!("source|building|t{n}|{:?}|h1@pos{n}", n / 2)
+            } else {
+                format!("source|building|t0|{{Some(7)}}|h1@pos{n}")
+            };
+            let v = rule.sample(start + step * (n as u32), &sig);
+            assert!(
+                matches!(v, CatchUpVerdict::Waiting),
+                "sample {n} ended a wait that was still progressing: {v:?}"
+            );
+        }
+        // 29, not 30: the **first** sample is the baseline, not progress (same rule as `CatchUp`
+        // — an engine already frozen when the wait begins is measured from then).
+        assert_eq!(
+            rule.ticks(),
+            29,
+            "every sample after the first moved a channel"
+        );
+    }
+
+    /// A view whose state rows and `applied` are both frozen still fails, at the bound the
+    /// engine's numbers allow — not at 180 s, and not forever.
+    #[test]
+    fn a_frozen_ready_wait_fails_at_its_bound() {
+        let start = Instant::now();
+        let stall = engine_bounds::stall(engine_bounds::default_target_timeout());
+        let mut rule = ReadyProgress::new(start, Duration::from_secs(180), stall, "view vm_x");
+        let frozen = "source|building|t0|{Some(3)}|h1@pos841";
+        // Past the floor and inside what one reconnect plus one timed-out statement explain.
+        assert!(matches!(
+            rule.sample(start + Duration::from_secs(200), frozen),
+            CatchUpVerdict::Waiting
+        ));
+        assert!(matches!(
+            rule.sample(start + stall - Duration::from_millis(1), frozen),
+            CatchUpVerdict::Waiting
+        ));
+        match rule.sample(start + stall + Duration::from_millis(1), frozen) {
+            CatchUpVerdict::Failed(why) => {
+                assert!(why.contains("did not move its state rows"), "{why}");
+                assert!(why.contains("view vm_x"), "{why}");
+                assert!(why.contains("0 progress tick(s)"), "{why}");
+            }
+            CatchUpVerdict::Waiting => panic!("a stall past the engine's own bound must fail"),
+        }
+    }
+
+    /// The floor is a floor here too: a ready wait never ends earlier than the bound its caller
+    /// asked for, so making the waits progress-aware cannot make any other test fail sooner.
+    #[test]
+    fn the_ready_floor_is_never_shortened() {
+        let start = Instant::now();
+        let mut rule = ReadyProgress::new(
+            start,
+            Duration::from_secs(600),
+            Duration::from_secs(60),
+            "v",
+        );
+        assert!(matches!(
+            rule.sample(start + Duration::from_secs(599), "same"),
+            CatchUpVerdict::Waiting
+        ));
+        assert!(matches!(
+            rule.sample(start + Duration::from_secs(601), "same"),
             CatchUpVerdict::Failed(_)
         ));
     }

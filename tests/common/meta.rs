@@ -128,15 +128,49 @@ async fn wait_ready_grace(
     timeout: Duration,
     error_grace: Option<Duration>,
 ) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+    // #231: `timeout` is a **floor**, not a wall. The engine puts no bound on a build (refined
+    // review N-05), and a fixed guess failed a `definition change` that was still building under
+    // host load (180 s, state "building"). The wait now goes on while the view *progresses* — a
+    // state row moves or `applied()` advances — and still fails the moment a living engine goes
+    // silent on both channels for longer than `engine_bounds::stall` allows.
+    let start = Instant::now();
+    let stall = engine_bounds::stall(
+        engine
+            .cfg
+            .target_timeout
+            .max(engine_bounds::default_target_timeout()),
+    );
+    let mut rule = ReadyProgress::new(
+        start,
+        timeout,
+        stall,
+        format!("views [{}]", names.join(", ")),
+    );
+    // The last time the state table actually answered: an unreadable state table spends the same
+    // stall bound it would spend waiting, and no more (a read error is not progress).
+    let mut last_read = Instant::now();
     let mut error_since: HashMap<String, Instant> = HashMap::new();
     let mut no_row_since: HashMap<String, Instant> = HashMap::new();
     loop {
         engine.check_alive()?;
         let states = match view_states(conn).await {
-            Ok(s) => s,
-            // A transient read error spends budget, it does not abort the wait.
-            Err(e) if is_transient(&e) && Instant::now() < deadline => {
+            Ok(s) => {
+                last_read = Instant::now();
+                s
+            }
+            // A transient read error spends budget, it does not abort the wait — the budget is
+            // the engine's own stall bound (there is nothing to measure progress against while
+            // the table cannot be read at all).
+            Err(e) if is_transient(&e) => {
+                if Instant::now().saturating_duration_since(last_read) > stall {
+                    bail!(
+                        "views not ready: `_lazyview_state` has not answered a read for {stall:?} \
+                         (past what a living engine can account for), waiting for [{}] — last \
+                         error {e:#} — log {}",
+                        names.join(", "),
+                        engine.log_path.display()
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -145,8 +179,13 @@ async fn wait_ready_grace(
         let mut pending = Vec::new();
         // The engine is up and has made other views ready (any view, not only these).
         let any_ready = states.iter().any(|s| s.state == "ready");
+        let mine: Vec<StateRow> = states
+            .iter()
+            .filter(|s| names.contains(&s.name.as_str()))
+            .cloned()
+            .collect();
         for n in names {
-            let mine: Vec<&StateRow> = states.iter().filter(|s| &s.name == n).collect();
+            let mine: Vec<&StateRow> = mine.iter().filter(|s| &s.name == n).collect();
             // A view the engine never registers while others are already ready: fail after 60 s
             // instead of the full timeout (look for errors in the engine log).
             if mine.is_empty() && any_ready && error_grace.is_some() {
@@ -198,11 +237,24 @@ async fn wait_ready_grace(
             }
         }
         if pending.is_empty() {
+            let elapsed = start.elapsed();
+            if elapsed > rule.floor() {
+                // The measurement review N-04 asks for: how long a ready wait actually runs
+                // once the engine's own numbers are allowed to outvote the fixed guess.
+                eprintln!(
+                    "ready-wait measure [{}]: {elapsed:?} total past the {:?} floor, {} \
+                     progress tick(s) — build/catch-up length on this engine (review N-04)",
+                    names.join(", "),
+                    rule.floor(),
+                    rule.ticks()
+                );
+            }
             return Ok(());
         }
-        if Instant::now() > deadline {
+        let sig = ready_sig(&mine, engine.applied().as_ref());
+        if let CatchUpVerdict::Failed(why) = rule.sample(Instant::now(), &sig) {
             bail!(
-                "views not ready within {timeout:?}: {} — log {}",
+                "views not ready ({}): {why} — log {}",
                 pending.join(", "),
                 engine.log_path.display()
             );
@@ -211,9 +263,102 @@ async fn wait_ready_grace(
     }
 }
 
+/// The signature [`ReadyProgress`] watches: every field of the waited-for views' state rows that
+/// a refresh or a build stamps (target, state, `refreshed_at`, `definition_id`,
+/// `definition_hash`) plus the engine's applied position. A change on any of them is progress.
+fn ready_sig(rows: &[StateRow], applied: Option<&Position>) -> String {
+    let mut parts: Vec<String> = rows
+        .iter()
+        .map(|s| {
+            format!(
+                "{}|{}|{}|{:?}|{:?}",
+                s.target.as_deref().unwrap_or("?"),
+                s.state,
+                s.refreshed_at.as_deref().unwrap_or("-"),
+                s.definition_id,
+                s.definition_hash
+            )
+        })
+        .collect();
+    parts.sort();
+    match applied {
+        Some(a) => format!("{}@applied {a}", parts.join(";")),
+        None => parts.join(";"),
+    }
+}
+
 /// Waits until the view's state rows are all `ready` with a definition hash different from
 /// `old_hash` (i.e. a changed definition has been built and swapped in).
+///
+/// `timeout` is a **floor** (#231, same rule as [`wait_ready`]): a rebuild that is progressing —
+/// its state rows move or `applied()` advances — is never cut off at it; a rebuild silent on both
+/// channels past [`engine_bounds::stall`] fails with the bound it died on.
 pub async fn wait_rebuilt(
+    conn: &mut Conn,
+    engine: &mut Engine,
+    name: &str,
+    old_hash: &Option<String>,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let stall = engine_bounds::stall(
+        engine
+            .cfg
+            .target_timeout
+            .max(engine_bounds::default_target_timeout()),
+    );
+    let mut rule = ReadyProgress::new(start, timeout, stall, format!("view {name}"));
+    let mut last_read = Instant::now();
+    loop {
+        engine.check_alive()?;
+        let st = match view_state(conn, name).await {
+            Ok(s) => {
+                last_read = Instant::now();
+                s
+            }
+            Err(e) if is_transient(&e) => {
+                if Instant::now().saturating_duration_since(last_read) > stall {
+                    bail!(
+                        "view {name} not rebuilt: `_lazyview_state` has not answered a read for \
+                         {stall:?} (past what a living engine can account for) — last error \
+                         {e:#} — log {}",
+                        engine.log_path.display()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if !st.is_empty()
+            && st
+                .iter()
+                .all(|s| s.state == "ready" && &s.definition_hash != old_hash)
+        {
+            let elapsed = start.elapsed();
+            if elapsed > rule.floor() {
+                eprintln!(
+                    "ready-wait measure [view {name} rebuilt]: {elapsed:?} total past the {:?} \
+                     floor, {} progress tick(s) — build length on this engine (review N-04)",
+                    rule.floor(),
+                    rule.ticks()
+                );
+            }
+            return Ok(());
+        }
+        let sig = ready_sig(&st, engine.applied().as_ref());
+        if let CatchUpVerdict::Failed(why) = rule.sample(Instant::now(), &sig) {
+            bail!("view {name} not rebuilt with its new definition: {why}; state: {st:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The **fixed wall-clock** variant of [`wait_rebuilt`]: hard deadline, extended by nothing.
+/// Kept for the waits that *want* a hard wall — a scenario proving the view does **not** get
+/// rebuilt — and used as the red half of the deterministic #231 reproduction, exactly as
+/// [`Engine::wait_applied`] is kept beside [`Engine::wait_applied_progressive`] for #248.
+pub async fn wait_rebuilt_fixed(
     conn: &mut Conn,
     engine: &mut Engine,
     name: &str,

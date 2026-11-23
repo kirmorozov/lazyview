@@ -174,6 +174,23 @@ async fn setup(
     std::collections::HashMap<String, u64>,
     Engine,
 )> {
+    setup_with_env(ctx, tag, extra, &[]).await
+}
+
+/// [`setup`] with extra engine overrides (e.g. `LAZYVIEW_TEST_BUILD_DELAY` for the #231
+/// reproduction). The batch window stays as every migration scenario runs it.
+async fn setup_with_env(
+    ctx: &Ctx,
+    tag: &str,
+    extra: Vec<ViewSpec>,
+    env: &[(&str, &str)],
+) -> Result<(
+    Db,
+    Arc<Ids>,
+    Vec<ViewSpec>,
+    std::collections::HashMap<String, u64>,
+    Engine,
+)> {
     let db = ctx.new_db(tag).await?;
     let ids = setup_ecommerce(&db, ctx.sub_seed("seed"), Sizes::scaled()).await?;
     let keep = [
@@ -187,8 +204,9 @@ async fn setup(
         .filter(|v| keep.contains(&v.name.as_str()))
         .collect();
     specs.extend(extra);
-    let (mut eng, idmap) =
-        start_with_views(ctx, &db, &specs, &[("LAZYVIEW_BATCH_WINDOW_MS", "50")]).await?;
+    let mut ov: Vec<(&str, &str)> = vec![("LAZYVIEW_BATCH_WINDOW_MS", "50")];
+    ov.extend_from_slice(env);
+    let (mut eng, idmap) = start_with_views(ctx, &db, &specs, &ov).await?;
     verify(ctx, &mut eng, &db, &specs, "initial").await?;
     Ok((db, ids, specs, idmap, eng))
 }
@@ -257,6 +275,161 @@ fn migration_definition_changes_online() {
             }
             verify(&ctx, &mut eng, &db, &specs, &what).await?;
         }
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// #231, reproduced on purpose with the engine's own knob for a long build:
+/// `LAZYVIEW_TEST_BUILD_DELAY=<marker>:<ms>` (see `src/engine.rs`, `build_task`) makes the build
+/// of a definition whose text carries `<marker>` sleep before it reads. The flake's recorded
+/// shape (issue #231, local migration-suite run on mariadb1011 under shared-server load): a
+/// definition change whose rebuild was still running when the harness's fixed 180 s ready wall
+/// expired — `state: "building"` — and the same seed passed on re-run. The crawl here is that
+/// delay, sized from the harness's own numbers: `t_ready()` plus half the room between the floor
+/// and the engine's stall bound — strictly past what a healthy engine was ever held to, strictly
+/// inside what one failed connect cycle plus one timed-out statement can account for. Both
+/// halves of the proof are assertions in this one run:
+///
+/// * **red, the old bound**: with the crawl underway, the fixed [`wait_rebuilt_fixed`] deadline
+///   expires at the floor on an alive engine whose view's state rows still say `building` — had
+///   that wait been the only bound, as it was, this is where #231 failed. Note what that wait
+///   had to go on: nothing moves on either progress channel while an honest def-change build
+///   reads. The engine holds the *reported* position at the build's own start for as long as a
+///   new version builds (`after_boundary`: "new versions still building ... hold it at their
+///   start, as do pending definition changes"), and a `building` state row stamps nothing until
+///   the swap. The bound was all the old wait had, and the guess is what it died on — which is
+///   why the green half is the engine's own number, not a claim about what should be moving.
+/// * **green, the engine's own bound**: the same rebuild — the delay is never lifted — brought
+///   home by the progress-aware [`wait_rebuilt`]: the floor holds a healthy engine to exactly
+///   what it is held to today (it is never shortened), and silence is spent against
+///   [`engine_bounds::stall`] instead of against the guess. The scripted rule tests in
+///   `common/engine.rs` cover the channels that extend the wait past the bound (state rows
+///   moving, `applied` advancing) and that a view frozen past it still fails there.
+#[test]
+fn migration_definition_change_crawl_outlives_the_fixed_ready_floor() {
+    scenario("mig_s231", |ctx| async move {
+        let v0 = ViewSpec::new(
+            "vm_orders",
+            Kind::Incremental,
+            "SELECT id, status FROM orders",
+        );
+        // The crawl is sized from the harness's own numbers, never guessed at: it must outlive
+        // the floor a healthy engine is held to (else the reproduction is not one) and stay
+        // inside the silence the engine can itself account for (else a wait that dies there is
+        // right, and proving it green would be cheating).
+        let floor = t_ready();
+        let stall = engine_bounds::stall(engine_bounds::default_target_timeout());
+        ensure!(
+            stall > floor + Duration::from_secs(60),
+            "#231's premise is gone: the engine's own stall bound {stall:?} must sit at least a \
+             minute above the {floor:?} floor — with the floor scaled past it there is no crawl \
+             that outlives one bound and not the other"
+        );
+        let crawl = floor + (stall - floor) / 2;
+        let delay = format!("/*lv-slow-build*/:{}", crawl.as_millis());
+        let changed = ViewSpec::new(
+            "vm_orders",
+            Kind::Incremental,
+            "SELECT id, status, customer_id FROM orders WHERE id > 0 /*lv-slow-build*/",
+        );
+        let (db, ids, mut specs, idmap, mut eng) = setup_with_env(
+            &ctx,
+            "mig_s231",
+            vec![v0],
+            &[("LAZYVIEW_TEST_BUILD_DELAY", &delay)],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        let old_hash = current_hash(&mut c, "vm_orders").await?;
+        // The flake's shape is a migration under concurrent traffic: the writers and the two
+        // readers of `migration_definition_changes_online` run across the whole crawl, the old
+        // MV staying readable until the swap (issue #231 was seen with the suite's own load on
+        // a busy host).
+        let bg = start_background(
+            &db,
+            ids.clone(),
+            ctx.sub_seed("crawl"),
+            &[vec!["vm_orders"], vec!["v_customer_stats"]],
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        exec(
+            &mut c,
+            &format!(
+                "UPDATE _lazyview SET definition = {} WHERE id = {}",
+                q(&changed.definition),
+                idmap["vm_orders"]
+            ),
+        )
+        .await?;
+        // The crawl is proven underway before anything is waited on.
+        let dsn = db.dsn.clone();
+        let want = old_hash.clone();
+        wait_until("the delayed rebuild to be underway", t_ready(), || {
+            let dsn = dsn.clone();
+            let want = want.clone();
+            async move {
+                let mut c = connect(&dsn).await?;
+                let st = view_state(&mut c, "vm_orders").await?;
+                c.disconnect().await.ok();
+                Ok(st.iter().any(|s| s.state == "building")
+                    || st.iter().any(|s| s.definition_hash != want))
+            }
+        })
+        .await?;
+        // --- red: the fixed wall, on a live engine, with the crawl still running.
+        let t = Instant::now();
+        let red = wait_rebuilt_fixed(&mut c, &mut eng, "vm_orders", &old_hash, floor).await;
+        let expired = t.elapsed();
+        ensure!(
+            red.is_err(),
+            "the reproduction is not one: the fixed ready bound of {floor:?} caught the crawl \
+             anyway ({expired:?} elapsed, the build was delayed {crawl:?}) — #231's shape, the \
+             180 s timeout with the view still building on a live engine, cannot be reproduced \
+             here. Underlying error: {red:#?}"
+        );
+        eng.check_alive()?;
+        let st = view_state(&mut c, "vm_orders").await?;
+        ensure!(
+            st.iter().any(|s| s.state == "building"),
+            "vm_orders was not 'building' when the fixed bound expired (the flake's shape); \
+             state: {st:?}",
+        );
+        ctx.log(format!(
+            "reproduced #231: the fixed ready wall of {floor:?} expired at {expired:?} with \
+             vm_orders 'building' on a live engine (that build sleeps {crawl:?} before reading)"
+        ));
+        // --- green: the same rebuild under the progress-aware wait, delay still armed.
+        wait_rebuilt(&mut c, &mut eng, "vm_orders", &old_hash, floor)
+            .await
+            .with_context(|| {
+                format!(
+                    "the progress-aware ready wait gave up on a build that was only delayed: it \
+                     had already run {expired:?} past the {floor:?} floor with the engine alive \
+                     and the view building, and the engine's own stall bound is {stall:?}"
+                )
+            })?;
+        ctx.log(format!(
+            "the same crawl passed under the progress rule: green {:.0?} after the fixed bound \
+             expired",
+            t.elapsed() - expired
+        ));
+        let logs = bg.finish(&ctx, "the crawl rebuild").await?;
+        let cols = fetch(&mut c, "SELECT * FROM vm_orders LIMIT 0")
+            .await?
+            .columns;
+        ensure!(
+            logs[0].last_shape().map(|s| &s.1) == Some(&cols),
+            "the crawl rebuild: reader's last shape {:?} is not the new one {cols:?}",
+            logs[0].last_shape()
+        );
+        for s in specs.iter_mut() {
+            if s.name == "vm_orders" {
+                *s = changed.clone();
+            }
+        }
+        verify(&ctx, &mut eng, &db, &specs, "after the crawl rebuild").await?;
+        c.disconnect().await.ok();
         eng.stop().await?;
         Ok(())
     });
