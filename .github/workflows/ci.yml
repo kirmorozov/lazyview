@@ -1,6 +1,7 @@
 name: ci
 
-# Every pull_request, push to main, v* tag and workflow_dispatch runs the same full set: lint, unit,
+# Every pull_request that changes anything but documentation, every push to main, v* tag and
+# workflow_dispatch run the same full set: lint, unit,
 # e2e, deny (cargo-deny advisories + licenses), features (the optional cargo features built and
 # tested; their clippy runs sit in `lint`), scan-image (trivy), the integration matrix,
 # integration-multi, integration-pg (PostgreSQL
@@ -36,11 +37,32 @@ name: ci
 #                       servers must pass, its 2 advisory pre-release entries run with
 #                       continue-on-error and cannot block it)
 # Pull requests never get registry credentials and never push.
+# The one exception, and the only path filter in this file: a pull_request whose every changed file
+# is documentation starts NO run here (paths-ignore below). Owner, 2026-11-23: "doc only prs can be
+# bundled and merged without test runs" -- the keeper's landing pass lands such a PR on its guard PASS
+# without waiting for CI (tmp/lvs-land-ready.sh), so a run here would only spend a runner on prose.
+# `docs/**` is the documentation tree at the repository root and its subdirectories; `**/*.md` is a
+# markdown file anywhere, the repository root included. The filter skips only when EVERY changed file
+# matches one of them, so a PR that changes a doc alongside anything else runs the full set exactly as
+# it does today.
+# .github/** and .claude/** are NOT in the list: they are config, not documentation, so a PR that
+# changes only a workflow, an action or .claude/agents/generic-guard.md runs everything. A markdown
+# file under those two directories does match `**/*.md`, so it does skip: prose nothing executes, and
+# next to a .yml or a script the full set runs again. `push` (main, v*) and `workflow_dispatch` keep
+# NO filter on purpose -- every landed commit shows its own full matrix, and a manual run is asked
+# for.
+# ci.yml is the only workflow that triggers on pull_request (the others run on schedule,
+# workflow_dispatch or workflow_call), so a docs-only PR starts no Actions run at all. The keeper's own
+# docs-only test is stricter: it keeps markdown under .github/, .claude/, src/ and tests/ on the CI
+# path, and such a PR can still be given a run by hand: `gh workflow run ci.yml --ref <branch>`.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
     inputs:
       long_soak:
