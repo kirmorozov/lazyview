@@ -45,7 +45,8 @@ S1. Changed files and added lines:
     they are in.
 
 S2. HARD CHECK H1, no special-casing by name. Over the ADDED lines under `src/` (code and inline tests alike):
-    `git -C REPO diff --unified=0 BASE HEAD -- src | grep -E '^\+' | grep -v '^+++' | grep -niE 'magento|lvm2|m2cdc|catalog_product|catalog_category|cataloginventory|inventory_(source|stock|reservation)|sales_order|customer_(entity|grid_flat|address_entity)|\beav_|attribute_id|store_id|entity_id|super_link|product_[a-z]|\bproducts\b|category_[a-z]|\bcategories\b'`
+    `git -C REPO diff --unified=0 BASE HEAD -- src | grep -E '^\+' | grep -v '^+++' | grep -niE 'magento|lvm2|m2cdc|catalog_product|catalog_category|cataloginventory|inventory_(source|stock|reservation)|sales_order|customer_(entity|grid_flat|address_entity)|\beav_|attribute_id|store_id|super_link|product_[a-z]|\bproducts\b|category_[a-z]|\bcategories\b'`
+    (`entity_id` is neutral: owner 2026-11-23 - it is a generic column name, not an application term.)
     (`product` alone is fine where it means a database product such as MySQL vs MariaDB, or Rust's
     `Iterator::product`; as a domain term it is not.)
     Any hit = FAIL H1, unless the hit is inside a comment that cites a user report without driving behaviour,
