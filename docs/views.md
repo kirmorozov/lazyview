@@ -21,8 +21,8 @@ UPDATE _lazyview SET enabled = 0 WHERE name = 'paid_orders';
 UPDATE _lazyview SET enabled = 1 WHERE name = 'paid_orders';
 DELETE FROM _lazyview WHERE name = 'paid_orders';
 
--- rebuild one view from scratch (online)
-UPDATE _lazyview SET rebuild = 1 WHERE name = 'paid_orders';
+-- rebuild one view from scratch (online): see "Rebuilding a view" below
+UPDATE _lazyview SET rebuild = rebuild + 1 WHERE name = 'paid_orders';
 ```
 
 * `name` is unique (enforced by the table). In a `CREATE VIEW` statement the view name of the
@@ -68,6 +68,31 @@ that does not parse or plan keeps its last good table (readable, no longer maint
 definition is fixed; the table is dropped only when the definition row is deleted or disabled.
 At startup every definition is planned again, views in error included: a view stays in error
 only if it still fails, with a fresh `last_error` and `updated_at`.
+
+## Rebuilding a view
+
+Hand-edited a view's table, or want one view rebuilt from scratch online? Ask with one `UPDATE` of
+your own; it needs no restart:
+
+```sql
+UPDATE _lazyview SET rebuild = rebuild + 1 WHERE id = <definition id>;
+-- or by name, when you keep one:
+UPDATE _lazyview SET rebuild = rebuild + 1 WHERE name = 'my_view';
+```
+
+* lazyview notices the new value on the binlog, rebuilds that one view — its other views are
+  untouched — and swaps the table in, online, like any changed definition
+  ([changes while running](#changes-while-running)). The swap rebuilds the chained views that read
+  it.
+* `rebuild` is a flag: **any non-zero value** asks for one rebuild of that view, and lazyview sets
+  it back to `0` once the new table is live. Ask with `rebuild = rebuild + 1`: it is a change
+  whatever the row holds, so you never have to know whether a request is already sitting there.
+* A statement that writes the value the row already carries changes no row, so it asks for nothing:
+  while a request is pending, `SET rebuild = 1` again is still that same one request.
+* A request made while lazyview is stopped is served by the next start.
+* A rebuild that fails never takes the live table away: the old one keeps serving while the view
+  goes into `error`, the reason in `last_error`, retried with exponential backoff of up to 5
+  minutes. Nothing clears the request while it fails, so the retry asks for the same rebuild.
 
 ## The materialized table
 
@@ -428,7 +453,7 @@ maintained) until an atomic `RENAME TABLE` swap.
 | new `name` for the same `_lazyview.id`, or another view name in its `CREATE VIEW` statement | the new table is built; the old one is dropped after the new one is live. `name` follows the statement's view name |
 | `targets` changed | built on the new targets; removed targets are dropped after the swap |
 | `enabled = 0` or row deleted | the table is dropped (with `LAZYVIEW_DROP_REMOVED=true`, the default) |
-| `UPDATE _lazyview SET rebuild = 1` | the view is rebuilt online like a changed definition; `rebuild` goes back to `0` once the new table is live. Set while lazyview is stopped, the view is rebuilt at startup instead of resumed |
+| `UPDATE _lazyview SET rebuild = rebuild + 1` | the view is rebuilt online like a changed definition, noticed on the binlog with no restart; `rebuild` goes back to `0` once the new table is live. Set while lazyview is stopped, the view is rebuilt at startup instead of resumed. See [rebuilding a view](#rebuilding-a-view) |
 | `TRUNCATE` or `DROP TABLE` of a view's table on the source | the view is rebuilt online (lazyview never truncates its tables); after a `DROP` the table is missing until the rebuilt one is renamed into place |
 | `ALTER TABLE` of a source table (an added index or column, a moved column, a type change that leaves what the view reads alone), or `CREATE INDEX` / `DROP INDEX` on it | the view is re-planned and keeps its table: the new plan only decodes rows with the new column positions, no rebuild. What the view reads is compared by column name, type, collation, nullability, generation, the keys and foreign keys it uses, and the SQL lazyview runs. Views with `mode = 'full'` still rebuild, and so does a view whose plan may already include later changes of the table (after a restart or while catching up across several DDLs) |
 | `RENAME TABLE` of a source table (an online schema change tool's table swap: `RENAME TABLE t TO t_old, t_new TO t`), `ALTER TABLE ... RENAME`, `TRUNCATE`, `REPAIR` or re-creation, or any other `ALTER TABLE` (a column the view reads retyped, recollated or dropped, a key it uses changed) | the view is re-planned and rebuilt online: a swapped-in table may hold other rows. The old table stays readable but is not maintained until the swap |
@@ -440,7 +465,9 @@ retried with exponential backoff of up to 5 minutes.
 
 Other hand edits of a view's table (`DELETE`, `UPDATE`, `INSERT`, or any change on a target) are
 not noticed: lazyview keeps maintaining the table on top of them, so rows that are not changed
-again stay wrong. Repair such a view with `rebuild = 1`.
+again stay wrong. Repair such a view with a rebuild request
+(`UPDATE _lazyview SET rebuild = rebuild + 1 WHERE id = …`, see
+[rebuilding a view](#rebuilding-a-view)).
 
 ## Metadata tables
 
@@ -455,7 +482,7 @@ lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing column
 | `definition` | a `SELECT` (with `name`) or a complete `CREATE VIEW` statement |
 | `targets` | comma-separated target names; NULL means `source` |
 | `enabled` | `1` (default) or `0` |
-| `rebuild` | set to `1` to rebuild the view once; lazyview sets it back to `0` when the new table is live |
+| `rebuild` | the rebuild request: any non-zero value asks for one rebuild of that view, and lazyview sets it back to `0` when the new table is live; ask with `rebuild = rebuild + 1` ([rebuilding a view](#rebuilding-a-view)) |
 | `created_at`, `updated_at` | timestamps |
 
 `_lazyview_state`: one row per view and target.
