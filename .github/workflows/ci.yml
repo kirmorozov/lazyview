@@ -56,10 +56,15 @@ on:
         type: boolean
         default: false
 
-# A newer run for the same ref and event cancels the superseded one, except on main: every landed
-# commit keeps its own run (keyed by sha there, so a queued main run is never replaced either).
+# A newer run for the same ref and event cancels the superseded one, except on main, where
+# cancel-in-progress stays false: a running main verification is never cancelled. On main the
+# group is per BRANCH, not per sha (2026-11-23: 3 main runs queued behind each other for 4 h —
+# sha-keyed groups gave every push its own group, so a queued run was never replaced): a newer
+# pending push replaces an older pending one inside the group, so the queue holds at most one
+# running and one pending main run, and the newest commit is always verified. Pull-request
+# behaviour is unchanged (a group per PR ref, a newer push to the PR cancels the older run).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.ref_name || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
