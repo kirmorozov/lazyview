@@ -90,6 +90,9 @@ pub struct Dedup {
     /// engine keeps the (b) cache authoritative for these until `move_core_caches` moves the
     /// patched cache in.
     shape_stale: std::collections::HashSet<u64>,
+    /// The image layouts this server logs a row event in, set by the engine at startup:
+    /// see [`Self::layout_refusal`].
+    image_layouts: &'static [crate::source::Skip],
 }
 
 impl Dedup {
@@ -114,7 +117,17 @@ impl Dedup {
             fed: 0,
             wake: None,
             shape_stale: std::collections::HashSet::new(),
+            // The safe default: images at catalog positions, what every server is until the
+            // engine says otherwise (`set_image_layouts`).
+            image_layouts: &[crate::source::Skip::None],
         }
+    }
+
+    /// What layouts this server puts row images in (`source::image_layouts` of the connected
+    /// server), set once at startup: a server that logs some generated columns out of its
+    /// images keeps plans that read past them off the core ([`Self::layout_refusal`]).
+    pub(crate) fn set_image_layouts(&mut self, layouts: &'static [crate::source::Skip]) {
+        self.image_layouts = layouts;
     }
 
     /// Whether `plan` runs on the core: its static route is Dedup.
@@ -161,17 +174,80 @@ impl Dedup {
         })
     }
 
+    /// C-01 (#7): why `plan` must keep the viewplan executor on a server whose row images are
+    /// not the catalog positions the core indexes. The core's consumer
+    /// (`dedup::consumer::value_at`, a copy-set file) reads a column where the catalog puts
+    /// it, which is right only while every layout this server logs carries every column before
+    /// the first one it leaves out. Where [`crate::source::image_layouts`] offers a layout
+    /// that omits generated columns, a plan reading a generated column, or any column
+    /// positioned after one, would read its neighbour's value there: it keeps the executor,
+    /// whose readers go through the binlog reader's image map
+    /// ([`crate::accumulate::feed_with_image`]). A plan that reads only the prefix every
+    /// layout preserves — the usual case, and every view of a table with nothing generated —
+    /// keeps the core. Refusing it is the engine's policy, like [`Self::core_refusal`]'s.
+    fn layout_refusal(plan: &ViewPlan, layouts: &[crate::source::Skip]) -> Option<String> {
+        if layouts
+            .iter()
+            .all(|s| matches!(s, crate::source::Skip::None))
+        {
+            return None;
+        }
+        let access = AccessPlan::of(plan);
+        for (ai, occ) in access.occurrences.iter().enumerate() {
+            // Full-mode occurrences name a table, not an alias: they are not on the core
+            // (`Route::Full`), and read no image position either way.
+            let Some(table) = plan.aliases.get(ai).map(|a| a.table.clone()) else {
+                continue;
+            };
+            // The first column this server may leave out of an image: everything from here on
+            // sits at a position the image does not keep.
+            let Some(first) = table.columns.iter().position(|c| c.generated.is_some()) else {
+                continue;
+            };
+            let reads = |c: usize| match &occ.read_columns {
+                None => true,
+                Some(r) => r.get(c).copied().unwrap_or(false),
+            };
+            // The mask is the alias's referenced columns, which covers the unit and link
+            // columns of its path (a partner alias is checked in its own turn, against its own
+            // table); the path's own columns are named again only because a `None` mask means
+            // "any column" and a Direct path reads exactly those.
+            let path_cols: &[usize] = match &occ.path {
+                Path::Direct { cols } | Path::Partial { cols, .. } => cols,
+                _ => &[],
+            };
+            let moved = path_cols
+                .iter()
+                .copied()
+                .find(|&c| c >= first)
+                .or_else(|| (first..table.columns.len()).find(|&c| reads(c)));
+            if let Some(c) = moved {
+                return Some(format!(
+                    "table `{}` logs its generated columns out of the row images here (issue \
+                     #7): alias `{}` reads `{}`, at or after the generated column `{}`, and the \
+                     core reads an image by position; the viewplan executor reads it through the \
+                     binlog reader's image map",
+                    table.name, occ.alias, table.columns[c].name, table.columns[first].name
+                ));
+            }
+        }
+        None
+    }
+
     /// Mirrors `live` (definition id, plan) onto core targets: a routed plan gets a target (added, or
     /// replaced in place when the plan object changed), and every target not listed is removed. A target
     /// starts at once (`start` = the smallest position): lazyview adds them between transactions.
     pub fn sync(&mut self, live: &[(u64, Arc<ViewPlan>)]) -> Synced {
         let mut out = Synced::default();
         let mut keep = std::collections::HashSet::new();
+        let layouts = self.image_layouts;
         for (id, plan) in live {
             if !Self::routed(plan) {
                 continue;
             }
-            if let Some(why) = Self::core_refusal(plan) {
+            if let Some(why) =
+                Self::core_refusal(plan).or_else(|| Self::layout_refusal(plan, layouts))
+            {
                 // Keep its id (an added-then-refused target is removed here, not by the stale
                 // sweep, so the `refused` marker below survives the sweep's `retain`).
                 keep.insert(*id);
@@ -1579,5 +1655,77 @@ mod tests {
             std::time::Duration::from_millis(250),
             "reset"
         );
+    }
+
+    /// C-01 (#7): the core's consumer indexes a row image by catalog position, so on a server
+    /// that logs generated columns out of its images a plan that reads one — or any column
+    /// positioned after one — keeps the viewplan executor, whose readers go through the binlog
+    /// reader's image map. A plan reading only the prefix every layout preserves, and every
+    /// plan on a server whose images are the catalog, keeps the core.
+    #[test]
+    fn layout_refusal_keeps_reads_past_a_generated_column_on_the_executor() {
+        use crate::catalog::{Column, Generated};
+        use crate::dedup::testkit;
+        use crate::source::Skip;
+
+        let generated = |name: &str, stored: bool, base: &str| {
+            let mut c = Column::simple(name, "int");
+            c.generated = Some(Generated {
+                expr: format!("(`{base}` + 1)"),
+                stored,
+                deps: None,
+            });
+            c
+        };
+        let cols = vec![
+            Column::simple("id", "int"),
+            Column::simple("a", "int"),
+            generated("g", false, "a"),
+            generated("s", true, "a"),
+            Column::simple("extra", "int"),
+        ];
+        let mut cat = testkit::catalog();
+        let (key, t) = crate::catalog::test_catalog::typed("gen_t", cols, &[0]);
+        cat.insert(key, t);
+        let over = |sql: &str| testkit::plan_in(sql, &cat);
+        const LAYOUTS: [Skip; 3] = [Skip::None, Skip::NonVirtual, Skip::Base];
+        // Only the layouts of a server that omits nothing: everything keeps the core.
+        const FULL: [Skip; 1] = [Skip::None];
+
+        let prefix = over("SELECT i.id, i.a FROM gen_t i");
+        assert!(Dedup::routed(&prefix), "the fixture is a core plan");
+        assert_eq!(
+            Dedup::layout_refusal(&prefix, &LAYOUTS),
+            None,
+            "`a` sits before the first column any layout leaves out: its slot is its ordinal"
+        );
+        let stored = over("SELECT i.id, i.s FROM gen_t i");
+        assert_eq!(
+            Dedup::layout_refusal(&stored, &FULL),
+            None,
+            "images carry it here"
+        );
+        let why = Dedup::layout_refusal(&stored, &LAYOUTS)
+            .expect("a STORED column is in no image of the base-only layout");
+        assert!(
+            why.contains("#7") && why.contains("gen_t") && why.contains("generated column `g`"),
+            "the reason names the issue, the table and the generated column at or before the \
+             read column: {why}"
+        );
+        let after = over("SELECT i.id, i.extra FROM gen_t i");
+        assert!(
+            Dedup::layout_refusal(&after, &LAYOUTS).is_some(),
+            "a real column after the generated ones shifts with them"
+        );
+
+        // `sync` refuses it the way it refuses a hop plan — and only once the engine has said
+        // what layouts this server logs.
+        let mut d = dedup();
+        let s = d.sync(&[(1, stored.clone())]);
+        assert_eq!(s.added, vec![1], "the safe default is the catalog: {s:?}");
+        d.set_image_layouts(&LAYOUTS);
+        let s = d.sync(&[(1, stored)]);
+        assert_eq!(s.refused.len(), 1, "{:?}", s.refused);
+        assert!(d.is_refused(1), "its rows keep the RouteT path");
     }
 }

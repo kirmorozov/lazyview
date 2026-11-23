@@ -459,6 +459,42 @@ pub(crate) fn plan_refusal(
     }
 }
 
+/// Where a server's row-event images put each catalog column, as the binlog
+/// reader's [`crate::binlog::ImageMap`] needs it (issue #7 / C-01).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Skip {
+    /// Identity: every catalog column is in the image.
+    None,
+    /// Columns with `generated.is_some() && !stored` are missing.
+    NonVirtual,
+    /// Every generated column is missing, stored included.
+    Base,
+}
+
+/// The layouts this server can put a row image into — one entry per layout a
+/// TABLE_MAP-reconciled candidate may take.
+pub(crate) fn image_layouts(flavor: Flavor, version: &str) -> &'static [Skip] {
+    // The MySQL family never leaves generated columns out of a FULL image,
+    // whatever a stale `binlog_row_virtual_table_info` claim on the connection
+    // says; only MariaDB >= 11.4 logs generated values out of row events. The
+    // same version gate as [`maria::plan_refusal`] (`at_least_11_4`),
+    // deliberately: a plan can never be refused for a view the map handles.
+    // Measured (PR-1, `tmp/out/lvs-virtual/pr1/facts.md`): MariaDB >= 11.4
+    // UPDATE/DELETE images are base-only (STORED columns too), INSERT images
+    // are the full catalog under FULL; MySQL/Percona images are the full
+    // catalog everywhere.
+    match flavor {
+        Flavor::MySql | Flavor::Percona => &[Skip::None],
+        Flavor::MariaDb => {
+            if maria::at_least_11_4(version) {
+                &[Skip::None, Skip::NonVirtual, Skip::Base]
+            } else {
+                &[Skip::None]
+            }
+        }
+    }
+}
+
 /// The one place the per-flavor `log_pos = 0` position rule lives: `Tracker::advance` calls
 /// this for such an event, after excluding the FORMAT_DESCRIPTION re-send and ROTATE (whose
 /// zero `log_pos` never means "inside a transaction"). The MySQL family's arm is trivial — its

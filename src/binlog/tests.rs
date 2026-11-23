@@ -1129,3 +1129,163 @@ fn a_network_fault_is_never_undecodable() {
     assert!(crate::source::is_undecodable(&e));
     assert!(!is_transient(&e));
 }
+
+// ---------------------------------------------------------------------------------------------
+// C-01 (#7): the image slot maps the reader reconciles once per (table, layout).
+
+/// A table of INTEGER columns with the given ordinals generated (`storeds` STORED, `virtuals`
+/// VIRTUAL): the catalog shape the layout probes of `plan/decisions.md` measure.
+fn generated_table(
+    names: &[&str],
+    virtuals: &[usize],
+    storeds: &[usize],
+) -> crate::catalog::TableInfo {
+    use crate::catalog::{Column, Generated};
+    let mut columns = names
+        .iter()
+        .map(|n| Column::simple(n, "int"))
+        .collect::<Vec<_>>();
+    for &i in virtuals.iter().chain(storeds.iter()) {
+        columns[i].generated = Some(Generated {
+            expr: format!("(`{}` + 1)", names[i - 1]),
+            stored: storeds.contains(&i),
+            deps: None,
+        });
+    }
+    crate::catalog::TableInfo {
+        schema: "db".into(),
+        name: "t".into(),
+        columns,
+        pk: vec![0],
+        unique_keys: vec![],
+        cascades: vec![],
+        is_view: false,
+        view_bases: vec![],
+    }
+}
+
+fn key() -> crate::catalog::TableRef {
+    ("db".to_string(), "t".to_string())
+}
+
+/// The candidate layouts are the measured matrix (facts.md): MySQL family and MariaDB below
+/// 11.4 log every column; MariaDB 11.4+ has three layouts, keyed on the same version gate as
+/// the C-01 refusal.
+#[test]
+fn image_layouts_matrix() {
+    use crate::source::{image_layouts, Skip};
+    assert_eq!(
+        image_layouts(Flavor::MySql, "8.4.0"),
+        vec![Skip::None],
+        "MySQL logs generated columns in every image"
+    );
+    assert_eq!(image_layouts(Flavor::Percona, "8.4.0-2"), vec![Skip::None]);
+    assert_eq!(
+        image_layouts(Flavor::MariaDb, "11.4.2-MariaDB"),
+        vec![Skip::None, Skip::NonVirtual, Skip::Base],
+        "the same gate as `plan_refusal`"
+    );
+    assert_eq!(
+        image_layouts(Flavor::MariaDb, "10.11.8-MariaDB"),
+        vec![Skip::None]
+    );
+}
+
+/// One entry per distinct width, each naming the catalog column of every slot; a column the
+/// layout leaves out has no slot at all, so nothing resolves to it.
+#[test]
+fn image_maps_by_layout() {
+    use crate::source::{image_layouts, Skip};
+    let t = Tracker::new(Flavor::MariaDb, &pos("mariadb-bin.000001", 4));
+    let info = generated_table(&["id", "name", "g", "base", "extra"], &[2], &[3]);
+    // The TABLE_MAP count is the full catalog width on every server we measure.
+    t.set_image_maps(
+        key(),
+        &info,
+        5,
+        image_layouts(Flavor::MariaDb, "11.4.2-MariaDB"),
+    )
+    .expect("reconciles");
+
+    let full = t.image_map(&key(), 5).unwrap().expect("the FULL layout");
+    assert_eq!(full.column_of(0), Some(0));
+    assert_eq!(full.column_of(4), Some(4));
+
+    // WORK/DELETE: the VIRTUAL column is gone, `base` shifts down one slot.
+    let nw = t
+        .image_map(&key(), 4)
+        .unwrap()
+        .expect("the no-virtual layout");
+    assert_eq!((nw.column_of(0), nw.column_of(1)), (Some(0), Some(1)));
+    assert_eq!(
+        (nw.column_of(2), nw.column_of(3)),
+        (Some(3), Some(4)),
+        "the slots after a VIRTUAL column name the columns after it"
+    );
+    assert_eq!(nw.column_of(4), None, "past the end of this layout");
+
+    // WRITE_ROWS / PARTIAL_UPDATE / bulk: only the stored columns.
+    let base = t
+        .image_map(&key(), 3)
+        .unwrap()
+        .expect("the base-columns layout");
+    assert_eq!(
+        (base.column_of(0), base.column_of(1), base.column_of(2)),
+        (Some(0), Some(1), Some(4))
+    );
+    assert_eq!(base.column_of(3), None);
+
+    // An image of a width no layout has: `Some(None)`, read as "refuse", never guessed.
+    assert!(matches!(t.image_map(&key(), 2), Some(None)));
+    // An unknown table stays the identity path (the pre-#7 reader).
+    assert!(t.image_map(&("db".into(), "other".into()), 5).is_none());
+
+    // A table with nothing generated answers all three candidates identically: one entry.
+    let plain = generated_table(&["id", "a", "b"], &[], &[]);
+    t.set_image_maps(
+        ("db".into(), "p".into()),
+        &plain,
+        3,
+        &[Skip::None, Skip::NonVirtual, Skip::Base],
+    )
+    .expect("identical candidates collapse");
+    for w in [3, 3, 3] {
+        let m = t.image_map(&("db".into(), "p".into()), w).unwrap().unwrap();
+        assert_eq!(
+            (m.column_of(0), m.column_of(1), m.column_of(2)),
+            (Some(0), Some(1), Some(2))
+        );
+    }
+}
+
+/// A TABLE_MAP count that disagrees with the catalog cannot be reconciled: the table is
+/// poisoned (every rows event refused) rather than read by guessed positions.
+#[test]
+fn image_maps_of_an_unreconcilable_table_are_poisoned() {
+    let t = Tracker::new(Flavor::MariaDb, &pos("mariadb-bin.000001", 4));
+    let info = generated_table(&["id", "name", "g", "base", "extra"], &[2], &[]);
+    let e = t
+        .set_image_maps(key(), &info, 4, &[crate::source::Skip::None])
+        .expect_err("the TABLE_MAP count must agree with the catalog");
+    assert!(e.contains("columns"), "{e}");
+    assert!(t.has_image_maps(&key()), "the refusal is remembered");
+    for w in [0, 3, 4, 5, 9] {
+        assert!(
+            matches!(t.image_map(&key(), w), Some(None)),
+            "a poisoned table resolves no width"
+        );
+    }
+    // The engine poisons a table whose catalog row is gone; DDL drops the entry, so the next
+    // TABLE_MAP reconciles against the new catalog.
+    t.poison_image_maps(("db".into(), "gone".into()));
+    assert!(matches!(
+        t.image_map(&("db".into(), "gone".into()), 4),
+        Some(None)
+    ));
+    t.forget_image_maps(&key());
+    assert!(!t.has_image_maps(&key()));
+    assert!(
+        t.image_map(&key(), 4).is_none(),
+        "no entry: the identity path"
+    );
+}

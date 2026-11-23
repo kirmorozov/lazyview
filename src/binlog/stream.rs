@@ -1,13 +1,16 @@
 use super::*;
 
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use crate::binlog::connect::product;
 use crate::source::mysql::{
     classify_query, dump_sids, mysql_gtid, time2_twin, tme_name, xa_prepare_event, Payload,
     QueryKind, Time2Twin,
 };
 use crate::source::{
-    is_duplicate_server_id_error, maria, missing_binlog_message, position_rule, Step, Undecodable,
-    ACCESS_DENIED_CODES,
+    is_duplicate_server_id_error, maria, missing_binlog_message, position_rule, Skip, Step,
+    Undecodable, ACCESS_DENIED_CODES,
 };
 
 // Raw event type codes (MariaDB's are not in mysql_common's `EventType`).
@@ -100,6 +103,80 @@ fn kind_label(et: u8) -> String {
     format!("{}({et})", event_kind(et))
 }
 
+/// Where each catalog column sits in one decoded row image: `column_of_slot[s]`
+/// is the catalog index of the value at image slot `s`. A generated column the
+/// server leaves out simply has no slot, so no map entry — this is a positional
+/// lookup, not a column filter. Shared as an `Arc` between the TABLE_MAP handler
+/// that reconciled it and every `accumulate` consumer that applies it; the only
+/// per-value cost is one array index (issue #7 / C-01).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageMap {
+    column_of_slot: Arc<[u16]>,
+    /// The inverse, built once with the map: `slot_of_column[c]` is the slot holding
+    /// catalog column `c`, `None` for a column this layout leaves out (and for one
+    /// past the map). One array index per value is the whole hot-path cost.
+    slot_of_column: Arc<[Option<u16>]>,
+}
+
+impl ImageMap {
+    pub(crate) fn new(column_of_slot: Vec<u16>) -> Self {
+        let width = column_of_slot
+            .iter()
+            .copied()
+            .max()
+            .map(|c| c as usize + 1)
+            .unwrap_or(0);
+        let mut slot_of_column: Vec<Option<u16>> = vec![None; width];
+        for (slot, &column) in column_of_slot.iter().enumerate() {
+            slot_of_column[column as usize] = Some(slot as u16);
+        }
+        ImageMap {
+            column_of_slot: column_of_slot.into(),
+            slot_of_column: slot_of_column.into(),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.column_of_slot.len()
+    }
+
+    /// The catalog column whose value sits at image slot `slot`, or `None` past
+    /// the end of the map: the direction the map is built in, read by the tests
+    /// that assert a layout (`slot_of` is what the row readers use).
+    #[cfg(test)]
+    pub(crate) fn column_of(&self, slot: usize) -> Option<usize> {
+        self.column_of_slot.get(slot).map(|&c| c as usize)
+    }
+
+    /// The image slot holding catalog column `column`, or `None` when this layout
+    /// leaves the column out (a generated value the server does not log): the
+    /// caller then reads it as "no value", never as its neighbour's.
+    pub(crate) fn slot_of(&self, column: usize) -> Option<usize> {
+        self.slot_of_column
+            .get(column)
+            .copied()
+            .flatten()
+            .map(|s| s as usize)
+    }
+}
+
+/// One table's reconciled image layouts (issue #7 / C-01): one map per distinct
+/// image width the server can log for it. An empty `maps` is a poison entry: the
+/// image could not be reconciled with the catalog at all, and every rows event
+/// for the table must be refused rather than read by guessed positions.
+#[derive(Clone)]
+pub(crate) struct TableMaps {
+    maps: Arc<[ImageMap]>,
+}
+
+impl TableMaps {
+    /// The map for a decoded image of `width` slots; `None`: no layout has that
+    /// width, which the caller reads as an un-mappable image.
+    fn for_width(&self, width: usize) -> Option<ImageMap> {
+        self.maps.iter().find(|m| m.len() == width).cloned()
+    }
+}
+
 /// Position bookkeeping and event → [`Item`] mapping, independent of the connection.
 pub(super) struct Tracker {
     flavor: Flavor,
@@ -116,6 +193,13 @@ pub(super) struct Tracker {
     /// Table maps by id, tagged with the file generation they were seen in. Entries survive one
     /// ROTATE (unlike mysql_common's map), so rows buffered across a rotate still decode.
     tables: HashMap<u64, (u64, TableMapEvent<'static>, Option<Time2Twin>)>,
+    /// C-01 (#7): image slot maps keyed by table NAME — a TABLE_MAP event carries
+    /// the name, so entries survive a log switch and `xa_committed` (which knows
+    /// only names) resolves them. A table absent from this map was never
+    /// reconciled: its images are read by their plain positions (identity), which
+    /// is exactly what the pre-#7 reader did. The engine drops entries at DDL
+    /// boundaries; the next TABLE_MAP reconciles against the new catalog.
+    image_maps: RefCell<HashMap<crate::catalog::TableRef, TableMaps>>,
     generation: u64,
     /// Second item produced by one event (MariaDB XA GTID → `Gtid` + `XaStart`).
     queued: Option<Item>,
@@ -140,6 +224,7 @@ impl Tracker {
             payload: None,
             partial: None,
             tables: HashMap::new(),
+            image_maps: RefCell::new(HashMap::new()),
             generation: 0,
             queued: None,
             head_pos: 0,
@@ -149,6 +234,119 @@ impl Tracker {
 
     pub(super) fn table_map(&self, table_id: u64) -> Option<&TableMapEvent<'static>> {
         self.tables.get(&table_id).map(|(_, t, _)| t)
+    }
+
+    /// The image slot maps for a table, resolved against a decoded image's slot
+    /// count: outer `None` — no entry was ever built for this table (identity);
+    /// `Some(None)` — an image of a width no candidate layout has (refuse, never
+    /// guess); `Some(Some(m))` — apply `m`.
+    pub(super) fn image_map(
+        &self,
+        table: &crate::catalog::TableRef,
+        width: usize,
+    ) -> Option<Option<ImageMap>> {
+        self.image_maps
+            .borrow()
+            .get(table)
+            .map(|e| e.for_width(width))
+    }
+
+    /// Reconcile and store the candidate layouts for one table — the cold path,
+    /// once per (table, layout), at the TABLE_MAP boundary.
+    ///
+    /// Refuses (poisoning the table, so its rows events are refused rather than
+    /// guessed) whenever the image cannot be reconciled with the catalog: a
+    /// TABLE_MAP count that disagrees with the catalog width, or two genuinely
+    /// different candidate layouts sharing one width. It never rebuilds a
+    /// guessed layout.
+    pub(super) fn set_image_maps(
+        &self,
+        table: crate::catalog::TableRef,
+        info: &crate::catalog::TableInfo,
+        table_map_columns: u64,
+        cands: &[Skip],
+    ) -> Result<(), String> {
+        // A TABLE_MAP event's column_count is the FULL catalog width on every
+        // server we measure: it is the reconciliation, and an image wider than
+        // it cannot be a projection of the catalog at all.
+        if table_map_columns as usize != info.columns.len() {
+            self.poison_image_maps(table.clone());
+            return Err(format!(
+                "TABLE_MAP for `{}`.`{}` declares {table_map_columns} columns, the catalog has {}",
+                table.0,
+                table.1,
+                info.columns.len()
+            ));
+        }
+        let mut maps: Vec<ImageMap> = Vec::with_capacity(cands.len());
+        for &skip in cands {
+            let m = Self::build_image_map(info, skip);
+            if let Some(prev) = maps.iter().find(|p| p.len() == m.len()) {
+                if prev != &m {
+                    // Two layouts would decode identically and cannot be told
+                    // apart from the payload: refuse rather than guess.
+                    self.poison_image_maps(table.clone());
+                    return Err(format!(
+                        "table `{}`.`{}` can be logged in two different image layouts of {} slots",
+                        table.0,
+                        table.1,
+                        m.len()
+                    ));
+                }
+                // The same map from another candidate (a table with no
+                // generated columns answers all three): one entry.
+                continue;
+            }
+            maps.push(m);
+        }
+        self.image_maps
+            .borrow_mut()
+            .insert(table, TableMaps { maps: maps.into() });
+        Ok(())
+    }
+
+    /// The map for one layout: slot `i` names the i-th catalog column the image
+    /// keeps, so a skipped column has no entry at all.
+    fn build_image_map(info: &crate::catalog::TableInfo, skip: Skip) -> ImageMap {
+        let column_of_slot: Vec<u16> = info
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, c)| match skip {
+                Skip::None => Some(ordinal as u16),
+                Skip::NonVirtual
+                    if c.generated.is_some() && !c.generated.as_ref().unwrap().stored =>
+                {
+                    None
+                }
+                Skip::NonVirtual => Some(ordinal as u16),
+                Skip::Base if c.generated.is_some() => None,
+                Skip::Base => Some(ordinal as u16),
+            })
+            .collect();
+        ImageMap::new(column_of_slot)
+    }
+
+    /// An entry whose images match no layout: every rows event of this table is
+    /// refused (never read by guessed positions) until a TABLE_MAP reconciles.
+    pub(super) fn poison_image_maps(&self, table: crate::catalog::TableRef) {
+        self.image_maps.borrow_mut().insert(
+            table,
+            TableMaps {
+                maps: Arc::from(Vec::new()),
+            },
+        );
+    }
+
+    /// The engine drops a table's entries at a DDL boundary: a layout
+    /// reconciled against the old catalog must never be applied to the new one.
+    pub(super) fn forget_image_maps(&self, table: &crate::catalog::TableRef) {
+        self.image_maps.borrow_mut().remove(table);
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_image_maps(&self, table: &crate::catalog::TableRef) -> bool {
+        self.image_maps.borrow().contains_key(table)
     }
 }
 
@@ -362,6 +560,45 @@ impl BinlogReader {
         event: &Event,
     ) -> Result<Vec<(Option<BinlogRow>, Option<BinlogRow>)>> {
         self.t.rows(table_id, event)
+    }
+
+    // The four image-map hooks below answer a caller that lives in `engine.rs`, outside
+    // this copy-set file: lazy-wire-fire copies this file byte for byte and has no such
+    // call site yet, so each carries the allow that keeps the copy unedited (the
+    // arrangement `lib.rs` records for the `dialect` and `source` seams).
+
+    /// C-01 (#7): see [`Tracker::image_map`].
+    #[allow(dead_code)] // engine-only hook: see the note above
+    pub(crate) fn image_map(
+        &self,
+        table: &crate::catalog::TableRef,
+        width: usize,
+    ) -> Option<Option<ImageMap>> {
+        self.t.image_map(table, width)
+    }
+
+    /// C-01 (#7): see [`Tracker::set_image_maps`].
+    #[allow(dead_code)] // engine-only hook: see the note above
+    pub(crate) fn set_image_maps(
+        &self,
+        table: crate::catalog::TableRef,
+        info: &crate::catalog::TableInfo,
+        table_map_columns: u64,
+        cands: &[Skip],
+    ) -> Result<(), String> {
+        self.t.set_image_maps(table, info, table_map_columns, cands)
+    }
+
+    /// C-01 (#7): see [`Tracker::poison_image_maps`].
+    #[allow(dead_code)] // engine-only hook: see the note above
+    pub(crate) fn poison_image_maps(&self, table: crate::catalog::TableRef) {
+        self.t.poison_image_maps(table);
+    }
+
+    /// C-01 (#7): see [`Tracker::forget_image_maps`].
+    #[allow(dead_code)] // engine-only hook: see the note above
+    pub(crate) fn forget_image_maps(&self, table: &crate::catalog::TableRef) {
+        self.t.forget_image_maps(table);
     }
 
     pub async fn close(self) -> Result<()> {
