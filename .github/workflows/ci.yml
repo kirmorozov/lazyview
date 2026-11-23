@@ -20,14 +20,15 @@ name: ci
 # integration-pg
 # (integration-pg-multi pins that target and rotates the sources, so the faults are not paid for
 # twice; its legs are the targets_pg_ gates).
-# The soak jobs (bottom of the file): `soak-pr`, a bounded 5-minute smoke on mysql84, runs on
-# every pull_request (a check of its own, so its log shows soak_smoke_30m passing for real);
-# `soak-smoke` (30 minutes, mysql84 + mariadb1011) and `soak-long` (3 hours on mysql84, weekly,
-# behind the long_soak input) run only for the nightly and a manual run, and `report` opens or
-# updates the one open issue labelled `nightly` after a failed nightly. The nightly is
-# nightly.yml calling this workflow on the schedule: the schedule event then runs the soak jobs
-# only (every regular job skips), because a push to main has already run the full set on this
-# very commit (#236) and the nightly adds only what that push does not run.
+# The soak jobs (bottom of the file) are the two bounded soaks: `soak-pr`, a bounded 5-minute smoke
+# on mysql84, runs on every pull_request (a check of its own, so its log shows soak_smoke_30m
+# passing for real); `soak-smoke` (30 minutes, mysql84 + mariadb1011) runs only for the nightly and
+# a manual run, and `report` opens or updates the one open issue labelled `nightly` after a failed
+# nightly. The nightly is nightly.yml calling this workflow on the schedule: the schedule event then
+# runs the soak jobs only (every regular job skips), because a push to main has already run the
+# full set on this very commit (#236) and the nightly adds only what that push does not run. The
+# long soak (tests/soak.rs `soak_long`) is not a CI job: GitHub Actions have time limits, so it
+# runs locally as a release gate through tmp/lvs-suite.sh.
 # twice; its legs are the targets_pg_ gates). The jobs that gate image/release (the supply-chain scans,
 # deny + scan-image, and the optional features) are not advisory (S-09): an advisory job gates nothing.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:
@@ -64,19 +65,10 @@ on:
       - "docs/**"
       - "**/*.md"
   workflow_dispatch:
-    inputs:
-      long_soak:
-        description: "Also run the 3-hour long soak (nightly.yml passes it on the weekly schedule)"
-        type: boolean
-        default: false
   # Called by nightly.yml (the nightly on main HEAD). Its caller's event is `schedule`, so every
   # regular job skips and only the soak jobs and report run; workflow_call is listed alongside
   # schedule in those `if`s so the split holds whichever event name the called workflow sees.
   workflow_call:
-    inputs:
-      long_soak:
-        type: boolean
-        default: false
 
 # A newer run for the same ref and event cancels the superseded one, except on main, where
 # cancel-in-progress stays false: a running main verification is never cancelled. On main the
@@ -1151,8 +1143,9 @@ jobs:
   # ---- Soak jobs (tests/soak.rs). All strict: LAZYVIEW_TEST_STRICT=soak_ is the harness's own
   # strict mode (tests/common, from the tests-strict-targets PR), so a skipped soak scenario
   # fails the job instead of printing a green SKIP line. soak-pr runs on every pull request;
-  # soak-smoke and soak-long are the nightly's (nightly.yml calls this workflow on the schedule)
-  # and a manual run of this workflow, so a branch can prove them before merge. ----
+  # soak-smoke is the nightly's (nightly.yml calls this workflow on the schedule) and a manual run
+  # of this workflow, so a branch can prove them before merge. Both are bounded: the long soak
+  # (tests/soak.rs soak_long) runs locally, not here (see the header). ----
 
   soak-pr:
     # The bounded soak on pull requests: 5 minutes (LAZYVIEW_TEST_SOAK_MINUTES) on mysql84, as
@@ -1160,7 +1153,7 @@ jobs:
     # never executed the soak impossible: soak_smoke_30m must show as passed in the log. What the
     # 5-minute bound proves: the writers, the views and the checks run and settle for that
     # window. The full five kinds of smoke chaos need the nightly's 30-minute smoke (10 events
-    # per hour), and the long soak runs weekly: below.
+    # per hour).
     name: soak smoke (mysql84, bounded 5 min)
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
@@ -1276,59 +1269,6 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  soak-long:
-    # Weekly (nightly.yml passes long_soak on Sunday): 180 minutes of run, the test's margin
-    # (210 min in all), the build and the server start, inside the 6-hour hosted-runner limit.
-    # No container chaos here: LAZYVIEW_TEST_SOAK_CONTAINERS needs a source and a target container.
-    name: soak long (mysql84, 3 hours)
-    if: ${{ inputs.long_soak == true }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    env:
-      COMPOSE_FILE: docker-compose.test.yml
-      FLAVOR: mysql84
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: start mysql84 (in the background)
-        run: docker compose up -d --quiet-pull "$FLAVOR"
-      - name: rust ${{ env.RUST_TOOLCHAIN }}
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: integration
-          save-if: false
-      - name: build the soak tests
-        run: cargo test --locked --test soak --no-run
-      - name: wait for mysql84
-        run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"
-      - name: server version
-        run: docker compose exec -T "$FLAVOR" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
-      - name: long soak (180 minutes)
-        timeout-minutes: 220
-        env:
-          LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
-          LAZYVIEW_HEALTH_ADDR: "off"
-          LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
-          LAZYVIEW_TEST_SOAK: long
-          LAZYVIEW_TEST_SOAK_MINUTES: "180"
-          LAZYVIEW_TEST_STRICT: soak_
-        run: cargo test --locked --test soak -- --test-threads=1 soak_long
-      - name: upload the soak report
-        if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: soak-long-mysql84
-          path: tmp/out/lvs-soak/
-          retention-days: 14
-          if-no-files-found: ignore
-      - name: stop mysql84
-        if: always()
-        run: docker compose down -v
-
   report:
     # The nightly's own reporter (schedule and the nightly call only; a manual run never writes
     # to the issue tracker): a failed nightly opens or updates the one open issue labelled
@@ -1336,7 +1276,7 @@ jobs:
     # a scheduled run is the soak (the regular jobs above already ran on the push to main), and the
     # network-chaos scenarios run inside those integration jobs on the push, so they are not here.
     name: report failed nightly
-    needs: [soak-smoke, soak-long]
+    needs: [soak-smoke]
     if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_call') && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
