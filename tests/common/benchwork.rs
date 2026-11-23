@@ -10,7 +10,7 @@
 //! table is the view shape and not the schema. `items` and `links` are FK children of `entities`
 //! with `ON DELETE CASCADE`, which is how the cascade shape makes the *server* feed the views.
 
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 
 use super::engineproc::Rng;
 use super::oracle::{Kind, ViewSpec};
@@ -453,22 +453,43 @@ pub async fn columns(c: &mut Conn, schema: &str, table: &str) -> Result<Vec<Stri
         .collect())
 }
 
-/// The two aggregates of one shape row, read out of what the server answered. Moved here verbatim
-/// from `shape_of` so the row can be fed to it by a unit test; the way it reads a row it cannot
-/// parse is the subject of #338, which the test beside this module shows is wrong.
-fn shape_row(_table: &str, rs: &[Vec<Option<String>>]) -> Result<(i64, u64)> {
-    let r = rs.first().and_then(|r| r.first()).cloned().flatten();
-    let n: i64 = r.as_deref().unwrap_or("0").parse().unwrap_or(0);
-    let h: u64 = rs
-        .first()
-        .and_then(|r| r.get(1).cloned().flatten())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+/// The two aggregates of one shape row, or an error naming `table` and the value it could not read
+/// (#338). The query below answers one row with two non-null values — an aggregate over no rows
+/// still answers `0` and `0` — so a missing or unparseable one is a broken measurement and not a
+/// measurement: reading it as the pair an empty view really has is how this harness would one day
+/// report a comparison it never made. `compare_with_oracle` reads both sides through `shape_of`, so
+/// each side failing here ends the window instead of reaching the `want == got` line.
+fn shape_row(table: &str, rs: &[Vec<Option<String>>]) -> Result<(i64, u64)> {
+    let row = match rs.first() {
+        Some(row) => row,
+        None => {
+            bail!("{table}: the aggregate query returned no row: neither COUNT(*) nor a checksum")
+        }
+    };
+    let count = match row.first().cloned().flatten() {
+        Some(v) => v,
+        None => bail!("{table}: COUNT(*) came back missing or NULL, which is not a row count"),
+    };
+    let checksum = match row.get(1).cloned().flatten() {
+        Some(v) => v,
+        None => bail!("{table}: the checksum came back missing or NULL, which is not a checksum"),
+    };
+    let n: i64 = match count.parse() {
+        Ok(v) => v,
+        Err(e) => bail!("{table}: COUNT(*) came back as {count:?}, which is not a row count ({e})"),
+    };
+    let h: u64 = match checksum.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            bail!("{table}: the checksum came back as {checksum:?}, which is not a checksum ({e})")
+        }
+    };
     Ok((n, h))
 }
 
 /// `COUNT(*)` plus an order-independent checksum of the same columns, both computed inside the
-/// server: exactly one row crosses the wire, so the harness never holds a view in memory.
+/// server: exactly one row crosses the wire, so the harness never holds a view in memory. A row it
+/// cannot read is an error out of `shape_row`, never a zero (see #338).
 async fn shape_of(c: &mut Conn, table: &str, cols: &[String]) -> Result<(i64, u64)> {
     let expr = cols
         .iter()
@@ -522,7 +543,11 @@ mod tests {
             (0, 0),
         );
         assert_eq!(
-            shape_row("b_simple", &[vec![Some("6000".into()), Some("3735928559".into())]]).unwrap(),
+            shape_row(
+                "b_simple",
+                &[vec![Some("6000".into()), Some("3735928559".into())]]
+            )
+            .unwrap(),
             (6_000, 3_735_928_559),
         );
     }
@@ -534,7 +559,10 @@ mod tests {
     fn no_row_at_all_fails_the_comparison() {
         let e = shape_row("b_simple", &[]).unwrap_err().to_string();
         assert!(e.contains("b_simple"), "the view is not named: {e}");
-        assert!(e.contains("COUNT(*)"), "the missing value is not named: {e}");
+        assert!(
+            e.contains("COUNT(*)"),
+            "the missing value is not named: {e}"
+        );
     }
 
     /// The driver hands `NULL` to the harness as `None`, so a `NULL` count is the same unreadable
