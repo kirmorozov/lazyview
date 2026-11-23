@@ -8397,6 +8397,14 @@ impl Engine {
                     {
                         warn!(view = %n.name, "acknowledging _lazyview.rebuild: {e:#}");
                     } else {
+                        // One INFO line per served request, so a management user who keeps typing
+                        // `SET rebuild = 1` (a no-op once `rebuild_served` is past 1) can find the
+                        // request it never serves and the statement that does ask for one.
+                        info!(
+                            view = %n.name,
+                            "rebuild of {} served at request {v}; request another with UPDATE _lazyview SET rebuild = rebuild + 1",
+                            n.name
+                        );
                         self.rebuild_served_map.insert(def_id, v);
                         let s = &mut self.slots[i];
                         s.rebuild_served = v;

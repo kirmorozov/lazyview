@@ -153,7 +153,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
 /// its own where the service account has SELECT only, so a name that would resolve through the
 /// connection's default schema could read a different table. `defs_schema` is
 /// `LAZYVIEW_DEFINITIONS_DATABASE`, or `LAZYVIEW_DATABASE` when unset (the simple setup).
-pub fn defs_table(defs_schema: &str) -> String {
+pub(crate) fn defs_table(defs_schema: &str) -> String {
     format!("`{}`.`{}`", defs_schema.replace('`', "``"), DEFS)
 }
 
