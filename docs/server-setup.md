@@ -245,8 +245,9 @@ run: the setup run is the only one that does DDL on lazyview's own tables. Two l
 **simple setup** with one account that plays both roles, and an **advanced setup** with the three
 accounts — **setup**, **control** and **consumption** — the recommended production layout. The
 neutral names below are yours to choose: `app` is the application's schema, `lazyview` the schema
-of lazyview's own (`LAZYVIEW_DATABASE`: its definitions and status tables, and the view tables it
-builds on the source), `other_schema` any schema a view reads.
+of lazyview's own (`LAZYVIEW_DATABASE`: its status tables, the view tables it builds on the
+source, and `_lazyview` unless [the definitions have a schema of their
+own](#definitions-in-a-schema-of-their-own)), `other_schema` any schema a view reads.
 
 ### Simple setup
 
@@ -283,9 +284,13 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lazyview'@'%';
   prints `GRANT REPLICATION SLAVE, BINLOG MONITOR ON *.*` for the documented `GRANT`. Same
   privilege, nothing to change.
 * The cost of the one account: it holds `CREATE`, `DROP` and `ALTER` on lazyview's own schema, and
-  it writes its own definitions — it can disable or delete a row of `_lazyview`, which drops the
-  view's table by default ([changes while running](views.md#changes-while-running)). Where that
-  matters, use the [advanced setup](#advanced-setup-recommended-for-production).
+  it is also the account that writes the definitions — disabling or deleting a row of `_lazyview`
+  drops the view's table by default ([changes while running](views.md#changes-while-running)).
+  From v0.2 the service writes no row of `_lazyview` at all (the name and the rebuild request are
+  yours), so with one account the audit log cannot even tell the service's operator from the
+  control plane. No extra grant is needed for that: the `SELECT` above is what the service uses
+  there. Where the distinction matters, use the
+  [advanced setup](#advanced-setup-recommended-for-production).
 
 ### Advanced setup (recommended for production)
 
@@ -295,18 +300,23 @@ themselves: `lazyview_setup`, `lazyview_control`, `lazyview_svc`.
 
 | account | used | grants |
 |---|---|---|
-| setup | `lazyview setup` only — at install and at upgrade, never at run time | `CREATE`, `ALTER`, `INDEX`, `CREATE VIEW`, `DROP` on lazyview's own schema (its tables and the `_lazyview_overview` view), `INSERT` and `UPDATE` on `_lazyview_status` (the run takes the instance lock, whose fencing epoch lives there), and `SELECT` on every schema a definition reads: validating a definition plans it, and a table the account cannot see reads as missing |
-| control | whoever writes the definitions (your control plane); the service never does | `SELECT` on lazyview's own schema; `INSERT`, `UPDATE`, `DELETE` on `_lazyview` — it alone changes definitions |
-| consumption | the operations run: the service | `SELECT` on `_lazyview`; `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the status tables; no DDL on lazyview's own tables; its DDL rights are for the view tables it builds; `REPLICATION SLAVE`, `REPLICATION CLIENT` on `*.*` of the servers whose binlog it reads |
+| setup | `lazyview setup` only — at install and at upgrade, never at run time | `CREATE`, `ALTER`, `INDEX`, `CREATE VIEW`, `DROP` on lazyview's own schema (its tables and the `_lazyview_overview` view), `INSERT` and `UPDATE` on `_lazyview_status` (the run takes the instance lock, whose fencing epoch lives there), `SELECT` on every schema a definition reads: validating a definition plans it, and a table the account cannot see reads as missing — and, with the definitions in a schema of their own, `SELECT`, `CREATE`, `ALTER` and `INDEX` there: it is the setup account that creates `_lazyview` and widens its `rebuild` counter |
+| control | whoever writes the definitions (your control plane); the service never does | `SELECT` on lazyview's own schema; `INSERT`, `UPDATE`, `DELETE` on `_lazyview` — it alone changes definitions, enables and disables them, sets `targets` and asks for a rebuild (`rebuild = rebuild + 1`) |
+| consumption | the operations run: the service | `SELECT` on `_lazyview` and, from v0.2, nothing else there; `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the status tables; no DDL on lazyview's own tables; its DDL rights are for the view tables it builds; `REPLICATION SLAVE`, `REPLICATION CLIENT` on `*.*` of the servers whose binlog it reads |
 
 The status tables are `_lazyview_state` (one row per view and target, upserted),
 `_lazyview_status` (the saved position per instance) and `_lazyview_fence` (the
-visibility-fence counter). Until the definitions table becomes read-only for the
-service (a change in progress), the service also writes two columns of
-`_lazyview`: `name`, filled in from a view's `CREATE VIEW` statement, and
-`rebuild`, cleared when a rebuild request is served. In the advanced layout grant
-it `UPDATE` on those two columns only (column privileges, in the script below);
-that grant goes away with the change.
+visibility-fence counter). From v0.2 those are the only tables the service writes:
+the definitions table is read-only for it, so every change of a definition —
+including a rebuild request, `UPDATE _lazyview SET rebuild = rebuild + 1` — is a
+write of the control account, and the request is acknowledged in the service's own
+`_lazyview_state.rebuild_served`
+([rebuilding a view](views.md#rebuilding-a-view)). Until v0.2 the service also
+wrote two columns of `_lazyview`: `name`, filled in from a view's `CREATE VIEW`
+statement, and `rebuild`, cleared when a rebuild request was served; while you are
+still on that release, keep the column grant the consumption script used to carry
+(`GRANT UPDATE (name, rebuild) ON lazyview._lazyview TO 'lazyview_svc'@'%';`). The
+v0.2 service needs neither.
 
 The two runs are what makes the split exact. `lazyview setup`, run with the setup account, owns
 all DDL on lazyview's own tables; the operations run issues none of it — it checks them through
@@ -319,14 +329,17 @@ Secret with the setup account ([Kubernetes](kubernetes.md#deploy)).
 
 Today the control tables live on the source server in `LAZYVIEW_DATABASE`. A
 control store off the source is planned; no version is promised for it. In the
-advanced layout the definitions table `_lazyview` then lives in a schema of its
+advanced layout the definitions table `_lazyview` lives in a schema of its
 own, apart from the schemas where the service creates and drops view tables:
 MySQL grants `CREATE` and `DROP` per schema, so a service that may create its
-view tables in the same schema could drop the definitions table too. The setting
-that places it there is coming; until it lands, the service's view tables on the
-source are still created in the schema of lazyview's own (`LAZYVIEW_DATABASE`),
-which is why the consumption script below carries the schema-wide DDL line. Once
-a view's tables are known ahead of time, grant them per table instead:
+view tables in the same schema could drop the definitions table too. From v0.2
+the setting that places it there is `LAZYVIEW_DEFINITIONS_DATABASE`, and the
+service account then holds `SELECT` in that schema and nothing else
+([definitions in a schema of their own](#definitions-in-a-schema-of-their-own)).
+The service's view tables on the source are still created in the schema of
+lazyview's own (`LAZYVIEW_DATABASE`), which is why the consumption script below
+carries the schema-wide DDL line. Once a view's tables are known ahead of time,
+grant them per table instead:
 `v_order_total`, `v_order_total__lv_new`, `v_order_total__lv_old`, and the
 planner's `_lv_probe_%` views (`CREATE VIEW` and `DROP`).
 
@@ -374,7 +387,9 @@ service, the operations run: no DDL on lazyview's own tables.
 ```sql
 CREATE USER 'lazyview_svc'@'%' IDENTIFIED BY 'change-me';
 GRANT SELECT ON lazyview._lazyview TO 'lazyview_svc'@'%';
-GRANT UPDATE (name, rebuild) ON lazyview._lazyview TO 'lazyview_svc'@'%';  -- goes away when the definitions table turns read-only
+-- from v0.2 the service writes no column of _lazyview, so it needs no UPDATE there; on the
+-- release before v0.2 it also wrote `name` and cleared `rebuild`, and needs
+-- GRANT UPDATE (name, rebuild) ON lazyview._lazyview TO 'lazyview_svc'@'%';  until then
 GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_state TO 'lazyview_svc'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_status TO 'lazyview_svc'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_fence TO 'lazyview_svc'@'%';
@@ -390,6 +405,8 @@ GRANT INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, CREATE VIEW, SHOW VIEW
 -- optional, for dashboards and humans:
 CREATE USER 'lazyview_monitor'@'%' IDENTIFIED BY 'change-me';
 GRANT SELECT ON lazyview._lazyview_overview TO 'lazyview_monitor'@'%';
+GRANT SELECT ON lazyview._lazyview TO 'lazyview_monitor'@'%';  -- the overview is SQL SECURITY
+                                                                -- INVOKER and joins _lazyview
 GRANT SELECT ON lazyview._lazyview_state TO 'lazyview_monitor'@'%';
 GRANT SELECT ON lazyview._lazyview_status TO 'lazyview_monitor'@'%';
 GRANT SELECT ON lazyview._lazyview_fence TO 'lazyview_monitor'@'%';
@@ -399,6 +416,92 @@ On MySQL and MariaDB the replication privileges (`REPLICATION SLAVE`, `REPLICATI
 global, never per schema: a service that streams a separate control instance sees that instance's
 whole binlog and filters it client-side. (On PostgreSQL a publication can be limited to the
 control tables.)
+
+#### Definitions in a schema of their own
+
+From v0.2 `LAZYVIEW_DEFINITIONS_DATABASE` places `_lazyview` in a schema of its own —
+`shop_views` below; unset it is the schema of `LAZYVIEW_DSN`, which is the simple setup
+unchanged. This is the setting to use when the definitions are owned by a migration tool or a
+DBA role and the runtime account should not be able to touch them: the service account holds
+`SELECT` in that schema and nothing else, so it cannot write, widen or rename anything there. Its
+own tables (`_lazyview_state`, `_lazyview_status`, the commit fence, `_lazyview_overview`) and its
+view tables stay in `LAZYVIEW_DATABASE`. The definitions table is always addressed
+schema-qualified (`shop_views`.`_lazyview`), so the service does not need that schema as its
+connection schema and unqualified names in a definition still mean `LAZYVIEW_DATABASE`. Rebuild
+requests are read through the same `SELECT` and acknowledged in the service's own
+`_lazyview_state.rebuild_served`, so the definitions schema needs no write grant at all.
+
+```sh
+LAZYVIEW_DSN=mysql://lazyview_svc:change-me@db:3306/lazyview   # the service's own schema
+LAZYVIEW_DEFINITIONS_DATABASE=shop_views                       # where _lazyview lives
+```
+
+Both runs read the variable, so give the setup run the same value: pointed at no definitions
+schema, it creates `_lazyview` in the service's own schema (`ensure`, `src/meta.rs:353`) and the
+operations run then reports the definitions table missing (`verify`, `src/meta.rs:286`). A service
+that started with the setting logs ``definitions table `shop_views`.`_lazyview` (the service reads
+it only)`` (`src/engine.rs:1796`).
+
+And the definitions schema has to be binlogged: a definition you change there reaches the service
+as a binlog event on that table (`src/engine.rs:5001`), so a `binlog-do-db` / `binlog-ignore-db`
+that drops it leaves the service seeing the definitions only at its next restart — the startup
+check says exactly that
+(`binlog-do-db / binlog-ignore-db exclude the definitions schema {defs_schema}: … noticed only when
+the service restarts; remove the filter or include {defs_schema}`, `src/engine.rs:232-243`, and see
+[binlog-do-db / binlog-ignore-db](#binlog-do-db--binlog-ignore-db)).
+
+**GRANT script — setup account, definitions in their own schema.** Run once as an admin. The
+setup run is the only run that does DDL, and it owns the DDL on *both* schemas: lazyview's own
+tables in `lazyview`, and the definitions table in `shop_views` — creating `_lazyview` where it is
+missing and running the two migrations of v0.2, `rebuild` widened to `BIGINT UNSIGNED` and
+`rebuild_served BIGINT UNSIGNED NOT NULL DEFAULT 0` added to `_lazyview_state`. The `SELECT` on
+the definitions schema is what lets the run read the definitions to validate them and create
+`_lazyview_overview` over them. There is no `DROP` there: lazyview drops nothing in the
+definitions schema, and the management user's table should not be droppable by the installer.
+
+```sql
+CREATE DATABASE shop_views;                        -- the definitions' own schema
+CREATE USER 'lazyview_setup'@'%' IDENTIFIED BY 'change-me';
+GRANT SELECT, CREATE, ALTER, INDEX, CREATE VIEW, DROP ON lazyview.* TO 'lazyview_setup'@'%';
+GRANT INSERT, UPDATE ON lazyview._lazyview_status TO 'lazyview_setup'@'%';  -- the instance lock writes the fencing epoch there
+GRANT SELECT, CREATE, ALTER, INDEX ON shop_views.* TO 'lazyview_setup'@'%'; -- creates _lazyview, adds its columns, widens rebuild
+GRANT SELECT ON app.* TO 'lazyview_setup'@'%';            -- the schemas its definitions read
+```
+
+**GRANT script — consumption account, definitions in their own schema.** `SELECT` in the
+definitions schema and nothing else there. With only those rights the service still reads the
+definitions, serves a rebuild request and acknowledges it in its own schema. It runs no migration
+there: an account without the right would meet `ERROR 1142` mid-migration, so the operations run
+asks `information_schema` first and stops with a message naming the missing table or column and
+the `lazyview setup` that adds it (exit `2`). On `lazyview.*` and on the source schemas it holds
+exactly what the consumption script above grants:
+
+```sql
+CREATE USER 'lazyview_svc'@'%' IDENTIFIED BY 'change-me';
+GRANT SELECT ON shop_views.* TO 'lazyview_svc'@'%';          -- SELECT only: no write, no DDL
+GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_state TO 'lazyview_svc'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_status TO 'lazyview_svc'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON lazyview._lazyview_fence TO 'lazyview_svc'@'%';
+GRANT INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, CREATE VIEW, SHOW VIEW
+  ON lazyview.* TO 'lazyview_svc'@'%';                        -- its own view tables
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'lazyview_svc'@'%';
+GRANT SELECT ON app.* TO 'lazyview_svc'@'%';
+```
+
+**GRANT script — control account, definitions in their own schema.** Definitions, `enabled`,
+`targets` and rebuild requests are all its writes, so the audit log names it for every change:
+
+```sql
+CREATE USER 'lazyview_control'@'%' IDENTIFIED BY 'change-me';
+GRANT SELECT ON lazyview.* TO 'lazyview_control'@'%';        -- also reads the state tables and the overview
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop_views._lazyview TO 'lazyview_control'@'%';
+```
+
+One thing to know about this layout: whoever reads `_lazyview_overview` needs the read right in
+**both** schemas. The view is created `SQL SECURITY INVOKER` and joins the definitions table
+(`create_overview`, `src/meta.rs:136`), so its reader is checked against both sides — add
+`GRANT SELECT ON shop_views._lazyview TO 'lazyview_monitor'@'%';` to the monitor script above,
+next to the `SELECT` on `lazyview._lazyview_overview`.
 
 **GRANT script — separate control instance (planned).** When the control store
 runs on an instance of its own instead of the source, the same three accounts

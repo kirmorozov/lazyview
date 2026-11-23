@@ -7,7 +7,7 @@ accounts and their `GRANT`s: [server setup](server-setup.md#advanced-setup-recom
 
 | run | command | what it does | account |
 |---|---|---|---|
-| setup and migration | `lazyview setup` | creates and migrates lazyview's own tables (`_lazyview`, `_lazyview_state`, `_lazyview_status`, `_lazyview_fence`) in the configured schema, validates every enabled definition and logs its mode and plan; exits `0` when all is ready, `1` when a definition is invalid. Idempotent, and it builds no view tables and never moves the saved binlog position | setup (DDL on lazyview's own tables) |
+| setup and migration | `lazyview setup` | creates and migrates lazyview's own tables (`_lazyview` in the definitions schema — `LAZYVIEW_DEFINITIONS_DATABASE`, or the service's own schema (`LAZYVIEW_DATABASE`) when unset — and `_lazyview_state`, `_lazyview_status`, `_lazyview_fence` in the service's own schema), validates every enabled definition and logs its mode and plan; exits `0` when all is ready, `1` when a definition is invalid. Idempotent, and it builds no view tables and never moves the saved binlog position | setup (DDL on lazyview's own tables, and on the definitions table) |
 | operations | `lazyview` (or `lazyview run`) | streams the binlog and maintains the views. It never issues DDL on lazyview's own tables: it checks them through `information_schema` with `SELECT` rights only, and a missing table or column is a startup error (exit `2`) naming the fix — run `lazyview setup` with the setup account | consumption (no DDL on lazyview's own tables) |
 
 View tables are **not** lazyview's own tables: their DDL (build, swap, drop) stays in the
@@ -18,6 +18,10 @@ It takes the instance lock first, so next to a running instance give it another
 `LAZYVIEW_SYNC=false` is a **deprecated alias of `lazyview setup`** (one release): it logs a WARN
 and behaves exactly like the setup run. Replace it in scripts and CI with `lazyview setup`, run
 with the setup account.
+
+An upgrade is the setup run of the new build first, then the operations run. What a release
+changes for an operator, and what to do about it, is listed per release in
+[upgrading](upgrading.md).
 
 ## Running with Docker
 

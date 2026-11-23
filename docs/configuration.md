@@ -24,9 +24,9 @@ read the same variables, and each run takes its own account ([the two runs](oper
 
 | account | used by | what it needs |
 |---|---|---|
-| setup | `lazyview setup`, at install and at upgrade | DDL on lazyview's own tables, plus the `SELECT` rights that let it plan the definitions |
-| control | whoever writes the definitions (the service never does) | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on `_lazyview` |
-| consumption | the operations run | `SELECT` on `_lazyview`, DML on the status tables, `SELECT` on the sources its views read, DDL for its own view tables, and `REPLICATION SLAVE` / `REPLICATION CLIENT` where it reads the binlog |
+| setup | `lazyview setup`, at install and at upgrade | DDL on lazyview's own tables, plus the `SELECT` rights that let it plan the definitions. With the definitions in a schema of their own, `CREATE`, `ALTER` and `INDEX` there too: that schema holds `rebuild`, which the setup run widens to a counter |
+| control | whoever writes the definitions (the service never does) | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on `_lazyview` — the definitions, `enabled`, `targets`, and rebuild requests (`SET rebuild = rebuild + 1`) |
+| consumption | the operations run | `SELECT` on `_lazyview` (from v0.2 that is all it needs there: it writes no column of it), DML on the status tables, `SELECT` on the sources its views read, DDL for its own view tables, and `REPLICATION SLAVE` / `REPLICATION CLIENT` where it reads the binlog |
 
 The simple setup gives one account all of these; the [server setup](server-setup.md#advanced-setup-recommended-for-production)
 is the production layout and carries one `GRANT` script per account and per layout (a control
@@ -47,8 +47,9 @@ default target for views. Set either the separate variables or a DSN.
 | `LAZYVIEW_USER` | `root` | user name |
 | `LAZYVIEW_PASSWORD` | none | password; may hold a [reference](#secrets) instead of the value |
 | `LAZYVIEW_PASSWORD_FILE` | — | read the password from that file instead of the environment: the file's content, one trailing newline trimmed (see [Secrets](#secrets)) |
-| `LAZYVIEW_DATABASE` | required with `LAZYVIEW_HOST` | the schema lazyview works in: it holds `_lazyview`, the other metadata tables and the views |
+| `LAZYVIEW_DATABASE` | required with `LAZYVIEW_HOST` | the schema lazyview works in: it holds the metadata tables and the views, and `_lazyview` unless `LAZYVIEW_DEFINITIONS_DATABASE` names another schema |
 | `LAZYVIEW_DSN` | — | alternative to the five above: `mysql://user:pass@host:3306/app` (`mariadb://` is accepted too). Takes precedence when set |
+| `LAZYVIEW_DEFINITIONS_DATABASE` | — | **from v0.2**: the schema that holds `_lazyview`, the definitions table, for the setup where the definitions are owned by a migration tool or a DBA role. Unset (or empty) it is the schema of `LAZYVIEW_DSN` / `LAZYVIEW_DATABASE` — the simple setup, unchanged. The service account then needs `SELECT` there and nothing else, and it holds no DDL there: the migrations of `_lazyview` are the setup account's, run by `lazyview setup`. The status tables, the commit fence, `_lazyview_overview` and the view tables stay in the service's own schema. Grants: [server setup](server-setup.md#definitions-in-a-schema-of-their-own) |
 | `LAZYVIEW_TLS` | `disabled` | `disabled`, `required`, `verify-ca`, `verify-full` (see [TLS](#tls)) |
 | `LAZYVIEW_TLS_CA` | — | PEM file with the CA certificates to trust; implies `verify-full` when `LAZYVIEW_TLS` is not set |
 
@@ -57,6 +58,11 @@ default target for views. Set either the separate variables or a DSN.
   `file://…` or `aws-secret://…` is a [reference](#secrets), not a value; a password that really
   starts that way is written `plain://p@ss`.
 * Empty values count as unset.
+* `LAZYVIEW_DEFINITIONS_DATABASE` moves only `_lazyview`, and it is always read schema-qualified:
+  unqualified names in a definition still mean the service's own schema, and your own writes to the
+  definitions — including a rebuild request,
+  `UPDATE <definitions schema>._lazyview SET rebuild = rebuild + 1` — are made in that schema
+  ([rebuilding a view](views.md#rebuilding-a-view)).
 * With neither `LAZYVIEW_HOST` nor `LAZYVIEW_DSN` set, lazyview exits with code `2` and
   `no database configured`.
 * The DSN may carry extra driver parameters after `?`. For example, `?prefer_socket=false` keeps
@@ -122,7 +128,7 @@ with the prefix `LAZYVIEW_TARGET_<NAME>_`:
 | `LAZYVIEW_TARGET_<NAME>_TLS`, `_TLS_CA` | `LAZYVIEW_TLS`, `LAZYVIEW_TLS_CA` | TLS for this target; the source's settings apply when unset |
 | `LAZYVIEW_TARGETS` | discovered | comma-separated target names. When unset, every `LAZYVIEW_TARGET_<NAME>_DSN` or `_HOST` variable defines a target |
 | `LAZYVIEW_TARGET_TIMEOUT_MS` | `60000` | upper bound for one write round trip to a target (minimum `1000`), so an unresponsive target cannot stall the binlog loop |
-| `LAZYVIEW_PLAN_TIMEOUT_MS` | `10000` | upper bound for planning one definition. Planning runs off the binlog loop; a definition that takes longer goes into error (``planning took longer than 10 s; simplify the definition or raise LAZYVIEW_PLAN_TIMEOUT_MS``) and is not planned again until it changes, a rebuild is asked for (`rebuild = rebuild + 1`), or lazyview restarts |
+| `LAZYVIEW_PLAN_TIMEOUT_MS` | `10000` | upper bound for planning one definition. Planning runs off the binlog loop; a definition that takes longer goes into error (``planning took longer than 10 s; simplify the definition or raise LAZYVIEW_PLAN_TIMEOUT_MS``) and is not planned again until it changes, its rebuild counter is bumped (`rebuild = rebuild + 1`), or lazyview restarts |
 
 Discovered targets get lower-case names: `LAZYVIEW_TARGET_ANALYTICS_HOST` defines `analytics`.
 Names listed in `LAZYVIEW_TARGETS` are used as written; their variables use the name in upper

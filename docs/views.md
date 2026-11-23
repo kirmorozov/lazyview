@@ -2,16 +2,19 @@
 
 ## Defining a view
 
-Each row of `_lazyview` (in the schema `LAZYVIEW_DATABASE`) is one view, and there can be any
-number of them. lazyview picks up inserts, updates and deletes from the binlog; no restart is
-needed.
+Each row of `_lazyview` (in the schema `LAZYVIEW_DATABASE`, or in the schema named by
+`LAZYVIEW_DEFINITIONS_DATABASE`) is one view, and there can be any number of them. lazyview picks
+up inserts, updates and deletes from the binlog; no restart is needed. The table is yours: from
+v0.2 the service only reads it, so every change of a definition is a write of yours — which is
+what the database's audit log then attributes
+([definitions in a schema of their own](server-setup.md#definitions-in-a-schema-of-their-own)).
 
 ```sql
 -- a name and a plain SELECT
 INSERT INTO _lazyview (name, definition) VALUES
  ('customer_totals', 'SELECT customer_id, SUM(total) AS total, COUNT(*) AS n FROM orders GROUP BY customer_id');
 
--- or a complete CREATE VIEW statement; `name` is filled in for you
+-- or a complete CREATE VIEW statement; its view name is the view's name
 INSERT INTO _lazyview (definition) VALUES
  ('CREATE VIEW paid_orders AS SELECT id, total FROM orders WHERE status = ''paid''');
 
@@ -21,14 +24,22 @@ UPDATE _lazyview SET enabled = 0 WHERE name = 'paid_orders';
 UPDATE _lazyview SET enabled = 1 WHERE name = 'paid_orders';
 DELETE FROM _lazyview WHERE name = 'paid_orders';
 
--- rebuild one view from scratch (online): see "Rebuilding a view" below
-UPDATE _lazyview SET rebuild = rebuild + 1 WHERE name = 'paid_orders';
+-- rebuild one view from scratch (online): bump the counter, see
+-- [rebuilding a view](#rebuilding-a-view)
+UPDATE _lazyview SET rebuild = rebuild + 1 WHERE id = 7;
 ```
 
 * `name` is unique (enforced by the table). In a `CREATE VIEW` statement the view name of the
-  statement counts: `name` is filled in or updated to it, so changing the name in the statement
-  renames the view online. If another row already has that name, the view goes into error:
-  ``name `x` already used by row #N``. A bare SELECT takes its name from `name`.
+  statement counts, so changing the name in the statement renames the view online. A bare SELECT
+  takes its name from `name`, which is why a bare SELECT needs one. From v0.2 `name` is only
+  yours: the service derives the name from the definition on every read and never writes the
+  column, so a `name` you store stays as you wrote it (until then the service filled `name` in from
+  the statement). If another row resolves to the same name, the row with the lower `id` keeps it
+  and the other goes into error (the owner of a name is its smallest `id` — `index_definitions`,
+  `src/engine.rs:3056`):
+  ``name `x` already used by row #7: rename this view, or remove the other definition with DELETE
+  FROM `shop_views`.`_lazyview` WHERE id = 7`` (`src/engine.rs:2713`; the qualified table name is
+  `defs_table`, `src/meta.rs:124`, so it names the definitions schema).
 * `name` ignores letter case. A view whose name differs from another row's only in case
   (`lz_case` next to `Lz_Case`) goes into error, keeping its own name:
   ``name `lz_case` is already used by row #N as `Lz_Case`: … remove this row with DELETE FROM
@@ -39,7 +50,9 @@ UPDATE _lazyview SET rebuild = rebuild + 1 WHERE name = 'paid_orders';
 * A column list (`CREATE VIEW v (a, b, c) AS SELECT …`) renames the result columns in order. It
   must have as many names as the SELECT has columns.
 * Unqualified table names refer to `LAZYVIEW_DATABASE`. Other schemas work when qualified
-  (`other.customers`) and when the user may read them.
+  (`other.customers`) and when the user may read them. Where the definitions live makes no
+  difference here: `_lazyview` is always read schema-qualified, so a definition's unqualified
+  names still mean `LAZYVIEW_DATABASE`, not `LAZYVIEW_DEFINITIONS_DATABASE`.
 * The view is always created in `LAZYVIEW_DATABASE` (and in each target's schema). A view name
   qualified with that schema (`CREATE VIEW app.x AS …`) is accepted; a name qualified with any
   other schema is rejected: ``schema-qualified view name `other`.`x` is not supported``.
@@ -71,28 +84,49 @@ only if it still fails, with a fresh `last_error` and `updated_at`.
 
 ## Rebuilding a view
 
-Hand-edited a view's table, or want one view rebuilt from scratch online? Ask with one `UPDATE` of
-your own; it needs no restart:
+Hand-edited a view's table, or want one view rebuilt from scratch online? Bump its rebuild
+counter. The request is one `UPDATE` of your own; it needs no restart and no kick:
 
 ```sql
 UPDATE _lazyview SET rebuild = rebuild + 1 WHERE id = <definition id>;
--- or by name, when you keep one:
+-- or, when you store the name yourself (a `name` lazyview never overwrites):
 UPDATE _lazyview SET rebuild = rebuild + 1 WHERE name = 'my_view';
 ```
 
 * lazyview notices the new value on the binlog, rebuilds that one view — its other views are
   untouched — and swaps the table in, online, like any changed definition
-  ([changes while running](#changes-while-running)). The swap rebuilds the chained views that read
-  it.
-* `rebuild` is a flag: **any non-zero value** asks for one rebuild of that view, and lazyview sets
-  it back to `0` once the new table is live. Ask with `rebuild = rebuild + 1`: it is a change
-  whatever the row holds, so you never have to know whether a request is already sitting there.
-* A statement that writes the value the row already carries changes no row, so it asks for nothing:
-  while a request is pending, `SET rebuild = 1` again is still that same one request.
-* A request made while lazyview is stopped is served by the next start.
-* A rebuild that fails never takes the live table away: the old one keeps serving while the view
-  goes into `error`, the reason in `last_error`, retried with exponential backoff of up to 5
-  minutes. Nothing clears the request while it fails, so the retry asks for the same rebuild.
+  ([changes while running](#changes-while-running)): a pending request is a build, not a resume
+  (`src/engine.rs:3149`), so the new table is filled from the source and the changes that arrive
+  while it fills are applied before the swap. The swap rebuilds the chained views that read it.
+* It is a counter, so a request is served exactly once: lazyview records the value it built from
+  in its own `_lazyview_state.rebuild_served` (`serve_rebuild`, `src/meta.rs:543`), and a request
+  is pending while `rebuild <> rebuild_served` (`src/engine.rs:3691`, `:3707`) — a difference, not
+  a greater-than, so the counter never has to come back down. Lazyview never writes `rebuild`
+  itself, so a request cannot be answered away or reset under you. A request made while lazyview is
+  stopped is served by the next start.
+* Ask with `rebuild = rebuild + 1`, never with `rebuild = 1`. Setting the same value twice asks
+  for nothing, so a `SET rebuild = 1` on a view whose request was already served is a silent
+  no-op. (The release before v0.2 had a flag instead of a counter: `rebuild = 1` was the only
+  form, and lazyview cleared it when the new table was live.)
+* A rebuild that fails never takes the live table away: it keeps serving while the view goes into
+  `error` with the reason in `last_error`, retried with exponential backoff of up to 5 minutes.
+  Nothing resets the request, so the retry keeps working at the same counter value.
+* Which half is versioned (here and below, *v0.2* names the release that makes the definitions
+  table read-only for the service): the statement works on both releases — the earlier code treated
+  any non-zero `rebuild` as one request. What arrives with v0.2 is the column
+  `_lazyview_state.rebuild_served` and the widening of `rebuild` from the first release's
+  `TINYINT(1)` to `BIGINT UNSIGNED` (`MIGRATIONS`, `src/meta.rs:72`, and the widening in `ensure`,
+  `src/meta.rs:384-411`). Both are added by `lazyview setup`, the run that holds the DDL rights
+  ([the two runs](operations.md#the-two-runs)); the operations run only checks for them (`verify`,
+  `src/meta.rs:286`) and refuses to start, exit `2`, until the setup run has run.
+* **Upgrading to v0.2:** the old single-shot request is served once. A `rebuild = 1` the previous
+  version left unserved becomes pending, because a new `rebuild_served` row starts at `0`. After
+  that, the flag form asks for nothing until the counter is bumped
+  ([upgrading](upgrading.md#upgrading-from-v01-to-v02)).
+* With the definitions in a schema of their own, run the statement there
+  (`UPDATE shop_views._lazyview SET rebuild = rebuild + 1 WHERE id = …`, or connect with that
+  schema): it is `LAZYVIEW_DEFINITIONS_DATABASE`
+  ([definitions in a schema of their own](server-setup.md#definitions-in-a-schema-of-their-own)).
 
 ## The materialized table
 
@@ -453,7 +487,7 @@ maintained) until an atomic `RENAME TABLE` swap.
 | new `name` for the same `_lazyview.id`, or another view name in its `CREATE VIEW` statement | the new table is built; the old one is dropped after the new one is live. `name` follows the statement's view name |
 | `targets` changed | built on the new targets; removed targets are dropped after the swap |
 | `enabled = 0` or row deleted | the table is dropped (with `LAZYVIEW_DROP_REMOVED=true`, the default) |
-| `UPDATE _lazyview SET rebuild = rebuild + 1` | the view is rebuilt online like a changed definition, noticed on the binlog with no restart; `rebuild` goes back to `0` once the new table is live. Set while lazyview is stopped, the view is rebuilt at startup instead of resumed. See [rebuilding a view](#rebuilding-a-view) |
+| `UPDATE _lazyview SET rebuild = rebuild + 1 WHERE id = …` | the view is rebuilt online like a changed definition; the request is noticed on the binlog, no restart. It is served exactly once: lazyview records the counter value it built from in its own `_lazyview_state.rebuild_served`, so pending is `rebuild <> rebuild_served` and lazyview never writes the counter back. Set while lazyview is stopped, the view is rebuilt at the next start instead of resumed. See [rebuilding a view](#rebuilding-a-view) |
 | `TRUNCATE` or `DROP TABLE` of a view's table on the source | the view is rebuilt online (lazyview never truncates its tables); after a `DROP` the table is missing until the rebuilt one is renamed into place |
 | `ALTER TABLE` of a source table (an added index or column, a moved column, a type change that leaves what the view reads alone), or `CREATE INDEX` / `DROP INDEX` on it | the view is re-planned and keeps its table: the new plan only decodes rows with the new column positions, no rebuild. What the view reads is compared by column name, type, collation, nullability, generation, the keys and foreign keys it uses, and the SQL lazyview runs. Views with `mode = 'full'` still rebuild, and so does a view whose plan may already include later changes of the table (after a restart or while catching up across several DDLs) |
 | `RENAME TABLE` of a source table (an online schema change tool's table swap: `RENAME TABLE t TO t_old, t_new TO t`), `ALTER TABLE ... RENAME`, `TRUNCATE`, `REPAIR` or re-creation, or any other `ALTER TABLE` (a column the view reads retyped, recollated or dropped, a key it uses changed) | the view is re-planned and rebuilt online: a swapped-in table may hold other rows. The old table stays readable but is not maintained until the swap |
@@ -465,24 +499,30 @@ retried with exponential backoff of up to 5 minutes.
 
 Other hand edits of a view's table (`DELETE`, `UPDATE`, `INSERT`, or any change on a target) are
 not noticed: lazyview keeps maintaining the table on top of them, so rows that are not changed
-again stay wrong. Repair such a view with a rebuild request
+again stay wrong. Repair such a view by bumping its rebuild counter
 (`UPDATE _lazyview SET rebuild = rebuild + 1 WHERE id = …`, see
 [rebuilding a view](#rebuilding-a-view)).
 
 ## Metadata tables
 
-lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing columns after an upgrade.
+The setup run (`lazyview setup`) creates these and adds a column an upgrade needs; the operations
+run issues no DDL on them — it checks them and refuses to start (exit `2`) naming the setup run
+([the two runs](operations.md#the-two-runs)). The status tables live in `LAZYVIEW_DATABASE`;
+`_lazyview` lives there too, or in `LAZYVIEW_DEFINITIONS_DATABASE` when the definitions have a
+schema of their own.
 
-`_lazyview`: your definitions.
+`_lazyview`: your definitions. From v0.2 the service only reads this table: the name and the
+rebuild request below are written by you (or by your control plane or migration tool), never by
+lazyview, so the audit log attributes every definition change to whoever made it.
 
 | column | meaning |
 |---|---|
 | `id` | auto-increment key |
-| `name` | view name, unique; filled in from `CREATE VIEW` when NULL |
+| `name` | view name, unique. Optional: a `CREATE VIEW` definition names its own view, a bare `SELECT` needs this column. lazyview never writes it (from v0.2), so your value is never overwritten |
 | `definition` | a `SELECT` (with `name`) or a complete `CREATE VIEW` statement |
 | `targets` | comma-separated target names; NULL means `source` |
 | `enabled` | `1` (default) or `0` |
-| `rebuild` | the rebuild request: any non-zero value asks for one rebuild of that view, and lazyview sets it back to `0` when the new table is live; ask with `rebuild = rebuild + 1` ([rebuilding a view](#rebuilding-a-view)) |
+| `rebuild` | the rebuild counter, `BIGINT UNSIGNED` from v0.2: `SET rebuild = rebuild + 1` asks for one rebuild, which lazyview acknowledges in `_lazyview_state.rebuild_served` and never answers by writing this column ([rebuilding a view](#rebuilding-a-view)) |
 | `created_at`, `updated_at` | timestamps |
 
 `_lazyview_state`: one row per view and target.
@@ -495,6 +535,7 @@ lazyview creates these in `LAZYVIEW_DATABASE` at startup and adds missing column
 | `route`, `access` | the access plan's route (`dedup`, `viewplan`, `recompute`, `full`; NULL while no plan is known) and its EXPLAIN text, whose header carries the fingerprint (`fp …`) |
 | `state` | `building`, `ready`, `waiting` (a chained view whose upstream view is not built yet) or `error` |
 | `managed` | `1` once lazyview created the table; only such tables are ever replaced or dropped |
+| `rebuild_served` | from v0.2: the `_lazyview.rebuild` value this view and target were last built from, so a request is pending while `rebuild <> rebuild_served` ([rebuilding a view](#rebuilding-a-view)) |
 | `last_error` | the error message in state `error` |
 | `refreshed_at` | last time the table was built or refreshed |
 | `updated_at` | last change of this row |
@@ -509,11 +550,14 @@ lazyview built one).
 
 `_lazyview_overview`: a view that joins definitions and state: `id`, `name`, `target`,
 `enabled`, `state`, `mode`, `detail`, `route`, `access`, `last_error`, `refreshed_at`,
-`definition_updated_at`, `definition`. A definition that never got a state row shows up with
-NULL state. `route` is `dedup`, `viewplan`, `recompute` or `full` (the view's access plan
-route, or NULL while no plan is known); `access` is the access plan's EXPLAIN text, whose
-header carries its fingerprint (`fp …`), so it names every source table, its read columns,
-filters and path, and the cascades.
+`definition_updated_at`, `definition`. It is created by the setup run in the service's own schema
+next to the status tables — the operations run does not require it — and it reads the definitions
+table through its schema qualifier (`LAZYVIEW_DEFINITIONS_DATABASE` or `LAZYVIEW_DATABASE`). It is
+`SQL SECURITY INVOKER`, so whoever reads it needs `SELECT` on the definitions table as well as on
+the overview. A definition that never got a state row shows up with NULL state. `route` is `dedup`,
+`viewplan`, `recompute` or `full` (the view's access plan route, or NULL while no plan is known);
+`access` is the access plan's EXPLAIN text, whose header carries its fingerprint (`fp …`), so it
+names every source table, its read columns, filters and path, and the cascades.
 
 ```sql
 SELECT * FROM _lazyview_overview;
