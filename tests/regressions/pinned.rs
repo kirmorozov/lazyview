@@ -1775,8 +1775,9 @@ async fn replay_check(
 /// * **The crash is anchored on the engine, and the window is a batch.** `run_event` quiesces the
 ///   paced writers, waits for the engine's own caught-up point before the kill, and runs
 ///   [`crate::common::soakwork::SoakWorkload::cascade_in_window`] while the engine is dead, so the
-///   resume window holds a mapped-cascade parent change every run; the writers are turned back on as
-///   the engine comes up. Killing at the wall-clock instant instead made the window a sample of the
+///   resume window holds a mapped-cascade parent change every run; the writers are turned back on once
+///   the restarted engine has reported itself streaming, and before `wait_ready`, which needs them
+///   producing. Killing at the wall-clock instant instead made the window a sample of the
 ///   writers' pace (`soakwork.rs::run_paced` paces against `Instant::now()`), so `cascade_gaps` was 0
 ///   on a loaded runner and the run was red on nothing but timing. Quiescing for the wait is not
 ///   optional: that same pacing means a loaded engine is never at the head long enough for the
