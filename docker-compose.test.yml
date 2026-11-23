@@ -463,6 +463,469 @@ services:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - mariadb132-pre:/var/lib/mysql
 
+  # ---- cluster families (profile `cluster`; the single-server lanes never depend on them) --------
+  # The HA source topologies of the resume-by-GTID work (review A-01: "a change of source server ends
+  # in a stop or in a rebuild of every view"). The CI lanes are `failover-async`, `galera114`, `pxc84`
+  # and `gr84` in .github/workflows/ci.yml; they start these services in the order each family needs
+  # and assert the topology really formed (3/3 members, a running applier) before they run anything.
+  #
+  # Why `network_mode: bridge` instead of the compose project network: this host runs several suites at
+  # once, so a per-project network would be one more shared network per run (and `docker network
+  # create` is forbidden on it). Every one of these services therefore sits on docker0, which has two
+  # consequences the CI jobs handle:
+  #   - nodes address each other by the docker0 address the job reads with `docker inspect`
+  #     (no service-name DNS on the default bridge), and
+  #   - the seed address of a second/third node, or of a replica, is composed at start time from that
+  #     address: hence the ${GALERA_*} / ${GR_*} / ${REPLICA_*} interpolation below, and the
+  #     start-on-boot=off options that let the job configure replication and GR after the server is up.
+  # MariaDB keeps its own names for the two replica-facing options (11.4's image refuses the MySQL
+  # 8.4 spelling: `--log-slave-updates`, `--skip-slave-start`) - the same server-side settings, the
+  # flavor's own option names, as everywhere else the two families differ.
+  #
+  # They are NOT in scripts/test-servers.sh's MATRIX_FLAVORS (its `dsns` and the default `compose up`
+  # list stay the single servers of the matrix), and they sit behind the `cluster` profile, so
+  #   docker compose -f docker-compose.test.yml up -d galera114-1   # explicit name: profile not needed
+  # is how a lane (or a developer) starts one; `down -v` drops the data.
+  #
+  # Memory: one family at a time on a developer host (3 nodes x 2-3 GiB ceiling); the pairs are the
+  # same size as the single servers they copy. Ports: pairs 334xx, Galera 335xx, PXC 336xx, GR 337xx.
+  #
+  # ---- async primary/replica pairs (the RDS Multi-AZ / promoted-replica shape) -------------------
+  # The core A-01 shape: the writer and a promoted-replica candidate of the same flavor. Both have
+  # binlog + GTIDs so either can be the binlog source; `log_replica_updates` is what makes the
+  # replica's binlog hold the primary's transactions (without it a promoted replica cannot be read).
+  # The replica is read-only for a non-SUPER account (the engine account of docs/server-setup.md): a
+  # reader is a reader. The CI job wires the channel with CHANGE REPLICATION SOURCE (GTID
+  # auto-position), which is also the "repoint the DSN" promotion the failover tests use.
+  mysql84a:
+    # The primary of the async pair (image and flags of mysql84 above, plus the replica-facing ones).
+    <<: *mysql-common
+    image: mysql:8.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33484:3306"]
+    command:
+      - --server-id=33484
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --binlog-row-metadata=FULL
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mysql84a:/var/lib/mysql
+
+  mysql84b:
+    # The would-be replica: same server, GTIDs on, applier not started by the image (the lane
+    # configures and starts it), read-only so a mistake cannot write here through the engine account.
+    <<: *mysql-common
+    image: mysql:8.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33485:3306"]
+    command:
+      - --server-id=33485
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --binlog-row-metadata=FULL
+      - --relay-log=relay
+      - --skip-replica-start
+      - --read-only=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mysql84b:/var/lib/mysql
+
+  mariadb114a:
+    # The writer of the MariaDB pair (the reader lanes of the read-endpoint plan use this pair too:
+    # mariadb114b is a real reader with its own GTID state to wait for).
+    <<: *mariadb-common
+    image: mariadb:11.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33414:3306"]
+    command:
+      - --server-id=33414
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --log-slave-updates=ON
+      - --gtid-strict-mode=ON
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb114a:/var/lib/mysql
+
+  mariadb114b:
+    # The reader of the MariaDB pair: applies what 114a writes (MASTER_GTID_WAIT is what a read on it
+    # must fence with), and is read-only for the engine account.
+    <<: *mariadb-common
+    image: mariadb:11.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33415:3306"]
+    command:
+      - --server-id=33415
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --log-slave-updates=ON
+      - --gtid-strict-mode=ON
+      - --relay-log=relay
+      - --skip-slave-start
+      - --read-only=ON
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - mariadb114b:/var/lib/mysql
+
+  # ---- MariaDB Galera (wsrep_gtid_mode: the GTID state is cluster-continuous) --------------------
+  # 3 x mariadb:11.4.13 (the LTS pin of mariadb114) with the galera-4 provider the image ships at
+  # /usr/lib/galera/libgalera_smm.so. The four settings that make node-to-node resume work are
+  # wsrep_on + wsrep_gtid_mode=ON + a fixed wsrep_gtid_domain_id + log_replica_updates: with them
+  # every node's gtid_binlog_state carries the cluster's transactions under one domain-server, so a
+  # saved cursor is a subset of any surviving member. wsrep_sst_auth uses the image's root account:
+  # these are throwaway per-run containers (the lane always ends with `down -v`).
+  # The lane starts node 1 with GALERA_BOOTSTRAP=ON and GALERA_ADDRESS_1=gcomm://, reads its docker0
+  # address with `docker inspect`, then starts 2 and 3 with GALERA_ADDRESS_2/3=gcomm://<node1>:3306,
+  # <node2>:3306. SST (mariabackup) is what costs the real minute here.
+  galera114-1:
+    <<: *mariadb-common
+    image: mariadb:11.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33511:3306"]
+    command:
+      - --server-id=33511
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --log-slave-updates=ON
+      - --gtid-strict-mode=ON
+      - --wsrep-on=ON
+      - --wsrep-provider=/usr/lib/galera/libgalera_smm.so
+      - --wsrep-cluster-address=${GALERA_ADDRESS_1:-gcomm://}
+      - --wsrep-provider-options=pc.bootstrap=${GALERA_BOOTSTRAP:-OFF};gcache.size=128M
+      - --wsrep-node-name=galera114-1
+      - --wsrep-sst-auth=root:root
+      - --wsrep-gtid-mode=ON
+      - --wsrep-gtid-domain-id=42
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb --protocol=TCP -h127.0.0.1 -ulv -plv -NBe \"SHOW STATUS LIKE 'wsrep_local_state_comment'\" | grep -qw Synced"]
+      interval: 3s
+      timeout: 5s
+      retries: 120
+      start_period: 20s
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - galera114-1:/var/lib/mysql
+
+  galera114-2:
+    <<: *mariadb-common
+    image: mariadb:11.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33512:3306"]
+    command:
+      - --server-id=33512
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --log-slave-updates=ON
+      - --gtid-strict-mode=ON
+      - --wsrep-on=ON
+      - --wsrep-provider=/usr/lib/galera/libgalera_smm.so
+      - --wsrep-cluster-address=${GALERA_ADDRESS_2:-gcomm://}
+      - --wsrep-provider-options=gcache.size=128M
+      - --wsrep-node-name=galera114-2
+      - --wsrep-sst-auth=root:root
+      - --wsrep-gtid-mode=ON
+      - --wsrep-gtid-domain-id=42
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb --protocol=TCP -h127.0.0.1 -ulv -plv -NBe \"SHOW STATUS LIKE 'wsrep_local_state_comment'\" | grep -qw Synced"]
+      interval: 3s
+      timeout: 5s
+      retries: 120
+      start_period: 20s
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - galera114-2:/var/lib/mysql
+
+  galera114-3:
+    <<: *mariadb-common
+    image: mariadb:11.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33513:3306"]
+    command:
+      - --server-id=33513
+      - --log-bin=mariadb-bin
+      - --log-basename=mariadb
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --log-slave-updates=ON
+      - --gtid-strict-mode=ON
+      - --wsrep-on=ON
+      - --wsrep-provider=/usr/lib/galera/libgalera_smm.so
+      - --wsrep-cluster-address=${GALERA_ADDRESS_3:-gcomm://}
+      - --wsrep-provider-options=gcache.size=128M
+      - --wsrep-node-name=galera114-3
+      - --wsrep-sst-auth=root:root
+      - --wsrep-gtid-mode=ON
+      - --wsrep-gtid-domain-id=42
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb --protocol=TCP -h127.0.0.1 -ulv -plv -NBe \"SHOW STATUS LIKE 'wsrep_local_state_comment'\" | grep -qw Synced"]
+      interval: 3s
+      timeout: 5s
+      retries: 120
+      start_period: 20s
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - galera114-3:/var/lib/mysql
+
+  # ---- Percona XtraDB Cluster 8.4 (Galera on MySQL, real MySQL GTIDs) ---------------------------
+  # PXC's own requirement set for a continuous GTID state (gtid_mode + wsrep_gtid_mode + a fixed
+  # wsrep_gtid_domain_id + log_replica_updates on every node); the lane resumes by GTID on any member.
+  # The image is pinned by digest (its tag moves with PXC's own build number), and the SST hash key is
+  # a fixed test value: all three nodes must share it, and the containers are dropped after every run.
+  # Start order as in Galera: PXC_ADDRESS_1=gcomm:// + PXC_BOOTSTRAP=ON on node 1, then the docker0
+  # addresses of the started nodes in PXC_ADDRESS_2/3. There is no wsrep_sst_auth here on purpose:
+  # PXC 8.4 has no such server option (the server aborts with "unknown variable"), its entrypoint
+  # authorizes SST from XTRADB_INTERNAL_HASH_KEY, which is why that key is shared by the three nodes.
+  pxc84-1:
+    <<: *mysql-common
+    image: percona/percona-xtradb-cluster:8.4.11-12.1@sha256:1a93f0a886a23872f3fc97858ff3dc7c17664a77336a8c8f31de9e2b29c70907
+    profiles: [cluster]
+    ports: ["127.0.0.1:33611:3306"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: lvtest
+      # Shared by the three nodes: PXC encrypts the SST stream with it, so a node that starts with a
+      # different (or auto-generated) key cannot join. Test-only value, these containers never leave
+      # the runner and are dropped with their volumes.
+      XTRADB_INTERNAL_HASH_KEY: lv-test-sst-hash-key
+      CLUSTER_NAME: lvpxc84
+    command:
+      - --server-id=33611
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+      - --wsrep-on=ON
+      - --wsrep-provider=/usr/lib64/galera4/libgalera_smm.so
+      - --wsrep-cluster-address=${PXC_ADDRESS_1:-gcomm://}
+      - --wsrep-provider-options=pc.bootstrap=${PXC_BOOTSTRAP:-OFF};gcache.size=128M
+      - --wsrep-node-name=pxc84-1
+      - --wsrep-gtid-mode=ON
+      - --wsrep-gtid-domain-id=42
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - pxc84-1:/var/lib/mysql
+
+  pxc84-2:
+    <<: *mysql-common
+    image: percona/percona-xtradb-cluster:8.4.11-12.1@sha256:1a93f0a886a23872f3fc97858ff3dc7c17664a77336a8c8f31de9e2b29c70907
+    profiles: [cluster]
+    ports: ["127.0.0.1:33612:3306"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: lvtest
+      XTRADB_INTERNAL_HASH_KEY: lv-test-sst-hash-key
+      CLUSTER_NAME: lvpxc84
+    command:
+      - --server-id=33612
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+      - --wsrep-on=ON
+      - --wsrep-provider=/usr/lib64/galera4/libgalera_smm.so
+      - --wsrep-cluster-address=${PXC_ADDRESS_2:-gcomm://}
+      - --wsrep-provider-options=gcache.size=128M
+      - --wsrep-node-name=pxc84-2
+      - --wsrep-gtid-mode=ON
+      - --wsrep-gtid-domain-id=42
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - pxc84-2:/var/lib/mysql
+
+  pxc84-3:
+    <<: *mysql-common
+    image: percona/percona-xtradb-cluster:8.4.11-12.1@sha256:1a93f0a886a23872f3fc97858ff3dc7c17664a77336a8c8f31de9e2b29c70907
+    profiles: [cluster]
+    ports: ["127.0.0.1:33613:3306"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: lvtest
+      XTRADB_INTERNAL_HASH_KEY: lv-test-sst-hash-key
+      CLUSTER_NAME: lvpxc84
+    command:
+      - --server-id=33613
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --performance-schema=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+      - --wsrep-on=ON
+      - --wsrep-provider=/usr/lib64/galera4/libgalera_smm.so
+      - --wsrep-cluster-address=${PXC_ADDRESS_3:-gcomm://}
+      - --wsrep-provider-options=gcache.size=128M
+      - --wsrep-node-name=pxc84-3
+      - --wsrep-gtid-mode=ON
+      - --wsrep-gtid-domain-id=42
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - pxc84-3:/var/lib/mysql
+
+  # ---- MySQL Group Replication / InnoDB Cluster, single primary ---------------------------------
+  # 3 x mysql:8.4.13 (the mysql84 pin). GTIDs are mandatory in GR, and the transactions carry the
+  # GROUP uuid, not the member's, so gtid_executed converges on every member and a primary change is a
+  # non-event for the cursor. group_replication_start_on_boot=OFF: the docker0 address of a node is
+  # only known once it is up, so the lane sets group_replication_local_address and the seeds with
+  # SET GLOBAL (both dynamic) and bootstraps node 1 with START GROUP_REPLICATION.
+  # group_replication_local_address uses port 33061 on each node's own docker0 address; the nodes talk
+  # to each other on docker0, nothing here publishes those ports.
+  # The three group_replication mode flags are interpolated (GR_SINGLE_PRIMARY / GR_ENFORCE_EVERYWHERE
+  # / GR_ISOLATION, defaulting to single primary): the blocking `gr84` lane runs the group as
+  # single-primary and the advisory nightly `gr84-mp` starts the same three services in multi-primary
+  # mode - one definition of the topology, not two that can drift apart.
+  gr84-1:
+    <<: *mysql-common
+    image: mysql:8.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33711:3306"]
+    command:
+      - --server-id=33711
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+      - --plugin-load-add=group_replication.so
+      - --loose-group-replication-group-name=11111111-1111-1111-1111-111111111111
+      - --loose-group-replication-start-on-boot=OFF
+      - --loose-group-replication-single-primary-mode=${GR_SINGLE_PRIMARY:-ON}
+      - --loose-group-replication-enforce-update-everywhere-checks=${GR_ENFORCE_EVERYWHERE:-OFF}
+      - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
+      - --loose-group-replication-member-weight=100
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - gr84-1:/var/lib/mysql
+
+  gr84-2:
+    <<: *mysql-common
+    image: mysql:8.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33712:3306"]
+    command:
+      - --server-id=33712
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+      - --plugin-load-add=group_replication.so
+      - --loose-group-replication-group-name=11111111-1111-1111-1111-111111111111
+      - --loose-group-replication-start-on-boot=OFF
+      - --loose-group-replication-single-primary-mode=${GR_SINGLE_PRIMARY:-ON}
+      - --loose-group-replication-enforce-update-everywhere-checks=${GR_ENFORCE_EVERYWHERE:-OFF}
+      - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
+      - --loose-group-replication-member-weight=50
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - gr84-2:/var/lib/mysql
+
+  gr84-3:
+    <<: *mysql-common
+    image: mysql:8.4.13
+    profiles: [cluster]
+    ports: ["127.0.0.1:33713:3306"]
+    command:
+      - --server-id=33713
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --skip-name-resolve
+      - --mysqlx=OFF
+      - --temptable-max-ram=1G
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=200
+      - --plugin-load-add=group_replication.so
+      - --loose-group-replication-group-name=11111111-1111-1111-1111-111111111111
+      - --loose-group-replication-start-on-boot=OFF
+      - --loose-group-replication-single-primary-mode=${GR_SINGLE_PRIMARY:-ON}
+      - --loose-group-replication-enforce-update-everywhere-checks=${GR_ENFORCE_EVERYWHERE:-OFF}
+      - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
+      - --loose-group-replication-member-weight=50
+    volumes:
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - gr84-3:/var/lib/mysql
+
   # ---- chaos: Toxiproxy (profile `chaos`; nothing in the default stack depends on it) ----------
   # Network-layer faults for tests/chaos.rs (docs/development.md "Chaos tests"). The engine and the
   # targets are reached through proxies the tests create and delete over the API; the harness itself
@@ -507,6 +970,20 @@ volumes:
   mariadb130:
   mariadb131-rc:
   mariadb132-pre:
+  # cluster families (profile `cluster`): the async pairs, then Galera / PXC / GR, three each.
+  mysql84a:
+  mysql84b:
+  mariadb114a:
+  mariadb114b:
+  galera114-1:
+  galera114-2:
+  galera114-3:
+  pxc84-1:
+  pxc84-2:
+  pxc84-3:
+  gr84-1:
+  gr84-2:
+  gr84-3:
   pg14:
   pg15:
   pg16:
