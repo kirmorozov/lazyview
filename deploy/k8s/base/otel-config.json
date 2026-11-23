@@ -1,0 +1,31 @@
+{
+  "file_format": "1.2",
+  "resource": {
+    "attributes_list": "${OTEL_RESOURCE_ATTRIBUTES}"
+  },
+  "propagator": ["tracecontext", "baggage"],
+  "tracer_provider": {
+    "sampler": "always_on",
+    "processors": [
+      {
+        "batch": {
+          "schedule_delay": "5s",
+          "export_timeout": "30s",
+          "max_queue_size": 2048,
+          "max_export_batch_size": 512,
+          "exporter": {
+            "otlp_grpc": {
+              "endpoint": "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}",
+              "timeout": "10s"
+            }
+          }
+        }
+      }
+    ],
+    "limits": {
+      "attribute_count_limit": 128,
+      "event_count_limit": 128,
+      "link_count_limit": 128
+    }
+  }
+}

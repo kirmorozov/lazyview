@@ -39,19 +39,32 @@ thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
 serde_json = { version = "1", features = ["float_roundtrip"] }
-# Opt-in OpenTelemetry (`LAZYVIEW_OTEL=otlp`, src/otel.rs, docs/configuration.md "OpenTelemetry").
+# Opt-in OpenTelemetry (`OTEL_CONFIG_FILE`, src/otel.rs, docs/configuration.md "OpenTelemetry").
 # The official SDK (owner 2026-11-14; the naming and the copy-set terms are the lwf agreement in
-# tmp/out/lwf-coordination/otel-agreement.md). Versions are pinned here and announced to lwf, whose
-# verbatim copy of `src/otel.rs` aligns on them; OTLP/gRPC rides the same tonic/prost lazy-wire-fire
-# uses. `default-features = false` everywhere: the OTLP http/* transports (reqwest + prost) are not
-# taken on — `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` is refused with one WARN (src/otel.rs) —
-# and `metrics` / `logs` arrive with their own PRs. `rt-tokio` is not needed: the SDK's batch
-# processor runs on its own thread (`futures_executor::block_on`), the provider is built inside the
-# engine's runtime, as tonic requires.
+# tmp/out/lwf-coordination/otel-agreement.md), with the standard declarative-configuration file as
+# the only switch and the only config source — there is no bespoke telemetry name. Versions are
+# pinned here and announced to lwf, whose verbatim copy of `src/otel.rs` aligns on them; OTLP/gRPC
+# rides the same tonic/prost lazy-wire-fire uses. `default-features = false` everywhere: the OTLP
+# http/* transports (reqwest + prost) are not taken on — a file that asks for `otlp_http` is refused
+# with one WARN — and `metrics` / `logs` arrive with their own PRs. `rt-tokio` is not needed: the
+# SDK's batch processor runs on its own thread (`futures_executor::block_on`), the provider is built
+# inside the engine's runtime, as tonic requires.
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "grpc-tonic"] }
 opentelemetry-semantic-conventions = { version = "0.33.1", default-features = false }
+# The declarative-config reader (`src/otel/config.rs`) reads the standard file's JSON encoding with
+# the `serde_json` this crate already depends on above: no YAML crate and no bespoke parser, so the
+# reader adds no dependency of its own. The gRPC export does: these four crates pull in
+# `opentelemetry-proto`, `tonic`, `tonic-prost`, `tonic-types`, `prost`, `prost-derive`,
+# `prost-types`, `tokio-stream`, `futures-executor`, `hyper-timeout`, `itertools`, `pin-project`,
+# `pin-project-internal`, `portable-atomic`, `ppv-lite86`, `rand_chacha`, `sync_wrapper`, `zerocopy`
+# and `zerocopy-derive` (23 crates new to the lock, `rand`/`rand_core` a second version each), which
+# compile in every build — there is no `otel` feature, the switch is the runtime
+# `OTEL_CONFIG_FILE`. Owner ruling 2026-11-25: "for otel grpc i am fine to have nessesary
+# dependencies". `headers` in the file is read and reported, not applied: the official OTLP/gRPC
+# exporter exposes request headers only as `tonic` metadata (`WithTonicConfig::with_metadata`), which
+# this crate cannot reach without a direct `tonic` dep; serving them is the follow-up PR.
 # Resolved secret references (`src/secrets.rs`) are cleared when the last handle drops. The
 # crate is already in the tree (rustls, tls_codec), so this names an existing dependency.
 zeroize = "1"

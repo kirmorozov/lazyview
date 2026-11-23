@@ -1,64 +1,82 @@
-//! Opt-in OpenTelemetry: the init + conventions module, and the W3C seam.
+//! Opt-in OpenTelemetry: the declarative-config reader, the init + conventions module, and the W3C
+//! seam.
 //!
 //! **Copy set.** `src/otel.rs` and `src/otel/**` are copied verbatim by lazy-wire-fire (its
 //! `vendor/lazyview.lock` takes the glob at the re-sync that first carries them), so the rules of
 //! the copy set hold here: no `crate::` import of anything outside the copy set, and no
-//! lazyview-only state read — the host's own settings (`LAZYVIEW_OTEL`, the instance id, the
-//! source's identity) arrive as parameters of [`init`], which is how lazywf feeds its own
-//! (`LAZYWF_OTEL`) too. The standard OTel environment variables (`OTEL_*`) *are* read here: they
-//! are the specification's, not lazyview's (agreement §2, `tmp/out/lwf-coordination/otel-agreement.md`).
+//! lazyview-only state read — what the host knows (the resolved config file, the service name and
+//! version, the source's identity) arrives as parameters of [`init`], which is how lazywf feeds its
+//! own values too. The environment is read in exactly two places, both the specification's rather
+//! than lazyview's: the host reads the standard `OTEL_CONFIG_FILE` name itself and passes what
+//! [`gate`] makes of it, and [`config`] substitutes `${…}` references inside that file. No
+//! `LAZYVIEW_*`, and no flat `OTEL_*` switch, sampler or exporter name is read here (`agreement` §2
+//! as amended, `tmp/out/lwf-coordination/otel-agreement.md`).
 //!
 //! # One switch, and why "off" is provable
 //!
-//! `LAZYVIEW_OTEL=off|otlp` (default **off**) is the only way this ever runs: an ambient collector
-//! on the pod network changes nothing. Off, no provider and no exporter exist and the once-cell is
-//! unset, so every span helper below returns a disabled handle **before it builds an attribute**,
-//! and the instrumented hot paths cost one relaxed atomic load each. That is not a comment:
-//! `tests/otel_off_free.rs` counts allocations around those calls with a counting allocator and
-//! requires zero — the guarantee the agreement asks for (lwf's pending-key budget of ~19 B/key
-//! must not grow, so nothing per entry is added anywhere: the parents of a batch live on the
-//! reader, one per transaction, and in the engine's capped per-view sidecar).
+//! `OTEL_CONFIG_FILE` — the standard declarative-configuration variable — is the switch *and* the
+//! config source: unset is off, a path that is not an existing readable regular file is off with one
+//! `WARN`, and the file that is there says everything (lv-super ruling, 2026-11-22, verified in the
+//! orchestration store: "why would we need explicit params if OTEL_CONFIG_FILE can have everything we
+//! need for otel"). [`config`] is the
+//! reader; there is no bespoke telemetry name any more. Off — every one of those three cases — no
+//! provider and no exporter exist and the once-cell is unset, so every span helper below returns a
+//! disabled handle **before it builds an attribute**, and the instrumented hot paths cost one relaxed
+//! atomic load each. That is not a comment: `tests/otel_off_free.rs` counts allocations around those
+//! calls with a counting allocator and requires zero, for all three off reasons — the guarantee the
+//! agreement asks for (lwf's pending-key budget of ~19 B/key must not grow, so nothing per entry is
+//! added anywhere: the parents of a batch live on the reader, one per transaction, and in the
+//! engine's capped per-view sidecar).
 //!
 //! # What is exported, and what never is
 //!
 //! Span and attribute names are [`span`] and [`attr`], the agreed vocabulary. Values are names,
 //! ids, counts, positions and outcomes — **never customer data**: no key values, no payloads, no
 //! SQL, no DSNs. [`Span::fail`] takes a `&'static str` error class rather than an error's text so
-//! a statement or a row value cannot reach a span by accident. The resource carries
-//! `service.name`, `service.version`, `service.instance.id` and the source's server identity.
+//! a statement or a row value cannot reach a span by accident. The resource is the file's
+//! (`resource.attributes`, and `attributes_list` for the standard `OTEL_RESOURCE_ATTRIBUTES`, which
+//! is how an operator carries `service.name` and `service.instance.id`); `service.version` is the
+//! one attribute lazyview still decides from the crate version unless the file sets it, and the
+//! source's server identity comes from [`Host::source`]. Nothing here reads an instance id.
 //!
-//! Telemetry must never break the pipeline: a bad `OTEL_*` value, an unsupported protocol or an
-//! unreachable collector leaves tracing off (one WARN) or makes exports fail into
-//! [`Counters`]' rate-limited WARN, and the engine runs on.
+//! Telemetry must never break the pipeline: a file that is missing, unreadable, malformed, or that
+//! asks for something this build cannot carry leaves tracing off with one `WARN` — never a failed
+//! start, never a panic — and an unreachable collector only ever reaches [`Counters`]' rate-limited
+//! WARN. The engine runs on either way.
 //!
 //! # Signals
 //!
-//! Traces only, for now. Metrics (over the same engine fields `/metrics` and `/stats` read) and
-//! the `tracing` → OTLP logs bridge land in their own PRs on this module's once-cell, resource and
-//! per-signal exporter switches (`OTEL_METRICS_EXPORTER` / `OTEL_LOGS_EXPORTER` are read there).
+//! Traces only, for now: `meter_provider` and `logger_provider` are recognised and reported as
+//! ignored by [`config`], and the metrics and logs phases fill those sections in on this module's
+//! once-cell and resource rather than re-shaping it.
 
+mod config;
 mod prop;
 #[cfg(test)]
 mod tests;
 
+pub use config::{gate, Gate, CONFIG_FILE_ENV};
 pub use prop::{extract, extract_from, inject, TraceParent, TRACEPARENT};
 
 use opentelemetry::trace::{
     Link, Span as _, SpanContext, SpanKind, Status, TraceContextExt, TracerProvider as _,
 };
 use opentelemetry::{Context, Key, KeyValue};
-use opentelemetry_sdk::resource::{EnvResourceDetector, TelemetryResourceDetector};
+use opentelemetry_otlp::{WithExportConfig, WithTonicConfig};
+use opentelemetry_sdk::resource::TelemetryResourceDetector;
 use opentelemetry_sdk::trace::{
-    SdkTracer, SdkTracerProvider, Span as SdkSpan, SpanData, SpanExporter,
+    BatchConfigBuilder, BatchSpanProcessor, Sampler as SdkSampler, SdkTracer, SdkTracerProvider,
+    ShouldSample, SimpleSpanProcessor, Span as SdkSpan, SpanData, SpanExporter, SpanLimits,
 };
 use opentelemetry_sdk::Resource;
-use opentelemetry_semantic_conventions::resource::{
-    SERVICE_INSTANCE_ID, SERVICE_NAME, SERVICE_VERSION,
-};
+use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
 use std::borrow::Cow;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use self::config::{Exporter, Plan, Processor, Sampler};
 
 /// The instrumentation scope of every span this module opens (`otel.library.name`).
 const SCOPE: &str = "lazyview";
@@ -124,43 +142,21 @@ pub mod outcome {
 /// (agreement §3: links, and links that cannot grow the hot path).
 pub const MAX_LINKS: usize = 16;
 
-/// `LAZYVIEW_OTEL` / `LAZYWF_OTEL`: only `otlp` turns telemetry on. Anything else — including a
-/// typo — is off, because a misspelled switch must not silently start sending telemetry (and must
-/// not fail startup either; `Config` WARNs on the value it did not understand).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Switch {
-    Off,
-    Otlp,
-}
-
-impl Switch {
-    /// Parses the host's switch value (`None` when the variable is unset).
-    pub fn parse(value: Option<&str>) -> Switch {
-        match value.map(str::trim).filter(|v| !v.is_empty()) {
-            Some(v) if v.eq_ignore_ascii_case("otlp") => Switch::Otlp,
-            _ => Switch::Off,
-        }
-    }
-
-    pub fn is_on(self) -> bool {
-        self == Switch::Otlp
-    }
-}
-
 /// What the host tells the module: everything this copy-set file may not read for itself. Every
 /// field is plain data the host already has, and each side feeds it from its own configuration.
 #[derive(Debug, Clone)]
 pub struct Host<'a> {
-    /// The host's own switch value, parsed with [`Switch::parse`].
-    pub switch: Switch,
-    /// `service.name` unless `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES` say otherwise:
-    /// `lazyview` here, `lazy-wire-fire` for the embedder.
+    /// The operator's declarative-config file, as [`gate`] resolves it from the standard
+    /// `OTEL_CONFIG_FILE`: `Some` only for an existing, readable, regular file, and `None` is off.
+    /// The host reads the variable, this module reads the file — that is the whole of the
+    /// host/module boundary for the switch.
+    pub config_file: Option<&'a Path>,
+    /// `service.name` unless the file says otherwise: `lazyview` here, `lazy-wire-fire` for the
+    /// embedder.
     pub service_name: &'static str,
-    /// `service.version` — the host's `CARGO_PKG_VERSION`.
+    /// `service.version` — the host's `CARGO_PKG_VERSION`, unless the file sets it. The one
+    /// attribute lazyview still decides, and it is not identity.
     pub service_version: &'static str,
-    /// `service.instance.id` — `LAZYVIEW_INSTANCE_ID`. Two instances working on one schema must
-    /// be tellable apart, which is the same reason the fencing epoch exists.
-    pub instance_id: &'a str,
     /// The source's identity (`server_identity`): a name, never a credential or a DSN.
     pub source: Option<&'a str>,
 }
@@ -226,7 +222,7 @@ pub fn enabled() -> bool {
     STATE.load(Ordering::Relaxed) == ON
 }
 
-/// `true` once [`init`] has built a provider and an exporter. With no environment set it stays
+/// `true` once [`init`] has built a provider and an exporter. With no file to read it stays
 /// `false`, which is the off test's probe: there is provably no tracer and no exporter in the
 /// process, because nothing ever created one.
 #[inline]
@@ -242,53 +238,172 @@ pub fn export_errors() -> u64 {
         .unwrap_or(0)
 }
 
-/// Builds the tracer provider and installs it in the once-cell. `true` when telemetry is on;
-/// every failure (a value this build does not support, an exporter that cannot be built) is one
-/// WARN and `false` — never an error the caller has to handle. Idempotent: the first call decides.
-pub fn init(host: &Host) -> bool {
-    if !host.switch.is_on() {
-        STATE.store(OFF, Ordering::Relaxed);
-        return false;
+/// One `WARN` per distinct message per run. Reading a file is a once-per-process thing, but the
+/// notes are collected rather than logged as they are found — so a repeated unknown key, or the same
+/// problem reached twice from two sections, is said once and cannot become a log loop.
+fn warn_once(what: &str) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.iter().any(|s| s == what) {
+        return;
     }
+    seen.push(what.to_owned());
+    drop(seen);
+    tracing::warn!("OpenTelemetry: {what}");
+}
+
+/// Builds the provider and the exporters the file names, and installs them in the once-cell.
+/// `true` when telemetry is on; every problem — a file that cannot be read, a model version this
+/// build does not have, an exporter that cannot be built — is one `WARN` and `false`, never an error
+/// the caller has to handle. Idempotent: the first call decides.
+pub fn init(host: &Host) -> bool {
     if enabled() {
         return true;
     }
-    match refused() {
-        Some(why) => {
+    let Some(path) = host.config_file else {
+        // Unset is the documented default: nothing to say, nothing to build.
+        STATE.store(OFF, Ordering::Relaxed);
+        return false;
+    };
+    match config::read_file(path) {
+        config::Reading::Off { reason, warn } => {
             // Telemetry is a visitor: a refused visit is reported, and the run goes on without it.
-            tracing::warn!("OpenTelemetry stays off ({why})");
+            if warn {
+                warn_once(&reason);
+            }
             STATE.store(OFF, Ordering::Relaxed);
             false
         }
-        None => match opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .build()
-            .map_err(|e| format!("building the OTLP exporter: {e}"))
-        {
-            Ok(exporter) => install(host, exporter),
-            Err(e) => {
-                tracing::warn!("OpenTelemetry stays off ({e})");
-                STATE.store(OFF, Ordering::Relaxed);
-                false
+        config::Reading::On(plan) => {
+            let plan: Plan = *plan;
+            for note in &plan.warnings {
+                warn_once(note);
             }
-        },
+            if let Some(t) = &plan.traces {
+                if t.limits.attribute_value_length.is_some() {
+                    warn_once(
+                        "tracer_provider.limits.attribute_value_length_limit is not supported by \
+                         this SDK build and was ignored",
+                    );
+                }
+            }
+            match build_exporters(&plan) {
+                Ok(ps) if ps.is_empty() => {
+                    warn_once("the file names no processor telemetry can use");
+                    STATE.store(OFF, Ordering::Relaxed);
+                    false
+                }
+                Ok(ps) => install_processors(host, &plan, ps, Arc::new(Counters::default())),
+                Err(reason) => {
+                    warn_once(&reason);
+                    STATE.store(OFF, Ordering::Relaxed);
+                    false
+                }
+            }
+        }
     }
 }
 
-/// Installs a provider whose spans go to `exporter`. Split out of [`init`] so the tests can put a
-/// capturing exporter here and assert what the product actually emits.
-fn install<E: SpanExporter + 'static>(host: &Host, exporter: E) -> bool {
-    let counters = Arc::new(Counters::default());
-    // The sampler and the span limits come from the SDK's own default config, which is what reads
-    // `OTEL_TRACES_SAMPLER` / `_ARG` and the `OTEL_SPAN_*_COUNT_LIMIT` names; only the resource is
-    // ours to say (below), so nothing here re-implements the specification's config.
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(RateLimited {
+/// The exporters the file's processors name, each paired with the processor that asked for it.
+fn build_exporters(plan: &Plan) -> Result<Vec<(Built, Processor)>, String> {
+    let Some(t) = &plan.traces else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(t.processors.len());
+    for p in &t.processors {
+        let exporter = match p {
+            Processor::Batch { exporter, .. } | Processor::Simple { exporter, .. } => exporter,
+        };
+        out.push((build_exporter(exporter)?, p.clone()));
+    }
+    Ok(out)
+}
+
+/// Builds one exporter. The OTLP/gRPC one has every field the flat `OTEL_EXPORTER_OTLP_*` names
+/// would otherwise feed the SDK given here, so the file really is the only config source (the three
+/// the SDK still resolves itself are named in `docs/configuration.md`).
+fn build_exporter(exporter: &Exporter) -> Result<Built, String> {
+    match exporter {
+        Exporter::Console => Ok(Built::Console),
+        Exporter::OtlpGrpc(g) => {
+            if !g.headers.is_empty() {
+                // Read, reported, and deliberately not applied: the official gRPC exporter sends
+                // per-request headers only as `tonic` metadata (`WithTonicConfig::with_metadata`),
+                // and that setter is reachable only through a direct `tonic` dependency, which this
+                // crate does not name — `tonic` is in the lock only as a transitive of
+                // `opentelemetry-otlp`'s `grpc-tonic` feature, which the export itself needs.
+                // Saying so once is the whole difference between a collector that rejects the
+                // exports in silence and an operator who knows why.
+                warn_once(&format!(
+                    "{}: the file's `headers` are read but not sent — this build's OTLP/gRPC \
+                         exporter sets no per-request headers without a direct tonic dependency; \
+                         serve them at the collector or the network path",
+                    g.endpoint
+                ));
+            }
+            let b = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(g.endpoint.clone())
+                .with_timeout(g.timeout);
+            let b = match g.compression {
+                Some(c) => b.with_compression(c),
+                None => b,
+            };
+            b.build().map(|e| Built::Otlp(Box::new(e))).map_err(|e| {
+                format!(
+                    "the OTLP/gRPC exporter for {} cannot be built ({e})",
+                    g.endpoint
+                )
+            })
+        }
+    }
+}
+
+/// Installs a provider with one processor per entry, each holding `exporter`. Split out of [`init`]
+/// so the tests can put a capturing exporter here and assert what the product actually does with
+/// the values the file carried.
+fn install_processors<E: SpanExporter + 'static>(
+    host: &Host,
+    plan: &Plan,
+    processors: Vec<(E, Processor)>,
+    counters: Arc<Counters>,
+) -> bool {
+    let mut b = SdkTracerProvider::builder().with_resource(resource(host, plan));
+    if let Some(t) = &plan.traces {
+        b = b.with_sampler(Box::new(sdk_sampler(&t.sampler)) as Box<dyn ShouldSample>);
+        b = b.with_span_limits(span_limits(&t.limits));
+    }
+    for (exporter, spec) in processors {
+        let wrapped = RateLimited {
             inner: exporter,
             counters: counters.clone(),
-        })
-        .with_resource(resource(host))
-        .build();
+        };
+        b = match spec {
+            // Every knob of the batch processor is given explicitly, the ones the file left out
+            // included, because `BatchConfig`'s own defaults seed themselves from `OTEL_BSP_*`.
+            Processor::Batch { batch, .. } => {
+                // The SDK's builder has no setter for the export timeout outside its experimental
+                // async-runtime feature, so this one knob stays the environment's if the file names
+                // a value of its own — said once, like every other gap, and named in the docs.
+                if batch.export_timeout != config::BATCH_EXPORT_TIMEOUT {
+                    warn_once(&format!(
+                        "the file's `export_timeout` of {:?} cannot be set on the batch processor                          by this SDK build (OTEL_BSP_MAX_EXPORT_TIMEOUT is the SDK's own door);                          exports use {:?}",
+                        batch.export_timeout, config::BATCH_EXPORT_TIMEOUT
+                    ));
+                }
+                b.with_span_processor(BatchSpanProcessor::new(
+                    wrapped,
+                    BatchConfigBuilder::default()
+                        .with_max_queue_size(batch.max_queue_size)
+                        .with_max_export_batch_size(batch.max_export_batch_size)
+                        .with_scheduled_delay(batch.schedule_delay)
+                        .build(),
+                ))
+            }
+            Processor::Simple { .. } => b.with_span_processor(SimpleSpanProcessor::new(wrapped)),
+        };
+    }
+    let provider = b.build();
     let tracer = provider.tracer(SCOPE);
     *TELEMETRY.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Telemetry {
         provider,
@@ -299,66 +414,90 @@ fn install<E: SpanExporter + 'static>(host: &Host, exporter: E) -> bool {
     true
 }
 
-/// Why the switch is on but this build will not export, or `None` to go ahead. Everything here is
-/// the standard environment: the same names every OTel SDK reads, so a collector setup that works
-/// for one language's SDK works here (agreement §2).
-fn refused() -> Option<String> {
-    // `OTEL_TRACES_EXPORTER=none` disables traces even with the switch on: one collector setup
-    // can then carry metrics and logs and no spans, which is what the spec's per-signal switch is for.
-    match std::env::var("OTEL_TRACES_EXPORTER")
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-    {
-        Some(v) if v.is_empty() || v == "none" => return Some("OTEL_TRACES_EXPORTER=none".into()),
-        Some(v) if v != "otlp" => {
-            return Some(format!(
-                "OTEL_TRACES_EXPORTER={v} is not supported (otlp, none)"
-            ))
+/// The file's sampler, as the SDK's own. `parent_based` maps to the SDK's parent-based sampler with
+/// only the branches the file named overridden, so the specification's defaults stay the SDK's.
+fn sdk_sampler(s: &Sampler) -> SdkSampler {
+    match s {
+        Sampler::AlwaysOn => SdkSampler::AlwaysOn,
+        Sampler::AlwaysOff => SdkSampler::AlwaysOff,
+        Sampler::Ratio(r) => SdkSampler::TraceIdRatioBased(*r),
+        Sampler::ParentBased {
+            root,
+            remote_parent_sampled,
+            remote_parent_not_sampled,
+            local_parent_sampled,
+            local_parent_not_sampled,
+        } => {
+            let mut p = SdkSampler::parent_based(box_sampler(root));
+            if let Some(x) = remote_parent_sampled {
+                p = p.with_remote_parent_sampled(box_sampler(x));
+            }
+            if let Some(x) = remote_parent_not_sampled {
+                p = p.with_remote_parent_not_sampled(box_sampler(x));
+            }
+            if let Some(x) = local_parent_sampled {
+                p = p.with_local_parent_sampled(box_sampler(x));
+            }
+            if let Some(x) = local_parent_not_sampled {
+                p = p.with_local_parent_not_sampled(box_sampler(x));
+            }
+            SdkSampler::ParentBased(Box::new(p))
         }
-        _ => {}
-    }
-    if std::env::var("OTEL_SDK_DISABLED")
-        .ok()
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
-    {
-        return Some("OTEL_SDK_DISABLED=true".into());
-    }
-    // OTLP/gRPC only: the http/* transports would add reqwest and prost to a binary that has no
-    // other use for them, and gRPC is the transport lazy-wire-fire already carries (agreement §4).
-    let protocol = std::env::var("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
-        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL"))
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty());
-    match protocol.as_deref() {
-        Some(p) if p != "grpc" => Some(format!(
-            "OTEL_EXPORTER_OTLP_PROTOCOL={p} is not supported (grpc)"
-        )),
-        _ => None,
     }
 }
 
-/// The resource: who produced this telemetry. `telemetry.sdk.*` says which SDK produced it.
-/// The operator's `OTEL_SERVICE_NAME` is adopted as our own `service.name` — the SDK's detectors
-/// merge *under* programmatic attributes (the specification's precedence), so taking it in is the
-/// only way an env value beats the default; `OTEL_RESOURCE_ATTRIBUTES` arrives through the env
-/// detector for every key we did not set ourselves.
-fn resource(host: &Host) -> Resource {
-    let service = std::env::var("OTEL_SERVICE_NAME")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let mut ours = vec![
-        KeyValue::new(
+fn box_sampler(s: &Sampler) -> Box<dyn ShouldSample> {
+    Box::new(sdk_sampler(s)) as Box<dyn ShouldSample>
+}
+
+/// The file's `tracer_provider.limits`, over the SDK's own defaults.
+fn span_limits(l: &config::Limits) -> SpanLimits {
+    let mut sl = SpanLimits::default();
+    if let Some(v) = l.attribute_count {
+        sl.max_attributes_per_span = v;
+    }
+    if let Some(v) = l.event_count {
+        sl.max_events_per_span = v;
+    }
+    if let Some(v) = l.link_count {
+        sl.max_links_per_span = v;
+    }
+    if let Some(v) = l.event_attribute_count {
+        sl.max_attributes_per_event = v;
+    }
+    if let Some(v) = l.link_attribute_count {
+        sl.max_attributes_per_link = v;
+    }
+    sl
+}
+
+/// The resource: who produced this telemetry. What the file's `resource` section says wins; the
+/// defaults *under* it are the host's service name and the crate version. `telemetry.sdk.*` comes
+/// from the SDK's own detector, which reads no environment — the `OTEL_RESOURCE_ATTRIBUTES` and
+/// `OTEL_SERVICE_NAME` names reach the resource through the file's `${…}` substitution, which is
+/// why the SDK's env detector is deliberately not installed here.
+fn resource(host: &Host, plan: &Plan) -> Resource {
+    let mut ours: Vec<KeyValue> = plan
+        .resource
+        .iter()
+        .map(|(k, v)| KeyValue::new(Key::new(Cow::Owned(k.clone())), Cow::Owned(v.clone())))
+        .collect();
+    let has = |key: &str| ours.iter().any(|a| a.key.as_str() == key);
+    let (want_name, want_version) = (!has(SERVICE_NAME), !has(SERVICE_VERSION));
+    if want_name {
+        ours.push(KeyValue::new(
             Key::from_static_str(SERVICE_NAME),
-            service.unwrap_or_else(|| host.service_name.to_owned()),
-        ),
-        KeyValue::new(Key::from_static_str(SERVICE_VERSION), host.service_version),
-        KeyValue::new(
-            Key::from_static_str(SERVICE_INSTANCE_ID),
-            host.instance_id.to_owned(),
-        ),
-    ];
+            host.service_name,
+        ));
+    }
+    if want_version {
+        ours.push(KeyValue::new(
+            Key::from_static_str(SERVICE_VERSION),
+            host.service_version,
+        ));
+    }
     if let Some(s) = host.source {
+        // Owned: `host` is a borrow of the caller's, and a resource attribute outlives this call.
         ours.push(KeyValue::new(
             Key::from_static_str(attr::SOURCE_SERVER),
             s.to_owned(),
@@ -366,7 +505,6 @@ fn resource(host: &Host) -> Resource {
     }
     Resource::builder_empty()
         .with_attributes(ours)
-        .with_detector(Box::new(EnvResourceDetector::new()))
         .with_detector(Box::new(TelemetryResourceDetector))
         .build()
 }
@@ -392,17 +530,11 @@ struct RateLimited<E> {
 }
 
 impl<E: SpanExporter + 'static> SpanExporter for RateLimited<E> {
-    fn export(
-        &self,
-        batch: Vec<SpanData>,
-    ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
-        let inner = &self.inner;
-        let counters = self.counters.clone();
-        async move {
-            inner.export(batch).await.inspect_err(|e| {
-                counters.note(&e.to_string());
-            })
-        }
+    async fn export(&self, batch: Vec<SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner
+            .export(batch)
+            .await
+            .inspect_err(|e| self.counters.note(&e.to_string()))
     }
 
     fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
@@ -416,6 +548,71 @@ impl<E: SpanExporter + 'static> SpanExporter for RateLimited<E> {
     fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
         self.inner.shutdown_with_timeout(timeout)
     }
+}
+
+/// The exporter the file names, as one type so that the SDK's own processors can hold whichever
+/// combination of exporters the file lists.
+#[derive(Debug)]
+enum Built {
+    // Boxed: the OTLP exporter is hundreds of bytes and the console one is nothing, and this enum
+    // is held by every processor the file names.
+    Otlp(Box<opentelemetry_otlp::SpanExporter>),
+    Console,
+}
+
+impl SpanExporter for Built {
+    async fn export(&self, batch: Vec<SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+        match self {
+            Built::Otlp(e) => e.export(batch).await,
+            Built::Console => {
+                for s in &batch {
+                    // The model's `console` exporter: what a span is, on stdout. Only ever
+                    // reached when the operator asked for it.
+                    println!(
+                        "otel span name={} trace_id={} span_id={} kind={:?} attributes={} \
+                         links={} status={:?}",
+                        s.name,
+                        hex(&s.span_context.trace_id().to_bytes()),
+                        hex(&s.span_context.span_id().to_bytes()),
+                        s.span_kind,
+                        s.attributes.len(),
+                        s.links.len(),
+                        s.status
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        match self {
+            Built::Otlp(e) => e.force_flush(),
+            Built::Console => Ok(()),
+        }
+    }
+
+    fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        match self {
+            Built::Otlp(e) => e.shutdown(),
+            Built::Console => Ok(()),
+        }
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        match self {
+            Built::Otlp(e) => e.shutdown_with_timeout(timeout),
+            Built::Console => Ok(()),
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// The current telemetry, when there is one. Only the on-path reaches the lock.
@@ -577,7 +774,7 @@ impl SpanInit {
 }
 
 /// Opens a span named `name`. `build` — the attributes and the links — runs **only when tracing is
-/// on**: with `LAZYVIEW_OTEL` unset this returns a disabled handle after one atomic load, which is
+/// on**: with `OTEL_CONFIG_FILE` unset this returns a disabled handle after one atomic load, which is
 /// the whole off-is-free mechanism, and is what `tests/otel_off_free.rs` measures in allocations.
 ///
 /// The span ends when the handle is dropped, so bind it for as long as the work it covers: for an
@@ -620,21 +817,62 @@ pub fn propagator() -> &'static opentelemetry_sdk::propagation::TraceContextProp
     P.get_or_init(opentelemetry_sdk::propagation::TraceContextPropagator::new)
 }
 
-/// Test-only: replaces the once-cell with a provider whose spans go to `exporter`, runs `f`, and
-/// puts the cell back the way it was. Serialised: exactly one test may hold telemetry at a time.
+/// Test-only: installs the provider [`init`] would have built from `plan`, with each given exporter
+/// in the processor the file said, runs `f`, and puts the cell back the way it was. Serialised:
+/// exactly one test may hold telemetry at a time. The `exporter` inside each processor spec only
+/// says which *kind* of processor to build — the exporter itself is the one passed in.
+#[cfg(test)]
+pub(crate) fn with_plan<R, E: SpanExporter + 'static>(
+    host: &Host,
+    plan: &Plan,
+    processors: Vec<(E, Processor)>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset();
+    install_processors(host, plan, processors, Arc::new(Counters::default()));
+    let out = f();
+    shutdown();
+    reset();
+    out
+}
+
+/// Test-only: the ordinary case — one simple processor sending to `exporter`, the SDK's default
+/// sampler and limits, the file's resource empty.
 #[cfg(test)]
 pub(crate) fn with_telemetry<R>(
     host: &Host,
     exporter: impl SpanExporter + 'static,
     f: impl FnOnce() -> R,
 ) -> R {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    reset();
-    install(host, exporter);
-    let out = f();
-    shutdown();
-    reset();
-    out
+    let plan = Plan {
+        traces: Some(self::config::Traces {
+            sampler: Sampler::AlwaysOn,
+            processors: Vec::new(),
+            limits: config::Limits::default(),
+        }),
+        ..Plan::default()
+    };
+    with_plan(
+        host,
+        &plan,
+        vec![(
+            exporter,
+            Processor::Simple {
+                exporter: Exporter::Console,
+            },
+        )],
+        f,
+    )
+}
+
+/// Test-only: gives a batch processor its turn to export (the exit path's flush, without its
+/// shutdown), so a test can see what a batch actually left in.
+#[cfg(test)]
+pub(crate) fn flush() {
+    if let Some(t) = telemetry() {
+        let _ = t.provider.force_flush();
+    }
 }
 
 /// Test-only: runs `f` with the cell forced back to unset (the state a process that never called

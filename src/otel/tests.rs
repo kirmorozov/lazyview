@@ -53,12 +53,37 @@ impl SpanExporter for Unreachable {
 
 fn host<'a>() -> Host<'a> {
     Host {
-        switch: Switch::Otlp,
+        config_file: None,
         service_name: "lazyview-test",
         service_version: "0.0.0-test",
-        instance_id: "test-instance",
         source: Some("source-1"),
     }
+}
+
+/// The same host, naming the declarative-config file the operator would have named.
+fn host_with<'a>(config_file: Option<&'a std::path::Path>) -> Host<'a> {
+    Host {
+        config_file,
+        ..host()
+    }
+}
+
+/// Files a test needs go under the target directory — never `/tmp`, and never next to the sources
+/// where a run would leave them behind.
+fn scratch_dir() -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        p = std::path::PathBuf::from(dir);
+    }
+    p.join("lvs-otel-tests")
+}
+
+fn write_scratch(name: &str, contents: &str) -> std::path::PathBuf {
+    let dir = scratch_dir();
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("write config");
+    path
 }
 
 fn attr(s: &SpanData, key: &str) -> Option<Value> {
@@ -96,59 +121,116 @@ fn res(r: &Resource, key: &str) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------- the switch
+// ---------------------------------------------------------------- the gate
 
+/// The gate's four answers, and that none of them is ever a failure: `OTEL_CONFIG_FILE` is the
+/// whole switch, so a value that is not a readable regular file leaves telemetry off and says so
+/// once, naming the variable and the path.
 #[test]
-fn the_switch_is_off_unless_it_says_otlp() {
-    assert_eq!(Switch::parse(None), Switch::Off);
-    for on in ["otlp", "OTLP", " otlp "] {
-        assert_eq!(Switch::parse(Some(on)), Switch::Otlp, "{on} is on");
+fn the_file_named_by_the_environment_is_the_switch() {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let named = manifest.join("deploy/k8s/base/otel-config.json");
+
+    // Unset, empty and whitespace-only are off, and off quietly: an ambient collector that exports
+    // by itself must not make this process say anything about telemetry.
+    for v in [None, Some(""), Some("   ")] {
+        let g = gate(CONFIG_FILE_ENV, v);
+        assert_eq!(g.file, None, "{v:?} names no file");
+        assert_eq!(
+            g.warning, None,
+            "{v:?} is the documented default, not a mistake"
+        );
     }
-    // Anything else is off, including the near misses: a misspelling must not start telemetry.
-    for off in ["", "   ", "off", "1", "yes", "otlp-x", "grpc", "none"] {
-        assert_eq!(Switch::parse(Some(off)), Switch::Off, "{off:?} is not on");
+
+    // A file that is there is the on switch, and the only thing the on switch needs.
+    let g = gate(CONFIG_FILE_ENV, named.to_str());
+    assert_eq!(
+        g.file.as_deref(),
+        Some(named.as_path()),
+        "the named file is on"
+    );
+    assert_eq!(g.warning, None, "nothing to complain about");
+
+    // Anything else is off *with* the one sentence that tells the operator why.
+    for v in [
+        "/definitely/not/mounted/lazyview-otel.json",
+        manifest.to_str().unwrap(),
+    ] {
+        let g = gate(CONFIG_FILE_ENV, Some(v));
+        assert_eq!(
+            g.file, None,
+            "{v} is not a file telemetry can be built from"
+        );
+        let w = g
+            .warning
+            .unwrap_or_else(|| panic!("{v} must say why telemetry stayed off"));
+        assert!(w.contains(CONFIG_FILE_ENV), "{w} names the variable");
+        assert!(w.contains(v), "{w} names the path");
     }
-    assert!(Switch::parse(Some("otlp")).is_on());
-    assert!(!Switch::parse(Some("")).is_on());
 }
 
-/// A switch that is on but names something this build does not carry: one WARN, telemetry off, and
-/// `init` says so with `false` rather than failing the caller.
+/// `init` is the caller's safety net: whatever it is handed — no file, a missing path, a directory,
+/// a file full of things this build cannot carry — it answers `false` and installs nothing. It is
+/// never an error, never a panic, and never a half-built provider.
 #[test]
-fn a_setup_this_build_does_not_carry_is_refused() {
-    for (k, v) in [
-        ("OTEL_TRACES_EXPORTER", "none"),
-        ("OTEL_TRACES_EXPORTER", "stdout"),
-        ("OTEL_SDK_DISABLED", "true"),
-        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
-        ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/json"),
-    ] {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset();
-        std::env::set_var(k, v);
-        let on = init(&host());
-        std::env::remove_var(k);
-        assert!(!on, "{k}={v} must leave telemetry off, not fail the run");
-        assert!(!enabled(), "{k}={v} must leave no provider installed");
-        reset();
-    }
-    // The values this build does carry are accepted. Building the OTLP/gRPC exporter wants a tokio
-    // context (the tonic channel registers with its reactor) — the product calls `init` from the
-    // engine's runtime, so the test stands in the same kind of context.
+fn a_start_is_never_failed_by_a_telemetry_setup_it_cannot_carry() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset();
-    std::env::set_var("OTEL_TRACES_EXPORTER", "otlp");
-    std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc");
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let missing = manifest.join("deploy/k8s/base/not-mounted.json");
+    let scratch = scratch_dir();
+
+    for path in [None, Some(missing.as_path()), Some(scratch.as_path())] {
+        assert!(
+            !init(&host_with(path)),
+            "{path:?} builds nothing rather than failing the start"
+        );
+        assert!(!enabled(), "{path:?} leaves no provider installed");
+        assert!(!initialised(), "{path:?} leaves no exporter either");
+    }
+
+    // A file whose every exporter this build does not carry: off, with the sentence about it.
+    let refused = write_scratch(
+        "refused-http.json",
+        r#"{"file_format":"1.2","tracer_provider":{"processors":[{"batch":{"exporter":{"otlp_http":{"endpoint":"http://127.0.0.1:4318"}}}}]}}"#,
+    );
+    assert!(!init(&host_with(Some(&refused))), "gRPC only");
+    assert!(!enabled());
+
+    // A file that is there and readable but names no processor this build can use: the same answer.
+    let mute = write_scratch(
+        "mute.json",
+        r#"{"file_format":"1.2","tracer_provider":{"enabled":false}}"#,
+    );
+    assert!(!init(&host_with(Some(&mute))), "an off file builds nothing");
+    assert!(!enabled());
+    reset();
+}
+
+/// The file the operator is pointed at is accepted by the code that reads it: `init` says yes to
+/// it, in the same kind of runtime context the engine starts in. The endpoint points at a closed
+/// port — building an exporter never connects, so this proves the read and the build, and the
+/// shutdown afterwards proves a collector that never answers cannot wedge a start.
+#[test]
+fn the_starting_file_the_repository_ships_is_accepted() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset();
+    let named = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("deploy/k8s/base/otel-config.json");
+    let g = gate(CONFIG_FILE_ENV, named.to_str());
+    assert!(g.file.is_some(), "the shipped file is a gate");
     std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("a runtime to build the exporter in");
-    let on = rt.block_on(async { init(&host()) });
-    std::env::remove_var("OTEL_TRACES_EXPORTER");
-    std::env::remove_var("OTEL_EXPORTER_OTLP_PROTOCOL");
+    let on = rt.block_on(async { init(&host_with(g.file.as_deref())) });
     std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
-    assert!(on, "the carried setup (otlp over grpc) is accepted");
+    assert!(
+        on,
+        "the file the documentation points operators at is accepted"
+    );
+    assert!(enabled());
     // Outside `block_on`: `shutdown` drives the batch flush with its own `block_on`, which refuses
     // to run from inside a runtime's context.
     drop(rt);
@@ -405,68 +487,183 @@ fn on_spans_carry_the_agreed_names_and_values() {
     }
 }
 
-/// The unsampled path is the one a low `OTEL_TRACES_SAMPLER` ratio puts the hot path on: nothing is
-/// stamped, so nothing downstream pays for a parent (agreement §3).
+/// The unsampled path is the one a low `trace_id_ratio_based` ratio puts the hot path on: nothing
+/// is stamped, so nothing downstream pays for a parent (agreement §3). The sampler is what the file
+/// said — no flat `OTEL_TRACES_SAMPLER` is consulted, which is what the second half checks.
 #[test]
 fn an_unsampled_span_stamps_nothing() {
     let cap = Capture::default();
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    reset();
-    std::env::set_var("OTEL_TRACES_SAMPLER", "always_off");
-    install(&host(), cap.clone());
-    let mut s = span(span::BINLOG_TRANSACTION, |a| {
-        a.str(attr::SOURCE_POSITION, "mysql-bin.000003:4");
-    });
-    assert!(!s.sampled(), "the sampler took it out");
-    assert!(s.trace_parent().is_none(), "so there is nothing to stamp");
-    s.ok();
-    drop(s);
-    shutdown();
-    reset();
+    let plan = Plan {
+        traces: Some(config::Traces {
+            sampler: Sampler::AlwaysOff,
+            processors: Vec::new(),
+            limits: config::Limits::default(),
+        }),
+        ..Plan::default()
+    };
+    // The flat name says the opposite of the file: whatever the plan says is what runs, so the
+    // span below must still be unsampled. (`with_plan` holds the module's test lock; taking it
+    // here as well would be a self-deadlock, and the name is one nothing here reads anyway.)
+    std::env::set_var("OTEL_TRACES_SAMPLER", "always_on");
+    with_plan(
+        &host(),
+        &plan,
+        vec![(
+            cap.clone(),
+            Processor::Simple {
+                exporter: Exporter::Console,
+            },
+        )],
+        || {
+            let mut s = span(span::BINLOG_TRANSACTION, |a| {
+                a.str(attr::SOURCE_POSITION, "mysql-bin.000003:4");
+            });
+            assert!(!s.sampled(), "the sampler the file chose took it out");
+            assert!(s.trace_parent().is_none(), "so there is nothing to stamp");
+            s.ok();
+        },
+    );
     std::env::remove_var("OTEL_TRACES_SAMPLER");
     assert!(cap.taken().is_empty(), "an unsampled span is not exported");
 }
 
-/// The resource is what a collector groups by: our names, and the operator's `OTEL_*` values win.
+/// The `batch` the file names is the processor that runs: spans wait for their turn instead of
+/// going out one by one, and [`flush`] — the exit path's door — is what empties the queue, so a
+/// process that stops normally loses nothing the file asked to be sent.
 #[test]
-fn the_resource_names_the_producer() {
-    let r = resource(&Host {
-        switch: Switch::Otlp,
-        service_name: "lazyview",
-        service_version: "1.2.3",
-        instance_id: "inst-7",
-        source: None,
-    });
-    assert_eq!(res(&r, SERVICE_NAME).as_deref(), Some("lazyview"));
-    assert_eq!(res(&r, SERVICE_VERSION).as_deref(), Some("1.2.3"));
-    assert_eq!(res(&r, SERVICE_INSTANCE_ID).as_deref(), Some("inst-7"));
-    assert!(
-        res(&r, attr::SOURCE_SERVER).is_none(),
-        "no source, no attribute"
+fn a_batch_processor_holds_its_spans_until_the_process_flushes() {
+    let cap = Capture::default();
+    let plan = Plan {
+        traces: Some(config::Traces {
+            sampler: Sampler::AlwaysOn,
+            processors: Vec::new(),
+            limits: config::Limits::default(),
+        }),
+        ..Plan::default()
+    };
+    with_plan(
+        &host(),
+        &plan,
+        vec![(
+            cap.clone(),
+            Processor::Batch {
+                exporter: Exporter::Console,
+                batch: config::Batch {
+                    schedule_delay: config::BATCH_SCHEDULE_DELAY,
+                    export_timeout: config::BATCH_EXPORT_TIMEOUT,
+                    max_queue_size: config::BATCH_MAX_QUEUE_SIZE,
+                    max_export_batch_size: config::BATCH_MAX_EXPORT_BATCH_SIZE,
+                },
+            },
+        )],
+        || {
+            {
+                let mut s = span(span::VIEW_FLUSH, |a| {
+                    a.u64(attr::EPOCH, 7);
+                });
+                s.ok();
+            } // `end` is Drop, and an ended span is what the batch has to hold.
+            assert!(
+                cap.taken().is_empty(),
+                "a batch processor is not a simple one: nothing has been exported yet"
+            );
+            flush();
+            assert_eq!(
+                cap.taken()
+                    .iter()
+                    .filter(|s| s.name.as_ref() == span::VIEW_FLUSH)
+                    .count(),
+                1,
+                "the flush the exit path makes is what sends the batch"
+            );
+        },
     );
-    assert!(
-        res(&r, "telemetry.sdk.name").is_some(),
-        "the SDK says who produced it"
-    );
+}
 
-    // The operator's values win over the defaults: the env detector runs after them.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("OTEL_SERVICE_NAME", "collector-side-name");
-    std::env::set_var(
-        "OTEL_RESOURCE_ATTRIBUTES",
-        "deployment.environment.name=prod",
+/// The resource is what a collector groups by: the host's defaults underneath, the file's
+/// attributes on top, and nothing else — no `EnvResourceDetector`, no `OTEL_RESOURCE_ATTRIBUTES`,
+/// no per-process instance id.
+#[test]
+fn the_resource_names_the_producer_and_the_file_wins() {
+    let plan = Plan {
+        resource: vec![
+            ("service.name".to_string(), "named-by-the-file".to_string()),
+            (
+                "deployment.environment.name".to_string(),
+                "prod".to_string(),
+            ),
+        ],
+        ..Plan::default()
+    };
+    let r = resource(
+        &Host {
+            config_file: None,
+            service_name: "lazyview",
+            service_version: "1.2.3",
+            source: Some("src-1"),
+        },
+        &plan,
     );
-    let r = resource(&host());
-    std::env::remove_var("OTEL_SERVICE_NAME");
-    std::env::remove_var("OTEL_RESOURCE_ATTRIBUTES");
     assert_eq!(
         res(&r, SERVICE_NAME).as_deref(),
-        Some("collector-side-name"),
-        "the operator's service.name wins"
+        Some("named-by-the-file"),
+        "the file outranks the host's default name"
+    );
+    assert_eq!(
+        res(&r, SERVICE_VERSION).as_deref(),
+        Some("1.2.3"),
+        "the version the host decided is still ours"
     );
     assert_eq!(
         res(&r, "deployment.environment.name").as_deref(),
         Some("prod")
+    );
+    assert_eq!(res(&r, attr::SOURCE_SERVER).as_deref(), Some("src-1"));
+    assert!(
+        res(&r, "telemetry.sdk.name").is_some(),
+        "the SDK says who produced it"
+    );
+    assert_eq!(
+        r.get(&opentelemetry::Key::from_static_str("service.instance.id")),
+        None,
+        "no per-process identity: a pod's identity is the file's `resource`, not an ambient name"
+    );
+    // A host with no source server says nothing about one: the attribute appears when the engine has
+    // a source to name, and not before.
+    let quiet = resource(
+        &Host {
+            config_file: None,
+            service_name: "lazyview",
+            service_version: "1.2.3",
+            source: None,
+        },
+        &Plan::default(),
+    );
+    assert!(
+        res(&quiet, attr::SOURCE_SERVER).is_none(),
+        "no source, no attribute"
+    );
+
+    // And the flat names the SDK used to read for itself change nothing: with the file in charge,
+    // it is the only source of a resource attribute.
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("OTEL_SERVICE_NAME", "collector-side-name");
+    std::env::set_var(
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "deployment.environment.name=from-the-environment",
+    );
+    let r = resource(&host(), &Plan::default());
+    std::env::remove_var("OTEL_SERVICE_NAME");
+    std::env::remove_var("OTEL_RESOURCE_ATTRIBUTES");
+    assert_eq!(
+        res(&r, SERVICE_NAME).as_deref(),
+        Some("lazyview-test"),
+        "the host's name stands: no flat variable overrides it"
+    );
+    assert_eq!(
+        res(&r, "deployment.environment.name"),
+        None,
+        "OTEL_RESOURCE_ATTRIBUTES is not consulted"
     );
 }
 

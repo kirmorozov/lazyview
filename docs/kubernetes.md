@@ -253,32 +253,61 @@ beyond what the node identity already allows.
 
 ## OpenTelemetry
 
-Tracing is off until you switch it on, and switching it on is environment only: there is no manifest
-to add and no right to grant. lazyview is a *client* of your collector, and the
-[network policy](#deploy) restricts ingress only, so egress to a collector needs no new rule.
+Telemetry is off until you point lazyview at a declarative-config file, and turning it on is one
+environment line plus one mount: there is no sidecar to add and no right to grant. lazyview is a
+*client* of your collector, and the [network policy](#deploy) restricts ingress only, so egress to a
+collector needs no new rule.
 
 ```yaml
-# base/config.env, or your overlay's
-LAZYVIEW_OTEL=otlp
-OTEL_EXPORTER_OTLP_ENDPOINT=http://opentelemetry-collector.observability.svc.cluster.local:4317
-# OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer%20…   a managed collector's auth header
-# OTEL_TRACES_SAMPLER=parentbased_traceidratio           sample a share of the runs
-# OTEL_TRACES_SAMPLER_ARG=0.05
+# base/config.env, or your overlay's — one line, and it is the standard name.
+OTEL_CONFIG_FILE=/etc/lazyview/otel/config.json
 ```
 
-* The spans, the attributes, and the rule that no span carries a row value:
-  [configuration → OpenTelemetry](configuration.md#opentelemetry). Off (the default) costs nothing:
-  no provider and no exporter exist in the process at all.
-* **OTLP/gRPC only** (4317 by default). `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` is refused with one
-  `WARN` and tracing stays off rather than exporting over a second HTTP stack.
-* `service.instance.id` is `LAZYVIEW_INSTANCE_ID`, so the active pod and its standbys are told apart,
-  and `lazyview.epoch.takeover` marks the moment the fencing epoch moved to a replica (see
-  [rollouts and standby](#rollouts-drains-and-standby)).
+Mount the file from a ConfigMap (or a Secret, once it carries anything sensitive) at the path that
+variable names. It is JSON, in the standard declarative-config model: `base/otel-config.json` is the
+recommended starting content, and the collector's address, the sampled share and the resource identity
+all live inside it.
+
+```yaml
+# the ConfigMap's key, from the shipped example
+otel-config.json: |
+  {
+    "file_format": "1.2",
+    "resource": { "attributes_list": "${OTEL_RESOURCE_ATTRIBUTES}" },
+    "tracer_provider": {
+      "processors": [
+        { "batch": { "exporter": { "otlp_grpc": {
+          "endpoint": "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://opentelemetry-collector.observability.svc.cluster.local:4317}"
+        } } } }
+      ]
+    }
+  }
+```
+
+The pod's own environment then carries what the file substitutes: `OTEL_RESOURCE_ATTRIBUTES` (say
+`service.name=lazyview,deployment.environment.name=prod,service.instance.id=<the pod's>`) and, if you
+prefer not to spell the address in the file, `OTEL_EXPORTER_OTLP_ENDPOINT`. The k8s story is becoming
+a Helm chart (`04-helm-k8s`), so this is deliberately written as a mount and a variable rather than a
+kustomize-only arrangement: whatever renders the pod spec has to put those bytes at that path.
+
+* The keys the file understands, the `${…}` substitution rules, and the rule that no span carries a
+  row value: [configuration → OpenTelemetry](configuration.md#opentelemetry). Off (the default) costs
+  nothing: no provider and no exporter exist in the process at all.
+* **OTLP/gRPC only** (4317 by default). A file that asks for `otlp_http` or `otlp_http/json` is refused
+  with one `WARN` and telemetry stays off rather than exporting over a second HTTP stack; the same
+  goes for the file's TLS keys, so terminate TLS at the collector.
+* `service.instance.id` comes from the file — normally `attributes_list: ${OTEL_RESOURCE_ATTRIBUTES}`,
+  which is where the operator puts the pod's own identity. lazyview does not put its
+  `LAZYVIEW_INSTANCE_ID` on any span or resource: that variable names the saved position row, the
+  named lock and the fence counter. `lazyview.epoch.takeover` still marks the moment the fencing epoch
+  moved to a replica (see [rollouts and standby](#rollouts-drains-and-standby)).
 * No collector ships with these manifests: point the endpoint at the cluster's own (the OpenTelemetry
-  Operator, or a collector Deployment of yours). A `components/opentelemetry-collector` component comes
-  with the metrics and logs signals; until then the endpoint above is the whole wiring.
+  Operator, or a collector Deployment of yours). The collector component belongs to the Helm chart
+  (`04-helm-k8s`) and comes with the logs signal; until then the endpoint in the file is the whole
+  wiring.
 * A collector that is away costs a `WARN` at most once a minute: it never blocks a flush, a probe or a
-  rollout. `/metrics` and `components/prometheus` are unchanged and do not depend on the switch.
+  rollout. `/metrics` and `components/prometheus` are unchanged and do not depend on telemetry being
+  on.
 
 ## Metrics
 

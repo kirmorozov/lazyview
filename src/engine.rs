@@ -2911,15 +2911,16 @@ impl Engine {
         // is no real position, so the first save moves them.
         e.persisted = start.clone();
         e.persisted_at = row_at;
-        // Telemetry is opt-in (`LAZYVIEW_OTEL`, default off) and starts here, once the source's
+        // Telemetry is opt-in (`OTEL_CONFIG_FILE`, default off) and starts here, once the source's
         // identity is known: the resource carries it, and everything the copy-set module may not
-        // read for itself arrives as a parameter of `init` (see `src/otel.rs`'s header). Off — the
-        // default, and any value but `otlp` — this builds no provider and no exporter at all.
+        // read for itself arrives as a parameter of `init` (see `src/otel.rs`'s header). Off — no
+        // file named, or a path that is not one — this builds no provider and no exporter at all.
+        // The engine's `instance_id` is deliberately not offered: it names the position row, the
+        // named lock and the fence, and telemetry must not use it (lv-super ruling 2026-11-22).
         otel::init(&otel::Host {
-            switch: e.cfg.otel_switch,
+            config_file: e.cfg.otel_config_file.as_deref(),
             service_name: "lazyview",
             service_version: env!("CARGO_PKG_VERSION"),
-            instance_id: &e.cfg.instance_id,
             source: (!identity.is_empty()).then_some(identity.as_str()),
         });
         e.boundary = start.clone();
