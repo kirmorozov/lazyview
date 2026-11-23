@@ -2028,6 +2028,11 @@ fn reg_cascade_refusal_core_guard() {
 /// `EngineCrash` event through the schedule's own `run_event`, and the smoke's closing exactness
 /// check. Fails before the fix (the cascade views keep the vanished rows, the check disagrees);
 /// passes after it (the window costs at most one whole-view refresh per view, never a rebuild).
+///
+/// The window is the seeded [`crate::common::soakwork::SoakWorkload::cascade_in_window`] batch, run
+/// while the engine is dead (#319): the budget and the "the window ran through the gap path" claim
+/// below only mean something if a parent change really was replayed inside the window, and a
+/// wall-clock kill never guaranteed that.
 #[test]
 fn reg_cascade_window_seed_replay() {
     scenario("reg_casc_seedwin", |ctx| async move {
@@ -2080,6 +2085,12 @@ fn reg_cascade_window_seed_replay() {
         while began.elapsed() < events[0].0 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+        // The window this replay budgets is the seeded #167 batch, run while the engine is dead
+        // (#319). Its budget assertion (`whole_view_refreshes <= 1` per cascade view) and the
+        // "the window ran through the gap path" claim below only mean anything if a parent change
+        // was in fact replayed inside the window, and a wall-clock kill did not guarantee that.
+        let window =
+            crate::common::soakwork::SoakWorkload::cascade_in_window(SEED, events[0].0.as_secs());
         let mut run = crate::common::soakchaos::ChaosRun {
             ctx: &ctx,
             src: &db,
@@ -2092,11 +2103,7 @@ fn reg_cascade_window_seed_replay() {
             attribution: &mut attribution,
             seed: SEED,
             toxi_i: 0,
-            // Left as the schedule runs it for the soak: this replay asserts the budget
-            // (`whole_view_refreshes <= 1`, no rebuild) and the oracle, and both hold whether or not
-            // the window happened to hold a parent change. Making its window a batch too is the
-            // obvious follow-up (#319); it is not this test's claim.
-            crash_window: &[],
+            crash_window: &window,
         };
         let (row, mut eng) =
             crate::common::soakchaos::run_event(&mut run, eng, events[0].1, events[0].0).await?;
