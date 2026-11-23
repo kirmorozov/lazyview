@@ -2197,6 +2197,190 @@ fn chaos_tgt_blackhole_during_flush() {
     });
 }
 
+/// [`check_views_targets`] as a poll that keeps the reason it last disagreed. The plain
+/// `wait_until` shape used by `tgt_blackhole` reports "independence broken" and nothing else;
+/// #214 is a lost-rows bug, so the test names the view and the rows that are missing (or extra)
+/// on the target, which is the difference between a diagnosis and a rerun.
+async fn wait_target_exact(
+    src: &Db,
+    name: &str,
+    t: &Db,
+    specs: &[ViewSpec],
+    what: &str,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    let targets: HashMap<String, Db> = [(name.to_string(), t.clone())].into();
+    loop {
+        // The reason is the disagreement of the LAST check: at the deadline that is the state
+        // the target is in, which is what a reader of the failure needs.
+        match check_views_targets(src, &targets, specs).await {
+            Ok(()) => return Ok(()),
+            Err(e) if Instant::now() > deadline => {
+                return Err(anyhow::anyhow!(
+                    "timed out after {budget:?} waiting for {what}: {e:#}"
+                ));
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// #214 regression (ruling 2026-11-22): a target flagged `behind` across a refresh that carried
+/// **no units for the view** must still receive the rows it is owed. The black hole on `t1`
+/// makes the flush slow, and the 1-byte lag budget flags the healthy direct `t2` behind on the
+/// views the flush wrote: the changes that arrived while it hung are what `t2` now owes. Then
+/// refreshes that resolve zero units for the view (qty flips on rows the `qty > 0` filter never
+/// lets into `w_items_direct` / `w_item_entity_grp`) run while `t2` is behind — the shape that
+/// claimed the empty group and reported "caught up (group empty) claimed=0" without writing
+/// (`suite-p84-f1`). The owed rows inserted afterwards must still reach `t2` while `t1` is still
+/// black-holed, and `t2`'s catch-up must be the owed keys only: `assert_no_rebuilds` pins that
+/// no incremental view (none of these six is Full) ever took a whole-view refresh, so an
+/// empty-buffer flag may not be answered with a blanket re-derive — the owed set decides what
+/// the catch-up writes.
+#[test]
+fn chaos_tgt_behind_survives_no_units_refresh() {
+    let _one = toxi::exclusive();
+    scenario("chaos_tgt_bhno", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        let db = ctx.new_db("chaos_tgt_bhno").await?;
+        let _clean = toxi.for_schema(&db.name);
+        let t2 = ctx.new_db("chaos_tgt_bhno_t2").await?;
+        let t1 = ctx.new_db("chaos_tgt_bhno_t1").await?;
+        let ids = setup_soak(&db, ctx.sub_seed("chaos_tgt_bhno"), Sizes::tiny()).await?;
+        let specs = chaos_specs("source,t1,t2");
+        let p1 = toxi
+            .proxy(&db.name, "t1", &toxi::upstream(&db.flavor))
+            .await?;
+        toxi.wait_listening(&p1).await?;
+        let mut ov =
+            toxi::proxied_target_env(&[("t1", t1.dsn.as_str(), Some(&p1)), ("t2", &t2.dsn, None)])?;
+        for (k, v) in [
+            ("LAZYVIEW_HEARTBEAT_MS", "200"),
+            ("LAZYVIEW_TARGET_TIMEOUT_MS", "2000"),
+            ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "1"),
+        ] {
+            ov.push((k.to_string(), v.to_string()));
+        }
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &ov_refs(&ov)).await?;
+        let tmysql: HashMap<String, Db> = [
+            ("t1".to_string(), t1.clone()),
+            ("t2".to_string(), t2.clone()),
+        ]
+        .into();
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmysql,
+            &HashMap::new(),
+            &specs,
+            "initial build on both targets",
+        )
+        .await?;
+        let before = eng.snapshot();
+        toxi.arm(&p1, &Toxic::timeout(0).on(Dir::Upstream).named("bh"))
+            .await?;
+        // The stream keeps moving over the 1-byte budget while every flush pays `t1`'s dead
+        // connect: the same condition that flags `t2` behind in `tgt_blackhole`.
+        let (tx, writers) = spawn_target_writers(&ctx, &db, ids.clone(), "chaos_tgt_bhno_w", 60);
+        // Phase A: rows the flush commits to `t2` before the flag (they are written: `t2` is in
+        // the flush's targets); the changes arriving behind them while `t1` hangs are owed.
+        let (stmts, _) = items_txn(&ids, 300);
+        let mut c = db.conn().await?;
+        exec_all(&mut c, &stmts).await?;
+        // The flag must actually have been raised — the fault-landed check, same as #6/#8.
+        wait_until(
+            "the healthy direct target to be reported behind (the fault never landed)",
+            FAULT_BUDGET,
+            || {
+                let m = eng.metrics.clone();
+                async move { Ok(m.snapshot().lag_over_budget > before.lag_over_budget) }
+            },
+        )
+        .await?;
+        // Phase B: the ruling's shape — refreshes that carry NO units for the view (rows the
+        // `qty > 0` filter never admits, then flips among excluded qty values), run while `t2`
+        // sits behind. They must not answer the behind flag with an empty catch-up.
+        let from = ids.item.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        exec(
+            &mut c,
+            &format!(
+                "INSERT INTO items (id, entity_id, grp, qty, price, label) VALUES \
+                 ({}, 1, 1, -5, 1.0, 'unseen_a'), ({}, 2, 1, -5, 1.0, 'unseen_b')",
+                from,
+                from + 1
+            ),
+        )
+        .await?;
+        for k in 0..6u64 {
+            exec(
+                &mut c,
+                &format!(
+                    "UPDATE items SET qty = {} WHERE id IN ({}, {})",
+                    -5i64 - k as i64,
+                    from,
+                    from + 1
+                ),
+            )
+            .await?;
+        }
+        // Phase C: the owed rows — units for the same views, arriving while `t2` is behind.
+        let (stmts, _) = items_txn(&ids, 300);
+        exec_all(&mut c, &stmts).await?;
+        stop_writers(&ctx, tx, writers).await?;
+        // The independence half of the proof: with `t1` still black-holed, `t2` alone must have
+        // received everything — including the Phase C rows the empty-group claim used to skip.
+        wait_target_exact(
+            &db,
+            "t2",
+            &t2,
+            &specs,
+            "the direct target to stay exact across the no-units refreshes (owed rows lost)",
+            FAULT_BUDGET,
+        )
+        .await?;
+        toxi.remove_toxic(&p1, "bh").await?;
+        wait_until(
+            "t1 to catch up after the black hole (the fault never went away)",
+            FAULT_BUDGET,
+            || {
+                let m = eng.metrics.clone();
+                async move { Ok(m.snapshot().target_catchups > before.target_catchups) }
+            },
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        let pos = server_position(&mut c).await?;
+        eng.wait_applied(&pos, t_catchup()).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &tmysql,
+            &HashMap::new(),
+            &specs,
+            "final after the catch-up",
+        )
+        .await?;
+        let d = eng.snapshot().since(&before);
+        ensure!(
+            d.lag_over_budget >= 1 && d.target_catchups >= 1,
+            "chaos_tgt_bhno: neither the behind report nor a catch-up was observed: {}",
+            fmt_snapshot(&d)
+        );
+        // No blanket re-derive: none of these six views is Full-mode, so any whole-view refresh
+        // of any of them (an `all: true` answer to an empty buffer) fails here (F6 rule).
+        assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_tgt_bhno")?;
+        eng.check_alive()?;
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
 /// #7 against a PostgreSQL target (T8, plan §6): the black hole on `lv_<s>_pgt1`, upstream
 /// `pg16:5432`, while the direct MySQL `t2` proves the PG write pool's stall does not spread.
 /// Skips, not fails, with no server in `LAZYVIEW_TEST_PG_DSNS` (C1's shape).
