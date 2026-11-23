@@ -8164,6 +8164,22 @@ impl Engine {
             .filter(|t| !lagging.contains(t))
             .cloned()
             .collect();
+        // #214 (target isolation): with every target excluded there is nothing to write AND no
+        // target holding current rows to read the materialized table from —
+        // [`Self::read_materialized`] reads the write set (`source` first, they hold the same
+        // rows), so an empty set only bought a failing round: "reading the materialized table:
+        // no target answered", retried under [`crate::supervisor::Policy::STATEMENTS`], with the
+        // buffer above gone along with the error. The changes stay in the buffer instead:
+        // `lag_due` hands them to the targets that owe them, and the first round with an eligible
+        // target applies them. Cost: one emptiness test per refresh that takes its targets from
+        // the live version, off the binlog event path.
+        if targets.is_empty() {
+            l.dirty = dirty;
+            // Not logged per round: with every target behind this is the hot path (22 000 lines
+            // in one 140 s run of the black-hole test), and the state is already visible as the
+            // view's lag entries (`lag refresh claimed …` lines and the lag gauges).
+            return None;
+        }
         if let Mode::Full(_) = plan.mode {
             // Rebuild into a shadow; at most one rebuild runs and at most one is pending. Changes
             // during a running build mark it for one more rebuild; a pending re-plan (a retry
@@ -8190,6 +8206,37 @@ impl Engine {
                 if all.is_empty() {
                     l.dirty.all = true;
                     return None;
+                }
+                // #214 (target isolation): the targets this rebuild excludes are not written by
+                // it, and what a whole-view rebuild changes is not knowable per key — the rows
+                // are whatever the re-derive produces, so no key list is cheaper than the view.
+                // Their owed set is the view itself: `all: true`, the one case the ruling of
+                // 2026-11-22 leaves it (the same reasoning as `lag_after_build_fail`), and the
+                // catch-up is the existing streamed whole-view refresh (#167) — a refresh, not a
+                // rebuild. Without this record the buffer went to the version being built while
+                // the excluded target kept rows the engine's own diff believed current: after the
+                // black-holed `t1` failed one build, `w_union_kinds` on the HEALTHY targets of
+                // `chaos_tgt_blackhole_during_flush` (mysql80) stopped gaining rows for the rest
+                // of the run. Cost (guard R3): one entry per excluded target per rebuild.
+                for t in &lagging {
+                    l.behind.remove(t.as_str());
+                    l.lag.entry(t.clone()).or_insert_with(|| Lag {
+                        units: UnitSet::default(),
+                        partial: Vec::new(),
+                        all: false,
+                        since: live_since
+                            .clone()
+                            .unwrap_or_else(|| self.boundary.to_position()),
+                        failures: 0,
+                        retry_at: now,
+                        down: false,
+                        posted: UnitSet::default(),
+                        posted_partial: Vec::new(),
+                        posted_all: false,
+                    });
+                    if let Some(g) = l.lag.get_mut(t.as_str()) {
+                        g.all = true;
+                    }
                 }
                 self.start_next(i, plan, name, all, false).await;
             } else {
@@ -8251,29 +8298,57 @@ impl Engine {
                 posted_all: false,
             });
         }
-        // A target flagged behind (`mark_behind_targets`) that this refresh applied to none of:
-        // what it is owed is exactly what was fed since the flag, i.e. what this refresh
-        // carried. It becomes the lag entry the failed path above gives (#215): from here the
-        // accounting is the one a down target gets — kept keys over the budget reported, the
-        // saved position waiting, `retry_lag` catching it up and counting the catch-up.
+        // Owed-set accounting (#214, lv-super ruling 2026-11-22): every target this refresh
+        // excluded — flagged behind by `mark_behind_targets` or already lagging — is owed
+        // exactly what this refresh carried for the targets it did write, and the record of that
+        // debt is its lag entry: the pass below feeds every excluded target the units of this
+        // refresh, and an excluded target the refresh could have written something for always
+        // ends this call holding a lag entry. The old rule created the entry only on a surviving
+        // flag (a `behind` -> `lag` transition whose flag was still there): when `lag_due` took
+        // the flag between this refresh's `live_begin` (which still excluded the target) and
+        // this fold, no entry was made and the units this refresh applied to the other targets
+        // were lost for it — the target kept rows the engine's own diff then believed current,
+        // and `lag_end` reported "caught up (group empty)" without writing anything
+        // (`chaos_tgt_blackhole_during_flush` on percona84). A target excluded by `live_begin`
+        // owes what the refresh carried, whether or not the flag still stands. From here the
+        // accounting is the one a down target gets: kept keys over the budget reported, the
+        // saved position waiting at its `since` (`lag_floor`), `retry_lag` catching it up and
+        // counting the catch-up.
+        //
+        // An entry is opened only for a debt that exists: a refresh that carried nothing for the
+        // view (the usual case — the stream of a quiescing schema is mostly rows no view of this
+        // one reads) leaves the behind flag where it is, for `lag_due` to resolve with the
+        // buffer beside it. Turning every such refresh into a lag entry sent a HEALTHY target out
+        // of the flush path and into a claim-read-write-fold round trip per view per target per
+        // flush, which is how the direct target of `chaos_tgt_blackhole_during_flush` spent the
+        // 90 s its oracle allows on mysql80. Cost (guard R3): one entry feed per excluded target
+        // per refresh that carried units — never per binlog event.
+        let carried = !r.units.is_empty() || !r.partial.iter().all(UnitSet::is_empty) || r.all;
         for t in lagging {
-            if l.behind.remove(t.as_str()).is_some() && !l.lag.contains_key(t.as_str()) {
-                l.lag.insert(
-                    t.clone(),
-                    Lag {
-                        units: UnitSet::default(),
-                        partial: Vec::new(),
-                        all: false,
-                        since: floor.clone(),
-                        failures: 0,
-                        retry_at: Instant::now() + connect_retry_delay(1),
-                        down: false,
-                        posted: UnitSet::default(),
-                        posted_partial: Vec::new(),
-                        posted_all: false,
-                    },
-                );
+            if !carried || l.lag.contains_key(t.as_str()) {
+                continue; // nothing to owe, or the owed group the feed below extends is there
             }
+            l.behind.remove(t.as_str());
+            l.lag.insert(
+                t.clone(),
+                Lag {
+                    units: UnitSet::default(),
+                    partial: Vec::new(),
+                    all: false,
+                    since: floor.clone(),
+                    failures: 0,
+                    // No backoff: this target answered every write it was given, it was only
+                    // excluded from this round. The connect delay belongs to the failed path
+                    // above (a target that did not answer must not be hammered); a healthy
+                    // target made to wait it would let an unresponsive peer hold its rows
+                    // hostage (#214, the independence the black-hole tests measure).
+                    retry_at: Instant::now(),
+                    down: false,
+                    posted: UnitSet::default(),
+                    posted_partial: Vec::new(),
+                    posted_all: false,
+                },
+            );
         }
         for t in r.failed.iter().map(|(t, _)| t).chain(lagging) {
             if let Some(g) = l.lag.get_mut(t) {
@@ -8374,8 +8449,32 @@ impl Engine {
                         }
                     } else if full_due && !replan_pending {
                         debug!(view = %name, "affected rows unknown (cascading FK / overflow); rebuilding online");
-                        let all = l.targets.clone();
-                        self.start_next(i, plan, name, all, false).await;
+                        // #214 (target isolation): the targets this round excludes are not
+                        // written by the rebuild either — handed the whole list, every attempt
+                        // paid the black-holed target's connect timeout until the build failed
+                        // outright and was retried on the connect backoff, and the healthy
+                        // targets stayed two rows stale past the oracle's 90 s
+                        // (`wc_child_only` on mysql80). The rebuild flag survives instead: the
+                        // untraceable cascade is re-derived on the next round, when a target
+                        // that was behind is maintained again, and the keys this refresh did
+                        // carry stay owed in the entries the feed above made. An incremental
+                        // target is never answered with a whole-view refresh
+                        // (`lag_after_build_fail`), so there is nothing to record beyond that.
+                        let all: Vec<String> = l
+                            .targets
+                            .iter()
+                            .filter(|t| !lagging.contains(t))
+                            .cloned()
+                            .collect();
+                        if all.is_empty() {
+                            // Nothing to write to and no one to read the current rows from: the
+                            // flag stays, and the slot waits for the lagging targets' retry time
+                            // rather than rebuilding once per round of the loop.
+                            l.dirty.rebuild = true;
+                            self.slots[i].retry_at = Some(Instant::now() + connect_retry_delay(1));
+                        } else {
+                            self.start_next(i, plan, name, all, false).await;
+                        }
                     } else {
                         l.dirty.rebuild = true;
                     }
@@ -8424,10 +8523,28 @@ impl Engine {
         let now = Instant::now();
         // Behind flags whose retry time came without a refresh handing them their units (a
         // one-target view: the skipped refresh has no target left to read the materialized
-        // table from) become lag entries on their own (#215): the changes buffered now are
-        // what the target is owed, so the entry seeds itself from them and the pass below
-        // catches it up. A flagged target that owes nothing (buffer empty) just drops the
-        // flag — it never missed a change, so there is no catch-up to count either.
+        // table from) become lag entries on their own (#215): the changes buffered now are what
+        // the target is owed at this moment, so the entry seeds itself from them and the pass
+        // below catches it up.
+        //
+        // An empty buffer is NOT the verdict, and neither is it the reason to keep the flag
+        // (#214, lv-super ruling 2026-11-22): what decides is whether anything is owed, which is
+        // the buffer AND the entry together. While a target is flagged behind, `live_begin`
+        // excludes it from every refresh, and `note_refresh` records what such a refresh carried
+        // for the other targets as its lag entry; `mark_behind_targets` flags only targets the
+        // flush itself wrote, so the flag's own flush left them current. No entry and an empty
+        // buffer therefore means no refresh has excluded this target since the flag and nothing
+        // has arrived since it was written: it owes nothing, and it goes straight back to the
+        // flush path instead of paying a claim for an empty group. The old rule read the empty
+        // buffer alone while `note_refresh` made the entry only on a surviving flag, so the
+        // record of a debt could be discarded with the flag — `chaos_tgt_blackhole_during_flush`
+        // saw the healthy direct `t2` left stale on exactly this while the black-holed `t1` was
+        // unresponsive. `or_insert` keeps an entry that already holds owed keys and adds the
+        // buffer to the catch-up otherwise. A whole-view `all` is NOT seeded from a flag: the
+        // engine knows each refresh's units, so an unknowable owed set cannot arise here
+        // (ruling 2026-11-22; the one `all` site is `lag_after_build_fail`). Cost (guard R3):
+        // one clone of the slot's buffer per due flag that owes something, off the binlog event
+        // path (this runs in `lag_service`/`retry_lag`).
         if let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
             let flagged: Vec<String> = l
                 .behind
@@ -8435,9 +8552,16 @@ impl Engine {
                 .filter(|(_, at)| **at <= now)
                 .map(|(t, _)| t.clone())
                 .collect();
+            let name = l.name.clone();
             for t in flagged {
+                let owed = l.lag.contains_key(t.as_str())
+                    || !l.dirty.units.is_empty()
+                    || !l.dirty.partial.iter().all(UnitSet::is_empty)
+                    || l.dirty.all;
                 l.behind.remove(&t);
-                if l.dirty.units.is_empty() && l.dirty.partial.is_empty() && !l.dirty.all {
+                if !owed {
+                    debug!(view = %name, target = %t,
+                           "behind flag resolved with nothing owed: back to the flush path");
                     continue;
                 }
                 let seed = Lag {
@@ -8553,6 +8677,15 @@ impl Engine {
     /// keeps failing. False: not a maintained target of the live version (a new version, a
     /// frozen swap, an incremental view with its own lag bookkeeping, or a target the view
     /// never had) — `target_down` and a retried build as before.
+    ///
+    /// This is the one lag path that keeps `all: true` (ruling 2026-11-22): the owed set here
+    /// is genuinely not derivable per key — the target never received the built version, so it
+    /// misses every row of the view, including rows no binlog event will ever name again. No
+    /// key list is cheaper than the view itself. The catch-up is the existing whole-view
+    /// `dirty.all` refresh (#167): `refresh` reads the view once through `mv::read_source` and
+    /// applies it in place in chunks — streamed, bounded memory, a refresh and not a rebuild.
+    /// The owed-set paths (`note_refresh`, `lag_due`) must never seed `all` for an empty
+    /// group: there the engine knows each refresh's units and re-derives exactly those keys.
     fn lag_after_build_fail(&mut self, i: usize, t: &str, plan: &Arc<ViewPlan>) -> bool {
         if !matches!(plan.mode, Mode::Full(_)) {
             return false;
@@ -8623,14 +8756,48 @@ impl Engine {
                 debug!(view = %name, target = %t,
                        claimed = retry.claimed_units.ints.len() as usize + retry.claimed_units.keys.len(),
                        "lag retry caught up (group empty)");
-                info!(view = %name, target = %t, "target caught up");
-                Metrics::add(&self.metrics.target_catchups, 1);
-                let (id, hash) = (s.def_id, s.hash.clone());
-                self.set_state(&name, &t, id, &hash, Some(&plan), "ready", None)
-                    .await;
+                // "Caught up" is reported and counted only once the target's owed set has been
+                // written (ruling 2026-11-22). An empty claim wrote nothing: if nothing was
+                // owed at the claim and nothing re-fed arrived since (the check above keeps a
+                // re-fed group owed), the flag that led here was noise, not debt — no catch-up
+                // to count, announce, or persist. A target that had been reported down is the
+                // exception: its recovery line is an operator event whatever this claim held —
+                // but only once a write of its own proved the peer answers, which an empty
+                // claim does not (#214, below).
+                let owed_any = !retry.claimed_units.is_empty()
+                    || retry.claimed_partial.iter().any(|s| !s.is_empty())
+                    || retry.claimed_all;
+                let was_down = g.down;
+                // #214 (target isolation): a target with failed writes behind it is NOT readmitted
+                // by a claim that carried nothing. Nothing was written, so nothing proves the peer
+                // answers; clearing the entry here handed a black-holed target straight back to the
+                // flush path, which paid its connect timeout on the hot loop (`slow flush: refresh
+                // (dedup core) w_items_direct 10004ms`) and let the healthy target fall past its
+                // oracle budget while an unresponsive peer held the round. The entry's `retry_at`
+                // backoff paces the next attempt instead, and `note_refresh` keeps feeding it the
+                // units of every flush it missed, so the next claim is a real write that either
+                // lands (and is the catch-up) or fails (and reports it down).
+                if !owed_any && g.failures > 0 {
+                    debug!(view = %name, target = %t, failures = g.failures,
+                           "lag retry carried nothing to write and the target has not answered: still behind");
+                    g.retry_at = Instant::now() + connect_retry_delay(g.failures);
+                    if let Some(l) = self.slots[i].live.as_mut() {
+                        l.lag.insert(t, g);
+                    }
+                    return;
+                }
+                if owed_any {
+                    info!(view = %name, target = %t, "target caught up");
+                    Metrics::add(&self.metrics.target_catchups, 1);
+                    let (id, hash) = (s.def_id, s.hash.clone());
+                    self.set_state(&name, &t, id, &hash, Some(&plan), "ready", None)
+                        .await;
+                } else {
+                    debug!(view = %name, target = %t,
+                           "behind flag resolved with nothing owed: nothing was written");
+                }
                 // A target reported down was taken out of the version's targets; it is
                 // maintained again from now on, and its `Down` entry is gone with its keys.
-                let was_down = g.down;
                 // A Full-mode target that failed a build/swap is not in the live version's
                 // targets either (it lagged instead of going down, #214): a target the view's
                 // definition lists is maintained again once it has caught up.
@@ -9297,7 +9464,12 @@ impl Engine {
         }
         let (lagging, targets) = {
             let l = self.slots[i].live.as_ref().expect("live, checked above");
-            let lagging: Vec<String> = l.lag.keys().cloned().collect();
+            // #214 (target isolation): the same two maps `live_begin` excludes on — a target
+            // flagged `behind` by the byte budget has written rows it is still owed and must not
+            // be dialled again on the core's account. `lag` alone left such a target on the
+            // core's write list, so a peer that stopped answering cost the flush a connect
+            // timeout per round while its healthy siblings waited behind it.
+            let lagging: Vec<String> = l.lag.keys().chain(l.behind.keys()).cloned().collect();
             let targets: Vec<String> = l
                 .targets
                 .iter()
