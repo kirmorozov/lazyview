@@ -382,10 +382,15 @@ pub struct ChaosRun<'a> {
     /// runs while stopped. The dead engine cannot apply them, so the saved position stays behind
     /// every statement and the resume is *known* to replay a mapped-cascade parent change instead
     /// of whatever the paced writers happened to emit before the kill landed (#319). Non-empty also
-    /// anchors the kill on the engine rather than the clock: the engine is first waited out to a
-    /// caught-up point (`applied()` past what the source holds, the same observable
-    /// `wait_caught_up` uses). Empty — the soak's shape — is the plain kill-9 at the scheduled
-    /// instant, which is what made a pinned replay a lottery on host throughput.
+    /// anchors the kill on the engine rather than the clock: the paced writers are quiesced first
+    /// (`soakcheck::set_writers`, the same call `quiesce_and_check` makes around every event's
+    /// check), the engine is waited out to a caught-up point (`applied()` past what the source
+    /// holds, the same observable `wait_caught_up` uses), and the writers are turned back on once the
+    /// engine has restarted. The pause is what makes the anchor reachable at all: `run_paced` paces
+    /// against the wall clock, so a loaded engine is never at the head for three rounds and the wait
+    /// alone would fail a run at `LAZYVIEW_TEST_SOAK_TPS=400`. Empty — the soak's shape — is the
+    /// plain kill-9 at the scheduled instant, which is what made a pinned replay a lottery on host
+    /// throughput.
     pub crash_window: &'a [String],
 }
 
@@ -454,7 +459,27 @@ pub async fn run_event(
             // everything the source holds, the same test `wait_caught_up` makes — so the position
             // the cut falls on is the same one every run of the scenario, and what the resume
             // replays is the batch below rather than a sample of the writers' pace.
-            if !run.crash_window.is_empty() {
+            //
+            // The writers have to be stopped for that wait, and that is the load-bearing part.
+            // `run_paced` paces against `Instant::now()` (`soakwork.rs:1610-1621`: one row per
+            // `1e9 / tps` ns, and after a pause it bursts to catch the schedule back up), so a writer
+            // under load is *never* behind the source by less than a pacing period for long enough for
+            // three rounds to pass: on the amplifier this scenario reproduces on — `LAZYVIEW_TEST_SOAK_TPS=400`
+            // over 4 writers, a 2.5 ms period — the wait could not be satisfied at any throughput, and
+            // 8 of 10 `mysql97` runs died on `the engine never reached a caught-up point to crash at`,
+            // which is a fact about this harness and not about the engine. Quiescing first is also what
+            // makes the anchor mean the same thing twice: the crash then always lands on an engine that
+            // has applied everything the writers left, with the batch below as the only thing in the gap.
+            //
+            // Stopping and restarting them this way is the harness's own idiom, not a new one:
+            // `quiesce_and_check` does exactly this around every event's oracle sweep
+            // (`soakcheck.rs:701-703`, `set_writers(true)` / `(false)`), and `wait_flushed` further down
+            // this function depends on them running again, so they are turned back on as soon as the
+            // engine is up — the resumed engine therefore replays the gap while live traffic keeps
+            // arriving, which is the condition the scenario is about.
+            let anchored = !run.crash_window.is_empty();
+            if anchored {
+                crate::common::soakcheck::set_writers(run.writers, true);
                 let mut c = run.src.conn().await?;
                 eng.wait_caught_up_rounds(&mut c, t_catchup(), 3)
                     .await
@@ -462,6 +487,11 @@ pub async fn run_event(
                         format!("{what}: the engine never reached a caught-up point to crash at")
                     })?;
                 c.disconnect().await.ok();
+                ctx.log(format!(
+                    "{what}: writers paused, engine caught up — crashing here, {n_window} window \
+                     statements to replay after the restart",
+                    n_window = run.crash_window.len()
+                ));
             }
             let before = saved_position(run.src).await?;
             eng.crash().await?;
@@ -480,6 +510,9 @@ pub async fn run_event(
                         .with_context(|| format!("{what}: the window cascade: {stmt}"))?;
                 }
                 c.disconnect().await.ok();
+            }
+            if anchored {
+                crate::common::soakcheck::set_writers(run.writers, false);
             }
             eng = run.start_engine()?;
             wait_streaming(&mut eng).await?;
