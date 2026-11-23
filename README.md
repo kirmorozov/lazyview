@@ -185,6 +185,7 @@ https://github.com/kirmorozov/lazyview/issues?q=is:issue%20is:open%20label:%22kn
 * [Configuration](docs/configuration.md): every environment variable, TLS.
 * [Writing views](docs/views.md): definitions, incremental and full mode, joins, targets, metadata.
 * [Operations](docs/operations.md): Docker, health, metrics, logs, restarts, troubleshooting.
+* [Upgrading](docs/upgrading.md): what each release changes for an operator, and what to do about it.
 * [Kubernetes](docs/kubernetes.md): kustomize manifests, probes, rollouts.
 * [Internals](docs/internals.md): units, de-duplication, diff writes, resume.
 * [Comparison](docs/comparison.md): similar projects and when not to use lazyview.
