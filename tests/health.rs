@@ -1560,7 +1560,7 @@ fn alert_rules_stream_undecodable() {
         let db = ctx.new_db("alert_undecodable").await?;
         lag_seed(&db, 100).await?;
         let addr = free_local_addr()?;
-        let (eng, _) = start_with_views(
+        let (mut eng, _) = start_with_views(
             &ctx,
             &db,
             &[lag_view()],
@@ -1638,9 +1638,46 @@ fn alert_rules_stream_undecodable() {
         // gauge: while the reader backs off from the event its connection is down by design
         // (`lazyview_streaming` dips with each round), and it is back at 1 once the event is
         // through — with the rows of the refused events applied in full.
-        lag_wait_zero(&addr, &key, Duration::from_secs(180)).await?;
+        //
+        // The rows are waited for first, and by the progress rule rather than a fixed budget
+        // (the pattern of #248, as #340 applied it): the two gauges cannot be the gate here.
+        // Every round connects the reader, which starts *believed* at the head until the first
+        // heartbeat says otherwise (ruling 1), and the liveness beat runs through the backoff
+        // pauses — so `source_lag_seconds` reads 0 and `lazyview_streaming` reads 1 in the
+        // middle of the ladder, while the refused event still sits ahead of the applied
+        // position. Reading the rows at that instant fails a healthy engine that is still
+        // catching up: in #342 (percona84 run 45146922386, percona97 run 45187862444) the
+        // engine resumed from the same boundary after the test had already given up on the
+        // rows. So the wait goes on while the engine's own `applied()` advances, and it dies
+        // on the bound the engine is held to (`engine_bounds::stall`, not a guessed wall
+        // clock): a view that really stops applying after the refused round still fails, and
+        // its message names the bound that ran out.
+        let t = Instant::now();
+        let mut rule = CatchUp::new(
+            t,
+            Duration::from_secs(180),
+            engine_bounds::stall(engine_bounds::default_target_timeout()),
+        );
+        let mut c = db.conn().await?;
+        loop {
+            if lag_rows_match(&mut c, "vs_lag").await.is_ok() {
+                break;
+            }
+            eng.check_alive()?;
+            if let CatchUpVerdict::Failed(why) = rule.sample(Instant::now(), eng.applied().as_ref())
+            {
+                let last = lag_rows_match(&mut c, "vs_lag").await.unwrap_err();
+                bail!(
+                    "the rows of the refused events never landed after {stuck:.0} stuck rounds: \
+                     {why}; last comparison: {last:#}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         // The gauge dips with every backoff pause, so the stream coming back is waited for, not
-        // sampled at one instant: the last round must end in a connected reader.
+        // sampled at one instant: the last round must end in a connected reader. With the rows
+        // landed this is the honest reading, and the gauge below is read after it, not before
+        // the rows.
         let t = Instant::now();
         loop {
             let (_, body) = http_get(&addr, "/metrics").await?;
@@ -1653,8 +1690,7 @@ fn alert_rules_stream_undecodable() {
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        let mut c = db.conn().await?;
-        lag_rows_match(&mut c, "vs_lag").await?;
+        lag_wait_zero(&addr, &key, Duration::from_secs(180)).await?;
         c.disconnect().await.ok();
         eng.stop().await?;
         Ok(())
