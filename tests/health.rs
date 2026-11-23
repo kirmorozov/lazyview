@@ -1520,21 +1520,26 @@ fn alert_rules_target_behind_and_view_metric_absent() {
         exec(&mut block, "DROP TRIGGER lv_block").await?;
         block.disconnect().await.ok();
         let mut c = db.conn().await?;
+        // Rows and counter are waited for in one wait, not one after the other: the retry that
+        // applies the kept changes commits them and only then counts the catch-up, so a view read
+        // in the moment between the commit and the counter is exact and yet reports no catch-up.
+        // Sampling the rows first and the counter afterwards proved the same thing twice, on the
+        // wrong side of that line.
         let t = Instant::now();
         loop {
-            if lag_rows_match(&mut c, "vs_lag").await.is_ok() {
+            let rows = lag_rows_match(&mut c, "vs_lag").await.is_ok();
+            let counted = eng.snapshot().since(&before).target_catchups >= 1;
+            if rows && counted {
                 break;
             }
             ensure!(
                 t.elapsed() < Duration::from_secs(180),
-                "the target never caught up from the changes kept for it"
+                "the target never caught up from the changes kept for it (its rows match: \
+                 {rows}, catch-ups counted: {})",
+                eng.snapshot().since(&before).target_catchups
             );
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
-        ensure!(
-            eng.snapshot().since(&before).target_catchups >= 1,
-            "the catch-up was not counted: the rule's backstop would not see it either"
-        );
         c.disconnect().await.ok();
         eng.stop().await?;
         Ok(())
@@ -1568,28 +1573,51 @@ fn alert_rules_stream_undecodable() {
         .await?;
         let key = format!("{}.vs_lag", db.name);
         lag_wait_zero(&addr, &key, Duration::from_secs(90)).await?;
-        let pinned = eng.applied().context("no applied position at ready")?;
         let base = counter_of(&addr, "lazyview_stream_reconnect_undecodable_total").await?;
         lag_rows(&db, 1001, 10).await?; // the events the reader is about to refuse
                                         // The rule's own side: `increase(...[5m]) > 3` is this counter having moved by more than
                                         // three rounds, and the state that goes with it — alive, position pinned, series published.
+                                        //
+                                        // The position is pinned against the reader's own rounds, not against a value read
+                                        // before the fault. A round breaks at the refused event with the changes it had already
+                                        // read still in its queue, and the next round re-reads and applies them (that re-apply
+                                        // is what makes the repeat harmless), so the reported position settles onto the refused
+                                        // event over the first round. From the second round on the reader comes back to the
+                                        // same event every time, and the position must not move again: one that moves while the
+                                        // rounds are being counted is a refused event that was skipped.
         let t = Instant::now();
+        let mut rounds = base; // the counter value the position below was read at
+        let mut pinned = None;
+        let mut checks = 0;
         let stuck = loop {
             let (status, body) = http_get(&addr, "/metrics").await?;
             ensure!(status == 200, "/metrics answered {status}");
             let v = metric(&body, "lazyview_stream_reconnect_undecodable_total").unwrap_or(0.0);
-            if v > base + 3.0 {
-                break v;
-            }
             let (code, _) = http_get(&addr, "/livez").await?;
             ensure!(
                 code == 200,
                 "/livez while the reader is stuck on one event: {code}"
             );
-            ensure!(
-                eng.applied().as_ref() == Some(&pinned),
-                "the position moved while the reader was coming back to the same event"
-            );
+            if v > rounds {
+                // another round has been counted since the last look
+                rounds = v;
+                if v > base + 1.0 {
+                    if let Some(p) = &pinned {
+                        ensure!(
+                            eng.applied().as_ref() == Some(p),
+                            "the position moved off {p} while the reader was coming back to the \
+                             same event ({v:.0} rounds counted): {:?}",
+                            eng.applied()
+                        );
+                        checks += 1;
+                    } else {
+                        pinned = eng.applied();
+                    }
+                }
+            }
+            if v > base + 3.0 {
+                break v;
+            }
             ensure!(
                 t.elapsed() < Duration::from_secs(120),
                 "lazyview_stream_reconnect_undecodable_total stayed at {v:.0} (base {base}): the \
@@ -1597,6 +1625,11 @@ fn alert_rules_stream_undecodable() {
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         };
+        ensure!(
+            checks >= 1,
+            "no round-to-round comparison of the applied position was made across the \
+             {stuck:.0} stuck rounds: the counter moved in one look, so the pin proved nothing"
+        );
         ctx.log(format!(
             "alert_undecodable: {stuck:.0} stuck rounds ({base:.0} before) in {:?}",
             t.elapsed()
