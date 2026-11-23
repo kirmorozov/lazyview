@@ -506,6 +506,81 @@ pub(crate) fn is_lock_wait_timeout(e: &anyhow::Error) -> bool {
     })
 }
 
+/// How a write to a target died, for the per-class counters of Part B (`lazyview_target_write_err_*`
+/// in src/metrics.rs, added by [`crate::engine::Engine::note_target_write_err`]). The classes are the
+/// network edges the chaos suite's needles name (`target_write_error_logged` in tests/chaos.rs): a
+/// link cut mid-write, a stream closed under an open transaction, a backend the server terminated, a
+/// server-side error, a peer that never answered the connect at all.
+///
+/// Classified from the rendered chain rather than the drivers' types on purpose: `mysql_async` and
+/// `tokio_postgres` report the same edge in different types (a cut PG stream arrives as a closed
+/// connection or a `db error`, `mysql_async`'s as an io error), and the class is an operator's label
+/// — no retry policy branches on it, so a misclassification costs a wrong label, never a wrong action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteErr {
+    /// The socket was reset mid-write (`ECONNRESET`).
+    Reset,
+    /// The stream ended while a statement was open (`EOF`, broken pipe).
+    Closed,
+    /// The server ended the session: `pg_terminate_backend`, an idle-session kill.
+    Terminated,
+    /// The server answered with an error of its own (`db error`, a constraint, a full disk).
+    Server,
+    /// The target never answered the connect (refused, unroutable, unreachable host).
+    Connect,
+    /// Anything else — a statement that timed out on a live link, an unexpected driver error.
+    Other,
+}
+
+impl WriteErr {
+    /// The label of the class: the suffix of its counter's name, and the text of the log line.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            WriteErr::Reset => "reset",
+            WriteErr::Closed => "closed",
+            WriteErr::Terminated => "terminated",
+            WriteErr::Server => "server",
+            WriteErr::Connect => "connect",
+            WriteErr::Other => "other",
+        }
+    }
+
+    pub(crate) fn classify(e: &anyhow::Error) -> WriteErr {
+        let m = format!("{e:#}").to_lowercase();
+        // Order matters: every one of these strings contains "connect", so the classes that name
+        // what happened to an established link are asked before the one that names never reaching
+        // the target at all.
+        if m.contains("reset by peer")
+            || m.contains("connection reset")
+            || m.contains("os error 104")
+        {
+            WriteErr::Reset
+        } else if m.contains("terminating connection")
+            || m.contains("server closed the connection unexpectedly")
+        {
+            WriteErr::Terminated
+        } else if m.contains("connection closed")
+            || m.contains("broken pipe")
+            || m.contains("io error")
+            || m.contains("unexpected end of file")
+        {
+            WriteErr::Closed
+        } else if m.contains("could not connect")
+            || m.contains("connecting to")
+            || m.contains("connection refused")
+            || m.contains("no route to host")
+            || m.contains("network is unreachable")
+            || m.contains("name or service not known")
+        {
+            WriteErr::Connect
+        } else if m.contains("db error") || m.contains("server returned") {
+            WriteErr::Server
+        } else {
+            WriteErr::Other
+        }
+    }
+}
+
 /// The statements that give a new pooled connection the family's session settings. Dispatched
 /// once per pooled connection (never per statement).
 pub(crate) fn session_setup(kind: Kind, sql_mode: &str, lock_wait_s: u64) -> Vec<String> {

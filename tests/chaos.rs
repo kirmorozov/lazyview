@@ -1745,6 +1745,48 @@ fn target_write_error_logged(log_path: &std::path::Path, target: &str) -> bool {
     })
 }
 
+/// How many of the engine's log lines name `target` and carry the phrase `what` — the count the
+/// Part B assertions need: the crossing of the down state and its recovery are ONE line each, by
+/// ruling, not one per failed write.
+fn log_lines_about(log_path: &std::path::Path, target: &str, what: &str) -> usize {
+    let Ok(text) = std::fs::read_to_string(log_path) else {
+        return 0;
+    };
+    text.lines()
+        .filter(|l| l.contains(target) && l.contains(what))
+        .count()
+}
+
+/// The value of one `/metrics` series: `name{key="value"}` for a labelled gauge, `name` for a
+/// plain counter; `None` when the endpoint does not carry it at all (which is how "this target was
+/// never reported down" reads while the process is up).
+fn metric_value(body: &str, name: &str, label: Option<(&str, &str)>) -> Option<f64> {
+    let want = match label {
+        Some((k, v)) => format!("{name}{{{k}=\"{v}\"}} "),
+        None => format!("{name} "),
+    };
+    body.lines()
+        .find_map(|l| l.strip_prefix(&want))
+        .and_then(|rest| rest.trim().parse::<f64>().ok())
+}
+
+/// The sum of the per-class counters of failed writes to a target (Part B):
+/// `lazyview_target_write_err_{class}_total` over every class of `target::WriteErr`.
+fn target_write_err_counted(body: &str) -> u64 {
+    [
+        "reset",
+        "closed",
+        "terminated",
+        "server",
+        "connect",
+        "other",
+    ]
+    .iter()
+    .filter_map(|c| metric_value(body, &format!("lazyview_target_write_err_{c}_total"), None))
+    .map(|v| v as u64)
+    .sum()
+}
+
 /// `t1` → its schema, the shape `verify_targets` takes for one target.
 fn tmap(t1: &Db) -> HashMap<String, Db> {
     [("t1".to_string(), t1.clone())].into()
@@ -1867,6 +1909,16 @@ async fn tgt_reset(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -> Re
         ("LAZYVIEW_SUPERVISOR", "fixed"),
     ] {
         ov.push((k.to_string(), v.to_string()));
+    }
+    // Part B reads the operator's own endpoint, so the PostgreSQL leg gets a health port. The MySQL
+    // leg keeps no health endpoint here, exactly as before: it has no down-observable until the
+    // question `05-target-down-observ` is answered, and its run must stay byte-identical.
+    let health = match &pgdb {
+        Some(_) => Some(free_local_addr()?),
+        None => None,
+    };
+    if let Some(a) = &health {
+        ov.push(("LAZYVIEW_HEALTH_ADDR".to_string(), a.clone()));
     }
     let (mut eng, _) = start_with_views(ctx, &db, &specs, &ov_refs(&ov)).await?;
     let tmysql = match &t1 {
@@ -2014,6 +2066,52 @@ async fn tgt_reset(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -> Re
          no refresh error, no supervisor retry, nothing in the log: {}",
         fmt_snapshot(&d)
     );
+    // Part B (lv-super ruling 2026-11-22): the down observability of a PostgreSQL target, read the
+    // way an operator reads it — `/metrics`, not the engine's private snapshot. A reset on the link
+    // need NOT take the target down (the edge may retry the write into success — the note above the
+    // catch-up wait), so what is asserted is the AGREEMENT between what the engine saw and what it
+    // exposes: a logged write failure has a counted class, and the down state is ONE warn at the
+    // crossing plus its one recovery line, with the gauge agreeing at both ends.
+    if let (Some(pgdb), Some(addr)) = (&pgdb, &health) {
+        let (_, body) = http_get(addr, "/metrics").await?;
+        let logged = target_write_error_logged(&eng.log_path, tname);
+        let counted = target_write_err_counted(&body);
+        let downs = log_lines_about(&eng.log_path, tname, "target is down");
+        let ups = log_lines_about(&eng.log_path, tname, "target answers again");
+        let gauge = metric_value(&body, "lazyview_target_down", Some(("target", tname)));
+        ensure!(
+            downs <= 1,
+            "{tag}: the down crossing was logged {downs} times: the ruling allows ONE warn per \
+             crossing, not one per failed write"
+        );
+        if logged {
+            ensure!(
+                counted >= 1,
+                "{tag}: the engine logged a write that died on the way to {tname} and counted no \
+                 error class for it (every lazyview_target_write_err_*_total is 0): the class of a \
+                 lost write is the observable Part B promises"
+            );
+        }
+        if downs == 1 {
+            // The two lines come as a pair, and `verify_targets` above proved the target exact: a
+            // target that answers again must not stay 1 on the series a dashboard alerts on.
+            ensure!(
+                ups == 1,
+                "{tag}: {tname} was reported down and caught up, but its recovery line is missing \
+                 ({ups} 'target answers again' lines): the pair is what makes the gauge readable"
+            );
+            ensure!(
+                gauge == Some(0.0),
+                "{tag}: {tname} caught up (checked above) but lazyview_target_down for it reads \
+                 {gauge:?}: a target that answers must not stay 1"
+            );
+        }
+        ctx.log(format!(
+            "{tag}: down observability for {tname} (schema {}): logged={logged} counted={counted} \
+             crossing lines={downs} recovery lines={ups} gauge={gauge:?}",
+            pgdb.schema
+        ));
+    }
     assert_no_rebuilds(&eng, &db, &specs, &before, tag)?;
     eng.check_alive()?;
     eng.stop().await?;

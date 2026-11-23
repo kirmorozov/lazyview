@@ -14,6 +14,10 @@ macro_rules! counters {
             pub gauges: Gauges,
             /// Per-pool supervisor gauges (one entry per connection pool).
             pub pools: Mutex<Vec<Arc<PoolGauges>>>,
+            /// Per-target down state, by target name (Part B, pg target down-observability):
+            /// the `lazyview_target_down` gauge. Entries are kept after a target answers again
+            /// (then 0), so the endpoint distinguishes "never down" from "was down".
+            pub targets: Mutex<std::collections::BTreeMap<String, TargetGauge>>,
             /// Per-view update statistics (`/stats`, see src/stats.rs), shared with the
             /// aggregator task the engine starts.
             pub view_stats: Arc<crate::stats::Registry>,
@@ -114,6 +118,20 @@ counters!(
     stream_reconnect_transient,
     stream_reconnect_closed,
     stream_reconnect_silence,
+    // Writes to a PostgreSQL-family target that failed, by class (see `target::WriteErr` and
+    // `Engine::note_target_write_err`): the network edge of a target that goes down is what an
+    // operator has to tell apart (a reset link, a backend the server cut, a server-side error),
+    // and a single counter would say only "writes failed". Counted per failed write ATTEMPT —
+    // never per binlog event and never per row. The MySQL family is deliberately not counted
+    // here: whether it gets the same down-observability is the open question
+    // 05-target-down-observ, and until it is answered the MySQL targets expose exactly the
+    // metrics they always did.
+    target_write_err_reset,
+    target_write_err_closed,
+    target_write_err_terminated,
+    target_write_err_server,
+    target_write_err_connect,
+    target_write_err_other,
     // Times the lock task entered `Uncertain` (lv-super ruling 1, 2026-11-16): two periods without
     // an answered beat, so the write gates closed and the ops in flight were fenced until the lock
     // was confirmed again. One count per episode — not per beat and never per binlog event. A rate
@@ -210,6 +228,21 @@ impl PoolGauges {
     }
 }
 
+/// The `lazyview_target_down` gauge of one target (Part B, pg target down-observability): 1 from
+/// the moment the engine's writes to it have failed LAG_MAX_FAILURES times in a row until the
+/// catch-up that proves it answers again. Kept per target, never per view: an operator's question
+/// is "is this database reachable", and one dead target would otherwise multiply over the views.
+#[derive(Debug, Clone, Default)]
+pub struct TargetGauge {
+    pub down: bool,
+    /// Unix seconds of the last crossing to down (`0` while it was never down).
+    pub since_unix: u64,
+    /// Times this target was reported down since the process started.
+    pub crossings: u64,
+    /// The last error class seen on a write to it, for the line an operator reads first.
+    pub last_err: &'static str,
+}
+
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -237,10 +270,49 @@ impl Metrics {
         Metrics::set(&self.gauges.leader_last_beat_ok, unix_now());
     }
 
+    /// Records the down state of one target for `lazyview_target_down` (Part B, pg target
+    /// down-observability) and returns whether the state CHANGED: the caller logs the crossing and
+    /// the recovery once each, not once per failed write. `err` is the class of the write that
+    /// took it down (`/metrics` has the counters; this is the line an operator reads first).
+    pub(crate) fn set_target_down(&self, target: &str, down: bool, err: &'static str) -> bool {
+        let mut m = lock(&self.targets);
+        let g = m.entry(target.to_string()).or_default();
+        if g.down == down {
+            return false;
+        }
+        g.down = down;
+        if down {
+            g.since_unix = unix_now();
+            g.crossings += 1;
+            g.last_err = err;
+        }
+        true
+    }
+
+    /// Every target the engine has reported down at least once, with its current state: the rows
+    /// of `lazyview_target_down` on `/metrics`.
+    pub(crate) fn target_states(&self) -> Vec<(String, TargetGauge)> {
+        lock(&self.targets).clone().into_iter().collect()
+    }
+
+    /// Counts one failed write to a PostgreSQL-family target by error class (Part B). One count
+    /// per ATTEMPT — never per row and never per binlog event. The class is what an operator tells
+    /// apart on `/metrics`; no retry policy branches on it.
+    pub(crate) fn target_write_err(&self, class: crate::target::WriteErr) {
+        let c = match class {
+            crate::target::WriteErr::Reset => &self.target_write_err_reset,
+            crate::target::WriteErr::Closed => &self.target_write_err_closed,
+            crate::target::WriteErr::Terminated => &self.target_write_err_terminated,
+            crate::target::WriteErr::Server => &self.target_write_err_server,
+            crate::target::WriteErr::Connect => &self.target_write_err_connect,
+            crate::target::WriteErr::Other => &self.target_write_err_other,
+        };
+        Metrics::add(c, 1);
+    }
+
     pub fn set(g: &AtomicU64, v: u64) {
         g.store(v, Ordering::Relaxed);
     }
-
     pub fn get(g: &AtomicU64) -> u64 {
         g.load(Ordering::Relaxed)
     }
