@@ -503,3 +503,97 @@ pub async fn compare_with_oracle(c: &mut Conn, schema: &str, spec: &ViewSpec) ->
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// The aggregate row, unit-proved (#338): a row the harness cannot read fails, it never measures 0
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{oracle_name, shape_row};
+
+    /// The one answer `(0, 0)` is legitimate for: an empty table, where `COUNT(*)` really is 0 and
+    /// the checksum of no rows really is 0. This case has to stay a measurement — the fix #338 asks
+    /// for is about rows the harness cannot read, not about zeros it does read.
+    #[test]
+    fn a_real_empty_table_measures_zero() {
+        assert_eq!(
+            shape_row("b_simple", &[vec![Some("0".into()), Some("0".into())]]).unwrap(),
+            (0, 0),
+        );
+        assert_eq!(
+            shape_row("b_simple", &[vec![Some("6000".into()), Some("3735928559".into())]]).unwrap(),
+            (6_000, 3_735_928_559),
+        );
+    }
+
+    /// #338: no row at all used to come back as `(0, 0)` — the pair of an exact empty view — so the
+    /// window this row belongs to was recorded as a view that equals its oracle. It must be an error
+    /// naming the view and the value that is missing.
+    #[test]
+    fn no_row_at_all_fails_the_comparison() {
+        let e = shape_row("b_simple", &[]).unwrap_err().to_string();
+        assert!(e.contains("b_simple"), "the view is not named: {e}");
+        assert!(e.contains("COUNT(*)"), "the missing value is not named: {e}");
+    }
+
+    /// The driver hands `NULL` to the harness as `None`, so a `NULL` count is the same unreadable
+    /// row in a different shape; it used to be read as "zero rows".
+    #[test]
+    fn a_null_count_fails_the_comparison() {
+        let e = shape_row("b_agg", &[vec![None, Some("42".into())]])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("b_agg") && e.contains("COUNT(*)"), "{e}");
+        assert!(!e.contains("checksum"), "the wrong value is named: {e}");
+    }
+
+    /// …and so is a `NULL` checksum, which used to be read as the checksum of an empty view.
+    #[test]
+    fn a_null_checksum_fails_the_comparison() {
+        let e = shape_row("b_agg", &[vec![Some("12".into()), None]])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("b_agg") && e.contains("checksum"), "{e}");
+        assert!(!e.contains("COUNT(*)"), "the wrong value is named: {e}");
+    }
+
+    /// A row of the right shape whose values are not numbers — a driver that hands back text it
+    /// should not have, a proxy answering for the server — is not a measurement either, and the row
+    /// it was read out of has to appear in the message.
+    #[test]
+    fn unreadable_values_fail_the_comparison() {
+        for (count, checksum) in [("twelve", "42"), ("", "42"), ("12", "0x2a"), ("12", "-1")] {
+            let row = vec![Some(count.to_string()), Some(checksum.to_string())];
+            let e = shape_row("b_join", &[row]).unwrap_err().to_string();
+            assert!(
+                e.contains("b_join"),
+                "{count:?} + {checksum:?}: the view is not named: {e}"
+            );
+        }
+    }
+
+    /// A row that stopped after the count must fail on its own: reading only the count would let
+    /// `(12, 0)` meet the oracle's `(12, 0)` and call a view exact on a checksum nobody read.
+    #[test]
+    fn a_row_short_of_a_checksum_fails_the_comparison() {
+        let e = shape_row("b_cascade", &[vec![Some("12".into())]])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("b_cascade") && e.contains("checksum"), "{e}");
+    }
+
+    /// The pass the issue names as the danger: `compare_with_oracle` reads both sides through
+    /// `shape_of`, so both aggregate rows unreadable meant `(0, 0)` on the view and `(0, 0)` on the
+    /// oracle, `want == got`, and a green window that measured nothing. Each side fails by itself
+    /// now, so the comparison is never reached.
+    #[test]
+    fn two_unreadable_sides_do_not_agree() {
+        let view = shape_row("b_cascade", &[]);
+        let oracle = shape_row(&oracle_name("b_cascade"), &[]);
+        assert!(
+            view.is_err() && oracle.is_err(),
+            "both sides measured something: view {view:?}, oracle {oracle:?}"
+        );
+    }
+}
