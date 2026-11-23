@@ -119,6 +119,12 @@ impl Cursor {
         self.at.clone()
     }
 
+    /// The flavor whose rules spell this cursor's text — what `binlog_cursor` is stored and read
+    /// under, and what the size bound of [`crate::meta::gtid_fits`] measures the text with.
+    pub fn flavor(&self) -> Flavor {
+        self.flavor
+    }
+
     /// The GTID state this cursor carries, as the flavor's canonical set text (MySQL/Percona:
     /// `uuid:interval,…`; MariaDB: a `domain-server-seq` list) — the transactions the reader has
     /// consumed, which is what a resume on another server is checked against. `None` on a cursor

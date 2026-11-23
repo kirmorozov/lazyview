@@ -1188,6 +1188,9 @@ struct Engine {
     /// the text in a flush (the position save, the fence), never on the event path.
     executed_text: Option<String>,
     executed_dirty: bool,
+    /// Whether the run has yet named a GTID set it had to shed from the saved position — the
+    /// shed is said once, not once per flush (see [`Self::persist_position`], issue #347).
+    gtid_shed_noted: bool,
     /// High-water mark of the seeding read (see the seeding block of `run`): the stream must
     /// consume through this position before the set may be persisted or anchor a dump. A set
     /// seeded from the server's executed state also claims transactions committed after the
@@ -2435,6 +2438,7 @@ impl Engine {
             executed: source::mysql::GtidSet::new(),
             executed_text: None,
             executed_dirty: false,
+            gtid_shed_noted: false,
             gtid_seed_hiw: None,
             gtid_seed_unproven: false,
             read_node: None,
@@ -9489,16 +9493,33 @@ impl Engine {
             None
         };
         self.persist_needed = true;
-        meta::save_position(
+        let wanted = Cursor::from_position(self.flavor, &pos).with_gtid(gtid);
+        let saved = meta::save_position(
             &mut self.meta,
             &self.cfg.instance_id,
-            &Cursor::from_position(self.flavor, &pos).with_gtid(gtid.clone()),
+            &wanted,
             self.leader.epoch,
         )
         .await?;
+        // The row holds what `save_position` returns: `wanted` without a `[g=…]` set too long for
+        // `binlog_cursor` (`meta::MAX_CURSOR_BYTES`, issue #347 — a set the column truncates comes
+        // back unparsable and the next start refuses to run). Said once per run: the set only
+        // grows, so every later save sheds it the same way, and the file/pos and identity rules
+        // answer for the resume exactly as they do for an unproven seed.
+        if wanted.gtid().is_some() && saved.gtid().is_none() && !self.gtid_shed_noted {
+            self.gtid_shed_noted = true;
+            info!(
+                set_bytes = wanted.gtid().unwrap_or_default().len(),
+                limit = meta::MAX_CURSOR_BYTES,
+                "the consumed GTID set no longer fits `binlog_cursor`; the saved position carries \
+                 its file/pos alone"
+            );
+        }
         // Held back: save again once the pending changes are applied.
         self.persist_needed = pos < self.boundary.to_position();
-        self.persisted = Cursor::from_position(self.flavor, &pos).with_gtid(gtid);
+        // What the row holds, not what was asked for: `persisted`'s set is the one later saves
+        // carry forward, and a shed set was never stored.
+        self.persisted = saved;
         self.last_persist = Instant::now();
         Ok(())
     }

@@ -17,6 +17,20 @@ pub const STATUS: &str = "_lazyview_status";
 /// Name usable in `_lazyview.targets` for the source instance itself.
 pub const SOURCE_TARGET: &str = "source";
 
+/// The longest cursor text `binlog_cursor` can hold whole. The column is a `TEXT`
+/// ([`CREATE_STATUS`], and the `MIGRATIONS` entry that widened it): the MySQL family stores at
+/// most 65,535 **bytes** there and hands back the first ones of a longer value, so a cursor
+/// whose `[g=…]` set does not fit comes back from [`load_position`] cut in half — and an
+/// unterminated set is no cursor at all, so the start refuses to run (issue #347: a 30-minute
+/// smoke's `gtid_executed` reached that size — the row's own text carries 1,332 intervals before
+/// it stops mid-UUID — and its first `stop` event found the restarted engine dying on
+/// `the saved position "…[g=…" is no cursor this source speaks`). The bound keeps the whole set
+/// *and* the `file:pos` around it inside the column, with room to spare. The set is not merely
+/// long: it grows with every gap the server leaves in its GTID stream, so no column width bounds
+/// it, and this row is rewritten once per flush — a save that sheds an over-long set is the
+/// cheaper answer too.
+pub const MAX_CURSOR_BYTES: usize = 60 * 1024;
+
 const CREATE_DEFS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   `name` VARCHAR(64) NULL DEFAULT NULL,
@@ -612,14 +626,40 @@ pub async fn save_identity(conn: &mut Conn, instance: &str, identity: &str) -> R
     Ok(())
 }
 
+/// Whether a `[g=…]` set of `gtid` bytes still fits `binlog_cursor` beside a cursor whose
+/// `file:pos` text is `at_len` bytes ([`MAX_CURSOR_BYTES`]). The cursor text is ASCII
+/// (`file:pos[g=uuid:interval,…]`, see [`Cursor`]'s `Display`), so bytes and chars are the same.
+pub fn gtid_fits(at_len: usize, gtid: &str) -> bool {
+    at_len + "[g=]".len() + gtid.len() <= MAX_CURSOR_BYTES
+}
+
 /// Saves the position if `epoch` is still current; fails when another instance took over.
-pub async fn save_position(conn: &mut Conn, instance: &str, c: &Cursor, epoch: u64) -> Result<()> {
+///
+/// Returns the cursor the row now holds, which is what the caller must believe: an over-long
+/// `[g=…]` set is **shed** rather than stored, because the column would keep only its first
+/// 65,535 bytes and the next start would read back an unterminated set it cannot parse and refuse
+/// to run ([`MAX_CURSOR_BYTES`], issue #347). A save without the set is a state the engine already
+/// knows — the file/pos and identity rules answer for it, as they do for a seed whose claim could
+/// not be proven or an XA COMMIT that failed to attribute — so the position keeps advancing and
+/// the resume stays correct on the server that wrote it.
+pub async fn save_position(
+    conn: &mut Conn,
+    instance: &str,
+    c: &Cursor,
+    epoch: u64,
+) -> Result<Cursor> {
     // `binlog_cursor` is the value a start reads; the two pre-cursor columns stay filled through
     // the bump, so an older build (and the harness) still finds the position there.
     let at = c.to_position();
+    let bare = Cursor::from_parts(c.flavor(), at.file.clone(), at.pos);
+    let gtid = c
+        .gtid()
+        .filter(|g| gtid_fits(bare.to_string().len(), g))
+        .map(str::to_string);
+    let stored = bare.with_gtid(gtid);
     conn.exec_drop(
         "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ?, `binlog_cursor` = ? WHERE `instance_id` = ? AND `epoch` = ?",
-        (&at.file, at.pos, c.to_string(), instance, epoch),
+        (&at.file, at.pos, stored.to_string(), instance, epoch),
     )
     .await?;
     if conn.affected_rows() == 0 {
@@ -635,7 +675,7 @@ pub async fn save_position(conn: &mut Conn, instance: &str, c: &Cursor, epoch: u
             );
         }
     }
-    Ok(())
+    Ok(stored)
 }
 
 #[cfg(test)]
@@ -683,6 +723,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `binlog_cursor` is the TEXT whose 65,535-byte limit [`MAX_CURSOR_BYTES`] stays under
+    /// (#347): the bound is only a bound while the column is the one `ensure` creates and
+    /// migrates to.
+    #[test]
+    fn cursor_column_is_the_text_the_bound_measures() {
+        assert!(
+            CREATE_STATUS.contains("`binlog_cursor` TEXT NULL"),
+            "CREATE_STATUS no longer creates a TEXT cursor: MAX_CURSOR_BYTES must follow it"
+        );
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|(t, c, d)| *t == STATUS && *c == "binlog_cursor" && d.starts_with("TEXT")),
+            "the migration that widened the cursor column is gone"
+        );
+        // The TEXT limit itself: at or over it a set would reach the server and be truncated.
+        // Checked at compile time, so the bound cannot drift from the column unnoticed.
+        const _: () = assert!(
+            MAX_CURSOR_BYTES < 65_535,
+            "the bound must stay under the 65,535 bytes a TEXT column holds"
+        );
+    }
+
+    /// The decision [`save_position`] makes about the `[g=…]` set, without a server: a set that
+    /// does not fit whole is not saved at all, and the shed cursor is byte-for-byte the pre-GTID
+    /// text a start can parse. #347's cursor — `file:pos` plus a set the row cut at 65,535 bytes
+    /// mid-interval — is the shape both halves check.
+    #[test]
+    fn gtid_fits_is_the_text_the_column_holds() {
+        let at = Cursor::from_parts(Flavor::MySql, "binlog.000004".into(), 228_705_009);
+        let at_len = at.to_string().len();
+        let set = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf:1-346,".repeat(4);
+        assert!(
+            gtid_fits(at_len, &set),
+            "an ordinary set must still ride the save"
+        );
+        let too_big = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf:1-346,".repeat(2_000);
+        assert!(too_big.len() > MAX_CURSOR_BYTES);
+        assert!(
+            !gtid_fits(at_len, &too_big),
+            "a set the column cannot hold whole must not be sent to it"
+        );
+        // The shed shape parses; the truncated one is what killed the smoke's restart, and the
+        // parser must keep refusing to guess a set closed.
+        let parsed = Flavor::MySql
+            .parse_cursor(&at.to_string())
+            .expect("the pre-GTID text parses");
+        assert_eq!(parsed.to_position(), at.to_position());
+        assert_eq!(parsed.gtid(), None);
+        assert!(
+            Flavor::MySql
+                .parse_cursor(&format!("{}[g={}", at, too_big))
+                .is_none(),
+            "an unterminated [g=…] set must stay an error"
+        );
     }
 
     /// The fence DDL in `create_fence` mirrors `src/fence.rs`'s private `create_sql` (the file

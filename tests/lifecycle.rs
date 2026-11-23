@@ -1817,3 +1817,143 @@ async fn account_stmt(c: &mut mysql_async::Conn, sql: &str) -> Result<()> {
         }
     }
 }
+
+/// The position the engine saves always fits the column that holds it (#347). `binlog_cursor` is
+/// a TEXT, and the MySQL family hands back the first 65,535 bytes of a longer value: a `[g=…]` set
+/// past that comes back from `meta::load_position` cut in half, an unterminated set is no cursor,
+/// and the start refuses to run — `the saved position "…" is no cursor this source speaks`. The
+/// nightly smoke of #347 met exactly that at its first `stop` event, 15 minutes into a run whose
+/// server had grown a 1,332-interval `gtid_executed`. `meta::save_position` sheds a set that will
+/// not fit whole (the position keeps its `file:pos`, which is all a resume on the server that
+/// wrote it needs), so the row stays parseable and the restart happens.
+#[test]
+fn lifecycle_saved_cursor_never_overflows_the_column() {
+    scenario("lc_cursor_overflow", |ctx| async move {
+        use lazyview::source::{Cursor, Flavor};
+        use mysql_async::prelude::Queryable;
+        let db = ctx.new_db("lc_cursor_overflow").await?;
+        let mut c = db.conn().await?;
+        for s in [
+            "CREATE TABLE entities (id INT PRIMARY KEY, grp INT NOT NULL, status VARCHAR(10) NOT NULL)",
+            "INSERT INTO entities VALUES (10, 1, 'new'), (11, 1, 'paid')",
+        ] {
+            exec(&mut c, s).await?;
+        }
+        let specs = vec![ViewSpec::new(
+            "lc_counts",
+            Kind::Incremental,
+            "SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp",
+        )];
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        exec(&mut c, "INSERT INTO entities VALUES (12, 2, 'new')").await?;
+        eng.wait_caught_up(&mut c, t_catchup()).await?;
+        eng.stop().await?;
+        let flavor = if ctx.flavor().starts_with("mariadb") {
+            Flavor::MariaDb
+        } else {
+            Flavor::MySql
+        };
+        // The row the engine left, as the engine left it: its instance, its epoch, and the real
+        // resume point. A made-up file/pos would fail the leg below for the wrong reason.
+        let (instance, epoch, file, pos): (String, u64, String, u64) = c
+            .query_first(
+                "SELECT CAST(instance_id AS CHAR), epoch, CAST(binlog_file AS CHAR), binlog_pos \
+                 FROM _lazyview_status",
+            )
+            .await?
+            .context("no status row to overflow")?;
+        ensure!(
+            !instance.is_empty() && !file.is_empty(),
+            "the engine saved no position to overflow"
+        );
+        let at = Cursor::from_parts(flavor, file.clone(), pos);
+        // #347's set: one interval per transaction, the spelling a server with gaps in its GTID
+        // stream gives `gtid_executed` — here well past what the column can hold.
+        let uuid = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf";
+        let huge = (0..2_000u32)
+            .map(|i| format!("{uuid}:{}-{}", i * 3 + 1, i * 3 + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        ensure!(
+            huge.len() > lazyview::meta::MAX_CURSOR_BYTES,
+            "the test set must be one the column cannot hold ({} B)",
+            huge.len()
+        );
+        let saved = lazyview::meta::save_position(
+            &mut c,
+            &instance,
+            &at.clone().with_gtid(Some(huge.clone())),
+            epoch,
+        )
+        .await?;
+        // Shed, never truncated: the same position with no set at all, and the row holds it whole.
+        ensure!(
+            saved.gtid().is_none(),
+            "a set of {} B rode the save anyway",
+            huge.len()
+        );
+        ensure!(
+            saved.to_position() == at.to_position(),
+            "shedding moved the position: {} vs {}",
+            saved,
+            at
+        );
+        let (text, stored): (String, u64) = c
+            .query_first(
+                "SELECT CAST(binlog_cursor AS CHAR), LENGTH(binlog_cursor) FROM _lazyview_status",
+            )
+            .await?
+            .context("no cursor after the save")?;
+        ensure!(
+            text == saved.to_string() && !text.contains("[g="),
+            "the row holds {text:?}, not the shed cursor"
+        );
+        ensure!(
+            (stored as usize) <= lazyview::meta::MAX_CURSOR_BYTES,
+            "the row holds {stored} bytes"
+        );
+        // The read of that row is where #347's engine died: it hands back the position, not an error.
+        let back = lazyview::meta::load_position(&mut c, &instance, flavor)
+            .await?
+            .context("the shed cursor reads back as no cursor")?;
+        ensure!(
+            back.to_position() == at.to_position() && back.gtid().is_none(),
+            "the saved cursor reads back as {back}"
+        );
+        // The other half: an ordinary set (the shape of every run before #347) still rides the
+        // save — the bound must not quietly cost the resume-by-GTID state it was added for.
+        let small = format!("{uuid}:1-346");
+        let saved = lazyview::meta::save_position(
+            &mut c,
+            &instance,
+            &at.clone().with_gtid(Some(small.clone())),
+            epoch,
+        )
+        .await?;
+        ensure!(
+            saved.gtid() == Some(small.as_str()),
+            "an ordinary set was shed: {:?}",
+            saved.gtid()
+        );
+        lazyview::meta::save_position(&mut c, &instance, &at, epoch).await?;
+        // And a start on the shed row happens at all — this is the `stop` event of #347, seconds
+        // instead of 15 minutes in — and it brings the view up to date from the saved file/pos.
+        exec(&mut c, "INSERT INTO entities VALUES (13, 3, 'new')").await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "resumed from a cursor that shed its set",
+        )
+        .await?;
+        eng.stop().await?;
+        c.disconnect().await.ok();
+        Ok(())
+    });
+}
