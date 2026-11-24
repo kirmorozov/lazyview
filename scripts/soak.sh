@@ -89,16 +89,20 @@ check_containers() { # <containers>
 
 # Writes DONE/summary the way lvs-suite.sh does, echoes "<run> rc=<rc> <DONE>" plus the harness's
 # report path, and exits: 0 green, 1 failed (2 got its die() for usage/environment errors).
+# Green is the libtest summary, not the "test <name> ... ok" line: --nocapture interleaves the
+# test's own output between the "test <name> ... " prefix and its "ok", so that line is never
+# one line here. The proof a skipped soak is not a pass is LAZYVIEW_TEST_STRICT=soak_ (the skip
+# becomes a panic, the 2026-11-16 opt-in rule, as in CI's soak jobs); a stray SKIP line fails too.
 finish() { # <run-dir> <rc> <test-name> <log>
   local run=$1 rc=$2 name=$3 log=$4 check
   check=$(grep -oE "^test $name \.\.\. FAILED" "$log" 2>/dev/null | head -1 | awk '{print $2}')
   [ -n "$check" ] || check=$name
   if [ "$rc" = 124 ]; then check=timeout; fi
-  # the proof of a real run: the filter names it, and a SKIP of it is not a pass (the opt-in
-  # rule of 2026-11-16) — a green run without "test <name> ... ok" is a failure.
-  if [ "$rc" = 0 ] && ! grep -q "^test $name \.\.\. ok$" "$log" 2>/dev/null; then
+  # exactly the filtered test ran (0 passed would be the filter matching nothing) and no SKIP.
+  if [ "$rc" = 0 ] && { ! grep -qE '^test result: ok\. 1 passed' "$log" 2>/dev/null ||
+      grep -q '^SKIP ' "$log" 2>/dev/null; }; then
     rc=1; check="$name skipped or never ran"
-    echo "$name: no 'ok' line: the soak did not run" >> "$run/summary.txt"
+    echo "$name: no green 'test result' or a SKIP: the soak did not run for real" >> "$run/summary.txt"
   fi
   { grep -E '^test .* FAILED|panicked at' "$log" 2>/dev/null | head -6
     grep -E '^test result' "$log" 2>/dev/null | tail -1
