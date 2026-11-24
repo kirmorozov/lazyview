@@ -26,27 +26,24 @@
 # without LAZYVIEW_TEST_PG_DSNS is green by vacuity, which the owner's no-SKIP rule forbids; the
 # `indexes` step runs LAZYVIEW_TEST_STRICT=idx_ so that skip becomes a FAILED test — a declared red,
 # never a vacuous green — and the PostgreSQL leg runs where a PG target is published).
-idx_single_at_create by-design #278
-idx_unique_at_create by-design #278
-idx_fulltext_where_supported by-design #278
-idx_multi_column_order_matters by-design #278
+#
+# Lines deleted by the implementation PR #358 (03-idx-impl, #278) because their case is GREEN at its
+# head — lv-super's condition 2 (msg_6e79dafcd136): the PR that turns a by-design red green deletes
+# its line. Measured per flavor with the PostgreSQL legs executed; the per-flavor numbers, the seed
+# and the run ids are in the PR body:
+#   idx_single_at_create, idx_unique_at_create, idx_fulltext_where_supported,
+#   idx_multi_column_order_matters, idx_declared_twice_is_idempotent, idx_over_undeclared_column_errors,
+#   idx_resume_after_interrupted_reconcile, idx_name_collision_two_views,
+#   idx_unsupported_forms_fail_at_parse, idx_fulltext_refused_on_pg, idx_unknown_column_errors,
+#   idx_over_budget_errors_with_reason, idx_fulltext_declared_later_never_blocks_writes.
 idx_coexist_with_engine_keys by-design #278
 idx_declared_later_online by-design #278
 idx_fanout_all_targets_converge by-design #278
 idx_on_declared_virtual_column by-design #332
 index_kind_supported_per_flavor by-design #332
 idx_reconciles_same_name_different_columns by-design #278
-idx_declared_twice_is_idempotent by-design #278
-idx_over_undeclared_column_errors by-design #278
 idx_declared_during_inflight_build by-design #278
-idx_resume_after_interrupted_reconcile by-design #278
 idx_drift_reconverges_without_report_only by-design #278
-idx_name_collision_two_views by-design #278
-idx_unsupported_forms_fail_at_parse by-design #278
-idx_fulltext_refused_on_pg by-design #278
-idx_unknown_column_errors by-design #278
-idx_over_budget_errors_with_reason by-design #278
 idx_unique_violated_reports_and_survives by-design #278
-idx_fulltext_declared_later_never_blocks_writes by-design #278
 idx_pg_concurrently_invalid_swept by-design #278
 idx_mdl_wait_does_not_stall_writes by-design #278

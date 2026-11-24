@@ -67,6 +67,20 @@ const B: &[&str] = &[
     "INSERT INTO items VALUES (1,1,10.50),(2,1,20.25),(3,2,5.00),(4,3,7.75),(5,2,0.00)",
 ];
 
+/// Corpus `B` widened by the `status` column E7's second view projects. (a) of that case is
+/// `v_ent` = `CREATE VIEW v_ent AS SELECT id, status FROM entities`, and corpus `B` as
+/// `tests/targets.rs:447-450` has no such column (its `entities` is `(id, name)`), so the case could
+/// only ever die in planning with `cannot resolve column status` — for every implementation, before
+/// any index code ran. The same widening `BW` exists for (E11's `wide`), applied to the column (a)
+/// itself names; `expect_idx` and the PG leg keep asserting against `status`, unchanged.
+const BS: &[&str] = &[
+    "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL, status VARCHAR(10) NOT \
+     NULL)",
+    "CREATE TABLE items (id INT PRIMARY KEY, owner_id INT NOT NULL, amount DECIMAL(10,2) NOT NULL)",
+    "INSERT INTO entities VALUES (1,'alpha','new'),(2,'beta','paid'),(3,'gamma','new')",
+    "INSERT INTO items VALUES (1,1,10.50),(2,1,20.25),(3,2,5.00),(4,3,7.75),(5,2,0.00)",
+];
+
 /// Corpus `B` widened by the `VARCHAR(2000)` column E11 needs ("corpus `B` widened by the extra
 /// column"), so the declared key over `(name, total, owner_id)` overflows the key budget.
 const BW: &[&str] = &[
@@ -243,7 +257,11 @@ async fn myf_idx(c: &mut Conn, t: &str) -> Result<Vec<Idx>> {
     let mut acc: BTreeMap<String, (Vec<String>, bool, String)> = BTreeMap::new();
     for r in rows {
         let get = |i: usize| r.get(i).and_then(|x| x.clone()).unwrap_or_default();
-        let (name, col, non_unique, kind) = (get(0), get(1), get(2) == "0", get(3));
+        // `NON_UNIQUE` is MySQL's own column: 1 means the index is NOT unique. Read it as itself —
+        // comparing to "0" here made this helper report the exact negation of the truth for every
+        // index, which no implementation can satisfy (it asked `i_total`, declared non-unique, to be
+        // stored UNIQUE *and* `u_status_grp`, declared UNIQUE, to be stored non-unique at once).
+        let (name, col, non_unique, kind) = (get(0), get(1), get(2) == "1", get(3));
         let e = acc.entry(name).or_insert_with(|| (Vec::new(), true, kind));
         e.0.push(col);
         if non_unique {
@@ -1711,7 +1729,8 @@ const DECL_V_ENT: &str = "CREATE INDEX i_total ON v_ent (status)";
 /// (a) `v_items` = `CREATE VIEW v_items AS SELECT owner_id, SUM(amount) AS total FROM items GROUP BY
 /// owner_id;` + `CREATE INDEX i_total ON v_items (total);`, and `v_ent` = `CREATE VIEW v_ent AS
 /// SELECT id, status FROM entities;` + `CREATE INDEX i_total ON v_ent (status);`, both on the same
-/// instance/schema; (b) corpus `B`; (c) MYF: both tables keep `i_total` with their own columns, no
+/// instance/schema; (b) corpus `BS` (`B` widened by the `status` column (a) names, which plain `B`
+/// does not have); (c) MYF: both tables keep `i_total` with their own columns, no
 /// error; PG: names are schema-wide (the reason src/target/postgres.rs:721-723 prefixes the table
 /// name), so the engine must either physically name them `v_items_i_total` / `v_ent_i_total` (the
 /// recommended reading, Q3) or fail with a named error — silently letting the second build die with
@@ -1721,7 +1740,7 @@ fn idx_name_collision_two_views() {
     scenario("idx_name_collision_two_views", |ctx| async move {
         let src = ctx.new_db("idx_e7").await?;
         let mut c = src.conn().await?;
-        exec_all(&mut c, B).await?;
+        exec_all(&mut c, BS).await?;
         ensure_lazyview_table(&mut c).await?;
         let mut s1 = ViewSpec::new("v_items", Kind::Incremental, SEL_V_ITEMS);
         s1.definition = script("v_items", SEL_V_ITEMS, &[DECL_V_ITEMS]);
@@ -2175,6 +2194,29 @@ fn idx_unique_violated_reports_and_survives() {
             // (b) a second ('new',1) through the binlog, so the UNIQUE the user is about to declare is
             // already violated by the data.
             exec(&mut sc, "INSERT INTO entities VALUES (14, 1, 'new')").await?;
+            // (b) has to be IN the view before (c) samples the rows it promises to keep. The row
+            // travels through the binlog, and no `settle` can wait for it: the state row never
+            // leaves `ready` while a projection takes one more row, so `settle` would return at
+            // once. Sampling first compared the count against a number from before the INSERT, which
+            // no implementation can satisfy (the failing run's engine log has
+            // `refreshed concurrently view=entity_status chunks=1` five milliseconds after the
+            // sample: `rows_before` = 4, the table 5). `SEL_STATUS` is a plain projection of
+            // `entities`, so the source's own count is the exact target of this wait.
+            let catch_up = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                eng.check_alive()?;
+                let src = scalar_i64(&mut sc, "SELECT COUNT(*) FROM entities").await?;
+                let live = scalar_i64(&mut sc, "SELECT COUNT(*) FROM entity_status").await?;
+                if src == live {
+                    break;
+                }
+                ensure!(
+                    std::time::Instant::now() < catch_up,
+                    "E12 (b): the second ('new',1) never reached the view table \
+                     (`entities` = {src}, `entity_status` = {live}), so (c) has no rows to preserve",
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             let before = myf_idx(&mut sc, "entity_status").await?;
             let rows_before = scalar_i64(&mut sc, "SELECT COUNT(*) FROM entity_status").await?;
             let snap = eng.snapshot();

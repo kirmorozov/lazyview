@@ -936,6 +936,85 @@ impl PgConn {
         Ok(found.is_some())
     }
 
+    /// The whole index set of `table`, in the shape the declared set is compared with
+    /// ([`crate::target::decls::Actual`]): name, key columns in key order, uniqueness, kind, and
+    /// `pg_index.indisvalid` — an index left `INVALID` by a failed `CREATE INDEX CONCURRENTLY`
+    /// must be visible to the reconcile, because `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would
+    /// see it and silently skip the rebuild (online-ddl-research.md item 3).
+    pub(crate) async fn index_set(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<crate::target::decls::Actual>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT c.relname::text, i.indisunique, i.indisvalid, am.amname::text, \
+                        (SELECT array_agg(a.attname::text ORDER BY x.ord) \
+                           FROM unnest(i.indkey) WITH ORDINALITY x(attnum, ord) \
+                           JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = x.attnum) \
+                 FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indexrelid \
+                 JOIN pg_class t ON t.oid = i.indrelid \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 JOIN pg_am am ON am.oid = c.relam \
+                 WHERE n.nspname = $1 AND t.relname = $2 \
+                 ORDER BY c.relname",
+                &[&schema.to_string(), &table.to_string()],
+            )
+            .await
+            .with_context(|| format!("reading the indexes of {schema}.{table}"))?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::target::decls::Actual {
+                name: r.get::<_, String>(0),
+                unique: r.get::<_, bool>(1),
+                invalid: !r.get::<_, bool>(2),
+                fulltext: false, // PostgreSQL has no FULLTEXT index type; E9 refuses the kind.
+                cols: r.get::<_, Option<Vec<String>>>(4).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Converges the index set of one of our tables to the declared set (#278). Every statement
+    /// is its own `CONCURRENTLY` round trip: index DDL cannot run inside a transaction on
+    /// PostgreSQL, so this is the one place that must not use [`Self::write_tx`]; a failed
+    /// `CREATE INDEX CONCURRENTLY` leaves an INVALID index behind, which the next pass sweeps
+    /// through [`Self::index_set`] and drops before re-creating (never an `IF NOT EXISTS`, which
+    /// would keep the invalid one forever).
+    pub(crate) async fn converge_declarations(
+        &self,
+        schema: &str,
+        table: &str,
+        drops: &[String],
+        adds: &[crate::target::decls::Wanted],
+    ) -> Result<()> {
+        let s = format!("{}.{}", quote_ident(schema), quote_ident(table));
+        for name in drops {
+            self.client
+                .batch_execute(&format!(
+                    "DROP INDEX CONCURRENTLY IF EXISTS {}.{}",
+                    quote_ident(schema),
+                    quote_ident(name)
+                ))
+                .await
+                .with_context(|| format!("dropping index `{name}` of {s}"))?;
+        }
+        for w in adds {
+            let sql = format!(
+                "CREATE {}INDEX CONCURRENTLY {} ON {s} ({})",
+                if w.unique { "UNIQUE " } else { "" },
+                quote_ident(&w.name),
+                w.parts,
+            );
+            self.client
+                .batch_execute(&sql)
+                .await
+                .with_context(|| format!("creating declared index `{}` of {s}", w.name))?;
+        }
+        Ok(())
+    }
+
     /// The ownership marker (see [`crate::target::marker`]) of an existing table, if its
     /// description is one: [`create_table_sql`] stores it with `COMMENT ON TABLE` (T3.3).
     /// Reached through `target::Conn::table_marker` (T6).
