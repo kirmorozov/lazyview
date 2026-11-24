@@ -231,6 +231,14 @@ fn soak_mode(mode: &'static str) {
         .await;
         // The report is the evidence and `finish_run` (`mod.rs:856`) drops the schemas and the
         // engine log dir afterwards: write it on every path, including this one (F12).
+        // A hard error out of `soak_run` is not a check row — an event that could not be
+        // performed (the #347 smoke's `stop` event: the restarted engine died on its saved
+        // position) or a writer task that died ends the run between two PASS rows — so it is
+        // recorded as the failed row it is. Without it the one line the log has,
+        // `report: … — ALL_OK`, contradicts the `out?` one line later that fails the test.
+        if let Err(e) = &out {
+            report.checks.push(Check::failed("run", format!("{e:#}")));
+        }
         write_report(&ctx, &dir, &mut report, &logs);
         out?;
         let failed: Vec<String> = report
@@ -286,7 +294,7 @@ async fn soak_run(
     // shape `soak_workload_is_deterministic` uses), with `LAZYVIEW_HEALTH_ADDR` on a fresh port
     // (`engine.rs:251`) so `/metrics` answers for the lag and memory samples (S2.6).
     let addr = free_local_addr()?;
-    let (mut eng, _) =
+    let (eng, _) =
         start_with_views(ctx, &db, &specs, &[("LAZYVIEW_HEALTH_ADDR", addr.as_str())]).await?;
     logs.push(eng.log_path.clone());
 
@@ -298,6 +306,12 @@ async fn soak_run(
     let events = plan(seed, minutes, per_hour, network);
     let mut next_check = began + Duration::from_secs(check_s);
     let mut window = Window::now(&eng);
+    // The run owns its engine until the tail. `run_event` takes it and hands back the one to
+    // continue with, so an event that fails part-way (`EngineStop` on an engine that would not
+    // come up, #347) leaves the run without one — and the tail still owes the report the counters
+    // of what did happen. `None` is that state: nothing to roll, nothing to stop, the harness
+    // kills the process.
+    let mut eng = Some(eng);
     // The approved-rebuild ledger of the per-view F5 rule (S3.3/Q3): chaos events fill it, the
     // checks honor it, and a fresh engine empties it (`ChaosRun::start_engine_with`).
     let mut approved = Ledger::default();
@@ -336,19 +350,36 @@ async fn soak_run(
                 // #167 window is the `EngineStop` event's seeded batch (`soakchaos.rs`).
                 crash_window: &[],
             };
-            let (row, next) = run_event(&mut run, eng, kind, at).await?;
-            eng = next;
+            // `break`, never `?`: an event that could not be performed (a restarted engine that
+            // died, a statement the schema refused) still ends the run through the tail below, so
+            // the report keeps the counters of what the run did manage to do (#347's smoke ended
+            // with an empty `counters:` line and a `report: … ALL_OK` an `out?` contradicted).
+            let ev = run_event(
+                &mut run,
+                eng.take().expect("the run holds its engine until the tail"),
+                kind,
+                at,
+            )
+            .await;
+            let (row, next) = match ev {
+                Ok(v) => v,
+                Err(e) => break Err(e),
+            };
+            eng = Some(next);
             // An event that stopped the engine handed back a new one, and `Snapshot::since`
             // subtracts (`metrics.rs:40`): a window opened on the old engine's counters would
             // underflow. Every counter table starts at the engine it measures.
-            window = Window::now(&eng);
+            window = Window::now(eng.as_ref().expect("the event handed one back"));
             fold(report, &row, began);
             report.events.push(Check {
                 name: kind.name(),
                 pass: row.check.pass,
                 detail: row.check.detail,
             });
-            report.txns += join_writers(&mut writers.1).await?;
+            match join_writers(&mut writers.1).await {
+                Ok(n) => report.txns += n,
+                Err(e) => break Err(e).context("joining the writers after the chaos event"),
+            }
             writers = start_writers(&db, &ids, seed, n_writers, per_writer);
             continue;
         }
@@ -363,20 +394,30 @@ async fn soak_run(
             continue; // an event became due while waiting
         }
         next_check = Instant::now() + Duration::from_secs(check_s);
-        let (d, w) = window.roll(&eng);
+        let (d, w) = window.roll(
+            eng.as_ref()
+                .expect("the run holds its engine until the tail"),
+        );
         window = w;
         for (name, value) in &d {
             if *value > 0 {
                 *totals.entry(*name).or_default() += *value;
             }
         }
+        // The check pauses the load, so a new batch starts with it.
         set_writers(&writers.0, true);
-        report.txns += join_writers(&mut writers.1).await?;
+        match join_writers(&mut writers.1).await {
+            Ok(n) => report.txns += n,
+            Err(e) => break Err(e).context("joining the writers before the scheduled check"),
+        }
         // The scheduled check of §4, in its own order (S2.3). A failed check ends the run: the
         // report names it, and a schema that disagrees with its oracle is not worth 40 more hours.
-        let row = quiesce_and_check(
+        // `break`, not `?` — see the chaos event above: the run's numbers belong in the report
+        // even when the check that ends it is the one that failed.
+        let row = match quiesce_and_check(
             ctx,
-            &mut eng,
+            eng.as_mut()
+                .expect("the run holds its engine until the tail"),
             &db,
             &targets,
             &specs,
@@ -385,7 +426,11 @@ async fn soak_run(
             &mut attribution,
             &format!("scheduled @+{}s", began.elapsed().as_secs()),
         )
-        .await?;
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => break Err(e),
+        };
         fold(report, &row, began);
         writers = start_writers(&db, &ids, seed, n_writers, per_writer);
     };
@@ -396,14 +441,26 @@ async fn soak_run(
         Err(e) if out.is_ok() => return Err(e),
         Err(_) => {}
     }
-    let (d, _) = window.roll(&eng);
-    for (name, value) in &d {
-        if *value > 0 {
-            *totals.entry(*name).or_default() += *value;
+    // The engine to roll the last window on and to stop: `Some` whenever the run reached the tail
+    // with one, `None` after a chaos event consumed it and failed — then the harness's `Drop` kills
+    // the process, and the counters of what did happen are still worth printing. #347's report had
+    // neither: the `?` that ended the run skipped every line below.
+    if let Some(eng) = eng.take() {
+        let (d, _) = window.roll(&eng);
+        for (name, value) in &d {
+            if *value > 0 {
+                *totals.entry(*name).or_default() += *value;
+            }
+        }
+        if out.is_ok() {
+            eng.stop().await?;
+        } else {
+            // The run is already over and its reason is the story to tell: an engine that will not
+            // stop (the #347 one had already died) must not replace it with a stop error.
+            eng.stop().await.ok();
         }
     }
     report.counters = totals.into_iter().collect();
-    eng.stop().await?;
     out
 }
 
