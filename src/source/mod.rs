@@ -120,7 +120,7 @@ impl Cursor {
     }
 
     /// The flavor whose rules spell this cursor's text — what `binlog_cursor` is stored and read
-    /// under, and what the size bound of [`crate::meta::gtid_fits`] measures the text with.
+    /// under.
     pub fn flavor(&self) -> Flavor {
         self.flavor
     }

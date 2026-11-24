@@ -1188,9 +1188,6 @@ struct Engine {
     /// the text in a flush (the position save, the fence), never on the event path.
     executed_text: Option<String>,
     executed_dirty: bool,
-    /// Whether the run has yet named a GTID set it had to shed from the saved position — the
-    /// shed is said once, not once per flush (see [`Self::persist_position`], issue #347).
-    gtid_shed_noted: bool,
     /// High-water mark of the seeding read (see the seeding block of `run`): the stream must
     /// consume through this position before the set may be persisted or anchor a dump. A set
     /// seeded from the server's executed state also claims transactions committed after the
@@ -2438,7 +2435,6 @@ impl Engine {
             executed: source::mysql::GtidSet::new(),
             executed_text: None,
             executed_dirty: false,
-            gtid_shed_noted: false,
             gtid_seed_hiw: None,
             gtid_seed_unproven: false,
             read_node: None,
@@ -4689,6 +4685,16 @@ impl Engine {
                 gtid = None;
             }
             self.stream_by_gtid = gtid.is_some();
+            // Which of the two anchors this round got, in the log: the three conditions above can
+            // each hold a run back to file/pos for the whole run, and the difference shows up to
+            // the operator only as a resume that takes longer or rebuilds more than it should. It
+            // costs one line per connect (and is what a resume-by-GTID test can assert on).
+            info!(
+                position = %pos,
+                set_bytes = gtid.as_deref().map_or(0, str::len),
+                "binlog dump anchored on the {}",
+                if gtid.is_some() { "consumed GTID set" } else { "file and position" }
+            );
             // A connect is a repeat (the reader resumes from `boundary`, and delete-before-
             // insert tolerates re-applied events): the one helper with Policy::CONNECT, and no
             // nested retry inside BinlogReader::connect.
@@ -9501,24 +9507,17 @@ impl Engine {
             self.leader.epoch,
         )
         .await?;
-        // The row holds what `save_position` returns: `wanted` without a `[g=…]` set too long for
-        // `binlog_cursor` (`meta::MAX_CURSOR_BYTES`, issue #347 — a set the column truncates comes
-        // back unparsable and the next start refuses to run). Said once per run: the set only
-        // grows, so every later save sheds it the same way, and the file/pos and identity rules
-        // answer for the resume exactly as they do for an unproven seed.
-        if wanted.gtid().is_some() && saved.gtid().is_none() && !self.gtid_shed_noted {
-            self.gtid_shed_noted = true;
-            info!(
-                set_bytes = wanted.gtid().unwrap_or_default().len(),
-                limit = meta::MAX_CURSOR_BYTES,
-                "the consumed GTID set no longer fits `binlog_cursor`; the saved position carries \
-                 its file/pos alone"
-            );
-        }
+        // A cursor the column cannot hold whole is refused there, with an error naming its size, the
+        // limit and the cause (a pathologically fragmented `gtid_executed`) — never shortened, and
+        // `meta::MAX_CURSOR_BYTES` says why: the set is what a resume on another server is checked
+        // against, so shedding it (what #356 did) silently disables resume-by-GTID for the
+        // long-lived clusters whose set outgrows a column. The save is the engine's own word that
+        // the row holds this cursor byte for byte, so an error here stops the run: a position we
+        // cannot prove is stored is a resume we cannot prove is safe.
         // Held back: save again once the pending changes are applied.
         self.persist_needed = pos < self.boundary.to_position();
-        // What the row holds, not what was asked for: `persisted`'s set is the one later saves
-        // carry forward, and a shed set was never stored.
+        // What the row holds, which `save_position` has just measured: `persisted`'s set is the one
+        // later saves carry forward.
         self.persisted = saved;
         self.last_persist = Instant::now();
         Ok(())
