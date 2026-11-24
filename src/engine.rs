@@ -1616,6 +1616,20 @@ fn m1_ints(s: &crate::intset::IntSet) -> String {
     format!("{}[{}]", v.len(), shown.join(","))
 }
 
+/// The non-integer unit keys of a buffer, as `n[a.b,c.d]` (the first 50, each key's first four
+/// parts). A view whose units are not a single integer — a grouped view keyed by text, a composite
+/// key — keeps every unit in `UnitSet::keys`, so a line that prints only `ints` says nothing about
+/// it: `w_item_tags` in the #319 scenario reads `0[]` for every row of a run that is correct.
+fn m1_keys(s: &crate::accumulate::KeySet) -> String {
+    let n = s.len();
+    if n > 50 {
+        return format!("{n}[…]");
+    }
+    let mut v: Vec<String> = s.iter().map(|k| m1_tuple(k)).collect();
+    v.sort();
+    format!("{n}[{}]", v.join(" "))
+}
+
 /// A hop link or a key's parts, compact: the first four, bytes as their text. A hop line has to be
 /// readable against a `READ` line's key, which `{Datum:?}` alone is not (Bytes comes out as digits).
 fn m1_tuple(t: &[Datum]) -> String {
@@ -5859,13 +5873,14 @@ impl Engine {
                 if m1_view(&m1_name) {
                     tracing::trace!(
                         target: "m1trace",
-                        "FED view={} next={} kind={:?} fed={:?} marked={} units={} keys={} partial={} all={} rebuild={} row={}=>{}",
+                        "FED view={} next={} kind={:?} fed={:?} marked={} units={} ukeys={} keys={} partial={} all={} rebuild={} row={}=>{}",
                         m1_name,
                         r.next,
                         r.kind,
                         fed,
                         !dirty.is_empty(),
                         m1_ints(&dirty.units.ints),
+                        m1_keys(&dirty.units.keys),
                         dirty.units.keys.len(),
                         dirty.partial.len(),
                         dirty.all,
@@ -5904,6 +5919,19 @@ impl Engine {
                 Some(o) => self.dedup.core.row_at(o, s, b.as_ref(), a.as_ref()),
                 None => self.dedup.core.row(s, b.as_ref(), a.as_ref()),
             }
+        }
+        // DIAGNOSTIC (temporary): the core's own silent skip. `Consumer::source` drops a row for
+        // every occurrence, cascade or map whose plan reads another column count than this
+        // TABLE_MAP (`Source::skip`), and `Consumer::row` marks nothing for it — no rebuild, no
+        // warn. The table is the one the `READ` line right above names.
+        if m1_on() {
+            tracing::trace!(
+                target: "m1trace",
+                "CORE-SKIP rows={} origin={:?} src={:?}",
+                rows.len(),
+                origin.map(|p| p.to_string()),
+                s,
+            );
         }
         if count {
             Metrics::add(&self.metrics.rows_seen, rows.len() as u64);
@@ -7674,11 +7702,12 @@ impl Engine {
         if m1_view(&name) {
             tracing::trace!(
                 target: "m1trace",
-                "DRAIN view={} targets=[{}] lagging=[{:?}] units={} keys={} partial={} all={} since={:?}",
+                "DRAIN view={} targets=[{}] lagging=[{:?}] units={} ukeys={} keys={} partial={} all={} since={:?}",
                 name,
                 targets.join(","),
                 lagging,
                 m1_ints(&dirty.units.ints),
+                m1_keys(&dirty.units.keys),
                 dirty.units.keys.len(),
                 dirty.partial.len(),
                 dirty.all,
@@ -7723,7 +7752,7 @@ impl Engine {
         if m1_view(&name) {
             tracing::trace!(
                 target: "m1trace",
-                "WROTE view={} targets=[{}] failed=[{}] lagging=[{:?}] applied_units={}",
+                "WROTE view={} targets=[{}] failed=[{}] lagging=[{:?}] applied_units={} applied_ukeys={}",
                 name,
                 targets.join(","),
                 r.failed
@@ -7733,6 +7762,7 @@ impl Engine {
                     .join(","),
                 lagging,
                 m1_ints(&r.units.ints),
+                m1_keys(&r.units.keys),
             );
         }
         self.flush_wrote.push((i, targets.to_vec()));
