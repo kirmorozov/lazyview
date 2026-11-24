@@ -28,9 +28,6 @@ pub struct Leadership {
     pub epoch: u64,
 }
 
-/// How long [`reacquire`] waits for the leadership lock of a lost metadata connection.
-const REACQUIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Takes the leadership lock without waiting for it (`1` = this session holds it).
 const GET_LOCK_NOW: &str = "SELECT GET_LOCK(?, 0)";
 /// The keepalive one beat sends: the server counts it as activity on the session, which is what
@@ -548,23 +545,18 @@ pub async fn reacquire(
     instance_id: &str,
     deadline: Option<Duration>,
 ) -> Result<()> {
-    // Our old session may still hold the lock for a moment: a killed connection releases its
-    // locks only when the server has finished it (KILL is asynchronous). Another instance that
-    // took over keeps it, and the epoch check below catches a takeover in between.
+    // Take the lock without a server-side wait (`GET_LOCK(name, 0)` answers at once), so this
+    // statement stays inside the heartbeat deadline: a lock link that has stopped answering
+    // returns a transient error here rather than hanging the beat task. Waiting on the server
+    // instead (the old `REACQUIRE_WAIT`) could not be cut to a heartbeat without turning every
+    // "still held, retry" into a timeout, so we let the beat loop drive the retry (below).
     let got: Option<Option<i64>> = bounded(
         deadline,
-        conn.exec_first(
-            "SELECT GET_LOCK(?, ?)",
-            (&l.lock_name, REACQUIRE_WAIT.as_secs()),
-        ),
+        conn.exec_first("SELECT GET_LOCK(?, ?)", (&l.lock_name, 0u64)),
     )
     .await?;
-    if got.flatten() != Some(1) {
-        bail!(
-            "lost leadership lock `{}` while disconnected; another instance is active",
-            l.lock_name
-        );
-    }
+    // Read our epoch back either way: it is what tells a takeover (fence) from our own previous
+    // session still holding the lock under a lease that has not expired yet (stay `Uncertain`).
     let epoch: Option<u64> = bounded(
         deadline,
         conn.exec_first(
@@ -574,10 +566,22 @@ pub async fn reacquire(
     )
     .await?;
     if epoch != Some(l.epoch) {
+        // The epoch moved while we were away: another instance bumped it and took the lock. This
+        // one is the replaced one and must stop (a definitive verdict, not a deferral).
         bail!(
             "another lazyview instance took over while disconnected (epoch {epoch:?}, ours {}); stopping",
             l.epoch
         );
+    }
+    if got.flatten() != Some(1) {
+        // We did not get the lock but the epoch is ours: our previous session (lost to the
+        // partition, not closed) still holds the named lock until the server waits out the lease,
+        // or a takeover is mid-flight. Not a verdict yet — a transient deferral keeps the gates
+        // closed and the next beat tries again until the lease frees the lock or the epoch moves.
+        return Err(lock_deadline(format!(
+            "leadership lock `{}` still held (our previous session or a takeover in flight); retrying",
+            l.lock_name
+        )));
     }
     Ok(())
 }
