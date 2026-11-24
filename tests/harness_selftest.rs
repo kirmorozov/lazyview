@@ -885,29 +885,211 @@ fn selftest_engineproc_sampler_vs_time() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The other half of the sampler's contract, and the one that made main red (#360): a GNU `time` run
-/// that **finished** before the sampler could attach is a measured run with 0 samples, not a run that
-/// "never forked". `/bin/true` under `time -v` lives about a millisecond, so whether the one `/proc`
-/// scan of the fork wait still catches `time`'s child is the *runner's* choice, not the program's —
-/// the same race that let a short `sort` expire inside the old fixed 5 s deadline and report
-/// `` `time` never forked `` (issue #360, main run 45302379688). Before the fix this test fails on
-/// the first run with that error; after it, the wait ends when `time` exits and the run comes back
-/// as measured.
+/// The finished-before-attach outcome, tested **without the race** — which is why it is a separate
+/// test and not a line in the loop below. Whether `/bin/true` dies before the fork wait's one `/proc`
+/// scan is the runner's choice, so demanding that outcome from 50 spawns asserts on a scheduling race
+/// and fails a runner that always attaches in time. The step that produces it is
+/// [`engineproc::finished_time_run_result`], so this hands it the two facts the fork wait leaves when
+/// `time` exits first — the exit status, and the report `time` wrote to its stderr — and demands the
+/// answer the fix is about: `Ok`, the empty measurement, and `time`'s own numbers. No spawn, no scan,
+/// no sleep, so it says the same on every runner class; and it goes red the moment that step reports a
+/// finished run as an error again, which is exactly what `main`'s 5 s deadline did (#360).
+#[test]
+fn selftest_engineproc_finished_time_run_before_attach() {
+    // `ExitStatusExt` (already imported here) is what builds one from a wait status: the step under
+    // test is handed a status, so the test needs no process to have one.
+    use std::process::ExitStatus;
+
+    /// GNU `time` 1.9-0.2 writing the report of `/bin/sort` on 1e6 lines — captured from a real
+    /// `time -v` run, tabs and all, because the parse is part of what is under test and a fixture
+    /// that flatters it proves nothing. `user`, `sys` and `maxrss` are non-zero on purpose: with an
+    /// all-zero report, a step that threw the report away and returned zeros would pass too.
+    const REPORT: &str = concat!(
+        "\tCommand being timed: \"/bin/sort -o big-out.txt big.txt\"\n",
+        "\tUser time (seconds): 0.82\n",
+        "\tSystem time (seconds): 0.15\n",
+        "\tPercent of CPU this job got: 290%\n",
+        "\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.33\n",
+        "\tAverage shared text size (kbytes): 0\n",
+        "\tAverage unshared data size (kbytes): 0\n",
+        "\tAverage stack size (kbytes): 0\n",
+        "\tAverage total size (kbytes): 0\n",
+        "\tMaximum resident set size (kbytes): 157384\n",
+        "\tAverage resident set size (kbytes): 0\n",
+        "\tMajor (requiring I/O) page faults: 0\n",
+        "\tMinor (reclaiming a frame) page faults: 39400\n",
+        "\tVoluntary context switches: 1292\n",
+        "\tInvoluntary context switches: 127\n",
+        "\tSwaps: 0\n",
+        "\tFile system inputs: 0\n",
+        "\tFile system outputs: 64236\n",
+        "\tSocket messages sent: 0\n",
+        "\tSocket messages received: 0\n",
+        "\tSignals delivered: 0\n",
+        "\tPage size (bytes): 4096\n",
+        "\tExit status: 0\n",
+    );
+    let sort = PathBuf::from("/bin/sort");
+
+    // The run exactly as the fork wait leaves it: `time` exited 0 and printed its report, and its
+    // child was gone before the scan could name a pid to sample.
+    let (u, t) = engineproc::finished_time_run_result(
+        &sort,
+        ExitStatus::from_raw(0),
+        Some(REPORT.to_string()),
+    )
+    .expect(
+        "a `time` run that finished before the sampler attached is measured, not an error (#360)",
+    );
+    // The empty measurement: 0 samples and every counter 0. That shape is what the caller's "too few
+    // samples, double the input" loop reads as "give me work", and it is the shape `Sampler::finish`
+    // reduces a child that died before the first read to, so the two runs are not told apart.
+    assert_eq!(u.samples, 0, "nothing was sampled: {}", u.line());
+    assert_eq!(
+        (
+            u.wall,
+            u.cpu_seconds,
+            u.rss_first_kib,
+            u.rss_med_kib,
+            u.rss_mean_kib,
+            u.rss_peak_kib,
+            u.vmhwm_kib,
+            u.stopped_samples,
+        ),
+        (Duration::ZERO, 0.0, 0, 0, 0, 0, 0, 0),
+        "a run that sampled nothing must report the empty measurement, not a partial one: {}",
+        u.line()
+    );
+    assert_eq!(
+        u.line(),
+        engineproc::reduce_samples(Vec::new()).line(),
+        "the same line the sampler itself prints for an empty window"
+    );
+    // And `time`'s own numbers, read from that report: the run was taken as finished and its report
+    // was read, which is the half that "never forked" threw away along with the measurement.
+    assert_eq!(
+        t,
+        Some(engineproc::GnuTime {
+            user_s: 0.82,
+            sys_s: 0.15,
+            max_rss_kib: 157_384,
+        }),
+        "`time`'s numbers must come back with the empty measurement"
+    );
+
+    // The step is not an unconditional `Ok`, either: the exit status is `time`'s own verdict on the
+    // run, and a report whose fields cannot be read is not evidence of a finished run. Both fail
+    // loudly here, as they do in `run_measured` — a finished run must be *attested*, not invented.
+    let e = engineproc::finished_time_run_result(
+        &sort,
+        ExitStatus::from_raw(0x100),
+        Some(REPORT.to_string()),
+    )
+    .expect_err("`time` exited 1: that run is not a measured one");
+    assert!(format!("{e:#}").contains("exited with"), "{e:#}");
+    for bad in ["", "not a report at all", "\tUser time (seconds): 0.82\n"] {
+        let e = engineproc::finished_time_run_result(
+            &sort,
+            ExitStatus::from_raw(0),
+            Some(bad.to_string()),
+        )
+        .expect_err("a report without its three fields is not a finished run");
+        assert!(
+            format!("{e:#}").contains("cannot read `time -v`'s report"),
+            "{e:#}"
+        );
+    }
+    // A run that never went under `time` at all has no report to read: `None` is the honest answer
+    // there, and the measurement is still the empty one rather than an error.
+    let (u, t) = engineproc::finished_time_run_result(&sort, ExitStatus::from_raw(0), None)
+        .expect("no `time` on the host is not an error either");
+    assert_eq!(t, None, "no `time`, no numbers");
+    assert_eq!(u.samples, 0, "{}", u.line());
+}
+
+/// Both ends of the fork wait itself, taken from **the process the test hands it** instead of from
+/// the runner's scheduling. [`engineproc::time_child`] is the loop that turns "a child appeared" into
+/// a pid to sample and "`time` exited" into `None`, and pre-fix the second of those ended in the error
+/// `` `time` never forked `` (#360) — so both ends have to be answered on demand, and a test that only
+/// spawned `/bin/true` under a real `time` would be back at the mercy of the race.
 ///
-/// What is asserted is what holds whichever way that race falls; the 0-sample outcome the fix is
-/// about is demanded by name, over enough independent runs that the runner catching the child is not
-/// a thing that happens:
-/// * the call never errors — a finished run is never reported as one that never started;
-/// * a run that sampled nothing reports the **empty** measurement (every counter 0) and still
-///   `time`'s own numbers, so the report was read and the run taken as finished, not unforked —
-///   which is the shape the caller's "too few samples, double the input" loop reads as "give me work";
-/// * a run that did catch the child reports a window of a living process, the shape
-///   [`selftest_engineproc_sampler_vs_time`] measures.
+/// * **a child to find**: `sh -c 'sleep 30 & wait'` forks `sleep` and then blocks in `wait`, so it is
+///   alive for as long as the loop looks. A loop with no deadline can leave that only one way — by
+///   finding the child — so `Some(pid)` is forced, and the pid is checked to be a live process that is
+///   a child of the process it was given (the pid a sampler would then have sampled).
+/// * **nothing left to find**: a process the test already `wait`ed and reaped, which is the state
+///   `time` is in when its program finished first. The scan has no child to name and `try_wait`
+///   answers the moment it is asked, so `Ok(None)` comes back immediately — no sleep, no timeout.
+#[test]
+fn selftest_engineproc_time_child_ends_both_ways() {
+    let null = || std::process::Stdio::null();
+
+    // (a) A child to find.
+    let mut parent = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 30 & wait"])
+        .stdin(null())
+        .stdout(null())
+        .stderr(null())
+        .spawn()
+        .expect("spawn a shell that waits for a child of its own");
+    let ppid = parent.id();
+    let found = engineproc::time_child(&mut parent)
+        .expect("a parent with a live child is answered, never reported as one that never forked")
+        .expect(
+            "the loop ends by finding the child: it has no other way out but the parent exiting",
+        );
+    assert_ne!(
+        found, ppid,
+        "the wait hands back the child to sample, not the process it was given"
+    );
+    assert!(
+        engineproc::pid_alive(found),
+        "the pid the wait returned names a live process: {found}"
+    );
+    assert!(
+        engineproc::child_pids(ppid).contains(&found),
+        "the pid the wait returned is a child of {ppid}: {found}"
+    );
+    // Teardown in the order that leaves nothing behind: the grandchild first (an orphaned `sleep 30`
+    // would outlive the test), then the shell, whose `wait` returns as soon as that child dies.
+    engineproc::signal(found, engineproc::Signal::Kill).ok();
+    let _ = parent.kill();
+    let _ = parent.wait();
+
+    // (b) Nothing left to find: the run is over and the pid is reaped. Pre-fix, this is the state that
+    // came back as an error, which is what turned a finished run into a failed test.
+    let mut done = std::process::Command::new("/bin/true")
+        .stdin(null())
+        .stdout(null())
+        .stderr(null())
+        .spawn()
+        .expect("spawn /bin/true");
+    assert!(
+        done.wait().expect("reap /bin/true").success(),
+        "the finished run this case is about must itself have succeeded"
+    );
+    assert_eq!(
+        engineproc::time_child(&mut done).expect("a finished run is an answer, not an error (#360)"),
+        None,
+        "an exited, reaped parent leaves no child to sample: the fork wait must say `None`, not error"
+    );
+}
+
+/// The same outcome with **two real processes**, kept as the integration smoke check of the wiring: 50
+/// spawns of `/bin/true` under `time -v` — a program gone in about a millisecond, so the fork wait and
+/// the spawn are what actually run. It is a smoke check and nothing more: what it asserts holds
+/// whichever way the race between `time`'s fork and the one `/proc` scan falls — every call is `Ok`,
+/// every run carries `time -v`'s report, and a run that sampled nothing reports the all-zero
+/// measurement — and how the 50 split between "finished first" and "caught the child" is only printed,
+/// with [`engineproc::measured`]. The split says nothing either way and asserts nothing: the two
+/// outcomes the race decides are each pinned without a race by
+/// [`selftest_engineproc_time_child_ends_both_ways`] and
+/// [`selftest_engineproc_finished_time_run_before_attach`], and those are what a runner must keep
+/// green. Before #360's fix this test failed on the first run with `` `time` never forked ``.
 #[test]
 fn selftest_engineproc_finished_time_run() {
-    // Independent runs, each a spawn of `time` plus the fork wait's `/proc` scan. The child is caught
-    // only when a scan happens to be in flight during its ~1 ms of life; the run below prints the
-    // split it saw, and one caught child in fifty cannot make this fail.
+    // Independent runs, each a spawn of `time` plus the fork wait's `/proc` scan: the split the loop
+    // prints is the runner's, never this test's expectation.
     const RUNS: usize = 50;
 
     // The gate is the `time` binary and nothing else: `gnu_time` is what decides whether a run goes
@@ -970,16 +1152,16 @@ fn selftest_engineproc_finished_time_run() {
             );
         }
     }
+    // The split this runner happened to see, recorded and **not** asserted on: demanding that at least
+    // one of the 50 finished before the scan is an assertion on which way the race fell, and a runner
+    // that always attaches in time would fail it — the same class of flake #360 is about. That outcome
+    // is demanded of the step that produces it, without a race, by
+    // `selftest_engineproc_finished_time_run_before_attach`.
     engineproc::measured(format!(
         "finished-run /bin/true x{RUNS}: {unsampled} finished before the sampler could attach, {} \
          caught a window",
         RUNS - unsampled
     ));
-    assert!(
-        unsampled > 0,
-        "not one of {RUNS} runs of /bin/true finished before the sampler attached: the empty \
-         measurement the fix is about was never taken, so this test proved nothing"
-    );
 }
 
 /// The engine as a real process killed with real signals: `/startupz` answers, `/metrics` is gated by

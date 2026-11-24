@@ -13,8 +13,9 @@
 //! Owned here: [`engine_binary`] (which binary to run), [`EngineProc`] (spawn, endpoints,
 //! signals, teardown), [`parse_prometheus`] (a tiny reader for the text `/metrics` serves),
 //! [`Sampler`] (CPU/RSS from `/proc`), [`KillPointPlan`] (a seeded, reproducible "any
-//! instant"), and [`run_measured`] (the sampler's own cross-check against the kernel's
-//! report, `time -v`).
+//! instant"), [`run_measured`] (the sampler's own cross-check against the kernel's
+//! report, `time -v`), and [`finished_time_run_result`] (what a `time` run that was over before the
+//! sampler attached reports).
 //!
 //! Rules kept: **no new dependency** (HTTP/1.1 over one short-lived connection like
 //! `super::engine::http_json`, signals through `kill`, `/proc` through `std::fs`); **teardown
@@ -1254,7 +1255,10 @@ pub fn parse_gnu_time(text: &str) -> Option<GnuTime> {
 /// that did not schedule it for tens of ms could let a short `sort` finish inside that: `time` had
 /// exited, no child was left to find, and a **finished** run was reported as one that "never
 /// forked" (#360).
-fn time_child(child: &mut Child) -> Result<Option<u32>> {
+///
+/// Public because `selftest_engineproc_time_child_ends_both_ways` hands it an ordinary process and
+/// asks: which of the two ends it takes is then the process's doing, not the runner's.
+pub fn time_child(child: &mut Child) -> Result<Option<u32>> {
     loop {
         if let Some(p) = child_pids(child.id()).first().copied() {
             return Ok(Some(p));
@@ -1271,6 +1275,49 @@ fn time_child(child: &mut Child) -> Result<Option<u32>> {
     }
 }
 
+/// The two facts a run under `time` owes its caller, checked one way for both outcomes below: `time`
+/// exited 0, and its `-v` report parsed (a locale that renamed the fields, or a `time` that is not
+/// GNU's, yields `None` from [`parse_gnu_time`] and is not a report to trust). `report_text` is what
+/// its stderr held — `None` when the run never went under `time`, which reports no numbers.
+fn time_run_report(
+    program: &Path,
+    status: ExitStatus,
+    report_text: Option<String>,
+) -> Result<Option<GnuTime>> {
+    ensure!(status.success(), "{:?} exited with {status:?}", program);
+    match report_text {
+        Some(text) => {
+            let parsed = parse_gnu_time(&text);
+            ensure!(parsed.is_some(), "cannot read `time -v`'s report:\n{text}");
+            Ok(parsed)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Builds the result [`run_measured`] gives for a `time -v` run whose child the fork wait **never
+/// saw** — `time` had already exited when [`time_child`] scanned, so the program is gone (#360). It
+/// is `Ok`, not an error, and carries two things:
+///
+/// * the **empty measurement** — 0 samples and every counter 0, `reduce_samples` of an empty list,
+///   which is the same shape [`Sampler::finish`] reduces a child that died before the sampler's
+///   first read to, so a caller cannot tell the two runs apart and its "too few samples, double the
+///   input" loop reads both as "give me work";
+/// * `time`'s own numbers, from the report on its stderr — proof the run was taken as finished and
+///   its report read, not dropped on the floor as one that "never forked".
+///
+/// Split out of `run_measured` so `selftest_engineproc_finished_time_run_before_attach` can demand
+/// this outcome from the step that produces it, with a report it hands in, instead of hoping a
+/// runner lets `/bin/true` die before the scan catches it.
+pub fn finished_time_run_result(
+    program: &Path,
+    status: ExitStatus,
+    report_text: Option<String>,
+) -> Result<(ProcUsage, Option<GnuTime>)> {
+    let report = time_run_report(program, status, report_text)?;
+    Ok((reduce_samples(Vec::new()), report))
+}
+
 /// Runs `program args...` under the sampler, and under `/usr/bin/time -v` when the host has it, so
 /// **one** run yields both the kernel's report and the sampler's numbers for the *same* process (the
 /// measured pid is `time`'s child when it runs, our own child otherwise). A sampler whose interval or
@@ -1279,8 +1326,9 @@ fn time_child(child: &mut Child) -> Result<Option<u32>> {
 /// A program that finishes before `time`'s child can be seen — a short `sort`, or any program on a
 /// runner slow to schedule the scan — is a run that is **over**, not one that never started: it
 /// returns the empty measurement (0 samples) with `time`'s own numbers when `time` printed them, so
-/// the caller decides whether the work was big enough to measure. `selftest_engineproc_finished_time_run`
-/// keeps that ([`time_child`]).
+/// the caller decides whether the work was big enough to measure. [`finished_time_run_result`] builds
+/// that result, and `selftest_engineproc_finished_time_run_before_attach` tests it directly;
+/// `selftest_engineproc_finished_time_run` keeps the real two-process version of it ([`time_child`]).
 pub fn run_measured(
     program: &Path,
     args: &[String],
@@ -1317,24 +1365,23 @@ pub fn run_measured(
     let status = child
         .wait()
         .with_context(|| format!("wait for {:?}", program))?;
-    // No target means `time` was already gone before the first scan: the run is over and there was
-    // nothing to sample. The reduction of an empty sample list is the same shape `finish` returns
-    // for a child that died before the sampler's first read, so the two are reported identically.
-    let usage = match sampler {
-        Some(s) => s.finish(),
-        None => reduce_samples(Vec::new()),
-    };
-    ensure!(status.success(), "{:?} exited with {status:?}", program);
-    let report = match (&gnu, child.stderr.take()) {
+    // `time`'s report is the only stderr piped; anything else the program wrote went to /dev/null.
+    let report_text = match (&gnu, child.stderr.take()) {
         (Some(_), Some(mut err)) => {
             use std::io::Read;
             let mut text = String::new();
             err.read_to_string(&mut text).ok();
-            let parsed = parse_gnu_time(&text);
-            ensure!(parsed.is_some(), "cannot read `time -v`'s report:\n{text}");
-            parsed
+            Some(text)
         }
         _ => None,
     };
-    Ok((usage, report))
+    match (sampler, report_text) {
+        // No sampler means `time` was already gone before the first scan: the run is over, there was
+        // nothing to sample, and the step that says so is the one the selftest drives by hand (#360).
+        (None, text) => finished_time_run_result(program, status, text),
+        (Some(s), text) => {
+            let usage = s.finish();
+            Ok((usage, time_run_report(program, status, text)?))
+        }
+    }
 }
