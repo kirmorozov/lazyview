@@ -885,6 +885,103 @@ fn selftest_engineproc_sampler_vs_time() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The other half of the sampler's contract, and the one that made main red (#360): a GNU `time` run
+/// that **finished** before the sampler could attach is a measured run with 0 samples, not a run that
+/// "never forked". `/bin/true` under `time -v` lives about a millisecond, so whether the one `/proc`
+/// scan of the fork wait still catches `time`'s child is the *runner's* choice, not the program's —
+/// the same race that let a short `sort` expire inside the old fixed 5 s deadline and report
+/// `` `time` never forked `` (issue #360, main run 45302379688). Before the fix this test fails on
+/// the first run with that error; after it, the wait ends when `time` exits and the run comes back
+/// as measured.
+///
+/// What is asserted is what holds whichever way that race falls; the 0-sample outcome the fix is
+/// about is demanded by name, over enough independent runs that the runner catching the child is not
+/// a thing that happens:
+/// * the call never errors — a finished run is never reported as one that never started;
+/// * a run that sampled nothing reports the **empty** measurement (every counter 0) and still
+///   `time`'s own numbers, so the report was read and the run taken as finished, not unforked —
+///   which is the shape the caller's "too few samples, double the input" loop reads as "give me work";
+/// * a run that did catch the child reports a window of a living process, the shape
+///   [`selftest_engineproc_sampler_vs_time`] measures.
+#[test]
+fn selftest_engineproc_finished_time_run() {
+    // Independent runs, each a spawn of `time` plus the fork wait's `/proc` scan. The child is caught
+    // only when a scan happens to be in flight during its ~1 ms of life; the run below prints the
+    // split it saw, and one caught child in fifty cannot make this fail.
+    const RUNS: usize = 50;
+
+    // The gate is the `time` binary and nothing else: `gnu_time` is what decides whether a run goes
+    // under `time` at all (it probes `/usr/bin/time -v /bin/true`), so without it there is no
+    // finished-`time` run for this test to talk about. Both files it needs are the ones it checked.
+    if engineproc::gnu_time().is_none() {
+        skip_scenario(
+            "selftest_engineproc_finished_time_run",
+            "/usr/bin/time (GNU time) is not usable here (missing, or `-v /bin/true` does not exit \
+             0): nothing runs under `time` on this host, so there is no finished-`time` run to \
+             report (CI runs ubuntu-24.04, which has it)",
+        );
+        return;
+    }
+    let true_bin = PathBuf::from("/bin/true");
+
+    let mut unsampled = 0;
+    for run in 0..RUNS {
+        let (u, t) = engineproc::run_measured(&true_bin, &[], Duration::from_millis(2))
+            .unwrap_or_else(|e| panic!("run {run} of /bin/true under the sampler: {e:#}"));
+        // `time` always prints its report on this path, and a run that sampled something saw a live
+        // process: both halves of that hold in either order the race falls.
+        let t = t.unwrap_or_else(|| panic!("run {run}: no `time -v` report from a `time` run"));
+        assert!(
+            t.max_rss_kib > 0,
+            "run {run}: `time -v` saw no memory: {t:?}"
+        );
+        if u.samples == 0 {
+            unsampled += 1;
+            assert_eq!(
+                (
+                    u.wall,
+                    u.cpu_seconds,
+                    u.rss_first_kib,
+                    u.rss_med_kib,
+                    u.rss_mean_kib,
+                    u.rss_peak_kib,
+                    u.vmhwm_kib,
+                    u.stopped_samples,
+                ),
+                (
+                    Duration::ZERO,
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ),
+                "a run that sampled nothing must report the empty measurement, not a partial one: {}",
+                u.line()
+            );
+        } else {
+            assert!(
+                u.rss_peak_kib > 0,
+                "run {run} sampled {} samples with no memory in it: {}",
+                u.samples,
+                u.line()
+            );
+        }
+    }
+    engineproc::measured(format!(
+        "finished-run /bin/true x{RUNS}: {unsampled} finished before the sampler could attach, {} \
+         caught a window",
+        RUNS - unsampled
+    ));
+    assert!(
+        unsampled > 0,
+        "not one of {RUNS} runs of /bin/true finished before the sampler attached: the empty \
+         measurement the fix is about was never taken, so this test proved nothing"
+    );
+}
+
 /// The engine as a real process killed with real signals: `/startupz` answers, `/metrics` is gated by
 /// `LAZYVIEW_HEALTH_TOKEN` and parses, the sampler sees the process, `SIGSTOP` freezes it (its health
 /// endpoint with it — the pull-the-plug model, not a simulation), `SIGCONT` thaws it, and `kill -9`

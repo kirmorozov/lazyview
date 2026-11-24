@@ -1244,10 +1244,43 @@ pub fn parse_gnu_time(text: &str) -> Option<GnuTime> {
     })
 }
 
+/// Waits for GNU `time` to fork the command it was given and returns that child's pid, or `None`
+/// when `time` exited first.
+///
+/// There is deliberately **no deadline** here. `time` forks before its child can run, so the two
+/// ways out of this loop are the two ways the run itself ends — a child to sample, or `time` done —
+/// and `child.wait()` below waits for the second one anyway; a duration would only ever be a guess
+/// at how long the runner may take to schedule this thread. It used to be a fixed 5 s, and a runner
+/// that did not schedule it for tens of ms could let a short `sort` finish inside that: `time` had
+/// exited, no child was left to find, and a **finished** run was reported as one that "never
+/// forked" (#360).
+fn time_child(child: &mut Child) -> Result<Option<u32>> {
+    loop {
+        if let Some(p) = child_pids(child.id()).first().copied() {
+            return Ok(Some(p));
+        }
+        // After the scan, not before: a child born and gone within one scan is a finished run too.
+        if child
+            .try_wait()
+            .with_context(|| "ask whether `time` exited")?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Runs `program args...` under the sampler, and under `/usr/bin/time -v` when the host has it, so
 /// **one** run yields both the kernel's report and the sampler's numbers for the *same* process (the
 /// measured pid is `time`'s child when it runs, our own child otherwise). A sampler whose interval or
 /// parsing were wrong shows up here immediately.
+///
+/// A program that finishes before `time`'s child can be seen — a short `sort`, or any program on a
+/// runner slow to schedule the scan — is a run that is **over**, not one that never started: it
+/// returns the empty measurement (0 samples) with `time`'s own numbers when `time` printed them, so
+/// the caller decides whether the work was big enough to measure. `selftest_engineproc_finished_time_run`
+/// keeps that ([`time_child`]).
 pub fn run_measured(
     program: &Path,
     args: &[String],
@@ -1276,23 +1309,21 @@ pub fn run_measured(
         .spawn()
         .with_context(|| format!("spawn {:?}", program))?;
     let target = match &gnu {
-        Some(_) => {
-            let t0 = Instant::now();
-            loop {
-                if let Some(p) = child_pids(child.id()).first().copied() {
-                    break p;
-                }
-                ensure!(t0.elapsed() < Duration::from_secs(5), "`time` never forked");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        None => child.id(),
+        // `time`'s child once it forks; no target at all once `time` has exited (#360).
+        Some(_) => time_child(&mut child)?,
+        None => Some(child.id()),
     };
-    let sampler = Sampler::start(target, interval);
+    let sampler = target.map(|pid| Sampler::start(pid, interval));
     let status = child
         .wait()
         .with_context(|| format!("wait for {:?}", program))?;
-    let usage = sampler.finish();
+    // No target means `time` was already gone before the first scan: the run is over and there was
+    // nothing to sample. The reduction of an empty sample list is the same shape `finish` returns
+    // for a child that died before the sampler's first read, so the two are reported identically.
+    let usage = match sampler {
+        Some(s) => s.finish(),
+        None => reduce_samples(Vec::new()),
+    };
     ensure!(status.success(), "{:?} exited with {status:?}", program);
     let report = match (&gnu, child.stderr.take()) {
         (Some(_), Some(mut err)) => {
