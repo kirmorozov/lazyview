@@ -38,6 +38,7 @@ use crate::plan_swap;
 use crate::source::{self, mysql, Cursor, FenceState, SourceCaps};
 use crate::supervisor::{self, Supervisor};
 use crate::target;
+use mysql_async::binlog::events::{Event, EventData};
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
 
@@ -634,8 +635,106 @@ enum RouteKind {
     MapChild(usize),
 }
 
-type XaRow = (TableRef, Option<BinlogRow>, Option<BinlogRow>);
+/// A table's short-image guard (review C-02), built with its `RouteT`s and aligned with them.
+/// Every read of a row image is positional: the values carry no column ids, only the event's
+/// present-column bitmap says which ones are there, so a column left out below a column a feed
+/// reads shifts every value after it and the feed silently reads one column as another. The
+/// guard is therefore the prefix the feeds read — the highest column any of them may read, and
+/// with it every column under it. Columns above it are don't-care, which is what keeps an image
+/// that leaves a trailing VIRTUAL generated column out legal (issue #7; the same proof
+/// `cascade::provable_omission` gives the cascade path in #321).
+struct TableNeed {
+    /// The highest column a row event of this table must carry, `None` where no feed of the
+    /// table reads a column by position (every route of it is a whole-view one): no image of
+    /// this table can be short.
+    reads: Option<usize>,
+    /// Per `RouteT` of this table in `Engine::routes` (the same order): the unit columns whose
+    /// presence lets an `Alias` feed's unit keys be read from the image (both images of an
+    /// UPDATE) — `None` where a short image can only be answered with the whole-view refresh.
+    units: Box<[Option<Box<[u16]>>]>,
+}
 
+/// `rebuild_routes`' accumulator per table; its `units` is pushed exactly where the table's
+/// `routes` entry is, keeping the two aligned.
+#[derive(Default)]
+struct NeedAcc {
+    reads: Option<usize>,
+    units: Vec<Option<Box<[u16]>>>,
+}
+
+impl NeedAcc {
+    /// Widens the read prefix to `c`: an image that stops below it cannot be read by position.
+    fn read(&mut self, c: usize) {
+        self.reads = Some(self.reads.map_or(c, |r| r.max(c)));
+    }
+
+    /// The highest column one alias of `plan` may read: anywhere in its statement, its unit and
+    /// membership columns, its literal image and its partial keys.
+    fn read_alias(&mut self, plan: &ViewPlan, ai: usize) {
+        let a = &plan.aliases[ai];
+        let hi = a
+            .referenced
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b)
+            .map(|(c, _)| c)
+            .chain(
+                a.membership
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b)
+                    .map(|(c, _)| c),
+            )
+            .chain(a.image_cols.iter().copied())
+            .chain(a.direct_unit.iter().flatten().copied())
+            .chain(
+                plan.partial_of(ai)
+                    .into_iter()
+                    .flat_map(|(_, p)| p.iter().copied()),
+            )
+            .max();
+        if let Some(c) = hi {
+            self.read(c);
+        }
+    }
+
+    /// Up to the last stored column of a shape (a cascade parent, a mapped child: which columns
+    /// the derivation reads is cascade code's business, so every stored one is asked for; a
+    /// generated one above them all is don't-care, a generated one below is needed for the
+    /// positions of the others).
+    fn read_shape(&mut self, columns: &[crate::catalog::Column]) {
+        if let Some(c) = columns.iter().rposition(|c| c.generated.is_none()) {
+            self.read(c);
+        }
+    }
+
+    /// A whole-view plan's column mask: `feed_rows` skips the refresh when none of these
+    /// columns changed, so a value misread there would leave the view stale.
+    fn read_mask(&mut self, mask: &[bool]) {
+        if let Some(c) = mask.iter().rposition(|b| *b) {
+            self.read(c);
+        }
+    }
+}
+
+/// The unit columns an incremental `Alias` feed reads straight from the images, in the order
+/// `accumulate::feed` takes its buckets (direct unit, partial set, literal image). `None` when
+/// the set is empty or names a column the table does not have: then only the whole-view
+/// refresh is safe.
+fn unit_cols(plan: &ViewPlan, ai: usize) -> Option<Box<[u16]>> {
+    let a = &plan.aliases[ai];
+    let cols: &[usize] = match &a.direct_unit {
+        Some(d) => d,
+        None => match plan.partial_of(ai) {
+            Some((_, p)) => p,
+            None => &a.image_cols,
+        },
+    };
+    (!cols.is_empty() && cols.iter().all(|&c| c < a.table.columns.len()))
+        .then(|| cols.iter().map(|&c| c as u16).collect())
+}
+
+type XaRow = (TableRef, Option<BinlogRow>, Option<BinlogRow>);
 /// An XA transaction read from the binlog; its rows are applied at XA COMMIT.
 struct XaTxn {
     /// The cursor before it (replaying from there re-reads its rows); `Cursor::is_some`
@@ -937,6 +1036,13 @@ struct Engine {
     /// Tables we have created and own: (name, target) → definition hash.
     owned: HashMap<(String, String), String>,
     routes: HashMap<TableRef, Arc<Vec<RouteT>>>,
+    /// Per routed table: what a row image must carry for its feeds to read the right columns
+    /// (review C-02), precomputed with `routes` and aligned with its `RouteT`s.
+    route_need: HashMap<TableRef, Arc<TableNeed>>,
+    /// Live/next versions running on the dedup core (no `RouteT`s) that read each table: a
+    /// short row image answers them with a whole-view refresh (the consumer of the core is
+    /// copy-set code and cannot tell the compacted image from a full one).
+    core_reads: HashMap<TableRef, Vec<(usize, bool)>>,
     /// TABLE_MAP ids of the current transaction (re-sent for every transaction; cleared at
     /// each boundary so table id churn cannot grow it).
     table_ids: HashMap<
@@ -945,6 +1051,7 @@ struct Engine {
             TableRef,
             Option<Arc<Vec<RouteT>>>,
             Option<crate::dedup::Source>,
+            Option<Arc<TableNeed>>,
         ),
     >,
     /// (table, binlog column count) → column count of the table's current definition.
@@ -2208,6 +2315,8 @@ impl Engine {
             def_names: HashMap::new(),
             owned,
             routes: HashMap::new(),
+            route_need: HashMap::new(),
+            core_reads: HashMap::new(),
             table_ids: HashMap::new(),
             shapes: HashMap::new(),
             xa_current: None,
@@ -4072,6 +4181,10 @@ impl Engine {
         // seeds keeps its target held (fed nothing) until its install/drain delivers it.
         self.move_core_caches(&synced);
         let mut routes: HashMap<TableRef, Vec<RouteT>> = HashMap::new();
+        // Short-image guards (review C-02) built with the routes: `units` of a table's
+        // accumulator is pushed exactly where its `routes` entry is, keeping them aligned.
+        let mut needs: HashMap<TableRef, NeedAcc> = HashMap::new();
+        let mut core_reads: HashMap<TableRef, Vec<(usize, bool)>> = HashMap::new();
         let mut stolen_cache: Vec<usize> = Vec::new();
         for (si, s) in self.slots.iter().enumerate() {
             let versions = [
@@ -4088,6 +4201,14 @@ impl Engine {
                 if on_core {
                     // A live version on the core: its rows go to the core's consumer, not to a
                     // `RouteT` fan-out (a refused plan keeps its routes, draining entry or not).
+                    // Register it as a reader of its alias tables (review C-02): the consumer
+                    // cannot tell a compacted image from a full one (copy-set code), so a short
+                    // image refreshes its view as a whole; its reads still widen the need mask.
+                    for (ai, a) in plan.aliases.iter().enumerate() {
+                        let t = (a.table.schema.clone(), a.table.name.clone());
+                        core_reads.entry(t.clone()).or_default().push((si, next));
+                        needs.entry(t).or_default().read_alias(plan, ai);
+                    }
                     continue;
                 }
                 if !next && !self.dedup.is_refused(s.def_id) && self.dedup.entry(s.def_id).is_some()
@@ -4108,11 +4229,32 @@ impl Engine {
                                 next,
                                 kind: RouteKind::Alias(ai),
                             });
+                        let nd = needs
+                            .entry((a.table.schema.clone(), a.table.name.clone()))
+                            .or_default();
+                        nd.read_alias(plan, ai);
+                        // Only a unit-based (incremental) Alias feed can name its units from
+                        // the image; a Global view's answer to any short image is its single
+                        // whole-view refresh (`mark_all`).
+                        nd.units.push(if plan.is_incremental() {
+                            unit_cols(plan, ai)
+                        } else {
+                            None
+                        });
                     }
                 } else {
                     for (ti, t) in plan.tables.iter().enumerate() {
+                        let nd = needs.entry(t.clone()).or_default();
                         let kind = match plan.table_columns.get(ti) {
-                            Some(Some(_)) => RouteKind::All(ti),
+                            // The mask names the columns the statement reads and `feed_rows`
+                            // skips the refresh when none of them changed: a value misread
+                            // there would keep the view stale, so ask for the mask's prefix.
+                            Some(Some(m)) => {
+                                nd.read_mask(m);
+                                RouteKind::All(ti)
+                            }
+                            // Any change refreshes the whole view: a short image asks for
+                            // nothing beyond what that refresh already does.
                             _ => RouteKind::Any,
                         };
                         routes.entry(t.clone()).or_default().push(RouteT {
@@ -4120,6 +4262,8 @@ impl Engine {
                             next,
                             kind,
                         });
+                        // A whole-view route reads no unit out of an image.
+                        nd.units.push(None);
                     }
                 }
                 // (A traced cascade is found through the parent's alias route.)
@@ -4132,6 +4276,14 @@ impl Engine {
                             next,
                             kind: RouteKind::Cascade(ci),
                         });
+                    let nd = needs
+                        .entry((c.parent.schema.clone(), c.parent.name.clone()))
+                        .or_default();
+                    // Which parent columns the derivation reads is the cascade's own business
+                    // (copy-set code): require every stored one, and answer a short image with
+                    // the whole-view refresh.
+                    nd.read_shape(&c.parent.columns);
+                    nd.units.push(None);
                 }
                 for (ci, c) in plan
                     .cascades
@@ -4144,6 +4296,9 @@ impl Engine {
                         next,
                         kind: RouteKind::MapChild(ci),
                     });
+                    let nd = needs.entry(c.child.clone()).or_default();
+                    nd.read_shape(&c.child_table.columns);
+                    nd.units.push(None);
                 }
             }
         }
@@ -4157,6 +4312,19 @@ impl Engine {
             }
         }
         self.routes = routes.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        self.route_need = needs
+            .into_iter()
+            .map(|(k, a)| {
+                (
+                    k,
+                    Arc::new(TableNeed {
+                        reads: a.reads,
+                        units: a.units.into_boxed_slice(),
+                    }),
+                )
+            })
+            .collect();
+        self.core_reads = core_reads;
         self.table_ids.clear();
     }
 
@@ -4378,7 +4546,7 @@ impl Engine {
                 let read = self
                     .table_ids
                     .get(table_id)
-                    .is_some_and(|(_, route, src)| route.is_some() || src.is_some());
+                    .is_some_and(|(_, route, src, _)| route.is_some() || src.is_some());
                 read && Metrics::get(&self.metrics.events_undecodable) < u64::from(n)
             }
             _ => false,
@@ -5086,13 +5254,16 @@ impl Engine {
                 // The definitions table and the commit fence's table are ours: no view reads
                 // them, both are remembered without a route.
                 if key.0 == self.schema && (key.1 == meta::DEFS || key.1 == mysql::table()) {
-                    self.table_ids.insert(table_id, (key, None, None));
+                    self.table_ids.insert(table_id, (key, None, None, None));
                     return Ok(());
                 }
                 let route = match self.routes.get(&key).cloned() {
                     Some(r) => Some(self.check_shapes(&key, r, columns).await),
                     None => None,
                 };
+                // What a row image of this table must carry for its feeds (review C-02), fixed
+                // for this TABLE_MAP together with the route: never recomputed per event.
+                let need = self.route_need.get(&key).cloned();
                 // Core targets: this table as the core's consumer sees it; an occurrence
                 // planned for another column count re-plans its view (as `check_shapes` does
                 // for outdated plans on routes).
@@ -5220,7 +5391,7 @@ impl Engine {
                         src = self.dedup.core.source(&key, Some(columns as usize));
                     }
                 }
-                self.table_ids.insert(table_id, (key, route, src));
+                self.table_ids.insert(table_id, (key, route, src, need));
             }
             Item::Rows {
                 table_id,
@@ -5228,7 +5399,7 @@ impl Engine {
                 event,
             } => {
                 self.in_txn = true;
-                let Some((key, route, src)) = self.table_ids.get(&table_id).cloned() else {
+                let Some((key, route, src, need)) = self.table_ids.get(&table_id).cloned() else {
                     return Ok(());
                 };
                 if key.0 == self.schema && key.1 == meta::DEFS {
@@ -5262,8 +5433,17 @@ impl Engine {
                     // No view reads it now; one defined while this transaction is prepared may.
                     // Keep its rows so `xa_committed` can feed that view instead of rebuilding it
                     // (owner rule), up to one prepared transaction's budget of kept rows.
+                    // Review C-02: an image that is not full is never kept. Its values are
+                    // positional and which columns that future view would read is not known yet,
+                    // so it must not be fed compacted ones later: the table joins the rows-dropped
+                    // path and `xa_committed` refreshes a view defined on it from the source.
+                    let short = keep_unrouted && !Self::image_full(&event);
+                    if short {
+                        let at = self.boundary.to_position();
+                        Self::count_short_image(&self.metrics, &key, kind, &at);
+                    }
                     if let Some((_, xa)) = self.xa_current.as_mut() {
-                        if keep_unrouted {
+                        if keep_unrouted && !short {
                             let rows = reader.rows(table_id, &event)?;
                             xa.bytes += rows.len() * KEY_BYTES;
                             xa.rows
@@ -5298,6 +5478,30 @@ impl Engine {
                         .is_some_and(|rt| rt.iter().any(|r| r.kind != RouteKind::Any));
                 if !need_rows {
                     return Ok(());
+                }
+                // Review C-02: the event's present-column bitmaps against the set this table's
+                // feeds read — precomputed at route build, tested once per event (one pass of
+                // the two bitmaps, no row decode; the common full image passes without a
+                // marking). A needed real column left out means every positional read of the
+                // image would land on another column's value: nothing of this event is applied.
+                if let Some(nd) = &need {
+                    if Self::event_short(&event, nd) {
+                        self.note_short_image(
+                            reader,
+                            table_id,
+                            &event,
+                            kind,
+                            &key,
+                            nd,
+                            route.as_ref().map(|r| r.as_slice()),
+                            &since,
+                        )?;
+                        if let Some((_, xa)) = self.xa_current.as_mut() {
+                            // The compacted rows must not be re-fed at COMMIT either (above).
+                            xa.other_tables.insert(key);
+                        }
+                        return Ok(());
+                    }
                 }
                 let rows = reader.rows(table_id, &event)?;
                 if let Some(route) = &route {
@@ -5790,6 +5994,248 @@ impl Engine {
         self.first_dirty.get_or_insert_with(Instant::now);
         Metrics::add(&self.metrics.rows_seen, seen);
         Metrics::add(&self.metrics.rows_skipped, skipped);
+    }
+
+    /// Hot path (review C-02): the event's own present-column bitmaps against the prefix this
+    /// table's feeds read — a set precomputed with the routes, never with the event. Once per
+    /// rows event, never per row, and no row decode: the two bitmaps are fields of the event
+    /// header and the rows are not touched here (nor decoded more than they were). A full image
+    /// — every column the event names is present, which is what `binlog_row_image=FULL` writes —
+    /// costs the length compare plus one popcount of the bitmap's own bytes (one word for a
+    /// table of up to 64 columns) per image side, and marks nothing. A non-rows event reads as
+    /// covered; `reader.rows` has the saying there.
+    fn event_short(event: &Event, need: &TableNeed) -> bool {
+        let Some(hi) = need.reads else {
+            return false;
+        };
+        match event.read_data() {
+            Ok(Some(EventData::RowsEvent(re))) => {
+                let sides = [re.columns_before_image(), re.columns_after_image()];
+                // Short when an image side the event writes does not carry the whole prefix. A
+                // side it does not write (an insert has no before-image) is covered, and so is
+                // one that carries every column up to the last one the feeds read.
+                sides
+                    .into_iter()
+                    .any(|bits| !bits.is_none_or(|b| b.get(..=hi).is_some_and(|s| s.all())))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether both images of a rows event carry every column the event names (review C-02).
+    /// The rule for a table no view reads yet, where the prefix its feeds would need is not
+    /// known: rows of anything less than a full image are not kept for a view defined inside an
+    /// XA window, because a view of that table would read the compacted values by position.
+    fn image_full(event: &Event) -> bool {
+        match event.read_data() {
+            Ok(Some(EventData::RowsEvent(re))) => {
+                let sides = [re.columns_before_image(), re.columns_after_image()];
+                sides.into_iter().all(|bits| bits.is_none_or(|b| b.all()))
+            }
+            _ => true,
+        }
+    }
+
+    /// Counted the short row event and warned (once per interval): review S-08 — kind, schema,
+    /// table and binlog position only, never a row value. Takes the metrics rather than `&self`
+    /// so the XA hold can count while it holds `xa_current` mutably.
+    fn count_short_image(metrics: &Metrics, key: &TableRef, kind: binlog::RowsKind, at: &Position) {
+        Metrics::add(&metrics.short_row_images, 1);
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        crate::accumulate::warn_throttled(&LAST, || {
+            warn!(
+                kind = match kind {
+                    binlog::RowsKind::Insert => "insert",
+                    binlog::RowsKind::Update => "update",
+                    binlog::RowsKind::Delete => "delete",
+                },
+                schema = %key.0,
+                table = %key.1,
+                at = %at,
+                "a row image left out a column the reader needs by position \
+                 (binlog_row_image is not FULL for the writing session, or the global value \
+                 moved after start): such values are never applied; the views that read the \
+                 table are refreshed from the source"
+            );
+        });
+    }
+
+    /// Review C-02: a rows event that left out a real column this table's feeds read. Its
+    /// values are never applied (a compacted image is positional: the missing column shifts
+    /// every value after it). Each version reading the table is answered the cheapest safe
+    /// way: when the event names the unit keys of all its routes on this table — the unit
+    /// columns present in both images — exactly those units are marked and the refresh reads
+    /// their current rows from the source; otherwise the view is marked for one whole-view
+    /// refresh (`accumulate::mark_all`, the #167 path: a refresh, not a rebuild). Versions
+    /// whose rows the dedup core's consumer takes always take the whole-view refresh: the
+    /// consumer is copy-set code and cannot tell the compacted image from a full one.
+    #[allow(clippy::too_many_arguments)]
+    fn note_short_image(
+        &mut self,
+        reader: &BinlogReader,
+        table_id: u64,
+        event: &Event,
+        kind: binlog::RowsKind,
+        key: &TableRef,
+        need: &TableNeed,
+        route: Option<&[RouteT]>,
+        since: &Position,
+    ) -> Result<()> {
+        Self::count_short_image(&self.metrics, key, kind, since);
+        // The event's own present-column bitmaps, copied out (the parse of the event does not
+        // outlive the arm that reads it) with whether it writes that side at all. Rare path: an
+        // image short of FULL only.
+        let (sides, has_b, has_a) = match event.read_data() {
+            Ok(Some(EventData::RowsEvent(re))) => (
+                [
+                    re.columns_before_image().map(|b| b.to_bitvec()),
+                    re.columns_after_image().map(|b| b.to_bitvec()),
+                ],
+                matches!(kind, binlog::RowsKind::Update | binlog::RowsKind::Delete),
+                matches!(kind, binlog::RowsKind::Update | binlog::RowsKind::Insert),
+            ),
+            _ => ([None, None], false, false),
+        };
+        let bits = |i: usize| sides[i].as_ref().map(|b| b.as_bitslice());
+        // Whether every column of `cols` stands in each image side the event writes.
+        let cols_ok = |cols: &[u16]| -> bool {
+            [0, 1].into_iter().zip([has_b, has_a]).all(|(i, want)| {
+                !want
+                    || bits(i).is_some_and(|b| {
+                        cols.iter().all(|&c| {
+                            (c as usize) < b.len() && b.get(c as usize).is_some_and(|x| *x)
+                        })
+                    })
+            })
+        };
+        // Marks the units one row change of the `Alias` feed touches, reading a unit column at
+        // its place among the values the image carries (the caller proved those columns
+        // arrived). Both sides of the row are always marked — refreshing a unit that did not
+        // move costs one lookup the refresh makes anyway, missing one that did leaves the view
+        // wrong — through the same three buckets as `accumulate::feed` (direct unit, partial
+        // set, literal image) and in its order, without its change checks: a compacted image
+        // cannot be trusted to say what changed.
+        let mark_units = |plan: &ViewPlan,
+                          ai: usize,
+                          dirty: &mut ViewDirty,
+                          cols: &[u16],
+                          before: Option<&BinlogRow>,
+                          after: Option<&BinlogRow>| {
+            let a = &plan.aliases[ai];
+            // Which bucket `feed` would mark for this alias, sized for the write here.
+            enum Bucket {
+                Units,
+                Partial(usize),
+                Images,
+            }
+            let bucket = if a.direct_unit.is_some() {
+                Bucket::Units
+            } else if let Some((set, _)) = plan.partial_of(ai) {
+                if dirty.partial.len() <= set {
+                    dirty.partial.resize_with(set + 1, UnitSet::default);
+                }
+                Bucket::Partial(set)
+            } else {
+                if dirty.images.len() <= ai {
+                    dirty.images.resize(plan.aliases.len(), KeySet::default());
+                }
+                Bucket::Images
+            };
+            for (row, side, want) in [(before, bits(0), has_b), (after, bits(1), has_a)] {
+                let (Some(row), Some(side), true) = (row, side, want) else {
+                    continue;
+                };
+                // A column's place among the values a compacted image carries: the number of
+                // present columns below it.
+                let key: Key = cols
+                    .iter()
+                    .map(|&c| {
+                        let c = c as usize;
+                        let at = side.get(..c).map_or(0, |s| s.count_ones());
+                        Datum::from_binlog(row.as_ref(at), &a.table.columns[c])
+                    })
+                    .collect();
+                match bucket {
+                    Bucket::Units => dirty.mark(key),
+                    Bucket::Partial(set) => {
+                        let fresh = dirty.partial[set].insert(key);
+                        dirty.tally.id(fresh);
+                    }
+                    Bucket::Images => {
+                        let fresh = dirty.images[ai].insert(key);
+                        dirty.tally.image(fresh);
+                    }
+                }
+            }
+        };
+        if let Some(route) = route {
+            let mut rows: Option<Vec<(Option<BinlogRow>, Option<BinlogRow>)>> = None;
+            let mut done: Vec<(usize, bool)> = Vec::new();
+            for r in route.iter() {
+                if done.contains(&(r.slot, r.next)) {
+                    continue;
+                }
+                done.push((r.slot, r.next));
+                // Unit-wise when every route of this version on this table yields its unit
+                // keys from the images; whole-view otherwise.
+                let mut al: Vec<(usize, &[u16])> = Vec::new();
+                let mut unitwise = true;
+                for (i, x) in route.iter().enumerate() {
+                    if x.slot != r.slot || x.next != r.next {
+                        continue;
+                    }
+                    match x.kind {
+                        RouteKind::Any => {}
+                        RouteKind::Alias(ai) => {
+                            let Some(cols) = need.units.get(i).and_then(|u| u.as_deref()) else {
+                                unitwise = false;
+                                break;
+                            };
+                            if !cols_ok(cols) {
+                                unitwise = false;
+                                break;
+                            }
+                            al.push((ai, cols));
+                        }
+                        _ => {
+                            unitwise = false;
+                            break;
+                        }
+                    }
+                }
+                let Some((plan, dirty, ver_since)) = self.version_of(*r) else {
+                    continue;
+                };
+                if unitwise && plan.is_incremental() {
+                    if rows.is_none() {
+                        rows = Some(reader.rows(table_id, event)?);
+                    }
+                    for (b, a) in rows.as_ref().expect("decoded once") {
+                        for (ai, cols) in &al {
+                            mark_units(plan, *ai, dirty, cols, b.as_ref(), a.as_ref());
+                        }
+                    }
+                } else {
+                    dirty.mark_all(plan);
+                }
+                ver_since.get_or_insert_with(|| since.clone());
+            }
+        }
+        for (slot, next) in self.core_reads.get(key).cloned().unwrap_or_default() {
+            // The core's consumer reads the image by position and cannot skip a short one:
+            // the whole-view refresh for every version it runs.
+            let Some((plan, dirty, ver_since)) = self.version_of(RouteT {
+                slot,
+                next,
+                kind: RouteKind::Any,
+            }) else {
+                continue;
+            };
+            dirty.mark_all(plan);
+            ver_since.get_or_insert_with(|| since.clone());
+        }
+        self.first_dirty.get_or_insert_with(Instant::now);
+        Ok(())
     }
 
     /// Hot path, executor (a): the rows of a source table to the dedup core, whose consumer replaces the

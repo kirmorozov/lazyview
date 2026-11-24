@@ -18,6 +18,8 @@ mod json;
 mod lifecycle;
 #[path = "regressions/pinned.rs"]
 mod pinned;
+#[path = "regressions/short_image.rs"]
+mod short_image;
 #[path = "regressions/state.rs"]
 mod state;
 

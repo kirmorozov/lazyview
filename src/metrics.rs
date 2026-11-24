@@ -84,6 +84,13 @@ counters!(
     // until a rebuild (review C-03). Counted per event; the WARN line itself is rate-limited to
     // one per table per interval by `Engine::note_statement_dml`. For the alert work (03-obs-plan).
     statement_events_ignored,
+    // Row events that left out a real column a view reading the table needs (a session set
+    // `binlog_row_image` away from FULL, or the global value moved after startup — review
+    // C-02): the misread values are never applied; the affected views are refreshed from the
+    // source (per unit where the image still names the unit keys, whole-view otherwise).
+    // Counted per event; the WARN line is rate-limited (review S-08). For the alert work
+    // (03-obs-plan).
+    short_row_images,
     // Child rows a mapped cascade changed, replayed from the in-memory cascade cache
     // (src/cascade.rs): the global sum over views, added in publish_stats.
     cascade_rows,
