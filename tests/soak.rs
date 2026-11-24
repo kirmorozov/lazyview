@@ -134,7 +134,11 @@ fn soak_smoke_30m() {
 }
 
 /// The 24–72 hour run of §5, on the harness's own servers (`LAZYVIEW_TEST_SOAK_CONTAINERS`):
-/// lv-super starts it before v0.2.0 and before any pilot, through `scripts/soak.sh long`.
+/// lv-super starts it before v0.2.0 and before any pilot with `scripts/soak.sh long [hours]`
+/// (1–72, default 48). The runner verifies the two throwaways of D1 (lvtmp-soak-1, mysql84
+/// :34941, the source; lvtmp-soak-2, mariadb1011 :34942, the chaos target), runs this test
+/// alone on the source DSN — no heavy-suite lock while it runs (S4/D9) — and prints the
+/// `report.md` of §4, written under `tmp/out/lvs-soak/runs/`.
 #[test]
 fn soak_long() {
     soak_mode("long");
