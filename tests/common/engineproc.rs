@@ -900,6 +900,13 @@ impl EngineProc {
         if let Ok(v) = std::env::var("LAZYVIEW_SUPERVISOR") {
             env.insert("LAZYVIEW_SUPERVISOR".into(), v);
         }
+        // DIAGNOSTIC (temporary, #319): the row-trace switches of `engine.rs` reach the engine the
+        // same way, so a scenario can follow one key from the binlog to the materialized table.
+        for k in ["LAZYVIEW_TEST_M1_TRACE", "LAZYVIEW_TEST_M1_VIEWS"] {
+            if let Ok(v) = std::env::var(k) {
+                env.insert(k.into(), v);
+            }
+        }
         for (k, v) in overrides {
             env.insert((*k).to_string(), (*v).to_string());
         }

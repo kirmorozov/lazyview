@@ -1528,6 +1528,104 @@ fn columns_changed(before: &BinlogRow, after: &BinlogRow, cols: &[bool]) -> bool
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// #319 mode-1 hunt: temporary row trace (DIAGNOSTIC ONLY — dropped before the PR lands).
+// Off unless LAZYVIEW_TEST_M1_TRACE names one source table; LAZYVIEW_TEST_M1_VIEWS narrows the
+// per-view lines to a comma list. It exists to answer, for a lost row, the three separate
+// questions the kept logs cannot: was the event READ, was it FED to this view, was its unit
+// WRITTEN — and at which position.
+// ---------------------------------------------------------------------------------------------
+
+/// The table the trace follows, if any (read once).
+fn m1_table() -> Option<&'static str> {
+    static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        std::env::var("LAZYVIEW_TEST_M1_TRACE")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+    .as_deref()
+}
+
+/// Whether the trace follows rows of `table`.
+fn m1_rows(table: &str) -> bool {
+    m1_table().is_some_and(|t| t == table)
+}
+
+/// Whether the row trace is on at all: `LAZYVIEW_TEST_M1_TRACE=<table>` in the engine's env. The
+/// lines that are not about one table's rows (a position save, a view's drain) ask only this.
+fn m1_on() -> bool {
+    m1_table().is_some()
+}
+
+/// Whether the trace follows view `name` (only ever asked while the trace is on).
+fn m1_view(name: &str) -> bool {
+    if m1_table().is_none() {
+        return false;
+    }
+    static V: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let v = V.get_or_init(|| {
+        std::env::var("LAZYVIEW_TEST_M1_VIEWS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    v.is_empty() || v.iter().any(|x| x == name)
+}
+
+/// One row side as `a|b|c`, `-` for a side an INSERT/DELETE does not have.
+fn m1_side(row: Option<&BinlogRow>) -> String {
+    let Some(r) = row else {
+        return "-".into();
+    };
+    // The leading columns are the key and what the views read; a whole wide row per event is what
+    // made a traced run's log 240 MB and the engine fall behind its stream.
+    (0..r.len().min(6))
+        .map(|c| match r.as_ref(c) {
+            Some(v) => format!("{v:?}"),
+            None => "·".into(),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// A batch of row changes as `before=>after` pairs.
+fn m1_dump(rows: &[(Option<BinlogRow>, Option<BinlogRow>)]) -> String {
+    rows.iter()
+        .map(|(b, a)| format!("{}=>{}", m1_side(b.as_ref()), m1_side(a.as_ref())))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The ids a set holds, as `n[1,2,3]` (values only up to 40 of them: `to_sorted_vec` allocates, and
+/// `{:?}` on a bitmap set prints its whole internals — what made a traced run's log 240 MB).
+fn m1_ints(s: &crate::intset::IntSet) -> String {
+    let n = s.len();
+    if n > 40 {
+        return format!("{n}[…]");
+    }
+    let v = s.to_sorted_vec();
+    let shown: Vec<String> = v
+        .iter()
+        .map(|x| crate::intset::to_i64(*x).to_string())
+        .collect();
+    format!("{}[{}]", v.len(), shown.join(","))
+}
+
+/// A row's first column, which is the key the views' units are named by: what a per-view line needs
+/// to be matched with the event's `READ` line without printing the row six times.
+fn m1_key(row: Option<&BinlogRow>) -> String {
+    let Some(r) = row else {
+        return "-".into();
+    };
+    match r.as_ref(0) {
+        Some(v) => format!("{v:?}"),
+        None => "·".into(),
+    }
+}
+
 /// Target ids waiting in a buffer: its units and partial unit keys, or a global view's single
 /// row.
 fn pending_ids(d: &ViewDirty, plan: &ViewPlan) -> u64 {
@@ -5243,6 +5341,19 @@ impl Engine {
                     return Ok(());
                 }
                 let rows = reader.rows(table_id, &event)?;
+                // DIAGNOSTIC (temporary): the changes this instance was handed for a watched
+                // table — what the binlog reader gave the engine, before any of it is routed.
+                if m1_rows(&key.1) {
+                    tracing::trace!(
+                        target: "m1trace",
+                        "READ tbl={} kind={:?} route={} src={} rows=[{}]",
+                        key.1,
+                        kind,
+                        route.is_some(),
+                        src.is_some(),
+                        m1_dump(&rows),
+                    );
+                }
                 if let Some(route) = &route {
                     self.feed_rows(route, &rows, &since);
                 }
@@ -5680,6 +5791,11 @@ impl Engine {
         for (before, after) in rows {
             seen += 1;
             for (ri, r) in route.iter().enumerate() {
+                let m1_name = if m1_on() {
+                    self.slots.get(r.slot).map(|s| s.name.clone()).unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let Some((plan, dirty, ver_since)) = self.version_of(*r) else {
                     continue;
                 };
@@ -5721,6 +5837,27 @@ impl Engine {
                     },
                     RouteKind::Any => continue,
                 };
+                // DIAGNOSTIC (temporary): the mark this row left on the view's live buffer. An
+                // unmarked row (`marked=false`) is a row that goes nowhere until something else
+                // marks the same key.
+                if m1_view(&m1_name) {
+                    tracing::trace!(
+                        target: "m1trace",
+                        "FED view={} next={} kind={:?} fed={:?} marked={} units={} keys={} partial={} all={} rebuild={} row={}=>{}",
+                        m1_name,
+                        r.next,
+                        r.kind,
+                        fed,
+                        !dirty.is_empty(),
+                        m1_ints(&dirty.units.ints),
+                        dirty.units.keys.len(),
+                        dirty.partial.len(),
+                        dirty.all,
+                        dirty.rebuild,
+                        m1_key(before.as_ref()),
+                        m1_key(after.as_ref()),
+                    );
+                }
                 dirty.tally.row(fed == Fed::Skipped);
                 match fed {
                     Fed::Skipped => skipped += 1,
@@ -7516,6 +7653,22 @@ impl Engine {
         }
         let recent = std::mem::take(&mut l.recent);
         let since = l.since.clone();
+        // DIAGNOSTIC (temporary): the marks this refresh took out of the live buffer, the targets
+        // it will write, and the ones it is skipping because they lag or are behind.
+        if m1_view(&name) {
+            tracing::trace!(
+                target: "m1trace",
+                "DRAIN view={} targets=[{}] lagging=[{:?}] units={} keys={} partial={} all={} since={:?}",
+                name,
+                targets.join(","),
+                lagging,
+                m1_ints(&dirty.units.ints),
+                dirty.units.keys.len(),
+                dirty.partial.len(),
+                dirty.all,
+                since.as_ref().map(|p| p.to_string()),
+            );
+        }
         Some(LiveRefresh {
             plan,
             layout,
@@ -7549,6 +7702,23 @@ impl Engine {
         let Some(l) = s.live.as_mut() else {
             return;
         };
+        // DIAGNOSTIC (temporary): the targets this refresh actually wrote, and the ones that
+        // missed it (they owe what the drain carried).
+        if m1_view(&name) {
+            tracing::trace!(
+                target: "m1trace",
+                "WROTE view={} targets=[{}] failed=[{}] lagging=[{:?}] applied_units={}",
+                name,
+                targets.join(","),
+                r.failed
+                    .iter()
+                    .map(|(t, _)| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                lagging,
+                m1_ints(&r.units.ints),
+            );
+        }
         self.flush_wrote.push((i, targets.to_vec()));
         // Targets that missed this refresh (or earlier ones) get the units later.
         for (t, e) in &r.failed {
@@ -7711,7 +7881,30 @@ impl Engine {
             for t in flagged {
                 l.behind.remove(&t);
                 if l.dirty.units.is_empty() && l.dirty.partial.is_empty() && !l.dirty.all {
+                    // DIAGNOSTIC (temporary): the flag is dropped because the live buffer is empty
+                    // now — which is only the same as "this target never missed a change" while
+                    // nothing has drained the marks it was owed.
+                    if m1_view(&l.name) {
+                        tracing::trace!(
+                            target: "m1trace",
+                            "BEHIND view={} target={} dropped: live buffer empty, nothing owed",
+                            l.name,
+                            t,
+                        );
+                    }
                     continue;
+                }
+                if m1_view(&l.name) {
+                    tracing::trace!(
+                        target: "m1trace",
+                        "BEHIND view={} target={} seeded lag units={} keys={} partial={} all={}",
+                        l.name,
+                        t,
+                        m1_ints(&l.dirty.units.ints),
+                        l.dirty.units.keys.len(),
+                        l.dirty.partial.len(),
+                        l.dirty.all,
+                    );
                 }
                 let seed = Lag {
                     units: l.dirty.units.clone(),
@@ -8209,7 +8402,34 @@ impl Engine {
                     .and_then(|s| s.live.as_ref())
                     .is_some_and(|l| !l.frozen && !self.dedup.plan_matches(def_id, &l.plan))
         });
+        // DIAGNOSTIC (temporary): who owns this chunk's rows — the core (a), or the RouteT fan-out
+        // (b) whose rows were fed at the binlog event. `taken=true` with no `FED` line for the same
+        // key is a row that ends applied to nothing.
+        if m1_view(&self.slots[i].name) {
+            tracing::trace!(
+                target: "m1trace",
+                "TAKEN view={} job={} taken={} refused={} live={} frozen={} swapping={} entry={}",
+                self.slots[i].name,
+                job.id.0,
+                taken,
+                self.dedup.is_refused(def_id),
+                self.slots[i].live.is_some(),
+                self.slots[i].live.as_ref().is_some_and(|l| l.frozen),
+                self.slots[i].next.as_ref().is_some_and(|n| n.swapping),
+                self.dedup.entry(def_id).is_some(),
+            );
+        }
         if taken && self.slots[i].live.is_none() {
+            // DIAGNOSTIC (temporary): the core's chunk is consumed here — applied by nobody, on the
+            // reading that executor (b) owns the view and already wrote these rows.
+            if m1_view(&self.slots[i].name) {
+                tracing::trace!(
+                    target: "m1trace",
+                    "DROP-CORE view={} job={} reason=taken-and-no-live-version",
+                    self.slots[i].name,
+                    job.id.0,
+                );
+            }
             self.dedup
                 .core
                 .complete(job.id, crate::dedup::JobResult::ok());
@@ -8235,6 +8455,22 @@ impl Engine {
             return;
         };
         let (mut dirty, links) = crate::exec::Dedup::to_dirty(&eplan, chunk);
+        // DIAGNOSTIC (temporary): the ids this core job carries for its view, before the hop
+        // lookups answer for them.
+        if m1_view(&self.slots[i].name) {
+            tracing::trace!(
+                target: "m1trace",
+                "CORE-JOB view={} job={} target={:?} units={} keys={} partial={} all={} links={}",
+                self.slots[i].name,
+                job.id.0,
+                job.target,
+                m1_ints(&dirty.units.ints),
+                dirty.units.keys.len(),
+                dirty.partial.len(),
+                dirty.all,
+                links.len(),
+            );
+        }
         let (mut answers, mut queries, mut resolved) = (Vec::new(), 0u64, 0u64);
         if !links.is_empty() {
             match self
@@ -8267,9 +8503,38 @@ impl Engine {
                 }
             }
         }
+        // DIAGNOSTIC (temporary): the core's hop answers for this chunk — links asked, answers
+        // back, ids resolved. A link that comes back with no answer names no unit, so its row is
+        // refreshed for nobody.
+        if m1_view(&name) {
+            tracing::trace!(
+                target: "m1trace",
+                "HOP view={} job={} links={} answers={} resolved={} units={}",
+                name,
+                job.id.0,
+                links.len(),
+                answers.len(),
+                resolved,
+                m1_ints(&dirty.units.ints),
+            );
+        }
         if taken {
             // Executor (b) wrote these rows with the version's own plan: the core kept only
             // its hop answers.
+            // DIAGNOSTIC (temporary): the other place a chunk ends applied-to-nothing, on the
+            // reading that the RouteT fan-out wrote these ids.
+            if m1_view(&name) {
+                tracing::trace!(
+                    target: "m1trace",
+                    "DROP-CORE view={} job={} reason=taken-by-executor-b units={} keys={} partial={} all={}",
+                    name,
+                    job.id.0,
+                    m1_ints(&dirty.units.ints),
+                    dirty.units.keys.len(),
+                    dirty.partial.len(),
+                    dirty.all,
+                );
+            }
             self.dedup.core.complete(
                 job.id,
                 crate::dedup::JobResult {
@@ -8411,6 +8676,29 @@ impl Engine {
         units: &mut UnitSet,
     ) -> Result<()> {
         let fresh = |a: usize| images.get(a).is_some_and(|s| !s.is_empty());
+        // DIAGNOSTIC (temporary): which of this view's aliases had a changed row to resolve at all.
+        if m1_view(table) {
+            tracing::trace!(
+                target: "m1trace",
+                "LOOKUP view={} fresh={:?} plain={:?} lineage={:?}",
+                table,
+                (0..plan.aliases.len())
+                    .map(|a| usize::from(fresh(a)))
+                    .collect::<Vec<_>>(),
+                (0..plan.aliases.len())
+                    .map(|a| usize::from(plan.lineage_of(a).is_some()))
+                    .collect::<Vec<_>>(),
+                (0..plan.aliases.len())
+                    .map(|a| {
+                        usize::from(
+                            plan.aliases[a].direct_unit.is_none()
+                                && plan.lineage_of(a).is_none()
+                                && plan.partial_of(a).is_none(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
         for a in (0..plan.aliases.len()).filter(|&a| fresh(a)) {
             if plan.lineage_of(a).is_some() {
                 self.lineage_lookup(plan, layout, a, &images[a], targets, table, units)
@@ -8429,6 +8717,15 @@ impl Engine {
             for &a in plain.iter().filter(|&&a| fresh(a)) {
                 self.lookup(plan, &[(a, &images[a])], units).await?;
             }
+            if m1_view(table) {
+                tracing::trace!(
+                    target: "m1trace",
+                    "LOOKED view={} one-plain units={} partial_keys={}",
+                    table,
+                    m1_ints(&units.ints),
+                    units.keys.len(),
+                );
+            }
             return Ok(());
         }
         let combos = recent.combinations(&plain, images);
@@ -8438,6 +8735,15 @@ impl Engine {
                 _ => set.iter().map(|&a| (a, &combos.all[a])).collect(),
             };
             self.lookup(plan, &parts, units).await?;
+        }
+        if m1_view(table) {
+            tracing::trace!(
+                target: "m1trace",
+                "LOOKED view={} units={} partial_keys={}",
+                table,
+                m1_ints(&units.ints),
+                units.keys.len(),
+            );
         }
         if plain.iter().any(|&a| fresh(a)) {
             // Every change visible to the lookups above is in the binlog before this position.
@@ -8792,6 +9098,21 @@ impl Engine {
             None
         };
         self.persist_needed = true;
+        // DIAGNOSTIC (temporary): the row a save writes — the position and the GTID set that rides
+        // it. A saved set that claims more than `pos` covers is what lets a resume skip events.
+        if m1_on() {
+            tracing::trace!(
+                target: "m1trace",
+                "POS-SAVE pos={} boundary={} gtid={:?} carried={:?} seed_hiw={:?} xa_gap_dump={} force={}",
+                pos,
+                self.boundary.to_position(),
+                gtid,
+                self.persisted.gtid().map(str::to_string),
+                self.gtid_seed_hiw.as_ref().map(|p| p.to_string()),
+                self.xa_gap_no_gtid_dump,
+                force,
+            );
+        }
         meta::save_position(
             &mut self.meta,
             &self.cfg.instance_id,
