@@ -2240,10 +2240,13 @@ async fn tgt_blackhole(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -
     // failed target from the refresh and retries it from the kept keys; if a dead target can
     // stall `t2`, this wait fails and the suite says so.
     stop_writers(ctx, tx, writers).await?;
-    wait_until(
+    wait_target_exact(
+        &db,
+        "t2",
+        &t2,
+        &specs,
         "the direct target to stay exact while the proxied target is black-holed (independence broken)",
         FAULT_BUDGET,
-        || async { Ok(check_views_targets(&db, &tmap(&t2), &specs).await.is_ok()) },
     )
     .await?;
     toxi.remove_toxic(&p1, "bh").await?;

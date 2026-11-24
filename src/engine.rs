@@ -8182,32 +8182,54 @@ impl Engine {
         }
         let dirty = l.dirty.take();
         let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
-        let lagging: Vec<String> = l.lag.keys().chain(l.behind.keys()).cloned().collect();
-        let targets: Vec<String> = l
+        // Two kinds of excluded target, and they are not alike. `lag` holds the ones whose WRITES
+        // failed: the round must not hand them another connection. `behind` holds the ones that
+        // answered every write they were given and are only slow against the byte budget; they are
+        // excluded so the lag path can pull them along with the changes they missed. That exclusion
+        // is right only while another route exists. When it would leave the round with nobody to
+        // write to, they ARE the round's targets (main's behaviour, which converged): this path is
+        // their only delivery route, and with one dead peer and a tight budget they would otherwise
+        // sit out every round of the run — measured on `chaos_tgt_blackhole_during_flush` (percona84):
+        // the Full-mode view `w_union_kinds` had no eligible target on any round after the fault, so
+        // it was never rebuilt again and its healthy targets froze 129 rows behind the oracle.
+        let hard: Vec<String> = l.lag.keys().cloned().collect();
+        let behind: Vec<String> = l.behind.keys().cloned().collect();
+        let mut excluded: Vec<String> = hard.clone();
+        excluded.extend(behind.iter().cloned());
+        let mut lagging = excluded.clone();
+        let mut targets: Vec<String> = l
             .targets
             .iter()
             .filter(|t| !lagging.contains(t))
             .cloned()
             .collect();
+        if targets.is_empty() && !behind.is_empty() {
+            lagging = hard;
+            targets = l
+                .targets
+                .iter()
+                .filter(|t| !lagging.contains(t))
+                .cloned()
+                .collect();
+        }
         // #214 (target isolation): with no eligible target there is nothing to write AND no target
         // holding current rows to read the materialized table from — [`Self::read_materialized`]
         // reads the write set (`source` first, they hold the same rows), so an empty set only bought
         // a failing round: "reading the materialized table: no target answered", retried under
         // [`crate::supervisor::Policy::STATEMENTS`], with the buffer above gone along with the error.
-        // Nor may the changes stay in the buffer: only a successful flush clears it, and with one
-        // dead target the healthy ones are flagged behind on every round of the black-hole test's
-        // 1-byte budget, so this became the hot path and the buffer grew forever while its rows
-        // reached the healthy targets only as re-fed claims (`chaos_tgt_blackhole_during_flush`,
-        // percona84: the direct target 90 s behind the oracle). What a flush would have owed them,
-        // it owes them HERE: the taken buffer becomes their owed set, the entries are what
-        // `lag_end` writes and `lag_floor` pins into the saved position, and the buffer is cleared
-        // as a flush clears it. Cost (guard R3): one set feed per excluded target per round that
-        // carries something — never per binlog event.
+        // Nor may the changes stay in the buffer: only a successful flush clears it, so with every
+        // target's writes failing (the case left here, the fallback above having kept the healthy
+        // ones in) the buffer grew forever while its rows reached the survivors only as re-fed
+        // claims. What a flush would have owed them, it owes them HERE: the taken buffer becomes
+        // their owed set, the entries are what `lag_end` writes and `lag_floor` pins into the saved
+        // position, and the buffer is cleared as a flush clears it. Cost (guard R3): one set feed
+        // per excluded target per round that carries something — never per binlog event.
         if targets.is_empty() {
-            let carries = !dirty.units.is_empty()
+            let carries = dirty.rebuild
+                || !dirty.units.is_empty()
                 || !dirty.partial.iter().all(UnitSet::is_empty)
                 || dirty.all;
-            if carries && !dirty.rebuild {
+            if carries {
                 let floor = l
                     .since
                     .clone()
@@ -8227,20 +8249,31 @@ impl Engine {
                         posted_all: false,
                     });
                     if let Some(g) = l.lag.get_mut(t) {
-                        g.units.extend(dirty.units.clone());
-                        extend_partial(&mut g.partial, dirty.partial.clone());
-                        g.all |= dirty.all;
-                        // Same rule as `note_refresh` (#214): if this target's retry is claimed and
-                        // runs detached, its read predates these changes, so they must survive the
-                        // fold of its claim — `lag_subtract` re-adds exactly what was posted.
-                        g.posted.extend(dirty.units.clone());
-                        extend_partial(&mut g.posted_partial, dirty.partial.clone());
-                        g.posted_all |= dirty.all;
+                        if dirty.rebuild {
+                            // The whole-view case, and the ONLY one this PR introduces: what a
+                            // re-derive changes is not knowable per key, so the owed set cannot be
+                            // listed (lv-super ruling 2026-11-22 keeps `all` for the genuinely
+                            // unknowable debt only, documented at each site: here and in the Full
+                            // branch below). It is served by the existing STREAMED whole-view
+                            // refresh (#167), so the bounded-memory rule holds.
+                            g.all = true;
+                            g.posted_all = true;
+                        } else {
+                            g.units.extend(dirty.units.clone());
+                            extend_partial(&mut g.partial, dirty.partial.clone());
+                            g.all |= dirty.all;
+                            // Same rule as `note_refresh` (#214): if this target's retry is claimed and
+                            // runs detached, its read predates these changes, so they must survive the
+                            // fold of its claim — `lag_subtract` re-adds exactly what was posted.
+                            g.posted.extend(dirty.units.clone());
+                            extend_partial(&mut g.posted_partial, dirty.partial.clone());
+                            g.posted_all |= dirty.all;
+                        }
                     }
                 }
             } else {
-                // Nothing owed (the usual round of a quiescing schema), or a rebuild that no key
-                // list can express: keep it for the round that has a target to write to.
+                // Nothing owed (the usual round of a quiescing schema): keep it for the round
+                // that has a target to write to.
                 l.dirty = dirty;
             }
             return None;
