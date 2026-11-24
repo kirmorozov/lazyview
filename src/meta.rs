@@ -17,19 +17,33 @@ pub const STATUS: &str = "_lazyview_status";
 /// Name usable in `_lazyview.targets` for the source instance itself.
 pub const SOURCE_TARGET: &str = "source";
 
-/// The longest cursor text `binlog_cursor` can hold whole. The column is a `TEXT`
-/// ([`CREATE_STATUS`], and the `MIGRATIONS` entry that widened it): the MySQL family stores at
-/// most 65,535 **bytes** there and hands back the first ones of a longer value, so a cursor
-/// whose `[g=…]` set does not fit comes back from [`load_position`] cut in half — and an
-/// unterminated set is no cursor at all, so the start refuses to run (issue #347: a 30-minute
-/// smoke's `gtid_executed` reached that size — the row's own text carries 1,332 intervals before
-/// it stops mid-UUID — and its first `stop` event found the restarted engine dying on
-/// `the saved position "…[g=…" is no cursor this source speaks`). The bound keeps the whole set
-/// *and* the `file:pos` around it inside the column, with room to spare. The set is not merely
-/// long: it grows with every gap the server leaves in its GTID stream, so no column width bounds
-/// it, and this row is rewritten once per flush — a save that sheds an over-long set is the
-/// cheaper answer too.
-pub const MAX_CURSOR_BYTES: usize = 60 * 1024;
+/// The largest value a `MEDIUMTEXT` column holds whole: 2^24-1 **bytes** (the width
+/// [`CREATE_STATUS`] and the `MIGRATIONS` entry give `binlog_cursor`).
+const MEDIUMTEXT_BYTES: usize = 16 * 1024 * 1024 - 1;
+
+/// How far below [`MEDIUMTEXT_BYTES`] a cursor still counts as one the column can hold, so that
+/// the refusal of [`save_position`] is the message the operator reads rather than the server's
+/// own packet error. The value travels inside a statement (`UPDATE … SET binlog_cursor = ?`),
+/// and a server caps a statement at its `max_allowed_packet` — 16 MiB is what MariaDB ships with,
+/// so a cursor that wanted every last byte of the column could never be sent to such a server.
+/// Half a MiB covers the statement around the value and keeps the whole UPDATE under 16 MiB.
+const CURSOR_HEADROOM_BYTES: usize = 512 * 1024;
+
+/// The longest cursor text `binlog_cursor` can hold whole, and so the longest one
+/// [`save_position`] will hand the server. The MySQL family stores at most the column's bytes
+/// and, with `sql_mode` without `STRICT_TRANS_TABLES`, **hands back the first ones of a longer
+/// value and says nothing**: a cursor whose `[g=…]` set was cut comes back from [`load_position`]
+/// as an unterminated set, which is no cursor at all, and the start refuses to run. That is
+/// issue #347 — a 30-minute smoke's `gtid_executed` reached 1,332 intervals, the `TEXT` column
+/// of the day kept the first 65,535 of 69,000 bytes, and the first `stop` event found the
+/// restarted engine dying on `the saved position "…[g=…" is no cursor this source speaks`.
+/// Over the bound a cursor is **refused** (an error, nothing stored), never shortened: the set is
+/// what a resume by GTID is checked against on another server (the subset question of
+/// [`crate::source::gtid_covers`]), so a save that dropped it would silently disable the resume
+/// for exactly the long-lived clusters whose set outgrows a column. Widening the column to
+/// `MEDIUMTEXT` buys the room the set really needs; the bound here is the wall behind it, and the
+/// round-trip check of [`save_position`] is the one that says the server stored what we wrote.
+pub const MAX_CURSOR_BYTES: usize = MEDIUMTEXT_BYTES - CURSOR_HEADROOM_BYTES;
 
 const CREATE_DEFS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -62,7 +76,7 @@ const CREATE_STATUS: &str = "CREATE TABLE IF NOT EXISTS `_lazyview_status` (
   `instance_id` VARCHAR(64) NOT NULL PRIMARY KEY,
   `binlog_file` VARCHAR(255) NOT NULL,
   `binlog_pos` BIGINT UNSIGNED NOT NULL,
-  `binlog_cursor` TEXT NULL,
+  `binlog_cursor` MEDIUMTEXT NULL,
   `epoch` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `server_identity` VARCHAR(255) NULL,
   `updated_at` TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
@@ -103,7 +117,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "epoch",
         "BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER `binlog_pos`",
     ),
-    (STATUS, "binlog_cursor", "TEXT NULL AFTER `binlog_pos`"),
+    (
+        STATUS,
+        "binlog_cursor",
+        "MEDIUMTEXT NULL AFTER `binlog_pos`",
+    ),
     (STATUS, "server_identity", "VARCHAR(255) NULL AFTER `epoch`"),
     (STATE, "route", "VARCHAR(16) NULL AFTER `detail`"),
     (STATE, "access", "TEXT NULL AFTER `route`"),
@@ -244,6 +262,24 @@ pub async fn verify(conn: &mut Conn, schema: &str) -> Result<()> {
             missing.push(format!("`{STATE}`.name is not utf8mb4_bin"));
         }
     }
+    // The width of the cursor column is a rule, not a nicety: a `TEXT` (or older) column is the
+    // #347 truncation, and only the setup run's `ensure` widens it. Asking here names the fix at
+    // startup (`SetupRequired`), instead of the operations run dying at its first oversized save.
+    if present.iter().any(|t| t == STATUS) {
+        let cursor_type: Option<Option<String>> = conn
+            .exec_first(
+                "SELECT CAST(DATA_TYPE AS CHAR) FROM information_schema.COLUMNS WHERE \
+                 TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'binlog_cursor'",
+                (schema, STATUS),
+            )
+            .await?;
+        let cursor_type = cursor_type.flatten();
+        if cursor_type.as_deref() != Some("mediumtext") {
+            missing.push(format!(
+                "`{STATUS}`.binlog_cursor is {cursor_type:?}, not mediumtext"
+            ));
+        }
+    }
     if !missing.is_empty() {
         return Err(SetupRequired(missing).into());
     }
@@ -267,22 +303,28 @@ pub async fn ensure(conn: &mut Conn, schema: &str) -> Result<()> {
                 .await?;
         }
     }
-    // `binlog_cursor` widened to TEXT for the resume-by-GTID plan: the cursor text can now carry a
-    // whole GTID set (`file:pos[g=…]`), which a few thousand writers could push past VARCHAR(255)
-    // and truncate into a wrong resume. It stays NULL-able because a TEXT column takes no DEFAULT
-    // (the status row is first inserted without it, in `coord::claim`, and read back as "no cursor
-    // yet"). The row is still written once per flush on the same cadence — the payload only grows,
-    // from ~30 B to typically <1 KB — so this adds no new writes to the source, and the cursor is
-    // metadata that belongs in the control store (`_lazyview_status`), not the source. Idempotent:
-    // the ALTER runs only while the column is not already TEXT.
+    // `binlog_cursor` widened to MEDIUMTEXT for the resume-by-GTID plan: the cursor text can carry
+    // a whole GTID set (`file:pos[g=…]`), which a few thousand writers could push past VARCHAR(255)
+    // and truncate into a wrong resume, and a long-lived cluster pushes past the 65,535 bytes of the
+    // `TEXT` this column had until #356 (issue #347: 1,332 intervals of `gtid_executed`, the server
+    // kept the first 64 KiB and said nothing). It stays NULL-able because a TEXT/MEDIUMTEXT column
+    // takes no DEFAULT (the status row is first inserted without it, in `coord::claim`, and read
+    // back as "no cursor yet"). The row is still written once per flush on the same cadence — the
+    // payload only grows, from ~30 B to typically <1 KB — so this adds no new writes to the source,
+    // and the cursor is metadata that belongs in the control store (`_lazyview_status`), not the
+    // source. Idempotent: the ALTER runs only while the column is not already MEDIUMTEXT, so an
+    // install that `ensure` created (or widened on an earlier run) does no DDL per start, and an old
+    // install that stopped at VARCHAR(255) or `TEXT` is brought to the same shape by this one path —
+    // the same `MIGRATIONS`/`ensure` path every earlier column change uses, on the metadata server
+    // the status row lives on (`Config::test_meta_dsn`, `dsn` when there is no separate one).
     let cursor_type: Option<Option<String>> = conn
         .exec_first(
             "SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_lazyview_status' AND COLUMN_NAME = 'binlog_cursor'",
             (schema,),
         )
         .await?;
-    if cursor_type.flatten().as_deref() != Some("text") {
-        conn.query_drop("ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` TEXT NULL")
+    if cursor_type.flatten().as_deref() != Some("mediumtext") {
+        conn.query_drop("ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` MEDIUMTEXT NULL")
             .await?;
     }
     // State rows are keyed by the view's table name, which the server compares case-sensitively
@@ -626,22 +668,53 @@ pub async fn save_identity(conn: &mut Conn, instance: &str, identity: &str) -> R
     Ok(())
 }
 
-/// Whether a `[g=…]` set of `gtid` bytes still fits `binlog_cursor` beside a cursor whose
-/// `file:pos` text is `at_len` bytes ([`MAX_CURSOR_BYTES`]). The cursor text is ASCII
-/// (`file:pos[g=uuid:interval,…]`, see [`Cursor`]'s `Display`), so bytes and chars are the same.
-pub fn gtid_fits(at_len: usize, gtid: &str) -> bool {
-    at_len + "[g=]".len() + gtid.len() <= MAX_CURSOR_BYTES
+/// The decision [`save_position`] makes before it hands the server anything: whether a cursor text
+/// of `text_len` bytes fits `binlog_cursor` ([`MAX_CURSOR_BYTES`]). The cursor text is ASCII
+/// (`file:pos[g=uuid:interval,…]`, see [`Cursor`]'s `Display`), so bytes and chars are the same and
+/// the column's byte limit is the bound. Separate from the save so the wall the engine stops on is
+/// visibly the one the column has (unit test: `cursor_column_is_the_mediumtext_the_bound_measures`).
+fn cursor_fits(text_len: usize) -> bool {
+    text_len <= MAX_CURSOR_BYTES
+}
+
+/// The error of a cursor the column cannot hold whole. It names the three things the operator
+/// needs to act on: how big the cursor is, what the limit is, and why it grew that big — a
+/// pathologically fragmented `gtid_executed`, one interval per gap in the server's GTID stream.
+/// Shortening the cursor is not an answer [`save_position`] may take: the set is what a resume on
+/// another server is checked against ([`crate::source::gtid_covers`]), so a save that dropped or
+/// cut it would silently disable resume-by-GTID for exactly the long-lived clusters whose set
+/// outgrows a column ([`MAX_CURSOR_BYTES`], issue #347).
+fn cursor_too_long(text_len: usize, gtid: Option<&str>) -> anyhow::Error {
+    let (set_bytes, intervals) = match gtid {
+        Some(g) => (
+            g.len(),
+            g.split(',').filter(|s| !s.is_empty()).count().max(1),
+        ),
+        None => (0, 0),
+    };
+    anyhow::anyhow!(
+        "refusing to save a cursor of {text_len} bytes: `binlog_cursor` holds at most \
+         {MAX_CURSOR_BYTES} (a MEDIUMTEXT column), and half a cursor is no cursor — nothing was \
+         stored, the row keeps the position it had. The cause is the consumed GTID set: {set_bytes} \
+         bytes in {intervals} interval(s), which means the server's `gtid_executed` is \
+         pathologically fragmented (a gap between nearly every transaction, from rolled back or \
+         empty transactions, or a restored or multi-source history). This is the source's own set, \
+         so `lazyview setup` is not the fix — the column is already MEDIUMTEXT: ask why the source \
+         reports that many intervals, and consolidate its set"
+    )
 }
 
 /// Saves the position if `epoch` is still current; fails when another instance took over.
 ///
-/// Returns the cursor the row now holds, which is what the caller must believe: an over-long
-/// `[g=…]` set is **shed** rather than stored, because the column would keep only its first
-/// 65,535 bytes and the next start would read back an unterminated set it cannot parse and refuse
-/// to run ([`MAX_CURSOR_BYTES`], issue #347). A save without the set is a state the engine already
-/// knows — the file/pos and identity rules answer for it, as they do for a seed whose claim could
-/// not be proven or an XA COMMIT that failed to attribute — so the position keeps advancing and
-/// the resume stays correct on the server that wrote it.
+/// Returns the cursor the row now holds, verified: [`save_position`] refuses a cursor the column
+/// cannot hold whole ([`cursor_too_long`], nothing stored) and reads back what the server says it
+/// kept, so no server setting — `sql_mode` without strict tables, or a column an old install left
+/// narrower than MEDIUMTEXT — can hand back the first bytes of a long cursor in silence, which is
+/// how #347 died. A save the server did shorten is an error too, and it leaves no half cursor
+/// behind: the column is cleared to NULL, so the next start reads the `binlog_file`/`binlog_pos`
+/// the same statement wrote instead of the truncated text it cannot parse. A refused or mismatched
+/// save is an error, never a warning: the caller must stop, because a position the row does not
+/// actually hold is worse than no save at all.
 pub async fn save_position(
     conn: &mut Conn,
     instance: &str,
@@ -651,31 +724,72 @@ pub async fn save_position(
     // `binlog_cursor` is the value a start reads; the two pre-cursor columns stay filled through
     // the bump, so an older build (and the harness) still finds the position there.
     let at = c.to_position();
-    let bare = Cursor::from_parts(c.flavor(), at.file.clone(), at.pos);
-    let gtid = c
-        .gtid()
-        .filter(|g| gtid_fits(bare.to_string().len(), g))
-        .map(str::to_string);
-    let stored = bare.with_gtid(gtid);
+    let text = c.to_string();
+    if !cursor_fits(text.len()) {
+        return Err(cursor_too_long(text.len(), c.gtid()));
+    }
     conn.exec_drop(
         "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ?, `binlog_cursor` = ? WHERE `instance_id` = ? AND `epoch` = ?",
-        (&at.file, at.pos, stored.to_string(), instance, epoch),
+        (&at.file, at.pos, &text, instance, epoch),
     )
     .await?;
-    if conn.affected_rows() == 0 {
-        let cur: Option<u64> = conn
-            .exec_first(
-                "SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
-                (instance,),
-            )
-            .await?;
-        if cur != Some(epoch) {
-            anyhow::bail!(
-                "another lazyview instance took over (epoch {cur:?}, ours {epoch}); stopping"
-            );
-        }
+    // The byte-exact round-trip, on the same read as the fencing epoch. Length, not content, is
+    // what a server that truncates can be caught with: it keeps the *first* bytes of an over-long
+    // value, so the stored length is the one thing that cannot survive it, and `CHAR_LENGTH`
+    // against `LENGTH` catches the other way a value can come back wrong (a charset mangling —
+    // the cursor text is ASCII, so both must be `text.len()`). One extra read per save, which is
+    // one per `LAZYVIEW_POSITION_PERSIST_MS` (5 s by default) on the flush path, never the event
+    // path — the price of never believing a position the row does not hold.
+    let row: Option<(Option<u64>, Option<u64>, u64)> = conn
+        .exec_first(
+            "SELECT LENGTH(`binlog_cursor`), CHAR_LENGTH(`binlog_cursor`), `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
+            (instance,),
+        )
+        .await?;
+    let (bytes, chars, cur) = row.context(format!(
+        "the status row of instance {instance} is gone: the saved position cannot be verified"
+    ))?;
+    if cur != epoch {
+        anyhow::bail!("another lazyview instance took over (epoch {cur}, ours {epoch}); stopping");
     }
-    Ok(stored)
+    let want = text.len() as u64;
+    if bytes != Some(want) || chars != Some(want) {
+        // What the server kept is the *first bytes* of the value — #347's row, which the next
+        // start cannot read. Nothing that reads as a cursor is left behind: the column goes back
+        // to NULL (the same row, the same epoch guard), so a start from here takes the
+        // `binlog_file`/`binlog_pos` the statement did write — a position this run really read —
+        // instead of dying on `no cursor this source speaks`. The save still fails: the row does
+        // not hold the cursor this run read, and that is what the caller must stop on.
+        let cleared = conn
+            .exec_drop(
+                "UPDATE `_lazyview_status` SET `binlog_cursor` = NULL WHERE `instance_id` = ? AND `epoch` = ?",
+                (instance, epoch),
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let left = match cleared {
+            Ok(()) => "The cursor column is cleared to NULL, so a start from this row reads the \
+                       file and position it can trust."
+                .to_string(),
+            Err(e) => format!(
+                "Clearing the cursor column failed ({e}): a start from this row reads a \
+                 truncated cursor until `lazyview setup` widens the column."
+            ),
+        };
+        anyhow::bail!(
+            "the server kept {} of the {want} bytes of cursor it was given for instance \
+             {instance} (and says they are {} characters): `_lazyview_status`.binlog_cursor does \
+             not hold the position this run read — a truncated cursor is the #347 failure, whose \
+             next start dies on `no cursor this source speaks`. The column must be MEDIUMTEXT \
+             (up to {MAX_CURSOR_BYTES} bytes of cursor): run `lazyview setup` with the setup \
+             account, and check the server's `sql_mode` and `max_allowed_packet` — lazyview's own \
+             sessions run a sql_mode without `STRICT_TRANS_TABLES` (`dialect/mysql.rs`), so an \
+             over-long value is truncated in silence rather than refused. {left}",
+            bytes.unwrap_or(0),
+            chars.unwrap_or(0),
+        );
+    }
+    Ok(c.clone())
 }
 
 #[cfg(test)]
@@ -725,61 +839,106 @@ mod tests {
         }
     }
 
-    /// `binlog_cursor` is the TEXT whose 65,535-byte limit [`MAX_CURSOR_BYTES`] stays under
-    /// (#347): the bound is only a bound while the column is the one `ensure` creates and
-    /// migrates to.
+    /// `binlog_cursor` is the MEDIUMTEXT whose byte limit [`MAX_CURSOR_BYTES`] stays under (#347):
+    /// the bound is only a bound while the column is the one `ensure` creates and migrates to — and
+    /// it is only the right bound while it sits *past* the 65,535 bytes the old `TEXT` column
+    /// stopped a set at, which is what #356's shed silently accepted.
     #[test]
-    fn cursor_column_is_the_text_the_bound_measures() {
+    fn cursor_column_is_the_mediumtext_the_bound_measures() {
         assert!(
-            CREATE_STATUS.contains("`binlog_cursor` TEXT NULL"),
-            "CREATE_STATUS no longer creates a TEXT cursor: MAX_CURSOR_BYTES must follow it"
+            CREATE_STATUS.contains("`binlog_cursor` MEDIUMTEXT NULL"),
+            "CREATE_STATUS no longer creates a MEDIUMTEXT cursor: MAX_CURSOR_BYTES must follow it"
         );
         assert!(
-            MIGRATIONS
-                .iter()
-                .any(|(t, c, d)| *t == STATUS && *c == "binlog_cursor" && d.starts_with("TEXT")),
-            "the migration that widened the cursor column is gone"
+            MIGRATIONS.iter().any(|(t, c, d)| *t == STATUS
+                && *c == "binlog_cursor"
+                && d.starts_with("MEDIUMTEXT")),
+            "the migration that widened the cursor column is gone, or no longer widens it"
         );
-        // The TEXT limit itself: at or over it a set would reach the server and be truncated.
-        // Checked at compile time, so the bound cannot drift from the column unnoticed.
+        // Checked at compile time, so the bound cannot drift from the column unnoticed: under the
+        // MEDIUMTEXT limit (at it, a cursor would reach the server and be truncated), and over the
+        // TEXT limit — being wider than the column #347 died on is the whole point.
         const _: () = assert!(
-            MAX_CURSOR_BYTES < 65_535,
-            "the bound must stay under the 65,535 bytes a TEXT column holds"
+            MAX_CURSOR_BYTES < MEDIUMTEXT_BYTES,
+            "the bound must stay under what a MEDIUMTEXT column holds"
+        );
+        const _: () = assert!(
+            MAX_CURSOR_BYTES > 65_535,
+            "the bound must stay past the 65,535 bytes a TEXT column held"
         );
     }
 
-    /// The decision [`save_position`] makes about the `[g=…]` set, without a server: a set that
-    /// does not fit whole is not saved at all, and the shed cursor is byte-for-byte the pre-GTID
-    /// text a start can parse. #347's cursor — `file:pos` plus a set the row cut at 65,535 bytes
-    /// mid-interval — is the shape both halves check.
+    /// The decision [`save_position`] makes about the cursor text, without a server: everything the
+    /// `TEXT` column of #347 could not hold is saved whole (a shed is not an option — the set is
+    /// what [`crate::source::gtid_covers`] checks a resume against), and only a cursor past the
+    /// MEDIUMTEXT bound is refused, with a message that names the size, the limit and the cause.
     #[test]
-    fn gtid_fits_is_the_text_the_column_holds() {
+    fn only_a_cursor_past_the_mediumtext_bound_is_refused() {
         let at = Cursor::from_parts(Flavor::MySql, "binlog.000004".into(), 228_705_009);
-        let at_len = at.to_string().len();
         let set = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf:1-346,".repeat(4);
         assert!(
-            gtid_fits(at_len, &set),
+            cursor_fits(at.clone().with_gtid(Some(set)).to_string().len()),
             "an ordinary set must still ride the save"
         );
-        let too_big = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf:1-346,".repeat(2_000);
-        assert!(too_big.len() > MAX_CURSOR_BYTES);
+        // #347's cursor: one interval per gap, the shape that reached 65,535 bytes and came back cut
+        // mid-UUID. It fits MEDIUMTEXT, so it rides the save whole.
+        let fragmented = (0..2_000u32)
+            .map(|i| {
+                format!(
+                    "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf:{}-{}",
+                    i * 3 + 1,
+                    i * 3 + 2
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         assert!(
-            !gtid_fits(at_len, &too_big),
-            "a set the column cannot hold whole must not be sent to it"
+            fragmented.len() > 65_535,
+            "the test set must be one the TEXT column could not hold ({} B)",
+            fragmented.len()
         );
-        // The shed shape parses; the truncated one is what killed the smoke's restart, and the
-        // parser must keep refusing to guess a set closed.
+        let whole = at.clone().with_gtid(Some(fragmented.clone()));
+        assert!(
+            cursor_fits(whole.to_string().len()),
+            "a set past the old TEXT limit must ride the save whole ({} B)",
+            whole.to_string().len()
+        );
+        assert_eq!(whole.to_string(), format!("{at}[g={fragmented}]"));
+        // Past the MEDIUMTEXT bound: refused, and the refusal names the three things to act on.
+        let monster = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf:1-346,".repeat(400_000);
+        let big = at.clone().with_gtid(Some(monster.clone()));
+        let big_len = big.to_string().len();
+        assert!(
+            !cursor_fits(big_len),
+            "a cursor the column cannot hold whole must never be sent to it"
+        );
+        let msg = format!("{:#}", cursor_too_long(big_len, big.gtid()));
+        let size = big_len.to_string();
+        let limit = MAX_CURSOR_BYTES.to_string();
+        for names in [
+            size.as_str(),
+            limit.as_str(),
+            "pathologically fragmented",
+            "nothing was stored",
+        ] {
+            assert!(
+                msg.contains(names),
+                "the refusal {msg:?} does not name {names:?}"
+            );
+        }
+        // The parser still refuses to guess a set closed: a truncated cursor — what the server
+        // handed back in #347 — is no cursor, and `load_position` makes that an error.
+        assert!(
+            Flavor::MySql
+                .parse_cursor(&format!("{at}[g={monster}"))
+                .is_none(),
+            "an unterminated [g=…] set must stay an error"
+        );
         let parsed = Flavor::MySql
             .parse_cursor(&at.to_string())
             .expect("the pre-GTID text parses");
         assert_eq!(parsed.to_position(), at.to_position());
         assert_eq!(parsed.gtid(), None);
-        assert!(
-            Flavor::MySql
-                .parse_cursor(&format!("{}[g={}", at, too_big))
-                .is_none(),
-            "an unterminated [g=…] set must stay an error"
-        );
     }
 
     /// The fence DDL in `create_fence` mirrors `src/fence.rs`'s private `create_sql` (the file

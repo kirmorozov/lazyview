@@ -1818,23 +1818,227 @@ async fn account_stmt(c: &mut mysql_async::Conn, sql: &str) -> Result<()> {
     }
 }
 
-/// The position the engine saves always fits the column that holds it (#347). `binlog_cursor` is
-/// a TEXT, and the MySQL family hands back the first 65,535 bytes of a longer value: a `[g=…]` set
-/// past that comes back from `meta::load_position` cut in half, an unterminated set is no cursor,
-/// and the start refuses to run — `the saved position "…" is no cursor this source speaks`. The
-/// nightly smoke of #347 met exactly that at its first `stop` event, 15 minutes into a run whose
-/// server had grown a 1,332-interval `gtid_executed`. `meta::save_position` sheds a set that will
-/// not fit whole (the position keeps its `file:pos`, which is all a resume on the server that
-/// wrote it needs), so the row stays parseable and the restart happens.
+/// The set the server itself says it has consumed — `@@GLOBAL.gtid_executed` on the MySQL family,
+/// `@@GLOBAL.gtid_binlog_state` on MariaDB. The words the resume-by-GTID question is asked against
+/// ([`lazyview::source::gtid_covers`]), so it is also what a test measures a saved cursor against.
+async fn server_gtid_set(c: &mut mysql_async::Conn, maria: bool) -> Result<String> {
+    Ok(scalar(
+        c,
+        if maria {
+            "SELECT @@GLOBAL.gtid_binlog_state"
+        } else {
+            "SELECT @@GLOBAL.gtid_executed"
+        },
+    )
+    .await?
+    .unwrap_or_default())
+}
+
+/// Grows the server's GTID stream until the **cursor the engine has saved for `instance`** is at
+/// least `at_least` bytes — the quantity `binlog_cursor` has to hold, so the loop measures it on
+/// the row itself rather than guessing it from how the server spells a set. One committed
+/// transaction at a time, every transaction its own interval: the MySQL family commits each one
+/// under an explicit `GTID_NEXT` at a gap of its own (a rolled back transaction would not do —
+/// MySQL assigns the GTID at commit, so a transaction that never reached the binlog consumed no
+/// number and cut no hole), MariaDB under its own `gtid_domain_id` (one interval per domain in
+/// `gtid_binlog_state`). Both give the shape #347's row had — 1,332 intervals of set, which the
+/// `TEXT` column of the day kept the first 65,535 bytes of in silence. The writes go to a table no
+/// view reads, so the engine only has to read their events.
+///
+/// Returns how many transactions it took, the bytes the row held when it stopped, and the bytes
+/// the server's own set text held by then (the two differ in how each renders an interval — the
+/// server names its uuid once per group, the engine's text on every interval).
+///
+/// Fails, naming both measurements, when the stream does not fragment: without a cursor the old
+/// column could not hold there is nothing to check.
+async fn fragment_gtid_stream(
+    c: &mut mysql_async::Conn,
+    instance: &str,
+    maria: bool,
+    at_least: usize,
+) -> Result<(usize, usize, usize)> {
+    /// The source uuid of the injected transactions. Deliberately not the server's own: its
+    /// auto-assigned numbers never collide with these, so the only thing the injected set holds is
+    /// the intervals this loop gave it.
+    const INJECT_UUID: &str = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf";
+    let started = std::time::Instant::now();
+    let mut groups = 0usize;
+    loop {
+        if maria {
+            exec(
+                c,
+                &format!(
+                    "SET SESSION gtid_domain_id = {}",
+                    4_000_000_000u64 + groups as u64
+                ),
+            )
+            .await?;
+            exec(
+                c,
+                &format!("INSERT INTO lc_noise (id, pad) VALUES ({groups}, 'frag')"),
+            )
+            .await?;
+        } else {
+            // An odd number every time: consecutive gnos would merge into one interval, and an
+            // interval per transaction is the whole point.
+            exec(
+                c,
+                &format!(
+                    "SET @@SESSION.GTID_NEXT = '{INJECT_UUID}:{}'",
+                    groups * 2 + 1
+                ),
+            )
+            .await?;
+            exec(c, "BEGIN").await?;
+            exec(
+                c,
+                &format!("INSERT INTO lc_noise (id, pad) VALUES ({groups}, 'frag')"),
+            )
+            .await?;
+            exec(c, "COMMIT").await?;
+        }
+        groups += 1;
+        if !groups.is_multiple_of(200) {
+            continue;
+        }
+        // What the row holds is the thing under test; the server's own text is read alongside it
+        // so a run that fails says what both sides measured.
+        let saved = saved_cursor_bytes(c, instance).await?;
+        let set = server_gtid_set(c, maria).await?;
+        if saved >= at_least {
+            break;
+        }
+        ensure!(
+            groups < 40_000 && started.elapsed() < Duration::from_secs(1200),
+            "{groups} transactions in {:?} grew the saved cursor to only {saved} bytes and the \
+             server's set to {} bytes ({}): no fragmentation, nothing to test",
+            started.elapsed(),
+            set.len(),
+            set.chars().take(120).collect::<String>()
+        );
+    }
+    // The session goes back to normal: the test writes ordinary transactions on this connection
+    // afterwards, and they must carry the server's own GTIDs, not a second injected one.
+    if maria {
+        exec(c, "SET SESSION gtid_domain_id = 0").await?;
+    } else {
+        exec(c, "SET @@SESSION.GTID_NEXT = 'AUTOMATIC'").await?;
+    }
+    Ok((
+        groups,
+        saved_cursor_bytes(c, instance).await?,
+        server_gtid_set(c, maria).await?.len(),
+    ))
+}
+
+/// One interval of a fabricated consumed set, in the flavor's own spelling: `uuid:interval` on the
+/// MySQL family, `domain-server-seq` on MariaDB — the shape a server with a hole after nearly every
+/// transaction gives its consumed state.
+fn fragmented_set_item(flavor: lazyview::source::Flavor, i: usize) -> String {
+    let uuid = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf";
+    match flavor {
+        lazyview::source::Flavor::MySql | lazyview::source::Flavor::Percona => {
+            format!("{uuid}:{}-{}", i * 3 + 1, i * 3 + 2)
+        }
+        lazyview::source::Flavor::MariaDb => {
+            format!("{}-33111-{}", 4_000_000_000u64 + i as u64, i + 1)
+        }
+    }
+}
+
+/// A `[g=…]` set of `count` intervals. For the legs that measure the column rather than ask the
+/// server about the set (a made-up set is no answer to [`lazyview::source::gtid_covers`], so the
+/// engine leg grows a real one instead).
+fn fragmented_set(flavor: lazyview::source::Flavor, count: usize) -> String {
+    (0..count)
+        .map(|i| fragmented_set_item(flavor, i))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The same, at least `at_least` bytes long — and no more than one interval past it: these sets
+/// are megabytes long and one test holds several of them at once.
+fn fragmented_set_of(flavor: lazyview::source::Flavor, at_least: usize) -> String {
+    let mut items: Vec<String> = Vec::new();
+    let mut len = 0;
+    while len < at_least {
+        let item = fragmented_set_item(flavor, items.len());
+        len += item.len() + 1; // the comma that joins it
+        items.push(item);
+    }
+    items.join(",")
+}
+
+/// The width `ensure` gave `binlog_cursor` in this schema, as the server spells it.
+async fn cursor_column_type(c: &mut mysql_async::Conn) -> Result<String> {
+    Ok(scalar(
+        c,
+        "SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() \
+         AND TABLE_NAME = '_lazyview_status' AND COLUMN_NAME = 'binlog_cursor'",
+    )
+    .await?
+    .unwrap_or_default())
+}
+
+/// How many bytes the *server* says `binlog_cursor` holds for one instance (0 while the row has
+/// never been saved). The growing loop's measure: it waits on a number, so it asks for the number
+/// rather than pulling megabytes of text over the wire every 200 transactions.
+async fn saved_cursor_bytes(c: &mut mysql_async::Conn, instance: &str) -> Result<usize> {
+    Ok(scalar_i64(
+        c,
+        &format!(
+            "SELECT COALESCE(LENGTH(binlog_cursor), 0) FROM _lazyview_status WHERE instance_id = {}",
+            q(instance)
+        ),
+    )
+    .await? as usize)
+}
+
+/// The row of one instance, as `meta::save_position` left it: its text and the length the *server*
+/// says it holds. Both come from the server, so a value the server shortened is caught here rather
+/// than in the text the caller asked for; a row that was claimed and never saved reads as empty.
+async fn saved_cursor_row(c: &mut mysql_async::Conn, instance: &str) -> Result<(String, u64)> {
+    use mysql_async::prelude::Queryable;
+    c.query_first(format!(
+        "SELECT COALESCE(CAST(binlog_cursor AS CHAR), ''), \
+         COALESCE(LENGTH(binlog_cursor), 0) FROM _lazyview_status WHERE instance_id = {}",
+        q(instance)
+    ))
+    .await?
+    .context("no status row for the instance")
+}
+
+/// The whole consumed set rides `binlog_cursor` and the restart reads it back — #347, and the
+/// ruling that replaced #356's shed: a cursor between the 65,535 bytes the column used to hold and
+/// the 16 MB it holds now is stored **whole**, and the resume by GTID that needs it still works.
+///
+/// Nothing here is a made-up set: the run fragments the server's own GTID stream (a gap after every
+/// transaction) until the cursor the engine has saved for itself passes the old limit, and asks the
+/// row twice — the test's own read of it, and `source::gtid_covers`, the question a resume on
+/// another server asks. The fail-before is that shape at the head before the widening — the server
+/// kept the first 65,535 bytes of it (strict mode: `ERROR 1406 ... Data too long for column
+/// 'binlog_cursor'`) and the next start died on `the saved position "…[g=…" is no cursor this
+/// source speaks`; with #356's shed the row comes back holding no set at all, which the
+/// `gtid_covers` leg below refuses. The last leg takes the column back under the living run: a save
+/// it cannot prove stops the engine, naming the column.
 #[test]
-fn lifecycle_saved_cursor_never_overflows_the_column() {
-    scenario("lc_cursor_overflow", |ctx| async move {
-        use lazyview::source::{Cursor, Flavor};
+fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
+    scenario("lc_cursor_whole", |ctx| async move {
+        use lazyview::source::Flavor;
         use mysql_async::prelude::Queryable;
-        let db = ctx.new_db("lc_cursor_overflow").await?;
+        let db = ctx.new_db("lc_cursor_whole").await?;
         let mut c = db.conn().await?;
+        let maria = ctx.flavor().starts_with("mariadb");
+        let flavor = if maria {
+            Flavor::MariaDb
+        } else {
+            Flavor::MySql
+        };
         for s in [
             "CREATE TABLE entities (id INT PRIMARY KEY, grp INT NOT NULL, status VARCHAR(10) NOT NULL)",
+            // The fragmentation lands here: no view reads it, so the engine only has to read its
+            // events, not refresh anything for them.
+            "CREATE TABLE lc_noise (id INT PRIMARY KEY, pad VARCHAR(8) NOT NULL)",
             "INSERT INTO entities VALUES (10, 1, 'new'), (11, 1, 'paid')",
         ] {
             exec(&mut c, s).await?;
@@ -1846,113 +2050,481 @@ fn lifecycle_saved_cursor_never_overflows_the_column() {
         )];
         ensure_lazyview_table(&mut c).await?;
         add_views(&mut c, &specs).await?;
-        let mut eng = ctx.start_engine(&db, &[])?;
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_POSITION_PERSIST_MS", "200")])?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-        exec(&mut c, "INSERT INTO entities VALUES (12, 2, 'new')").await?;
+
+        // What the engine saves by itself — the test writes nothing to the row. The instance id is
+        // the one `coord::claim` wrote when the engine took the leadership lock.
+        let instance: String = c
+            .query_first("SELECT CAST(instance_id AS CHAR) FROM _lazyview_status")
+            .await?
+            .context("no status row to save into")?;
+        ensure!(
+            !instance.is_empty(),
+            "the engine saved no position to measure"
+        );
+
+        let (groups, saved, server_bytes) =
+            fragment_gtid_stream(&mut c, &instance, maria, 70_000).await?;
+        ctx.log(format!(
+            "fragmented the server's GTID stream with {groups} transactions: the row holds a \
+             {saved}-byte cursor, and the server's own set text is {server_bytes} bytes"
+        ));
         eng.wait_caught_up(&mut c, t_catchup()).await?;
-        eng.stop().await?;
-        let flavor = if ctx.flavor().starts_with("mariadb") {
-            Flavor::MariaDb
-        } else {
-            Flavor::MySql
+        // The row catches up with the last of them on the save cadence (200 ms here), so the read
+        // waits for the cursor to pass the old limit instead of guessing how long that takes; the
+        // deadline is the guard against a set that never got that big.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let (text, stored) = loop {
+            let row = saved_cursor_row(&mut c, &instance).await?;
+            if row.0.len() > 65_535 || std::time::Instant::now() >= deadline {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         };
-        // The row the engine left, as the engine left it: its instance, its epoch, and the real
-        // resume point. A made-up file/pos would fail the leg below for the wrong reason.
-        let (instance, epoch, file, pos): (String, u64, String, u64) = c
-            .query_first(
-                "SELECT CAST(instance_id AS CHAR), epoch, CAST(binlog_file AS CHAR), binlog_pos \
-                 FROM _lazyview_status",
-            )
-            .await?
-            .context("no status row to overflow")?;
         ensure!(
-            !instance.is_empty() && !file.is_empty(),
-            "the engine saved no position to overflow"
-        );
-        let at = Cursor::from_parts(flavor, file.clone(), pos);
-        // #347's set: one interval per transaction, the spelling a server with gaps in its GTID
-        // stream gives `gtid_executed` — here well past what the column can hold.
-        let uuid = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf";
-        let huge = (0..2_000u32)
-            .map(|i| format!("{uuid}:{}-{}", i * 3 + 1, i * 3 + 2))
-            .collect::<Vec<_>>()
-            .join(",");
-        ensure!(
-            huge.len() > lazyview::meta::MAX_CURSOR_BYTES,
-            "the test set must be one the column cannot hold ({} B)",
-            huge.len()
-        );
-        let saved = lazyview::meta::save_position(
-            &mut c,
-            &instance,
-            &at.clone().with_gtid(Some(huge.clone())),
-            epoch,
-        )
-        .await?;
-        // Shed, never truncated: the same position with no set at all, and the row holds it whole.
-        ensure!(
-            saved.gtid().is_none(),
-            "a set of {} B rode the save anyway",
-            huge.len()
+            stored as usize == text.len(),
+            "the server reports {stored} bytes for the {} bytes of cursor the row holds",
+            text.len()
         );
         ensure!(
-            saved.to_position() == at.to_position(),
-            "shedding moved the position: {} vs {}",
-            saved,
-            at
+            text.len() > 65_535,
+            "the run saved only {} bytes: the set never grew past the limit the column used to \
+             have, so this proves nothing (fragmented with {groups} transactions)",
+            text.len()
         );
-        let (text, stored): (String, u64) = c
-            .query_first(
-                "SELECT CAST(binlog_cursor AS CHAR), LENGTH(binlog_cursor) FROM _lazyview_status",
-            )
-            .await?
-            .context("no cursor after the save")?;
-        ensure!(
-            text == saved.to_string() && !text.contains("[g="),
-            "the row holds {text:?}, not the shed cursor"
-        );
-        ensure!(
-            (stored as usize) <= lazyview::meta::MAX_CURSOR_BYTES,
-            "the row holds {stored} bytes"
-        );
-        // The read of that row is where #347's engine died: it hands back the position, not an error.
+        ctx.log(format!(
+            "the engine saved a {}-byte cursor with its set",
+            text.len()
+        ));
+        // The read of that row is where #347's engine died.
         let back = lazyview::meta::load_position(&mut c, &instance, flavor)
             .await?
-            .context("the shed cursor reads back as no cursor")?;
+            .context("the saved cursor reads back as no cursor")?;
         ensure!(
-            back.to_position() == at.to_position() && back.gtid().is_none(),
-            "the saved cursor reads back as {back}"
+            back.to_string() == text,
+            "the cursor reads back as {back}, not the {} bytes the row holds",
+            text.len()
         );
-        // The other half: an ordinary set (the shape of every run before #347) still rides the
-        // save — the bound must not quietly cost the resume-by-GTID state it was added for.
-        let small = format!("{uuid}:1-346");
-        let saved = lazyview::meta::save_position(
-            &mut c,
-            &instance,
-            &at.clone().with_gtid(Some(small.clone())),
-            epoch,
-        )
-        .await?;
+        let set = back.gtid().unwrap_or_default();
         ensure!(
-            saved.gtid() == Some(small.as_str()),
-            "an ordinary set was shed: {:?}",
-            saved.gtid()
+            !set.is_empty(),
+            "the row holds a {}-byte cursor with no [g=…] set in it: the set was shed",
+            text.len()
         );
-        lazyview::meta::save_position(&mut c, &instance, &at, epoch).await?;
-        // And a start on the shed row happens at all — this is the `stop` event of #347, seconds
-        // instead of 15 minutes in — and it brings the view up to date from the saved file/pos.
+        // And it is the server's own set, whole — the question a resume on another server asks
+        // before it trusts a cursor. A set cut short is either unparsable (the line above) or does
+        // not answer here.
+        ensure!(
+            lazyview::source::gtid_covers(&mut c, &back).await?,
+            "this server does not cover the saved set: the row does not hold what the engine \
+             consumed ({} bytes of set)",
+            set.len()
+        );
+
+        // The other half of #347: the restart. It must come up on that cursor, open the dump by
+        // the set, and bring the view up to date.
         exec(&mut c, "INSERT INTO entities VALUES (13, 3, 'new')").await?;
-        let mut eng = ctx.start_engine(&db, &[])?;
+        eng.stop().await?;
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_POSITION_PERSIST_MS", "200")])?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        // The line the restart has to earn: the run opened its dump on the set the row holds. It
+        // is written once per connect, so the wait is on the log rather than a guess at how long
+        // a start takes — `wait_ready` above answers from the state rows, which the first run
+        // already left `ready`.
+        let anchored = "binlog dump anchored on the consumed GTID set";
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let log = loop {
+            eng.check_alive()?;
+            let log = common::engineproc::tail_lines(&eng.log_path, 400);
+            if log.contains(anchored) || std::time::Instant::now() >= deadline {
+                break log;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        ensure!(
+            log.contains(anchored),
+            "the restart did not open the dump by the saved set; its log says:\n{log}"
+        );
+        eng.wait_caught_up(&mut c, t_catchup()).await?;
         verify(
             &ctx,
             &mut eng,
             &db,
             &specs,
-            "resumed from a cursor that shed its set",
+            "resumed from a cursor the old column cut in half",
         )
         .await?;
-        eng.stop().await?;
+        // A run that resumes by GTID keeps the set it resumed on: the row still holds a set past
+        // the old limit, whole, after the second run's own saves (which carry it forward).
+        let (text, stored) = saved_cursor_row(&mut c, &instance).await?;
+        ensure!(
+            stored as usize == text.len() && text.len() > 65_535 && text.contains("[g="),
+            "after the restart the row holds {stored} bytes: {text}"
+        );
+        let back = lazyview::meta::load_position(&mut c, &instance, flavor)
+            .await?
+            .context("the cursor of the restarted run reads back as no cursor")?;
+        ensure!(
+            back.to_string() == text,
+            "the restarted run's cursor reads back as {back}"
+        );
+
+        // The same wall from the engine's side, on the row the engine owns. The column is taken
+        // back to what an install that never ran `lazyview setup` has — too narrow for this
+        // cursor — and lazyview's own sessions run a `sql_mode` without `STRICT_TRANS_TABLES`
+        // (`dialect/mysql.rs`), so the server *accepts* the over-long cursor and keeps its first
+        // bytes: the save's own round trip is what notices. The run stops naming the column, and
+        // the row is left startable — the cursor cleared to NULL, the file and position that save
+        // wrote still there — rather than holding the truncated text #347's next start died on.
+        // (The refusal *before* the server sees anything, and the untouched row it leaves, is the
+        // leg of `lifecycle_a_cursor_past_the_column_is_refused_and_nothing_is_stored`.)
+        // The session's own `sql_mode` goes non-strict only so the ALTER below can shrink the
+        // column under the 70 KB value the row still holds at that moment. The save cadence is
+        // 200 ms, so the engine can slip a whole cursor back into the column between the clear and
+        // the ALTER — the ALTER then answers 1406, and clearing and retrying is the answer rather
+        // than a wider window.
+        exec(&mut c, "SET SESSION sql_mode = ''").await?;
+        for attempt in 0..40 {
+            exec(&mut c, "UPDATE _lazyview_status SET binlog_cursor = NULL").await?;
+            match exec(
+                &mut c,
+                "ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` VARCHAR(2000) NULL",
+            )
+            .await
+            {
+                Ok(()) => break,
+                Err(e) => {
+                    let why = format!("{e:#}");
+                    ensure!(
+                        why.contains("1406") || why.contains("Data too long"),
+                        "narrowing the cursor column failed on attempt {attempt}: {why}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        // Something has to make the engine save again: a position save follows a position that
+        // moved, and this run is idle now (no view reads the noise table, so the writes cost no
+        // refresh). Without them the narrow column would meet no save and the engine would have
+        // nothing to die on.
+        for i in 0..20 {
+            exec(
+                &mut c,
+                &format!(
+                    "INSERT INTO lc_noise (id, pad) VALUES ({}, 'after')",
+                    900_000 + i
+                ),
+            )
+            .await?;
+        }
+        let died = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                match eng.check_alive() {
+                    Err(e) => break format!("{e:#}"),
+                    Ok(()) if std::time::Instant::now() >= deadline => break String::new(),
+                    Ok(()) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+        };
+        ctx.log(format!("the engine met the narrow column saying: {died}"));
+        ensure!(
+            died.contains("the server kept") && died.contains("2000"),
+            "the engine kept running with a column that cannot hold its cursor ({died:?})"
+        );
+        let (kept, stored) = saved_cursor_row(&mut c, &instance).await?;
+        ensure!(
+            kept.is_empty() && stored == 0,
+            "the save the server shortened left {stored} bytes ({}) in the column instead of \
+             clearing it",
+            kept.chars().take(120).collect::<String>()
+        );
+        // Startable, not merely empty. `load_position` reads a NULL cursor as "no cursor yet" and
+        // hands back the `binlog_file`/`binlog_pos` the refused statement did write, so the row has
+        // to answer with a position carrying **no set** — a set here would be the truncated text
+        // #347's next start died on — at exactly the coordinate the row holds. (Asking it for
+        // `None` was wrong: `None` is a row with no file either, which the save did not leave.)
+        let (file, pos): (String, u64) = c
+            .query_first(format!(
+                "SELECT CAST(binlog_file AS CHAR), binlog_pos FROM _lazyview_status WHERE instance_id = {}",
+                q(&instance)
+            ))
+            .await?
+            .context("the status row vanished")?;
+        ensure!(
+            !file.is_empty() && pos > 0,
+            "the cleared row lost its file and position as well: {file}:{pos}"
+        );
+        let back = lazyview::meta::load_position(&mut c, &instance, flavor)
+            .await?
+            .context("the cleared row hands the next start no position at all")?;
+        ensure!(
+            back.gtid().is_none() && !back.to_string().contains("[g="),
+            "the cleared row still hands the next start a set to read: {back}"
+        );
+        let at = back.to_position();
+        ensure!(
+            at.file == file && at.pos == pos,
+            "the next start reads {}:{}, not the {file}:{pos} the cleared row holds",
+            at.file,
+            at.pos
+        );
+        c.disconnect().await.ok();
+        Ok(())
+    });
+}
+
+/// A cursor that does not fit even the MEDIUMTEXT column is **refused**: `meta::save_position`
+/// answers an error naming the size, the limit and the cause, the engine stops on it, and the row
+/// keeps the cursor it had — never the first bytes of the one it was given. #356 shed the set
+/// instead (a save that quietly disabled resume-by-GTID); shortening is not an answer, so neither
+/// is storing half of it.
+#[test]
+fn lifecycle_a_cursor_past_the_column_is_refused_and_nothing_is_stored() {
+    scenario("lc_cursor_refused", |ctx| async move {
+        use lazyview::source::{Cursor, Flavor};
+        let db = ctx.new_db("lc_cursor_refused").await?;
+        let mut c = db.conn().await?;
+        let flavor = if ctx.flavor().starts_with("mariadb") {
+            Flavor::MariaDb
+        } else {
+            Flavor::MySql
+        };
+        // The row as `coord::claim` writes it: an instance, an epoch, no cursor yet.
+        setup_run(&db).await?;
+        exec(
+            &mut c,
+            "INSERT INTO _lazyview_status (instance_id, binlog_file, binlog_pos, epoch) \
+             VALUES ('lc_refused', 'binlog.000004', 228705009, 7)",
+        )
+        .await?;
+        let at = Cursor::from_parts(flavor, "binlog.000004".into(), 228_705_009);
+
+        // #347's own shape — one interval per gap, the size that killed the smoke's restart — is
+        // the first thing that must simply work now: it rides the save whole. This is the leg
+        // #356's shed failed: it answered a cursor with no set at all.
+        let frag = fragmented_set(flavor, 4_000);
+        ensure!(
+            frag.len() > 65_535,
+            "the #347-shaped set is only {} bytes: it must pass the limit the old column had",
+            frag.len()
+        );
+        let wanted = at.clone().with_gtid(Some(frag.clone()));
+        lazyview::meta::save_position(&mut c, "lc_refused", &wanted, 7)
+            .await
+            .context("a cursor the old TEXT column could not hold was refused")?;
+        let (text, stored) = saved_cursor_row(&mut c, "lc_refused").await?;
+        ensure!(
+            stored as usize == wanted.to_string().len() && text == wanted.to_string(),
+            "the row holds {stored} bytes, not the {} of the #347-shaped cursor",
+            wanted.to_string().len()
+        );
+        let back = lazyview::meta::load_position(&mut c, "lc_refused", flavor)
+            .await?
+            .context("the cursor past the old limit reads back as no cursor")?;
+        ensure!(
+            back.gtid() == Some(frag.as_str()),
+            "the set came back as {:?} bytes, not the {} it was saved as",
+            back.gtid().map(str::len),
+            frag.len()
+        );
+
+        // The same, an order of magnitude bigger: the column is 16 MB, so megabytes ride the save
+        // and come back byte for byte.
+        let big = fragmented_set_of(flavor, 4 * 1024 * 1024);
+        let wanted = at.clone().with_gtid(Some(big.clone()));
+        let saved = lazyview::meta::save_position(&mut c, "lc_refused", &wanted, 7)
+            .await
+            .context("a cursor the MEDIUMTEXT column holds was refused")?;
+        ensure!(
+            saved.gtid() == Some(big.as_str()),
+            "a 4 MB set did not ride the save"
+        );
+        let (text, stored) = saved_cursor_row(&mut c, "lc_refused").await?;
+        let want = wanted.to_string();
+        ensure!(
+            stored as usize == want.len() && text == want,
+            "the row holds {stored} bytes, not the {} the save wrote",
+            want.len()
+        );
+        let back = lazyview::meta::load_position(&mut c, "lc_refused", flavor)
+            .await?
+            .context("the 4 MB cursor reads back as no cursor")?;
+        ensure!(
+            back.gtid() == Some(big.as_str()),
+            "the 4 MB set came back as {:?} bytes",
+            back.gtid().map(str::len)
+        );
+
+        // Past the column: refused, loudly, and the row is untouched.
+        let monster = fragmented_set_of(flavor, lazyview::meta::MAX_CURSOR_BYTES + 1);
+        let too_big = at.clone().with_gtid(Some(monster.clone()));
+        let too_big_len = too_big.to_string().len();
+        let err = lazyview::meta::save_position(&mut c, "lc_refused", &too_big, 7)
+            .await
+            .expect_err("a cursor past the column must be refused, not saved");
+        let msg = format!("{err:#}");
+        ctx.log(format!("refused as: {msg}"));
+        let size = too_big_len.to_string();
+        let limit = lazyview::meta::MAX_CURSOR_BYTES.to_string();
+        for names in [
+            size.as_str(),
+            limit.as_str(),
+            "pathologically fragmented",
+            "nothing was stored",
+        ] {
+            ensure!(
+                msg.contains(names),
+                "the refusal does not name {names:?}: {msg}"
+            );
+        }
+        let (still, stored) = saved_cursor_row(&mut c, "lc_refused").await?;
+        ensure!(
+            stored as usize == want.len() && still == want,
+            "the refused save changed the row: it holds {stored} bytes of {still}"
+        );
+        // And the save works again afterwards: a refusal is a refusal of that cursor, not a
+        // broken connection or a poisoned row.
+        lazyview::meta::save_position(&mut c, "lc_refused", &at, 7)
+            .await
+            .context("the save did not work again after a refusal")?;
+        let (text, stored) = saved_cursor_row(&mut c, "lc_refused").await?;
+        ensure!(
+            stored as usize == at.to_string().len() && text == at.to_string(),
+            "the plain cursor after the refusal is {stored} bytes: {text}"
+        );
+
+        // The third leg, and the one no server setting can take away: an install whose column is
+        // narrower than the cursor, on a session whose `sql_mode` does not refuse an over-long
+        // value. That is exactly #347's silence — the server keeps the first bytes, warns nobody,
+        // and the next start reads a cut cursor. `save_position` measures what the server says it
+        // kept, so the save fails here instead of at the next start.
+        exec(&mut c, "SET SESSION sql_mode = ''").await?;
+        exec(
+            &mut c,
+            "ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` VARCHAR(2000) NULL",
+        )
+        .await?;
+        let narrow = at.clone().with_gtid(Some(fragmented_set(flavor, 200)));
+        let err = lazyview::meta::save_position(&mut c, "lc_refused", &narrow, 7)
+            .await
+            .expect_err("a column narrower than the cursor must fail the save, not truncate it");
+        let msg = format!("{err:#}");
+        ctx.log(format!("the narrow column answered: {msg}"));
+        ensure!(
+            msg.contains("the server kept") && msg.contains("2000"),
+            "the round-trip check says {msg:?}, which does not name what the server kept"
+        );
+        // And `lazyview setup` is the fix it names: after the migration the same cursor rides the
+        // save again on the same connection.
+        setup_run(&db).await?;
+        lazyview::meta::save_position(&mut c, "lc_refused", &narrow, 7)
+            .await
+            .context("the same cursor was refused after `lazyview setup` widened the column")?;
+        let (text, stored) = saved_cursor_row(&mut c, "lc_refused").await?;
+        ensure!(
+            stored as usize == narrow.to_string().len() && text == narrow.to_string(),
+            "after the migration the row holds {stored} bytes, not {}",
+            narrow.to_string().len()
+        );
+        c.disconnect().await.ok();
+        Ok(())
+    });
+}
+
+/// An install that stopped at the old, narrow `binlog_cursor` is migrated by `lazyview setup`
+/// (`meta::ensure`, the same idempotent path every earlier column change uses), on the metadata
+/// server the status row lives on — and only then is a cursor wider than that column storable. The
+/// operations run refuses to start on the un-migrated column at all (`meta::verify`), naming the
+/// setup run: the round trip is the guarantee, but a schema it can already see is fixed at startup.
+#[test]
+fn lifecycle_setup_widens_an_old_cursor_column() {
+    scenario("lc_cursor_widen", |ctx| async move {
+        use lazyview::source::{Cursor, Flavor};
+        let db = ctx.new_db("lc_cursor_widen").await?;
+        let mut c = db.conn().await?;
+        let flavor = if ctx.flavor().starts_with("mariadb") {
+            Flavor::MariaDb
+        } else {
+            Flavor::MySql
+        };
+        // A new install gets the wide column from `CREATE TABLE`.
+        setup_run(&db).await?;
+        ensure!(
+            cursor_column_type(&mut c).await? == "mediumtext",
+            "a new install did not get a MEDIUMTEXT cursor column"
+        );
+        // The old install: the width `ensure` left behind before #356 widened it, with a row in it.
+        exec(
+            &mut c,
+            "ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` TEXT NULL",
+        )
+        .await?;
+        ensure!(
+            cursor_column_type(&mut c).await? == "text",
+            "the simulated old install is not a TEXT column"
+        );
+        exec(
+            &mut c,
+            "INSERT INTO _lazyview_status (instance_id, binlog_file, binlog_pos, epoch) \
+             VALUES ('lc_widen', 'binlog.000001', 4242, 3)",
+        )
+        .await?;
+        // The setup run migrates it, and does it twice without minding: idempotent, like every
+        // other column change in `MIGRATIONS`.
+        setup_run(&db).await?;
+        ensure!(
+            cursor_column_type(&mut c).await? == "mediumtext",
+            "`lazyview setup` left an old TEXT cursor column narrow"
+        );
+        setup_run(&db).await?;
+        ensure!(
+            cursor_column_type(&mut c).await? == "mediumtext",
+            "the second setup run narrowed or lost the cursor column"
+        );
+        let (text, stored) = saved_cursor_row(&mut c, "lc_widen").await?;
+        ensure!(
+            stored == 0 && text.is_empty(),
+            "the migration rewrote the row it was only supposed to widen: {text}"
+        );
+        // The point of the width: the set that used to be cut rides the migrated row whole.
+        let set = fragmented_set_of(flavor, 70_000);
+        let at = Cursor::from_parts(flavor, "binlog.000001".into(), 4242);
+        let wanted = at.clone().with_gtid(Some(set));
+        lazyview::meta::save_position(&mut c, "lc_widen", &wanted, 3)
+            .await
+            .context(
+                "a cursor the old TEXT column could not hold was refused after the migration",
+            )?;
+        let (text, stored) = saved_cursor_row(&mut c, "lc_widen").await?;
+        ensure!(
+            stored as usize == wanted.to_string().len() && text == wanted.to_string(),
+            "the migrated row holds {stored} bytes, not the {} the save wrote",
+            wanted.to_string().len()
+        );
+        // Before it is migrated, the operations run says so instead of truncating: `verify` is that
+        // check, and its error names the setup run. The row is emptied first — the leg is about the
+        // width of the column, and strict mode rightly refuses to shrink a column under a value it
+        // cannot hold (the same refusal that made #347 loud on a strict server).
+        exec(&mut c, "UPDATE _lazyview_status SET binlog_cursor = NULL").await?;
+        exec(
+            &mut c,
+            "ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` TEXT NULL",
+        )
+        .await?;
+        let err = lazyview::meta::verify(&mut c, &db.name)
+            .await
+            .expect_err("the operations run must not accept a narrow cursor column");
+        let msg = format!("{err:#}");
+        ensure!(
+            msg.contains("binlog_cursor") && msg.contains("lazyview setup"),
+            "the pre-flight says {msg:?}, which names neither the column nor the fix"
+        );
+        setup_run(&db).await?;
+        lazyview::meta::verify(&mut c, &db.name)
+            .await
+            .context("the operations run still refuses after the migration")?;
         c.disconnect().await.ok();
         Ok(())
     });
