@@ -204,6 +204,12 @@ pub struct MysqlLock {
     name: String,
     /// The statement that gives the session its lease.
     lease_stmt: String,
+    /// The client-side deadline every statement on this lock session runs under, so a lock link
+    /// that stops answering (a partition, a black-holed proxy) can never leave the beat task hung
+    /// inside a `connect`, a session `SET`, a `GET_LOCK` or the beat. It is the beat timeout — at
+    /// most one `heartbeat` — so a statement that cannot be answered returns in time for the beat
+    /// task to reach its time-driven `Uncertain` check (lv-super ruling 1, A-06).
+    stmt_deadline: Duration,
 }
 
 impl MysqlLock {
@@ -214,6 +220,7 @@ impl MysqlLock {
             opts,
             name: lock_name(schema, instance_id),
             lease_stmt: lease_statement(lease.lease),
+            stmt_deadline: lease.beat_timeout,
         }
     }
 }
@@ -226,11 +233,16 @@ impl LockBackend for MysqlLock {
     }
 
     async fn open(&mut self) -> Result<Conn> {
-        connect_setup(&self.opts, &self.lease_statements()).await
+        connect_setup(
+            &self.opts,
+            &self.lease_statements(),
+            Some(self.stmt_deadline),
+        )
+        .await
     }
 
     async fn try_hold(&mut self, conn: &mut Conn) -> Result<Take> {
-        try_hold(conn, &self.name).await
+        try_hold(conn, &self.name, Some(self.stmt_deadline)).await
     }
 
     async fn beat(&mut self, conn: &mut Conn) -> Result<bool> {
@@ -245,7 +257,7 @@ impl LockBackend for MysqlLock {
     }
 
     async fn rejoin(&mut self, conn: &mut Conn, l: &Leadership, instance_id: &str) -> Result<()> {
-        reacquire(conn, l, instance_id).await
+        reacquire(conn, l, instance_id, Some(self.stmt_deadline)).await
     }
 }
 
@@ -384,13 +396,13 @@ async fn acquire_with_setup(
     let mut logged = false;
     let mut wait = Duration::from_millis(250);
     loop {
-        match try_hold(conn, &name).await {
+        match try_hold(conn, &name, None).await {
             Ok(Take::Held) => break,
             Ok(Take::Busy) => {}
             Ok(Take::Lost(e)) => {
                 warn!("standby: lock connection lost ({e}); reconnecting");
                 metrics.beat();
-                match connect_setup(opts, setup).await {
+                match connect_setup(opts, setup, None).await {
                     Ok(c) => *conn = c,
                     Err(_) => {
                         tokio::time::sleep(wait).await;
@@ -425,13 +437,21 @@ async fn acquire_with_setup(
 }
 
 /// Tries to take the leadership lock on `conn` without waiting for it, sorted into the cases
-/// [`Take`] separates: ours, held by someone else, or a session that has to be replaced.
-async fn try_hold(conn: &mut Conn, name: &str) -> Result<Take> {
-    match conn.exec_first(GET_LOCK_NOW, (name,)).await {
+/// [`Take`] separates: ours, held by someone else, or a session that has to be replaced. The
+/// `GET_LOCK` runs under `deadline` (one heartbeat on the lock session), so a lock link that has
+/// stopped answering yields `Take::Lost` and a fresh session instead of hanging the beat task.
+async fn try_hold(conn: &mut Conn, name: &str, deadline: Option<Duration>) -> Result<Take> {
+    let got = match deadline {
+        None => conn.exec_first(GET_LOCK_NOW, (name,)).await,
+        Some(d) => tokio::time::timeout(d, conn.exec_first(GET_LOCK_NOW, (name,)))
+            .await
+            .map_err(|_| lock_deadline("lock session: GET_LOCK did not answer in time"))?,
+    };
+    match got {
         Ok(got) if got.flatten() == Some(1) => Ok(Take::Held),
         Ok(_) => Ok(Take::Busy),
-        // A connection that died is ordinary while standing by; any other error is the server
-        // refusing the lock, which waiting will not fix.
+        // A connection that died, or a round-trip that never answered, is ordinary while standing
+        // by; any other error is the server refusing the lock, which waiting will not fix.
         Err(e @ (mysql_async::Error::Io(_) | mysql_async::Error::Driver(_))) => {
             Ok(Take::Lost(e.into()))
         }
@@ -439,22 +459,58 @@ async fn try_hold(conn: &mut Conn, name: &str) -> Result<Take> {
     }
 }
 
-/// Opens a connection for the leadership lock and runs its session statements — bounded by the
-/// same connect bound as every other connection the service opens, so a lock server that is away
-/// cannot hang the task that beats it.
-async fn connect_setup(opts: &Opts, setup: &[String]) -> Result<Conn> {
-    let mut conn =
-        tokio::time::timeout(crate::supervisor::CONNECT_TIMEOUT, Conn::new(opts.clone()))
+/// A client-side deadline miss on the lock session, typed so [`binlog::is_transient`] recognises
+/// it: a lock link that stopped answering is a network fault to ride out (keep the gates closed and
+/// try the next beat), never a verdict that this instance was replaced. Only a `GET_LOCK` that the
+/// server answered "someone else has it", or a fencing epoch that moved, says `Fenced`.
+fn lock_deadline(msg: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        msg.to_string(),
+    ))
+}
+
+/// Runs one lock-session statement under `deadline`, so a statement whose reply never comes
+/// returns a transient error instead of hanging the beat task. `None` keeps the statement
+/// unbounded (the standby's connect, which has its own `CONNECT_TIMEOUT` bound). Accepts any
+/// statement error that converts to `anyhow` (the MySQL driver's, or nothing at all).
+async fn bounded<T, E, F>(deadline: Option<Duration>, fut: F) -> Result<T>
+where
+    E: Into<anyhow::Error>,
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    match deadline {
+        None => fut.await.map_err(Into::into),
+        Some(d) => tokio::time::timeout(d, fut)
             .await
             .map_err(|_| {
-                anyhow!(
-                    "the lock server did not answer within {} s",
-                    crate::supervisor::CONNECT_TIMEOUT.as_secs()
-                )
+                lock_deadline(format!(
+                    "the lock server did not answer within {} ms",
+                    d.as_millis()
+                ))
             })?
-            .context("lock session: connect")?;
+            .map_err(Into::into),
+    }
+}
+
+/// Opens a connection for the leadership lock and runs its session statements — each under the
+/// caller's client-side `deadline` (the beat task passes one heartbeat), so a lock server that has
+/// stopped answering cannot hang the task that beats the lock: the statement returns a transient
+/// error and the beat task reaches its time-driven `Uncertain` check (lv-super ruling 1, A-06).
+async fn connect_setup(opts: &Opts, setup: &[String], deadline: Option<Duration>) -> Result<Conn> {
+    let connect_bound = deadline.unwrap_or(crate::supervisor::CONNECT_TIMEOUT);
+    let mut conn = tokio::time::timeout(connect_bound, Conn::new(opts.clone()))
+        .await
+        .map_err(|_| {
+            lock_deadline(format!(
+                "the lock server did not answer the connect within {} ms",
+                connect_bound.as_millis()
+            ))
+        })?
+        .context("lock session: connect")?;
     for stmt in setup {
-        conn.exec_drop(stmt, ())
+        let stmt = stmt.clone();
+        bounded(deadline, conn.exec_drop(&stmt, ()))
             .await
             .with_context(|| format!("lock session: {stmt}"))?;
     }
@@ -482,29 +538,41 @@ async fn bump_epoch(conn: &mut Conn, instance_id: &str) -> Result<u64> {
 
 /// Takes the lock again on a new metadata connection after the previous one was lost (the
 /// server released the lock with it). Fails if another instance holds it now, or took over
-/// meanwhile (the fencing epoch moved on): this one must stop then.
-pub async fn reacquire(conn: &mut Conn, l: &Leadership, instance_id: &str) -> Result<()> {
+/// meanwhile (the fencing epoch moved on): this one must stop then. Both statements run under
+/// `deadline` (one heartbeat on the lock session): a rejoin whose answer never comes returns a
+/// transient error — the beat task keeps its gates closed and retries — rather than hanging the
+/// task that is supposed to notice the lease running out (lv-super ruling 1, A-06).
+pub async fn reacquire(
+    conn: &mut Conn,
+    l: &Leadership,
+    instance_id: &str,
+    deadline: Option<Duration>,
+) -> Result<()> {
     // Our old session may still hold the lock for a moment: a killed connection releases its
     // locks only when the server has finished it (KILL is asynchronous). Another instance that
     // took over keeps it, and the epoch check below catches a takeover in between.
-    let got: Option<Option<i64>> = conn
-        .exec_first(
+    let got: Option<Option<i64>> = bounded(
+        deadline,
+        conn.exec_first(
             "SELECT GET_LOCK(?, ?)",
             (&l.lock_name, REACQUIRE_WAIT.as_secs()),
-        )
-        .await?;
+        ),
+    )
+    .await?;
     if got.flatten() != Some(1) {
         bail!(
             "lost leadership lock `{}` while disconnected; another instance is active",
             l.lock_name
         );
     }
-    let epoch: Option<u64> = conn
-        .exec_first(
+    let epoch: Option<u64> = bounded(
+        deadline,
+        conn.exec_first(
             "SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
             (instance_id,),
-        )
-        .await?;
+        ),
+    )
+    .await?;
     if epoch != Some(l.epoch) {
         bail!(
             "another lazyview instance took over while disconnected (epoch {epoch:?}, ours {}); stopping",

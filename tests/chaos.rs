@@ -2534,7 +2534,6 @@ fn chaos_both_sides_fragmented() {
 // =============================================================================================
 
 use common::engineproc::{measured, proc_state, EngineProc};
-use std::time::Instant;
 
 /// The lock's own settings for these three scenarios: the floor the rules allow (a 1 s beat, and a
 /// lease of exactly the `4 x` `Lease::new` demands), so a scenario runs in seconds and asserts about

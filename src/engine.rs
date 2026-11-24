@@ -1695,6 +1695,18 @@ impl Drop for LockTask {
     }
 }
 
+/// The one leadership gate every write path asks (lv-super ruling 1, A-06): `true` means no *new*
+/// write may start here, because this instance is either the replaced one (`Fenced`) or the one
+/// whose beats have stopped being answered (`Uncertain`). It is an atomic `watch` read — no
+/// allocation, no round trip — so calling it from every write path (flush, the position save, the
+/// meta writes, the target DDL: `drop_shadow`, `drop_table`, the swap and its rename) costs nothing
+/// on the event path, and there is a single predicate to keep correct rather than a check copied to
+/// each site. The refresh supervisor's write ops reach the same predicate through
+/// [`supervisor::LeaderGate`] ([`LeaderWriteGate`]).
+fn leader_holds(state: &watch::Receiver<LeaderState>) -> bool {
+    !matches!(*state.borrow(), LeaderState::Active)
+}
+
 /// Publishes the state unless it already says that, so a beat that changes nothing wakes nobody.
 fn publish_leader(state: &watch::Sender<LeaderState>, next: LeaderState) {
     state.send_if_modified(|cur| {
@@ -1812,20 +1824,39 @@ async fn run_lock_beat<D: LockBeat + Send + 'static, F: WriteFence>(
                     "leadership lock: beat failed ({}); rejoining",
                     e.root_cause()
                 );
-                match d.rejoin().await {
-                    Ok(()) => {
+                // The beat that just failed answered nothing, so the clock may already have run
+                // past the two-beat window: close the gates now, before (and independently of) the
+                // rejoin. The rejoin is itself bounded below, but this check fires the `Uncertain`
+                // transition on time wherever the rejoin happens to be (lv-super ruling 1, A-06).
+                if last_ok.elapsed() >= uncertain_after {
+                    hold_writes(&metrics, &state, &fence, &mut fencing, uncertain_after);
+                }
+                // A rejoin whose session statements cannot be answered must not stall the beat task
+                // (it is the task that is supposed to notice the lease ending). Each statement is
+                // bounded to a heartbeat in `coord`; bound the whole attempt too, and treat a stall
+                // as a transient deferral so the gates stay closed and the next beat tries again.
+                match tokio::time::timeout(uncertain_after, d.rejoin()).await {
+                    Ok(Ok(())) => {
                         metrics.leader_beat_ok();
                         last_ok = Instant::now();
                         publish_leader(&state, LeaderState::Active);
                         info!("leadership lock: session re-opened, the lock and epoch confirmed; still the active instance");
                     }
-                    // The lock server is away: the lease is the server's own clock, so this
-                    // instance keeps its lock there for now and the next beat tries again. The
-                    // beat that failed already counted; a deferred rejoin is not a second one.
-                    Err(e) if binlog::is_transient(&e) => {
+                    // The lock server is away (or a rejoin statement went unanswered): the lease is
+                    // the server's own clock, so this instance keeps its lock there for now and the
+                    // next beat tries again. The failed beat already counted; a deferred rejoin is
+                    // not a second one, and the gates stay closed until a beat or rejoin answers.
+                    Ok(Err(e)) if binlog::is_transient(&e) => {
                         warn!("leadership lock: rejoin deferred ({})", e.root_cause());
                     }
-                    Err(e) => {
+                    // The rejoin could not be completed inside the uncertainty window: same as a
+                    // deferred rejoin — the link is not answering, so stay `Uncertain`.
+                    Err(_) => {
+                        warn!("leadership lock: rejoin timed out after {uncertain_after:?}; staying uncertain");
+                    }
+                    // The lock answered and said this instance is the replaced one (the lock is held
+                    // elsewhere, or the epoch moved while we were away): fence and stop.
+                    Ok(Err(e)) => {
                         quarantine_writes(&mut fencing, &fence).await;
                         fence_leader(&metrics, &state, format!("{e:#}"));
                         return;
@@ -3391,6 +3422,12 @@ impl Engine {
                 {
                     continue;
                 }
+                // Target DDL: behind the one leadership gate (ruling 1, A-06). Startup reclaim runs
+                // Active, so this is a guard, not a behaviour change: a not-provable instance drops
+                // nothing, and the next Active pass reclaims the orphan.
+                if leader_holds(&self.leader_state) {
+                    continue;
+                }
                 info!(table = %table, "removing a table lazyview created for a definition that no longer exists");
                 if let Err(e) =
                     target::mysql::drop_table(&mut self.meta, &self.schema, &table, &self.metrics)
@@ -3636,8 +3673,13 @@ impl Engine {
         Ok(rest)
     }
 
-    /// Drops the shadow table of `name` on target `t` (best effort).
+    /// Drops the shadow table of `name` on target `t` (best effort). A target DDL, so it goes behind
+    /// the same leadership gate as every other write (lv-super ruling 1, A-06): a replaced or
+    /// not-yet-provable instance drops nothing on a target.
     async fn drop_shadow(&mut self, t: &str, name: &str) {
+        if leader_holds(&self.leader_state) {
+            return;
+        }
         let ts = self.targets[t].schema.clone();
         if let Ok(c) = self.target_conn(t).await {
             let _ = c
@@ -3953,6 +3995,12 @@ impl Engine {
     }
 
     async fn drop_owned(&mut self, name: &str, target: &str) {
+        // Target DDL plus a meta write (the state row): behind the one leadership gate (lv-super
+        // ruling 1, A-06) — a replaced or not-yet-provable instance drops nothing, on a target or
+        // in the metadata; the ownership entry stays so the next Active pass still owns it.
+        if leader_holds(&self.leader_state) {
+            return;
+        }
         let key = (name.to_string(), target.to_string());
         if self.owned.remove(&key).is_none() {
             if let Err(e) = meta::delete_state(&mut self.meta, name, target).await {
@@ -6344,7 +6392,7 @@ impl Engine {
     /// The refresh supervisor's write ops are gated by the same state, through
     /// [`supervisor::LeaderGate`]; `leader_hold` is what keeps the loop off a closed gate.
     fn leader_holds_writes(&self) -> bool {
-        !matches!(*self.leader_state.borrow(), LeaderState::Active)
+        leader_holds(&self.leader_state)
     }
 
     async fn flush(&mut self) -> Result<()> {
