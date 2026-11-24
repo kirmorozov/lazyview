@@ -1649,9 +1649,12 @@ fn alert_rules_stream_undecodable() {
         // catching up: in #342 (percona84 run 45146922386, percona97 run 45187862444) the
         // engine resumed from the same boundary after the test had already given up on the
         // rows. So the wait goes on while the engine's own `applied()` advances, and it dies
-        // on the bound the engine is held to (`engine_bounds::stall`, not a guessed wall
-        // clock): a view that really stops applying after the refused round still fails, and
-        // its message names the bound that ran out.
+        // on the bound `CatchUp` keeps — `CatchUp::new` holds `stall.max(floor)`, the larger of
+        // this caller's 180 s floor and `engine_bounds::stall(default_target_timeout())`, so
+        // the engine's own bound (≈393 s on the library's defaults, the larger of the two
+        // here) governs, not the floor and never a guessed wall clock: a view that really
+        // stops applying after the refused round still fails, and its message names the bound
+        // that ran out.
         let t = Instant::now();
         let mut rule = CatchUp::new(
             t,
@@ -1666,11 +1669,19 @@ fn alert_rules_stream_undecodable() {
             eng.check_alive()?;
             if let CatchUpVerdict::Failed(why) = rule.sample(Instant::now(), eng.applied().as_ref())
             {
-                let last = lag_rows_match(&mut c, "vs_lag").await.unwrap_err();
-                bail!(
-                    "the rows of the refused events never landed after {stuck:.0} stuck rounds: \
-                     {why}; last comparison: {last:#}"
-                );
+                // The re-sample that quotes the last comparison runs after the break-check, and
+                // the rows can land in between: this is the same race the wait was built for, so
+                // it must not answer it with a panic. Ok means the rows matched after all — the
+                // wait's own invariant holds — and the verdict is spent: end the loop as the
+                // break-check would have. Only a re-sample that still disagrees fails, and then
+                // it is quoted.
+                match lag_rows_match(&mut c, "vs_lag").await {
+                    Ok(()) => break,
+                    Err(last) => bail!(
+                        "the rows of the refused events never landed after {stuck:.0} stuck \
+                         rounds: {why}; last comparison: {last:#}"
+                    ),
+                }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
