@@ -2570,6 +2570,34 @@ async fn lock_epoch(db: &Db) -> Result<u64> {
     e.with_context(|| format!("`_lazyview_status` has no row for instance `{LOCK_INSTANCE}`"))
 }
 
+/// The saved position of this schema's instance row *with the epoch that wrote it*, read in one
+/// statement so the two cannot come from two states of the row. Both engines of a takeover run
+/// under `LAZYVIEW_INSTANCE_ID` = `LOCK_INSTANCE` — sharing the id is what makes them contend for
+/// one lock — so `_lazyview_status` holds ONE row for the two of them, and the epoch says which of
+/// them last owned it. [`soakchaos::saved_position`] takes the highest position of any row and
+/// cannot tell the two apart; this can.
+async fn saved_row(db: &Db) -> Result<(lazyview::binlog::Position, u64)> {
+    let mut c = db.conn().await?;
+    let row: Option<(String, String, u64)> = c
+        .exec_first(
+            "SELECT CAST(`binlog_file` AS CHAR), CAST(`binlog_pos` AS CHAR), `epoch` \
+             FROM `_lazyview_status` WHERE `instance_id` = ?",
+            (LOCK_INSTANCE,),
+        )
+        .await
+        .with_context(|| format!("the saved row of instance `{LOCK_INSTANCE}`"))?;
+    c.disconnect().await.ok();
+    let (file, pos, epoch) = row
+        .with_context(|| format!("`_lazyview_status` has no row for instance `{LOCK_INSTANCE}`"))?;
+    Ok((
+        lazyview::binlog::Position {
+            file,
+            pos: pos.parse().unwrap_or(0),
+        },
+        epoch,
+    ))
+}
+
 /// Both halves of the connection black-holed: `timeout{timeout:0}` on `downstream` alone still lets
 /// the client's bytes reach the server, and a session the server is still reading from never looks
 /// idle — the lease *is* the server's socket-read timeout, so a black hole that is meant to end the
@@ -2611,7 +2639,20 @@ fn chaos_lock_blackhole_takeover() {
         let targets = f.targets.clone();
         let mut w = spawn_writers(&db, &f.ids, seed);
         f.wait_streaming().await?;
-        let mut b = ctx.start_engine(&db, &LOCK_ENV)?;
+        // The replacement runs the deployment the fenced one ran: the fixture's targets included.
+        // `Ctx::start_engine` gives an engine the source DSN and the harness defaults and nothing
+        // else, so without the target configuration every view the fixture put on `t1` comes up in
+        // error ("unknown target `t1`") and the final oracle check compares tables nothing wrote.
+        // The lock is deliberately NOT proxied for it — `LOCK_ENV` carries no `LAZYVIEW_TEST_LOCK_DSN`,
+        // so its own session dials the server directly, which is what lets it take over at all
+        // while the old instance's lock link is black-holed.
+        let t1 = targets
+            .get("t1")
+            .expect("the t1 target the fixture put the views on");
+        let t1_env = target_env(&[("t1", t1.dsn.as_str())]);
+        let mut b_env: Vec<(&str, &str)> = LOCK_ENV.iter().map(|(k, v)| (*k, *v)).collect();
+        b_env.extend(t1_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let mut b = ctx.start_engine(&db, &b_env)?;
         let bm = b.metrics.clone();
         wait_until("the replacement in hot standby", FAULT, || {
             let bm = bm.clone();
@@ -2668,19 +2709,37 @@ fn chaos_lock_blackhole_takeover() {
         // Nothing more may be saved from here on — and this is the only window in which that is
         // observable at all. Both engines run under the same `LAZYVIEW_INSTANCE_ID`
         // (`LOCK_INSTANCE`, which is what makes them contend for one lock), so `_lazyview_status`
-        // holds ONE row for the two of them and the replacement starts saving it the moment it
-        // streams. Until then the fenced instance is the only one that can write that row, and an
-        // ungated loop moves it every 50 ms (`soakchaos::saved_position`) — a few save intervals
-        // of a still row is the proof, and it has to be taken before the takeover.
-        for _ in 0..6 {
+        // holds ONE row for the two of them: the epoch that wrote it says which of them did.
+        // `coord::bump_epoch` IS the takeover and it happens before the replacement saves
+        // anything, so while the row still carries the replaced instance's epoch, that instance is
+        // the only one that can write it — and an ungated loop moves it every 50 ms
+        // (`soakchaos::saved_position`). The sample stops when the epoch moves: from then on the
+        // row is the replacement's own to save and the check would only measure the takeover.
+        let mut samples = 0;
+        let mut seen_takeover = false;
+        for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let now = soakchaos::saved_position(&db).await?;
+            let (now, epoch_now) = saved_row(&db).await?;
+            if epoch_now != epoch_before {
+                seen_takeover = true;
+                break;
+            }
+            samples += 1;
             ensure!(
                 now == position_held,
-                "the replaced instance saved a position after its lock was gone: \
-                 {position_held:?} -> {now:?}"
+                "the replaced instance saved a position after its gates closed: {position_held:?} \
+                 -> {now:?} while `_lazyview_status` still carried its own epoch {epoch_now}"
             );
         }
+        measured(format!(
+            "chaos_lock_blackhole_takeover: the fenced instance saved nothing over {samples} \
+             sample(s) of 100 ms of a row still under its own epoch{}",
+            if seen_takeover {
+                " (the takeover arrived inside the window)"
+            } else {
+                ""
+            }
+        ));
         // The takeover.
         wait_until("the replacement streaming", TAKEOVER, || {
             let bm = bm.clone();
