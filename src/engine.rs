@@ -5374,13 +5374,30 @@ impl Engine {
                 // DIAGNOSTIC (temporary): the changes this instance was handed for a watched
                 // table — what the binlog reader gave the engine, before any of it is routed.
                 if m1_rows(&key.1) {
+                    // The route list itself, not just that there is one: a view missing from this
+                    // list while its row is still fed to the core is the shape of the #319 loss.
+                    let views = route
+                        .as_ref()
+                        .map(|rt| {
+                            let mut v: Vec<&str> = rt
+                                .iter()
+                                .filter(|r| r.kind != RouteKind::Any)
+                                .filter_map(|r| self.slots.get(r.slot).map(|s| s.name.as_str()))
+                                .collect();
+                            v.sort_unstable();
+                            v.dedup();
+                            v.join(",")
+                        })
+                        .unwrap_or_default();
                     tracing::trace!(
                         target: "m1trace",
-                        "READ tbl={} kind={:?} route={} src={} rows=[{}]",
+                        "READ tbl={} kind={:?} route={} src={} views=[{}] xa={} rows=[{}]",
                         key.1,
                         kind,
                         route.is_some(),
                         src.is_some(),
+                        views,
+                        self.xa_current.is_some(),
                         m1_dump(&rows),
                     );
                 }
@@ -5397,6 +5414,9 @@ impl Engine {
             }
             Item::XaStart { xid } => {
                 self.in_txn = true;
+                if m1_on() {
+                    tracing::trace!(target: "m1trace", "XA ev=start xid={}", xid);
+                }
                 self.in_xa_txn = true;
                 self.xa_current = Some((
                     xid,
@@ -5415,6 +5435,22 @@ impl Engine {
             }
             Item::XaPrepare { xid, pos } => {
                 // Prepared rows become visible only at XA COMMIT: keep them to feed again then.
+                if m1_on() {
+                    let (rows, bytes) = self
+                        .xa_current
+                        .as_ref()
+                        .map(|(_, xa)| (xa.rows.len(), xa.bytes))
+                        .unwrap_or((0, 0));
+                    tracing::trace!(
+                        target: "m1trace",
+                        "XA ev=prepare xid={} held_rows={} bytes={} matched={} pending={}",
+                        xid,
+                        rows,
+                        bytes,
+                        self.xa_current.as_ref().is_some_and(|(x, _)| x == &xid),
+                        self.xa_pending.len(),
+                    );
+                }
                 self.end_txn(pos);
                 if let Some((x, mut xa)) = self.xa_current.take() {
                     let key = if x == xid { x } else { xid };
