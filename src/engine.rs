@@ -8271,6 +8271,22 @@ impl Engine {
                         }
                     }
                 }
+                if dirty.rebuild {
+                    // A rebuild is not carried by the owed sets alone. The view's own maintenance
+                    // IS this buffer: `flush_deadline` wakes the loop for `rebuild` / for `all` on a
+                    // Full-mode plan (`src/engine.rs:6423`), and the Full branch below starts the
+                    // cadence rebuild from it. Clearing it left the Full view with nothing pending:
+                    // after the black-holed `t1` failed one build, `w_union_kinds` was never rebuilt
+                    // again and its HEALTHY targets froze at the rows of the last swap (percona84,
+                    // seed 472297954799: `rebuilding view=w_union_kinds` appears exactly once in the
+                    // run) — and with the writers stopped no new change would ever re-arm it. Same
+                    // keeping as the Full branch's own `all.is_empty()` case: the whole buffer goes
+                    // back (a later round may answer it per key), and the excluded targets are
+                    // additionally owed the view itself by the `all` above.
+                    l.dirty.merge(dirty);
+                    l.dirty.rebuild = true;
+                    l.dirty.all = true;
+                }
             } else {
                 // Nothing owed (the usual round of a quiescing schema): keep it for the round
                 // that has a target to write to.
