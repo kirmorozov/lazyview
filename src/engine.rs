@@ -3800,6 +3800,7 @@ impl Engine {
             swap,
             test_delay,
             rb,
+            self.leader_state.clone(),
         ));
         if routine {
             debug!(view = %name, "rebuilding");
@@ -7201,6 +7202,7 @@ impl Engine {
                     self.cfg.lock_wait_s,
                     self.cfg.swap_lock_wait_s,
                     self.metrics.clone(),
+                    self.leader_state.clone(),
                 ));
                 n.swapping = true;
                 if !dirty.is_empty() {
@@ -7219,10 +7221,21 @@ impl Engine {
             // off-loop swap (the build task or the swap task) already timed out on the lock
             // is not tried again here — it goes straight to "left to the next rebuild".
             let timed_out = n.lock_wait.contains(&t);
-            let r = if timed_out {
+            // The rename of a swap is a write to a target, so it asks the one leadership gate
+            // (ruling 2, A-06): the instance that can no longer prove the lock renames nothing, and
+            // the table is left to a rebuild by whoever holds the lock. It goes by way of the same
+            // "spent its lock wait" error as N-02 rather than a `continue` because that path is what
+            // returns the changes buffered for this version to the live one; dropping the version
+            // here would drop them with it.
+            if !timed_out && self.leader_holds_writes() {
+                debug!(view = %n.name, target = %t,
+                    "swap held: the leadership lock does not allow new writes; left to the next rebuild");
+            }
+            let r = if timed_out || self.leader_holds_writes() {
                 // The swap task already spent the operator's bounded wait on this table's lock
-                // (N-02): the loop does not wait for it again. A decoded kind, so the call sites
-                // and `target_down` see a transient lock wait, not a build failure.
+                // (N-02), or the gate above is closed: the loop does not wait for it again. A
+                // decoded kind, so the call sites and `target_down` see a transient lock wait, not
+                // a build failure.
                 Err(anyhow!(target::SwapLockWait {
                     per_try_s: self.cfg.swap_lock_wait_s,
                     tries: crate::supervisor::Policy::SWAP.attempts + 1,
@@ -9157,11 +9170,21 @@ async fn swap_task(
     lock_wait_s: u64,
     swap_lock_wait_s: u64,
     metrics: Arc<Metrics>,
+    leader: watch::Receiver<LeaderState>,
 ) {
     let mut swapped = Vec::new();
     let mut lock_wait = Vec::new();
     for (t, opts, schema, kind, check) in targets {
         let r = async {
+            // The swap renames a table on a target, which is a write: it asks the one leadership
+            // gate before it starts (ruling 2, A-06). A task of its own is not covered by the
+            // flush gate of the binlog loop, and a rename by an instance that cannot prove the lock
+            // is exactly what the replacement must not find. The error below is the ordinary "swap
+            // left to the engine" outcome: the loop's own tail swap asks the same gate, so the
+            // table waits for a rebuild by whoever holds the lock.
+            if leader_holds(&leader) {
+                bail!("swap held: the leadership lock does not allow new writes");
+            }
             let mut c = match tokio::time::timeout(
                 TARGET_CONNECT_TIMEOUT * 3,
                 connect_target(&opts, kind, lock_wait_s, &metrics),
@@ -9357,6 +9380,7 @@ async fn build_task(
     swap: bool,
     test_delay: Option<Duration>,
     read_barrier: Option<ReadBarrier>,
+    leader: watch::Receiver<LeaderState>,
 ) {
     let result = async {
         let _permit = slots.acquire_owned().await?;
@@ -9424,7 +9448,15 @@ async fn build_task(
                 .iter()
                 .filter(|s| !failed.iter().any(|(t, _)| *t == s.target)),
         ) {
-            if !swap {
+            if !swap || leader_holds(&leader) {
+                // The same gate as the swap task and the loop's tail (ruling 2, A-06): the rename a
+                // swap performs is a write to a target, and an instance that cannot prove the lock
+                // leaves it, as it leaves a swap whose lock wait ran out, to the engine and to the
+                // next rebuild by whoever holds the lock.
+                if swap {
+                    debug!(view = %name, target = %spec.target,
+                        "swap held: the leadership lock does not allow new writes; left to the engine");
+                }
                 break;
             }
             if spec.check_table && foreign_table(c, ts, &name, &spec.marker).await {
