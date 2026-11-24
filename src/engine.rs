@@ -8189,20 +8189,60 @@ impl Engine {
             .filter(|t| !lagging.contains(t))
             .cloned()
             .collect();
-        // #214 (target isolation): with every target excluded there is nothing to write AND no
-        // target holding current rows to read the materialized table from —
-        // [`Self::read_materialized`] reads the write set (`source` first, they hold the same
-        // rows), so an empty set only bought a failing round: "reading the materialized table:
-        // no target answered", retried under [`crate::supervisor::Policy::STATEMENTS`], with the
-        // buffer above gone along with the error. The changes stay in the buffer instead:
-        // `lag_due` hands them to the targets that owe them, and the first round with an eligible
-        // target applies them. Cost: one emptiness test per refresh that takes its targets from
-        // the live version, off the binlog event path.
+        // #214 (target isolation): with no eligible target there is nothing to write AND no target
+        // holding current rows to read the materialized table from — [`Self::read_materialized`]
+        // reads the write set (`source` first, they hold the same rows), so an empty set only bought
+        // a failing round: "reading the materialized table: no target answered", retried under
+        // [`crate::supervisor::Policy::STATEMENTS`], with the buffer above gone along with the error.
+        // Nor may the changes stay in the buffer: only a successful flush clears it, and with one
+        // dead target the healthy ones are flagged behind on every round of the black-hole test's
+        // 1-byte budget, so this became the hot path and the buffer grew forever while its rows
+        // reached the healthy targets only as re-fed claims (`chaos_tgt_blackhole_during_flush`,
+        // percona84: the direct target 90 s behind the oracle). What a flush would have owed them,
+        // it owes them HERE: the taken buffer becomes their owed set, the entries are what
+        // `lag_end` writes and `lag_floor` pins into the saved position, and the buffer is cleared
+        // as a flush clears it. Cost (guard R3): one set feed per excluded target per round that
+        // carries something — never per binlog event.
         if targets.is_empty() {
-            l.dirty = dirty;
-            // Not logged per round: with every target behind this is the hot path (22 000 lines
-            // in one 140 s run of the black-hole test), and the state is already visible as the
-            // view's lag entries (`lag refresh claimed …` lines and the lag gauges).
+            let carries = !dirty.units.is_empty()
+                || !dirty.partial.iter().all(UnitSet::is_empty)
+                || dirty.all;
+            if carries && !dirty.rebuild {
+                let floor = l
+                    .since
+                    .clone()
+                    .unwrap_or_else(|| self.boundary.to_position());
+                for t in &lagging {
+                    l.behind.remove(t.as_str());
+                    l.lag.entry(t.clone()).or_insert_with(|| Lag {
+                        units: UnitSet::default(),
+                        partial: Vec::new(),
+                        all: false,
+                        since: floor.clone(),
+                        failures: 0,
+                        retry_at: Instant::now(),
+                        down: false,
+                        posted: UnitSet::default(),
+                        posted_partial: Vec::new(),
+                        posted_all: false,
+                    });
+                    if let Some(g) = l.lag.get_mut(t) {
+                        g.units.extend(dirty.units.clone());
+                        extend_partial(&mut g.partial, dirty.partial.clone());
+                        g.all |= dirty.all;
+                        // Same rule as `note_refresh` (#214): if this target's retry is claimed and
+                        // runs detached, its read predates these changes, so they must survive the
+                        // fold of its claim — `lag_subtract` re-adds exactly what was posted.
+                        g.posted.extend(dirty.units.clone());
+                        extend_partial(&mut g.posted_partial, dirty.partial.clone());
+                        g.posted_all |= dirty.all;
+                    }
+                }
+            } else {
+                // Nothing owed (the usual round of a quiescing schema), or a rebuild that no key
+                // list can express: keep it for the round that has a target to write to.
+                l.dirty = dirty;
+            }
             return None;
         }
         if let Mode::Full(_) = plan.mode {
@@ -9539,12 +9579,17 @@ impl Engine {
         }
         let (lagging, targets) = {
             let l = self.slots[i].live.as_ref().expect("live, checked above");
-            // #214 (target isolation): the same two maps `live_begin` excludes on — a target
-            // flagged `behind` by the byte budget has written rows it is still owed and must not
-            // be dialled again on the core's account. `lag` alone left such a target on the
-            // core's write list, so a peer that stopped answering cost the flush a connect
-            // timeout per round while its healthy siblings waited behind it.
-            let lagging: Vec<String> = l.lag.keys().chain(l.behind.keys()).cloned().collect();
+            // ONLY the `lag` map, deliberately — not `behind` as `live_begin` does. A target the
+            // byte budget flagged behind answered every write it was given; on the core's path it
+            // has no claim-based catch-up waiting behind the flush (its rows arrive through this
+            // job), so excluding it starves the view: measured on `chaos_tgt_blackhole_during_flush`,
+            // the budget of the test (1 byte) flags every written target behind on every round, and
+            // the healthy `source`/`t2` of the dedup view spent the run in 141+132 claim round trips
+            // while their rows piled up — the independence the test measures broke on the healthy
+            // target. A target whose writes really failed is in `lag` and IS excluded; the cost of
+            // that is one connect timeout per backoff period, which is what `Target::retry_at` and
+            // the `Policy::CONNECT` shape already bound.
+            let lagging: Vec<String> = l.lag.keys().cloned().collect();
             let targets: Vec<String> = l
                 .targets
                 .iter()
