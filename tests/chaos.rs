@@ -2623,9 +2623,11 @@ fn chaos_lock_blackhole_takeover() {
             "the replacement streamed while another instance held the lock"
         );
         let epoch_before = lock_epoch(&db).await?;
-        let position_before = soakchaos::saved_position(&db).await?;
         let am = f.eng.metrics.clone();
         let beats_before = ctr(&am, "leader_beat_failures");
+        // Timed from the instant the fault was armed: what is measured is how long the instance
+        // and the standby together take to go from a silent lock link to a streaming replacement.
+        let t0 = Instant::now();
         arm_black_hole_both_ways(&f, "lock").await?;
         wait_until(
             "the replaced instance to close its write gates",
@@ -2658,8 +2660,28 @@ fn chaos_lock_blackhole_takeover() {
         .await?;
         let held = f.eng.snapshot();
         let applied_held = f.eng.applied();
-        // The takeover, timed from the instant the fault was armed.
-        let t0 = Instant::now();
+        // The position baseline at the same closed-gate point as `held`/`applied_held`: the
+        // instance was still the rightful leader (until two beats went unanswered) between arming
+        // the fault and the gate closing, so a position it saved in that window is legitimate. The
+        // invariant is that nothing is written AFTER the gate closed — so baseline here, not earlier.
+        let position_held = soakchaos::saved_position(&db).await?;
+        // Nothing more may be saved from here on — and this is the only window in which that is
+        // observable at all. Both engines run under the same `LAZYVIEW_INSTANCE_ID`
+        // (`LOCK_INSTANCE`, which is what makes them contend for one lock), so `_lazyview_status`
+        // holds ONE row for the two of them and the replacement starts saving it the moment it
+        // streams. Until then the fenced instance is the only one that can write that row, and an
+        // ungated loop moves it every 50 ms (`soakchaos::saved_position`) — a few save intervals
+        // of a still row is the proof, and it has to be taken before the takeover.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let now = soakchaos::saved_position(&db).await?;
+            ensure!(
+                now == position_held,
+                "the replaced instance saved a position after its lock was gone: \
+                 {position_held:?} -> {now:?}"
+            );
+        }
+        // The takeover.
         wait_until("the replacement streaming", TAKEOVER, || {
             let bm = bm.clone();
             async move { Ok(bm.gauges.streaming.load(Ordering::Relaxed) == 1) }
@@ -2704,9 +2726,15 @@ fn chaos_lock_blackhole_takeover() {
             ctr(&am, "leader_beat_failures") > beats_before,
             "no beat of the black-holed session ever failed"
         );
+        // `_lazyview_status` has one row for both engines (`LOCK_INSTANCE`), so from the takeover
+        // on the replacement saves to it as well and the row is no longer the fenced instance's
+        // own. What still has to hold is that it never went backwards: a stale instance writing
+        // the position it stopped at is the split-brain that replays or loses changes.
+        let now = soakchaos::saved_position(&db).await?;
         ensure!(
-            soakchaos::saved_position(&db).await? == position_before,
-            "the replaced instance saved a position after its lock was gone"
+            now >= position_held,
+            "the saved position went backwards from {position_held:?} to {now:?} while the \
+             replaced instance was still running"
         );
         // Now let the old instance learn what happened: with the fault gone, its rejoin finds the
         // lock held elsewhere, and it must leave as the replaced one.
