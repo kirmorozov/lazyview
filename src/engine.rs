@@ -1848,6 +1848,14 @@ async fn run_lock_beat<D: LockBeat + Send + 'static, F: WriteFence>(
                     // not a second one, and the gates stay closed until a beat or rejoin answers.
                     Ok(Err(e)) if binlog::is_transient(&e) => {
                         warn!("leadership lock: rejoin deferred ({})", e.root_cause());
+                        // One rejoin per beat, whatever the wait below does. A link that refuses a
+                        // connection outright answers in microseconds — `GET_LOCK(name, 0)` never
+                        // waits and a proxy that closes the socket fails at once — so without this
+                        // the beat task retries back to back: hundreds of connects a second against
+                        // the server it is waiting for, and a `leader_beat_failures` counter that
+                        // counts the retry rather than the beats. Cost stays one statement per
+                        // `LAZYVIEW_LOCK_HEARTBEAT_MS` (lv-super ruling 1).
+                        tokio::time::sleep(heartbeat).await;
                     }
                     // The rejoin could not be completed inside the uncertainty window: same as a
                     // deferred rejoin — the link is not answering, so stay `Uncertain`.
