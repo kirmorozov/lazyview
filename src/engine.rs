@@ -1599,11 +1599,13 @@ fn m1_dump(rows: &[(Option<BinlogRow>, Option<BinlogRow>)]) -> String {
         .join(" ")
 }
 
-/// The ids a set holds, as `n[1,2,3]` (values only up to 40 of them: `to_sorted_vec` allocates, and
-/// `{:?}` on a bitmap set prints its whole internals — what made a traced run's log 240 MB).
+/// The ids a set holds, as `n[1,2,3]` (values only up to 200 of them: `to_sorted_vec` allocates,
+/// `{:?}` on a bitmap set prints its whole internals, and a hunt has to be able to answer "was the
+/// lost key IN this chunk" — a set that reads `43[…]` cannot. What made a traced run's log 240 MB
+/// was whole rows, not id lists).
 fn m1_ints(s: &crate::intset::IntSet) -> String {
     let n = s.len();
-    if n > 40 {
+    if n > 200 {
         return format!("{n}[…]");
     }
     let v = s.to_sorted_vec();
@@ -1612,6 +1614,20 @@ fn m1_ints(s: &crate::intset::IntSet) -> String {
         .map(|x| crate::intset::to_i64(*x).to_string())
         .collect();
     format!("{}[{}]", v.len(), shown.join(","))
+}
+
+/// A hop link or a key's parts, compact: the first four, bytes as their text. A hop line has to be
+/// readable against a `READ` line's key, which `{Datum:?}` alone is not (Bytes comes out as digits).
+fn m1_tuple(t: &[Datum]) -> String {
+    let shown: Vec<String> = t
+        .iter()
+        .take(4)
+        .map(|d| match d {
+            Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    shown.join(".")
 }
 
 /// A row's first column, which is the key the views' units are named by: what a per-view line needs
@@ -8503,17 +8519,37 @@ impl Engine {
                 }
             }
         }
-        // DIAGNOSTIC (temporary): the core's hop answers for this chunk — links asked, answers
-        // back, ids resolved. A link that comes back with no answer names no unit, so its row is
-        // refreshed for nobody.
+        // DIAGNOSTIC (temporary): the core's hop answers for this chunk — the link VALUES asked,
+        // the (link, id) pairs that came back, and the ids resolved. A link that comes back with
+        // no pair names no unit, so its row is refreshed for nobody; the values are what tells a
+        // link that was never asked from one that was asked and answered empty.
         if m1_view(&name) {
+            let asked: Vec<String> = links
+                .iter()
+                .take(12)
+                .map(|(h, l)| format!("h{}:{}", h.0, m1_tuple(&l[..])))
+                .collect();
+            let back: Vec<String> = answers
+                .iter()
+                .take(12)
+                .map(|(h, pairs)| {
+                    let p: Vec<String> = pairs
+                        .iter()
+                        .take(8)
+                        .map(|(l, k)| format!("{}=>{:?}", m1_tuple(&l[..]), k))
+                        .collect();
+                    format!("h{}[{}]{}", h.0, pairs.len(), p.join(","))
+                })
+                .collect();
             tracing::trace!(
                 target: "m1trace",
-                "HOP view={} job={} links={} answers={} resolved={} units={}",
+                "HOP view={} job={} links={} [{}] answers={} [{}] resolved={} units={}",
                 name,
                 job.id.0,
                 links.len(),
+                asked.join(","),
                 answers.len(),
+                back.join("|"),
                 resolved,
                 m1_ints(&dirty.units.ints),
             );
