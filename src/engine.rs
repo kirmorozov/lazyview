@@ -5573,10 +5573,21 @@ impl Engine {
                 }
                 let rows = reader.rows(table_id, &event)?;
                 // C-01 (#7): resolve the image layout once per rows event; an image of a
-                // width no layout the server can log has is refused here, never read by
-                // guessed positions — by either executor, since both would be wrong.
+                // width no layout the server can log has is never read by guessed positions
+                // — by either executor, since both would be wrong — and the views that read
+                // the table re-read their source rather than lose the change.
                 let image = if route.is_some() || src.is_some() {
-                    Self::rows_image(reader, &key, &rows)?
+                    match Self::rows_image(reader, &key, &rows) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            self.drop_unreadable(&key, &e.to_string(), &since);
+                            if let Some((_, xa)) = self.xa_current.as_mut() {
+                                // The buffered rows must not be re-fed at COMMIT either.
+                                xa.other_tables.insert(key.clone());
+                            }
+                            return Ok(());
+                        }
+                    }
                 } else {
                     None
                 };
@@ -5842,9 +5853,14 @@ impl Engine {
             if let Some(route) = self.routes.get(&t).cloned() {
                 self.mark_any(&route, &xa.start.to_position());
                 // C-01 (#7): the staged rows decode under the layout they were
-                // read with; resolve it again (the map outlives the transaction).
-                let image = Self::rows_image(reader, &t, &rows)?;
-                self.feed_rows(&route, &rows, image.as_ref(), &xa.start.to_position());
+                // read with; resolve it again (the map outlives the transaction). Rows
+                // whose image cannot be read are dropped as a whole and cost the views
+                // that read the table a re-read of their source, never a read by guessed
+                // positions.
+                match Self::rows_image(reader, &t, &rows) {
+                    Ok(image) => self.feed_rows(&route, &rows, image.as_ref(), &xa.start.to_position()),
+                    Err(e) => self.drop_unreadable(&t, &e.to_string(), &xa.start.to_position()),
+                }
             }
             if let Some(s) = self.dedup.core.source(&t, None) {
                 self.feed_core(
@@ -5886,6 +5902,48 @@ impl Engine {
         }
         self.first_dirty.get_or_insert_with(Instant::now);
         Ok(())
+    }
+
+    /// C-01 (#7): a rows event whose image cannot be read at all (its width matches no
+    /// layout this server logs, or its table's map was refused): the rows are not applied
+    /// by guessed positions, so the views that read the table have lost that change and
+    /// re-read their source instead — the whole-view refresh an unreadable image earns
+    /// elsewhere. This is a rare path, and mostly a bounded one: a DDL in flight, or rows
+    /// replayed from before the catalog was read, put an image of the *other* side of the
+    /// change next to a catalog that has moved. The next TABLE_MAP of the table reconciles
+    /// it (the reader's `image_maps_reconciled` fast path) and the table leaves this path; a permanent
+    /// disagreement is caught at plan time (`Dedup::layout_refusal`,
+    /// [`crate::exec::Dedup::map_refusal`]), not decided again per row.
+    fn drop_unreadable(&mut self, key: &TableRef, why: &str, since: &Position) {
+        warn!(
+            table = %format!("{}.`{}`", key.0, key.1),
+            "row images refused: {why}; the views that read the table re-read their source"
+        );
+        let want = (key.0.clone(), key.1.clone());
+        for s in self.slots.iter_mut() {
+            for (p, d, v) in s
+                .live
+                .iter_mut()
+                .map(|l| (&l.plan, &mut l.dirty, &mut l.since))
+                .chain(
+                    s.next
+                        .iter_mut()
+                        .map(|n| (&n.plan, &mut n.dirty, &mut n.since)),
+                )
+            {
+                let reads = p.tables.iter().any(|t| *t == want)
+                    || p.cascades.iter().any(|c| {
+                        (c.parent.schema.as_str(), c.parent.name.as_str())
+                            == (want.0.as_str(), want.1.as_str())
+                    });
+                if reads {
+                    d.rebuild = true;
+                    d.all = true;
+                    v.get_or_insert_with(|| since.clone());
+                }
+            }
+        }
+        self.first_dirty.get_or_insert_with(Instant::now);
     }
 
     /// C-01 (#7): the image layout of one rows event — the slot map of `key`'s
