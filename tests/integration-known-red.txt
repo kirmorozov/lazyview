@@ -29,3 +29,4 @@ pinned::reg_cascade_refusal_seed_replay #319
 # is a real failure with an open issue and a fix in flight; the fix PR (or the keeper pass that lands it)
 # deletes its line. These are not by-design reds and must not stay.
 lifecycle_crash_consistency #345
+bench_throughput_shapes #378
