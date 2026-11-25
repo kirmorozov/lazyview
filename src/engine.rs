@@ -8389,6 +8389,58 @@ impl Engine {
         }
     }
 
+    /// One INFO line per whole-view refresh (C2, #345 #319): the view, why the whole view is
+    /// being re-read, the position the read is taken at, and whether an XA transaction is
+    /// unresolved at that moment. A source `SELECT` cannot see the rows a prepared XA transaction
+    /// still holds, so a whole-view read taken inside one comes back without them and the view is
+    /// left without them: until this line the only trace of such a refresh was the
+    /// `whole_view_refreshes` counter (`src/stats.rs`), and a counter cannot be tied to a binlog
+    /// position, which is what makes a red's log able to answer the question.
+    ///
+    /// Cost: one line per refresh, from the refresh path, never per event — the read it reports is
+    /// a full `SELECT` over the view's source, so the line is nothing next to the work it
+    /// describes. Nothing is queried for it: it reads the boundary and the XA maps the caller
+    /// already holds, and formats the one or two position texts it prints.
+    fn log_whole_refresh(&self, plan: &ViewPlan, table: &str, dirty: &ViewDirty, global: bool) {
+        let reason = if global {
+            "a global aggregate view recomputes its one row"
+        } else if matches!(plan.mode, Mode::Full(_)) {
+            "a full-mode view re-reads its source"
+        } else if dirty.tally.xa_unknown_commits > 0 {
+            "an XA COMMIT prepared before this run: the reader never saw its rows"
+        } else if dirty.tally.cascade_gaps > 0 {
+            "a cascade gap window: the children a parent change took are not in the cache"
+        } else {
+            "changes no trace could follow (a whole-view route or a short row image)"
+        };
+        // The oldest unresolved XA transaction of the run: its start is the position a lost row's
+        // binlog position has to be compared against. `unpinned` ones are listed too — an XA that
+        // stopped holding the saved position is exactly the one that can strand a row.
+        let mut oldest: Option<&Cursor> = None;
+        if let Some((_, xa)) = &self.xa_current {
+            if xa.start.is_some() {
+                oldest = Some(&xa.start);
+            }
+        }
+        for xa in self.xa_pending.values() {
+            if xa.start.is_some() && oldest.is_none_or(|o| xa.start < *o) {
+                oldest = Some(&xa.start);
+            }
+        }
+        let read_at = self.boundary.to_position();
+        match oldest {
+            Some(c) => info!(
+                view = %plan.name, table, reason, read_at = %read_at,
+                xa_open = true, xa_start = %c,
+                "whole-view refresh: reading the source again",
+            ),
+            None => info!(
+                view = %plan.name, table, reason, read_at = %read_at, xa_open = false,
+                "whole-view refresh: reading the source again",
+            ),
+        }
+    }
+
     /// Refreshes the units in `dirty` on table `table` of every target in `targets`. Sources are
     /// read once per chunk and each target is written independently: one that fails is skipped
     /// from then on and reported. `dirty` is cleared (except a pending rebuild) unless reading
@@ -8413,6 +8465,12 @@ impl Engine {
         }
         let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
         let mut work = crate::stats::Work::default();
+        // The unsupervised form of the whole-view read: `dirty.all` is exactly the two branches
+        // below (a global view without it returns without reading), so this is the once-per-
+        // refresh site for the line the supervised path logs in `prepare_refresh`.
+        if dirty.all {
+            self.log_whole_refresh(plan, table, dirty, matches!(plan.mode, Mode::Global));
+        }
         if matches!(plan.mode, Mode::Global) {
             if !dirty.all {
                 return Ok(Refreshed::default());
@@ -8678,6 +8736,13 @@ impl Engine {
                 timeout: self.cfg.target_timeout,
                 fresh: self.caps.fresh_snapshot,
             });
+        }
+        // The supervised form of the whole-view read (see `log_whole_refresh`): logged here
+        // because `refresh_all_live` prepares every view's refresh before running any of them,
+        // so the line belongs with the job that is about to read. `p.whole` and `p.global` are
+        // both set only under `dirty.all`, and a refresh with no writable target reads nothing.
+        if p.job.is_some() && (p.whole || p.global) {
+            self.log_whole_refresh(plan, table, dirty, p.global);
         }
         self.metrics.beat();
         Ok(p)
