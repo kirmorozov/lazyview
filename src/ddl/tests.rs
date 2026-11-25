@@ -80,6 +80,90 @@ fn rows_kept() {
     }
 }
 
+/// Only statements whose every specification is off the head-check waiver's allow-list — plain
+/// index and column operations — leave `waive_head_check` set: their effects are either nothing
+/// the plan reads, or column rewrites `same_reads` compares, so an adopt past the head check
+/// cannot miss a change the definition depends on (#359: the engine may lag its own binlog and
+/// the head check would otherwise turn every next DDL into a whole-view rebuild).
+#[test]
+fn waive_head_check() {
+    let waivable = |q: &str| statement_effects(q, "d").waive_head_check;
+    for q in [
+        "ALTER TABLE t ADD INDEX i (a)",
+        "ALTER TABLE `entities` ADD INDEX `ent_kind_mod` (`kind`)",
+        "ALTER TABLE t ADD UNIQUE INDEX i (a)",
+        "ALTER TABLE t ADD FULLTEXT KEY i (a)",
+        "ALTER TABLE t ADD SPATIAL INDEX i (a)",
+        "ALTER TABLE t DROP INDEX i",
+        "ALTER TABLE t DROP KEY i",
+        "ALTER TABLE t DROP INDEX IF EXISTS i",
+        "ALTER TABLE t ADD INDEX i (a), DROP INDEX j",
+        "ALTER TABLE t RENAME INDEX old TO new",
+        "ALTER TABLE t ADD INDEX i (a(10)) USING BTREE COMMENT 'x'",
+        "CREATE INDEX i ON t (a)",
+        "DROP INDEX i ON t",
+        "ALTER TABLE t ADD INDEX i (a); ALTER TABLE u DROP INDEX j",
+        // Plain column operations: the read columns they touch are compared by `same_reads`,
+        // the rest are invisible to the plan. Positions (AFTER / FIRST) do not matter either.
+        "ALTER TABLE t ADD COLUMN c INT NULL",
+        "ALTER TABLE `items` ADD COLUMN `spare` INT NULL",
+        "ALTER TABLE t ADD COLUMN c INT NULL AFTER a",
+        "ALTER TABLE t ADD c INT, ADD d VARCHAR(8) NOT NULL DEFAULT 'x'",
+        "ALTER TABLE t ADD (a INT, b INT)",
+        "ALTER TABLE t ADD COLUMN c INT GENERATED ALWAYS AS (a + b) STORED",
+        "ALTER TABLE t DROP COLUMN x",
+        "ALTER TABLE t DROP x",
+        "ALTER TABLE t DROP COLUMN IF EXISTS x",
+        "ALTER TABLE t MODIFY COLUMN a BIGINT",
+        "ALTER TABLE t MODIFY a BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE t CHANGE COLUMN a b INT",
+        "ALTER TABLE t CHANGE a b VARCHAR(32) NULL FIRST",
+        "ALTER TABLE t RENAME COLUMN a TO b",
+        "ALTER TABLE t ALTER COLUMN a SET DEFAULT 1",
+        "ALTER TABLE t ALTER a DROP DEFAULT",
+        "ALTER TABLE t ADD INDEX i (a), ADD COLUMN c INT",
+        "ALTER TABLE t ADD INDEX i (a); ALTER TABLE u ADD COLUMN c INT",
+    ] {
+        assert!(waivable(q), "{q}");
+    }
+    for q in [
+        // Constraints, keys and partitions: not column rewrites, so off the allow-list.
+        "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (id)",
+        "ALTER TABLE t ADD PRIMARY KEY (a)",
+        "ALTER TABLE t ADD UNIQUE (a)",
+        "ALTER TABLE t DROP CONSTRAINT fk",
+        "ALTER TABLE t DROP FOREIGN KEY fk",
+        "ALTER TABLE t DROP PRIMARY KEY",
+        "ALTER TABLE t RENAME CONSTRAINT fk TO fk2",
+        "ALTER TABLE t ADD COLUMN c INT UNIQUE",
+        "ALTER TABLE t ADD COLUMN c INT REFERENCES p (id)",
+        "ALTER TABLE t ADD COLUMN c INT CHECK (c > 0)",
+        "ALTER TABLE t ADD (c INT UNIQUE)",
+        "ALTER TABLE t DROP INDEX i, DROP PARTITION p",
+        "ALTER TABLE t DROP PARTITION p",
+        "ALTER TABLE t ADD PARTITION (PARTITION p VALUES LESS THAN (10))",
+        "ALTER TABLE t MODIFY COLUMN a BIGINT, ADD CONSTRAINT f FOREIGN KEY (b) REFERENCES p (id)",
+        "ALTER TABLE t ALTER INDEX i INVISIBLE",
+        // Not an `ALTER TABLE` of allow-listed specifications, or not a DDL at all.
+        "ALTER TABLE t ENGINE=InnoDB",
+        "ALTER TABLE t ADD INDEX i (a), ALGORITHM=COPY",
+        "ALTER TABLE t ADD INDEX i (a); TRUNCATE TABLE t",
+        "ALTER TABLE t ADD INDEX i (a); ALTER TABLE u ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES p (id)",
+        "RENAME TABLE a TO b",
+        "ANALYZE TABLE t",
+        "",
+    ] {
+        assert!(!waivable(q), "{q:?}");
+    }
+    // A standalone index DDL touches nothing a plan reads.
+    for q in [
+        "CREATE FULLTEXT INDEX i ON t (a)",
+        "CREATE UNIQUE INDEX i ON t (a)",
+    ] {
+        assert!(waivable(q), "{q}");
+    }
+}
+
 #[test]
 fn alter_table() {
     assert_eq!(t("ALTER TABLE t ADD COLUMN x INT"), names(&[("d", "t")]));

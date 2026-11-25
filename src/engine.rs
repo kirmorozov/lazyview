@@ -5382,8 +5382,13 @@ impl Engine {
                 let tables = effects.tables;
                 if !tables.is_empty() {
                     tracing::trace!(%query, "statement affects tables {tables:?}");
-                    self.on_tables_changed(&tables, effects.rows_kept, &before)
-                        .await;
+                    self.on_tables_changed(
+                        &tables,
+                        effects.rows_kept,
+                        effects.waive_head_check,
+                        &before,
+                    )
+                    .await;
                     if first_keyword(&query).eq_ignore_ascii_case("TRUNCATE") {
                         self.on_view_table_lost(&tables, &before, "truncated");
                     } else if !effects.dropped.is_empty() {
@@ -5960,7 +5965,13 @@ impl Engine {
         }
     }
 
-    async fn on_tables_changed(&mut self, tables: &[TableRef], rows_kept: bool, since: &Position) {
+    async fn on_tables_changed(
+        &mut self,
+        tables: &[TableRef],
+        rows_kept: bool,
+        waive_head_check: bool,
+        since: &Position,
+    ) {
         self.shapes.clear();
         for t in tables {
             if t.1 == "*" {
@@ -6012,7 +6023,12 @@ impl Engine {
         for (id, freeze) in todo {
             // A schema change that keeps every row: the same reads swap in place. Anything else
             // (a table swapped in or rows removed) rebuilds online.
-            if freeze && rows_kept && self.swap_in_place(id, since, tables).await {
+            if freeze
+                && rows_kept
+                && self
+                    .swap_in_place(id, since, tables, waive_head_check)
+                    .await
+            {
                 continue;
             }
             let from = self.stale_from(id, since, tables);
@@ -6035,7 +6051,23 @@ impl Engine {
     /// restart or a catch-up the plan may come from a later catalog). The new read's head likewise
     /// bounds the DDLs it may include: a later DDL of those tables before it fails this check and
     /// rebuilds the view, stale since this swap (see [`Self::stale_from`]). DDL path only.
-    async fn swap_in_place(&mut self, id: u64, at: &Position, tables: &[TableRef]) -> bool {
+    ///
+    /// `waive_head_check` (see [`crate::ddl::StatementEffects::waive_head_check`]) waives that
+    /// head check: every specification of such a statement either stores nothing the plan reads
+    /// (indexes, column defaults) or rewrites columns that `same_reads` below compares by name,
+    /// type, collation and nullability against the catalog the new plan was just compiled from,
+    /// so a change the definition depends on cannot slip through — a definition read after `at`
+    /// decodes the rows before it exactly as one read before it did. Without the waiver the
+    /// engine lagging its own binlog (the catalog reads ahead of the position being processed)
+    /// turns every next DDL of such a table into a whole-view rebuild the view never needed
+    /// (#359).
+    async fn swap_in_place(
+        &mut self,
+        id: u64,
+        at: &Position,
+        tables: &[TableRef],
+        waive_head_check: bool,
+    ) -> bool {
         // #359 diagnostics: every silent decline of an in-place adopt, with the cause.
         macro_rules! declined {
             ($($arg:tt)*) => {
@@ -6101,7 +6133,7 @@ impl Engine {
                 .or(l.catalog_head.as_ref())
                 .is_some_and(|h| h <= at)
         };
-        if touched.is_empty() || !touched.iter().all(predates) {
+        if touched.is_empty() || !(touched.iter().all(predates) || waive_head_check) {
             for t in &touched {
                 if !predates(t) {
                     let heads = match l.table_heads.get(t) {
@@ -6111,16 +6143,26 @@ impl Engine {
                             None => "no head recorded".to_string(),
                         },
                     };
-                    declined!(
-                        "adopt declined: the live plan's `{}` definition was read after this DDL at {at} ({heads})",
-                        t.1,
-                    );
+                    if waive_head_check {
+                        declined!(
+                            "adopt continuing past the head check: `same_reads` covers every effect of this DDL (`{}` read after this DDL at {at}: {heads})",
+                            t.1,
+                        );
+                    } else {
+                        declined!(
+                            "adopt declined: the live plan's `{}` definition was read after this DDL at {at} ({heads})",
+                            t.1,
+                        );
+                    }
                 }
             }
             if touched.is_empty() {
                 declined!("adopt declined: nothing touched at {at} (tables {tables:?})");
             }
             return false;
+        }
+        if !touched.iter().all(predates) {
+            debug_assert!(waive_head_check);
         }
         held.retain(|t, _| !touched.contains(t));
         let (def, targets) = (s.definition.clone(), s.targets.clone());

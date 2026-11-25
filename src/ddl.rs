@@ -23,6 +23,19 @@ pub struct StatementEffects {
     /// ALTER TABLE ... RENAME TO/AS, TRUNCATE, REPAIR, CREATE [OR REPLACE] TABLE, DROP, database
     /// statements, views, statements that cannot be parsed).
     pub rows_kept: bool,
+    /// Every statement in `query` is an `ALTER TABLE` whose specifications all come off one
+    /// allow-list — `ADD`/`DROP`/`RENAME INDEX|KEY`, `ADD`/`DROP`/`MODIFY`/`CHANGE`/`RENAME
+    /// COLUMN`, column default, and `CREATE`/`DROP INDEX` — so each effect either leaves stored
+    /// column bytes alone or lands on a column that `same_reads` compares (by name, type,
+    /// collation and nullability) against the catalog the fresh plan was just compiled from: a
+    /// change the definition actually depends on fails that comparison and rebuilds. The swap
+    /// gate may therefore adopt such a statement in place even when the catalog read ran ahead
+    /// of the statement's binlog position (#359: an overshooting read already saw every DDL up
+    /// to its position, which is what makes it the most complete read, not a stale one).
+    /// Everything else — constraints, foreign keys, primary-key and partition operations, table
+    /// options, anything unanalysable — keeps this false and keeps the head check: the
+    /// conservative answer is the one that rebuilds. `rows_kept` is true whenever this is.
+    pub waive_head_check: bool,
 }
 
 /// Tables possibly affected by the non-row statement `query`, executed with default database
@@ -44,6 +57,11 @@ pub struct StatementEffects {
 /// tables it names: `ALTER TABLE` (without `RENAME TO/AS`), `CREATE … INDEX` and
 /// `DROP INDEX`. It is false for anything else, and for statements that cannot be analysed.
 ///
+/// [`StatementEffects::waive_head_check`] is true only when every statement is an `ALTER TABLE`
+/// built solely from allow-listed specifications (indexes, plain column adds/drops/modifies/
+/// changes/renames, column defaults) or a plain `CREATE`/`DROP INDEX`, so nothing outside what
+/// `same_reads` compares can change; see the field.
+///
 /// Empty for DML and for statements that cannot change table data or structure: `CREATE
 /// DATABASE`, `ALTER DATABASE`, `OPTIMIZE` / `ANALYZE` / `CHECK TABLE` (physical only), users,
 /// grants, routines, triggers, events, `SET`, `FLUSH`, ….
@@ -59,6 +77,7 @@ pub fn statement_effects(query: &str, default_schema: &str) -> StatementEffects 
                 tables: fallback(query, default_schema),
                 dropped: Vec::new(),
                 rows_kept: false,
+                waive_head_check: false,
             }
         }
     };
@@ -70,6 +89,8 @@ pub fn statement_effects(query: &str, default_schema: &str) -> StatementEffects 
         dropped: Vec::new(),
         rows_kept: true,
         kept_stmt: false,
+        waive_head_check: true,
+        waivable_stmt: false,
     };
     loop {
         let start = p.i;
@@ -107,6 +128,7 @@ pub fn statement_effects(query: &str, default_schema: &str) -> StatementEffects 
         tables: dedup(p.out),
         dropped: dedup(p.dropped),
         rows_kept: p.rows_kept,
+        waive_head_check: p.waive_head_check,
     }
 }
 
@@ -207,6 +229,13 @@ struct Parser<'a> {
     /// True while every parsed statement keeps every row of the tables it names
     /// ([`StatementEffects::rows_kept`]).
     rows_kept: bool,
+    /// Whether the statement being parsed is made only of `ALTER TABLE` specifications off the
+    /// [`crate::ddl::StatementEffects::waive_head_check`] allow-list, or is a plain
+    /// `CREATE`/`DROP INDEX`. Reset to false before each statement, so a statement form that
+    /// does not set it counts as unwaivable.
+    waivable_stmt: bool,
+    /// True while every parsed statement is waivable ([`StatementEffects::waive_head_check`]).
+    waive_head_check: bool,
     /// Whether the statement being parsed keeps every row. Reset to false before each statement,
     /// so a statement form that does not set it counts as removing rows.
     kept_stmt: bool,
@@ -342,11 +371,13 @@ impl Parser<'_> {
     fn statement(&mut self) -> bool {
         let Some(Tok::Word(first)) = self.t.get(self.i) else {
             self.rows_kept = false; // not a statement this parser understands
+            self.waive_head_check = false; // and so nothing can be adopted past the head check
             return true;
         };
         let first = first.to_ascii_uppercase();
         self.i += 1;
         self.kept_stmt = false;
+        self.waivable_stmt = false;
         let more = match first.as_str() {
             "ALTER" => {
                 self.alter();
@@ -378,6 +409,7 @@ impl Parser<'_> {
             _ => true,
         };
         self.rows_kept &= self.kept_stmt;
+        self.waive_head_check &= self.waivable_stmt;
         more
     }
 
@@ -395,15 +427,24 @@ impl Parser<'_> {
             return;
         }
         self.kept_stmt = true;
-        // Scan the alter specifications (outside parentheses) for other tables and for
-        // specifications that replace or remove rows.
+        // Scan the alter specifications (outside parentheses) for other tables, for
+        // specifications that replace or remove rows, and for whether every one of them is
+        // allow-listed for the swap gate's head-check waiver (`waive_head_check`, see
+        // `classify_alter_spec`).
+        self.waivable_stmt = true;
         let mut depth = 0i32;
+        let mut spec_start = true;
         while let Some(t) = self.t.get(self.i) {
             match t {
                 Tok::LParen => depth += 1,
                 Tok::RParen => depth -= 1,
+                Tok::Comma if depth <= 0 => spec_start = true,
                 Tok::Semi if depth <= 0 => return,
                 Tok::Word(_) if depth == 0 => {
+                    if spec_start {
+                        self.classify_alter_spec();
+                        spec_start = false;
+                    }
                     if self.eat_kw("RENAME") {
                         if self.at_kw("COLUMN")
                             || self.at_kw("INDEX")
@@ -442,6 +483,159 @@ impl Parser<'_> {
         }
     }
 
+    /// Classifies the alter specification starting at `self.i` for `waive_head_check`
+    /// (peek-only). The allow-list: `ADD`/`DROP`/`RENAME [UNIQUE|FULLTEXT|SPATIAL] [IF NOT
+    /// EXISTS] {INDEX|KEY}`, `ADD [COLUMN] …` (a column list or definition), `DROP [COLUMN] …`,
+    /// `MODIFY [COLUMN] …`, `CHANGE [COLUMN] …`, `RENAME COLUMN … TO …` and `ALTER [COLUMN] …
+    /// {SET DEFAULT …|DROP DEFAULT}`. Each of these either stores nothing the plan reads or
+    /// rewrites only columns `same_reads` compares against the freshly compiled plan, so a
+    /// change the definition depends on cannot pass that comparison unnoticed (#359). Column
+    /// specifications additionally deny any specification naming `FOREIGN`, `REFERENCES`,
+    /// `CHECK`, `UNIQUE`, `PARTITION` or `SUBPARTITION` anywhere: constraints and partition
+    /// operations are not column rewrites. Everything else — constraints, primary and foreign
+    /// keys, a `UNIQUE` without the index keyword (it can reject rows), partition operations,
+    /// table options — is off the list.
+    fn classify_alter_spec(&mut self) {
+        let upper = |off: usize| -> String {
+            match self.t.get(self.i + off) {
+                Some(Tok::Word(w)) => w.to_ascii_uppercase(),
+                _ => String::new(),
+            }
+        };
+        // A quoted token is always an identifier here, never a keyword.
+        let quoted = |off: usize| matches!(self.t.get(self.i + off), Some(Tok::Quoted(_)));
+        let skip = |off: &mut usize, kws: &[&str]| {
+            while kws.contains(&upper(*off).as_str()) {
+                *off += 1;
+            }
+        };
+        let mut off;
+        let head = upper(0);
+        match head.as_str() {
+            "ADD" => {
+                off = 1;
+                skip(&mut off, &["COLUMN", "IF", "NOT", "EXISTS"]);
+                let kind = upper(off);
+                if matches!(kind.as_str(), "INDEX" | "KEY") {
+                    return;
+                }
+                if matches!(kind.as_str(), "UNIQUE" | "FULLTEXT" | "SPATIAL") {
+                    // Only as a prefix of the index keyword, as before: `ADD UNIQUE (a)`
+                    // enforces without one and can reject rows.
+                    skip(&mut off, &["UNIQUE", "FULLTEXT", "SPATIAL"]);
+                    if matches!(upper(off).as_str(), "INDEX" | "KEY") {
+                        return;
+                    }
+                    self.waivable_stmt = false;
+                    return;
+                }
+                // `ADD CONSTRAINT|PRIMARY|FOREIGN|CHECK …` fall through to the name check
+                // below only as identifiers, which they are not; a column add is a name or a
+                // parenthesised column list.
+                if matches!(
+                    kind.as_str(),
+                    "CONSTRAINT" | "PRIMARY" | "FOREIGN" | "CHECK" | "PARTITION" | "SUBPARTITION"
+                ) || !matches!(
+                    self.t.get(self.i + off),
+                    Some(Tok::Word(_) | Tok::Quoted(_) | Tok::LParen)
+                ) {
+                    self.waivable_stmt = false;
+                    return;
+                }
+            }
+            "DROP" => {
+                off = 1;
+                skip(&mut off, &["COLUMN", "IF", "EXISTS"]);
+                if matches!(upper(off).as_str(), "INDEX" | "KEY") {
+                    return;
+                }
+                if matches!(
+                    upper(off).as_str(),
+                    "PRIMARY" | "FOREIGN" | "CONSTRAINT" | "CHECK" | "PARTITION" | "SUBPARTITION"
+                ) || !(quoted(off) || matches!(self.t.get(self.i + off), Some(Tok::Word(_))))
+                {
+                    self.waivable_stmt = false;
+                    return;
+                }
+            }
+            "MODIFY" | "CHANGE" => {
+                off = 1;
+                skip(&mut off, &["COLUMN"]);
+                if !matches!(upper(off).as_str(), "PARTITION" | "SUBPARTITION")
+                    && (quoted(off) || matches!(self.t.get(self.i + off), Some(Tok::Word(_))))
+                {
+                } else {
+                    self.waivable_stmt = false;
+                    return;
+                }
+            }
+            "ALTER" => {
+                // `ALTER [COLUMN] name {SET DEFAULT …|DROP DEFAULT}`: a default is written at
+                // insert time by the source, which our row events already reflect. Anything
+                // else under `ALTER` (index visibility, partitions) is off the list.
+                off = 1;
+                skip(&mut off, &["COLUMN"]);
+                if quoted(off) || matches!(self.t.get(self.i + off), Some(Tok::Word(_))) {
+                    off += 1;
+                } else {
+                    self.waivable_stmt = false;
+                    return;
+                }
+                let is_default = match upper(off).as_str() {
+                    "SET" => matches!(upper(off + 1).as_str(), "DEFAULT"),
+                    "DROP" => matches!(upper(off + 1).as_str(), "DEFAULT"),
+                    _ => false,
+                };
+                if !is_default {
+                    self.waivable_stmt = false;
+                    return;
+                }
+            }
+            "RENAME" => {
+                // Renaming a constraint renames the foreign key the plan compares; a column or
+                // a secondary index name is nothing stored.
+                if !matches!(upper(1).as_str(), "INDEX" | "KEY" | "COLUMN") {
+                    self.waivable_stmt = false;
+                }
+                return;
+            }
+            _ => {
+                self.waivable_stmt = false;
+                return;
+            }
+        }
+
+        // A column specification that mentions a constraint or partition keyword anywhere is
+        // not a plain column rewrite: `ADD c INT REFERENCES p (id)`, `ADD c INT CHECK (c > 0)`,
+        // `ADD (c INT UNIQUE)`, …
+        let mut depth = 0i32;
+        let mut j = self.i + off;
+        while let Some(t) = self.t.get(j) {
+            match t {
+                Tok::LParen => depth += 1,
+                Tok::RParen => depth -= 1,
+                Tok::Comma | Tok::Semi if depth <= 0 => break,
+                Tok::Word(w)
+                    if [
+                        "FOREIGN",
+                        "REFERENCES",
+                        "CHECK",
+                        "UNIQUE",
+                        "PARTITION",
+                        "SUBPARTITION",
+                    ]
+                    .iter()
+                    .any(|k| w.eq_ignore_ascii_case(k)) =>
+                {
+                    self.waivable_stmt = false;
+                    return;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+    }
+
     fn create(&mut self) -> bool {
         let replace = self.at_kw("OR") && self.peek_kw(1, "REPLACE");
         self.skip_object_attributes();
@@ -451,6 +645,7 @@ impl Parser<'_> {
         } else if self.eat_kw("INDEX") {
             self.index_target();
             self.kept_stmt = true;
+            self.waivable_stmt = true;
         } else if self.at_kw("DATABASE") || self.at_kw("SCHEMA") {
             self.i += 1;
             if replace {
@@ -491,6 +686,7 @@ impl Parser<'_> {
         } else if self.eat_kw("INDEX") {
             self.index_target();
             self.kept_stmt = true;
+            self.waivable_stmt = true;
         }
     }
 
