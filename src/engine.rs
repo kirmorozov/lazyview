@@ -4694,13 +4694,28 @@ impl Engine {
             // anchor back: a seeding read whose high-water mark the stream has not consumed
             // through yet — that set claims transactions after `pos` it has not applied, and a
             // dump anchored on it would skip exactly those.
+            // Which of them held the run back, when a set existed to offer: `set_bytes=0` alone
+            // cannot tell an operator (or a test log) whether the server would refuse this state,
+            // whether the set is not proven yet, or whether there is no set at all. The branch was
+            // taken anyway, so naming it costs a `&'static str`.
+            let mut held_back: Option<&'static str> = None;
+            let mut held_back_pair: Option<String> = None;
             let mut gtid = if self.gtid_seed_hiw.is_some() {
+                held_back = Some("the seeding read's high-water mark is not consumed through yet");
                 None
             } else {
                 self.executed_gtid_text()
             };
+            if gtid.is_none() && held_back.is_none() {
+                held_back = if self.gtid_seed_unproven {
+                    Some("the seed's over-claim can never be proven for this run")
+                } else {
+                    Some("no consumed set: GTIDs off, nothing consumed, or no set in the cursor")
+                };
+            }
             if gtid.is_some() && !self.xa_gap_no_gtid_dump && self.flavor.is_mysql_family() {
-                let purged_ok = match binlog::gtid_state(&mut self.src).await {
+                let read = binlog::gtid_state(&mut self.src).await;
+                let purged_ok = match &read {
                     Ok(st) => {
                         let purged =
                             source::parse_set(self.flavor, st.purged.as_deref().unwrap_or(""));
@@ -4710,9 +4725,15 @@ impl Engine {
                     Err(_) => false,
                 };
                 if !purged_ok {
+                    held_back = Some(if read.is_ok() {
+                        "the server has purged a transaction the set does not name"
+                    } else {
+                        "the server's purged set could not be read"
+                    });
                     gtid = None;
                 }
             } else if gtid.is_some() && self.xa_gap_no_gtid_dump {
+                held_back = Some("an XA commit arrived without its prepared transaction");
                 gtid = None;
             }
             // A fourth condition, MariaDB's own ([`crate::source::maria::dump_state_covers`]): the
@@ -4726,26 +4747,31 @@ impl Engine {
             // the same one status read per connect attempt as the purged check above, on the
             // connect path only.)
             if gtid.is_some() && self.flavor == Flavor::MariaDb {
-                let names_every_pair = match binlog::gtid_state(&mut self.src).await {
-                    Ok(st) => source::maria::dump_state_covers(
+                let unnamed = match binlog::gtid_state(&mut self.src).await {
+                    Ok(st) => source::maria::dump_state_unnamed(
                         st.binlog_state.as_deref().unwrap_or(""),
                         gtid.as_deref().unwrap_or(""),
                     ),
                     // Cannot ask, cannot anchor: a state checked against nothing is no check.
-                    Err(_) => false,
+                    Err(_) => Some("<gtid_binlog_state unreadable>".to_string()),
                 };
-                if !names_every_pair {
+                if let Some(pair) = unnamed {
+                    held_back = Some("the server's state carries a domain this set never saw");
+                    held_back_pair = Some(pair);
                     gtid = None;
                 }
             }
             self.stream_by_gtid = gtid.is_some();
-            // Which of the two anchors this round got, in the log: the four conditions above can
-            // each hold a run back to file/pos for the whole run, and the difference shows up to
-            // the operator only as a resume that takes longer or rebuilds more than it should. It
-            // costs one line per connect (and is what a resume-by-GTID test can assert on).
+            // Which of the two anchors this round got, and when the run had a set to offer and did
+            // not use it, which rule said so: the four conditions above can each hold a run back to
+            // file/pos for the whole run, and the difference shows up to the operator only as a
+            // resume that takes longer or rebuilds more than it should. It costs one line per
+            // connect (and is what a resume-by-GTID test can assert on).
             info!(
                 position = %pos,
                 set_bytes = gtid.as_deref().map_or(0, str::len),
+                held_back = held_back,
+                held_back_pair = held_back_pair.as_deref(),
                 "binlog dump anchored on the {}",
                 if gtid.is_some() { "consumed GTID set" } else { "file and position" }
             );
@@ -6999,9 +7025,10 @@ impl Engine {
         // A held-back cursor rewrite wakes the loop at its own bound (ten times the duration the
         // last one measured), not on the persist interval: the two halves of the row are on
         // different clocks precisely because they cost different amounts.
-        let set_wake = self
-            .set_pending
-            .then(|| self.last_set_write.map_or(Instant::now(), |(at, _)| at + self.set_write_bound()));
+        let set_wake = self.set_pending.then(|| {
+            self.last_set_write
+                .map_or(Instant::now(), |(at, _)| at + self.set_write_bound())
+        });
         // A closed leadership gate holds the flush: the loop wakes at the end of the hold rather
         // than on every due change, and since `flush_due_within` reads this deadline, neither the
         // batch window nor the persist interval can re-issue a gated flush ahead of it.
@@ -9669,8 +9696,13 @@ impl Engine {
             self.persisted = saved;
             self.persisted_at = pos.clone();
         } else if pos != self.persisted_at {
-            meta::save_position_at(&mut self.meta, &self.cfg.instance_id, &pos, self.leader.epoch)
-                .await?;
+            meta::save_position_at(
+                &mut self.meta,
+                &self.cfg.instance_id,
+                &pos,
+                self.leader.epoch,
+            )
+            .await?;
             self.persisted_at = pos.clone();
         }
         // Held back: save again once the pending changes are applied.
@@ -9678,21 +9710,6 @@ impl Engine {
         self.set_pending = wanted.to_string() != self.persisted.to_string();
         self.last_persist = Instant::now();
         Ok(())
-    }
-
-    /// Whether the bound on cursor rewrites has run out: ten times the duration the last one
-    /// measured on this link (so the rewrite costs the meta link about a tenth of its time, whatever
-    /// speed it is), or no cursor has been written at all yet, or the last one was too short to
-    /// need pacing.
-    fn set_write_ready(&self) -> bool {
-        match self.last_set_write {
-            None => true,
-            // A write that cost nothing (a short cursor on a fast link) needs no cooldown: the
-            // bound is there to keep an expensive rewrite off the apply loop, not to pace a cheap
-            // one, and `save_position_at` would be the odd place to discover the difference.
-            Some((_, dur)) if dur < Duration::from_millis(1) => true,
-            Some((at, dur)) => at.elapsed() >= 10 * dur,
-        }
     }
 
     /// `once` mode: waits for all builds and swaps them in.
