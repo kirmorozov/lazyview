@@ -40,32 +40,39 @@ name: ci
 #                       servers must pass, its 2 advisory pre-release entries run with
 #                       continue-on-error and cannot block it)
 # Pull requests never get registry credentials and never push.
-# The one exception, and the only path filter in this file: a pull_request whose every changed file
-# is documentation starts NO run here (paths-ignore below). Owner, 2026-11-23: "doc only prs can be
+# The one exception, and the only path filter in this file (#369): a pull_request whose every changed file
+# is documentation starts NO run here (paths below). Owner, 2026-11-23: "doc only prs can be
 # bundled and merged without test runs" -- the keeper's landing pass lands such a PR on its guard PASS
 # without waiting for CI (tmp/lvs-land-ready.sh), so a run here would only spend a runner on prose.
-# `docs/**` is the documentation tree at the repository root and its subdirectories; `**/*.md` is a
-# markdown file anywhere, the repository root included. The filter skips only when EVERY changed file
-# matches one of them, so a PR that changes a doc alongside anything else runs the full set exactly as
-# it does today.
-# .github/** and .claude/** are NOT in the list: they are config, not documentation, so a PR that
-# changes only a workflow, an action or .claude/agents/generic-guard.md runs everything. A markdown
-# file under those two directories does match `**/*.md`, so it does skip: prose nothing executes, and
-# next to a .yml or a script the full set runs again. `push` (main, v*) and `workflow_dispatch` keep
-# NO filter on purpose -- every landed commit shows its own full matrix, and a manual run is asked
-# for.
+# One truth, one filter: a PR that changes ONLY `docs/**`, or a markdown file outside `.claude/` and
+# `.github/`, starts no run; a PR that changes anything under `.claude/` or `.github/` -- markdown
+# included, `.claude/agents/generic-guard.md` included -- runs the full set. `**` takes every changed
+# path, the two `!` patterns after it take prose back out, and the two positive patterns after those put
+# the config trees back in: the LAST pattern a path matches decides it, so a negative pattern after a
+# positive one excludes and a positive one after a negative re-includes. The filter before #369 was the
+# ignore-list form of these same two prose patterns, and GitHub excludes a path that matches ANY ignore
+# pattern even when a positive one matches it too -- so the guard's own definition, an executable policy
+# artifact, started no run at all and tmp/lvs-land-ready.sh refused it twice: its docs_only() rejects
+# anything matching `^(src|tests)/|^\.` so it is not docs-only, and its normal path skips a PR whose
+# non-excluded checks are `0 not green of 0`. Config is not prose: the guard definition, the workflows and
+# the pinned actions are what CI and the keeper's landing pass actually execute, so an edit to them is
+# verified like code. A PR that changes a doc alongside anything else runs the full set exactly as it does
+# today.
+# `push` (main, v*) and `workflow_dispatch` keep NO filter on purpose -- every landed commit shows its own
+# full matrix, and a manual run is asked for.
 # ci.yml is the only workflow that triggers on pull_request (the others run on schedule,
-# workflow_dispatch or workflow_call), so a docs-only PR starts no Actions run at all. The keeper's own
-# docs-only test is stricter: it keeps markdown under .github/, .claude/, src/ and tests/ on the CI
-# path, and such a PR can still be given a run by hand: `gh workflow run ci.yml --ref <branch>`.
+# workflow_dispatch or workflow_call), so a docs-only PR starts no Actions run at all.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!**/*.md"
+      - ".claude/**"
+      - ".github/**"
   workflow_dispatch:
   # Called by nightly.yml (the nightly on main HEAD). Its caller's event is `schedule`, so every
   # regular job skips and only the soak jobs and report run; workflow_call is listed alongside
