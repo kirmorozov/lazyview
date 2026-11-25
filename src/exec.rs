@@ -1885,14 +1885,41 @@ mod tests {
         );
 
         // --- the cascade shape ----------------------------------------------
-        // The view reads only the child (the parent is the cascade's own business):
-        // a child prefix keeps the core, a child column past the VIRTUAL one does not.
+        // The child-only grouped view: `items` is the child of a cascading FK, so the access
+        // plan carries a cascade and `core_refusal` keeps the view on the viewplan executor on
+        // every flavor — which is what makes `feed_cascade_with_image` the reader of its kept
+        // rows, and what the integration test reads back from the engine's own route line.
         let child_prefix =
             over("SELECT i.qty, COUNT(*) AS n FROM items i WHERE i.qty > 0 GROUP BY i.qty");
+        let why = Dedup::core_refusal(&child_prefix).expect("a cascade plan keeps the executor");
+        assert!(
+            why.contains("cascade `entities` -> `items`"),
+            "the reason names the cascade the way the engine logs it: {why}"
+        );
         assert_eq!(
             Dedup::layout_refusal(&child_prefix, &LAYOUTS),
             None,
             "every read sits before the child's first generated column"
+        );
+        // The parent read alone: nothing cascades into `entities`, so this is the plan whose
+        // route the LAYOUT gate decides — the shape the integration test asserts against the
+        // engine's route line, flavor by flavor.
+        let parent_only = over("SELECT e.id, e.score, e.s FROM entities e");
+        assert!(
+            Dedup::routed(&parent_only),
+            "the parent projection is a core plan were it not for the layout"
+        );
+        assert!(Dedup::core_refusal(&parent_only).is_none(), "it has no cascade");
+        let why = Dedup::layout_refusal(&parent_only, &LAYOUTS)
+            .expect("it reads the STORED column past the VIRTUAL one, so the layout gate moves it");
+        assert!(
+            why.contains("entities") && why.contains("generated column `g`"),
+            "the reason names the table and the generated column at or before the read: {why}"
+        );
+        assert_eq!(
+            Dedup::layout_refusal(&parent_only, &FULL),
+            None,
+            "on a server whose images are the catalog the same plan keeps the core"
         );
         let child_past = over("SELECT i.s, COUNT(*) AS n FROM items i GROUP BY i.s");
         let why = Dedup::layout_refusal(&child_past, &LAYOUTS)

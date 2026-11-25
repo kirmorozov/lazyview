@@ -4,10 +4,13 @@
 //! images omit a column keeps its incremental plan instead of being read by position.
 //!
 //! R4 covers the routing decision end to end over the JOIN and cascade shapes (the neutral
-//! `entities` / `links` / `items` fixtures) with a VIRTUAL column before a real one: the
-//! prefix-reading join stays on the core, the one reading the STORED column past the
-//! VIRTUAL one keeps the viewplan executor, and both maintain exactly (the same churn,
-//! the same oracle).
+//! `entities` / `links` / `items` fixtures) with a VIRTUAL column before a real one, and the
+//! routes are checked against the counters that actually measure them: a join's core feed
+//! (`ids_marked`), the fact that no join of this fixture feeds an image buffer at all
+//! (`images_absorbed`), and the engine's cascade cache replaying kept child rows for a
+//! parent's delete (`cascade_rows`) — the read that goes through the image map on a server
+//! that logs generated columns out of its images. All three views take the same churn and
+//! stay equal to their oracle on every flavor.
 //!
 //! Measured layouts (PR-1, `tmp/out/lvs-virtual/pr1/facts.md`): MariaDB >= 11.4 logs
 //! UPDATE/DELETE images without generated columns (STORED included) and INSERT images as the
@@ -405,15 +408,26 @@ fn xa_rows_of_a_table_with_generated_columns_use_their_image_map() {
 }
 
 /// R4: the routing decision over the JOIN and cascade shapes, with a VIRTUAL and a STORED
-/// column before a real one on both sides of the join. Three views, three plans, one churn.
-/// The join that reads only the prefix every layout keeps runs on the core; so does the join
-/// that reads the parent's STORED column positioned after the parent's VIRTUAL one, because
-/// the core locates a join's parent row by its key and reads that row in a full image, which
-/// is exactly what `Dedup::layout_refusal`'s parent arm allows (refusing it would cost a
-/// route for nothing); the grouped view over the FK child runs through its cascade map. All
-/// three take the same churn — every image layout, and a cascade delete of the child the
-/// binlog never logs — stay oracle-equal on every flavor, and each is checked to have taken
-/// the route its plan earned.
+/// column before a real one on both sides of the join. Four views, four plans, one churn, and
+/// each plan is checked against the record the engine itself keeps of the route it got:
+///
+/// * the join reading only the prefix every layout preserves, and the join reading the
+///   parent's STORED column past the parent's VIRTUAL one, both stay on the **core** — the
+///   second because the core locates a join's parent row by its key and reads that row in a
+///   full image, which is what `Dedup::layout_refusal`'s parent arm allows (refusing it
+///   would cost a route for nothing). Proof: the core's own counters of theirs move.
+/// * the grouped view over the FK child keeps the **viewplan executor** on every flavor,
+///   because `Dedup::core_refusal` keeps every cascade plan there until #167's replay-window
+///   fixes land — so its kept child rows are read by `accumulate::feed_cascade_with_image`,
+///   through the image map, and a parent's cascade delete reaches the view that way. Proof:
+///   the engine's own `refused` line for it names the cascade and the executor.
+/// * the parent-only view reading its STORED column past its VIRTUAL one keeps the executor
+///   **only where the images omit generated columns** (the layout gate), and stays on the core
+///   where the image is the full catalog. Proof: the same log line on MariaDB >= 11.4, its
+///   absence on the MySQL family, with the core's counters moving there.
+///
+/// All four take the same churn — every image layout, and a cascade delete of the child the
+/// binlog never logs — and stay equal to their oracle on every flavor.
 #[test]
 fn join_and_cascade_shapes_are_maintained_on_both_routes() {
     scenario("vim_shapes", |ctx| async move {
@@ -474,9 +488,19 @@ fn join_and_cascade_shapes_are_maintained_on_both_routes() {
                 Kind::Incremental,
                 "SELECT e.id, e.s, l.w FROM entities e JOIN links l ON l.entity_id = e.id",
             ),
+            // The parent alone, reading its STORED `s` past its VIRTUAL `g`: `entities` is a
+            // cascade parent (nothing of its own is cascaded into it), so this is the one plan
+            // of the four whose route the layout gate decides — the executor where the images
+            // omit generated columns, the core where they are the catalog.
+            ViewSpec::new(
+                "v_parent_stored",
+                Kind::Incremental,
+                "SELECT e.id, e.score, e.s FROM entities e",
+            ),
             // The cascade shape: only the child is read, the parent is the cascade's own
-            // business; its kept rows go through the map and a parent's cascade delete
-            // reaches the view through the cascade route.
+            // business; `Dedup::core_refusal` keeps it on the viewplan executor, where its kept
+            // rows are read through the map and a parent's cascade delete reaches the view
+            // through that route (the binlog logs no child row).
             ViewSpec::new(
                 "v_cascade",
                 Kind::Incremental,
@@ -488,6 +512,7 @@ fn join_and_cascade_shapes_are_maintained_on_both_routes() {
         verify(&ctx, &mut eng, &db, &specs, "initial").await?;
         let p0 = eng.stats_of(&db, "v_join_prefix")?;
         let s0 = eng.stats_of(&db, "v_join_stored")?;
+        let f0 = eng.stats_of(&db, "v_parent_stored")?;
         let k0 = eng.stats_of(&db, "v_cascade")?;
         for round in 0..3 {
             let b = 100 + round * 20;
@@ -540,21 +565,31 @@ fn join_and_cascade_shapes_are_maintained_on_both_routes() {
             )
             .await?;
         }
-        // The three routes did differ: the prefix join and the join reading the parent's
-        // The routes did differ: the prefix join and the join reading the parent's STORED
-        // past its VIRTUAL both fed the core's counters — a join's parent row is located by
-        // its key and read in a full image, so the layout gate has nothing to say about that
-        // read and must not cost the view its route — while none of the three ever read a
-        // row through a cascade map.
+        // The four routes, checked against what actually records them: the core's counters of
+        // the views it serves, and the engine's own line for a plan it kept on the viewplan
+        // executor. `images_absorbed` is deliberately NOT used as a proxy here — it counts the
+        // core's buffered row images of a table that does not carry the target id (`stats.rs`),
+        // which says nothing about an image map (that was the mistake this test's first version
+        // made: it read a core counter of a view that has no core target at all as "the map was
+        // never used").
+        let omit_generated = images_leave_out_virtuals(&ctx, &mut c).await?;
         let p1 = eng.stats_of(&db, "v_join_prefix")?;
         let s1 = eng.stats_of(&db, "v_join_stored")?;
+        let f1 = eng.stats_of(&db, "v_parent_stored")?;
         let k1 = eng.stats_of(&db, "v_cascade")?;
         ctx.log(format!(
-            "routes: prefix ids_marked +{}, stored ids_marked +{}, cascade images_absorbed +{}",
+            "routes: prefix ids_marked +{}, stored ids_marked +{}, parent ids_marked +{}, \
+             cascade cascade_rows +{} cascade_gaps +{} (images omit generated: {omit_generated})",
             p1.ids_marked.saturating_sub(p0.ids_marked),
             s1.ids_marked.saturating_sub(s0.ids_marked),
-            k1.images_absorbed.saturating_sub(k0.images_absorbed)
+            f1.ids_marked.saturating_sub(f0.ids_marked),
+            k1.cascade_rows.saturating_sub(k0.cascade_rows),
+            k1.cascade_gaps.saturating_sub(k0.cascade_gaps),
         ));
+        // Both joins fed the core: the prefix one because nothing it reads sits at a position
+        // a layout moves, the parent-STORED one because a join's parent row is located by its
+        // key and read in a full image — the layout gate has nothing to say about that read and
+        // must not cost the view its route.
         ensure!(
             p1.ids_marked > p0.ids_marked,
             "the prefix join never fed the core: it is not on the route its plan earned"
@@ -568,17 +603,55 @@ fn join_and_cascade_shapes_are_maintained_on_both_routes() {
             s1.ids_marked.saturating_sub(s0.ids_marked),
             s1.ids_absorbed.saturating_sub(s0.ids_absorbed)
         );
+        let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+        // The cascade view: the core refuses every cascade plan until #167, so this is the
+        // shape whose kept child rows — the ones a parent's cascade delete answers from, with
+        // no binlog row event behind them — are read by the mapped feed.
         ensure!(
-            s1.images_absorbed == s0.images_absorbed && p1.images_absorbed == p0.images_absorbed,
-            "a join with no map in its plan fed the core through a cascade map: prefix +{}, \
-             stored +{}",
-            p1.images_absorbed.saturating_sub(p0.images_absorbed),
-            s1.images_absorbed.saturating_sub(s0.images_absorbed)
+            log.lines()
+                .any(|l| l.contains("keeps the viewplan executor")
+                    && l.contains("cascade `entities` -> `items`")),
+            "the view over the FK child never kept the viewplan executor, so the mapped cascade \
+             feed went untested here (engine log {})",
+            eng.log_path.display()
         );
         ensure!(
-            k1.images_absorbed > k0.images_absorbed,
-            "the cascade view never used its map, so the map route went untested here"
+            k1.cascade_rows.saturating_sub(k0.cascade_rows)
+                + k1.cascade_gaps.saturating_sub(k0.cascade_gaps)
+                > 0,
+            "the parent's cascade delete reached the view through neither kept child rows nor a \
+             cache gap, so the cascade route went untested here: rows +{}, gaps +{}",
+            k1.cascade_rows.saturating_sub(k0.cascade_rows),
+            k1.cascade_gaps.saturating_sub(k0.cascade_gaps)
         );
+        // The layout gate's own decision, on the one plan that is not already kept off the
+        // core by a cascade: the parent reading its STORED column past its VIRTUAL one.
+        let parent_on_executor = log.lines().any(|l| {
+            l.contains("v_parent_stored") && l.contains("logs its generated columns out of the row images")
+        });
+        ensure!(
+            parent_on_executor == omit_generated,
+            "the parent view reading its STORED column past its VIRTUAL one {} on this server \
+             (images omit generated columns: {omit_generated}): the engine's route line was {}",
+            if omit_generated {
+                "to keep the viewplan executor, which reads the image through the map"
+            } else {
+                "to stay on the core, whose positional read is exact there"
+            },
+            if parent_on_executor {
+                "the layout refusal"
+            } else {
+                "absent"
+            }
+        );
+        if !omit_generated {
+            ensure!(
+                f1.ids_marked > f0.ids_marked,
+                "with the image as the catalog the parent view keeps the core, but it fed no \
+                 marks: +{}",
+                f1.ids_marked.saturating_sub(f0.ids_marked)
+            );
+        }
         eng.stop().await?;
         Ok(())
     });
