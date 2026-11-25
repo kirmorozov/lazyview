@@ -29,6 +29,12 @@ use mysql_async::binlog::events::{BinlogEventHeader, Event};
 pub(crate) mod maria;
 pub(crate) mod percona;
 
+/// The MariaDB anchor rule, public because it is the product's own: a run whose saved set does not
+/// name every pair the node's state carries anchors on file and position, not on the set (see
+/// [`maria::dump_state_covers`]). A test that has to say which anchor it expects asks here instead
+/// of keeping a second copy of what `sql/sql_repl.cc`'s `contains_all_slave_gtid` does.
+pub use maria::{dump_state_covers, dump_state_unnamed};
+
 /// The binlog coordinate a stream read hands back: `pos` is the offset of the next event to read.
 /// It is the *wire* shape, known inside the source layer and to whoever opens the stream; what
 /// the engine and the metadata tables hold is [`Cursor`], which says nothing about files.
@@ -973,6 +979,33 @@ mod tests {
         // The bar is the pair, not its height: the node having run ahead of the saved set is what
         // a resume *means*, and the server answers that (the dump starts after the named state).
         assert!(maria::dump_state_covers("0-33114-999999", saved));
+    }
+
+    /// The refusal says which pair it refused over: the engine logs this, and a test that expects
+    /// one anchor rather than the other reads the same answer. Naming the pair is the difference
+    /// between `set_bytes=0` and an operator being able to tell a foreign `gtid_domain_id` from a
+    /// set that was never saved at all.
+    #[test]
+    fn maria_says_which_pair_a_dump_state_does_not_name() {
+        let saved = "0-33114-486898-486924";
+        assert_eq!(maria::dump_state_unnamed("0-33114-486924", saved), None);
+        assert_eq!(maria::dump_state_unnamed("", saved), None);
+        assert_eq!(maria::dump_state_unnamed("0-33114-0", saved), None);
+        assert_eq!(
+            maria::dump_state_unnamed("0-33114-486924,4000000000-33114-7", saved).as_deref(),
+            Some("4000000000-33114"),
+            "the foreign domain is what the dump thread dies on, so it is what the line names"
+        );
+        assert_eq!(
+            maria::dump_state_unnamed("0-33114-486924,0-33115-2", saved).as_deref(),
+            Some("0-33115")
+        );
+        // A pair the set names but only at seq 0 does not count as named: it claims no
+        // transaction, which is the same thing as being absent.
+        assert_eq!(
+            maria::dump_state_unnamed("0-33114-486924,7-9-3", "0-33114-486924,7-9-0").as_deref(),
+            Some("7-9")
+        );
     }
 
     /// The same cursor the failing legs stored reads back through the flavor's own grammar

@@ -543,15 +543,33 @@ pub(crate) fn dump_gtid_list(text: &str) -> Result<String> {
 /// for nothing the server has to recognize, so the resume still happens. `node_state` is
 /// `@@GLOBAL.gtid_binlog_state` and `saved` the cursor's `[g=…]` text; a node that has written
 /// nothing has no pair to name, so it answers true.
-pub(crate) fn dump_state_covers(node_state: &str, saved: &str) -> bool {
+pub fn dump_state_covers(node_state: &str, saved: &str) -> bool {
+    dump_state_unnamed(node_state, saved).is_none()
+}
+
+/// The pair [`dump_state_covers`] would refuse a dump over: the first `domain-server` pair this
+/// node's state carries that `saved` does not name, or `None` when the state can anchor a dump.
+///
+/// The engine logs it when one of its conditions holds a run back to the file/pos anchor, so an
+/// operator — and a test that has to say which rule fired — reads the pair out of the line instead
+/// of guessing from `set_bytes=0`. It is what `SHOW BINLOG EVENTS`' `Gtid_list` row names for that
+/// domain. Public because the rule is the engine's own: a test that expects one anchor or the other
+/// asks the product, rather than reading `sql_repl.cc` and writing its own copy of the check.
+pub fn dump_state_unnamed(node_state: &str, saved: &str) -> Option<String> {
     let want = parse_gtid_set(saved);
-    parse_gtid_set(node_state)
+    let named = |pair: &str| {
+        want.get(pair)
+            .is_some_and(|ivals| ivals.iter().any(|&(_, hi)| hi > 0))
+    };
+    // Sorted, so the line an operator reads (and a test asserts on) names the same pair every time
+    // the same two states are compared: the map the parse yields has no order of its own.
+    let mut missing: Vec<String> = parse_gtid_set(node_state)
         .into_iter()
-        .filter(|(_, ivals)| ivals.iter().any(|&(_, hi)| hi > 0))
-        .all(|(pair, _)| {
-            want.get(pair.as_str())
-                .is_some_and(|ivals| ivals.iter().any(|&(_, hi)| hi > 0))
-        })
+        .filter(|(pair, ivals)| ivals.iter().any(|&(_, hi)| hi > 0) && !named(pair))
+        .map(|(pair, _)| pair)
+        .collect();
+    missing.sort();
+    missing.into_iter().next()
 }
 
 /// The two session statements that make MariaDB answer the ordinary `COM_BINLOG_DUMP` of
