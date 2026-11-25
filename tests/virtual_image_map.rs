@@ -633,9 +633,16 @@ fn join_reading_a_child_column_past_its_generated_columns_is_refused_where_image
                 start_with_views(&ctx, &db, &specs, &[("LAZYVIEW_BATCH_WINDOW_MS", "100")]).await?;
             verify(&ctx, &mut eng, &db, &specs, "initial").await?;
             exec(&mut c, "UPDATE items SET qty = qty + 1 WHERE id % 2 = 0").await?;
-            exec(&mut c, "UPDATE items SET extra = extra + 10 WHERE id % 3 = 1").await?;
-            exec(&mut c, "INSERT INTO items (id, entity_id, qty, extra) VALUES (90, 2, 4, 4)")
-                .await?;
+            exec(
+                &mut c,
+                "UPDATE items SET extra = extra + 10 WHERE id % 3 = 1",
+            )
+            .await?;
+            exec(
+                &mut c,
+                "INSERT INTO items (id, entity_id, qty, extra) VALUES (90, 2, 4, 4)",
+            )
+            .await?;
             exec(&mut c, "DELETE FROM items WHERE id = 11").await?;
             exec(&mut c, "DELETE FROM entities WHERE id = 3").await?;
             verify(&ctx, &mut eng, &db, &specs, "after writes").await?;
@@ -653,7 +660,11 @@ fn join_reading_a_child_column_past_its_generated_columns_is_refused_where_image
              generated ones: {why}"
         );
         exec(&mut c, "UPDATE items SET extra = extra + 1 WHERE id = 10").await?;
-        exec(&mut c, "INSERT INTO items (id, entity_id, qty, extra) VALUES (91, 1, 5, 5)").await?;
+        exec(
+            &mut c,
+            "INSERT INTO items (id, entity_id, qty, extra) VALUES (91, 1, 5, 5)",
+        )
+        .await?;
         let row = wait_state(&mut c, &mut eng, "v_items", "error", t_ready()).await?;
         ensure!(
             row.last_error.unwrap_or_default().contains("#7"),
@@ -716,12 +727,26 @@ fn cascade_grouped_by_a_stored_generated_column_is_maintained_where_images_omit_
         // The generated column's base moves, so every image layout has to answer for the
         // group it belongs to; a parent delete cascades into rows the binlog never logs.
         exec(&mut c, "UPDATE parts SET qty = qty + 1 WHERE id % 2 = 0").await?;
-        verify(&ctx, &mut eng, &db, &specs, "the STORED column's base moved").await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the STORED column's base moved",
+        )
+        .await?;
         exec(&mut c, "INSERT INTO parts (id, eid, qty) VALUES (90, 2, 4)").await?;
         exec(&mut c, "DELETE FROM parts WHERE id = 11").await?;
         verify(&ctx, &mut eng, &db, &specs, "child writes").await?;
         exec(&mut c, "DELETE FROM entities WHERE id = 3").await?;
-        verify(&ctx, &mut eng, &db, &specs, "a cascade delete of the parent").await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "a cascade delete of the parent",
+        )
+        .await?;
         let s = eng.stats_of(&db, "v_parts")?;
         ctx.log(format!(
             "v_parts: ids_marked={}, ids_absorbed={}, images_absorbed={}, whole_view_refreshes={}",

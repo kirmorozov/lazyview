@@ -5858,7 +5858,9 @@ impl Engine {
                 // that read the table a re-read of their source, never a read by guessed
                 // positions.
                 match Self::rows_image(reader, &t, &rows) {
-                    Ok(image) => self.feed_rows(&route, &rows, image.as_ref(), &xa.start.to_position()),
+                    Ok(image) => {
+                        self.feed_rows(&route, &rows, image.as_ref(), &xa.start.to_position())
+                    }
                     Err(e) => self.drop_unreadable(&t, &e.to_string(), &xa.start.to_position()),
                 }
             }
@@ -5931,7 +5933,7 @@ impl Engine {
                         .map(|n| (&n.plan, &mut n.dirty, &mut n.since)),
                 )
             {
-                let reads = p.tables.iter().any(|t| *t == want)
+                let reads = p.tables.contains(&want)
                     || p.cascades.iter().any(|c| {
                         (c.parent.schema.as_str(), c.parent.name.as_str())
                             == (want.0.as_str(), want.1.as_str())
