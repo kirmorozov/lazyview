@@ -167,6 +167,13 @@ impl ImageMap {
 #[derive(Clone)]
 pub(crate) struct TableMaps {
     maps: Arc<[ImageMap]>,
+    /// What this was reconciled from — the TABLE_MAP's declared width and the
+    /// catalog's generated-column shape ([`Tracker::catalog_fingerprint`]) — so a
+    /// TABLE_MAP of the same shape (every transaction re-sends one) recognizes an
+    /// unchanged entry and pays neither the rebuild nor the catalog lookup
+    /// (R3). A DDL boundary drops the entry, so the fingerprint guards only
+    /// against a same-width definition the engine did not forget.
+    shape: (u64, u64),
 }
 
 impl TableMaps {
@@ -258,7 +265,11 @@ impl Tracker {
     /// guessed) whenever the image cannot be reconciled with the catalog: a
     /// TABLE_MAP count that disagrees with the catalog width, or two genuinely
     /// different candidate layouts sharing one width. It never rebuilds a
-    /// guessed layout.
+    /// guessed layout. A TABLE_MAP whose declared width and catalog
+    /// generated-column shape match the stored entry rebuilds nothing (R3):
+    /// the engine skips this call for those events altogether
+    /// ([`Tracker::image_maps_reconciled`]); this early return is the same proof
+    /// from the side that holds the catalog.
     pub(super) fn set_image_maps(
         &self,
         table: crate::catalog::TableRef,
@@ -277,6 +288,12 @@ impl Tracker {
                 table.1,
                 info.columns.len()
             ));
+        }
+        let shape = (table_map_columns, Self::catalog_fingerprint(info));
+        if let Some(e) = self.image_maps.borrow().get(&table) {
+            if e.shape == shape && !e.maps.is_empty() {
+                return Ok(());
+            }
         }
         let mut maps: Vec<ImageMap> = Vec::with_capacity(cands.len());
         for &skip in cands {
@@ -299,10 +316,47 @@ impl Tracker {
             }
             maps.push(m);
         }
-        self.image_maps
-            .borrow_mut()
-            .insert(table, TableMaps { maps: maps.into() });
+        self.image_maps.borrow_mut().insert(
+            table,
+            TableMaps {
+                maps: maps.into(),
+                shape,
+            },
+        );
         Ok(())
+    }
+
+    /// The generated-column shape of a catalog entry: what the layouts are built
+    /// from, folded so an unchanged table costs a TABLE_MAP nothing. The width
+    /// is covered by `table_map_columns` (it must equal the catalog width).
+    fn catalog_fingerprint(info: &crate::catalog::TableInfo) -> u64 {
+        let mut h: u64 = info.columns.len() as u64;
+        for c in &info.columns {
+            let g: u64 = match &c.generated {
+                None => 0,
+                Some(x) if x.stored => 2,
+                Some(_) => 1,
+            };
+            h = h.wrapping_mul(131).wrapping_add(g + 1);
+        }
+        h
+    }
+
+    /// Whether `table`'s layouts are already reconciled for a TABLE_MAP declaring
+    /// `table_map_columns` (R3): the engine's fast path out of the TABLE_MAP
+    /// handler — no catalog lookup, no rebuild, for the every-transaction
+    /// re-send of an unchanged table. A poison entry is not "reconciled": it
+    /// retries at every TABLE_MAP, as it did before the memo (a catalog that
+    /// answers again un-poisons the table).
+    pub(super) fn image_maps_reconciled(
+        &self,
+        table: &crate::catalog::TableRef,
+        table_map_columns: u64,
+    ) -> bool {
+        self.image_maps
+            .borrow()
+            .get(table)
+            .is_some_and(|e| !e.maps.is_empty() && e.shape.0 == table_map_columns)
     }
 
     /// The map for one layout: slot `i` names the i-th catalog column the image
@@ -329,11 +383,14 @@ impl Tracker {
 
     /// An entry whose images match no layout: every rows event of this table is
     /// refused (never read by guessed positions) until a TABLE_MAP reconciles.
+    /// The sentinel `shape` keeps it out of [`Tracker::image_maps_reconciled`],
+    /// so a TABLE_MAP retries the catalog for it.
     pub(super) fn poison_image_maps(&self, table: crate::catalog::TableRef) {
         self.image_maps.borrow_mut().insert(
             table,
             TableMaps {
                 maps: Arc::from(Vec::new()),
+                shape: (u64::MAX, u64::MAX),
             },
         );
     }
@@ -342,6 +399,12 @@ impl Tracker {
     /// reconciled against the old catalog must never be applied to the new one.
     pub(super) fn forget_image_maps(&self, table: &crate::catalog::TableRef) {
         self.image_maps.borrow_mut().remove(table);
+    }
+
+    /// The `("schema", "*")` DDL form (a database dropped or not analysable):
+    /// the whole memo goes, the way `on_tables_changed` clears the catalog.
+    pub(super) fn forget_all_image_maps(&self) {
+        self.image_maps.borrow_mut().clear();
     }
 
     #[cfg(test)]
@@ -599,6 +662,22 @@ impl BinlogReader {
     #[allow(dead_code)] // engine-only hook: see the note above
     pub(crate) fn forget_image_maps(&self, table: &crate::catalog::TableRef) {
         self.t.forget_image_maps(table);
+    }
+
+    /// C-01 (#7), R3: see [`Tracker::image_maps_reconciled`].
+    #[allow(dead_code)] // engine-only hook: see the note above
+    pub(crate) fn image_maps_reconciled(
+        &self,
+        table: &crate::catalog::TableRef,
+        columns: u64,
+    ) -> bool {
+        self.t.image_maps_reconciled(table, columns)
+    }
+
+    /// C-01 (#7): see [`Tracker::forget_all_image_maps`].
+    #[allow(dead_code)] // engine-only hook: see the note above
+    pub(crate) fn forget_all_image_maps(&self) {
+        self.t.forget_all_image_maps();
     }
 
     pub async fn close(self) -> Result<()> {

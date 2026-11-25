@@ -5431,11 +5431,17 @@ impl Engine {
                 // C-01 (#7): reconcile this table's image layouts against the
                 // catalog — cold path, once per (table, layout): the reader turns
                 // image slots into catalog ordinals for every slot-indexed reader
-                // (`accumulate::value_at` and friends). A table no view reads gets no
+                // (`accumulate::value_at` and friends). The TABLE_MAP of every
+                // later transaction of an unchanged table hits the reader's memo
+                // and passes here without the catalog lookup or a rebuild (R3):
+                // only a DDL (which drops the entry) or a new table-map shape
+                // reaches the catalog again. A table no view reads gets no
                 // map (identity), and the core never reads one it cannot index:
                 // `Dedup::layout_refusal` keeps a plan that reads past a generated
                 // column on the viewplan executor, which maps its images.
-                if route.is_some() || src.is_some() {
+                if (route.is_some() || src.is_some())
+                    && !reader.image_maps_reconciled(&key, columns)
+                {
                     let cands = source::image_layouts(self.flavor, &self.server_version);
                     match self.table_info(&key).await {
                         Ok(Some(info)) => {
@@ -5708,8 +5714,14 @@ impl Engine {
                     tracing::trace!(%query, "statement affects tables {tables:?}");
                     // C-01 (#7): a DDL boundary — a layout reconciled against the
                     // old catalog must never be applied to the new one; the next
-                    // TABLE_MAP reconciles against the new catalog.
+                    // TABLE_MAP reconciles against the new catalog. A `(db, "*")`
+                    // effect (a dropped or unanalysable database) drops the memo
+                    // entirely, the way `on_tables_changed` clears the catalog.
                     for t in &tables {
+                        if t.1 == "*" {
+                            reader.forget_all_image_maps();
+                            break;
+                        }
                         reader.forget_image_maps(t);
                     }
                     self.on_tables_changed(&tables, effects.rows_kept, &before)

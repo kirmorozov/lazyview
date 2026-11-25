@@ -1258,6 +1258,75 @@ fn image_maps_by_layout() {
     }
 }
 
+/// R3: the TABLE_MAP of every later transaction of an unchanged table must cost
+/// neither the catalog lookup nor a rebuild. The reader answers "already
+/// reconciled" for the same declared width; a DDL forget drops the answer, and a
+/// poisoned table never claims it. A same-width definition change (the catalog
+/// fingerprint moved) rebuilds the maps.
+#[test]
+fn image_maps_reconcile_once_per_table_shape() {
+    use crate::source::{image_layouts, Skip};
+    let maria = image_layouts(Flavor::MariaDb, "11.4.2-MariaDB");
+    let t = Tracker::new(Flavor::MariaDb, &pos("mariadb-bin.000001", 4));
+    let info = generated_table(&["id", "name", "g", "base", "extra"], &[2], &[3]);
+    t.set_image_maps(key(), &info, 5, maria)
+        .expect("reconciles");
+    assert!(
+        t.image_maps_reconciled(&key(), 5),
+        "an unchanged table's next TABLE_MAP passes without the catalog"
+    );
+    assert!(
+        !t.image_maps_reconciled(&key(), 4),
+        "a new table-map shape is not the reconciled one"
+    );
+    // Re-calling with the same shape rebuilds nothing (the early return: the
+    // width the rows resolve by is untouched).
+    t.set_image_maps(key(), &info, 5, maria)
+        .expect("idempotent");
+    assert!(t.image_map(&key(), 4).unwrap().is_some(), "same maps");
+
+    // The definition moves under the same width (STORED `base` turned VIRTUAL):
+    // the fingerprint differs and the layouts are rebuilt.
+    let moved = generated_table(&["id", "name", "g", "base", "extra"], &[2, 3], &[]);
+    t.set_image_maps(key(), &moved, 5, maria)
+        .expect("re-reconciles");
+    assert!(
+        matches!(t.image_map(&key(), 4), Some(None)),
+        "the 4-slot layout of the old shape is gone: no layout has that width now"
+    );
+
+    // A DDL boundary drops the entry: the next TABLE_MAP must re-read the catalog.
+    t.forget_image_maps(&key());
+    assert!(
+        !t.image_maps_reconciled(&key(), 5),
+        "forgotten is not reconciled"
+    );
+    assert!(t.image_map(&key(), 5).is_none(), "and the map is gone");
+
+    // A poisoned table never claims the fast path: it retries every TABLE_MAP
+    // (a catalog that answers again un-poisons it).
+    t.set_image_maps(key(), &info, 4, &[Skip::None])
+        .expect_err("the count disagrees");
+    assert!(
+        !t.image_maps_reconciled(&key(), 4),
+        "poison is not reconciled"
+    );
+    assert!(!t.image_maps_reconciled(&key(), 5), "not under any width");
+    t.set_image_maps(key(), &info, 5, maria)
+        .expect("the retry reconciles");
+    assert!(
+        t.image_maps_reconciled(&key(), 5),
+        "and un-poisons the table"
+    );
+
+    // The `(db, "*")` DDL form clears everything, as the catalog clear does.
+    t.forget_all_image_maps();
+    assert!(
+        !t.image_maps_reconciled(&key(), 5),
+        "cleared is not reconciled"
+    );
+}
+
 /// A TABLE_MAP count that disagrees with the catalog cannot be reconciled: the table is
 /// poisoned (every rows event refused) rather than read by guessed positions.
 #[test]
