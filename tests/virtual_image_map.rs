@@ -3,6 +3,12 @@
 //! the TABLE_MAP boundary and `accumulate` reads every value through it, so a table whose
 //! images omit a column keeps its incremental plan instead of being read by position.
 //!
+//! R4 covers the routing decision end to end over the JOIN and cascade shapes (the neutral
+//! `entities` / `links` / `items` fixtures) with a VIRTUAL column before a real one: the
+//! prefix-reading join stays on the core, the one reading the STORED column past the
+//! VIRTUAL one keeps the viewplan executor, and both maintain exactly (the same churn,
+//! the same oracle).
+//!
 //! Measured layouts (PR-1, `tmp/out/lvs-virtual/pr1/facts.md`): MariaDB >= 11.4 logs
 //! UPDATE/DELETE images without generated columns (STORED included) and INSERT images as the
 //! full catalog; the MySQL family logs the full catalog in every image. `TABLE_MAP` always
@@ -393,6 +399,245 @@ fn xa_rows_of_a_table_with_generated_columns_use_their_image_map() {
         .await?;
         exec(&mut xc, "XA COMMIT 'vim3' ONE PHASE").await?;
         verify(&ctx, &mut eng, &db, &specs, "XA COMMIT ONE PHASE").await?;
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// R4: the routing decision over the JOIN and cascade shapes, with a VIRTUAL column
+/// before a real one. The join that reads only the prefix every layout keeps stays on
+/// the core (the core's positional read is exact there); the join that reads the STORED
+/// column past the VIRTUAL one keeps the viewplan executor (`Dedup::layout_refusal`);
+/// the grouped view over the FK child runs on the executor through the cascade map.
+/// All three take the same churn — every image layout, and a cascade delete of the
+/// child the binlog never logs — and every one stays oracle-equal on every flavor.
+#[test]
+fn join_and_cascade_shapes_are_maintained_on_both_routes() {
+    scenario("vim_shapes", |ctx| async move {
+        let db = ctx.new_db("vim_shapes").await?;
+        let mut c = db.conn().await?;
+        exec(
+            &mut c,
+            "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL, \
+             score INT NOT NULL, g INT AS (score + 1) VIRTUAL, s INT AS (score + 2) STORED, \
+             extra INT NULL)",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "CREATE TABLE links (id INT PRIMARY KEY, entity_id INT NOT NULL, w INT NULL)",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "CREATE TABLE items (id INT PRIMARY KEY, entity_id INT NOT NULL, qty INT NOT NULL, \
+             g INT AS (qty + 1) VIRTUAL, s INT AS (qty + 2) STORED, extra INT NULL, \
+             FOREIGN KEY (entity_id) REFERENCES entities (id) ON DELETE CASCADE \
+             ON UPDATE CASCADE)",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "INSERT INTO entities (id, name, score, extra) VALUES \
+             (1,'a',1,10),(2,'b',2,20),(3,'c',3,30),(4,'d',4,NULL)",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "INSERT INTO links (id, entity_id, w) VALUES \
+             (1,1,5),(2,1,6),(3,2,NULL),(4,3,7),(5,4,8)",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "INSERT INTO items (id, entity_id, qty, extra) VALUES \
+             (1,1,1,1),(2,1,2,2),(3,2,1,3),(4,3,3,NULL),(5,4,2,5)",
+        )
+        .await?;
+        let specs = vec![
+            // Reads `id`, `name` (before the VIRTUAL) and the plain partner: a prefix
+            // join, which the core may serve by position.
+            ViewSpec::new(
+                "v_join_prefix",
+                Kind::Incremental,
+                "SELECT e.id, e.name, l.w FROM entities e JOIN links l ON l.entity_id = e.id",
+            ),
+            // Reads the STORED `s` positioned after the VIRTUAL `g`: the core indexes an
+            // image by position and cannot see it in a base-only image — the executor.
+            ViewSpec::new(
+                "v_join_stored",
+                Kind::Incremental,
+                "SELECT e.id, e.s, l.w FROM entities e JOIN links l ON l.entity_id = e.id",
+            ),
+            // The cascade shape: only the child is read, the parent is the cascade's own
+            // business; its kept rows go through the map and a parent's cascade delete
+            // reaches the view through the cascade route.
+            ViewSpec::new(
+                "v_cascade",
+                Kind::Incremental,
+                "SELECT i.qty, COUNT(*) AS n, SUM(i.qty * 2) AS d FROM items i GROUP BY i.qty",
+            ),
+        ];
+        let (mut eng, _ids) =
+            start_with_views(&ctx, &db, &specs, &[("LAZYVIEW_BATCH_WINDOW_MS", "100")]).await?;
+        verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+        let p0 = eng.stats_of(&db, "v_join_prefix")?;
+        let s0 = eng.stats_of(&db, "v_join_stored")?;
+        for round in 0..3 {
+            let b = 100 + round * 20;
+            exec(
+                &mut c,
+                &format!(
+                    "INSERT INTO entities (id, name, score, extra) VALUES ({b}, 'e{b}', {b}, {b})"
+                ),
+            )
+            .await?;
+            exec(
+                &mut c,
+                &format!(
+                    "INSERT INTO links (id, entity_id, w) VALUES ({b}, {b}, {})",
+                    b % 5
+                ),
+            )
+            .await?;
+            exec(
+                &mut c,
+                &format!(
+                    "INSERT INTO items (id, entity_id, qty, extra) VALUES ({b}, {}, {}, NULL)",
+                    1 + b % 4,
+                    b % 3
+                ),
+            )
+            .await?;
+            // The VIRTUAL's and STORED's base moves: on MariaDB >= 11.4 the image that
+            // carries the change carries neither of them.
+            exec(
+                &mut c,
+                "UPDATE entities SET score = score + 1 WHERE id % 3 = 1",
+            )
+            .await?;
+            exec(
+                &mut c,
+                "UPDATE entities SET extra = extra + 100 WHERE id % 4 = 2",
+            )
+            .await?;
+            exec(&mut c, "UPDATE items SET qty = qty + 1 WHERE id % 2 = 1").await?;
+            exec(&mut c, "DELETE FROM items WHERE id % 7 = 3").await?;
+            // The cascade delete: the child rows leave without a binlog row event.
+            exec(&mut c, "DELETE FROM entities WHERE id % 11 = 4").await?;
+            verify(
+                &ctx,
+                &mut eng,
+                &db,
+                &specs,
+                &format!("after churn round {round}"),
+            )
+            .await?;
+        }
+        // The two routes did differ: the prefix join fed the core's counters, the join
+        // reading past the VIRTUAL column never touched them (its plan is refused there).
+        let p1 = eng.stats_of(&db, "v_join_prefix")?;
+        let s1 = eng.stats_of(&db, "v_join_stored")?;
+        ctx.log(format!(
+            "routes: prefix ids_marked +{}, stored ids_marked +{}",
+            p1.ids_marked.saturating_sub(p0.ids_marked),
+            s1.ids_marked.saturating_sub(s0.ids_marked)
+        ));
+        ensure!(
+            p1.ids_marked > p0.ids_marked,
+            "the prefix join never fed the core: it is not on the route its plan earned"
+        );
+        ensure!(
+            s1.ids_marked == s0.ids_marked,
+            "the join reading STORED past VIRTUAL fed the core {} marks: layout_refusal \
+             must keep it on the viewplan executor",
+            s1.ids_marked.saturating_sub(s0.ids_marked)
+        );
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
+/// R1: a view whose cascade map keeps a STORED generated key is refused at PLAN time on
+/// a server that logs generated columns out of its images (`Dedup::map_refusal`, the
+/// reason names #7 and the kept column): the map reads its kept rows back from the
+/// child's UPDATE/DELETE images, which carry no slot for that column, so no kept row
+/// could ever be trusted — a per-row fallback would decide that permanent condition
+/// again with every row change. On a server whose images are the full catalog the same
+/// view is built and maintained exactly.
+#[test]
+fn cascade_map_keeping_a_stored_generated_key_is_refused_where_images_omit_generated() {
+    scenario("vim_map_refusal", |ctx| async move {
+        let db = ctx.new_db("vim_map_refusal").await?;
+        let mut c = db.conn().await?;
+        let omit_generated = images_leave_out_virtuals(&ctx, &mut c).await?;
+        exec(
+            &mut c,
+            "CREATE TABLE entities (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+        )
+        .await?;
+        // The child's PK is STORED generated (`pk_src` carries its base) — it is also the
+        // map key of the untraced cascade route the grouped view over the child builds.
+        exec(
+            &mut c,
+            "CREATE TABLE parts (pk_src INT NOT NULL, pk INT AS (pk_src) STORED NOT NULL, \
+             eid INT NOT NULL, qty INT NOT NULL, PRIMARY KEY (pk), KEY (eid), \
+             FOREIGN KEY (eid) REFERENCES entities (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "INSERT INTO entities (id, name) VALUES (1,'a'),(2,'b'),(3,'c')",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "INSERT INTO parts (pk_src, eid, qty) VALUES \
+             (10,1,1),(11,1,2),(12,2,1),(13,3,3),(14,3,2)",
+        )
+        .await?;
+        let spec = ViewSpec::new(
+            "v_parts",
+            Kind::Incremental,
+            "SELECT qty, COUNT(*) AS n FROM parts GROUP BY qty",
+        );
+        if !omit_generated {
+            let specs = vec![spec];
+            let (mut eng, _ids) =
+                start_with_views(&ctx, &db, &specs, &[("LAZYVIEW_BATCH_WINDOW_MS", "100")]).await?;
+            verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+            exec(&mut c, "UPDATE parts SET qty = qty + 1 WHERE pk % 2 = 0").await?;
+            exec(
+                &mut c,
+                "INSERT INTO parts (pk_src, eid, qty) VALUES (90, 2, 4)",
+            )
+            .await?;
+            exec(&mut c, "DELETE FROM parts WHERE pk = 11").await?;
+            exec(&mut c, "DELETE FROM entities WHERE id = 3").await?;
+            verify(&ctx, &mut eng, &db, &specs, "after writes").await?;
+            eng.stop().await?;
+            return Ok(());
+        }
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &[spec]).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        let row = wait_state(&mut c, &mut eng, "v_parts", "error", t_ready()).await?;
+        let why = row.last_error.unwrap_or_default();
+        ensure!(
+            why.contains("#7") && why.contains("parts") && why.contains("pk"),
+            "the refusal names issue #7, the child table and the kept column: {why}"
+        );
+        exec(&mut c, "UPDATE parts SET qty = qty + 1 WHERE pk = 10").await?;
+        exec(
+            &mut c,
+            "INSERT INTO parts (pk_src, eid, qty) VALUES (91, 1, 5)",
+        )
+        .await?;
+        let row = wait_state(&mut c, &mut eng, "v_parts", "error", t_ready()).await?;
+        ensure!(
+            row.last_error.unwrap_or_default().contains("#7"),
+            "the view stopped being refused while its table keeps changing"
+        );
         eng.stop().await?;
         Ok(())
     });
