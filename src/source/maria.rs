@@ -538,10 +538,11 @@ pub(crate) fn dump_gtid_list(text: &str) -> Result<String> {
 ///
 /// So a reader whose set does not name a pair this node has written cannot anchor on GTIDs at all
 /// — a writer with its own `gtid_domain_id`, a restored or multi-source history, a node whose
-/// `gtid_binlog_state` was reloaded by hand. [`crate::engine`] keeps the file/pos dump for those
-/// connects: the position asks for nothing the server has to recognize, so the resume still
-/// happens. `node_state` is `@@GLOBAL.gtid_binlog_state` and `saved` the cursor's `[g=…]` text; a
-/// node that has written nothing has no pair to name, so it answers true.
+/// `gtid_binlog_state` was reloaded by hand. The reader of this set is the one that has to know:
+/// a state the node cannot locate keeps the dump on its file/pos anchor, because the position asks
+/// for nothing the server has to recognize, so the resume still happens. `node_state` is
+/// `@@GLOBAL.gtid_binlog_state` and `saved` the cursor's `[g=…]` text; a node that has written
+/// nothing has no pair to name, so it answers true.
 pub(crate) fn dump_state_covers(node_state: &str, saved: &str) -> bool {
     let want = parse_gtid_set(saved);
     parse_gtid_set(node_state)
