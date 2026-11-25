@@ -2034,6 +2034,26 @@ fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
         } else {
             Flavor::MySql
         };
+        // The fragmentation this scenario measures is the server's own GTID stream, so it needs a
+        // server that hands out GTIDs at all. `mysql80` and `percona84` (the flavors whose compose
+        // service starts without `--gtid-mode=ON`, CI included) answer the injector's
+        // `SET @@SESSION.GTID_NEXT = '<uuid>:<n>'` with `ERROR 1781 (HY000): @@SESSION.GTID_NEXT
+        // cannot be set to UUID:NUMBER when @@GLOBAL.GTID_MODE = OFF`, and no made-up set can stand
+        // in for it: the leg below asks the server the resume question
+        // (`lazyview::source::gtid_covers`), which a fabricated set cannot answer. So the scenario
+        // skips there — visibly, and never in a job that requires it (CI's
+        // `LAZYVIEW_TEST_STRICT` covers `targets_`/`visibility_`/`chaos_`, not this test).
+        if !maria {
+            let mode = scalar(&mut c, "SELECT CAST(@@GLOBAL.gtid_mode AS CHAR)").await?;
+            if mode.as_deref() != Some("ON") {
+                ctx.skip(&format!(
+                    "gtid_mode is {} on this server: it assigns no GTIDs, so there is no set to \
+                     grow and no resume by GTID to check",
+                    mode.as_deref().unwrap_or("OFF")
+                ));
+                return Ok(());
+            }
+        }
         for s in [
             "CREATE TABLE entities (id INT PRIMARY KEY, grp INT NOT NULL, status VARCHAR(10) NOT NULL)",
             // The fragmentation lands here: no view reads it, so the engine only has to read its
