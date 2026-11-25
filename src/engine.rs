@@ -9112,10 +9112,20 @@ impl Engine {
                     if self.target_is_pg(&t) {
                         let class = target::WriteErr::classify(&e);
                         if self.metrics.set_target_down(&t, true, class.as_str()) {
+                            // The phrase the operator greps for (and the chaos suite's needles):
+                            // the link condition of THIS error, in the driver's own vocabulary,
+                            // next to the driver's own words. The counter's label stays the class
+                            // `classify` decided — the ruling keeps the two apart.
+                            let link = target::WriteErr::link_words(&e);
+                            let edge = if link.is_empty() {
+                                format!("last error class {class:?}")
+                            } else {
+                                format!("{link}, last error class {class:?}")
+                            };
                             warn!(view = %name, target = %t, failures = g.failures,
                                   class = class.as_str(),
-                                  "target is down: no write reached it \
-                                   (last error class {class:?}: {e:#}); its changes stay buffered \
+                                  "target is down: no write reached it ({edge}: {e:#}); \
+                                   its changes stay buffered \
                                    and its catch-up is retried at the connect backoff \
                                    (lazyview_target_down back to 1)");
                         }
