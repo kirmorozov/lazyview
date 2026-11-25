@@ -28,6 +28,5 @@ pinned::reg_cascade_refusal_seed_replay #319
 # Fix will follow (owner 2026-11-24: temporary, so main is mostly green while these are fixed). Each line
 # is a real failure with an open issue and a fix in flight; the fix PR (or the keeper pass that lands it)
 # deletes its line. These are not by-design reds and must not stay.
-alert_rules_stream_undecodable #342
 selftest_engineproc_sampler_vs_time #360
 lifecycle_crash_consistency #345
