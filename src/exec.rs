@@ -234,6 +234,45 @@ impl Dedup {
         None
     }
 
+    /// C-01 (#7), R1: why a view whose cascade map keeps a GENERATED column of
+    /// the child must be refused at plan time on a server that logs generated
+    /// columns out of its images. The map's kept rows are read back from the
+    /// child's images (the FK columns and the map key, `accumulate::feed_map_with_image`);
+    /// in a base-only image a generated column is in no slot, so no kept row of
+    /// such a child could ever be trusted — and an UPDATE or DELETE arrives that
+    /// way for EVERY row change, forever. One decision per plan, at plan time,
+    /// with the reason the operator reads in `_lazyview_state`: never a per-row
+    /// fallback deciding a permanent condition. Where every layout is the full
+    /// catalog the check is vacuous, and the view is built.
+    pub(crate) fn map_refusal(plan: &ViewPlan, layouts: &[crate::source::Skip]) -> Option<String> {
+        if layouts
+            .iter()
+            .all(|s| matches!(s, crate::source::Skip::None))
+        {
+            return None;
+        }
+        for c in plan.cascades.iter() {
+            let Some(m) = &c.map else {
+                continue;
+            };
+            let Some(&k) = c.child_cols.iter().chain(m.key.iter()).find(|&k| {
+                c.child_table
+                    .columns
+                    .get(*k)
+                    .is_some_and(|col| col.generated.is_some())
+            }) else {
+                continue;
+            };
+            return Some(format!(
+                "cascade `{}` -> `{}` keeps column `{}` of `{}` — its map key or FK — a generated \
+                 column this server logs out of the row images (issue #7): no kept row could be \
+                 read from an image of any layout it logs; the view is refused until #7 is fixed",
+                c.parent.name, c.child.1, c.child_table.columns[k].name, c.child.1
+            ));
+        }
+        None
+    }
+
     /// Mirrors `live` (definition id, plan) onto core targets: a routed plan gets a target (added, or
     /// replaced in place when the plan object changed), and every target not listed is removed. A target
     /// starts at once (`start` = the smallest position): lazyview adds them between transactions.
@@ -1727,5 +1766,250 @@ mod tests {
         let s = d.sync(&[(1, stored)]);
         assert_eq!(s.refused.len(), 1, "{:?}", s.refused);
         assert!(d.is_refused(1), "its rows keep the RouteT path");
+    }
+
+    /// R4: the same decision over the JOIN and cascade shapes, with a VIRTUAL column
+    /// before a real one on the table whose alias is at issue. A join's partner alias is
+    /// checked in its own turn (against its own table), an ON-vs-WHERE permutation reads
+    /// the same mask, a partial-unit path is checked like a direct one, and a cascade
+    /// child's alias is decided by its own reads — every arm answering core or executor
+    /// for the whole shape, not just for a single-table SELECT.
+    #[test]
+    fn layout_refusal_covers_join_and_cascade_shapes() {
+        use crate::catalog::{Column, FkAction, ForeignKey, Generated};
+        use crate::dedup::testkit;
+        use crate::source::Skip;
+
+        let generated = |name: &str, stored: bool, base: &str| {
+            let mut c = Column::simple(name, "int");
+            c.generated = Some(Generated {
+                expr: format!("(`{base}` + 1)"),
+                stored,
+                deps: None,
+            });
+            c
+        };
+        const LAYOUTS: [Skip; 3] = [Skip::None, Skip::NonVirtual, Skip::Base];
+        const FULL: [Skip; 1] = [Skip::None];
+
+        let mut cat = testkit::catalog();
+        // entities: the VIRTUAL `g` and STORED `s` sit before the real `extra`.
+        let (ekey, ent) = crate::catalog::test_catalog::typed(
+            "entities",
+            vec![
+                Column::simple("id", "int"),
+                Column::simple("name", "varchar"),
+                Column::simple("score", "int"),
+                generated("g", false, "score"),
+                generated("s", true, "score"),
+                Column::simple("extra", "int"),
+            ],
+            &[0],
+        );
+        cat.insert(ekey, ent);
+        // items: the same shape, an FK child of `entities` (the cascade shape).
+        let (ikey, it) = crate::catalog::test_catalog::typed(
+            "items",
+            vec![
+                Column::simple("id", "int"),
+                Column::simple("entity_id", "int"),
+                Column::simple("qty", "int"),
+                generated("g", false, "qty"),
+                generated("s", true, "qty"),
+                Column::simple("extra", "int"),
+            ],
+            &[0],
+        );
+        let mut items = (*it).clone();
+        items.cascades = vec![ForeignKey {
+            parent: ("db".into(), "entities".into()),
+            child_cols: vec![1],
+            parent_cols: vec!["id".into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        }];
+        cat.insert(ikey, Arc::new(items));
+        // links: a plain partner with nothing generated (the join needs one).
+        let (lkey, links) = crate::catalog::test_catalog::typed(
+            "links",
+            vec![
+                Column::simple("id", "int"),
+                Column::simple("entity_id", "int"),
+                Column::simple("w", "int"),
+            ],
+            &[0],
+        );
+        cat.insert(lkey, links);
+        let over = |sql: &str| testkit::plan_in(sql, &cat);
+
+        // --- the join shape -------------------------------------------------
+        let prefix =
+            over("SELECT e.id, e.name, l.w FROM entities e JOIN links l ON l.entity_id = e.id");
+        assert!(Dedup::routed(&prefix), "the join fixture is a core plan");
+        assert_eq!(
+            Dedup::layout_refusal(&prefix, &LAYOUTS),
+            None,
+            "every column read sits before the first one any layout leaves out"
+        );
+        let stored =
+            over("SELECT e.id, e.s, l.w FROM entities e JOIN links l ON l.entity_id = e.id");
+        let why = Dedup::layout_refusal(&stored, &LAYOUTS)
+            .expect("the join reading the STORED column past the VIRTUAL one keeps the executor");
+        assert!(
+            why.contains("#7") && why.contains("entities") && why.contains("generated column `g`"),
+            "the reason names the issue, the table and the generated column at or before \
+             the read column: {why}"
+        );
+        assert_eq!(
+            Dedup::layout_refusal(&stored, &FULL),
+            None,
+            "on a server whose images are the catalog the join keeps the core"
+        );
+        // The same read moved from the projection to WHERE: one mask, one answer.
+        let in_where =
+            over("SELECT e.id, e.name, l.w FROM entities e JOIN links l ON l.entity_id = e.id WHERE e.s > 0");
+        assert!(
+            Dedup::layout_refusal(&in_where, &LAYOUTS).is_some(),
+            "the pin on the STORED column reads it the same way the projection did"
+        );
+        // The partner alias in its own turn: the OTHER side of a self-join reads past
+        // the generated columns; the first alias reads only the prefix.
+        let partner = over(
+            "SELECT e.id, p.extra FROM entities e JOIN entities p ON p.id = e.id WHERE e.score > 0",
+        );
+        let why = Dedup::layout_refusal(&partner, &LAYOUTS)
+            .expect("the partner alias `p` reads `extra` past the generated columns");
+        assert!(
+            why.contains("`p`") && why.contains("extra"),
+            "the reason names the partner alias and its column: {why}"
+        );
+
+        // --- the cascade shape ----------------------------------------------
+        // The view reads only the child (the parent is the cascade's own business):
+        // a child prefix keeps the core, a child column past the VIRTUAL one does not.
+        let child_prefix =
+            over("SELECT i.qty, COUNT(*) AS n FROM items i WHERE i.qty > 0 GROUP BY i.qty");
+        assert_eq!(
+            Dedup::layout_refusal(&child_prefix, &LAYOUTS),
+            None,
+            "every read sits before the child's first generated column"
+        );
+        let child_past = over("SELECT i.s, COUNT(*) AS n FROM items i GROUP BY i.s");
+        let why = Dedup::layout_refusal(&child_past, &LAYOUTS)
+            .expect("the child alias reads the STORED column past the VIRTUAL one");
+        assert!(
+            why.contains("items") && why.contains("generated column `g`"),
+            "the reason names the child table and its generated column: {why}"
+        );
+        // Parent and child joined, both reading only their prefixes.
+        let join_prefix = over(
+            "SELECT e.name, i.qty, COUNT(*) AS n FROM entities e \
+             JOIN items i ON i.entity_id = e.id GROUP BY e.name, i.qty",
+        );
+        assert_eq!(
+            Dedup::layout_refusal(&join_prefix, &LAYOUTS),
+            None,
+            "two prefixes are still a prefix"
+        );
+    }
+
+    /// R1: on a server that logs generated columns out of its images, a view whose
+    /// cascade map keeps a GENERATED key or FK is refused at PLAN time: the map reads
+    /// its kept rows back from the child's images, and in a base-only image that column
+    /// is in no slot — for every UPDATE and DELETE, forever. The decision is one per
+    /// plan (the operator reads it in `_lazyview_state`), never a per-row fallback; the
+    /// same plan on a server that logs everything is built.
+    #[test]
+    fn map_refusal_refuses_a_cascade_map_keeping_a_generated_key_or_fk() {
+        use crate::catalog::{Column, FkAction, ForeignKey, Generated};
+        use crate::dedup::testkit;
+        use crate::source::Skip;
+
+        const LAYOUTS: [Skip; 3] = [Skip::None, Skip::NonVirtual, Skip::Base];
+        const FULL: [Skip; 1] = [Skip::None];
+
+        let mut cat = testkit::catalog();
+        let (ekey, ent) = crate::catalog::test_catalog::typed(
+            "entities",
+            vec![
+                Column::simple("id", "int"),
+                Column::simple("name", "varchar"),
+            ],
+            &[0],
+        );
+        cat.insert(ekey, ent);
+        // The mapped-cascade shape the plan builds for: the view reads only the child,
+        // which is an FK child of a parent it never names.
+        let (pkey, pt) = crate::catalog::test_catalog::typed(
+            "parts",
+            vec![
+                Column::simple("pid", "int"),
+                Column::simple("eid", "int"),
+                Column::simple("qty", "int"),
+            ],
+            &[0, 1],
+        );
+        let mut parts = (*pt).clone();
+        parts.cascades = vec![ForeignKey {
+            parent: ("db".into(), "entities".into()),
+            child_cols: vec![1],
+            parent_cols: vec!["id".into()],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Cascade,
+        }];
+        cat.insert(pkey, Arc::new(parts));
+        let plan = testkit::plan_in(
+            "SELECT p.qty, COUNT(*) AS n FROM parts p GROUP BY p.qty",
+            &cat,
+        );
+        assert!(
+            plan.cascades.iter().any(|c| c.map.is_some()),
+            "the fixture is the mapped-cascade shape the refusal decides on"
+        );
+        assert_eq!(
+            Dedup::map_refusal(&plan, &LAYOUTS),
+            None,
+            "kept key and FK are real columns: the map reads them from every layout"
+        );
+
+        // Turn the kept KEY (the child's PK) STORED generated — the refusal fires, and
+        // only on a server whose layouts leave generated columns out.
+        let mut made = (*plan).clone();
+        let c = &mut made.cascades[0];
+        let mut t = (*c.child_table).clone();
+        t.columns[0].generated = Some(Generated {
+            expr: "(`qty` + 1)".into(),
+            stored: true,
+            deps: None,
+        });
+        c.child_table = Arc::new(t);
+        let why = Dedup::map_refusal(&made, &LAYOUTS)
+            .expect("a STORED generated map key is in no base-only image");
+        assert!(
+            why.contains("#7") && why.contains("parts") && why.contains("pid"),
+            "the reason names the issue, the child table and the kept column: {why}"
+        );
+        assert_eq!(
+            Dedup::map_refusal(&made, &FULL),
+            None,
+            "where every image is the catalog, the map keeps it fine"
+        );
+
+        // The FK arm: the same plan with the generated column on the FK instead.
+        let mut made = (*plan).clone();
+        let c = &mut made.cascades[0];
+        let mut t = (*c.child_table).clone();
+        t.columns[1].generated = Some(Generated {
+            expr: "(`qty` + 2)".into(),
+            stored: true,
+            deps: None,
+        });
+        c.child_table = Arc::new(t);
+        let why = Dedup::map_refusal(&made, &LAYOUTS)
+            .expect("a STORED generated FK is in no base-only image either");
+        assert!(
+            why.contains("eid") && why.contains("FK"),
+            "the reason names the FK column: {why}"
+        );
     }
 }

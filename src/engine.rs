@@ -2919,7 +2919,9 @@ impl Engine {
 
     /// Refuses an incremental plan that the source cannot maintain from its row images
     /// ([`source::plan_refusal`], per flavor and server version). Full-refresh plans re-read the
-    /// source and are never refused here.
+    /// source and are never refused here. C-01 (#7) adds the cascade-map arm
+    /// ([`crate::exec::Dedup::map_refusal`]): one decision per plan, beside the layout decision
+    /// that keeps core plans off positional image reads, never re-decided per row.
     fn refuse_for_source(&self, plan: &ViewPlan) -> Result<()> {
         if matches!(plan.mode, Mode::Full(_)) {
             return Ok(());
@@ -2930,6 +2932,12 @@ impl Engine {
             {
                 bail!("{why}");
             }
+        }
+        if let Some(why) = crate::exec::Dedup::map_refusal(
+            plan,
+            source::image_layouts(self.flavor, &self.server_version),
+        ) {
+            bail!("{why}");
         }
         Ok(())
     }

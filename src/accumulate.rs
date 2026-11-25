@@ -1121,9 +1121,14 @@ pub(crate) fn feed_map_with_image(
     let Some(m) = &c.map else {
         return Fed::Skipped;
     };
-    // C-01 (#7): a kept column the layout leaves out of the image (a STORED
-    // generated key or FK) cannot be read at all: neither kept row could be
-    // trusted, so mark the view for a rebuild instead of caching a wrong row.
+    // C-01 (#7), R1: the PLAN-TIME decision for this condition is
+    // `Dedup::map_refusal` (engine.rs `refuse_for_source`): a view whose map key
+    // or FK is a generated column is refused at plan time on a server that logs
+    // them out of its images, so this arm never decides a permanent condition
+    // per row. What can still arrive here is bounded: rows that reached the live
+    // version between an ALTER making a kept column generated and the view's
+    // re-plan refusing it. A kept row that cannot be read from the image is
+    // never cached: the view is marked for a rebuild instead.
     if image.is_some_and(|im| {
         c.child_cols
             .iter()
