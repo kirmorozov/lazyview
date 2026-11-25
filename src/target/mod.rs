@@ -579,6 +579,39 @@ impl WriteErr {
             WriteErr::Other
         }
     }
+
+    /// The words a log line uses for the link condition of a failed write, in the vocabulary the
+    /// operator (and the chaos suite's `target_write_error_logged` needles) searches: a link cut
+    /// mid-write is a reset, a stream that ended under an open statement — or a peer that closed
+    /// the socket before the first byte of the answer, which is what a driver reports as an
+    /// `early eof` — is a closed connection, and a session the server ended says so itself.
+    ///
+    /// It says nothing about the [`WriteErr`] CLASS, and the class stays exactly what
+    /// [`Self::classify`] decided: a connect that reached EOF is still a connect (lv-super ruling
+    /// 2026-11-22 keeps the two questions apart, and the counter's label comes from the class).
+    /// A message none of the three families describes returns `""`: the caller then keeps the
+    /// driver's own words, which are in the line anyway.
+    pub(crate) fn link_words(e: &anyhow::Error) -> &'static str {
+        let m = format!("{e:#}").to_lowercase();
+        if m.contains("reset by peer")
+            || m.contains("connection reset")
+            || m.contains("os error 104")
+        {
+            "connection reset by peer"
+        } else if m.contains("terminating connection")
+            || m.contains("server closed the connection unexpectedly")
+        {
+            "server closed the connection unexpectedly"
+        } else if m.contains("connection closed")
+            || m.contains("broken pipe")
+            || m.contains("io error")
+            || m.contains("eof")
+        {
+            "connection closed"
+        } else {
+            ""
+        }
+    }
 }
 
 /// The statements that give a new pooled connection the family's session settings. Dispatched
@@ -1002,6 +1035,35 @@ mod tests {
             Kind::Postgres
         );
         assert_eq!(family_is_kind(crate::dialect::Family::Mysql), Kind::Mysql);
+    }
+
+    /// Part B (lv-super ruling 2026-11-22): the one line of the down crossing names the link
+    /// condition in the words an operator (and the chaos suite's needles) searches for, without
+    /// moving the class `classify` gave the same error. The PostgreSQL driver's `early eof` on a
+    /// connect the peer cut is still a `Connect` on the counter and still reads as a closed
+    /// connection in the log; a refusal belongs to none of the three families and keeps its own
+    /// words rather than borrowing a phrase it cannot claim.
+    #[test]
+    fn link_words_names_the_edge_without_moving_the_class() {
+        let eof =
+            anyhow::anyhow!("target pg: the write could not connect: connecting to pg: early eof");
+        assert_eq!(WriteErr::classify(&eof), WriteErr::Connect);
+        assert_eq!(WriteErr::link_words(&eof), "connection closed");
+
+        let reset = anyhow::anyhow!("target t1: io error: connection reset by peer (os error 104)");
+        assert_eq!(WriteErr::classify(&reset), WriteErr::Reset);
+        assert_eq!(WriteErr::link_words(&reset), "connection reset by peer");
+
+        let term = anyhow::anyhow!("db error: terminating connection due to administrator command");
+        assert_eq!(WriteErr::classify(&term), WriteErr::Terminated);
+        assert_eq!(
+            WriteErr::link_words(&term),
+            "server closed the connection unexpectedly"
+        );
+
+        let refused = anyhow::anyhow!("the write could not connect: connection refused");
+        assert_eq!(WriteErr::classify(&refused), WriteErr::Connect);
+        assert_eq!(WriteErr::link_words(&refused), "");
     }
 
     /// The quoting seam dispatches each family to its own renderer: MySQL answers backticks
