@@ -704,6 +704,49 @@ fn cursor_too_long(text_len: usize, gtid: Option<&str>) -> anyhow::Error {
     )
 }
 
+/// Saves the **cheap half** of the position: `binlog_file` and `binlog_pos` only, with no read-back.
+///
+/// The cursor column is deliberately left alone, so between two [`save_position`] calls the row can
+/// hold a cursor *behind* these two columns. That is the shape the apply loop needs: what a cursor
+/// costs to send is the size of its `[g=…]` set, and a slow or fragmented meta link must not be able
+/// to throttle applying by that many bytes (the CI red of run 45446296665: `chaos_both_sides` on a
+/// one-byte-per-packet link never caught up while every flush rewrote a tens-of-kilobytes set). What
+/// a lag costs is a restart that re-reads binlog it has already applied — safe because re-applying a
+/// change is idempotent (delete-before-insert, and the same rows in the same buckets), which is what
+/// `lifecycle_resumes_from_a_cursor_behind_the_applied_position` proves rather than asserts. The
+/// columns themselves stay the truth a start can fall back to (a NULL or absent cursor reads them),
+/// and they are written with the same `WHERE epoch = ?` as the full save: a write that changed
+/// nothing while the position did advance means another instance holds the row.
+pub async fn save_position_at(
+    conn: &mut Conn,
+    instance: &str,
+    at: &crate::binlog::Position,
+    epoch: u64,
+) -> Result<()> {
+    conn.exec_drop(
+        "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ? WHERE `instance_id` = ? AND `epoch` = ?",
+        (&at.file, at.pos, instance, epoch),
+    )
+    .await?;
+    if conn.affected_rows() == 0 {
+        let cur: Option<u64> = conn
+            .exec_first(
+                "SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
+                (instance,),
+            )
+            .await?;
+        if cur != Some(epoch) {
+            anyhow::bail!(
+                "another lazyview instance took over (epoch {cur:?}, ours {epoch}); stopping"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Writes the whole cursor — the position **and** its consumed set together — and is the only path
+/// that changes `binlog_cursor`, so it is also the only one that needs the byte-exact read-back.
+///
 /// Saves the position if `epoch` is still current; fails when another instance took over.
 ///
 /// Returns the cursor the row now holds, verified: [`save_position`] refuses a cursor the column
