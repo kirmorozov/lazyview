@@ -2902,7 +2902,14 @@ impl Engine {
 
     /// As [`Self::schedule_replan`]; unless it is a retry (the view is in error then), readers
     /// see a stale view from `since` on until a rebuild started after it is swapped in.
+    #[track_caller]
     fn schedule_replan_at(&mut self, def_id: u64, freeze: bool, retry: bool, since: &Position) {
+        // #359 diagnostics: which caller put this view on the rebuild path.
+        debug!(
+            view = %self.slots.iter().find(|s| s.def_id == def_id).map_or("?", |s| s.name.as_str()),
+            "replan scheduled (freeze={freeze} retry={retry} since={since:?}) from {}",
+            std::panic::Location::caller(),
+        );
         let delay = if retry {
             let n = self.failures.entry(def_id).or_insert(0);
             *n += 1;
@@ -6029,7 +6036,14 @@ impl Engine {
     /// bounds the DDLs it may include: a later DDL of those tables before it fails this check and
     /// rebuilds the view, stale since this swap (see [`Self::stale_from`]). DDL path only.
     async fn swap_in_place(&mut self, id: u64, at: &Position, tables: &[TableRef]) -> bool {
+        // #359 diagnostics: every silent decline of an in-place adopt, with the cause.
+        macro_rules! declined {
+            ($($arg:tt)*) => {
+                debug!(view = %self.slots.iter().find(|s| s.def_id == id).map_or("?", |s| s.name.as_str()), $($arg)*)
+            };
+        }
         let Some(i) = self.idx_of(id) else {
+            declined!("adopt declined: no such slot");
             return false;
         };
         let s = &self.slots[i];
@@ -6038,6 +6052,14 @@ impl Engine {
             .as_ref()
             .filter(|l| !l.frozen && !matches!(l.plan.mode, Mode::Full(_)))
         else {
+            declined!(
+                "adopt declined: {} at {at}",
+                match &s.live {
+                    None => "no live version",
+                    Some(l) if l.frozen => "live version frozen",
+                    Some(_) => "full mode",
+                }
+            );
             return false;
         };
         if s.next.is_some()
@@ -6045,6 +6067,13 @@ impl Engine {
             || s.waiting.is_some()
             || self.replan.contains_key(&id)
         {
+            declined!(
+                "adopt declined: build in flight (next={} error={} waiting={} replan={}) at {at}",
+                s.next.is_some(),
+                s.error.is_some(),
+                s.waiting.is_some(),
+                self.replan.contains_key(&id),
+            );
             return false;
         }
         let hit = |x: &TableRef| {
@@ -6073,6 +6102,24 @@ impl Engine {
                 .is_some_and(|h| h <= at)
         };
         if touched.is_empty() || !touched.iter().all(predates) {
+            for t in &touched {
+                if !predates(t) {
+                    let heads = match l.table_heads.get(t) {
+                        Some((r, sw)) => format!("read at {r}, swapped at {sw}"),
+                        None => match &l.catalog_head {
+                            Some(h) => format!("catalog head {h}"),
+                            None => "no head recorded".to_string(),
+                        },
+                    };
+                    declined!(
+                        "adopt declined: the live plan's `{}` definition was read after this DDL at {at} ({heads})",
+                        t.1,
+                    );
+                }
+            }
+            if touched.is_empty() {
+                declined!("adopt declined: nothing touched at {at} (tables {tables:?})");
+            }
             return false;
         }
         held.retain(|t, _| !touched.contains(t));
@@ -6088,6 +6135,7 @@ impl Engine {
         }
         // The catalog read below must see the DDL.
         if !self.fence().await {
+            declined!("adopt declined: fence failed at {at}");
             return false;
         }
         let plan = match self.parse_and_plan(&def, &targets, Some(id), &held).await {
@@ -6098,9 +6146,11 @@ impl Engine {
             }
         };
         let Some(head) = self.catalog_head().await else {
+            declined!("adopt declined: no catalog head at {at}");
             return false;
         };
         let Some(l) = self.slots[i].live.as_mut() else {
+            declined!("adopt declined: live version gone at {at}");
             return false;
         };
         if let Err(why) = plan_swap::same_reads(&l.plan, &plan) {
@@ -6869,7 +6919,12 @@ impl Engine {
             // Upstream data replaced / retry of a failed build: if a build is already running,
             // let it finish and re-plan once more afterwards instead of restarting it.
             let since = self.slots[i].stale_since.clone();
+            let vname = self.slots[i].name.clone();
             if let Some(n) = self.slots[i].next.as_mut() {
+                debug!(
+                    view = %vname,
+                    "replan merged into the running build: marked for rebuild, replanned after (non-freeze replan at {since:?})",
+                );
                 n.dirty.rebuild = true;
                 if let Some(p) = since {
                     n.since.get_or_insert(p);
@@ -7673,6 +7728,7 @@ impl Engine {
                 if dirty.rebuild {
                     let live_since = l.since.clone();
                     if let Some(n) = s.next.as_mut() {
+                        debug!(view = %name, "refresh done: rebuild flag kept for the running build (stale since {live_since:?})");
                         n.dirty.rebuild = true;
                         if let Some(p) = live_since {
                             n.since.get_or_insert(p);

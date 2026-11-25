@@ -633,6 +633,7 @@ pub fn feed_cascade(
         if c.map.is_some() {
             return feed_mapped_cascade(plan, c, ci, action, dirty, b, after);
         }
+        tracing::debug!(view = %plan.name, parent = %c.parent.name, "#359 diag: cascade parent change with no unit path: marked for rebuild");
         dirty.rebuild = true;
         return Fed::Recorded;
     };
