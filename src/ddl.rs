@@ -623,6 +623,15 @@ impl Parser<'_> {
                         "UNIQUE",
                         "PARTITION",
                         "SUBPARTITION",
+                        // A positional column op can reorder existing columns without
+                        // changing anything a shape check or `same_reads` sees
+                        // (`CHANGE a a INT AFTER c`, MySQL 8.4's `MOVE COLUMN … AFTER`):
+                        // the row images of the old layout would decode columns from the
+                        // wrong positions, silently. Requiring a rebuild for any position
+                        // clause costs little (it is the pre-fix behaviour) and rules the
+                        // family out instead of proving each spelling safe.
+                        "AFTER",
+                        "FIRST",
                     ]
                     .iter()
                     .any(|k| w.eq_ignore_ascii_case(k)) =>

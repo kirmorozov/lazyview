@@ -81,7 +81,8 @@ fn rows_kept() {
 }
 
 /// Only statements whose every specification is off the head-check waiver's allow-list — plain
-/// index and column operations — leave `waive_head_check` set: their effects are either nothing
+/// index and column operations without a position clause — leave `waive_head_check` set: their
+/// effects are either nothing
 /// the plan reads, or column rewrites `same_reads` compares, so an adopt past the head check
 /// cannot miss a change the definition depends on (#359: the engine may lag its own binlog and
 /// the head check would otherwise turn every next DDL into a whole-view rebuild).
@@ -104,10 +105,9 @@ fn waive_head_check() {
         "DROP INDEX i ON t",
         "ALTER TABLE t ADD INDEX i (a); ALTER TABLE u DROP INDEX j",
         // Plain column operations: the read columns they touch are compared by `same_reads`,
-        // the rest are invisible to the plan. Positions (AFTER / FIRST) do not matter either.
+        // the rest are invisible to the plan. A positional column op is off the list below.
         "ALTER TABLE t ADD COLUMN c INT NULL",
         "ALTER TABLE `items` ADD COLUMN `spare` INT NULL",
-        "ALTER TABLE t ADD COLUMN c INT NULL AFTER a",
         "ALTER TABLE t ADD c INT, ADD d VARCHAR(8) NOT NULL DEFAULT 'x'",
         "ALTER TABLE t ADD (a INT, b INT)",
         "ALTER TABLE t ADD COLUMN c INT GENERATED ALWAYS AS (a + b) STORED",
@@ -117,7 +117,6 @@ fn waive_head_check() {
         "ALTER TABLE t MODIFY COLUMN a BIGINT",
         "ALTER TABLE t MODIFY a BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE t CHANGE COLUMN a b INT",
-        "ALTER TABLE t CHANGE a b VARCHAR(32) NULL FIRST",
         "ALTER TABLE t RENAME COLUMN a TO b",
         "ALTER TABLE t ALTER COLUMN a SET DEFAULT 1",
         "ALTER TABLE t ALTER a DROP DEFAULT",
@@ -139,6 +138,13 @@ fn waive_head_check() {
         "ALTER TABLE t ADD COLUMN c INT REFERENCES p (id)",
         "ALTER TABLE t ADD COLUMN c INT CHECK (c > 0)",
         "ALTER TABLE t ADD (c INT UNIQUE)",
+        // A position clause can reorder existing columns invisibly to the shape checks
+        // and to `same_reads` (`CHANGE a a INT AFTER c`, 8.4's `MOVE COLUMN`): off the list.
+        "ALTER TABLE t ADD COLUMN c INT NULL AFTER a",
+        "ALTER TABLE t ADD COLUMN c INT FIRST",
+        "ALTER TABLE t CHANGE a b VARCHAR(32) NULL FIRST",
+        "ALTER TABLE t CHANGE COLUMN a a INT AFTER c",
+        "ALTER TABLE t MOVE COLUMN a AFTER b",
         "ALTER TABLE t DROP INDEX i, DROP PARTITION p",
         "ALTER TABLE t DROP PARTITION p",
         "ALTER TABLE t ADD PARTITION (PARTITION p VALUES LESS THAN (10))",

@@ -4138,13 +4138,16 @@ impl Engine {
 
     /// Checks routed plans against the column count of a TABLE_MAP. A plan built for another
     /// shape cannot decode the rows: they are skipped for it when they predate the plan (its
-    /// build already read them), and the view is re-planned when the plan is outdated (DDL
-    /// that was not seen as a statement). Other views of the table are unaffected.
+    /// build already read them — proven against the version's `since`, or the view is
+    /// re-planned so a rebuild's snapshot re-reads them), and the view is re-planned when the
+    /// plan is outdated (DDL that was not seen as a statement). Other views of the table are
+    /// unaffected.
     async fn check_shapes(
         &mut self,
         key: &TableRef,
         routes: Arc<Vec<RouteT>>,
         columns: u64,
+        at: &Position,
     ) -> Arc<Vec<RouteT>> {
         let expected = |plan: &ViewPlan, kind: RouteKind| match kind {
             RouteKind::Alias(a) => Some(plan.aliases[a].table.columns.len()),
@@ -4165,6 +4168,7 @@ impl Engine {
         let current = self.current_columns(key, columns).await;
         let mut kept = Vec::with_capacity(routes.len());
         let mut outdated = Vec::new();
+        let mut unapplied = Vec::new();
         for r in routes.iter() {
             let Some(plan) = self.plan_of(*r) else {
                 continue;
@@ -4175,6 +4179,26 @@ impl Engine {
             }
             if expected(plan, r.kind) != current {
                 outdated.push(self.slots[r.slot].def_id);
+            } else if !self
+                .slots
+                .get(r.slot)
+                .and_then(|s| {
+                    if r.next {
+                        s.next.as_ref().and_then(|n| n.since.as_ref())
+                    } else {
+                        s.live.as_ref().and_then(|v| v.since.as_ref())
+                    }
+                })
+                .is_some_and(|s| at < s)
+            {
+                // The plan has the live shape and the batch an older one: the version's
+                // build read at a position the shape comparison cannot see, and an adopt
+                // past the head check (#359) put it there without the decline that used to
+                // force a rebuild. "It predates the plan" may be false — the build may
+                // never have read these rows — so unless `since` proves the version has
+                // them already, re-plan: the rebuild's snapshot re-reads every committed
+                // row, exactly the recovery the head-check decline used to give.
+                unapplied.push(self.slots[r.slot].def_id);
             }
         }
         outdated.sort_unstable();
@@ -4182,6 +4206,14 @@ impl Engine {
         for id in outdated {
             if !self.replan.contains_key(&id) {
                 warn!(table = %key.1, "table definition differs from the view's plan; re-planning");
+                self.schedule_replan(id, true, false);
+            }
+        }
+        unapplied.sort_unstable();
+        unapplied.dedup();
+        for id in unapplied {
+            if !self.replan.contains_key(&id) {
+                warn!(table = %key.1, "rows of a superseded layout the view has not applied; re-planning");
                 self.schedule_replan(id, true, false);
             }
         }
@@ -5040,7 +5072,7 @@ impl Engine {
                     return Ok(());
                 }
                 let route = match self.routes.get(&key).cloned() {
-                    Some(r) => Some(self.check_shapes(&key, r, columns).await),
+                    Some(r) => Some(self.check_shapes(&key, r, columns, reader.position()).await),
                     None => None,
                 };
                 // Core targets: this table as the core's consumer sees it; an occurrence
@@ -5093,6 +5125,23 @@ impl Engine {
                             && !self.replan.contains_key(&id)
                         {
                             warn!(table = %key.1, "table definition differs from the view's plan; re-planning");
+                            self.schedule_replan(id, true, false);
+                        } else if want.is_some_and(|n| Some(n) == current && (n as u64) != columns)
+                            && !self
+                                .slots
+                                .iter()
+                                .find(|sl| sl.def_id == id)
+                                .and_then(|sl| sl.live.as_ref())
+                                .and_then(|v| v.since.as_ref())
+                                .is_some_and(|s| reader.position() < s)
+                            && !self.replan.contains_key(&id)
+                        {
+                            // Same rule as `check_shapes` for routed views: the plan has the
+                            // live shape and this batch an older one, so the core would skip
+                            // the rows as predating the plan — sound only when the version
+                            // has applied them already (`since` proves it). Otherwise the
+                            // rebuild's snapshot re-reads them.
+                            warn!(table = %key.1, "rows of a superseded layout the view has not applied; re-planning");
                             self.schedule_replan(id, true, false);
                         }
                         if self.dedup.replacing(id) {
@@ -6163,6 +6212,21 @@ impl Engine {
         }
         if !touched.iter().all(predates) {
             debug_assert!(waive_head_check);
+            for t in &touched {
+                if !predates(t) {
+                    let heads = match l.table_heads.get(t) {
+                        Some((r, sw)) => format!("read at {r}, swapped at {sw}"),
+                        None => match &l.catalog_head {
+                            Some(h) => format!("catalog head {h}"),
+                            None => "no head recorded".to_string(),
+                        },
+                    };
+                    declined!(
+                        "adopt past the head check: `{}` read after this DDL at {at} ({heads}); same_reads will rule",
+                        t.1,
+                    );
+                }
+            }
         }
         held.retain(|t, _| !touched.contains(t));
         let (def, targets) = (s.definition.clone(), s.targets.clone());
