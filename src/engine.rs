@@ -1127,6 +1127,11 @@ struct Engine {
     >,
     /// (table, binlog column count) → column count of the table's current definition.
     shapes: HashMap<(TableRef, u64), Option<usize>>,
+    /// Tables an in-place plan swap read the definition of from a catalog ahead of the DDL's
+    /// binlog position (#359), mapped to whether a TABLE_MAP of the table was read since: the
+    /// rows between that DDL and the next one were decoded with a layout that may be a later
+    /// one's. Empty (and free per event) outside such a window; see [`Engine::swap_in_place`].
+    readahead: HashMap<TableRef, bool>,
     /// XA transaction being read: (xid, position before it, rows of routed tables).
     xa_current: Option<(String, XaTxn)>,
     /// Prepared XA transactions awaiting XA COMMIT / ROLLBACK.
@@ -2396,6 +2401,7 @@ impl Engine {
             core_reads: HashMap::new(),
             table_ids: HashMap::new(),
             shapes: HashMap::new(),
+            readahead: HashMap::new(),
             xa_current: None,
             xa_pending: HashMap::new(),
             defs_dirty: false,
@@ -5315,6 +5321,11 @@ impl Engine {
             } => {
                 self.in_txn = true;
                 let key = (schema, table);
+                if !self.readahead.is_empty() {
+                    if let Some(seen) = self.readahead.get_mut(&key) {
+                        *seen = true;
+                    }
+                }
                 // Our own tables: the commit fence's rows are not a foreign change, and no view
                 // reads them.
                 if !(key.0 == self.schema
@@ -6513,6 +6524,20 @@ impl Engine {
 
     async fn on_tables_changed(&mut self, tables: &[TableRef], rows_kept: bool, since: &Position) {
         self.shapes.clear();
+        // The tables of this DDL whose rows since the last swap provably decoded with the layout
+        // they had (no TABLE_MAP read in the read-ahead window); the window ends here.
+        let hit_t = |x: &TableRef| {
+            tables
+                .iter()
+                .any(|t| t.0 == x.0 && (t.1 == "*" || t.1 == x.1))
+        };
+        let clean: Vec<TableRef> = self
+            .readahead
+            .iter()
+            .filter(|(t, seen)| !**seen && hit_t(t))
+            .map(|(t, _)| t.clone())
+            .collect();
+        self.readahead.retain(|t, _| !hit_t(t));
         for t in tables {
             if t.1 == "*" {
                 self.catalog.clear();
@@ -6563,7 +6588,7 @@ impl Engine {
         for (id, freeze) in todo {
             // A schema change that keeps every row: the same reads swap in place. Anything else
             // (a table swapped in or rows removed) rebuilds online.
-            if freeze && rows_kept && self.swap_in_place(id, since, tables).await {
+            if freeze && rows_kept && self.swap_in_place(id, since, tables, &clean).await {
                 continue;
             }
             let from = self.stale_from(id, since, tables);
@@ -6585,8 +6610,22 @@ impl Engine {
     /// definition of each was read when the binlog ended at or before `at` (its head; after a
     /// restart or a catch-up the plan may come from a later catalog). The new read's head likewise
     /// bounds the DDLs it may include: a later DDL of those tables before it fails this check and
-    /// rebuilds the view, stale since this swap (see [`Self::stale_from`]). DDL path only.
-    async fn swap_in_place(&mut self, id: u64, at: &Position, tables: &[TableRef]) -> bool {
+    /// rebuilds the view, stale since this swap (see [`Self::stale_from`]).
+    ///
+    /// The exception (#359), `clean`: a table whose live definition this engine itself put in
+    /// place by an earlier swap, reading the catalog ahead of that DDL, and of which no TABLE_MAP
+    /// was read since. Nothing was decoded with the read-ahead layout, so the later DDL the read
+    /// already included is adopted like any other (the new read is compared by `same_reads`).
+    /// Once a row of the table was read in that window it may have been decoded, or skipped as
+    /// "predating the plan" by `check_shapes`, with the wrong layout: the head check then
+    /// rebuilds from the earlier swap. DDL path only.
+    async fn swap_in_place(
+        &mut self,
+        id: u64,
+        at: &Position,
+        tables: &[TableRef],
+        clean: &[TableRef],
+    ) -> bool {
         let Some(i) = self.idx_of(id) else {
             return false;
         };
@@ -6629,6 +6668,7 @@ impl Engine {
                 .map(|h| &h.0)
                 .or(l.catalog_head.as_ref())
                 .is_some_and(|h| h <= at)
+                || (l.table_heads.contains_key(t) && clean.contains(t))
         };
         if touched.is_empty() || !touched.iter().all(predates) {
             return false;
@@ -6667,8 +6707,9 @@ impl Engine {
         }
         let plan = Arc::new(plan_swap::adopt(&l.plan, &plan));
         l.plan = plan.clone();
-        for t in touched {
-            l.table_heads.insert(t, (head.clone(), at.clone()));
+        let ahead = head > *at;
+        for t in &touched {
+            l.table_heads.insert(t.clone(), (head.clone(), at.clone()));
         }
         info!(
             view = %l.name,
@@ -6678,6 +6719,11 @@ impl Engine {
         let s = &mut self.slots[i];
         s.last_plan = Some(plan);
         s.last_plan_head = plan_head;
+        if ahead {
+            for t in touched {
+                self.readahead.entry(t).or_insert(false);
+            }
+        }
         self.rebuild_routes();
         true
     }
