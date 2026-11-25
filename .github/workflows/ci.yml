@@ -30,7 +30,8 @@ name: ci
 # long soak (tests/soak.rs `soak_long`) is not a CI job: GitHub Actions have time limits, so it
 # runs locally as a release gate through the repo's own runner, scripts/soak.sh: `scripts/soak.sh
 # long [hours]` (its `smoke [flavor]` is the same 30-minute smoke, run by hand). That runner
-# is PR #363, still open when this line was written, so the script is not in main yet.
+# is PR #363; it has since landed (scripts/soak.sh is on main), so the gate runs from the repo,
+# not from a scratch dir.
 # twice; its legs are the targets_pg_ gates). The jobs that gate image/release (the supply-chain scans,
 # deny + scan-image, and the optional features) are not advisory (S-09): an advisory job gates nothing.
 # Images are published to ghcr.io/kirmorozov/lazyview only for pushes:

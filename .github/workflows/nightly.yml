@@ -9,8 +9,9 @@ name: nightly
 # regular job skipping there), so a workflow_dispatch of ci.yml on a branch can prove them
 # before merge; this wrapper only owns the schedule and calls ci.yml. The long soak
 # (tests/soak.rs soak_long) is not scheduled here: GitHub Actions have time limits, so it runs
-# locally as a release gate through scripts/soak.sh long [hours], the repo's own soak runner that
-# PR #363 adds (still open when this line was written).
+# locally as a release gate through scripts/soak.sh long [hours], the repo's own soak runner from
+# PR #363 (its scripts/soak.sh smoke [flavor] is the same 30-minute smoke, run by hand). It has
+# since landed: scripts/soak.sh is on main, so the gate runs from the repo, not from a scratch dir.
 on:
   schedule:
     - cron: "17 2 * * *"   # nightly, 02:17 UTC
