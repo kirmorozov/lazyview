@@ -122,7 +122,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use lazyview::source::Position;
 use lazyview::{Config, Metrics, Snapshot};
 use mysql_async::prelude::Queryable;
@@ -1552,4 +1552,140 @@ pub async fn setup_views(
     wait_ready(&mut c, &mut eng, &workload::names(specs), t_ready()).await?;
     verify(ctx, &mut eng, &db, specs, "initial").await?;
     Ok((db, eng))
+}
+
+// --------------------------------------------------------------------------------- GTID stream
+//
+// Growing a server's consumed set for real, shared by the two suites that need it: `lifecycle`'s
+// whole-cursor scenario (the column has to hold a set no old column could) and `chaos`'s
+// fragmented-link scenario (the cost of a save is the size of its set, so a link that costs per
+// byte only shows what it costs when the set is big). Neither may fake a set: the resume questions
+// are asked of the server, and a server does not answer for transactions it never wrote.
+
+/// The set the server itself says it has consumed — `@@GLOBAL.gtid_executed` on the MySQL family,
+/// `@@GLOBAL.gtid_binlog_state` on MariaDB. The words the resume-by-GTID question is asked against
+/// ([`lazyview::source::gtid_covers`]), so it is also what a test measures a saved cursor against.
+pub async fn server_gtid_set(c: &mut mysql_async::Conn, maria: bool) -> Result<String> {
+    Ok(scalar(
+        c,
+        if maria {
+            "SELECT @@GLOBAL.gtid_binlog_state"
+        } else {
+            "SELECT @@GLOBAL.gtid_executed"
+        },
+    )
+    .await?
+    .unwrap_or_default())
+}
+
+/// Grows the server's GTID stream until the **cursor the engine has saved for `instance`** is at
+/// least `at_least` bytes — the quantity `binlog_cursor` has to hold, so the loop measures it on
+/// the row itself rather than guessing it from how the server spells a set. One committed
+/// transaction at a time, every transaction its own interval: the MySQL family commits each one
+/// under an explicit `GTID_NEXT` at a gap of its own (a rolled back transaction would not do —
+/// MySQL assigns the GTID at commit, so a transaction that never reached the binlog consumed no
+/// number and cut no hole), MariaDB under its own `gtid_domain_id` (one interval per domain in
+/// `gtid_binlog_state`). Both give the shape #347's row had — thousands of intervals of set, which
+/// the `TEXT` column of the day kept the first 65,535 bytes of in silence. `table` is a table no
+/// view reads, so the engine only has to read their events.
+///
+/// Returns how many transactions it took, the bytes the row held when it stopped, and the bytes
+/// the server's own set text held by then (the two differ in how each renders an interval — the
+/// server names its uuid once per group, the engine's text on every interval).
+///
+/// Fails, naming both measurements, when the stream does not fragment: without a cursor the old
+/// column could not hold there is nothing to check.
+pub async fn fragment_gtid_stream(
+    c: &mut mysql_async::Conn,
+    instance: &str,
+    maria: bool,
+    table: &str,
+    at_least: usize,
+) -> Result<(usize, usize, usize)> {
+    /// The source uuid of the injected transactions. Deliberately not the server's own: its
+    /// auto-assigned numbers never collide with these, so the only thing the injected set holds is
+    /// the intervals this loop gave it.
+    const INJECT_UUID: &str = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf";
+    let started = std::time::Instant::now();
+    let mut groups = 0usize;
+    loop {
+        if maria {
+            exec(
+                c,
+                &format!(
+                    "SET SESSION gtid_domain_id = {}",
+                    4_000_000_000u64 + groups as u64
+                ),
+            )
+            .await?;
+            exec(
+                c,
+                &format!("INSERT INTO {table} (id, pad) VALUES ({groups}, 'frag')"),
+            )
+            .await?;
+        } else {
+            // An odd number every time: consecutive gnos would merge into one interval, and an
+            // interval per transaction is the whole point.
+            exec(
+                c,
+                &format!(
+                    "SET @@SESSION.GTID_NEXT = '{INJECT_UUID}:{}'",
+                    groups * 2 + 1
+                ),
+            )
+            .await?;
+            exec(c, "BEGIN").await?;
+            exec(
+                c,
+                &format!("INSERT INTO {table} (id, pad) VALUES ({groups}, 'frag')"),
+            )
+            .await?;
+            exec(c, "COMMIT").await?;
+        }
+        groups += 1;
+        if !groups.is_multiple_of(200) {
+            continue;
+        }
+        // What the row holds is the thing under test; the server's own text is read alongside it
+        // so a run that fails says what both sides measured.
+        let saved = saved_cursor_bytes(c, instance).await?;
+        let set = server_gtid_set(c, maria).await?;
+        if saved >= at_least {
+            break;
+        }
+        ensure!(
+            groups < 40_000 && started.elapsed() < Duration::from_secs(1200),
+            "{groups} transactions in {:?} grew the saved cursor to only {saved} bytes and the \
+             server's set to {} bytes ({}): no fragmentation, nothing to test",
+            started.elapsed(),
+            set.len(),
+            set.chars().take(120).collect::<String>()
+        );
+    }
+    // The session goes back to normal: the test writes ordinary transactions on this connection
+    // afterwards, and they must carry the server's own GTIDs, not a second injected one.
+    if maria {
+        exec(c, "SET SESSION gtid_domain_id = 0").await?;
+    } else {
+        exec(c, "SET @@SESSION.GTID_NEXT = 'AUTOMATIC'").await?;
+    }
+    Ok((
+        groups,
+        saved_cursor_bytes(c, instance).await?,
+        server_gtid_set(c, maria).await?.len(),
+    ))
+}
+
+/// How many bytes the *server* says `binlog_cursor` holds for one instance (0 while the row has
+/// never been saved). The growing loop's measure: it waits on a number, so it asks for the number
+/// rather than pulling megabytes of text over the wire every 200 transactions.
+pub async fn saved_cursor_bytes(c: &mut mysql_async::Conn, instance: &str) -> Result<usize> {
+    Ok(scalar_i64(
+        c,
+        &format!(
+            "SELECT COALESCE(LENGTH(binlog_cursor), 0) FROM _lazyview_status WHERE instance_id = {}",
+            q(instance)
+        ),
+    )
+    .await? as usize)
 }
