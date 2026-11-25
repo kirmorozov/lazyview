@@ -1909,7 +1909,10 @@ mod tests {
             Dedup::routed(&parent_only),
             "the parent projection is a core plan were it not for the layout"
         );
-        assert!(Dedup::core_refusal(&parent_only).is_none(), "it has no cascade");
+        assert!(
+            Dedup::core_refusal(&parent_only).is_none(),
+            "it has no cascade"
+        );
         let why = Dedup::layout_refusal(&parent_only, &LAYOUTS)
             .expect("it reads the STORED column past the VIRTUAL one, so the layout gate moves it");
         assert!(

@@ -627,7 +627,8 @@ fn join_and_cascade_shapes_are_maintained_on_both_routes() {
         // The layout gate's own decision, on the one plan that is not already kept off the
         // core by a cascade: the parent reading its STORED column past its VIRTUAL one.
         let parent_on_executor = log.lines().any(|l| {
-            l.contains("v_parent_stored") && l.contains("logs its generated columns out of the row images")
+            l.contains("v_parent_stored")
+                && l.contains("logs its generated columns out of the row images")
         });
         ensure!(
             parent_on_executor == omit_generated,
