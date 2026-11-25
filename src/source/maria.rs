@@ -524,6 +524,35 @@ pub(crate) fn dump_gtid_list(text: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Whether MariaDB can locate a binlog dump on this cursor's set at all.
+///
+/// `SET @slave_connect_state` is not a set the server filters events out of: it is the state the
+/// dump starts *after*, and MariaDB answers it only for a state that names **every**
+/// `domain-server` pair the node has written. In `contains_all_slave_gtid` (`sql/sql_repl.cc`), a
+/// pair that a binlog file's `Gtid_list_log_event` carries but the requested state does not name
+/// means "this slave needs that domain from its very first transaction", so the server searches
+/// ever-older files; when none of the files it still has begins that domain, the dump dies with
+/// `Could not find GTID state requested by slave in any binlog files. Probably the slave state is
+/// too old and required binlog files have been purged` — and `@slave_gtid_strict_mode` never gets
+/// a say, because the request dies while the file is being chosen.
+///
+/// So a reader whose set does not name a pair this node has written cannot anchor on GTIDs at all
+/// — a writer with its own `gtid_domain_id`, a restored or multi-source history, a node whose
+/// `gtid_binlog_state` was reloaded by hand. [`crate::engine`] keeps the file/pos dump for those
+/// connects: the position asks for nothing the server has to recognize, so the resume still
+/// happens. `node_state` is `@@GLOBAL.gtid_binlog_state` and `saved` the cursor's `[g=…]` text; a
+/// node that has written nothing has no pair to name, so it answers true.
+pub(crate) fn dump_state_covers(node_state: &str, saved: &str) -> bool {
+    let want = parse_gtid_set(saved);
+    parse_gtid_set(node_state)
+        .into_iter()
+        .filter(|(_, ivals)| ivals.iter().any(|&(_, hi)| hi > 0))
+        .all(|(pair, _)| {
+            want.get(pair.as_str())
+                .is_some_and(|ivals| ivals.iter().any(|&(_, hi)| hi > 0))
+        })
+}
+
 /// The two session statements that make MariaDB answer the ordinary `COM_BINLOG_DUMP` of
 /// [`crate::binlog::stream`] (no file name, the minimum position) from a GTID position:
 /// `@slave_connect_state` is the list to resume after, and `@slave_gtid_strict_mode = 1` makes the
