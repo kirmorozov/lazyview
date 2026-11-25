@@ -106,8 +106,41 @@ writes off.
 A pre-flight check can cover the static server settings of this page: `log_bin`
 on, `binlog_format=ROW`, `binlog_row_image=FULL`, the binlog filters not
 excluding a schema a view reads. What no check can cover is a session changing
-its own settings while lazyview runs. A `preflight` command that runs the static
+its own settings while lazyview runs: a session that writes short row images is
+caught by the engine instead
+([below](#a-session-that-writes-short-row-images)), and nothing can cover
+`sql_log_bin=0` above. A `preflight` command that runs the static
 checks is planned; no version is promised for it.
+
+### A session that writes short row images
+
+`binlog_row_image` is dynamic, and a session may set it for its own writes
+(`MINIMAL`, or `NOBLOB` on MySQL), so the stream can carry images shorter than
+the server's global value; a global change after startup reaches only the
+sessions that connect afterwards ([above](#requirements)). That matters because a
+view reading a table incrementally needs every column below the highest one it
+reads to be present in the row images it consumes: the values carry no column
+ids, only the event's present-column bitmap says which columns are there, so a
+column left out *below* a column the view reads shifts every value after it and
+the feed would read one column as another.
+
+lazyview never applies such a row. The whole rows event is refused, counted
+(`lazyview_short_row_images_total`) and named in a WARN — kind, schema, table
+and binlog position, never a row value — printed at most once a minute. The
+views that read the table are refreshed from the source instead, which is what
+an incremental view does when it cannot attribute a change to units: where the
+images that did arrive still name the unit keys of every route the view has on
+the table, only the units that event touched are read back; otherwise the whole
+view is. Nothing is rebuilt, and a view is never left `ready` holding values
+read from a shifted image. Rows of a table no view reads yet are kept across a
+prepared XA transaction only while their images are full, so a view defined
+inside that window is refreshed from the source rather than fed compacted
+values.
+
+What to do: find the session or loader that sets `binlog_row_image` below
+`FULL` and stop it, or accept the extra refreshes — the counter going flat is
+the sign the stream is clean again. The views need no hand attention either
+way.
 
 ## Supported servers
 

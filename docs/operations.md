@@ -212,7 +212,18 @@ which it was read, `binlog_backpressure` those during which the queue was full (
 waits). `binlog_backpressure` also counts the pauses while the changes buffered for building views
 exceed their 256 MiB budget (logged as `binlog reading paused until a build is applied`): every
 view lags meanwhile. `cascade_rows` sums over the views the child rows a mapped cascade changed,
-replayed from the in-memory cascade cache.
+replayed from the in-memory cascade cache. `short_row_images` counts the rows events lazyview
+refused because an image left out a column a view reading that table needs by position
+([a session that writes short row images](server-setup.md#a-session-that-writes-short-row-images)).
+
+The leadership lock ([duplicate instances](#duplicate-instances-and-hot-standby)) keeps its own
+counters: `leader_beat_failures` (beats of the lock's own session that were not answered: the
+session is dropped, re-opened and the lock confirmed again, so a GC pause or a proxy blip shows here
+and is not fatal), `leader_uncertain` (episodes of two periods without an answered beat, during
+which every write gate was closed and the writes in flight ended through the zombie fence until the
+lock was confirmed again — the instance is not lost, but each entry is a stall of its refreshes)
+and `leader_fenced` (this instance was replaced: another session holds the lock or the fencing epoch
+moved while its session was away).
 
 Per connection pool of concurrent refreshes, labelled
 `{pool="read|write", endpoint="source|<target>"}`: `lazyview_supervisor_limit`, `_max` (pool
@@ -252,7 +263,12 @@ views without a live table for a long time (`lazyview_views - lazyview_views_rea
 lazyview_views_error > 0` for 2 h). [docs/kubernetes.md](kubernetes.md#metrics) has these as a
 PrometheusRule. An incremental view rebuilt as a whole (`increase(lazyview_view_whole_view_refreshes_total[1h]) > 0`
 on a view whose `_lazyview_state.mode` is `incremental`) is worth a look too: row changes never
-cause that, so its reason (in `/stats`) says what did.
+cause that, so its reason (in `/stats`) says what did. Of the lock's own counters,
+`lazyview_leader_fenced_total` rising on an instance you did not restart says a second instance
+took the lock, and `lazyview_leader_uncertain_total` rising steadily says the lock server keeps
+going silent on it — each entry is a stall of that instance's refreshes. A
+`lazyview_short_row_images_total` that grows is a writing session with `binlog_row_image` below
+`FULL` ([server setup](server-setup.md#a-session-that-writes-short-row-images)).
 
 ## Per-view update statistics
 
@@ -401,6 +417,34 @@ Instances with the same `LAZYVIEW_INSTANCE_ID` on the same schema share a MySQL 
 (`GET_LOCK`) on the source. Only the holder is active. A second instance logs `standing by`,
 stays connected, and takes over a few seconds after the active one stops or loses its connection.
 `/readyz` reports a standby as not ready unless asked with `?standby=ok`.
+
+A named lock has no expiry: it is freed when its session ends, so the lock lives on a connection of
+its own, beaten there by a task of its own — a `DO 1` and an ownership check every
+`LAZYVIEW_LOCK_HEARTBEAT_MS` (5 s), never on the binlog loop. That session also sets its own
+`wait_timeout` to `LAZYVIEW_LOCK_LEASE_MS` (20 s). While the process lives, its beats keep the
+session; when the process is gone — killed hard, its node powered off, or cut off so that nothing
+ever closes the connection — nobody beats, the server waits out the lease, ends the session, and
+the lock dies with it. The lock is thus *released* by the server, with nothing on the lazyview side
+having to notice anything, and the replacement streams after about one lease plus its own poll
+(≤ 5 s) and its start. Lowering the source's `wait_timeout` or the database host's TCP keepalive is
+no longer needed for that recovery; it stays harmless. Set the lease from your recovery objective:
+it is the time a partitioned node still holds the lock, and the biggest part of how long a
+replacement waits.
+
+The other direction is the beats noticing: every statement the lock's session sends carries a
+client-side deadline of one `LAZYVIEW_LOCK_HEARTBEAT_MS`, and two periods without an answered beat
+close every write gate at once — flushes, the saved position, the state rows, the refresh writes,
+and the target DDL (a rebuild's `RENAME TABLE` swap, dropping a shadow or an owned table, reclaiming
+an orphan) — while the writes already in flight are ended through the zombie fence instead of being
+left to run to `LAZYVIEW_TARGET_TIMEOUT_MS`. Checking a gate is one read of the lock task's own
+state, so it is not work on the event path. The task then re-opens the session and asks for the
+lock without waiting (`GET_LOCK(name, 0)`: the answer is immediate, or the server is not there). A
+fencing epoch that moved while the session was away says this instance was replaced: it logs
+`fenced: …; this instance is the replaced one and stops at its next check` at WARN and exits without
+touching the state rows the replacement now owns; an unchanged epoch means the lock is merely busy,
+and it stays gated and tries again on the next beat. A merely slow instance is not replaced: its
+beats are answered by their own task, so a busy binlog loop, a long catch-up or a swap waiting its
+`lock_wait_timeout` never loses the lock.
 
 Every takeover increments `_lazyview_status.epoch`, and every position write checks it. An
 instance that lost the lock without noticing stops at its next flush with `another lazyview

@@ -162,6 +162,8 @@ LAZYVIEW_TARGET_REPORTING_DSN=mysql://lazyview:change-me@reporting-db:3306/repor
 | `LAZYVIEW_VISIBILITY_DELAY_MS` | `20` | fallback wait before reading the sources when no exact visibility check is available: Oracle MySQL with GTIDs off and `binlog_order_commits=OFF`, or when lazyview cannot write `_lazyview_fence` (both logged as a warning). Unused otherwise |
 | `LAZYVIEW_HEARTBEAT_MS` | `5000` | replication heartbeat period (minimum `100`) |
 | `LAZYVIEW_POSITION_PERSIST_MS` | `5000` | how often the binlog position is saved when nothing else is written |
+| `LAZYVIEW_LOCK_HEARTBEAT_MS` | `5000` | period (minimum `1000`) of the leadership lock's own session: a `DO 1` and an ownership check on a connection of its own, from a task of its own — never on the binlog loop and never per binlog event. Also how fast a lost lock is noticed: two periods without an answered beat close every write gate. Nothing to do with `LAZYVIEW_HEARTBEAT_MS` above but the name (that one is the binlog heartbeat) |
+| `LAZYVIEW_LOCK_LEASE_MS` | `20000` | the `wait_timeout` (minimum `2000`) the leadership lock's own session sets for itself: the server ends a session it has heard nothing from this long, and a MySQL named lock dies with its session. How long a lost node keeps the lock, so the main term of how long a replacement waits for it (see [duplicate instances](operations.md#duplicate-instances-and-hot-standby)). Must be at least `4 × LAZYVIEW_LOCK_HEARTBEAT_MS` — two periods to notice the beats have stopped and one more to confirm the lock on the way back have to end before the lease does, and startup refuses a combination that does not |
 
 ### Reserved
 

@@ -217,6 +217,43 @@ cargo run --release --example throughput -- --dsn mysql://lv:lv@127.0.0.1:33084/
     --scenario join_direct --seconds 30 --writers 8 --batch 50
 ```
 
+### Running the soak (the release gate)
+
+`scripts/soak.sh` runs, locally, the two opt-in modes of `tests/soak.rs`: `soak_smoke_30m` and
+`soak_long`. The long run is the release gate: it runs before a `vX.Y.Z` tag
+([CI and publishing](#ci-and-publishing)) and before any pilot. GitHub Actions have time limits, so
+the multi-hour soak is not a CI job; CI keeps the two bounded ones (`soak-pr`, a 5-minute smoke on
+`mysql84` on every pull request, and `soak-smoke`, the nightly and on-demand 30-minute smoke on
+`mysql84` and `mariadb1011`), and the long mode here runs the very same `soak_long` test.
+
+```sh
+scripts/soak.sh smoke [flavor]   # the 30-minute smoke (default mysql84), the whole run under the
+                                 # heavy-suite lock, like every suite here
+scripts/soak.sh long [hours]     # the release run, 1..72 hours (default 48), on the harness's own
+                                 # servers: the soak plan's two throwaways, lvtmp-soak-1
+                                 # (mysql84, :34941) as the source and lvtmp-soak-2 (mariadb1011,
+                                 # :34942) as the chaos target; the chaos events stop and start
+                                 # only those two containers
+```
+
+Both build `cargo test --locked --test soak` under the build lock (or through the host's cargo
+runner, `LV_SOAK_CARGO_RUNNER`) and then run the one test single-threaded, with the environment
+`tests/soak.rs` needs: `LAZYVIEW_TEST_SOAK=<mode>` (without it both soaks skip), a source-only
+`LAZYVIEW_TEST_DSNS` (the harness runs one soak per flavor, and two would fight over the chaos
+source), `LAZYVIEW_TEST_ENGINE_USER=lvdoc:doc` and `LAZYVIEW_TEST_STRICT=soak_` (a skipped soak is
+a failure, as in CI's soak jobs). The smoke takes its DSN from `scripts/test-servers.sh dsns
+<flavor>`, so start that server first (`scripts/test-servers.sh compose up mysql84`, or tarball
+mode). The long run pre-flights and refuses when its throwaways are not running, accepts only
+`lvtmp-soak-*` containers, and never holds the heavy-suite lock while it runs — only around the
+pre-flight, so a multi-hour soak does not block the suites. Set
+`LAZYVIEW_TEST_SOAK_CONTAINERS=` to run the long mode with no container chaos, on one server.
+
+Every run writes its log, `summary.txt` and `DONE` (`ALL_OK`, or `FAILED <check>`) into its own
+directory under `tmp/out/lvs-soak/runs/` (`<utc>-smoke-<flavor>`, `<utc>-long-<hours>h`), and prints
+the path of the one-page `report.md` (with `report.json` and `samples.csv` beside it) that the
+harness writes under `tmp/out/lvs-soak/runs/`. The script exits non-zero when the run or one of its
+checks failed.
+
 ## Coverage
 
 `make coverage` (which runs `scripts/coverage.sh $(ARGS)`) measures the production-line
@@ -305,6 +342,11 @@ Workflows in `.github/workflows/`:
   runner load of every landing. The `mysql84` entry stays because it alone writes the shared
   `integration` rust-cache (its `save-if`) that the pull request runs restore. The servers run with
   the durable defaults (no `docker-compose.local.yml`).
+* The two bounded soak jobs at the bottom of `ci.yml`: `soak-pr`, a 5-minute smoke on `mysql84`,
+  runs on every pull request as a check of its own; `soak-smoke`, the 30-minute smoke on `mysql84`
+  and `mariadb1011`, runs on the nightly and on a manual run. Both are strict: a soak that skipped
+  fails the job. The long soak is not a CI job — GitHub Actions have time limits, so it runs
+  locally as the release gate ([running the soak](#running-the-soak-the-release-gate)).
 * Every image is built and tested before it is pushed: `--version`, exit code `2` without
   configuration, user `65532`, no shell and the healthcheck, on both architectures (arm64 under
   QEMU). An end-to-end run of `docker-compose.example.yml` against MySQL 8.4 (amd64) follows.
@@ -318,8 +360,12 @@ Workflows in `.github/workflows/`:
 * Dependabot (`.github/dependabot.yml`) proposes weekly updates for GitHub Actions, crates and the
   base images.
 
-Releasing: bump `version` in `Cargo.toml`, merge, then push a `vX.Y.Z` tag. CI fails the release
-if the binary's `--version` does not match the tag.
+Releasing: run `scripts/soak.sh long` before tagging — the long soak (`soak_long`, 1–72 hours,
+default 48) is the release gate, and CI runs no long soak at all, so if it is not run by hand
+nothing runs it. The run has to *finish*: the script exits `0` only when the whole soak passed, and
+prints its `report.md` ([running the soak](#running-the-soak-the-release-gate)). Then bump
+`version` in `Cargo.toml`, merge, and push a `vX.Y.Z` tag. CI fails the release if the binary's
+`--version` does not match the tag.
 
 The package `ghcr.io/kirmorozov/lazyview` is public (anonymous `docker pull` works) and linked to
 the repository. In a fork, the first push may create the package as private: package page,

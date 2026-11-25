@@ -10,6 +10,27 @@
   reads the table. Updates that touch no column a view uses are dropped. A row maps to its units
   straight from the row image when the unit is reachable through equalities
   (`i.order_id = o.id`). Otherwise one `SELECT DISTINCT` lookup per batch finds them.
+* **Short row images are never applied.** Row values carry no column ids: only the event's
+  present-column bitmap says which columns are there, so a column left out *below* a column a feed
+  reads shifts every value after it and the feed reads one column as another (`binlog_row_image`
+  below `FULL` for the writing session; see
+  [server setup](server-setup.md#a-session-that-writes-short-row-images)). Each watched table
+  therefore carries, next to its routes, the prefix its feeds read: the highest column any of them
+  may read — an alias's referenced and membership columns, its literal image, its unit and partial
+  keys; a whole-view route's skip mask; and, for a cascade parent or a mapped child, every stored
+  column of the shape, since which columns the derivation reads is cascade code's business
+  (`src/engine.rs`, `TableNeed`). Every rows event of that table is compared with the prefix once,
+  not per row: the two bitmaps are fields of the event header, so a full image costs a pass over the
+  bitmap's own bytes (one word for a table of up to 64 columns) and no row decode beyond what the
+  event needed anyway. A short one applies nothing: it is counted (`lazyview_short_row_images_total`),
+  warned about at most once a minute, and each version reading the table takes the cheapest safe
+  answer — the units the event touched, where the images still name the unit columns of all that
+  version's routes on the table, and `accumulate::mark_all`, one whole-view refresh, otherwise; a
+  version whose rows go to the de-duplication core's consumer always takes the whole-view refresh,
+  because that consumer is copy-set code and cannot tell a compacted image from a full one. Columns
+  above the prefix are don't-care, which is what keeps an image that leaves a trailing VIRTUAL
+  generated column out legal rather than short (the VIRTUAL-column row images of
+  [server setup](server-setup.md#caveats-per-line), issue #7).
 * **Lineage, not the current state, for old rows.** The current state of the sources can be
   ahead of the binlog read so far, so an old row joined with the *current* rows of the other
   tables may find nothing (a customer and its region deleted one after the other). Select/join

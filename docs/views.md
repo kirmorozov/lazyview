@@ -359,8 +359,13 @@ reads.
   (below), while every other parent row still changes nothing. This holds wherever every alias of
   the child is pinned on the foreign-key column, also when the view cannot follow the pinned rows
   from the parent's row.
-* These routes read the parent's row image: with `binlog_row_image` other than FULL a cascade
-  from such a parent rebuilds the view, and lazyview warns about the incomplete image.
+* These routes read the parent's row image, so what a short image costs depends on how short it
+  is. An image that leaves a stored column of the parent out is never read at all: the engine
+  refuses the whole rows event and refreshes the views that read the table from the source, as for
+  any short image ([server setup](server-setup.md#a-session-that-writes-short-row-images)). An
+  image that carries every column up to the last stored one but not the whole row (a trailing
+  VIRTUAL generated column left out) the derivation cannot use either: its safety net is a rebuild
+  of the view, with a warning naming the parent.
 * Through a `LEFT JOIN` with the parent on the NULL side, the parent is traced only when the join
   condition is the foreign-key equality and nothing else (`LEFT JOIN customers c ON c.id =
   a.customer_id`, or `USING`). With any other condition (`… ON c.id = a.customer_id AND

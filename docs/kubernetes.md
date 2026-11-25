@@ -170,12 +170,16 @@ read at container start: after
 * How fast a standby takes over depends on how the active pod goes away:
   * It stops (SIGTERM, crash, OOM kill, pod deletion): its connection closes, the server releases
     the lock at once, and the standby takes over within about 5 s.
-  * Its node dies, freezes or is cut off from the database: nothing closes the connection, so the
-    server keeps the lock until it ends that session itself, after its `wait_timeout` (MySQL
-    default 28800 s, 8 h) or a failed TCP keepalive on the database host (Linux default about
-    2 h 10 min). Until then nothing streams, and `LazyviewNotStreaming` fires after 10 minutes.
-    Lower the server's `wait_timeout` or the database host's `net.ipv4.tcp_keepalive_*` settings
-    if that gap matters.
+  * Its node dies, freezes or is cut off from the database: nothing closes the connection, and a
+    MySQL named lock is freed only when its session ends. The lock's own session therefore sets its
+    own `wait_timeout` to `LAZYVIEW_LOCK_LEASE_MS` (20 s) and is beaten by a task of its own
+    (a `DO 1` and an ownership check every `LAZYVIEW_LOCK_HEARTBEAT_MS`, 5 s), so a live pod keeps
+    the lock however busy its binlog loop is, while a lost one stops holding it when the server
+    waits out the lease: the replacement streams after about one lease plus its own poll (≤ 5 s)
+    and its start, with no `KILL` and no human in the loop. Set the lease from your recovery
+    objective — it is the time a partitioned node still holds the lock. Lowering the server's
+    `wait_timeout` or the database host's `net.ipv4.tcp_keepalive_*` settings is no longer required
+    for that recovery; it stays harmless.
 * The readiness probe is `/readyz?standby=ok&building=ok`: Ready means "a healthy member of the
   pair", either a standby polling the lock or the active pod streaming the binlog. Plain `/readyz`
   (humans, monitoring, `lazyview_ready`) is stricter, and using it for the probe would break this
