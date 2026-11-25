@@ -6814,14 +6814,38 @@ impl Engine {
         }
     }
 
+    /// A build task reported its result. Only the version that is STILL the pending one of its
+    /// slot may consume it: `start_next` aborts a superseded build's task and gives the slot a
+    /// newer `generation`, so a late report of that build belongs to nothing. The cases that
+    /// consume nothing are named here, because each of them leaves the slot with a version that
+    /// no `finish_next` will ever run (#214: a Full-mode view whose pending version is gone stops
+    /// maintaining its targets silently — `live_begin` hands every later round to the version in
+    /// flight, and with no version and an empty buffer the view has nothing left to do).
     fn on_build_done(&mut self, done: BuildDone) {
-        if let Some(s) = self.slots.iter_mut().find(|s| s.def_id == done.def_id) {
-            if let Some(n) = s.next.as_mut() {
-                if n.generation == done.generation {
-                    n.done = Some(done.result);
-                    self.first_dirty.get_or_insert_with(Instant::now);
-                }
+        let Some(i) = self.slots.iter().position(|s| s.def_id == done.def_id) else {
+            debug!(
+                def_id = done.def_id,
+                generation = done.generation,
+                "a build report arrived for no slot: its definition is gone"
+            );
+            return;
+        };
+        match self.slots[i].next.as_mut() {
+            Some(n) if n.generation == done.generation => {
+                n.done = Some(done.result);
+                self.first_dirty.get_or_insert_with(Instant::now);
             }
+            Some(n) => debug!(
+                view = %n.name,
+                generation = done.generation,
+                pending = n.generation,
+                "a build report arrived for a version that is no longer the pending one"
+            ),
+            None => warn!(
+                view = %self.slots[i].name,
+                generation = done.generation,
+                "a build report arrived with no pending version: no finish_next will run for it"
+            ),
         }
     }
 
@@ -7087,6 +7111,7 @@ impl Engine {
             });
         if has_reads && !self.fence().await {
             // Not visible yet: everything stays buffered for the next flush.
+            debug!("the fence is closed: this flush runs no build finish, no refresh and no retry");
             self.first_dirty = Some(Instant::now());
         } else {
             for (id, freeze) in ready {
@@ -7697,6 +7722,17 @@ impl Engine {
                 return;
             }
         };
+        debug!(
+            view = %n.name,
+            generation = n.generation,
+            targets = %n.targets.join(","),
+            swapped = %n.swapped.clone().into_iter().collect::<Vec<_>>().join(","),
+            failed = failed.len(),
+            partial = n.partial,
+            rebuilding = n.dirty.rebuild,
+            all = n.dirty.all,
+            "finishing a build"
+        );
         let log = n.dirty.cache.install(cache);
         accumulate::drain(&n.plan, &mut n.dirty, log);
         n.swapped.extend(swapped);
@@ -7815,6 +7851,11 @@ impl Engine {
                     n.since = since;
                 }
                 n.dirty.merge(dirty);
+                debug!(
+                    view = %n.name,
+                    generation = n.generation,
+                    "the swap runs off the loop: the version stays the pending one until the swap task reports"
+                );
                 self.slots[i].next = Some(n);
                 return;
             }
@@ -8229,6 +8270,16 @@ impl Engine {
                 || !dirty.units.is_empty()
                 || !dirty.partial.iter().all(UnitSet::is_empty)
                 || dirty.all;
+            debug!(
+                view = %name,
+                lagging = %lagging.join(","),
+                behind = %behind.join(","),
+                rebuild = dirty.rebuild,
+                all = dirty.all,
+                units = dirty.units.len(),
+                carries,
+                "no target of this round answers writes: the changes become owed sets"
+            );
             if carries {
                 let floor = l
                     .since
@@ -8300,6 +8351,15 @@ impl Engine {
             // with backoff) rebuilds instead.
             let live_since = l.since.clone();
             if let Some(n) = s.next.as_mut() {
+                // The round that will answer this buffer is the build in flight: `finish_next`
+                // gives its buffered changes to the new live version. Nothing else may rebuild.
+                debug!(
+                    view = %name,
+                    generation = n.generation,
+                    done = n.done.is_some(),
+                    swapping = n.swapping,
+                    "a build is in flight: this round's changes wait for it"
+                );
                 n.dirty.all = true;
                 if let Some(p) = live_since {
                     n.since.get_or_insert(p);
@@ -8984,10 +9044,20 @@ impl Engine {
                     if self.target_is_pg(&t) {
                         let class = target::WriteErr::classify(&e);
                         if self.metrics.set_target_down(&t, true, class.as_str()) {
+                            // The phrase the operator greps for (and the chaos suite's needles):
+                            // the link condition of THIS error, in the driver's own vocabulary,
+                            // next to the driver's own words. The counter's label stays the class
+                            // `classify` decided — the ruling keeps the two apart.
+                            let link = target::WriteErr::link_words(&e);
+                            let edge = if link.is_empty() {
+                                format!("last error class {class:?}")
+                            } else {
+                                format!("{link}, last error class {class:?}")
+                            };
                             warn!(view = %name, target = %t, failures = g.failures,
                                   class = class.as_str(),
-                                  "target is down: no write reached it \
-                                   (last error class {class:?}: {e:#}); its changes stay buffered \
+                                  "target is down: no write reached it ({edge}: {e:#}); \
+                                   its changes stay buffered \
                                    and its catch-up is retried at the connect backoff \
                                    (lazyview_target_down back to 1)");
                         }
