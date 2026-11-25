@@ -21,7 +21,8 @@
 //! `common::servers()` (unset ⇒ one visible `SKIP` line and a pass, which is why the proof runs
 //! name a flavour). Every fact line goes to the real **stderr**, past the harness's stdout
 //! capture, so the decoded image is in the log of a GREEN run:
-//! `bash tmp/lvs-suite.sh generated_facts <out> mariadb114` (and `mysql84`).
+//! `LAZYVIEW_TEST_DSNS="$(scripts/test-servers.sh dsns mariadb114)" cargo test --locked --test
+//! generated_facts` (and `mysql84`).
 
 mod common;
 
@@ -58,7 +59,7 @@ async fn generated_row_image_facts() {
     let Some(servers) = common::servers() else {
         common::skip_scenario(
             TEST,
-            "LAZYVIEW_TEST_DSNS is not set (run it through tmp/lvs-suite.sh <flavour>)",
+            "LAZYVIEW_TEST_DSNS is not set (run: LAZYVIEW_TEST_DSNS=\"$(scripts/test-servers.sh dsns <flavor>)\" cargo test --locked --test generated_facts)",
         );
         return;
     };

@@ -11,7 +11,11 @@
 #                                      mariadb1011:34942, as the chaos target), named by
 #                                      LAZYVIEW_TEST_SOAK_CONTAINERS (F7: only lvtmp-soak-* are
 #                                      ever stopped/started). The lock is taken around the
-#                                      pre-flight only, never around the multi-hour run.
+#                                      pre-flight only, never around the multi-hour run. It
+#                                      refuses to start while LAZYVIEW_TEST_SOAK_MINUTES is set
+#                                      (#366): in tests/soak.rs that variable overrides the hours
+#                                      argument, so a short inherited value would run a few
+#                                      minutes and still print ALL_OK.
 #
 # Both run `cargo test --locked --test soak -- --test-threads=1 <filter>` (through the binary
 # cargo built, so no build lock is held while tests run) on the harness's own servers — the DSN
@@ -23,8 +27,8 @@
 # LAZYVIEW_TEST_STRICT=soak_ (a skipped soak is a failure, as in CI's soak jobs). The build
 # goes through LV_SOAK_CARGO_RUNNER when set (a tmp/lvs-cargo.sh-shaped runner,
 # <dir> <target> <log> <cargo args...>) and otherwise under the build lock. Every run writes
-# its log, summary.txt and DONE (ALL_OK / FAILED <check>, the lvs-suite.sh shape lv-super reads
-# one line from) into tmp/out/lvs-soak/runs/<utc>-<mode>[-<flavor>]/; the harness writes
+# its log, summary.txt and DONE (ALL_OK / FAILED <check>, the one-line verdict lv-super reads
+# from it) into tmp/out/lvs-soak/runs/<utc>-<mode>[-<flavor>]/; the harness writes
 # report.md/report.json/samples.csv into tmp/out/lvs-soak/runs/<utc>/ of the crate tree (§4)
 # and the script prints that report path. Exits non-zero on failure.
 #
@@ -46,7 +50,7 @@ port_up() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 # The soak test binary: cargo builds it under the build lock (or the host's cargo runner, which
 # holds its own); the run then executes the binary with the same libtest args cargo test would
-# pass, so the build lock is never held while tests run (as lvs-suite.sh runs prebuilt binaries).
+# pass, so the build lock is never held while tests run: building and running are two steps.
 build_soak() { # <run-dir>
   local run=$1 bin
   local log=$run/soak-build.log
@@ -87,8 +91,9 @@ check_containers() { # <containers>
   done
 }
 
-# Writes DONE/summary the way lvs-suite.sh does, echoes "<run> rc=<rc> <DONE>" plus the harness's
-# report path, and exits: 0 green, 1 failed (2 got its die() for usage/environment errors).
+# Writes the run's DONE (one verdict on one line) and summary.txt, echoes
+# "<run> rc=<rc> <DONE>" plus the harness's report path, and exits: 0 green, 1 failed (2 got its
+# die() for usage/environment errors).
 # Green is the libtest summary, not the "test <name> ... ok" line: --nocapture interleaves the
 # test's own output between the "test <name> ... " prefix and its "ok", so that line is never
 # one line here. The proof a skipped soak is not a pass is LAZYVIEW_TEST_STRICT=soak_ (the skip
@@ -151,6 +156,13 @@ long() {
   case $hours in (''|*[!0-9]*) die "usage: soak.sh long [hours 1..72] (default 48)" ;; esac
   if [ "$hours" -lt 1 ] || [ "$hours" -gt 72 ]; then
     die "refused: hours must be 1..72 (got $hours)"
+  fi
+  # The hours argument is the contract of the release gate. tests/soak.rs:106 makes an inherited
+  # LAZYVIEW_TEST_SOAK_MINUTES override soak_hours()*60, and finish() decides DONE from rc and the
+  # test-result line, never from the hours asked for: an inherited value would run 5 minutes and
+  # print ALL_OK. Refuse instead (#366); the seeded replay drill calls cargo test directly.
+  if [ -n "${LAZYVIEW_TEST_SOAK_MINUTES:-}" ]; then
+    die "refused: LAZYVIEW_TEST_SOAK_MINUTES=$LAZYVIEW_TEST_SOAK_MINUTES is set and would override the hours argument (tests/soak.rs:106) — unset it to run the long soak"
   fi
   containers=${LAZYVIEW_TEST_SOAK_CONTAINERS-source=lvtmp-soak-1,target=lvtmp-soak-2}
   # the source flavor only (D1): scenario() runs one soak per DSN flavor and the chaos

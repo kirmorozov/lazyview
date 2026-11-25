@@ -272,7 +272,8 @@ impl Report {
             .collect()
     }
 
-    /// `ALL_OK` / `FAILED <check>` — the one-line `DONE` style of `tmp/lvs-suite.sh`.
+    /// `ALL_OK` / `FAILED <check>` — one verdict on one line, the style of the `DONE` file a
+    /// run gets from `scripts/soak.sh` at `tmp/out/lvs-soak/runs/<run>/DONE`.
     pub fn done_line(&self) -> String {
         match self.failed().first() {
             None => "ALL_OK".to_string(),
