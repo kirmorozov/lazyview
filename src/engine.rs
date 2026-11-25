@@ -4684,8 +4684,30 @@ impl Engine {
             } else if gtid.is_some() && self.xa_gap_no_gtid_dump {
                 gtid = None;
             }
+            // A fourth condition, MariaDB's own: the server can only *locate* a dump on a state
+            // that names every `domain-server` pair it has written, so a set that never saw such a
+            // pair — a writer with its own `gtid_domain_id`, a restored or multi-source history —
+            // cannot anchor a dump at all, whatever its intervals look like. Asking anyway is not a
+            // slower path but a dead connect (`Could not find GTID state requested by slave in any
+            // binlog files`), which the run reports as a lost position; the file/pos dump asks for
+            // nothing the server has to recognize, so that is the resume that stands. (Cost note:
+            // the same one status read per connect attempt as the purged check above, on the
+            // connect path only.)
+            if gtid.is_some() && self.flavor == Flavor::MariaDb {
+                let names_every_pair = match binlog::gtid_state(&mut self.src).await {
+                    Ok(st) => source::maria::dump_state_covers(
+                        st.binlog_state.as_deref().unwrap_or(""),
+                        gtid.as_deref().unwrap_or(""),
+                    ),
+                    // Cannot ask, cannot anchor: a state checked against nothing is no check.
+                    Err(_) => false,
+                };
+                if !names_every_pair {
+                    gtid = None;
+                }
+            }
             self.stream_by_gtid = gtid.is_some();
-            // Which of the two anchors this round got, in the log: the three conditions above can
+            // Which of the two anchors this round got, in the log: the four conditions above can
             // each hold a run back to file/pos for the whole run, and the difference shows up to
             // the operator only as a resume that takes longer or rebuilds more than it should. It
             // costs one line per connect (and is what a resume-by-GTID test can assert on).
