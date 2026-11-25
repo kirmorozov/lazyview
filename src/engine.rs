@@ -1911,13 +1911,19 @@ async fn run_lock_beat<D: LockBeat + Send + 'static, F: WriteFence>(
     mut stop: watch::Receiver<bool>,
 ) {
     let uncertain_after = 2 * heartbeat;
-    let mut last_ok = Instant::now();
+    // The loop's own clock is `tokio::time`'s, not `std`'s, because the two windows below and the
+    // sleeps that bound them must be measured by the same clock (#375): with a `std::time::Instant`
+    // here, the beats' progress depended on the runner's scheduler as well as on the beats, and a
+    // loaded CI runner could stretch the wall time of one unanswered beat past `uncertain_after`
+    // and close the gates on a single blip. A paused clock (the tests) now moves this only when a
+    // beat period passes; outside one, `tokio::time::Instant` is the very instant `std` reads.
+    let mut last_ok = tokio::time::Instant::now();
     let mut fencing: Option<JoinHandle<usize>> = None;
     loop {
         match d.beat().await {
             Ok(Beat::Held) => {
                 metrics.leader_beat_ok();
-                last_ok = Instant::now();
+                last_ok = tokio::time::Instant::now();
                 publish_leader(&state, LeaderState::Active);
             }
             Ok(Beat::Taken(why)) => {
@@ -1945,7 +1951,7 @@ async fn run_lock_beat<D: LockBeat + Send + 'static, F: WriteFence>(
                 match tokio::time::timeout(uncertain_after, d.rejoin()).await {
                     Ok(Ok(())) => {
                         metrics.leader_beat_ok();
-                        last_ok = Instant::now();
+                        last_ok = tokio::time::Instant::now();
                         publish_leader(&state, LeaderState::Active);
                         info!("leadership lock: session re-opened, the lock and epoch confirmed; still the active instance");
                     }
@@ -10191,6 +10197,14 @@ mod lock_task_tests {
     /// Runs the lock task over a script and reports what it left behind. The task ends by itself
     /// when it fences, and with the script otherwise (the driver closes the stop channel), so a
     /// run that needs neither would hang and fails on the bound below instead.
+    ///
+    /// The runtime's clock starts paused (#375), which is what makes a script mean what it says:
+    /// every `sleep(heartbeat)` in [`run_lock_beat`] advances the clock by exactly one period and
+    /// costs no wall time, so `last_ok.elapsed()` can only ever be a whole number of periods and
+    /// one `Script::Lost` can never be measured as two unanswered beats however loaded the runner
+    /// is. The 5 s bound below is virtual time on that clock, so a run that never ends fails on
+    /// it rather than hanging. `tokio`'s `test-util` (Cargo.toml's `[dev-dependencies]`) is what
+    /// the paused clock needs; it reaches no release build.
     fn drive(beats: &[Script], rejoins: &[Rejoin]) -> Run {
         let (stop_tx, stop_rx) = watch::channel(false);
         let (beats_done, rejoins_done) =
@@ -10209,6 +10223,7 @@ mod lock_task_tests {
         let published = Arc::new(std::sync::Mutex::new(Vec::new()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .start_paused(true)
             .build()
             .unwrap();
         let ended = rt
@@ -10262,6 +10277,36 @@ mod lock_task_tests {
             fences: stops.load(Ordering::Relaxed),
             published: states,
         }
+    }
+
+    /// The guard every run above rests on: the beat loop reads a clock the script moves, not the
+    /// runner's. Five hundred periods of beat time pass in no wall time at all — the margin below
+    /// is one second of the runner's time for 2.5 s of beat time, which no busy CI runner can eat.
+    /// Drop `start_paused` from [`drive`] and this is the test that says so before a scripted
+    /// `Script::Lost` starts meaning "however long the scheduler got round in" (#375).
+    #[test]
+    fn the_beat_clock_is_the_scripts_not_the_runners() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let wall = std::time::Instant::now();
+        let (beat_time, wall_time) = rt.block_on(async {
+            let before = tokio::time::Instant::now();
+            tokio::time::sleep(500 * Duration::from_millis(5)).await;
+            (before.elapsed(), wall.elapsed())
+        });
+        assert!(
+            beat_time >= Duration::from_secs(2),
+            "the beat clock must move with the beats: {beat_time:?} of beat time, {wall_time:?} \
+             of wall time"
+        );
+        assert!(
+            wall_time < Duration::from_secs(1),
+            "{wall_time:?} of wall time for {beat_time:?} of beat time: the clock is the runner's, \
+             not the script's, and how far one beat is worth depends on how loaded the machine is"
+        );
     }
 
     /// A healthy instance: every beat answered, the state stays `Active`, the beat clock moves,
