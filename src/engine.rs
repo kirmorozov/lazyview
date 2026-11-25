@@ -607,6 +607,9 @@ struct Next {
     routine: bool,
     /// The swap runs in the background (`task`); the live version pauses until it is done.
     swapping: bool,
+    /// When a round first saw this version's task over without its report (see
+    /// [`Engine::lost_build_report`]). `None` while the report is still owed in good faith.
+    lost: Option<Instant>,
     /// As [`Version::catalog_head`], for its plan.
     catalog_head: Option<Position>,
 }
@@ -4035,6 +4038,7 @@ impl Engine {
             recent: Lookback::default(),
             routine,
             swapping: false,
+            lost: None,
             catalog_head,
         });
         self.rebuild_routes();
@@ -4857,6 +4861,16 @@ impl Engine {
                         }
                         break;
                     }
+                }
+                // A report that arrived while this round was working the queue is applied by THIS
+                // round's flush. The channel is otherwise read only in the idle select above and in
+                // `hold_for_builds`, so a round that keeps finding work to do — which is exactly
+                // what a black-holed target produces, with every flush spending its connect timeout
+                // — never asks, and a build that finished in the meantime is not applied: the slot
+                // keeps its `next`, `live_begin` defers every later rebuild to it, and the targets
+                // that answer every write freeze at the rows of the last swap (#214).
+                while let Ok(done) = build_rx.try_recv() {
+                    self.on_build_done(done);
                 }
                 // A due flush runs once the stream is drained. While a backlog keeps delivering
                 // (catch-up), it runs only every CATCH_UP_BATCH past its deadline (or at
@@ -6814,14 +6828,52 @@ impl Engine {
         }
     }
 
+    /// Applies a build's (or a background swap's) report to the version waiting for it.
+    ///
+    /// The version is found by `generation`, not by `def_id`. `start_next` bumps the counter once
+    /// per build for the whole engine, so a generation names one version ever; a definition id
+    /// does not — a slot is re-keyed when its definition is re-planned or re-created, and a report
+    /// matched only against `def_id` then finds no slot (or another one), `done` is never set, and
+    /// nothing ever asks for that report again: the version stays in flight forever, `live_begin`
+    /// defers every later rebuild to it, and the targets that answer every write keep the rows of
+    /// the last swap. Both ways the report is dropped: only the second one says so.
     fn on_build_done(&mut self, done: BuildDone) {
-        if let Some(s) = self.slots.iter_mut().find(|s| s.def_id == done.def_id) {
-            if let Some(n) = s.next.as_mut() {
-                if n.generation == done.generation {
-                    n.done = Some(done.result);
-                    self.first_dirty.get_or_insert_with(Instant::now);
+        let i = self
+            .slots
+            .iter()
+            .position(|s| s.next.as_ref().is_some_and(|n| n.generation == done.generation));
+        match i {
+            Some(i) => {
+                let slot_def = self.slots[i].def_id;
+                let n = self.slots[i].next.as_mut().unwrap();
+                let name = n.name.clone();
+                let moved = slot_def != done.def_id;
+                n.done = Some(done.result);
+                n.lost = None;
+                self.first_dirty.get_or_insert_with(Instant::now);
+                debug!(
+                    view = %name,
+                    generation = done.generation,
+                    swapping = n.swapping,
+                    def_id = done.def_id,
+                    "build report applied"
+                );
+                if moved {
+                    // The case the `def_id` lookup used to lose silently: same version, the slot
+                    // has moved on to another definition id since the build started.
+                    warn!(view = %name, generation = done.generation, def_id = done.def_id,
+                        slot_def_id = slot_def,
+                        "the build report names the definition this version started on, which \
+                         the slot no longer has; applied to the version by its generation");
                 }
             }
+            None => warn!(
+                def_id = done.def_id,
+                generation = done.generation,
+                "the build report belongs to no version in flight: nothing waits for it (its \
+                 changes were returned to the live version when the build was abandoned or the \
+                 slot was retired)"
+            ),
         }
     }
 
@@ -7100,6 +7152,20 @@ impl Engine {
             // Supervised: the live views refresh together (below), each after its swap.
             let together = self.sup.is_some();
             for i in 0..self.slots.len() {
+                // A version whose task is over but whose report never arrived would hold the slot
+                // forever: `live_begin` defers every later rebuild of the view to it, and the
+                // targets that answer every write keep the rows of the last swap (#214). Seen
+                // twice in a row, with the channel drained above, the report is not coming: the
+                // build is abandoned as a failed one, which keeps what this round buffered for the
+                // live version and schedules the rebuild.
+                if self.lost_build_report(i) {
+                    let n = self.slots[i].next.take().unwrap();
+                    warn!(view = %n.name, generation = n.generation, swapping = n.swapping,
+                        "the build report never arrived: this build is abandoned, its changes \
+                         stay buffered for the live version and the rebuild starts again");
+                    self.next_failed(i, n, anyhow!("the build report never arrived"))
+                        .await;
+                }
                 let t0 = Instant::now();
                 if self.slots[i]
                     .next
@@ -7680,6 +7746,51 @@ impl Engine {
     /// `swap_lock_wait_s`, spent in the swap task off the loop: the shared reader is never
     /// paused for one target's metadata lock (N-01, N-02).
     const LOOP_SWAP_LOCK_WAIT_S: u64 = 1;
+
+    /// A version whose build (or swap) task is over and whose report has not arrived. Not on the
+    /// first round that sees it: the report of a task that returned is already in the channel, and
+    /// the round drains that before it gets here — so what survives a drain and a second look is a
+    /// report that is really gone (the task aborted or panicked, the channel closed under it, the
+    /// version no longer the one its slot waits for). Any other state forgets the observation.
+    fn lost_build_report(&mut self, i: usize) -> bool {
+        let Some(n) = self.slots[i].next.as_mut() else {
+            return false;
+        };
+        let (lost, seen) = Self::report_is_lost(
+            n.task.is_finished(),
+            n.done.is_some(),
+            n.lost,
+            Instant::now(),
+            Self::LOST_REPORT_GRACE,
+        );
+        n.lost = seen;
+        lost
+    }
+
+    /// [`Engine::lost_build_report`]'s decision over the three facts it reads, on its own so the
+    /// state machine is testable without a build: `task_over` (the build or swap task returned),
+    /// `has_report` (its report is applied), `seen` (when a round first saw the task over without
+    /// one). Returns whether to abandon the version now, and what to remember for the next round.
+    fn report_is_lost(
+        task_over: bool,
+        has_report: bool,
+        seen: Option<Instant>,
+        now: Instant,
+        grace: Duration,
+    ) -> (bool, Option<Instant>) {
+        if has_report || !task_over {
+            return (false, None);
+        }
+        match seen {
+            Some(at) if now.saturating_duration_since(at) >= grace => (true, Some(at)),
+            Some(at) => (false, Some(at)),
+            None => (false, Some(now)),
+        }
+    }
+
+    /// How long a finished build task may have been silent before its report is called lost:
+    /// long enough that the drain of the round (and one more) has had its chance at the channel.
+    const LOST_REPORT_GRACE: Duration = Duration::from_millis(250);
 
     /// Applies changes buffered during the build to the shadow tables, swaps them in.
     async fn finish_next(&mut self, i: usize) {
@@ -10831,11 +10942,19 @@ async fn build_task(
             }
         }
     }
-    let _ = tx.send(BuildDone {
+    // The report is the only thing that ends this version: nothing else can set its `done`, so a
+    // send that fails (the engine's receiver is gone — the loop is over) is said out loud rather
+    // than swallowed, and the round that finds the task over without a report abandons the build.
+    debug!(view = %name, def_id, generation, built = result.is_ok(), "build report: sending");
+    if let Err(e) = tx.send(BuildDone {
         def_id,
         generation,
         result,
-    });
+    }) {
+        warn!(view = %name, def_id, generation, error = %e,
+            "build report lost: nothing will read it (the engine's build loop is over), so the \
+             version is left to the round that finds its task finished without a report");
+    }
 }
 
 #[cfg(test)]
@@ -11366,6 +11485,41 @@ mod tests {
             without_collate("CAST(? AS DECIMAL(10,2)) COLLATE utf8mb4_bin"),
             "CAST(? AS DECIMAL(10,2)) COLLATE utf8mb4_bin",
             "not a bound string: unchanged"
+        );
+    }
+
+    /// A build whose task is over without its report is abandoned — but only once the report has
+    /// had its chance: the round that first sees it arms, a second look inside the grace only
+    /// watches, and any sign of life (the task running, the report applied) forgets the observation
+    /// (#214: a version waiting for a report that will never come freezes the targets that answer).
+    #[test]
+    fn a_build_report_is_lost_only_after_the_grace_and_only_while_nothing_comes() {
+        let t0 = Instant::now();
+        let grace = Duration::from_millis(250);
+        assert_eq!(
+            Engine::report_is_lost(false, false, Some(t0), t0, grace),
+            (false, None),
+            "a build that is still running is not lost, however long a round has been watching it"
+        );
+        assert_eq!(
+            Engine::report_is_lost(true, true, Some(t0), t0 + grace, grace),
+            (false, None),
+            "the report arrived: the observation is forgotten"
+        );
+        assert_eq!(
+            Engine::report_is_lost(true, false, None, t0, grace),
+            (false, Some(t0)),
+            "the round that first sees it only starts watching: the report may still be in the channel"
+        );
+        assert_eq!(
+            Engine::report_is_lost(true, false, Some(t0), t0 + Duration::from_millis(100), grace),
+            (false, Some(t0)),
+            "one drain has had its chance, not two"
+        );
+        assert_eq!(
+            Engine::report_is_lost(true, false, Some(t0), t0 + grace, grace),
+            (true, Some(t0)),
+            "a task over and silent past the grace reports nothing: abandon the version"
         );
     }
 
