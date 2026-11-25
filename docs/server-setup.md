@@ -131,11 +131,14 @@ views that read the table are refreshed from the source instead, which is what
 an incremental view does when it cannot attribute a change to units: where the
 images that did arrive still name the unit keys of every route the view has on
 the table, only the units that event touched are read back; otherwise the whole
-view is. Nothing is rebuilt, and a view is never left `ready` holding values
-read from a shifted image. Rows of a table no view reads yet are kept across a
-prepared XA transaction only while their images are full, so a view defined
-inside that window is refreshed from the source rather than fed compacted
-values.
+view is. Those are the two answers a refused event gets, and neither of them
+rebuilds a view; a view is never left `ready` holding values read from a
+shifted image. Rows of a table no view reads yet are kept across a prepared XA
+transaction only while their images are full: a compacted image keeps nothing,
+so the table joins the ones whose rows that transaction dropped, and a view
+defined inside that window that reads such a table is rebuilt for that commit;
+its WARN names the case:
+`a view defined while this XA transaction was prepared reads a table whose rows were dropped; rebuilding it`.
 
 What to do: find the session or loader that sets `binlog_row_image` below
 `FULL` and stop it, or accept the extra refreshes — the counter going flat is
