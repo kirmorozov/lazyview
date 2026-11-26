@@ -624,28 +624,58 @@ pub async fn load_position(
     instance: &str,
     flavor: Flavor,
 ) -> Result<Option<Cursor>> {
+    Ok(load_position_row(conn, instance, flavor).await?.0)
+}
+
+/// Both halves of the resume point as the row actually holds them: the cursor [`load_position`]
+/// reads, and the `binlog_file`/`binlog_pos` the same save is meant to have written — `('', 0)` when
+/// there is no row, or nothing was ever saved in it (no real position has an empty file name, so that
+/// value matches nothing).
+///
+/// They are read apart from each other because they can disagree, and the difference is what a save
+/// has to notice. A takeover's row is inserted by `coord`'s `bump_epoch` with the two columns empty
+/// and only the epoch filled; a run that seeds its "what the row holds" from the position it
+/// *started* at instead of the one the columns hold concludes the columns are current and never
+/// writes them — which leaves the row every operator's first query reads (`SELECT * FROM
+/// _lazyview_status`) silent about where its run began, and leaves a row with no cursor text with no
+/// position at all for the fallback above to read. Red on CI run 45670984231 as
+/// `lifecycle_bootstrap_and_live_definitions` waiting 60 s for a `binlog_file <> ''` row.
+pub async fn load_position_row(
+    conn: &mut Conn,
+    instance: &str,
+    flavor: Flavor,
+) -> Result<(Option<Cursor>, crate::binlog::Position)> {
     let row: Option<(String, u64, Option<String>)> = conn
         .exec_first(
             "SELECT `binlog_file`, `binlog_pos`, `binlog_cursor` FROM `_lazyview_status` WHERE `instance_id` = ?",
             (instance,),
         )
         .await?;
+    let nothing = crate::binlog::Position {
+        file: String::new(),
+        pos: 0,
+    };
     let Some((file, pos, text)) = row else {
-        return Ok(None);
+        return Ok((None, nothing));
     };
     // A NULL cursor (a status row claimed but never saved, or one from before the cursor existed)
     // is "no cursor yet" — the same reading the pre-cursor empty text had; the file/pos columns
     // below carry it.
     let text = text.unwrap_or_default();
     if !text.is_empty() {
-        return flavor.parse_cursor(&text).map(Some).with_context(|| {
+        let cursor = flavor.parse_cursor(&text).with_context(|| {
             format!("the saved position {text:?} is no cursor this source speaks")
-        });
+        })?;
+        return Ok((Some(cursor), crate::binlog::Position { file, pos }));
     }
     if file.is_empty() {
-        return Ok(None);
+        return Ok((None, nothing));
     }
-    Ok(Some(Cursor::from_parts(flavor, file, pos)))
+    let at = crate::binlog::Position {
+        file: file.clone(),
+        pos,
+    };
+    Ok((Some(Cursor::from_parts(flavor, file, pos)), at))
 }
 
 /// Identity of the server the saved position belongs to (see `engine::server_identity`).

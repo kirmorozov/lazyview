@@ -2559,7 +2559,8 @@ impl Engine {
             return Ok(Some((e, None)));
         }
 
-        let stored = meta::load_position(&mut e.meta, &e.cfg.instance_id, e.flavor).await?;
+        let (stored, row_at) =
+            meta::load_position_row(&mut e.meta, &e.cfg.instance_id, e.flavor).await?;
         let mut rebuild_all =
             matches!(e.cfg.start_mode, StartMode::Rebuild | StartMode::Once) || stored.is_none();
         let mut start = match &stored {
@@ -2699,12 +2700,15 @@ impl Engine {
         e.executed_text = None;
         e.executed_dirty = true;
         // The status row already holds this cursor: `persisted` starts from it, so a save held
-        // below the boundary keeps the set the row carries instead of losing it. The two
-        // pre-cursor columns are taken to hold the same position, so the first save that moves it
-        // writes them (a start cannot tell what an older build left there, and writing it again is
-        // a 60-byte statement).
+        // below the boundary keeps the set the row carries instead of losing it. The two pre-cursor
+        // columns start from what the ROW says they hold, not from `start`: a takeover's row is
+        // inserted with them empty (`coord`'s `bump_epoch`), and a run that assumed they already
+        // named its own start concluded on its first flush that they were current and wrote them
+        // again never — leaving the row every operator's first query reads silent about where the run
+        // began, which is what `lifecycle_bootstrap_and_live_definitions` waits 60 s for. `('', 0)`
+        // is no real position, so the first save moves them.
         e.persisted = start.clone();
-        e.persisted_at = start.to_position();
+        e.persisted_at = row_at;
         e.boundary = start.clone();
         // Read the definitions only now that `start` is fixed: a definition committed while the engine
         // starts is then in this snapshot, in the stream from `start`, or both (reloading an unchanged
