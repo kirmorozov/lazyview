@@ -1163,12 +1163,30 @@ struct Engine {
     persisted_at: Position,
     last_persist: Instant,
     /// When the last **cursor** write (the one that also writes `binlog_cursor`, and so the one
-    /// [`meta::save_position`] reads back) finished, and how long it took on this link: the bound on
-    /// the next one is ten times that duration.
-    last_set_write: Option<(Instant, Duration)>,
-    /// Write the cursor column at the next save whatever the bound says: set where a resume is about
-    /// to be read from the row (a source switch, a rejoin after the leadership gate closed; a clean
-    /// stop arrives through `force`).
+    /// [`meta::save_position`] reads back) finished, how long it took on this link, and how many
+    /// bytes it put on it: the bound on the next one is ten times that duration, and its size is
+    /// one of the two measurements the link's cost per byte is read from.
+    last_set_write: Option<(Instant, Duration, usize)>,
+    /// The same for the fixed-size `binlog_file`/`binlog_pos` save ([`meta::save_position_at`]), the
+    /// one the flush loop sends every interval: it is the measurement that knows what the meta link
+    /// costs *now*, which is what a cursor write is priced with (see
+    /// [`Self::set_write_affordable`]).
+    last_cheap_write: Option<(Instant, Duration, usize)>,
+    /// The source server's identity as this run read it (`@@server_uuid`, or MariaDB's
+    /// `server_id:gtid_domain_id`): written next to every position save, so the row says which
+    /// server its `binlog_file`/`binlog_pos` are exact on. Re-read when the source link is rebuilt
+    /// onto another node. See [`meta::save_position_at`] and the start's preference for the pair.
+    source_identity: String,
+    /// The run opened its stream on the row's `binlog_file`/`binlog_pos` because that pair is ahead
+    /// of the set the same row carries *and* this server wrote it — where a file name and an offset
+    /// mean what they said. The set the row carries is kept for the saves, but while this is set it
+    /// anchors no dump: a GTID dump starts after the state it names, and a state behind this run's
+    /// own start would redeliver exactly the transactions the preference exists to skip. Cleared when
+    /// a save has put a set at or past that position into the row.
+    pair_ahead: Option<Position>,
+    /// Write the cursor column at the next save whatever the bound or the link's price says: set
+    /// where a resume is about to be read from the row (a source switch, a rejoin after the
+    /// leadership gate closed; a clean stop arrives through `force`).
     set_write_now: bool,
     /// The cursor the run would write now is not the one the row holds, and the bound held it back:
     /// the flush loop wakes for it at the bound (see [`Self::set_write_ready`]).
@@ -2444,6 +2462,9 @@ impl Engine {
             },
             last_persist: Instant::now(),
             last_set_write: None,
+            last_cheap_write: None,
+            source_identity: String::new(),
+            pair_ahead: None,
             set_write_now: false,
             set_pending: false,
             in_txn: false,
@@ -2559,8 +2580,9 @@ impl Engine {
             return Ok(Some((e, None)));
         }
 
-        let (stored, row_at) =
-            meta::load_position_row(&mut e.meta, &e.cfg.instance_id, e.flavor).await?;
+        let row = meta::load_position_row(&mut e.meta, &e.cfg.instance_id, e.flavor).await?;
+        let stored = row.cursor;
+        let row_at = row.at;
         let mut rebuild_all =
             matches!(e.cfg.start_mode, StartMode::Rebuild | StartMode::Once) || stored.is_none();
         let mut start = match &stored {
@@ -2587,14 +2609,13 @@ impl Engine {
             Err(_) if stored.is_none() => String::new(), // nothing to check against: fresh start
             Err(e) => return Err(e).context("cannot read the source server identity"),
         };
-        let saved_identity = meta::load_identity(&mut e.meta, &e.cfg.instance_id)
-            .await?
-            .filter(|s| !s.is_empty());
+        let saved_identity = row.identity;
         // `(why, gone)`: `gone` = the saved file verifiably no longer exists on the source.
         let unusable = if rebuild_all {
             None
-        } else if let Some(saved) =
-            saved_identity.filter(|s| !identity.is_empty() && *s != identity)
+        } else if let Some(saved) = saved_identity
+            .clone()
+            .filter(|s| !identity.is_empty() && *s != identity)
         {
             // A different server (promotion, restore, rebuilt copy): the saved `file:pos`
             // means nothing here, but the GTID state can make the cursor valid on it — the
@@ -2650,7 +2671,53 @@ impl Engine {
             }
         }
         if !identity.is_empty() {
+            e.source_identity = identity.clone();
             meta::save_identity(&mut e.meta, &e.cfg.instance_id, &identity).await?;
+        }
+        // The two halves of the row are written apart — the `binlog_file`/`binlog_pos` pair with every
+        // flush, the cursor's `[g=…]` set on its own bound and price — so the pair can be AHEAD of the
+        // set the same row carries. That is the shape a run leaves behind when the meta link got
+        // expensive and the set write was priced out of it, and the question it raises is which anchor
+        // the restart opens on. On the server that wrote the pair, a file name and an offset are
+        // exact: they mean the same thing to it as to the run that saved them, so the pair wins and
+        // the run does not re-read binlog it has already applied. On any other server (a promotion, a
+        // restore, a hand-written row) the set is the only anchor that travels, and the adoption rules
+        // above are what decided whether this run may start at all — so the pair is preferred ONLY
+        // when the identity the row records is the identity this run just read (ruling, lv-super
+        // 2026-11-26: "same server: file/pos is exact. After a failover: the set, as today").
+        // `LAZYVIEW_ON_MISSING_BINLOG` keeps its meaning: the pair is asked the same
+        // "does this file still exist here" question the set's position is asked, and a pair the
+        // server cannot serve is not used.
+        let mut resume = start.clone();
+        if !rebuild_all
+            && !identity.is_empty()
+            && saved_identity.as_deref() == Some(identity.as_str())
+            && !row_at.file.is_empty()
+            && row_at.pos > 0
+            && row_at > start.to_position()
+        {
+            let pair = Cursor::from_parts(e.flavor, row_at.file.clone(), row_at.pos);
+            match source::can_resume(&mut e.src, &pair).await {
+                Ok(true) => {
+                    info!(
+                        "the row's file/pos pair {row_at} is ahead of the set the same row carries \
+                         ({start}); this server ({identity}) wrote it, so the stream opens there and \
+                         the set stays for the saves"
+                    );
+                    resume = pair;
+                    e.pair_ahead = Some(row_at.clone());
+                }
+                // Cannot ask, cannot prefer: a position no one verified is a position to skip, and
+                // the set's own anchor was already checked above.
+                Ok(false) => warn!(
+                    "the row's file/pos pair {row_at} is ahead of its set, but this server no longer \
+                     has that file: the run opens on the set's anchor ({start})"
+                ),
+                Err(err) => warn!(
+                    "the row's file/pos pair {row_at} is ahead of its set, but asking this server \
+                     for it failed ({err:#}): the run opens on the set's anchor ({start})"
+                ),
+            }
         }
         // Seed the consumed set (ruling 6: once per run, never on the event path). A resumed
         // cursor brings its own: it was only ever persisted at the stream's own boundary, so
@@ -2709,7 +2776,9 @@ impl Engine {
         // is no real position, so the first save moves them.
         e.persisted = start.clone();
         e.persisted_at = row_at;
-        e.boundary = start.clone();
+        // The stream opens at `resume`: the row's cursor, or that cursor's position replaced by the
+        // row's own `binlog_file`/`binlog_pos` when this server wrote them and they are ahead.
+        e.boundary = resume.clone();
         // Read the definitions only now that `start` is fixed: a definition committed while the engine
         // starts is then in this snapshot, in the stream from `start`, or both (reloading an unchanged
         // definition is a no-op). Read before the position, a commit in between was in neither and its
@@ -3212,6 +3281,20 @@ impl Engine {
         match connect_source(&self.query_opts, self.cfg.lock_wait_s, &self.metrics).await {
             Ok(c) => {
                 self.src = c;
+                // The new connection may be a different node (a proxy moved its endpoint, a promotion
+                // answered): the identity that travels with every position save must be the server
+                // this connection is actually on, or the row would record a pair as written by the
+                // node that is gone — and a start's preference for that pair is only sound on the
+                // server that wrote it. Failing to read it is not a reason to stop the heal: the row
+                // keeps the identity it had, which the start then reads as "not this server" and
+                // falls back to the set — the safe side of the rule.
+                match server_identity(&mut self.src, self.flavor, None, 1).await {
+                    Ok(id) => self.source_identity = id,
+                    Err(err) => warn!(
+                        "the rebuilt source link could not name its server ({err:#}): the saved \
+                         position keeps the identity it had"
+                    ),
+                }
                 // The row is what a start on the *new* node reads, so the cursor it holds must be
                 // this run's newest word, not one the bound held back: the file/pos pair may name a
                 // position the old node had and the new one does not.
@@ -4764,6 +4847,18 @@ impl Engine {
                     held_back_pair = Some(pair);
                     gtid = None;
                 }
+            }
+            // A fifth condition is the start's own preference (see the start's preference for the
+            // pair): when the run opened on the row's `binlog_file`/`binlog_pos` because this server
+            // wrote them and they are ahead of the set the row carries, that set cannot anchor the
+            // dump — a GTID dump starts *after* the state it names, so asking with a state behind
+            // this run's own position would redeliver exactly the transactions the preference exists
+            // to skip. The pair is the anchor until a save has carried the set up to it.
+            if gtid.is_some() && self.pair_ahead.is_some() {
+                held_back = Some(
+                    "the run opened on the row's file/pos pair, which this server wrote and the set has not reached",
+                );
+                gtid = None;
             }
             self.stream_by_gtid = gtid.is_some();
             // Which of the two anchors this round got, and when the run had a set to offer and did
@@ -7001,11 +7096,17 @@ impl Engine {
             .then(|| self.last_persist + self.cfg.position_persist_interval);
         // A held-back cursor rewrite wakes the loop at its own bound (ten times the duration the
         // last one measured), not on the persist interval: the two halves of the row are on
-        // different clocks precisely because they cost different amounts.
-        let set_wake = self.set_pending.then(|| {
-            self.last_set_write
-                .map_or(Instant::now(), |(at, _)| at + self.set_write_bound())
-        });
+        // different clocks precisely because they cost different amounts. A rewrite the *price* gate
+        // refused is not covered by a wake at all — its bound has run out, so waking at it would
+        // wake in the past and spin the loop; the persist deadline is what looks again, one interval
+        // later, at what the link costs by then.
+        let set_wake = self
+            .set_pending
+            .then(|| {
+                self.last_set_write
+                    .map_or(Instant::now(), |(at, _, _)| at + self.set_write_bound())
+            })
+            .filter(|t| *t > Instant::now());
         // A closed leadership gate holds the flush: the loop wakes at the end of the hold rather
         // than on every due change, and since `flush_due_within` reads this deadline, neither the
         // batch window nor the persist interval can re-issue a gated flush ahead of it.
@@ -9527,15 +9628,62 @@ impl Engine {
     /// minute's ceiling so that one pathological write (a link held by an admin's `FLUSH TABLES`, a
     /// toxiproxy run) cannot park the resume point for an hour.
     fn set_write_bound(&self) -> Duration {
-        10 * self
-            .last_set_write
-            .map_or(Duration::ZERO, |(_, dur)| dur.min(Duration::from_secs(60)))
+        10 * self.last_set_write.map_or(Duration::ZERO, |(_, dur, _)| {
+            dur.min(Duration::from_secs(60))
+        })
     }
 
     /// Whether the bound above has run out (no cursor written yet counts as "long ago").
     fn set_write_ready(&self) -> bool {
         self.last_set_write
-            .is_none_or(|(at, _)| at.elapsed() >= self.set_write_bound())
+            .is_none_or(|(at, _, _)| at.elapsed() >= self.set_write_bound())
+    }
+
+    /// What a statement of `bytes` would cost on the meta link **now**, from the last statement the
+    /// flush loop timed on it: the fixed-size `binlog_file`/`binlog_pos` save it sends every interval,
+    /// or the last cursor write, whichever finished more recently. Both are statements of known size
+    /// on the link a cursor write would travel, and their duration is the only clock that knows the
+    /// link's speed at this moment rather than at the moment of the last cursor write. `None` when
+    /// nothing has been timed yet — a run's very first save.
+    fn link_statement_cost(&self, bytes: usize) -> Option<Duration> {
+        let (_at, dur, size) = match (self.last_cheap_write, self.last_set_write) {
+            (Some(c), Some(s)) => {
+                if c.0 >= s.0 {
+                    c
+                } else {
+                    s
+                }
+            }
+            (Some(c), None) => c,
+            (None, Some(s)) => s,
+            (None, None) => return None,
+        };
+        if size == 0 || dur.is_zero() {
+            // A duration the clock could not see is a fast link, not an unknown one: the estimate
+            // that follows would refuse nothing, and a link too quick to measure is a link a cursor
+            // write can afford.
+            return None;
+        }
+        let ns = dur
+            .as_nanos()
+            .saturating_mul(bytes as u128)
+            .checked_div(size as u128)?;
+        Some(Duration::from_nanos(ns.min(u128::from(u64::MAX)) as u64))
+    }
+
+    /// The price gate on a mid-run cursor rewrite (lv-super's ruling of 2026-11-26, the second
+    /// condition in [`Self::persist_position`]): the rewrite goes when the size it has to carry is
+    /// something the loop can send between two flushes — one `LAZYVIEW_POSITION_PERSIST_MS` interval,
+    /// the budget the position save already works on. The bound alone is a rate limit with no
+    /// knowledge of the link; this is the price. When it refuses, the file/pos half still moves (a
+    /// fixed-size statement the same measurement says is affordable), so the run's own resume point
+    /// stays current and a start on this server opens there; and the three moments a resume is
+    /// actually read from the row write the set regardless.
+    fn set_write_affordable(&self, text_bytes: usize) -> bool {
+        match self.link_statement_cost(text_bytes) {
+            None => true,
+            Some(cost) => cost < self.cfg.position_persist_interval,
+        }
     }
 
     async fn persist_position(&mut self, force: bool) -> Result<()> {
@@ -9621,6 +9769,11 @@ impl Engine {
             None
         };
         self.persist_needed = true;
+        // The set this save carries is the stream's own word only when it was taken from the merged
+        // set at the position the reader has consumed through (`pos == boundary`, the rule of ruling 6
+        // above); a save below the boundary carries the row's set forward, which says nothing new.
+        // `pair_ahead` is cleared on the strength of that distinction and nothing else.
+        let set_from_stream = gtid.is_some() && pos == self.boundary.to_position();
         let wanted = Cursor::from_position(self.flavor, &pos).with_gtid(gtid);
         // The two halves of the row, written apart and for different reasons.
         //
@@ -9632,17 +9785,32 @@ impl Engine {
         // for. On the CI leg that fragmenting link runs one byte per 2 ms, that bill was every
         // flush and the run never caught up (run 45446296665, `chaos_both_sides`).
         //
-        // The cursor therefore follows on a bound measured on the link itself: the next rewrite
-        // waits ten times what the last one took, so it costs the link a tenth of its time — near
-        // every flush where the link is fast, rarely where it is not, with nothing to tune. What a
-        // held-back rewrite costs is a restart that re-reads the binlog its cursor has not reached
-        // yet: safe, because re-applying a change is idempotent (the rule
+        // The cursor therefore follows on two conditions, both read from the link it has to travel
+        // on. The first is a rate: the next rewrite waits ten times what the last one took, so it
+        // costs the link about a tenth of its time, near every flush where the link is fast and
+        // rarely where it is not, with nothing to tune. The second is a price ([`Self::
+        // set_write_affordable`], lv-super's ruling of 2026-11-26): what a statement of this size
+        // would cost on that link *as measured since*, from the file/pos save the loop sends every
+        // interval — and a rewrite the loop could not afford between two flushes is not sent at all.
+        // The rate alone was not enough: CI's `chaos_both_sides` (four flavors, seed 930018769523)
+        // starts unfragmented, so its first rewrite was cheap, and the toxics that arrived afterwards
+        // made the *next* one — allowed by the expired bound and by a ceiling on the last write's
+        // cost, both of which only remember the fast link — a 147-second statement the apply loop
+        // waited for. A price read from the link has no such memory.
+        //
+        // What a held-back rewrite costs is a restart that re-reads the binlog its cursor has not
+        // reached yet: safe, because re-applying a change is idempotent (the rule
         // `lifecycle_resumes_from_a_cursor_behind_the_applied_position` exists to prove, not to
-        // assert), and the same kind of lag `LAZYVIEW_POSITION_PERSIST_MS` already accepts. The
-        // three moments a resume is actually read from the row — a clean stop, a source switch, a
-        // rejoin after the leadership gate closed — write it at once, whatever the bound says.
-        let cursor_due = wanted.to_string() != self.persisted.to_string()
-            && (force || self.set_write_now || self.set_write_ready());
+        // assert), and cheap when the run resumes on this same server, where the row's own
+        // `binlog_file`/`binlog_pos` pair — which the loop keeps current whatever the price says — is
+        // the anchor the start prefers (see the start's preference for the pair). The three moments a
+        // resume is actually read from the row — a clean stop, a source switch, a rejoin after the
+        // leadership gate closed — write it at once, whatever the bound and the price say.
+        let wanted_text = wanted.to_string();
+        let cursor_due = wanted_text != self.persisted.to_string()
+            && (force
+                || self.set_write_now
+                || (self.set_write_ready() && self.set_write_affordable(wanted_text.len())));
         if cursor_due {
             // The save is the engine's own word that the row holds this cursor byte for byte:
             // `meta::save_position` refuses a cursor the column cannot hold whole with an error
@@ -9658,28 +9826,53 @@ impl Engine {
                 &self.cfg.instance_id,
                 &wanted,
                 self.leader.epoch,
+                &self.source_identity,
             )
             .await?;
-            // Measured on the real link, which is the only clock the bound can use.
-            self.last_set_write = Some((Instant::now(), began.elapsed()));
+            // Measured on the real link, which is the only clock the bound and the price can use.
+            self.last_set_write = Some((Instant::now(), began.elapsed(), wanted_text.len()));
             self.set_write_now = false;
             // What the row holds, which `save_position` has just measured: `persisted`'s set is the
             // one later saves carry forward.
             self.persisted = saved;
             self.persisted_at = pos.clone();
+            // The row now carries a set the *stream* filled, at a position past the one this run
+            // opened on: the dump may anchor on it again (see [`Self::pair_ahead`]). Until the stream
+            // has delivered something past that position, the set the row holds is the one the
+            // previous run left, and it is behind this run's own start — anchoring a dump on it would
+            // ask the server for the transactions this preference exists not to re-read.
+            if set_from_stream
+                && self.persisted.gtid().is_some()
+                && self
+                    .pair_ahead
+                    .as_ref()
+                    .is_some_and(|p| self.boundary.to_position() > *p)
+            {
+                self.pair_ahead = None;
+            }
         } else if pos != self.persisted_at {
+            // The cheap half: it is what a start reads when the set is behind, and what the price of
+            // a cursor rewrite is measured with, so it is timed as it goes (its size is known:
+            // [`meta::cheap_save_bytes`] is written next to the statement).
+            let began = Instant::now();
             meta::save_position_at(
                 &mut self.meta,
                 &self.cfg.instance_id,
                 &pos,
                 self.leader.epoch,
+                &self.source_identity,
             )
             .await?;
+            self.last_cheap_write = Some((
+                Instant::now(),
+                began.elapsed(),
+                meta::cheap_save_bytes(&pos, &self.cfg.instance_id, self.leader.epoch),
+            ));
             self.persisted_at = pos.clone();
         }
         // Held back: save again once the pending changes are applied.
         self.persist_needed = pos < self.boundary.to_position();
-        self.set_pending = wanted.to_string() != self.persisted.to_string();
+        self.set_pending = wanted_text != self.persisted.to_string();
         self.last_persist = Instant::now();
         Ok(())
     }

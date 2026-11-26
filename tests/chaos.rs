@@ -2460,20 +2460,36 @@ fn chaos_fragmented_link_catches_up_with_a_fragmented_cursor() {
         .await?;
         let mut c = db.conn().await?;
         let maria = db.flavor.starts_with("mariadb");
-        if !maria
-            && scalar(&mut c, "SELECT CAST(@@GLOBAL.gtid_mode AS CHAR)")
+        let flavor = if maria {
+            lazyview::source::Flavor::MariaDb
+        } else {
+            lazyview::source::Flavor::MySql
+        };
+        // What this leg prices is the cost of a save on the link the apply loop shares with it, and
+        // the expensive saves are the cursor's, because its size is the size of the consumed GTID
+        // set. A `gtid_mode = OFF` server — `mysql80` and `percona84`, CI's own flavors — has no such
+        // set: the injector's `SET @@SESSION.GTID_NEXT = '<uuid>:<n>'` answers `ERROR 1781 (HY000):
+        // @@SESSION.GTID_NEXT cannot be set to UUID:NUMBER when @@GLOBAL.GTID_MODE = OFF`, and no
+        // made-up set can stand in for one, because the leg asks its resume question of the server
+        // (`source::gtid_covers`). CI's `LAZYVIEW_TEST_STRICT=chaos_` refuses a skip from this binary,
+        // and it is right to: on such a server the only save the apply loop can be waiting on is the
+        // ~60-byte `binlog_file`/`binlog_pos` half — and *that* one must not throttle the reader
+        // either. So the leg runs both ways and says, in its own log, which way it ran.
+        let has_set = maria
+            || scalar(&mut c, "SELECT CAST(@@GLOBAL.gtid_mode AS CHAR)")
                 .await?
                 .as_deref()
-                != Some("ON")
-        {
-            // No GTIDs, no set, and a 60-byte cursor costs the link nothing on any speed of link:
-            // the question this leg asks has no content on such a server.
-            ctx.skip(
-                "gtid_mode is OFF on this server: there is no set to grow and no save to price",
-            );
-            eng.stop().await?;
-            return Ok(());
-        }
+                == Some("ON");
+        // What the server was already carrying before this leg wrote a line to it. On a CI leg server
+        // the suites that ran earlier in the same job leave a consumed set of tens of kilobytes, and
+        // that size — not the workload — is what a cursor write costs (it is what
+        // `chaos_both_sides_fragmented` drowned at, seed 930018769523); on a per-run server the leg
+        // starts near zero. The line is what tells those two states apart from the log alone.
+        let ambient = server_gtid_set(&mut c, maria).await?;
+        ctx.log(format!(
+            "this server's consumed set is {} bytes before this leg writes anything",
+            ambient.len()
+        ));
         exec(
             &mut c,
             "CREATE TABLE frag_noise (id INT PRIMARY KEY, pad VARCHAR(8) NOT NULL)",
@@ -2483,18 +2499,38 @@ fn chaos_fragmented_link_catches_up_with_a_fragmented_cursor() {
             .query_first("SELECT CAST(instance_id AS CHAR) FROM _lazyview_status")
             .await?
             .context("no status row to measure the cursor of")?;
-        let (groups, saved, server_bytes) =
-            fragment_gtid_stream(&mut c, &instance, maria, "frag_noise", 20_000).await?;
-        ctx.log(format!(
-            "fragmented the server's stream with {groups} transactions: the engine's saved cursor is \
-             {saved} bytes (the server's own set {server_bytes}) — the quantity every save has to \
-             carry on the meta link"
-        ));
-        ensure!(
-            saved >= 20_000,
-            "the saved cursor reached only {saved} bytes after {groups} transactions: the leg would \
-             be pricing a save anyone could afford"
-        );
+        // The row's own two halves before the link gets expensive: the cursor text (the quantity
+        // under price) and the position the cheap half holds (what a set-less run lives on).
+        let saved_row = lazyview::meta::load_position_row(&mut c, &instance, flavor).await?;
+        let row_cursor = saved_row.cursor;
+        let at0 = saved_row.at;
+        let mut saved = row_cursor.as_ref().map_or(0, |cur| cur.to_string().len());
+        if has_set {
+            // The size CI's leg was carrying: `lc_cursor_whole` read a 73,362-byte cursor back off the
+            // mysql84 leg's row. It is past the limit the cursor column used to have, and the size
+            // that turns one save into 147 s on a link that costs 2 ms a byte — the bill this leg
+            // exists to price, not a smaller one that flatters it.
+            let (groups, s, server_bytes) =
+                fragment_gtid_stream(&mut c, &instance, maria, "frag_noise", 70_000).await?;
+            saved = s;
+            ctx.log(format!(
+                "fragmented the server's stream with {groups} transactions: the engine's saved cursor is \
+                 {saved} bytes (the server's own set {server_bytes}) — the quantity every save has to \
+                 carry on the meta link"
+            ));
+            ensure!(
+                saved >= 65_536,
+                "the saved cursor reached only {saved} bytes after {groups} transactions: below the \
+                 size the CI leg was carrying, so this leg would be pricing a save anyone could afford"
+            );
+        } else {
+            ctx.log(format!(
+                "no GTIDs on this server, so there is no set to grow: this leg prices the {}-byte \
+                 file/pos save the row holds ({}) on a one-byte-per-2 ms meta link",
+                saved,
+                row_cursor.map_or_else(|| "no cursor yet".to_string(), |c| c.to_string())
+            ));
+        }
         let before = eng.snapshot();
         // One byte every 2 ms, both ways, on the link the saves ride.
         toxi.arm(
@@ -2511,7 +2547,11 @@ fn chaos_fragmented_link_catches_up_with_a_fragmented_cursor() {
         let n = run_soak_batches(&mut c, &mut wl, 10).await?;
         let pos = server_position(&mut c).await?;
         let began = std::time::Instant::now();
-        eng.wait_applied(&pos, Duration::from_secs(600))
+        // The same bound CI's `chaos_both_sides_fragmented` gives itself: 120 s. That is the bar the
+        // red was measured against, and the arithmetic it failed — a 73,338-byte set at 2 ms a byte
+        // is 147 s of one statement, so a save the loop has to wait for cannot fit inside this wait
+        // and must not have to.
+        eng.wait_applied(&pos, Duration::from_secs(120))
             .await
             .with_context(|| format!(
                 "chaos_frag_cursor: {n} transactions never applied while the meta link had to carry \
@@ -2540,24 +2580,36 @@ fn chaos_fragmented_link_catches_up_with_a_fragmented_cursor() {
         )
         .await?;
         assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_frag_cursor")?;
-        // The cursor the run holds is still its own complete word: pacing a write must never mean
-        // storing a set that does not answer for what the run consumed.
-        let back = lazyview::meta::load_position(
-            &mut c,
-            &instance,
-            if maria {
-                lazyview::source::Flavor::MariaDb
-            } else {
-                lazyview::source::Flavor::MySql
-            },
-        )
-        .await?
-        .context("the run saved no cursor")?;
-        ensure!(
-            lazyview::source::gtid_covers(&mut c, &back).await?,
-            "the cursor the run saved ({}) is not one this server covers",
-            back
-        );
+        // The cursor the run holds is still its own complete word, read after the writers stopped
+        // and the applied-wait passed: pacing a write must never mean storing a set that does not
+        // answer for what the run consumed.
+        let back = lazyview::meta::load_position(&mut c, &instance, flavor)
+            .await?
+            .context("the run saved no cursor")?;
+        if has_set {
+            ensure!(
+                lazyview::source::gtid_covers(&mut c, &back).await?,
+                "the cursor the run saved ({}) is not one this server covers",
+                back
+            );
+        } else {
+            // Nothing to carry, and so nothing to hold back: what the run owes on such a server is
+            // that its own resume point kept moving while the link cost 2 ms a byte. Read here, at
+            // convergence, with the writers stopped and the applied-wait passed.
+            ensure!(
+                back.gtid().unwrap_or_default().is_empty(),
+                "a server with `gtid_mode = OFF` saved a set in the cursor: {back}"
+            );
+            let at1 = lazyview::meta::load_position_row(&mut c, &instance, flavor)
+                .await?
+                .at;
+            ensure!(
+                at1.pos > at0.pos || (!at1.file.is_empty() && at1.file != at0.file),
+                "with no set to write, the row's own file/pos half never moved while the meta link \
+                 was sliced: {at0:?} -> {at1:?} while the source reached {pos:?} — the one save a \
+                 set-less run has is the one the apply loop waits on, and it did not run",
+            );
+        }
         eng.check_alive()?;
         eng.stop().await?;
         Ok(())

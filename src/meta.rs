@@ -624,30 +624,52 @@ pub async fn load_position(
     instance: &str,
     flavor: Flavor,
 ) -> Result<Option<Cursor>> {
-    Ok(load_position_row(conn, instance, flavor).await?.0)
+    Ok(load_position_row(conn, instance, flavor).await?.cursor)
 }
 
-/// Both halves of the resume point as the row actually holds them: the cursor [`load_position`]
-/// reads, and the `binlog_file`/`binlog_pos` the same save is meant to have written — `('', 0)` when
-/// there is no row, or nothing was ever saved in it (no real position has an empty file name, so that
-/// value matches nothing).
+/// One instance's resume point as the row actually holds it: the two halves of the position, and
+/// the identity of the server that wrote them.
 ///
-/// They are read apart from each other because they can disagree, and the difference is what a save
-/// has to notice. A takeover's row is inserted by `coord`'s `bump_epoch` with the two columns empty
-/// and only the epoch filled; a run that seeds its "what the row holds" from the position it
-/// *started* at instead of the one the columns hold concludes the columns are current and never
-/// writes them — which leaves the row every operator's first query reads (`SELECT * FROM
-/// _lazyview_status`) silent about where its run began, and leaves a row with no cursor text with no
-/// position at all for the fallback above to read. Red on CI run 45670984231 as
+/// The three are read by one statement because they are written by one statement ([`save_position`],
+/// [`save_position_at`]): a start has to know whether the `binlog_file`/`binlog_pos` it is about to
+/// prefer were written by the server it is talking to, and reading the identity in a second round
+/// trip could pair this run's columns with another run's identity.
+pub struct SavedRow {
+    /// The cursor text as [`load_position`] reads it: `None` when the column is NULL or empty (a row
+    /// a takeover only bumped, or one from before the cursor existed).
+    pub cursor: Option<Cursor>,
+    /// What the two pre-cursor columns hold — `('', 0)` when nothing was ever saved in them (no real
+    /// position has an empty file name, so that value matches nothing).
+    pub at: crate::binlog::Position,
+    /// The source server's identity as of the last position write (`@@server_uuid` on the MySQL
+    /// family, `server_id:gtid_domain_id` on MariaDB; see `engine::server_identity`). `None` on a row
+    /// no build that recorded it ever wrote — which reads as "not this server", the safe answer.
+    pub identity: Option<String>,
+}
+
+/// The resume point as the row holds it, in one read: see [`SavedRow`] for what the three fields
+/// mean and why they belong together.
+///
+/// The two position halves are read apart from each other because they can disagree, and the
+/// difference is what a start has to notice. A takeover's row is inserted by `coord`'s `bump_epoch`
+/// with the columns empty and only the epoch filled; a run that seeds its "what the row holds" from
+/// the position it *started* at instead of the one the columns hold concludes the columns are
+/// current and never writes them — which leaves the row every operator's first query reads
+/// (`SELECT * FROM _lazyview_status`) silent about where its run began, and leaves a row with no
+/// cursor text with no position at all for the fallback above to read. Red on CI run 45670984231 as
 /// `lifecycle_bootstrap_and_live_definitions` waiting 60 s for a `binlog_file <> ''` row.
+/// The other direction — the cursor behind the columns — is what a paced set write leaves on a slow
+/// link, and the reason the identity travels with them: on the server that wrote the columns a file
+/// name and an offset are exact, so a start there may open at the fresher of the two anchors.
 pub async fn load_position_row(
     conn: &mut Conn,
     instance: &str,
     flavor: Flavor,
-) -> Result<(Option<Cursor>, crate::binlog::Position)> {
-    let row: Option<(String, u64, Option<String>)> = conn
+) -> Result<SavedRow> {
+    let row: Option<(String, u64, Option<String>, Option<String>)> = conn
         .exec_first(
-            "SELECT `binlog_file`, `binlog_pos`, `binlog_cursor` FROM `_lazyview_status` WHERE `instance_id` = ?",
+            "SELECT `binlog_file`, `binlog_pos`, `binlog_cursor`, CAST(`server_identity` AS CHAR) \
+             FROM `_lazyview_status` WHERE `instance_id` = ?",
             (instance,),
         )
         .await?;
@@ -655,8 +677,17 @@ pub async fn load_position_row(
         file: String::new(),
         pos: 0,
     };
-    let Some((file, pos, text)) = row else {
-        return Ok((None, nothing));
+    let Some((file, pos, text, identity)) = row else {
+        return Ok(SavedRow {
+            cursor: None,
+            at: nothing,
+            identity: None,
+        });
+    };
+    let identity = identity.filter(|s| !s.is_empty());
+    let at = crate::binlog::Position {
+        file: file.clone(),
+        pos,
     };
     // A NULL cursor (a status row claimed but never saved, or one from before the cursor existed)
     // is "no cursor yet" — the same reading the pre-cursor empty text had; the file/pos columns
@@ -666,16 +697,24 @@ pub async fn load_position_row(
         let cursor = flavor.parse_cursor(&text).with_context(|| {
             format!("the saved position {text:?} is no cursor this source speaks")
         })?;
-        return Ok((Some(cursor), crate::binlog::Position { file, pos }));
+        return Ok(SavedRow {
+            cursor: Some(cursor),
+            at,
+            identity,
+        });
     }
     if file.is_empty() {
-        return Ok((None, nothing));
+        return Ok(SavedRow {
+            cursor: None,
+            at: nothing,
+            identity,
+        });
     }
-    let at = crate::binlog::Position {
-        file: file.clone(),
-        pos,
-    };
-    Ok((Some(Cursor::from_parts(flavor, file, pos)), at))
+    Ok(SavedRow {
+        cursor: Some(Cursor::from_parts(flavor, file, pos)),
+        at,
+        identity,
+    })
 }
 
 /// Identity of the server the saved position belongs to (see `engine::server_identity`).
@@ -747,15 +786,32 @@ fn cursor_too_long(text_len: usize, gtid: Option<&str>) -> anyhow::Error {
 /// columns themselves stay the truth a start can fall back to (a NULL or absent cursor reads them),
 /// and they are written with the same `WHERE epoch = ?` as the full save: a write that changed
 /// nothing while the position did advance means another instance holds the row.
+/// The size of the statement [`save_position_at`] puts on the wire, to within the packet header:
+/// its fixed text plus the four parameters. The engine divides a measured duration of that save by
+/// this number to get the meta link's cost per byte, and prices a cursor write with it ([`Cursor`]
+/// text is `file:pos[g=…]` ASCII, so its bytes and its characters are the same) — which is why the
+/// estimate is written next to the statement it estimates rather than guessed at the call site.
+pub fn cheap_save_bytes(at: &crate::binlog::Position, instance: &str, epoch: u64) -> usize {
+    const FIXED: usize = "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ? \
+                          WHERE `instance_id` = ? AND `epoch` = ?"
+        .len();
+    FIXED + at.file.len() + at.pos.to_string().len() + instance.len() + epoch.to_string().len() + 16
+}
+
 pub async fn save_position_at(
     conn: &mut Conn,
     instance: &str,
     at: &crate::binlog::Position,
     epoch: u64,
+    identity: &str,
 ) -> Result<()> {
+    // `server_identity` moves with the position, in the same statement, because the pair's value at
+    // a start is exactly as good as the server that wrote it: a resume may prefer these columns over
+    // a cursor set behind them only when they name this server (see `SavedRow::identity`). An empty
+    // identity (a start that could not read one) keeps what the row has rather than erasing it.
     conn.exec_drop(
-        "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ? WHERE `instance_id` = ? AND `epoch` = ?",
-        (&at.file, at.pos, instance, epoch),
+        "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ?, `server_identity` = COALESCE(NULLIF(?, ''), `server_identity`) WHERE `instance_id` = ? AND `epoch` = ?",
+        (&at.file, at.pos, identity, instance, epoch),
     )
     .await?;
     if conn.affected_rows() == 0 {
@@ -793,17 +849,20 @@ pub async fn save_position(
     instance: &str,
     c: &Cursor,
     epoch: u64,
+    identity: &str,
 ) -> Result<Cursor> {
     // `binlog_cursor` is the value a start reads; the two pre-cursor columns stay filled through
-    // the bump, so an older build (and the harness) still finds the position there.
+    // the bump, so an older build (and the harness) still finds the position there. The identity
+    // travels with them for the reason given at [`save_position_at`]: the columns are only a
+    // start's preferred anchor on the server that wrote them.
     let at = c.to_position();
     let text = c.to_string();
     if !cursor_fits(text.len()) {
         return Err(cursor_too_long(text.len(), c.gtid()));
     }
     conn.exec_drop(
-        "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ?, `binlog_cursor` = ? WHERE `instance_id` = ? AND `epoch` = ?",
-        (&at.file, at.pos, &text, instance, epoch),
+        "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ?, `binlog_cursor` = ?, `server_identity` = COALESCE(NULLIF(?, ''), `server_identity`) WHERE `instance_id` = ? AND `epoch` = ?",
+        (&at.file, at.pos, &text, identity, instance, epoch),
     )
     .await?;
     // The byte-exact round-trip, on the same read as the fencing epoch. Length, not content, is

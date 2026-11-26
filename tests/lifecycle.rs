@@ -2049,43 +2049,38 @@ fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
         // only way this server allows, and bring the view up to date.
         exec(&mut c, "INSERT INTO entities VALUES (13, 3, 'new')").await?;
         eng.stop().await?;
-        // Which anchor the restart may use is the server's answer, not the test's choice.
-        // `SET @slave_connect_state` names the state the dump starts *after*, and MariaDB locates a
-        // dump on such a state only when the binlog file it picks already carries every
-        // `domain-server` pair the state names (`contains_all_slave_gtid`, `sql/sql_repl.cc`): a
-        // pair the file carries and the state omits sends the dump thread hunting ever-older files
-        // until it dies with `Could not find GTID state requested by slave in any binlog files`,
-        // which is how every MariaDB leg of CI run 45446296665 went red. A run that joined this
-        // stream mid-way never saw a domain some earlier writer used, so on this server — one long
-        // lived server, shared by the 29 tests of this binary — the honest expectation is the
-        // product's own rule, asked of the product (`source::dump_state_covers`, the function the
-        // engine gates on) rather than asserted from a log line. Either anchor has to catch up
-        // below; what must not happen is the run dying, or a rebuild hiding the gap.
+        // The other half of #347: the restart. It has to come up on that cursor and bring the view
+        // current, and which of the two anchors it uses is the engine's decision, made on its own
+        // connection at connect time — so the leg does not duplicate that decision. Duplicating it
+        // is what made CI run 45746934249 red on mariadb1011 and mariadb131-rc: the test read
+        // `@@GLOBAL.gtid_binlog_state` and the row's text at +2.9 s, found the set named the node's
+        // pairs only partly, and demanded `file and position`; the engine had answered
+        // `anchored on the consumed GTID set … set_bytes=75621` against the row's 73 338 bytes of
+        // set — a set read from the server on the engine's connection, which names pairs the text
+        // the row happens to hold does not. Two readings of two different moments cannot settle a
+        // question about the third, and the answer was never a bug: what the rule exists to prevent
+        // is a dump the server cannot locate, and that is what this asserts instead.
+        //
         // Read in the variable *this* family has: `gtid_binlog_state` is MariaDB's own, and asking
         // a MySQL server for it is `ERROR 1193 (HY000): Unknown system variable`, which is how this
         // leg went red on every MySQL flavor of CI run 45670984231. `common::server_gtid_set` picks
-        // per flavor (`@@GLOBAL.gtid_executed` on the MySQL family), which is also the set the rule
-        // is really asked against there.
+        // per flavor (`@@GLOBAL.gtid_executed` on the MySQL family).
         let node_state = common::server_gtid_set(&mut c, maria).await?;
-        let covers = !maria || lazyview::source::dump_state_covers(&node_state, set);
-        let anchored = if covers {
-            "binlog dump anchored on the consumed GTID set"
-        } else {
-            "binlog dump anchored on the file and position"
-        };
         ctx.log(format!(
-            "the server's state carries {} bytes of GTIDs; the saved set names them {}so the \
-             restart is expected to open its dump on the {}",
+            "the server's state carries {} bytes of GTIDs and the row's set names them {}; either \
+             anchor has to bring the view current, and neither may die on the connect",
             node_state.len(),
-            if covers { "whole, " } else { "partly, " },
-            if covers { "set" } else { "file and position" }
+            if !maria || lazyview::source::dump_state_covers(&node_state, set) {
+                "whole"
+            } else {
+                "only partly (a domain an earlier writer used, which this run never saw)"
+            }
         ));
         let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_POSITION_PERSIST_MS", "200")])?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-        // The line the restart has to earn: the run opened its dump the way the server allows. It
-        // is written once per connect, so the wait is on the log rather than a guess at how long
-        // a start takes — `wait_ready` above answers from the state rows, which the first run
-        // already left `ready`.
+        // The line the restart has to earn, whichever anchor it won. It is written once per connect,
+        // so the wait is on the log rather than a guess at how long a start takes — `wait_ready`
+        // above answers from the state rows, which the first run already left `ready`.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let log = loop {
             eng.check_alive()?;
@@ -2097,11 +2092,19 @@ fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         ensure!(
-            log.contains(anchored),
-            "the restart did not open the dump on the {anchored} this server's state allows (the \
-             saved set names its pairs {covers}); its log says:\n{log}"
+            log.contains("binlog dump anchored on the"),
+            "the restart never said how it anchored its dump; its log says:\n{log}"
         );
-        if !covers {
+        // The dead connect `source::dump_state_covers` exists to prevent: a state naming a
+        // `domain-server` pair the file the server picks does not carry sends the dump thread
+        // hunting ever-older files until it dies (`sql/sql_repl.cc`, and every MariaDB leg of CI
+        // run 45446296665). Whether the engine chose the set or the position, it may not end here.
+        ensure!(
+            !log.contains("Could not find GTID state requested by slave"),
+            "the restart asked this server for a GTID state it could not locate — the dead connect \
+             the anchor rule exists to avoid; its log says:\n{log}"
+        );
+        if log.contains("anchored on the file and position") {
             // Held back, the run has to say which rule held it: `set_bytes=0` alone cannot tell an
             // operator a foreign `gtid_domain_id` from a run that saved no set at all.
             ensure!(
@@ -2275,7 +2278,10 @@ fn lifecycle_a_cursor_past_the_column_is_refused_and_nothing_is_stored() {
             frag.len()
         );
         let wanted = at.clone().with_gtid(Some(frag.clone()));
-        lazyview::meta::save_position(&mut c, "lc_refused", &wanted, 7)
+        // The identity argument these legs pass is the empty one: `save_position` keeps what the row
+        // already records for it (`COALESCE(NULLIF(?, ''), …)`), and what a test writes into the
+        // position columns says nothing about the server they were written on.
+        lazyview::meta::save_position(&mut c, "lc_refused", &wanted, 7, "")
             .await
             .context("a cursor the old TEXT column could not hold was refused")?;
         let (text, stored) = saved_cursor_row(&mut c, "lc_refused").await?;
@@ -2298,7 +2304,7 @@ fn lifecycle_a_cursor_past_the_column_is_refused_and_nothing_is_stored() {
         // and come back byte for byte.
         let big = fragmented_set_of(flavor, 4 * 1024 * 1024);
         let wanted = at.clone().with_gtid(Some(big.clone()));
-        let saved = lazyview::meta::save_position(&mut c, "lc_refused", &wanted, 7)
+        let saved = lazyview::meta::save_position(&mut c, "lc_refused", &wanted, 7, "")
             .await
             .context("a cursor the MEDIUMTEXT column holds was refused")?;
         ensure!(
@@ -2325,7 +2331,7 @@ fn lifecycle_a_cursor_past_the_column_is_refused_and_nothing_is_stored() {
         let monster = fragmented_set_of(flavor, lazyview::meta::MAX_CURSOR_BYTES + 1);
         let too_big = at.clone().with_gtid(Some(monster.clone()));
         let too_big_len = too_big.to_string().len();
-        let err = lazyview::meta::save_position(&mut c, "lc_refused", &too_big, 7)
+        let err = lazyview::meta::save_position(&mut c, "lc_refused", &too_big, 7, "")
             .await
             .expect_err("a cursor past the column must be refused, not saved");
         let msg = format!("{err:#}");
@@ -2350,7 +2356,7 @@ fn lifecycle_a_cursor_past_the_column_is_refused_and_nothing_is_stored() {
         );
         // And the save works again afterwards: a refusal is a refusal of that cursor, not a
         // broken connection or a poisoned row.
-        lazyview::meta::save_position(&mut c, "lc_refused", &at, 7)
+        lazyview::meta::save_position(&mut c, "lc_refused", &at, 7, "")
             .await
             .context("the save did not work again after a refusal")?;
         let (text, stored) = saved_cursor_row(&mut c, "lc_refused").await?;
@@ -2371,7 +2377,7 @@ fn lifecycle_a_cursor_past_the_column_is_refused_and_nothing_is_stored() {
         )
         .await?;
         let narrow = at.clone().with_gtid(Some(fragmented_set(flavor, 200)));
-        let err = lazyview::meta::save_position(&mut c, "lc_refused", &narrow, 7)
+        let err = lazyview::meta::save_position(&mut c, "lc_refused", &narrow, 7, "")
             .await
             .expect_err("a column narrower than the cursor must fail the save, not truncate it");
         let msg = format!("{err:#}");
@@ -2383,7 +2389,7 @@ fn lifecycle_a_cursor_past_the_column_is_refused_and_nothing_is_stored() {
         // And `lazyview setup` is the fix it names: after the migration the same cursor rides the
         // save again on the same connection.
         setup_run(&db).await?;
-        lazyview::meta::save_position(&mut c, "lc_refused", &narrow, 7)
+        lazyview::meta::save_position(&mut c, "lc_refused", &narrow, 7, "")
             .await
             .context("the same cursor was refused after `lazyview setup` widened the column")?;
         let (text, stored) = saved_cursor_row(&mut c, "lc_refused").await?;
@@ -2456,7 +2462,7 @@ fn lifecycle_setup_widens_an_old_cursor_column() {
         let set = fragmented_set_of(flavor, 70_000);
         let at = Cursor::from_parts(flavor, "binlog.000001".into(), 4242);
         let wanted = at.clone().with_gtid(Some(set));
-        lazyview::meta::save_position(&mut c, "lc_widen", &wanted, 3)
+        lazyview::meta::save_position(&mut c, "lc_widen", &wanted, 3, "")
             .await
             .context(
                 "a cursor the old TEXT column could not hold was refused after the migration",
@@ -2915,6 +2921,239 @@ fn lifecycle_resumes_from_a_cursor_behind_the_applied_position() {
             "the repaired cursor {back} is not one this server covers",
         );
         c.disconnect().await.ok();
+        Ok(())
+    });
+}
+
+/// The two halves of the status row are written apart, so they can disagree: the fixed-size
+/// `binlog_file`/`binlog_pos` pair goes with every flush that moved the position, while the
+/// cursor's `[g=…]` set follows on its own bound and its own price (the engine holds a rewrite back
+/// when what the set would cost on the meta link exceeds one persist interval). The shape that
+/// leaves behind is a pair AHEAD of the set in the same row, and the question this scenario answers
+/// is which of the two a restart opens on. It cannot be one answer: a file name and an offset are
+/// exact only on the server that wrote them, so the row records who wrote them
+/// (`_lazyview_status.server_identity`) and the choice follows that — the same server takes the
+/// pair and saves itself re-reading binlog it has already applied, any other server takes the set,
+/// which is the only half that travels (lv-super's ruling of 2026-11-26: "same server: file/pos is
+/// exact. After a failover: the set, as today").
+///
+/// Both directions are proven from what the run says it did, not from what it ended up with: the
+/// position the dump stream reports opening at. Half 1 leaves the pair ahead on this server and
+/// requires the stream to open there with no rebuild. Half 2 leaves the row in the same shape but
+/// attributed to another server, and requires the pair NOT to be the anchor.
+#[test]
+fn lifecycle_the_row_pair_anchors_a_resume_only_on_the_server_that_wrote_it() {
+    scenario("lc_pair_anchor", |ctx| async move {
+        use lazyview::source::Flavor;
+        use mysql_async::prelude::Queryable;
+        let db = ctx.new_db("lc_pair_anchor").await?;
+        let mut c = db.conn().await?;
+        let flavor = if ctx.flavor().starts_with("mariadb") {
+            Flavor::MariaDb
+        } else {
+            Flavor::MySql
+        };
+        for s in [
+            "CREATE TABLE entities (id INT PRIMARY KEY, grp INT NOT NULL, status VARCHAR(10) NOT NULL)",
+            "INSERT INTO entities VALUES (10, 1, 'new'), (11, 1, 'paid')",
+        ] {
+            exec(&mut c, s).await?;
+        }
+        let specs = vec![ViewSpec::new(
+            "lc_counts",
+            Kind::Incremental,
+            "SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp",
+        )];
+        ensure_lazyview_table(&mut c).await?;
+        add_views(&mut c, &specs).await?;
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_POSITION_PERSIST_MS", "200")])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        let instance: String = c
+            .query_first("SELECT CAST(instance_id AS CHAR) FROM _lazyview_status")
+            .await?
+            .context("no status row to leave behind")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let first = loop {
+            let row = lazyview::meta::load_position_row(&mut c, &instance, flavor).await?;
+            if (row.cursor.is_some() && row.at.pos > 0) || std::time::Instant::now() >= deadline {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let behind = first
+            .cursor
+            .context("the run saved no cursor, so there is nothing to leave behind")?;
+        let behind_pos = behind.to_position();
+        // Then the run moves: the pair follows every flush, the set the row holds is the one above.
+        for id in 20..60 {
+            exec(
+                &mut c,
+                &format!("INSERT INTO entities VALUES ({id}, 2, 'paid')"),
+            )
+            .await?;
+        }
+        eng.wait_caught_up(&mut c, t_catchup()).await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let later = loop {
+            let row = lazyview::meta::load_position_row(&mut c, &instance, flavor).await?;
+            if row.at > behind_pos || std::time::Instant::now() >= deadline {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        ensure!(
+            later.at > behind_pos,
+            "the row's file/pos pair never moved past the cursor's position ({behind_pos}), so the \
+             shape this scenario is about could not be made"
+        );
+        eng.stop().await?;
+        // The shape a priced-out set write leaves, made from two genuine words of the same run:
+        // the set it saved at {behind_pos}, and the pair it saved afterwards. Whatever wrote the
+        // pair, no run has seen the rows below it yet.
+        for id in 60..80 {
+            exec(
+                &mut c,
+                &format!("INSERT INTO entities VALUES ({id}, 3, 'new')"),
+            )
+            .await?;
+        }
+        exec(
+            &mut c,
+            &format!(
+                "UPDATE _lazyview_status SET binlog_cursor = {} WHERE instance_id = {}",
+                q(&behind.to_string()),
+                q(&instance)
+            ),
+        )
+        .await?;
+        let split = lazyview::meta::load_position_row(&mut c, &instance, flavor).await?;
+        let pair = split.at;
+        let stale = split
+            .cursor
+            .context("the row lost the cursor it was given")?;
+        ensure!(
+            pair > stale.to_position(),
+            "the row does not hold the shape the scenario is about: pair {pair}, cursor {stale}"
+        );
+        ctx.log(format!(
+            "the row holds the pair {pair} and the {}-byte cursor at {} — half 1 asks this server, \
+             which wrote the pair, which anchor it opens on",
+            stale.to_string().len(),
+            stale.to_position()
+        ));
+
+        // Half 1: the same server. The pair is exact here, so the stream opens there — the run
+        // does not re-read the binlog the previous run had already applied — and the set the row
+        // carries stays out of the way until the stream has carried a set past the pair.
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_POSITION_PERSIST_MS", "200")])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        let log = common::engineproc::tail_lines(&eng.log_path, 400);
+        ensure!(
+            log.contains("the run opened on the row's file/pos pair"),
+            "half 1: this server wrote the pair {pair} and it is ahead of the set at {}, but the \
+             restarted run never said it opened there; its log says:\n{log}",
+            stale.to_position()
+        );
+        ensure!(
+            log.contains(&format!("streaming binlog position={pair}")),
+            "half 1: the dump stream did not open at the pair {pair}, so the run re-read binlog it \
+             had already applied; its log says:\n{log}"
+        );
+        eng.wait_caught_up(&mut c, t_catchup()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "half 1: resumed on the row's pair",
+        )
+        .await?;
+        let snap = eng.snapshot();
+        ensure!(
+            snap.full_rebuilds == 0,
+            "half 1: resuming on the row's own pair cost {} full rebuild(s) — the views were \
+             repaired by rebuilding instead of by reading the binlog from {pair}: {}",
+            snap.full_rebuilds,
+            fmt_snapshot(&snap)
+        );
+        eng.stop().await?;
+        // The run put the set right too: it is the row's own word again, at or past the pair.
+        let back = lazyview::meta::load_position(&mut c, &instance, flavor)
+            .await?
+            .context("the resumed run saved no cursor")?;
+        ensure!(
+            back.to_position() >= pair,
+            "the resumed run left the cursor at {} — still behind the pair {pair} it opened on: \
+             {back}",
+            back.to_position()
+        );
+
+        // Half 2: the same shape, another server's name on it. The pair is now a guess, and a
+        // guess is not an anchor: whatever the run does next (adopt the set, or re-anchor and
+        // rebuild under `LAZYVIEW_ON_MISSING_BINLOG=rebuild` where the flavor has no GTID state to
+        // adopt with), it must not open on the pair.
+        for id in 80..100 {
+            exec(
+                &mut c,
+                &format!("INSERT INTO entities VALUES ({id}, 4, 'new')"),
+            )
+            .await?;
+        }
+        exec(
+            &mut c,
+            &format!(
+                "UPDATE _lazyview_status SET binlog_cursor = {}, server_identity = {} \
+                 WHERE instance_id = {}",
+                q(&stale.to_string()),
+                q("11111111-2222-3333-4444-555555555555:999"),
+                q(&instance)
+            ),
+        )
+        .await?;
+        let foreign = lazyview::meta::load_position_row(&mut c, &instance, flavor).await?;
+        let pair2 = foreign.at;
+        let stale2 = foreign
+            .cursor
+            .context("the row lost the cursor it was given")?;
+        ensure!(
+            pair2 > stale2.to_position(),
+            "half 2: the row does not hold the shape the scenario is about: pair {pair2}, \
+             cursor {stale2}"
+        );
+        ctx.log(format!(
+            "the same shape with another server's identity on it: pair {pair2}, cursor at {}",
+            stale2.to_position()
+        ));
+        let mut eng = ctx.start_engine(
+            &db,
+            &[
+                ("LAZYVIEW_POSITION_PERSIST_MS", "200"),
+                ("LAZYVIEW_ON_MISSING_BINLOG", "rebuild"),
+            ],
+        )?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        let log = common::engineproc::tail_lines(&eng.log_path, 400);
+        ensure!(
+            !log.contains("the run opened on the row's file/pos pair"),
+            "half 2: the row names another server, yet the run preferred its file/pos pair \
+             {pair2} — a position is exact only on the server that wrote it; its log says:\n{log}"
+        );
+        ensure!(
+            !log.contains(&format!("streaming binlog position={pair2}")),
+            "half 2: the dump stream opened at the foreign pair {pair2}; its log says:\n{log}"
+        );
+        eng.wait_caught_up(&mut c, t_catchup()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "half 2: resumed without the foreign pair",
+        )
+        .await?;
+        eng.stop().await?;
+        c.disconnect().await.ok();
+        ctx.log("both halves: the pair anchored this server's resume and never anchored another's");
         Ok(())
     });
 }
