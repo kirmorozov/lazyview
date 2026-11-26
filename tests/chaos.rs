@@ -1693,6 +1693,7 @@ fn assert_no_rebuilds(
 ) -> Result<()> {
     let d = eng.snapshot().since(before);
     let mut full_whole = 0u64;
+    let mut full_builds = 0u64;
     for s in specs {
         let vs = eng.stats_of(db, &s.name)?;
         if vs.mode.eq_ignore_ascii_case("incremental") {
@@ -1704,14 +1705,20 @@ fn assert_no_rebuilds(
             );
         } else {
             full_whole += vs.whole_view_refreshes;
+            // #265 (guard R1, owner rule 2026-11-26): what a Full-mode view owes a single lagging
+            // target arrives by the streamed build (`Engine::lag_build`), which is a build and not
+            // a whole-view refresh — so a build of a Full-mode view is inside the budget too. What
+            // stays outside it, and is the point of the check, is a build of an INCREMENTAL view.
+            full_builds += vs.builds;
         }
     }
     ensure!(
-        d.full_rebuilds <= full_whole,
-        "{what}: engine full_rebuilds delta {} exceeds the {} whole refreshes of the Full-mode \
-         views — an incremental view was rebuilt, not refreshed",
+        d.full_rebuilds <= full_whole + full_builds,
+        "{what}: engine full_rebuilds delta {} exceeds the {} whole refreshes and {} builds of \
+         the Full-mode views — an incremental view was rebuilt, not refreshed",
         d.full_rebuilds,
-        full_whole
+        full_whole,
+        full_builds,
     );
     Ok(())
 }
@@ -2279,6 +2286,35 @@ async fn tgt_blackhole(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -
         fmt_snapshot(&d)
     );
     assert_no_rebuilds(&eng, &db, &specs, &before, sname)?;
+    // Guard R1 (owner rule 2026-11-26), on the one site where a lagging target provably owed the
+    // whole view: what a target owes that can be listed per key is written by a units retry, and
+    // what cannot (a rebuild, a gap window, a Full-mode view) arrives by the streamed build
+    // (`Engine::lag_build`: `build_task` → `mv::fill`, one batch at a time into the shadow table).
+    // Neither reads the source whole, so an INCREMENTAL view of this run may never reach
+    // `refresh`'s `dirty.all` arm — `log_whole_refresh` logs that at INFO with the view's name, so
+    // the engine's own log is the witness. A line here means a lag catch-up grew a new way into the
+    // in-memory read, which is the whole point of the guard.
+    for s in &specs {
+        if !eng
+            .stats_of(&db, &s.name)?
+            .mode
+            .eq_ignore_ascii_case("incremental")
+        {
+            continue;
+        }
+        let needle = format!(
+            "whole-view refresh: reading the source again view={} table=",
+            s.name
+        );
+        if let Some(line) = soakchaos::grep_log(&eng.log_path, &needle)? {
+            return Err(anyhow::anyhow!(
+                "{sname}: incremental view {} read its source whole: {line}\n\
+                 A lagging target's catch-up is the streamed build (Engine::lag_build), never \
+                 refresh's dirty.all arm (guard R1, owner rule 2026-11-26).",
+                s.name,
+            ));
+        }
+    }
     eng.check_alive()?;
     eng.stop().await?;
     if let Some(pgdb) = &pgdb {

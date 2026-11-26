@@ -554,6 +554,26 @@ impl Lag {
         self.posted_partial = Vec::new();
         self.posted_all = false;
     }
+
+    /// The streamed build ([`Engine::lag_build`]) swapped the whole view onto this target: that is
+    /// what pays the entry's `all` debt, and it is the ONLY way an entry's `all` is ever paid — a
+    /// single lagging target never goes through `refresh`'s `dirty.all` arm, which reads the whole
+    /// source into memory (guard R1, owner rule 2026-11-26).
+    ///
+    /// A whole-view ask that arrived **while the fill read its source** (`posted_all`) is not in
+    /// what that read saw, so the debt stands and the next due attempt builds again. Units the
+    /// flushes fed meanwhile stay owed for a later units retry, exactly as [`Engine::lag_subtract`]
+    /// keeps them owed after a claim. Returns whether the owed set is empty now: the catch-up to
+    /// report and count (ruling 2026-11-22: "caught up" is said only once it is written).
+    fn pay_whole_view(&mut self) -> bool {
+        if !self.all || self.posted_all {
+            return false;
+        }
+        self.all = false;
+        self.failures = 0;
+        self.retry_at = Instant::now();
+        self.units.is_empty() && self.partial.iter().all(UnitSet::is_empty)
+    }
 }
 
 /// Lowers `floor` to `p` when that is a known position older than it.
@@ -8258,6 +8278,22 @@ impl Engine {
                     .await;
             }
             self.slots[i].down.remove(t);
+            // A target the build swapped in holds the WHOLE view as of the build's read position,
+            // which is what pays the `all` debt of [`Self::lag_build`]'s entry — the only way that
+            // debt is ever paid (guard R1). The accounting is `lag_end`'s, not a delete: what the
+            // flushes fed to the entry while the build ran is still owed, so those units stay for
+            // a later retry, and a whole-view ask that came in meanwhile builds again.
+            let paid = self.slots[i]
+                .live
+                .as_mut()
+                .filter(|l| l.name == n.name)
+                .and_then(|l| l.lag.get_mut(t))
+                .is_some_and(|g| g.pay_whole_view());
+            if paid {
+                self.slots[i].live.as_mut().and_then(|l| l.lag.remove(t));
+                info!(view = %n.name, target = %t, "target caught up");
+                Metrics::add(&self.metrics.target_catchups, 1);
+            }
         }
         let s = &mut self.slots[i];
         s.error = None;
@@ -8498,17 +8534,27 @@ impl Engine {
                     });
                     if let Some(g) = l.lag.get_mut(t) {
                         if dirty.rebuild {
-                            // The whole-view case, and the ONLY one this PR introduces: what a
-                            // re-derive changes is not knowable per key, so the owed set cannot be
-                            // listed (lv-super ruling 2026-11-22 keeps `all` for the genuinely
-                            // unknowable debt only, documented at each site: here and in the Full
-                            // branch below). It is served by the existing STREAMED whole-view
-                            // refresh (#167), so the bounded-memory rule holds.
+                            // The whole-view case: what a re-derive changes is not knowable per
+                            // key, so the owed set cannot be listed (lv-super ruling 2026-11-22
+                            // keeps `all` for the genuinely unknowable debt only, documented at
+                            // each site: here, in the Full branch below, and in
+                            // [`Self::lag_after_build_fail`]). Its catch-up is
+                            // [`Self::lag_build`] — the slot's streamed build (`start_next` →
+                            // `build_task` → `mv::fill`, one batch at a time into
+                            // `<name>__lv_new`, then the swap) — and NEVER `refresh`'s `dirty.all`
+                            // arm, which collects the whole view in memory
+                            // (`mv::read_source(…, chunk: None …)` + one `mv::prepare`). That is
+                            // the owner's memory rule of 2026-11-26 and the reason NO lag retry
+                            // ever hands `all` to a refresh (#265's guard R1), in either mode.
                             g.all = true;
                             g.posted_all = true;
                         } else {
                             g.units.extend(dirty.units.clone());
                             extend_partial(&mut g.partial, dirty.partial.clone());
+                            // `dirty.all` here is a whole-view debt the engine cannot list per
+                            // key either (a cascade gap window, an XA COMMIT the reader never
+                            // saw, a change no trace could follow): owed as `all`, caught up the
+                            // same streamed way.
                             g.all |= dirty.all;
                             // Same rule as `note_refresh` (#214): if this target's retry is claimed and
                             // runs detached, its read predates these changes, so they must survive the
@@ -8596,10 +8642,12 @@ impl Engine {
                 // it, and what a whole-view rebuild changes is not knowable per key — the rows
                 // are whatever the re-derive produces, so no key list is cheaper than the view.
                 // Their owed set is the view itself: `all: true`, the one case the ruling of
-                // 2026-11-22 leaves it (the same reasoning as `lag_after_build_fail`), and the
-                // catch-up is the existing streamed whole-view refresh (#167) — a refresh, not a
-                // rebuild. Without this record the buffer went to the version being built while
-                // the excluded target kept rows the engine's own diff believed current: after the
+                // 2026-11-22 leaves it (the same reasoning as `lag_after_build_fail`). Its
+                // catch-up is [`Self::lag_build`] — the slot's streamed build (`start_next` →
+                // `mv::fill`, a batch at a time into `<name>__lv_new`, then the swap) — never the
+                // in-memory `dirty.all` arm of a refresh (guard R1, owner rule 2026-11-26).
+                // Without this record the buffer went to the version being built while the
+                // excluded target kept rows the engine's own diff believed current: after the
                 // black-holed `t1` failed one build, `w_union_kinds` on the HEALTHY targets of
                 // `chaos_tgt_blackhole_during_flush` (mysql80) stopped gaining rows for the rest
                 // of the run. Cost (guard R3): one entry per excluded target per rebuild.
@@ -8876,8 +8924,26 @@ impl Engine {
     /// nothing else of the slot is running to wait for them: the supervised flush prepares the
     /// same retries with its healthy refreshes and runs them beside the writes
     /// ([`Self::lag_due`], [`Self::lag_end`]).
+    ///
+    /// What a target owes here is a set of units, and only that: an entry that owes the WHOLE
+    /// view goes to [`Self::lag_build`] (the streamed build) instead, in either maintenance mode
+    /// — a lag catch-up is never the whole-view read of `prepare_refresh` (guard R1).
     async fn retry_lag(&mut self, i: usize) {
         for mut g in self.lag_due(i, true) {
+            // The same rule as on the supervised path: what the target owes is the WHOLE view, so
+            // its catch-up is the slot's streamed build and never a refresh that reads the view
+            // into memory (`Self::lag_build`, #265's R1). `lag_due` left the entry in the map, and
+            // the swap is what discharges it.
+            if g.build {
+                self.lag_build(i, &g.t).await;
+                continue;
+            }
+            debug_assert!(
+                !g.dirty.all,
+                "a lag retry reached refresh owing the whole view ({} on {}): an `all` debt is \
+                 `lag_build`'s, never a refresh (guard R1)",
+                g.name, g.t
+            );
             let r = self
                 .refresh(
                     &g.plan,
@@ -8926,11 +8992,13 @@ impl Engine {
         // record of a debt could be discarded with the flag — `chaos_tgt_blackhole_during_flush`
         // saw the healthy direct `t2` left stale on exactly this while the black-holed `t1` was
         // unresponsive. `or_insert` keeps an entry that already holds owed keys and adds the
-        // buffer to the catch-up otherwise. A whole-view `all` is NOT seeded from a flag: the
-        // engine knows each refresh's units, so an unknowable owed set cannot arise here
-        // (ruling 2026-11-22; the one `all` site is `lag_after_build_fail`). Cost (guard R3):
-        // one clone of the slot's buffer per due flag that owes something, off the binlog event
-        // path (this runs in `lag_service`/`retry_lag`).
+        // buffer to the catch-up otherwise. The seed's `all` is main's, and only ever the buffer's
+        // own verdict (a gap window, an XA COMMIT the reader never saw, a change no trace could
+        // follow): a flag never invents a whole-view debt the engine cannot name — where it knows
+        // the units, it feeds units (ruling 2026-11-22). Whatever of it is `all` is caught up by
+        // the streamed build below, never by a refresh ([`Self::lag_build`], guard R1). Cost
+        // (guard R3): one clone of the slot's buffer per due flag that owes something, off the
+        // binlog event path (this runs in `lag_service`/`retry_lag`).
         if let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
             let flagged: Vec<String> = l
                 .behind
@@ -8983,7 +9051,13 @@ impl Engine {
                 return out;
             };
             let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
-            let kept = if take {
+            // What the entry owes is the WHOLE view: its catch-up is the streamed build, not a
+            // refresh ([`Self::lag_build`]), in either maintenance mode. Such an entry is NOT
+            // taken out of the map on the sequential path either: while the build runs the flush
+            // must keep skipping the target, `lag_wake` must keep pacing the attempts, and the
+            // swap is what discharges the debt.
+            let build = l.lag.get(&t).is_some_and(|g| g.all);
+            let kept = if take && !build {
                 // Sequential path: the group leaves the map and its retry runs at once
                 // (`retry_lag`), so nothing feeds it while it runs — the claim's read covers
                 // everything fed until now (#214).
@@ -9019,6 +9093,7 @@ impl Engine {
                 claimed_all: g.all,
                 look: Lookback::default(),
                 kept,
+                build,
                 p: None,
             });
         }
@@ -9057,24 +9132,27 @@ impl Engine {
         g.units.is_empty() && g.partial.iter().all(UnitSet::is_empty) && !g.all
     }
 
-    /// The target of a Full-mode view's maintained live version that a build or swap failed
-    /// on becomes a lagging target that owes the whole view (`all`) — not a `Down` target
-    /// that `retry_down` keeps rebuilding onto (each attempt pays the unresponsive target's
-    /// connect, and a down target answers lag with a rebuild, which #214 forbids: a down
-    /// target only lags). The flush's own lag retry (`lag_due`/`lag_end`) catches it up with
-    /// one whole-view refresh when it answers, and `lag_end` reports it down only if that
-    /// keeps failing. False: not a maintained target of the live version (a new version, a
-    /// frozen swap, an incremental view with its own lag bookkeeping, or a target the view
-    /// never had) — `target_down` and a retried build as before.
+    /// The target of a Full-mode view's maintained live version that a build or swap failed on
+    /// becomes a lagging target that owes the whole view (`all`) — not a `Down` target that
+    /// `retry_down` keeps rebuilding onto (each attempt pays the unresponsive target's connect, and
+    /// a down target answers lag with a rebuild, which #214 forbids: a down target only lags). Its
+    /// catch-up is the slot's streamed build ([`Self::lag_build`], one batch at a time into the
+    /// shadow table, then the swap), paced by the entry's own `retry_at`; after
+    /// [`LAG_MAX_FAILURES`] attempts it is reported down like a failed write. False: not a
+    /// maintained target of the live version (a new version, a frozen swap, an incremental view
+    /// with its own lag bookkeeping, or a target the view never had) — `target_down` and a retried
+    /// build as before.
     ///
-    /// This is the one lag path that keeps `all: true` (ruling 2026-11-22): the owed set here
-    /// is genuinely not derivable per key — the target never received the built version, so it
-    /// misses every row of the view, including rows no binlog event will ever name again. No
-    /// key list is cheaper than the view itself. The catch-up is the existing whole-view
-    /// `dirty.all` refresh (#167): `refresh` reads the view once through `mv::read_source` and
-    /// applies it in place in chunks — streamed, bounded memory, a refresh and not a rebuild.
-    /// The owed-set paths (`note_refresh`, `lag_due`) must never seed `all` for an empty
-    /// group: there the engine knows each refresh's units and re-derives exactly those keys.
+    /// Where the whole-view debt comes from, and how it is paid (guard R1, owner rule 2026-11-26):
+    /// a `Lag` entry holds `all` from four sites only — this one, the two `live_begin` feeds (a
+    /// rebuild with no target left to write to, and the targets a Full-mode rebuild excludes), and
+    /// main's behind-flag seed in [`Self::lag_due`], which copies the buffer's own verdict. None of
+    /// them ever reaches `refresh`: what the whole view is owed to ONE target, the streamed build
+    /// delivers ([`Self::lag_build`]), because `refresh`'s `dirty.all` arm collects the view in
+    /// memory (`mv::read_source(…, chunk: None …)` + one `mv::prepare`) and is priced for
+    /// refreshing the whole live version, all targets at once. The owed-set paths (`note_refresh`)
+    /// must never seed `all` for an empty group: there the engine knows each refresh's units and
+    /// re-derives exactly those keys.
     fn lag_after_build_fail(&mut self, i: usize, t: &str, plan: &Arc<ViewPlan>) -> bool {
         if !matches!(plan.mode, Mode::Full(_)) {
             return false;
@@ -9082,7 +9160,12 @@ impl Engine {
         let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) else {
             return false;
         };
-        if !Arc::ptr_eq(&l.plan, plan) || !l.targets.iter().any(|x| x == t) {
+        // The maintained targets, plus the one `lag_build` is rebuilding onto: it is not in
+        // `l.targets` (that is why it owes the view), and its failed attempt must re-arm its own
+        // backoff rather than fall through to `target_down` on its first miss.
+        if !Arc::ptr_eq(&l.plan, plan)
+            || !(l.targets.iter().any(|x| x == t) || l.lag.contains_key(t))
+        {
             return false;
         }
         let since = l
@@ -9103,6 +9186,75 @@ impl Engine {
             posted_all: false,
         });
         true
+    }
+
+    /// The whole-view catch-up of one lagging target: the slot's own streamed build (`start_next`
+    /// → `build_task` → `mv::fill`, one batch into `<name>__lv_new` at a time, then the swap),
+    /// which is how a target is ever given the whole view. It is what the `all` debt of
+    /// [`Self::lag_after_build_fail`] and of the two `live_begin` feeds owes, in either
+    /// maintenance mode, and it exists so that catching up ONE target never runs `refresh`'s
+    /// `dirty.all` arm: that reads the whole view into memory (`mv::read_source(…, chunk: None …)`
+    /// with one `mv::prepare` after it), which the owner's memory rule of 2026-11-26 leaves to
+    /// main's own whole-version paths (the cadence rebuild, the gap window, the XA sweep) until
+    /// the bounded sweep lands. An INCREMENTAL view in particular never reads its source whole
+    /// for a lagging target: it is behind on units, and what it cannot list per key it gets by
+    /// the build.
+    ///
+    /// Target isolation holds as it does for a detached retry: the build is the slot's task, the
+    /// tick never awaits it, and the target stays out of the flush path because its lag entry stays
+    /// in the map (that is why `lag_due` does not take such a group). A slot that is already
+    /// building — its cadence rebuild, another target's catch-up, a pending re-plan — is not
+    /// interrupted: the attempt moves to the entry's own backoff, which `lag_wake` reads, so nothing
+    /// spins. `finish_next` discharges the debt of a target it swaps in; `next_failed` re-arms it
+    /// through [`Self::lag_after_build_fail`]; after [`LAG_MAX_FAILURES`] attempts the target is
+    /// reported down the way a failed write is (its entry keeps the debt, so a peer that answers
+    /// later is still caught up), so a peer that never answers stops asking.
+    ///
+    /// Cost (guard R3): one call per due whole-view entry per backoff period, nothing per event.
+    async fn lag_build(&mut self, i: usize, t: &str) {
+        let (name, plan) = match self.slots[i].live.as_ref().filter(|l| !l.frozen) {
+            Some(l) => (l.name.clone(), l.plan.clone()),
+            None => return,
+        };
+        let s = &self.slots[i];
+        if s.next.is_some() || s.waiting.is_some() || self.replan.contains_key(&s.def_id) {
+            if let Some(g) = self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
+                g.retry_at = Instant::now() + connect_retry_delay(g.failures.max(1));
+            }
+            return;
+        }
+        let failures = match self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
+            Some(g) => {
+                g.failures += 1;
+                g.retry_at = Instant::now() + connect_retry_delay(g.failures);
+                g.failures
+            }
+            None => return,
+        };
+        if failures >= LAG_MAX_FAILURES {
+            // Reported down once, exactly the way `lag_end` reports a target whose writes never
+            // land — and the entry KEEPS its whole-view debt: `retry_down` builds only targets
+            // with no lag entry, so this one keeps making its own attempts at the capped backoff
+            // until one lands (which is the catch-up `finish_next` counts).
+            match self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
+                Some(g) if g.down => return,
+                Some(g) => g.down = true,
+                None => return,
+            }
+            if let Some(l) = self.slots[i].live.as_mut() {
+                l.targets.retain(|x| x != t);
+            }
+            warn!(view = %name, target = %t, failures,
+                  "the whole view never reached the target: it is reported down");
+            let e = anyhow!("the whole view never reached the target {t}");
+            self.target_down(i, &name, t, Some(&plan), &e).await;
+            self.rebuild_routes();
+            return;
+        }
+        debug!(view = %name, target = %t, failures,
+               "the whole view is owed to a lagging target: its catch-up is the streamed build");
+        self.start_next(i, plan, name, vec![t.to_string()], true)
+            .await;
     }
 
     /// Part B (lv-super ruling 2026-11-22): the gate of the whole of it — PostgreSQL-family
@@ -9416,7 +9568,14 @@ impl Engine {
             // branch above: read the whole view once and apply it in place, which deletes the
             // vanished rows. One read per window, at most once per view per window; a refresh,
             // not a rebuild, and the other buffered units are subsumed by it, so the buffer
-            // clears with it (a failed target is retried as a whole refresh by `retry_lag`).
+            // clears with it.
+            //
+            // What is NOT here is a lagging target's catch-up (guard R1, owner rule 2026-11-26):
+            // these callers refresh the WHOLE live version, all of its targets at once, which is
+            // what makes reading the source once the right price. A single target behind on the
+            // same debt is caught up by the streamed build (`Self::lag_build`), and `retry_lag`
+            // and `lag_service` assert it — a `Lag` entry that still says `all` never reaches this
+            // branch, in either maintenance mode.
             let fresh = self.caps.fresh_snapshot;
             // One wait per whole-view read (PR G §3.2): the read endpoint must have applied
             // the set the engine consumed, at the bound, before any row is read.
@@ -9795,6 +9954,23 @@ impl Engine {
                 if self.lag_retries.contains_key(&key) {
                     continue;
                 }
+                // The whole view is owed to this target: the catch-up is the slot's streamed
+                // build, not a refresh, and nothing is spawned or claimed for it (guard R1, owner
+                // rule 2026-11-26, [`Self::lag_build`]).
+                if g.build {
+                    self.lag_build(i, &g.t).await;
+                    continue;
+                }
+                // The same rule from the other side, where it could be broken: what is claimed
+                // below is a set of units and nothing else — an entry that still says `all` here
+                // would read the source into memory for one target, which is the bug, not the
+                // design.
+                debug_assert!(
+                    !g.dirty.all,
+                    "a lag claim reached prepare_refresh owing the whole view ({} on {}): an \
+                     `all` debt is `lag_build`'s, never a refresh (guard R1)",
+                    g.name, g.t
+                );
                 // The retry starts here: its claim clears the re-fed marks, so what it reads
                 // from now on it writes (#214; feeds after this moment post again).
                 if let Some(lg) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
@@ -10657,6 +10833,11 @@ struct LagRetry {
     /// result frees only the handle this retry was started under, never a newer claim of the same
     /// (view, target) (#391).
     id: u64,
+    /// The target owes the WHOLE view: its catch-up is the slot's streamed build
+    /// ([`Engine::lag_build`]), so no refresh is prepared, no task is spawned and no handle is
+    /// kept for it (#265's guard R1: a single lagging target never reads the view into memory,
+    /// in either maintenance mode).
+    build: bool,
     /// The target's name, and the view's name its state rows are kept under.
     t: String,
     name: String,
@@ -11902,6 +12083,57 @@ mod tests {
             posted_partial: Vec::new(),
             posted_all: false,
         }
+    }
+
+    /// Guard R1 (owner rule 2026-11-26) as a unit: the whole-view debt of a lagging target is paid
+    /// by the streamed build's swap ([`Engine::lag_build`]) and by nothing else, and the swap pays
+    /// only what its read actually covered. The cases are the shapes an entry holds when
+    /// `finish_next` swaps such a build in: the whole view alone (paid: the catch-up to count), the
+    /// whole view plus the units the flushes fed while the fill read its source (the `all` is paid,
+    /// the units stay owed for a units retry), a whole-view ask that arrived during the fill (that
+    /// read does not cover it: the debt stands), and a units-only entry (the refresh's, untouched).
+    #[test]
+    fn the_whole_view_of_a_lagging_target_is_paid_by_the_build_alone() {
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        g.failures = 2;
+        assert!(g.pay_whole_view(), "the swap covered the whole owed set");
+        assert!(
+            !g.all && g.failures == 0,
+            "a paid debt starts its backoff over"
+        );
+
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        g.units.insert_int(21);
+        assert!(
+            !g.pay_whole_view(),
+            "the units fed during the fill are still owed"
+        );
+        assert!(!g.all, "the build's read paid the whole view");
+        assert!(
+            !g.units.is_empty(),
+            "and nothing else wrote those units: no catch-up to count yet"
+        );
+
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        g.posted_all = true;
+        assert!(
+            !g.pay_whole_view(),
+            "a whole-view ask that came during the fill is not covered by its read"
+        );
+        assert!(g.all, "the debt stands until a build reads past it");
+
+        let mut g = lag(("binlog.000003", 100), false);
+        g.units.insert_int(7);
+        g.failures = 3;
+        assert!(
+            !g.pay_whole_view(),
+            "a units entry is the refresh's business"
+        );
+        assert_eq!(g.failures, 3, "and its failures are the retry's own");
+        assert!(!g.units.is_empty());
     }
 
     /// The saved position waits for a lagging target reported down (`pending_floor` keeps
