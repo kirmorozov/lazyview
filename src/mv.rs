@@ -1360,6 +1360,8 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
         ..Default::default()
     };
     let none: Vec<Row2> = Vec::new();
+    // New rows in the order the writes take their locks (see [`write_tx_mysql`]).
+    let mut ins: Vec<&Row2> = Vec::new();
     let units = new
         .groups
         .keys()
@@ -1375,16 +1377,35 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
         match row_key {
             None => {
                 d.deleted_rows += o.len() as u64;
-                d.inserts.extend(n.iter().map(|r| r.1.clone()));
+                ins.extend(n.iter().copied());
             }
-            Some(key) => diff_rows(key, o, n, &mut d),
+            Some(key) => diff_rows(key, o, n, &mut d, &mut ins),
         }
     }
+    // One order for every writer: two chunks that touch the same keys take their row locks in
+    // the same order, so their statements queue instead of deadlocking (#331).
+    let order = row_key.unwrap_or(&layout.unit_pos[..]);
+    ins.sort_by(|a, b| {
+        order
+            .iter()
+            .map(|&p| a.0[p].cmp(&b.0[p]))
+            .find(|o| o.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    d.inserts = ins.iter().map(|r| r.1.clone()).collect();
+    d.delete_keys.sort_unstable();
+    d.changed.sort_unstable();
     d
 }
 
 /// The rows of one changed unit, compared per row key (see [`diff`]).
-fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) {
+fn diff_rows<'a>(
+    key: &[usize],
+    old: Vec<&Row2>,
+    new: Vec<&'a Row2>,
+    d: &mut Diff,
+    ins: &mut Vec<&'a Row2>,
+) {
     fn by_key<'a>(key: &[usize], rows: Vec<&'a Row2>) -> HashMap<Key, Vec<&'a Row2>> {
         let mut m: HashMap<Key, Vec<&Row2>> = HashMap::new();
         for r in rows {
@@ -1416,7 +1437,7 @@ fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) {
         } else if !o.is_empty() {
             d.updated_rows += 1;
         }
-        d.inserts.extend(n.iter().map(|r| r.1.clone()));
+        ins.extend(n.iter().copied());
     }
     for (k, o) in old {
         d.delete_keys.push(k);
@@ -1424,9 +1445,9 @@ fn diff_rows(key: &[usize], old: Vec<&Row2>, new: Vec<&Row2>, d: &mut Diff) {
     }
 }
 
-/// Writes a diff in one transaction (see [`Diff`]). `began` is set once the transaction has
-/// been started on the server (from then on a lost connection may still commit: see the
-/// supervisor's zombie fence).
+/// Writes a diff as autocommit statements (see [`Diff`], [`write_tx_mysql`]). `began` is set
+/// before the first statement (from then on a lost connection may still have applied some: see
+/// the supervisor's zombie fence).
 pub async fn write_diff(
     conn: &mut Conn,
     schema: &str,
@@ -1470,8 +1491,8 @@ pub async fn write_diff(
     r
 }
 
-/// The MySQL transaction of [`write_diff`] (the family's own arm; the PostgreSQL arm arrives
-/// with its transaction in PR T4).
+/// The MySQL statements of [`write_diff`] (the family's own arm; the PostgreSQL arm is
+/// `PgConn::write_tx`).
 async fn write_tx_mysql(
     conn: &mut Conn,
     schema: &str,
@@ -1488,7 +1509,15 @@ async fn write_tx_mysql(
         updated: d.updated_rows,
         unchanged: d.unchanged_rows,
     };
-    let mut tx = conn.start_transaction(Default::default()).await?;
+    // No transaction (owner, #331): a transaction held every row lock of a chunk until its COMMIT,
+    // so two chunks touching the same rows in different orders deadlocked (ERROR 1213). Each
+    // statement below is its own autocommit and releases its locks at once; keys and rows are
+    // sorted (see [`diff`]), so one statement never waits on another that waits on it. The
+    // deletes run first: a key the diff replaces (a NULL in it, or the table holding it twice)
+    // must not take the upsert's new row with it. A crash or a failure between statements leaves
+    // the chunk half written, which is safe: the position is saved only after the whole chunk
+    // succeeded, and the replay re-reads the target, so its diff is exactly what is still missing.
+    let tx = conn;
     if d.by_unit && d.deleted_rows > 0 {
         let del_filter = if layout.unit_pos.is_empty() {
             ("TRUE".to_string(), Vec::new())
@@ -1520,7 +1549,7 @@ async fn write_tx_mysql(
             .row_key_for(w.kind)
             .expect("internal: rows of a by-row diff have no row key");
         delete_keys(
-            &mut tx,
+            tx,
             schema,
             table,
             layout,
@@ -1534,10 +1563,9 @@ async fn write_tx_mysql(
     }
     Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
     insert_rows(
-        &mut tx, schema, table, layout, &d.inserts, w, !d.by_unit, metrics,
+        tx, schema, table, layout, &d.inserts, w, !d.by_unit, metrics,
     )
     .await?;
-    tx.commit().await?;
     Metrics::add(&metrics.units_changed, out.units_changed);
     Ok(out)
 }
