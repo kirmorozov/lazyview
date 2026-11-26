@@ -1013,6 +1013,148 @@ fn values_non_utf8_charsets() {
     });
 }
 
+/// #394 fail-before (lv-worker-utf8-394): the `v_entity_by_a` group of the latin1 unit `É`
+/// (byte `0xC9`, which `latin1_swedish_ci` makes equal to `e`) holding row 11 alone never
+/// reaches the MV. Splitting the original `insert / delete a group of equal keys` step so a
+/// `verify` lands between the INSERT of row 11 and the `DELETE … a = 'e'` shows `('11','1','11')`
+/// missing from `v_entity_by_a` right after the insert — the mirror of the CI red that showed it
+/// as an extra kept row after the delete. Everything else here is that scenario copied verbatim;
+/// only its last step differs, and it drops two things with it: the INSERT's row 12 (`'ü '`, a
+/// group of its own) and the step's `DELETE … a = 'cafe'`. The red shows at the insert check,
+/// before either would matter, and the recorded runs used exactly this test. Same defect, caught
+/// one step earlier: the engine emits
+/// no `v_entity_by_a` refresh at all after that INSERT, silent through the catch-up and the extra
+/// 3 s re-check, so nothing was owed — the new group is never named for a refresh, and no later
+/// pass heals it (`mv::vanished`, the whole-view read that walks the units a view holds against
+/// the source, has no production caller). Red on `origin/main` at 9222872.. on mariadb106, 6/6
+/// seeds (the reported 785433886351 + five neighbours); green once the insert path names the
+/// `0xC9` unit and writes its group. Refs #394.
+#[test]
+fn values_non_utf8_group_by_a_survives() {
+    scenario("val_charsets394", |ctx| async move {
+        let mut specs = vec![
+            ViewSpec::new(
+                "v_entity",
+                Kind::Incremental,
+                "SELECT id, a, b, c, d, g FROM entity",
+            ),
+            ViewSpec::new(
+                "v_entity_by_g",
+                Kind::Incremental,
+                "SELECT g % 3 AS k, COUNT(*) AS n, GROUP_CONCAT(a ORDER BY id SEPARATOR '|') AS la, \
+                 GROUP_CONCAT(c ORDER BY id SEPARATOR '|') AS lc FROM entity GROUP BY g % 3",
+            ),
+        ];
+        let keys = vec![
+            ViewSpec::new(
+                "v_entity_by_a",
+                Kind::Incremental,
+                "SELECT MIN(id) AS k, COUNT(*) AS n, SUM(g) AS sg FROM entity GROUP BY a",
+            ),
+            ViewSpec::new(
+                "v_entity_by_c",
+                Kind::Incremental,
+                "SELECT MIN(id) AS k, COUNT(*) AS n, MAX(LENGTH(d)) AS ld FROM entity GROUP BY c",
+            ),
+            ViewSpec::new(
+                "v_entity_item",
+                Kind::Incremental,
+                "SELECT e.id, e.a, i.attr, i.label FROM entity e JOIN item i ON i.attr = e.a",
+            ),
+            ViewSpec::new(
+                "v_item",
+                Kind::Incremental,
+                "SELECT attr, label FROM item WHERE label <> '表'",
+            ),
+        ];
+        specs.extend(keys);
+        let ddl = [
+            "CREATE TABLE entity (id INT PRIMARY KEY, a VARCHAR(10) CHARACTER SET latin1 NULL, \
+             b CHAR(10) CHARACTER SET latin1 NULL, c VARCHAR(10) CHARACTER SET sjis NULL, \
+             d CHAR(150) CHARACTER SET sjis NULL, g INT NULL, KEY k_a (a), KEY k_c (c))",
+            "CREATE TABLE item (attr VARCHAR(10) CHARACTER SET latin1 NOT NULL PRIMARY KEY, \
+             label VARCHAR(10) CHARACTER SET sjis NULL)",
+            "INSERT INTO entity VALUES (1, 'café', 'É', '表', REPEAT('表', 150), 1), \
+             (2, 'CAFE', 'e', 'ソ', 'ソ', 2), (3, 'cafe ', 'ü ', '能', '', 3), \
+             (4, 'naïve', 'ß', 'ﾊﾟ', NULL, 4), (5, 'ÿ', NULL, '\\\\', '表\\\\', 5), \
+             (6, 'y', 'y', 'a\\\\b', 'ﾊﾟ', 6), (7, 'ü', '×÷', '表', '能', 7), (8, '', '', '', '', 8), \
+             (9, NULL, NULL, NULL, NULL, 9), (10, _latin1 X'E9FFD7', _latin1 X'F7', '能能', REPEAT('ソ', 149), 10)",
+            "INSERT INTO item VALUES ('café', '表'), ('naïve', 'ソ'), ('ÿ', 'ﾊﾟ'), ('', '\\\\'), ('×', NULL)",
+        ];
+        let (db, mut eng) = setup_views(
+            &ctx,
+            "val_charsets394",
+            &ddl,
+            &specs,
+            &[
+                ("LAZYVIEW_QUERY_CHUNK", "2"),
+                ("LAZYVIEW_BATCH_WINDOW_MS", "0"),
+            ],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        ensure_incremental(&mut c, &specs).await?;
+        let steps: &[(&str, &[&str])] = &[
+            (
+                "other column changes, keys unchanged",
+                &["UPDATE entity SET g = g + 10 WHERE id <= 5"],
+            ),
+            (
+                "case / accent / trailing-space-only key changes",
+                &[
+                    "UPDATE entity SET a = 'CAFÉ' WHERE id = 1",
+                    "UPDATE entity SET a = 'cafe' WHERE id = 3",
+                    "UPDATE entity SET a = 'Y' WHERE id = 7",
+                    "UPDATE entity SET b = 'É ' WHERE id = 1",
+                ],
+            ),
+            (
+                "join partner PK changes to an equal key",
+                &[
+                    "UPDATE item SET attr = 'CAFE' WHERE attr = 'café'",
+                    "UPDATE item SET label = 'ソ' WHERE attr = 'ÿ'",
+                ],
+            ),
+            (
+                "sjis keys with a 0x5C second byte",
+                &[
+                    "UPDATE entity SET c = '能' WHERE c = '表'",
+                    "UPDATE entity SET d = CONCAT(d, 'ソ') WHERE id = 2",
+                    "UPDATE entity SET c = '表\\\\' WHERE id = 5",
+                    "DELETE FROM entity WHERE c = 'ソ'",
+                ],
+            ),
+            (
+                "latin1 PK by value, non-UTF8 bytes as keys",
+                &[
+                    "DELETE FROM item WHERE attr = 'NAÏVE'",
+                    "INSERT INTO item VALUES (_latin1 X'E9FFD7', '能')",
+                    "UPDATE entity SET a = _latin1 X'E9FFD7' WHERE id = 4",
+                    "UPDATE item SET attr = 'y' WHERE attr = 'ÿ'",
+                ],
+            ),
+            // #394 fail-before: the race removed — a verify lands after the insert and
+            // before the delete. The latin1 'É' (byte 0xC9, = 'e' under latin1_swedish_ci)
+            // group holds row 11 alone, so it is (11,1,11) after the insert and gone after.
+            // The original step's other two pieces are not copied: its INSERT's row 12
+            // ('ü ', its own group) and its DELETE FROM entity WHERE a = 'cafe'.
+            (
+                "#394 insert: the 'É' group (row 11 alone)",
+                &["INSERT INTO entity VALUES (11, 'É', 'e', 'ソ', 'ソ', 11)"],
+            ),
+            (
+                "#394 delete: the 'É' group by a = 'e'",
+                &["DELETE FROM entity WHERE a = 'e'"],
+            ),
+        ];
+        for (what, stmts) in steps {
+            exec_all(&mut c, stmts).await?;
+            verify(&ctx, &mut eng, &db, &specs, what).await?;
+        }
+        eng.stop().await
+    });
+}
+
 /// UUID, INET4 and INET6 values as SPJ columns, group keys, join keys and a PK — in the
 /// storage each server has for them, so every flavor proves the values it can hold. MariaDB
 /// added its three native types in different releases (INET6 in 10.5, UUID in 10.7, INET4 in
