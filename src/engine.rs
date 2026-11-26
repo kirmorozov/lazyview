@@ -1319,10 +1319,17 @@ struct Engine {
     /// sequential refresh on the connections above). Shared as an `Arc`: a detached lag
     /// retry drives its writes from a spawned task while the flush tick moves on (#214).
     sup: Option<Arc<Supervisor>>,
-    /// Lag retries the detached tasks are running (#214): at most one per (slot, target).
-    /// The handle is kept so a task that died without its message (a panic) frees its
-    /// target on the next tick; results are folded in by `lag_end` on a later tick.
-    lag_retries: HashMap<(usize, String), tokio::task::JoinHandle<()>>,
+    /// Lag retries the detached tasks are running (#214): at most one per (slot, target), and
+    /// the entry is the claim, not just the handle — `(handle, claim id)`. The id is what makes
+    /// the invariant hold: a result folds (and frees its target) only when the entry still
+    /// carries the id the retry was started with, so a late result can never free a *newer*
+    /// claim, and a claim is never freed while its result is still in `lag_rx` (see
+    /// [`Engine::lag_service`]). A task that died without its message (a panic) frees its target
+    /// on the next tick; results are folded in by `lag_end` on a later tick.
+    lag_retries: HashMap<(usize, String), (tokio::task::JoinHandle<()>, u64)>,
+    /// The next claim id for [`Self::lag_retries`]: every claim of a (view, target) is unique,
+    /// which is what lets a fold tell its own retry from a newer one (#391).
+    lag_claim_seq: u64,
     lag_tx: mpsc::UnboundedSender<(usize, LagRetry, Result<Refreshed>)>,
     lag_rx: mpsc::UnboundedReceiver<(usize, LagRetry, Result<Refreshed>)>,
     /// Results drained from `lag_rx` whose slot is mid-swap (see `refresh_all_live`): they
@@ -2527,6 +2534,7 @@ impl Engine {
             stats_tx,
             sup,
             lag_retries: HashMap::new(),
+            lag_claim_seq: 0,
             lag_tx,
             lag_rx,
             lag_held: VecDeque::new(),
@@ -8998,6 +9006,9 @@ impl Engine {
             };
             out.push(LagRetry {
                 i,
+                // Assigned by whoever starts the retry (`lag_service`): a claim's id is what its
+                // fold is matched against (#391), and a group that never starts a task has none.
+                id: 0,
                 t,
                 name,
                 plan,
@@ -9131,6 +9142,12 @@ impl Engine {
             return;
         };
         let Some(mut g) = retry.kept.take().or_else(|| l.lag.remove(&t)) else {
+            // With one claim in flight per (view, target) and a fold that frees only its own
+            // handle, a result without its group means the group was dropped under the retry —
+            // which happens when its version is replaced (the entry rode over with the live
+            // version, and this is the only path that sees the result). Say so: silently
+            // swallowing it is what made the double-claim race invisible (#391).
+            debug!(view = %name, target = %t, "a retry result without its group: nothing to fold");
             return;
         };
         match r {
@@ -9711,6 +9728,21 @@ impl Engine {
     /// claims at most once per target per pass. Cost (guard R3): per loop iteration only the
     /// slot scan below (same shape as `flush_due`), never per binlog event.
     async fn lag_service(&mut self) {
+        // Which retries have ended is read BEFORE the drain, and the sweep that frees them comes
+        // after it (#391). A task sends its result and only then ends, so a handle seen finished
+        // here has its result either already in `lag_held` or still in `lag_rx` — and the drain
+        // below collects that. Sweeping before the drain is what let one (view, target) run two
+        // retries at once: the sweep freed the target of a retry whose result was in flight, the
+        // claim pass started a second one, and the late fold of the first result then removed the
+        // SECOND one's handle (it keyed only on (slot, target)), so a third started beside it.
+        // Two retries writing the same units to a target leaves second copies of rows on a view
+        // without row identity, and nothing re-owes them.
+        let finished: Vec<(usize, String)> = self
+            .lag_retries
+            .iter()
+            .filter(|(_, (h, _))| h.is_finished())
+            .map(|((i, t), _)| (*i, t.clone()))
+            .collect();
         while let Ok(m) = self.lag_rx.try_recv() {
             self.lag_held.push_back(m);
         }
@@ -9728,19 +9760,28 @@ impl Engine {
                 continue;
             }
             let (i, g, r) = self.lag_held.remove(at).unwrap();
-            self.lag_retries.remove(&(i, g.t.clone()));
+            // Free the target only if this result belongs to the claim still held: a late result
+            // must never release a newer claim of the same (view, target).
+            if self
+                .lag_retries
+                .get(&(i, g.t.clone()))
+                .is_some_and(|(_, id)| *id == g.id)
+            {
+                self.lag_retries.remove(&(i, g.t.clone()));
+            }
             self.lag_end(g, r).await;
         }
         // A retry whose task ended without a message (it panicked): free the target so its
-        // `retry_at` schedules a new attempt.
-        let lost: Vec<(usize, String)> = self
-            .lag_retries
-            .iter()
-            .filter(|(_, h)| h.is_finished())
-            .map(|((i, t), _)| (*i, t.clone()))
-            .collect();
-        for k in lost {
-            self.lag_retries.remove(&k);
+        // `retry_at` schedules a new attempt. A finished handle whose result is in `lag_held` is
+        // not lost — that result is the proof it delivered, and its fold frees the target.
+        for k in finished {
+            if !self
+                .lag_held
+                .iter()
+                .any(|(i, g, _)| *i == k.0 && g.t == k.1)
+            {
+                self.lag_retries.remove(&k);
+            }
         }
         // Start the retries that are due — at most one per target (one still running is
         // due again each pass: its `retry_at` stays behind until the result folds in).
@@ -9761,6 +9802,11 @@ impl Engine {
                         g0.clear_posted();
                     }
                 }
+                // The claim gets its identity here, with the task: the fold of this retry's
+                // result frees only the handle carrying this id, so a result that arrives after a
+                // newer claim was started cannot free that newer claim (#391).
+                g.id = self.lag_claim_seq;
+                self.lag_claim_seq += 1;
                 debug!(view = %g.name, target = %g.t, all = g.claimed_all, "lag refresh claimed");
                 // Prepared here: the lagging target's units are already resolved (its
                 // lookback is empty) and with `connect: false` nothing dials it — the
@@ -9779,6 +9825,7 @@ impl Engine {
                     .await,
                 );
                 let (tx, metrics, sup) = (self.lag_tx.clone(), self.metrics.clone(), sup.clone());
+                let id = g.id;
                 let h = tokio::spawn(async move {
                     let i = g.i;
                     let r = match g.p.take() {
@@ -9792,7 +9839,7 @@ impl Engine {
                     };
                     let _ = tx.send((i, g, r));
                 });
-                self.lag_retries.insert(key, h);
+                self.lag_retries.insert(key, (h, id));
             }
         }
     }
@@ -10606,6 +10653,10 @@ struct LiveRefresh {
 struct LagRetry {
     /// The view's slot.
     i: usize,
+    /// The claim this retry is: unique per claim ([`Engine::lag_claim_seq`]), so the fold of its
+    /// result frees only the handle this retry was started under, never a newer claim of the same
+    /// (view, target) (#391).
+    id: u64,
     /// The target's name, and the view's name its state rows are kept under.
     t: String,
     name: String,
