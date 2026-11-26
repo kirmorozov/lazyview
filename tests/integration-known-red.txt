@@ -29,10 +29,6 @@
 # tests run strict again. If either comes back, the engine now prints one line per whole-view
 # refresh naming the position it read the source at and whether an XA transaction was open there —
 # the evidence a red of this shape was missing.
-# #399 (owner 2026-11-26 "commit those in as will fix bugs"): red on main by design until the fix
-# PR lands (crash between a chunk's autocommit DELETE and INSERT loses the lineage-resolved units).
-lifecycle::reg_crash_between_a_chunks_statements_keeps_its_units #399
-lifecycle_crash_consistency #399
 # #319, back on the list (owner 2026-11-27, via lv-super): the seeded replay of
 # `pinned::reg_cascade_refusal_seed_replay` diverged again on mysql2610 ("after the crash 3 views
 # differ from their oracle": `w_items_left` 3 rows missing and 2 extra, `w_item_tags` 1 missing),
