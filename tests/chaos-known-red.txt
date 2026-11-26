@@ -8,5 +8,15 @@
 # So the list is the only thing between a new chaos regression and a red job, and an entry leaves
 # when its fix lands — the file is never a place to park a scenario for good. Empty file, strict
 # step: every chaos failure fails the job.
-chaos_tgt_blackhole_during_flush #214
-chaos_tgt_pg_blackhole_during_flush #214
+#
+# 2026-11-26 (target isolation, #265): the two black-hole entries leave here. They were #214's —
+# `chaos_tgt_blackhole_during_flush` and `chaos_tgt_pg_blackhole_during_flush` failed on rows the
+# engine had silently not delivered, and the cause was `live_begin`'s no-eligible-target owed feed
+# dropping the buffer's `images` / `marks` / `holds`, the base-row keys whose units only exist after
+# the materialized-table lookup (`7e64d13`). Run on the fixed binary: percona84 at the seeds that
+# were red (`551618406060` rc=0 69.73 s `suite-r5j-bh-p84-391`, `788055334415` rc=0 79.88 s
+# `suite-r5i-bh-p84-seed`) and two fresh draws (`suite-r5k-bh-p84-1`, `-2`), and mysql84 + pg16 for
+# the pg scenario twice (`suite-r5k-pgbh-1`, `-2`). CI's postgres-target job is the last word on
+# pg14/15/17/18: if it says the pg entry was not ready to leave, it comes back with a real issue.
+# `chaos_tgt_bandwidth_starvation` is not listed and never was: a main test, red on this PR, fixed
+# in this PR.
