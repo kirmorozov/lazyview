@@ -2748,21 +2748,16 @@ fn lifecycle_setup_refuses_and_migrates_a_narrow_cursor_column() {
     });
 }
 
-/// What the flush loop's two clocks owe, and the rule that pays for them: `binlog_file` and
-/// `binlog_pos` move with every flush that advanced the position ([`lazyview::meta::save_position_at`]
-/// — two columns, one statement, no read-back), while `binlog_cursor` carries the position *and* the
-/// consumed set, so its cost is the size of that set and it follows on a bound measured on the link
-/// itself (`Engine::set_write_bound`, ruling (A) of #356: on the fragmented meta link of CI run
-/// 45446296665 a tens-of-kilobytes rewrite on every flush was what stopped `chaos_both_sides` from
-/// ever catching up). Between two cursor writes the row therefore holds a cursor **behind** what the
-/// run has applied, and a restart reads that older set: it re-reads, and re-applies, binlog it has
-/// already applied.
+/// The rule the pacing work of #356 will lean on, proved here where it stands on its own: the row's
+/// `binlog_cursor` can name a position **behind** what the run has applied. The two pre-cursor
+/// columns and the cursor column are whatever whoever held the row last left there — a save that
+/// failed midway, a row an older build wrote, a row the harness wrote by hand — and a restart then
+/// opens its dump at the older position and re-reads, and re-applies, binlog it has already applied.
 ///
 /// That is safe only because re-applying a change is idempotent — which this scenario exists to
-/// *prove*, not to assume: the cursor is put back by hand (the row's two columns left ahead, the way
-/// a cheap save leaves them), the run has to open its dump at that older position — the log line says
-/// so — and the oracle has to answer equal afterwards, with no whole rebuild allowed to hide the
-/// double work or the miss.
+/// *prove*, not to assume: the cursor is put back by hand (the row's two columns left ahead), the
+/// run has to open its dump at that older position — the log line says so — and the oracle has to
+/// answer equal afterwards, with no whole rebuild allowed to hide the double work or the miss.
 #[test]
 fn lifecycle_resumes_from_a_cursor_behind_the_applied_position() {
     scenario("lc_cursor_behind", |ctx| async move {
@@ -2843,9 +2838,9 @@ fn lifecycle_resumes_from_a_cursor_behind_the_applied_position() {
             )
             .await?;
         }
-        // The row as two clocks leave it: the columns ahead (a cheap save writes only them), the
-        // cursor from before the applied position. `load_position` reads the cursor, so the start
-        // below begins there and has to re-apply what the view has already counted.
+        // The row as a save that stopped between the halves leaves it: the two pre-cursor columns
+        // ahead, the cursor from before the applied position. `load_position` reads the cursor, so
+        // the start below begins there and has to re-apply what the view has already counted.
         exec(
             &mut c,
             &format!(

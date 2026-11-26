@@ -1156,22 +1156,15 @@ struct Engine {
     last_publish: Instant,
     boundary: Cursor,
     persisted: Cursor,
-    /// What the two pre-cursor columns of the status row hold. They move with the flush loop
-    /// (fixed size, one statement); `persisted` — the cursor column — follows on a bound measured
-    /// on the meta link itself, because its size is the size of the consumed set. See
-    /// [`Self::persist_position`] and [`meta::save_position_at`].
+    /// The position the status row holds: seeded at the start from the row's own columns
+    /// ([`meta::load_position_row`], which is what makes a row whose cursor column is empty or
+    /// unreadable a starting point rather than a bootstrap) and updated by every save that went.
+    /// `persisted` is the same row's cursor column; the two name different positions when an older
+    /// build wrote them apart.
     persisted_at: Position,
     last_persist: Instant,
-    /// When the last **cursor** write (the one that also writes `binlog_cursor`, and so the one
-    /// [`meta::save_position`] reads back) finished, and how long it took on this link: the bound on
-    /// the next one is ten times that duration.
-    last_set_write: Option<(Instant, Duration)>,
-    /// Write the cursor column at the next save whatever the bound says: set where a resume is about
-    /// to be read from the row (a source switch, a rejoin after the leadership gate closed; a clean
-    /// stop arrives through `force`).
-    set_write_now: bool,
-    /// The cursor the run would write now is not the one the row holds, and the bound held it back:
-    /// the flush loop wakes for it at the bound (see [`Self::set_write_ready`]).
+    /// The cursor this run would write is not the one the row holds: nothing has moved the position
+    /// to make the next save notice, so this is what tells the flush loop a save is still owed.
     set_pending: bool,
     in_txn: bool,
     /// The current transaction touched something besides our own metadata tables.
@@ -2443,8 +2436,6 @@ impl Engine {
                 pos: 0,
             },
             last_persist: Instant::now(),
-            last_set_write: None,
-            set_write_now: false,
             set_pending: false,
             in_txn: false,
             txn_foreign: false,
@@ -3212,10 +3203,6 @@ impl Engine {
         match connect_source(&self.query_opts, self.cfg.lock_wait_s, &self.metrics).await {
             Ok(c) => {
                 self.src = c;
-                // The row is what a start on the *new* node reads, so the cursor it holds must be
-                // this run's newest word, not one the bound held back: the file/pos pair may name a
-                // position the old node had and the new one does not.
-                self.set_write_now = true;
                 // The new connection probes the commit order again (and re-creates a dropped
                 // fence table).
                 self.commit_fence = None;
@@ -7026,20 +7013,10 @@ impl Engine {
         let batch = self.first_dirty.map(|t| t + self.cfg.batch_window);
         let persist = (self.persist_needed || self.set_pending)
             .then(|| self.last_persist + self.cfg.position_persist_interval);
-        // A held-back cursor rewrite wakes the loop at its own bound (ten times the duration the
-        // last one measured), not on the persist interval: the two halves of the row are on
-        // different clocks precisely because they cost different amounts.
-        let set_wake = self.set_pending.then(|| {
-            self.last_set_write
-                .map_or(Instant::now(), |(at, _)| at + self.set_write_bound())
-        });
         // A closed leadership gate holds the flush: the loop wakes at the end of the hold rather
         // than on every due change, and since `flush_due_within` reads this deadline, neither the
         // batch window nor the persist interval can re-issue a gated flush ahead of it.
-        let next = [urgent, batch, persist, set_wake]
-            .into_iter()
-            .flatten()
-            .min();
+        let next = [urgent, batch, persist].into_iter().flatten().min();
         match (next, self.leader_hold) {
             (Some(d), Some(hold)) => Some(d.max(hold)),
             (None, hold) => hold,
@@ -7101,12 +7078,6 @@ impl Engine {
                 bytes = self.dedup.core.bytes(),
                 "dedup buffers over their bound: flushing"
             );
-        }
-        // The first flush the reopened gate allows (it was closed while the lock could not be
-        // proven): the row has not heard from this instance since, so bring its cursor current
-        // rather than let the bound decide when a resume on another instance reads it.
-        if self.leader_hold.is_some() {
-            self.set_write_now = true;
         }
         self.leader_hold = None;
         let started = Instant::now();
@@ -9553,23 +9524,6 @@ impl Engine {
         self.executed_text.clone()
     }
 
-    /// The bound on a held-back cursor rewrite: ten times what the last one measured on this link,
-    /// which is what keeps the rewrite at about a tenth of the meta link's time whatever speed that
-    /// link is — near every flush where it is fast, rarely where it is not, with nothing to tune. A
-    /// minute's ceiling so that one pathological write (a link held by an admin's `FLUSH TABLES`, a
-    /// toxiproxy run) cannot park the resume point for an hour.
-    fn set_write_bound(&self) -> Duration {
-        10 * self
-            .last_set_write
-            .map_or(Duration::ZERO, |(_, dur)| dur.min(Duration::from_secs(60)))
-    }
-
-    /// Whether the bound above has run out (no cursor written yet counts as "long ago").
-    fn set_write_ready(&self) -> bool {
-        self.last_set_write
-            .is_none_or(|(at, _)| at.elapsed() >= self.set_write_bound())
-    }
-
     async fn persist_position(&mut self, force: bool) -> Result<()> {
         // The leadership gate (ruling 1): the saved position is a row of the coordination store,
         // and an instance whose lock it cannot prove does not own it — the replacement writes it
@@ -9615,15 +9569,15 @@ impl Engine {
             |id| self.dedup.pinned(id),
             unresolved.as_ref(),
         );
-        // Neither half has anything new: the position the pre-cursor columns hold did not move
-        // since the last time the reader was allowed to claim it (`persist_needed`, so a run that
-        // read nothing of its own writes nothing), the cursor column carries the set this run has
-        // (`set_pending`, armed by the save that the bound held back), and the consumed set has not
-        // grown since (`executed_dirty`, the one thing that can make the row's cursor wrong without
-        // moving the position). Look again one interval later (the flush deadline is `last_persist`
-        // + interval; leaving it in the past would spin the loop).
-        let cheap_due = self.persist_needed && pos != self.persisted_at;
-        if !force && !cheap_due && !self.set_pending && !self.executed_dirty {
+        // Nothing has anything to store: the position the row holds did not move since the last time
+        // the reader was allowed to claim it (`persist_needed`, so a run that read nothing of its own
+        // writes nothing), the cursor column already carries the set this run has (`set_pending`,
+        // cleared by the save that wrote it), and the consumed set has not grown since
+        // (`executed_dirty`, the one thing that can make the row's cursor wrong without moving the
+        // position). Look again one interval later (the flush deadline is `last_persist` + interval;
+        // leaving it in the past would spin the loop).
+        let position_moved = self.persist_needed && pos != self.persisted_at;
+        if !force && !position_moved && !self.set_pending && !self.executed_dirty {
             self.last_persist = Instant::now();
             return Ok(());
         }
@@ -9654,64 +9608,37 @@ impl Engine {
         };
         self.persist_needed = true;
         let wanted = Cursor::from_position(self.flavor, &pos).with_gtid(gtid);
-        // The two halves of the row, written apart and for different reasons.
+        // One statement per save, the whole row: `binlog_file`/`binlog_pos` and `binlog_cursor`
+        // together, so the row never holds a position ahead of the set that was written with it. What
+        // that costs is the size of the consumed set — tens of kilobytes on a long-lived or
+        // fragmented source — which is why the save is not on the event path and the row is compared
+        // before it is written. Measuring the cost and pacing it is a separate step (PR B of #347);
+        // here the row simply tells the truth about what this run has consumed, every time the truth
+        // changes.
         //
-        // `binlog_file`/`binlog_pos` are a fixed ~60 bytes and the apply loop's own resume point:
-        // they go with every flush that moved the position ([`meta::save_position_at`], one
-        // statement, no read-back). `binlog_cursor` is the position *and* the consumed set, and its
-        // cost is the size of that set — tens of kilobytes on a long-lived or fragmented source —
-        // so rewriting it on the flush path handed the meta link a bill the apply loop had to wait
-        // for. On the CI leg that fragmenting link runs one byte per 2 ms, that bill was every
-        // flush and the run never caught up (run 45446296665, `chaos_both_sides`).
-        //
-        // The cursor therefore follows on a bound measured on the link itself: the next rewrite
-        // waits ten times what the last one took, so it costs the link a tenth of its time — near
-        // every flush where the link is fast, rarely where it is not, with nothing to tune. What a
-        // held-back rewrite costs is a restart that re-reads the binlog its cursor has not reached
-        // yet: safe, because re-applying a change is idempotent (the rule
-        // `lifecycle_resumes_from_a_cursor_behind_the_applied_position` exists to prove, not to
-        // assert), and the same kind of lag `LAZYVIEW_POSITION_PERSIST_MS` already accepts. The
-        // three moments a resume is actually read from the row — a clean stop, a source switch, a
-        // rejoin after the leadership gate closed — write it at once, whatever the bound says.
-        let cursor_due = wanted.to_string() != self.persisted.to_string()
-            && (force || self.set_write_now || self.set_write_ready());
-        if cursor_due {
-            // The save is the engine's own word that the row holds this cursor byte for byte:
-            // `meta::save_position` refuses a cursor the column cannot hold whole with an error
-            // naming its size, the limit and the cause (a pathologically fragmented
-            // `gtid_executed`) — never shortened, and `meta::MAX_CURSOR_BYTES` says why: the set is
-            // what a resume on another server is checked against, so shedding it (what #356 did)
-            // silently disables resume-by-GTID for the long-lived clusters whose set outgrows a
-            // column. An error here stops the run: a position we cannot prove is stored is a resume
-            // we cannot prove is safe.
-            let began = Instant::now();
-            let saved = meta::save_position(
-                &mut self.meta,
-                &self.cfg.instance_id,
-                &wanted,
-                self.leader.epoch,
-            )
-            .await?;
-            // Measured on the real link, which is the only clock the bound can use.
-            self.last_set_write = Some((Instant::now(), began.elapsed()));
-            self.set_write_now = false;
-            // What the row holds, which `save_position` has just measured: `persisted`'s set is the
-            // one later saves carry forward.
-            self.persisted = saved;
-            self.persisted_at = pos.clone();
-        } else if pos != self.persisted_at {
-            meta::save_position_at(
-                &mut self.meta,
-                &self.cfg.instance_id,
-                &pos,
-                self.leader.epoch,
-            )
-            .await?;
-            self.persisted_at = pos.clone();
-        }
+        // The save is the engine's own word that the row holds this cursor byte for byte:
+        // `meta::save_position` refuses a cursor the column cannot hold whole with an error naming
+        // its size, the limit and the cause (a pathologically fragmented `gtid_executed`) — never
+        // shortened, and `meta::MAX_CURSOR_BYTES` says why: the set is what a resume on another
+        // server is checked against, so shedding it (what #356 did) silently disables resume-by-GTID
+        // for the long-lived clusters whose set outgrows a column. An error here stops the run: a
+        // position we cannot prove is stored is a resume we cannot prove is safe.
+        let wanted_text = wanted.to_string();
+        let saved = meta::save_position(
+            &mut self.meta,
+            &self.cfg.instance_id,
+            &wanted,
+            self.leader.epoch,
+        )
+        .await?;
+        // What the row holds, which `save_position` has just measured and read back byte for byte:
+        // `persisted`'s set is the one later saves carry forward when the position is held below the
+        // boundary (ruling 6).
+        self.persisted = saved;
+        self.persisted_at = pos.clone();
         // Held back: save again once the pending changes are applied.
         self.persist_needed = pos < self.boundary.to_position();
-        self.set_pending = wanted.to_string() != self.persisted.to_string();
+        self.set_pending = wanted_text != self.persisted.to_string();
         self.last_persist = Instant::now();
         Ok(())
     }
