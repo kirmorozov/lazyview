@@ -298,12 +298,13 @@ jobs:
         # below (strict there); filtered out here so it never runs twice.
         # The gate below is scripts/chaos-gate.sh with tests/integration-known-red.txt, used exactly
         # as the chaos steps use it: any failing test this file does not list FAILS the step (a
-        # ::error:: per test names the file to fix), and the one listed test
-        # (pinned::reg_cascade_refusal_seed_replay, #319) still runs and is reported in the job
-        # summary with its issue. No continue-on-error, no skip, no retry; the entry is temporary
-        # and owner-approved (2026-11-22) and #319's fix PR deletes it, and with the file empty this
-        # step is strict exactly as it stands. The gate's SKIP guard is chaos-specific, so the skip
-        # discipline of this step stays what LAZYVIEW_TEST_STRICT above already enforces.
+        # ::error:: per test names the file to fix), and a listed one still runs and is reported in
+        # the job summary with its issue. No continue-on-error, no skip, no retry; every entry is
+        # temporary and owner-approved and its fix PR deletes it. Two entries went with the
+        # saved-position fix — `pinned::reg_cascade_refusal_seed_replay` (#319) and
+        # `lifecycle_crash_consistency` (#345), neither of which anyone has reproduced — so only
+        # `bench_throughput_shapes` (#378) is listed. The gate's SKIP guard is chaos-specific, so
+        # the skip discipline of this step stays what LAZYVIEW_TEST_STRICT above already enforces.
         # --color never: the gate's greps read these lines as plain text. The exit status of cargo
         # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
         run: |

@@ -14,19 +14,19 @@
 # and the fix PR for its issue MUST delete the entry here: this file is not a place to park a
 # failing test.
 #
-# `pinned::reg_cascade_refusal_seed_replay` entered this list on owner approval (2026-11-22) for the
-# cascade-seed replay that kept main red since 0225453. It stays. PR #329 fixed the half of it that
-# was the harness: the crash now runs at the engine's own caught-up point with a seeded window batch
-# instead of at a wall-clock instant with whatever the writers had emitted, so a run can no longer be
-# red because "the reproduction did not fire". What it is red for now is the other half, the engine's:
-# after the crash replay the materialised view is still one row short of the oracle and stays short on
-# the re-check (`oracle has 1195 rows, MV has 1194` on `mariadb123`, run `fix-m123/a4-015226Z`). That
-# is a data-consistency failure and no tolerance is being asked for it: the PR that fixes the engine
-# deletes this line.
-pinned::reg_cascade_refusal_seed_replay #319
-
 # Fix will follow (owner 2026-11-24: temporary, so main is mostly green while these are fixed). Each line
 # is a real failure with an open issue and a fix in flight; the fix PR (or the keeper pass that lands it)
 # deletes its line. These are not by-design reds and must not stay.
-lifecycle_crash_consistency #345
 bench_throughput_shapes #378
+#
+# The two entries the saved-position branch `kirmorozov/lv-worker-mode1-c1c2` removed (the frozen
+# live buffer and the build replacing it, `pending_floor` / `persist_position`):
+# `lifecycle_crash_consistency` (#345, percona84, base seed 271955029054) and
+# `pinned::reg_cascade_refusal_seed_replay` (#319, mariadb123, base seed 700674392118 at the default
+# and at the TPS-400 writer rate, red as `oracle has 1195 rows, MV has 1194`). Neither was reproduced
+# by anyone, so neither is claimed fixed: the hunt record (tmp/out/lvs-cascseed/mode1-fix/tally.md)
+# is 0 mode-1 reds in 48 runs, 36 of them reaching the oracle check, and those recorded seeds are
+# green on main's binary and on that branch's alike. The honest state is "not reproduced", and both
+# tests run strict again. If either comes back, the engine now prints one line per whole-view
+# refresh naming the position it read the source at and whether an XA transaction was open there —
+# the evidence a red of this shape was missing.
