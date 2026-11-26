@@ -1128,8 +1128,8 @@ impl PgConn {
                             .map(|&i| {
                                 r.get(i)
                                     .cloned()
-                                    .map(crate::datum::Datum::from_value)
-                                    .unwrap_or(crate::datum::Datum::Null)
+                                    .map(Datum::from_value)
+                                    .unwrap_or(Datum::Null)
                             })
                             .collect::<Vec<_>>()
                     });
@@ -1138,9 +1138,16 @@ impl PgConn {
                 }
                 None => &d.inserts,
             };
-            insert_rows_on(c, schema, table, layout, rows, w, true, metrics).await?;
+            // A key with a NULL never conflicts in the unique index, so its row is not upserted
+            // but replaced: its old row goes first (after the upsert it would take the new row
+            // with it). Every other gone key is deleted after the upsert.
             let mut gone = d.delete_keys.clone();
             gone.sort_unstable();
+            let (nulls, gone): (Vec<Key>, Vec<Key>) = gone
+                .into_iter()
+                .partition(|k| k.iter().any(|v| matches!(v, Datum::Null)));
+            delete_keys_on(c, schema, table, layout, &nulls, w, metrics).await?;
+            insert_rows_on(c, schema, table, layout, rows, w, true, metrics).await?;
             delete_keys_on(c, schema, table, layout, &gone, w, metrics).await?;
             Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
         }
