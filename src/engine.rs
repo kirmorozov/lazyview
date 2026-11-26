@@ -8420,7 +8420,7 @@ impl Engine {
         if l.frozen || l.dirty.is_empty() || backing_off {
             return None;
         }
-        let dirty = l.dirty.take();
+        let mut dirty = l.dirty.take();
         let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
         // Two kinds of excluded target, and they are not alike. `lag` holds the ones whose WRITES
         // failed: the round must not hand them another connection. `behind` holds the ones that
@@ -8511,7 +8511,30 @@ impl Engine {
                         }
                     }
                 }
-                if dirty.rebuild {
+                // #214 (regression this PR must not ship with, found on
+                // `chaos_tgt_bandwidth_starvation`, percona84, seed 475028141089): only the half the
+                // owed sets can NAME goes into them. `images`, `marks` and `holds` are BASE-ROW keys,
+                // not units — their units exist only after a lookup against the materialized table
+                // (`prepare_refresh`'s `lookups` / `presence_lookups`), and a round with no eligible
+                // target has nobody to read that from. Dropping them loses the DELETE half of the
+                // change on EVERY target at once: the oracle reported `w_item_entity_grp` 267 / 272
+                // with `0 row(s) missing, 5 unexpected`, the same five rows (all `total_qty='0.103'`)
+                // wrong on `source` and on `t1` — a write set that missed them would be wrong on one
+                // target only, so the loss is upstream of the write set, in the taken buffer. Main
+                // converges on that seed: there the empty write set made the MV read fail and
+                // `live_end`'s error arm merged the whole buffer back. So the keys no owed set can
+                // carry stay buffered until a round has a target to read them from; the units above
+                // are owed either way, and delivering a unit twice is idempotent (a unit write
+                // deletes then inserts). Cost: these three fields live in the buffer instead of being
+                // dropped, which is main's lifetime for them.
+                if !dirty.rebuild {
+                    l.dirty.merge(ViewDirty {
+                        images: std::mem::take(&mut dirty.images),
+                        marks: std::mem::take(&mut dirty.marks),
+                        holds: std::mem::take(&mut dirty.holds),
+                        ..Default::default()
+                    });
+                } else {
                     // A rebuild is not carried by the owed sets alone. The view's own maintenance
                     // IS this buffer: `flush_deadline` wakes the loop for `rebuild` / for `all` on a
                     // Full-mode plan (`src/engine.rs:6423`), and the Full branch below starts the
