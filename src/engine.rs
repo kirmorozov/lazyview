@@ -8335,9 +8335,11 @@ impl Engine {
                 Metrics::add(&self.metrics.target_catchups, 1);
                 // The target is maintained again from now on, the way `lag_end` readmits one whose
                 // writes finally landed: back into the live version's targets (the cap took it out,
-                // and a partial build swaps only what it built on), its `Down` entry gone with the
-                // entry, and the Part B gauge back to 0 with the one line that pairs with the down
-                // one — the same authority `lag_end` reads, so the pair is what `/metrics` shows.
+                // and a partial build swaps only what it built on; the target reached this point
+                // through a lag entry, which only a target the definition lists can grow), its
+                // `Down` entry gone with the entry, and the Part B gauge back to 0 with the one line
+                // that pairs with the down one — the same authority `lag_end` reads, so the pair is
+                // what `/metrics` shows as 1 / 0.
                 if let Some(l) = self.slots[i].live.as_mut() {
                     if !l.targets.contains(t) {
                         l.targets.push(t.clone());
