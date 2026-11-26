@@ -14,9 +14,9 @@ use std::time::Instant;
 use anyhow::Result;
 use mysql_async::Conn;
 
-use crate::access::{AccessPlan, Hop, Path, Route, Via};
+use crate::access::{self, AccessPlan, Hop, Occurrence, Path, Route, Via};
 use crate::accumulate::{UnitChunk, UnitSet, ViewDirty};
-use crate::analyze::ViewPlan;
+use crate::analyze::{MapPlan, ViewPlan};
 use crate::binlog::Position;
 
 use crate::cascade::Cache;
@@ -161,6 +161,113 @@ impl Dedup {
         })
     }
 
+    /// Pairs the items of `a` off against those of `b` under `same`, in any order: a multiset
+    /// match, where one item answers exactly one item, so a duplicate on one side needs its twin
+    /// on the other. The order of these lists is the order the query WRITES its sources in, and
+    /// the names in them are the names the query spells for them — neither is a fact the core
+    /// reads, so the comparisons below pair items off instead of walking the two `Vec`s in step.
+    fn same_unordered<T, U>(a: &[T], b: &[U], same: impl Fn(&T, &U) -> bool) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut rest: Vec<&U> = b.iter().collect();
+        a.iter()
+            .all(|x| match rest.iter().position(|y| same(x, y)) {
+                Some(i) => {
+                    rest.remove(i);
+                    true
+                }
+                None => false,
+            })
+    }
+
+    /// Whether the core compiles the same classifier from two occurrences: `Consumer::add` takes
+    /// the read mask from `table` and `read_columns`, which rows are the alias's from `filters`,
+    /// and the `Way` from `path`. It never reads `Occurrence::alias`, the name the query happens
+    /// to spell for the table (the analyzer resolved it into the plan's ordinals), so `FROM items
+    /// i` and `FROM items x` are the same classifier over the same rows.
+    fn same_occurrence(x: &Occurrence, y: &Occurrence) -> bool {
+        x.table == y.table
+            && x.read_columns == y.read_columns
+            && x.filters == y.filters
+            && x.path == y.path
+    }
+
+    /// Whether both plans have the same unit as the core reads it: its expressions, in order (a
+    /// unit is an ordered tuple, so a permutation is another unit), and whether one unit maps to
+    /// at most one materialized row. `IdPart::output` is left out: the index of the projection
+    /// column that happens to yield an expression, while the core marks units by value.
+    fn same_unit(a: &access::TargetId, b: &access::TargetId) -> bool {
+        a.unique == b.unique
+            && a.parts.len() == b.parts.len()
+            && a.parts.iter().zip(&b.parts).all(|(x, y)| x.expr == y.expr)
+    }
+
+    /// Whether the core's consumer classifies rows identically for the two plans: the same
+    /// occurrences (each source table, the columns it reads, its constant filters, the path its
+    /// changed rows take to the units), the same cascades, and the same unit. `Occurrence` is that
+    /// classification itself: `Consumer::add` compiles an occurrence's read mask from
+    /// `read_columns` and its table, its filters from `filters`, and its `Way` from `path`, and the
+    /// map routes come from `cascades` and the child's stored columns.
+    ///
+    /// What a re-plan changes besides these — its name, hash, the order the sources are written
+    /// in, how each source is aliased, which projection column yields a unit — leaves the rows it
+    /// derives alone, so each list is paired off by these facts rather than position by position.
+    fn same_consumer_reads(a: &AccessPlan, b: &AccessPlan) -> bool {
+        Self::same_unit(&a.id, &b.id)
+            && Self::same_unordered(&a.occurrences, &b.occurrences, Self::same_occurrence)
+            && Self::same_unordered(&a.cascades, &b.cascades, |x, y| x == y)
+    }
+
+    /// Whether two cascade maps keep the same rows: the same key, the same stored columns, and
+    /// the same filters of the child's aliases. Those lists are paired off too — `MapPlan::keeps`
+    /// passes a row that answers the filters of SOME alias, so the order the child's aliases were
+    /// written in decides nothing about what the cache keeps.
+    fn same_map(x: &MapPlan, y: &MapPlan) -> bool {
+        x.key == y.key
+            && x.cols == y.cols
+            && Self::same_unordered(&x.filters, &y.filters, |x, y| x == y)
+    }
+
+    /// Whether both plans were made against the same source columns: same aliases over the same
+    /// tables with the same layouts, same cascades over the same parent and child with the same
+    /// map of what the cascade cache keeps. A difference here means a DDL moved the layout under
+    /// the plan (not the definition), which is what the TABLE_MAP handler's shape machinery
+    /// (`core_hold_prefix`, `mark_shape_stale`) is for. The two lists are paired off, like the
+    /// reads above: which source the query writes first, and what it calls it, moves no column.
+    fn same_source_layouts(kept: &ViewPlan, plan: &ViewPlan) -> bool {
+        Self::same_unordered(&kept.aliases, &plan.aliases, |x, y| x.table == y.table)
+            && Self::same_unordered(&kept.cascades, &plan.cascades, |x, y| {
+                x.parent == y.parent
+                    && x.child == y.child
+                    && x.child_table == y.child_table
+                    && match (&x.map, &y.map) {
+                        (Some(x), Some(y)) => Self::same_map(x, y),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+    }
+
+    /// Whether `sync` may hold a replace of `kept` by `plan` while the target's queue drains:
+    /// meanwhile the REGISTERED consumer is the one deciding which rows of this view's tables are
+    /// irrelevant, so holding is free only when both consumers decide the same way.
+    ///
+    /// A re-plan of the same definition (its hash: a DDL's new column positions, a re-analyze)
+    /// keeps the rule as it was - the shape machinery above holds on it. A changed definition
+    /// waits only over unchanged source columns and identical reads, and those are compared by
+    /// what the core reads: in any written order, under any alias spelling. #385 was a definition
+    /// change that started reading a column the previous definition did not read, and while the
+    /// hold was in force a change to that column was skipped as irrelevant for a materialized
+    /// table that already had it, with nothing left to re-derive the row.
+    ///
+    /// Cost: two `AccessPlan::of` calls per replace of a busy target, never per row.
+    fn may_hold_replace(kept: &ViewPlan, plan: &ViewPlan) -> bool {
+        let (a, b) = (AccessPlan::of(kept), AccessPlan::of(plan));
+        a.hash == b.hash
+            || (Self::same_source_layouts(kept, plan) && Self::same_consumer_reads(&a, &b))
+    }
+
     /// Mirrors `live` (definition id, plan) onto core targets: a routed plan gets a target (added, or
     /// replaced in place when the plan object changed), and every target not listed is removed. A target
     /// starts at once (`start` = the smallest position): lazyview adds them between transactions.
@@ -232,8 +339,16 @@ impl Dedup {
                 if kept.unit_exprs == plan.unit_exprs && kept.partial.sets == plan.partial.sets {
                     // `replace_target` re-registers the hops (their ids are never reused):
                     // items still buffered under the old plan would name dead hops. Hold the
-                    // replace until the target's queue has drained (`advance_replacements`).
-                    if self.core.pending(*t) > 0 || self.core.busy(*t) {
+                    // replace until the target's queue has drained (`advance_replacements`) —
+                    // and hold it only while that costs nothing. Until the replace runs, the
+                    // REGISTERED consumer is the one deciding which rows of this view's tables
+                    // are irrelevant, so a re-plan that reads differently must not wait:
+                    // #385 was a definition change that started reading a column the previous
+                    // definition did not read, and while the hold was in force a change to that
+                    // column was skipped as irrelevant for a materialized table that already
+                    // had it, with nothing left to re-derive the row.
+                    let queued = self.core.pending(*t) > 0 || self.core.busy(*t);
+                    if queued && Self::may_hold_replace(kept, plan) {
                         self.pending_replace.insert(*id, plan.clone());
                         self.refused.remove(id);
                         add = false;
@@ -439,9 +554,11 @@ impl Dedup {
     }
 
     /// Whether the core runs `plan` for `def_id`: pointer-equal to the registered plan, or an
-    /// equal-shape replace held back by `sync` (`replacing`: the running target reads the same
-    /// way) that is not marked shape-stale - while marked, the registered source was built for
-    /// another column layout and would silently drop the occurrences it skips by column count.
+    /// equal-shape replace held back by `sync` (`replacing`: `sync` holds one only when both
+    /// consumers classify rows the same way, [`Self::may_hold_replace`], which is what makes the
+    /// running target read the same way) that is not marked shape-stale - while marked, the
+    /// registered source was built for another column layout and would silently drop the
+    /// occurrences it skips by column count.
     pub fn plan_matches(&self, def_id: u64, plan: &Arc<ViewPlan>) -> bool {
         self.entries.get(&def_id).is_some_and(|e| {
             Arc::ptr_eq(&e.plan, plan)
@@ -813,6 +930,28 @@ mod tests {
                                 item_values v1 ON v1.item_id = i.id AND v1.key_id = 7 JOIN \
                                 item_values v2 ON v2.key_id = l.parent_id GROUP BY l.parent_id, \
                                 i.id";
+    /// `TWO_PARTIALS` with its two `item_values` joins written the other way round: the same
+    /// reads in another written order (`AccessPlan::occurrences` follow the query).
+    const JOINS_PERMUTED: &str = "SELECT l.parent_id, i.id, MAX(v1.val) AS a, MAX(v2.val) AS b \
+                                  FROM item_links l JOIN items i ON i.id = l.child_id JOIN \
+                                  item_values v2 ON v2.key_id = l.parent_id JOIN item_values v1 \
+                                  ON v1.item_id = i.id AND v1.key_id = 7 GROUP BY l.parent_id, \
+                                  i.id";
+    /// `TWO_PARTIALS` with the two `item_values` aliases spelled `k1` and `k2`: the same reads
+    /// under other names (`Occurrence::alias` is what the query happens to spell).
+    const JOINS_RENAMED: &str = "SELECT l.parent_id, i.id, MAX(k1.val) AS a, MAX(k2.val) AS b \
+                                 FROM item_links l JOIN items i ON i.id = l.child_id JOIN \
+                                 item_values k1 ON k1.item_id = i.id AND k1.key_id = 7 JOIN \
+                                 item_values k2 ON k2.key_id = l.parent_id GROUP BY l.parent_id, \
+                                 i.id";
+    /// `JOINS_PERMUTED` with one more column of `v2` in the projection: another written order AND
+    /// another read, so the consumer must go through at once.
+    const JOINS_PERMUTED_READS_MORE: &str = "SELECT l.parent_id, i.id, MAX(v1.val) AS a, \
+                                             MAX(v2.val) AS b, MAX(v2.note) AS c \
+                                             FROM item_links l JOIN items i ON i.id = l.child_id \
+                                             JOIN item_values v2 ON v2.key_id = l.parent_id JOIN \
+                                             item_values v1 ON v1.item_id = i.id AND v1.key_id = 7 \
+                                             GROUP BY l.parent_id, i.id";
 
     #[test]
     fn routed_follows_the_access_plan() {
@@ -1011,6 +1150,374 @@ mod tests {
         assert_eq!(s.replaced, vec![1], "{s:?}");
         assert_ne!(d.entry(1).unwrap().target, t0);
         assert!(Arc::ptr_eq(&d.entry(1).unwrap().plan, &q));
+    }
+
+    /// The classifier's rule, which #385 turned against a view: a row change that touches no
+    /// column the plan reads is skipped as irrelevant and marks nothing. `items`.`owner_id` is
+    /// column 2, which [`DIRECT`] does not read; the view that starts reading it must not keep
+    /// this classifier (see `a_definition_change_replaces_the_consumer_while_the_queue_is_busy`).
+    #[test]
+    fn a_change_to_an_unread_column_is_skipped_as_irrelevant() {
+        let mut d = dedup();
+        d.sync(&[(1, plan(DIRECT))]);
+        let t = d.entry(1).unwrap().target;
+        let items = d
+            .core
+            .source(&table_ref("items"), Some(3))
+            .expect("watched");
+        d.core.take_stats(t);
+        d.core.row(
+            &items,
+            Some(&row(&[Some(4), Some(7), Some(1)])),
+            Some(&row(&[Some(4), Some(7), Some(9)])),
+        );
+        let s = d.core.take_stats(t);
+        assert_eq!((s.rows, s.rows_skipped, s.ids_marked), (1, 1, 0), "{s:?}");
+    }
+
+    /// #385 (CI, `migration_definition_change_crawl_outlives_the_fixed_ready_floor`, mariadb118,
+    /// seed 976365634362): two rows kept the `customer_id` they had before an `UPDATE` — the
+    /// column the definition change ADDS. `sync` held the equal-shape replace while the target's
+    /// queue was busy, so the OLD plan kept deciding which rows were irrelevant for a materialized
+    /// table that already had the new column: the change was skipped as irrelevant and, no further
+    /// change for that key ever arriving, nothing re-derived the row.
+    ///
+    /// A re-plan that reads differently therefore goes through at once, queue or no queue: the
+    /// hold exists for the hop ids `replace_target` re-registers, not for the classifier.
+    #[test]
+    fn a_definition_change_replaces_the_consumer_while_the_queue_is_busy() {
+        let mut d = dedup();
+        let old = plan(DIRECT);
+        d.sync(&[(1, old.clone())]);
+        let t = d.entry(1).unwrap().target;
+        let items = d
+            .core
+            .source(&table_ref("items"), Some(3))
+            .expect("watched");
+        d.core
+            .row(&items, None, Some(&row(&[Some(3), Some(7), Some(0)])));
+        assert!(
+            d.core.pending(t) > 0 || d.core.busy(t),
+            "the fed row is work in flight"
+        );
+
+        // The definition change: the view now also reads `owner_id`. Same unit, same spaces: the
+        // shape `sync` would otherwise hold for the queue.
+        let new = plan("SELECT i.id, i.kind_id, i.owner_id FROM items i");
+        let s = d.sync(&[(1, new.clone())]);
+        assert_eq!(
+            s.replaced,
+            vec![1],
+            "the new definition classifies this view's rows from now on: {s:?}"
+        );
+        assert!(Arc::ptr_eq(&d.entry(1).unwrap().plan, &new));
+        assert!(
+            !d.replacing(1),
+            "no replace is held back for a plan that reads differently"
+        );
+
+        // A change to the column the old definition did not read, for a key the buffer has never
+        // seen: it marks its unit, so the row is re-derived. The replace retired `t`.
+        let t = d.entry(1).unwrap().target;
+        d.core.take_stats(t);
+        d.core.row(
+            &items,
+            Some(&row(&[Some(4), Some(7), Some(1)])),
+            Some(&row(&[Some(4), Some(7), Some(9)])),
+        );
+        let s = d.core.take_stats(t);
+        assert_eq!(s.rows_skipped, 0, "skipped as irrelevant: {s:?}");
+        assert!(
+            s.ids_marked > 0,
+            "the row was not marked for a refresh: {s:?}"
+        );
+    }
+
+    /// The other half of the rule: a re-plan that reads the SAME way still waits for the queue
+    /// (`sync_holds_a_replan_until_the_target_drains`), so `plan_matches`'s claim — a held
+    /// replace is the plan the running target reads — holds.
+    #[test]
+    fn a_replan_that_reads_the_same_waits_for_the_queue() {
+        let of = |sql: &str| AccessPlan::of(&plan(sql));
+        assert!(Dedup::same_consumer_reads(
+            &of(DIRECT),
+            &of("SELECT i.id AS whatever, i.kind_id FROM items i")
+        ));
+        // The column the view starts (or stops) reading is the classifier, not just the output.
+        assert!(!Dedup::same_consumer_reads(
+            &of(DIRECT),
+            &of("SELECT i.id, i.kind_id, i.owner_id FROM items i")
+        ));
+        // So is a constant filter: it decides which rows of an alias are its rows at all. (The
+        // analyzer's `ConstFilter` carries equality and IN predicates, so that is what a filter
+        // difference looks like to the consumer.)
+        assert!(!Dedup::same_consumer_reads(
+            &of(DIRECT),
+            &of("SELECT i.id, i.kind_id FROM items i WHERE i.owner_id = 7")
+        ));
+        assert!(
+            Dedup::may_hold_replace(
+                &plan(DIRECT),
+                &plan("SELECT i.id AS whatever, i.kind_id FROM items i")
+            ),
+            "a definition that classifies the rows the same way may wait"
+        );
+        assert!(
+            !Dedup::may_hold_replace(
+                &plan(DIRECT),
+                &plan("SELECT i.id, i.kind_id, i.owner_id FROM items i")
+            ),
+            "one that starts reading a column may not (#385)"
+        );
+    }
+
+    /// The written order of the FROM clause and the names the query spells for its sources are
+    /// not facts the core reads: the same view with its two `item_values` joins the other way
+    /// round, or with those two aliases spelled `k1`/`k2`, classifies rows exactly as before and
+    /// so keeps waiting for the queue. What still goes through at once is a plan that READS
+    /// differently - here the permuted query with one more column of `v2`, the #385 shape.
+    #[test]
+    fn a_permuted_join_or_a_renamed_alias_keeps_the_hold() {
+        let of = |sql: &str| AccessPlan::of(&plan(sql));
+        let (base, permuted) = (of(TWO_PARTIALS), of(JOINS_PERMUTED));
+        assert_ne!(
+            base.occurrences, permuted.occurrences,
+            "each plan lists its occurrences in the order the query writes them: this is the \
+             pair a positional comparison refused"
+        );
+        assert!(
+            Dedup::same_consumer_reads(&base, &permuted),
+            "the same sources read the same way, in another order: {base:?} vs {permuted:?}"
+        );
+        let (base, renamed) = (of(TWO_PARTIALS), of(JOINS_RENAMED));
+        assert_ne!(
+            renamed.occurrences, base.occurrences,
+            "the two plans spell two aliases differently"
+        );
+        assert!(
+            base.occurrences
+                .iter()
+                .zip(&renamed.occurrences)
+                .all(|(x, y)| x.table == y.table
+                    && x.read_columns == y.read_columns
+                    && x.filters == y.filters
+                    && x.path == y.path)
+                && base
+                    .occurrences
+                    .iter()
+                    .zip(&renamed.occurrences)
+                    .any(|(x, y)| x.alias != y.alias),
+            "the spelling is the only difference: {base:?} vs {renamed:?}"
+        );
+        assert!(
+            Dedup::same_consumer_reads(&base, &renamed),
+            "the same sources under other names: {base:?} vs {renamed:?}"
+        );
+        for (what, kept_sql, next_sql) in [
+            ("a permuted join", TWO_PARTIALS, JOINS_PERMUTED),
+            ("a renamed source alias", TWO_PARTIALS, JOINS_RENAMED),
+            ("both at once", JOINS_PERMUTED, JOINS_RENAMED),
+        ] {
+            let (kept, next) = (plan(kept_sql), plan(next_sql));
+            assert!(
+                Dedup::same_source_layouts(&kept, &next),
+                "{what}: no column moved"
+            );
+            assert!(
+                Dedup::may_hold_replace(&kept, &next),
+                "{what}: a definition that reads the same may wait for the queue"
+            );
+        }
+        assert!(
+            !Dedup::may_hold_replace(&plan(TWO_PARTIALS), &plan(JOINS_PERMUTED_READS_MORE)),
+            "the permuted join that also starts reading a column replaces at once (#385)"
+        );
+    }
+
+    /// The same rule where it costs something: the target's queue is busy, and a re-plan that
+    /// only reordered its joins is still held (`sync_holds_a_replan_until_the_target_drains`
+    /// pins the re-plan of one definition; this is the re-plan of a DIFFERENT one, whose hash
+    /// therefore cannot answer for it), while the consumer classifies rows the old way
+    /// meanwhile. That is free only because it reads the same columns.
+    #[test]
+    fn sync_holds_a_replan_that_only_reordered_its_joins() {
+        let mut d = dedup();
+        let p = plan(TWO_PARTIALS);
+        d.sync(&[(1, p.clone())]);
+        let t0 = d.entry(1).unwrap().target;
+        let items = d
+            .core
+            .source(&table_ref("items"), Some(3))
+            .expect("watched");
+        d.core
+            .row(&items, None, Some(&row(&[Some(3), Some(7), Some(0)])));
+        assert!(
+            d.core.pending(t0) > 0 || d.core.busy(t0),
+            "the fed row is work in flight"
+        );
+
+        let q = plan(JOINS_PERMUTED);
+        let s = d.sync(&[(1, q.clone())]);
+        assert!(
+            s.replaced.is_empty() && s.added.is_empty(),
+            "a re-plan that reads the same in another order waits: {s:?}"
+        );
+        assert_eq!(
+            d.entry(1).unwrap().target,
+            t0,
+            "the old target serves meanwhile"
+        );
+        assert!(Arc::ptr_eq(&d.entry(1).unwrap().plan, &p));
+        drain(&mut d, t0);
+        assert_eq!(d.advance_replacements().replaced, vec![1]);
+        assert!(Arc::ptr_eq(&d.entry(1).unwrap().plan, &q));
+    }
+
+    /// The arm of `may_hold_replace` a DDL's re-plan never reaches (the same definition
+    /// short-circuits on its hash): a CHANGED definition over a source whose layout moved. Two
+    /// definitions that classify rows identically are not enough — while the replace waits, the
+    /// rows still flowing are classified and cached over the layout the OLD plan was made
+    /// against, which is what `mark_shape_stale` keeps the two writers from doing at once.
+    #[test]
+    fn a_changed_definition_over_a_moved_layout_is_not_held() {
+        let col = |n: &str| crate::catalog::Column::new(n, "int", "int", None, None, None, false);
+        // `items` as the three columns the view reads, with `note` appended (a DDL added a
+        // column), or with a UNIQUE key over `owner_id` (a DDL added an index) - a layout the
+        // plan's own reads never look at.
+        let catalog = |extra: bool, key: bool| {
+            let mut cols = vec![col("id"), col("kind_id"), col("owner_id")];
+            if extra {
+                cols.push(col("note"));
+            }
+            let (t, info) = typed("items", cols, &[0]);
+            let mut info = (*info).clone();
+            if key {
+                info.unique_keys = vec![vec![2]];
+            }
+            [(t, Arc::new(info))].into_iter().collect::<HashMap<_, _>>()
+        };
+        // A different definition (its hash) of the same two columns.
+        const CHANGED: &str = "SELECT i.id AS whatever, i.kind_id FROM items i";
+        let plain = catalog(false, false);
+        assert!(
+            Dedup::may_hold_replace(&plan_in(DIRECT, &plain), &plan_in(CHANGED, &plain)),
+            "two definitions over one layout, the same reads: they may wait"
+        );
+
+        let before = plan_in(DIRECT, &plain);
+        let after = plan_in(CHANGED, &catalog(true, false));
+        assert!(
+            !Dedup::same_source_layouts(&before, &after),
+            "the same columns are not the same table"
+        );
+        assert!(
+            !Dedup::may_hold_replace(&before, &after),
+            "a changed definition over an added column replaces at once"
+        );
+
+        // The case that pins the arm alone: a layout the reads cannot see at all, so the only
+        // thing that can refuse the hold is the layout comparison.
+        let after = plan_in(CHANGED, &catalog(false, true));
+        assert!(
+            Dedup::same_consumer_reads(&AccessPlan::of(&before), &AccessPlan::of(&after)),
+            "the classifier is unchanged: what moved is a key the view never reads"
+        );
+        assert!(
+            !Dedup::same_source_layouts(&before, &after),
+            "a layout the reads cannot see has still moved"
+        );
+        assert!(
+            !Dedup::may_hold_replace(&before, &after),
+            "a DDL under a changed definition replaces at once: the queue would be delivered \
+             over a map of the other layout"
+        );
+    }
+
+    /// The other comparison of `same_source_layouts` no re-plan of one definition can reach: the
+    /// map the cascade cache keeps of the child's rows. Two definitions that read the same over
+    /// `fk_catalog(true)` wait for the queue; a map carrying something else (what a DDL on the
+    /// child leaves it: its aliases pinned differently while the key and the stored columns
+    /// stand) sends the replace through at once. The second plan's map is set directly because
+    /// one child cannot have two layouts in two catalogs: the second catalog would move
+    /// `child_table` too, which the alias comparison already refuses, and the test would no
+    /// longer name which comparison answered.
+    #[test]
+    fn a_changed_definition_whose_cascade_map_moved_is_not_held() {
+        let cat = fk_catalog(true);
+        let before = plan_in(
+            "SELECT o.oid, MAX(a.val) AS x FROM obj o \
+             JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 GROUP BY o.oid",
+            &cat,
+        );
+        let mut after = Arc::unwrap_or_clone(plan_in(
+            "SELECT o.oid, MAX(a.val) AS whatever FROM obj o \
+             JOIN obj_attr a ON a.oid = o.oid AND a.aid = 7 GROUP BY o.oid",
+            &cat,
+        ));
+        let at = before
+            .cascades
+            .iter()
+            .position(|c| c.map.is_some())
+            .expect("fk_catalog(true) gives a mapped cascade");
+        assert!(
+            Dedup::may_hold_replace(&before, &Arc::new(after.clone())),
+            "two definitions over one layout, the same reads: they may wait"
+        );
+        let pin = |col: usize, v: i64| crate::analyze::ConstFilter {
+            col,
+            values: vec![Datum::Int(v)],
+        };
+        after.cascades[at].map.as_mut().unwrap().filters = vec![vec![pin(1, 7)], vec![pin(1, 8)]];
+        let pinned = Arc::new(after.clone());
+        assert!(
+            Dedup::same_consumer_reads(&AccessPlan::of(&before), &AccessPlan::of(&pinned)),
+            "occurrences and cascade routes unchanged: only what the cache keeps moved"
+        );
+        assert!(
+            !Dedup::same_source_layouts(&before, &pinned),
+            "what the cascade cache keeps of its child is a layout fact"
+        );
+        assert!(
+            !Dedup::may_hold_replace(&before, &pinned),
+            "a changed definition over a moved map replaces at once"
+        );
+        // The per-alias filters are a SET: `MapPlan::keeps` passes a row that answers the filters
+        // of SOME alias, so the order the child's aliases were written in keeps the hold.
+        after.cascades[at].map.as_mut().unwrap().filters = vec![vec![pin(1, 8)], vec![pin(1, 7)]];
+        let other_order = Arc::new(after.clone());
+        assert!(
+            Dedup::same_source_layouts(&pinned, &other_order),
+            "the same pins in another written order"
+        );
+        assert!(
+            Dedup::may_hold_replace(&pinned, &other_order),
+            "the order of the map's per-alias lists decides nothing"
+        );
+    }
+
+    /// A DDL, not a definition change: the same definition replanned over a table that gained a
+    /// column. That replace still waits whatever it reads - the TABLE_MAP handler's shape
+    /// machinery (`core_hold_prefix`, `mark_shape_stale`) delivers it once the queue has drained,
+    /// while delivering it under a map of the other layout would leave those rows to neither
+    /// writer. Only a changed definition goes through at once.
+    #[test]
+    fn a_ddl_replan_keeps_the_hold_although_the_layout_moved() {
+        let col = |n: &str| crate::catalog::Column::new(n, "int", "int", None, None, None, false);
+        let catalog = |extra: bool| {
+            let mut cols = vec![col("id"), col("kind_id"), col("owner_id")];
+            if extra {
+                cols.push(col("note"));
+            }
+            [typed("items", cols, &[0])]
+                .into_iter()
+                .collect::<HashMap<_, _>>()
+        };
+        let before = plan_in(DIRECT, &catalog(false));
+        let after = plan_in(DIRECT, &catalog(true));
+        assert!(
+            Dedup::may_hold_replace(&before, &after),
+            "the same definition over a moved layout keeps the hold: the shape machinery delivers it"
+        );
     }
 
     // The parent read through a partial alias: `obj`'s cascade is traced. MySQL logs no
