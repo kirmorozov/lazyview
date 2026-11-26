@@ -3017,17 +3017,39 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
             .await?;
             let epoch_before = lock_epoch(&db).await?;
             let mut w = spawn_writers(&db, &ids, seed);
+            // The freeze has to land on an instance that is writing. "Wrote nothing after the freeze"
+            // is a claim about the freeze only if there was writing before it, and a metric the
+            // endpoint does not carry reads as 0 (`Scraped::counter`), so every zero below has to be
+            // a zero that could have counted something. The engine logs `streaming binlog` before its
+            // first flush has run, so scraping at that line can freeze an instance that had nothing to
+            // lose (mysql84: "the instance had written no view row and issued no statement against a
+            // target before the freeze, so the counters this scenario holds at zero say nothing").
+            // Wait for the first row and the first statement — the initial build and the writers above
+            // produce both — and sample then.
+            let t_pre = Instant::now();
+            let pre = loop {
+                let s = a.scrape().await?;
+                if s.counter("mv_rows_inserted") > 0 && s.counter("mv_queries") > 0 {
+                    break s;
+                }
+                ensure!(
+                    t_pre.elapsed() < t_catchup(),
+                    "the old instance wrote no view row and issued no statement against a target in \
+                     the {:?} the writers were given: there was nothing to freeze, so every \
+                     \"wrote nothing\" below would have been proved by an idle run",
+                    t_catchup()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
             // Pull the plug: the process stops, its sockets stay open, and the server cannot know it is
             // gone — the only thing that can end its lock session is the lease.
-            let pre = a.scrape().await?;
             let pre_rows = pre.counter("mv_rows_inserted");
             let pre_deletes = pre.counter("mv_rows_deleted");
             let pre_upserts = pre.counter("mv_rows_upserted");
             let pre_rebuilds = pre.counter("full_rebuilds");
-            // A metric the endpoint does not carry reads as 0 (`Scraped::counter`), and every
-            // "wrote nothing" below would then be proved by a typo in a name. This instance has
-            // built its views and streamed rows since it started, so the counters the scenario
-            // holds at zero have to have counted something by now.
+            // The wait above established this; it is read again here because every "wrote nothing"
+            // below rests on it, and a metric the endpoint does not carry reads as 0
+            // (`Scraped::counter`) — so a renamed metric would otherwise be proved by a typo.
             ensure!(
                 pre_rows > 0 && pre.counter("mv_queries") > 0,
                 "the instance had written no view row and issued no statement against a target \
