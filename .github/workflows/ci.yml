@@ -1,14 +1,29 @@
 name: ci
 
-# Every pull_request that changes anything but documentation, every push to main, v* tag and
-# workflow_dispatch run the same full set: lint, unit,
+# What runs when (owner, 2026-11-26, after measuring the integration matrix at 807 of the 818
+# runner-minutes of a main run -- "7 hours per pr? that is stupidity", "2 hours for ci still too
+# much", "we need to solve ci/cd congestion cycle and tests wall clock time"):
+#   DRAFT pull_request  -> only the fast jobs: lint, unit, deny, features. No build, no container,
+#                          no server. Workers push WIP at least every 60 min (host rule); 30 such
+#                          runs in 24 h were filling the runners and queueing main's own run.
+#   pull_request        -> the fast jobs plus every heavy job ON THE 3-FLAVOR SET (below): marking
+#                          a PR ready (ready_for_review, in `on:`) is what starts the full run.
+#   push (main, v*), workflow_dispatch -> everything, on the FULL matrix: every landed commit
+#                          therefore shows its own full matrix, and a release tag pays for all of it.
+# The jobs: lint, unit,
 # e2e, deny (cargo-deny advisories + licenses), features (the optional cargo features built and
 # tested; their clippy runs sit in `lint`), scan-image (trivy), the integration matrix,
 # integration-multi, integration-pg (PostgreSQL
 # as a TARGET: every supported major, on the baseline source mysql84), integration-pg-multi (the same
 # target grid the other way round: every MySQL-family source on the baseline target pg16) and
-# integration-pgsrc (PostgreSQL as a SOURCE, every major). Every landed commit therefore shows its own
-# full matrix. The network-chaos suite (tests/chaos.rs) runs inside every integration job that starts
+# integration-pgsrc (PostgreSQL as a SOURCE, every major). The integration matrix runs ONE build
+# (`build-tests`, once) and then only RUN jobs -- (server group x binary shard) cells that download
+# the binaries from the build artifact, start their servers and execute their shard (owner
+# 2026-11-26: "build once, fan out the runs ... make sure we efficient on code"); the matrix is
+# 18 cells on a push (<= the runner concurrency, so a run never queues behind itself) and 9 on a
+# PR. A flavor that goes red on main after a landing is reverted or fixed forward the SAME DAY.
+# The network-chaos suite (tests/chaos.rs) runs only in the two shard-A chaos jobs (mysql84 and
+# mariadb114 -- the flavors whose `run: "chaos"` matrix entries start
 # the toxiproxy daemon: the job's own server family reached through it (compose profile `chaos`), its
 # scenarios required (scripts/chaos-gate.sh fails the step on any failure tests/chaos-known-red.txt
 # does not list, and prints the listed ones in the job summary), the toxi self-tests required. The
@@ -68,6 +83,10 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+    # ready_for_review (owner 2026-11-26): a DRAFT PR runs only the fast jobs (see the header), so
+    # marking it ready is what starts the heavy set -- without this type the full run would only
+    # arrive on the next push to the branch.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "**"
       - "!docs/**"
@@ -210,17 +229,109 @@ jobs:
         # here) and runs the unit tests against it. Required by `release`.
         run: cargo test --locked --lib --bins --features "${{ matrix.features }}"
 
-  integration:
-    # One job per server flavor of docker-compose.test.yml (docs/server-setup.md "Supported
-    # servers"): the 12 blocking servers (every supported LTS line, the latest GA of each product,
-    # and the two AWS-only lines) must pass, the 2 advisory pre-releases only annotate the run
-    # when they fail (continue-on-error). The tier is in the job title: LTS, GA, AWS-only or
-    # pre-release.
-    name: integration (${{ matrix.flavor }}, ${{ matrix.tier }}${{ matrix.supervisor && format(', supervisor {0}', matrix.supervisor) || '' }}${{ matrix.advisory && ', advisory' || '' }})
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
+  build-tests:
+    # "Build once, fan out the runs" (owner 2026-11-26: "fan out via docker or with github actions
+    # ci/cd and make sure we efficient on code"). This job compiles the engine binary, the lib tests
+    # and EVERY integration-suite binary (tests/*.rs) exactly once, and hands them to the run jobs
+    # as one artifact: ci-bins/ holds the executables plus ci-manifest.tsv (TAB-separated
+    # "<suite name>\t<executable path>"). No run job compiles anything -- they download the artifact
+    # and exec the binaries through scripts/ci-run-binaries.sh (no rustup, no rust-cache restore,
+    # no cargo in those jobs at all). Draft PRs run no heavy job, so this job is also the cut that
+    # makes a draft cheap. On a cache miss the build is ~10-15 min (it was paid inside every matrix
+    # job before); on a hit ~1-2 min + upload.
+    name: build test binaries
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
     runs-on: ubuntu-24.04
-    # The suites below (75) + the toxi self-tests (10) + the chaos scenarios (20) + build/wait.
-    timeout-minutes: 120
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: integration
+          # The ONE writer of the shared cache (the run jobs never compile; soak-smoke, the only job
+          # that still builds its own binary, reads this cache on the nightly).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: build the engine, the lib tests and every integration suite
+        run: |
+          cargo build --locked --bins
+          cargo test --locked --no-run --message-format=json > build.json
+          mkdir -p ci-bins/deps
+          # One manifest line per suite: "<name>\t<exe>", relative paths. kind ["test"] = a tests/*.rs
+          # binary (its target name is the file stem); kind ["lib"] with profile.test = the lib tests,
+          # named "lib". Plain lib/bin builds (profile.test false) are the cargo cache, not suites.
+          jq -r 'select(.reason == "compiler-artifact" and .executable != null and .profile.test == true)
+                 | [(if .target.kind == ["lib"] then "lib" else .target.name end), .executable] | @tsv' \
+            build.json | sort -u -k1,1 > ci-bins/ci-manifest.tsv
+          while IFS=$'\t' read -r name exe; do
+            [ -n "$name" ] || continue
+            cp "$exe" "ci-bins/deps/$(basename "$exe")"
+            printf '%s\t%s\n' "$name" "ci-bins/deps/$(basename "$exe")"
+          done < ci-bins/ci-manifest.tsv > ci-bins/ci-manifest.new
+          mv ci-bins/ci-manifest.new ci-bins/ci-manifest.tsv
+          # An empty manifest here would turn into 18 confusing "suite not in manifest" errors in
+          # the run jobs; fail at the source instead.
+          [ -s ci-bins/ci-manifest.tsv ] || { echo "::error::ci-manifest.tsv is empty: the jq above matched no compiler-artifact in build.json (first lines):"; head -5 build.json; exit 1; }
+          # The engine the harness spawns (tests/common/engineproc.rs engine_binary(): no cargo in the
+          # run jobs, so they name it with LAZYVIEW_TEST_ENGINE_BIN, which points here).
+          cp target/debug/lazyview ci-bins/lazyview
+          echo "manifest:"; column -t -s $'\t' ci-bins/ci-manifest.tsv
+      - name: upload the test binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bins
+          path: |
+            ci-bins/
+          retention-days: 1
+          if-no-files-found: error
+
+  integration:
+    # The matrix is (server group x binary shard) (owner 2026-11-26: "build once, fan out the
+    # runs"): every cell is one runner that downloads the binaries from `build-tests`, starts its
+    # server group (here one server -- a flavor of docker-compose.test.yml, docs/server-setup.md
+    # "Supported servers") and runs its shard's suites against it. No run job compiles anything.
+    # The SHARDS, balanced by the measured per-binary times of main run 45702946384 / mysql84
+    # (49.3 min of test time across 30 result lines from 28 test binaries:
+    # tmp/out/lvsuper/ci-time/mysql84.log -- health 12.5, regressions 10.3, chaos 7.3,
+    # migration 5.1, rename_invariance 3.6, bench_throughput 2.0, exclusive 2.0, supervisor 1.7,
+    # the other binaries under 1 min each):
+    #   run: "all"  -- every server-sensitive suite on this flavor (everything except health,
+    #                 bench_throughput, supervisor and the chaos binary): ~26 min. Main's set.
+    #   run: "b1"   -- regressions + rename_invariance (~14 min), run: "b2" -- migration, exclusive
+    #                 and the other 20 small binaries (~12 min): the same suites split in two, what
+    #                 a PR runs so no PR job pays the whole 26 min (owner: PR about 20 min wall).
+    #   run: "si"   -- the server-independent suites (health, bench_throughput, supervisor): they do
+    #                 not read the server dialect, so ONE job on mysql84 runs them for the whole set
+    #                 instead of every flavor paying its own 16 measured minutes of them.
+    #   run: "chaos"-- the chaos binary (self-tests + scenarios) on mysql84 and mariadb114 only --
+    #                 the faults arm the link between the harness and THIS job's server, so two
+    #                 flavors (one per product, both in the PR set) cover it without 15 x 7.3 min.
+    #                 These two cells are the only jobs that start the toxiproxy daemon.
+    # Every other suite is server-sensitive (binlog, DDL, charset, GTID, cursor) and runs on EVERY
+    # flavor of the event's set, so on main every flavor stays blocking for everything
+    # server-specific; a flavor that goes red on main after a landing is reverted or fixed forward
+    # the same day. The SET of flavors depends on the event (owner 2026-11-26: "7 hours per pr?
+    # that is stupidity"): a pull_request runs exactly 3 flavors -- mysql84 (the oldest supported
+    # MySQL LTS), mysql97 (the newest MySQL) and mariadb114 (the newest MariaDB LTS) -- 9 cells
+    # (b1/b2 per flavor + si + the two chaos cells); every other event -- the push to main and the
+    # v* tags, and workflow_dispatch -- runs the full list: the 12 blocking servers (every
+    # supported LTS line, the latest GA of each product, the two AWS-only lines), the
+    # supervisor:"off" sequential-refresh entry and the 2 advisory pre-releases = 18 cells, at or
+    # under the runner concurrency so a run never queues behind itself. The tier and the shard are
+    # in the job title, so a check reads e.g. "integration (mysql84, LTS, shard B1)".
+    name: integration (${{ matrix.flavor }}, ${{ matrix.tier }}, shard ${{ matrix.shard }}${{ matrix.run == 'chaos' && ', chaos' || '' }}${{ matrix.supervisor && format(', supervisor {0}', matrix.supervisor) || '' }}${{ matrix.advisory && ', advisory' || '' }})
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
+    needs: build-tests
+    runs-on: ubuntu-24.04
+    # Server + (for the chaos cells) toxiproxy start/wait, the artifact download and the suites
+    # (worst cell: ~26 min of measured test time). No compile: build-tests did that once.
+    timeout-minutes: 90
     continue-on-error: ${{ matrix.advisory }}
     strategy:
       fail-fast: false
@@ -230,42 +341,46 @@ jobs:
         # in docker-compose.test.yml). The supervisor:"off" entry is the sequential refresh path
         # (LAZYVIEW_SUPERVISOR=off); the other jobs run the default (concurrent) one. The advisory
         # pre-releases (compose profile `prerelease`) are tested, not supported, never required.
+        # One expression, two sets (the header above says which event runs which, and why): a
+        # pull_request takes the 3-flavor list, every other event the full one, byte for byte the
+        # flavors main ran before -- each flavor's fields (port, tier, advisory, supervisor) are
+        # exactly as they were. `shard` labels the job title; `run` picks the shard's binaries.
         include: >-
           ${{ fromJSON(
-          '[{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false},{"flavor":"mysql97","port":33097,"tier":"LTS","advisory":false},{"flavor":"mysql2610","port":33261,"tier":"GA","advisory":false},{"flavor":"mysql80","port":33080,"tier":"AWS-only","advisory":false},{"flavor":"percona84","port":33184,"tier":"LTS","advisory":false},{"flavor":"percona97","port":33197,"tier":"LTS","advisory":false},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false},{"flavor":"mariadb118","port":33118,"tier":"LTS","advisory":false},{"flavor":"mariadb123","port":33123,"tier":"LTS","advisory":false},{"flavor":"mariadb130","port":33130,"tier":"GA","advisory":false},{"flavor":"mariadb106","port":33106,"tier":"AWS-only","advisory":false},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false,"supervisor":"off"},{"flavor":"mariadb131-rc","port":33131,"tier":"pre-release","advisory":true},{"flavor":"mariadb132-pre","port":33132,"tier":"pre-release","advisory":true}]'
+          github.event_name == 'pull_request'
+          && '[{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false,"shard":"A","run":"si"},{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false,"shard":"A","run":"chaos"},{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false,"shard":"B1","run":"b1"},{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false,"shard":"B2","run":"b2"},{"flavor":"mysql97","port":33097,"tier":"LTS","advisory":false,"shard":"B1","run":"b1"},{"flavor":"mysql97","port":33097,"tier":"LTS","advisory":false,"shard":"B2","run":"b2"},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false,"shard":"A","run":"chaos"},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false,"shard":"B1","run":"b1"},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false,"shard":"B2","run":"b2"}]'
+          || '[{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false,"shard":"B","run":"all"},{"flavor":"mysql97","port":33097,"tier":"LTS","advisory":false,"shard":"B","run":"all"},{"flavor":"mysql2610","port":33261,"tier":"GA","advisory":false,"shard":"B","run":"all"},{"flavor":"mysql80","port":33080,"tier":"AWS-only","advisory":false,"shard":"B","run":"all"},{"flavor":"percona84","port":33184,"tier":"LTS","advisory":false,"shard":"B","run":"all"},{"flavor":"percona97","port":33197,"tier":"LTS","advisory":false,"shard":"B","run":"all"},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false,"shard":"B","run":"all"},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false,"shard":"B","run":"all"},{"flavor":"mariadb118","port":33118,"tier":"LTS","advisory":false,"shard":"B","run":"all"},{"flavor":"mariadb123","port":33123,"tier":"LTS","advisory":false,"shard":"B","run":"all"},{"flavor":"mariadb130","port":33130,"tier":"GA","advisory":false,"shard":"B","run":"all"},{"flavor":"mariadb106","port":33106,"tier":"AWS-only","advisory":false,"shard":"B","run":"all"},{"flavor":"mariadb1011","port":33111,"tier":"LTS","advisory":false,"supervisor":"off","shard":"B","run":"all"},{"flavor":"mariadb131-rc","port":33131,"tier":"pre-release","advisory":true,"shard":"B","run":"all"},{"flavor":"mariadb132-pre","port":33132,"tier":"pre-release","advisory":true,"shard":"B","run":"all"},{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false,"shard":"A","run":"si"},{"flavor":"mysql84","port":33084,"tier":"LTS","advisory":false,"shard":"A","run":"chaos"},{"flavor":"mariadb114","port":33114,"tier":"LTS","advisory":false,"shard":"A","run":"chaos"}]'
           ) }}
     env:
       COMPOSE_FILE: docker-compose.test.yml
-      # `prerelease` unlocks the pre-release flavors, `chaos` the toxiproxy service the chaos
-      # steps below start by name (the image is pinned in docker-compose.test.yml).
+      # `prerelease` unlocks the pre-release flavors, `chaos` the toxiproxy service the two
+      # run:"chaos" cells start by name (the image is pinned in docker-compose.test.yml).
       COMPOSE_PROFILES: prerelease,chaos
       FLAVOR: ${{ matrix.flavor }}
+      # The engine the harness spawns (tests/common/engineproc.rs): these jobs hold no cargo, so the
+      # binary comes from the build-tests artifact named here.
+      LAZYVIEW_TEST_ENGINE_BIN: ci-bins/lazyview
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: start ${{ matrix.flavor }} + toxiproxy (in the background)
-        run: docker compose up -d --quiet-pull "$FLAVOR" toxiproxy
-      - name: rust ${{ env.RUST_TOOLCHAIN }}
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: get the test binaries (built once by build-tests)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          shared-key: integration
-          # One writer for the matrix jobs; the test binaries compile even when tests fail.
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.flavor == 'mysql84' }}
-          cache-on-failure: true
-      - name: build integration tests
-        run: cargo test --locked --test '*' --no-run
-      - name: wait for ${{ matrix.flavor }} + toxiproxy
-        run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR" toxiproxy
-      - name: server version + toxiproxy
+          name: test-bins
+          path: ci-bins
+      - run: chmod +x ci-bins/deps/* ci-bins/lazyview
+      - name: start ${{ matrix.flavor }}${{ matrix.run == 'chaos' && ' + toxiproxy' || '' }} (in the background)
+        run: docker compose up -d --quiet-pull "$FLAVOR"${{ matrix.run == 'chaos' && ' toxiproxy' || '' }}
+      - name: wait for ${{ matrix.flavor }}${{ matrix.run == 'chaos' && ' + toxiproxy' || '' }}
+        run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"${{ matrix.run == 'chaos' && ' toxiproxy' || '' }}
+      - name: server version${{ matrix.run == 'chaos' && ' + toxiproxy' || '' }}
         run: |
           docker compose exec -T "$FLAVOR" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
-          curl -fsS http://127.0.0.1:18474/version
-      - name: integration tests
-        timeout-minutes: 75
+          ${{ matrix.run == 'chaos' && 'curl -fsS http://127.0.0.1:18474/version' || 'echo "no toxiproxy on this cell (chaos runs on mysql84 and mariadb114 only)"' }}
+      - name: integration tests (shard ${{ matrix.shard }})
+        if: matrix.run != 'chaos'
+        timeout-minutes: 45
         env:
           LAZYVIEW_TEST_DSNS: ${{ matrix.flavor }}=mysql://lv:lv@127.0.0.1:${{ matrix.port }}/lvtest
           # Strict: the MySQL-family target tests must run for real on this one server, never skip.
@@ -293,9 +408,16 @@ jobs:
           LAZYVIEW_SUPERVISOR: ${{ matrix.supervisor || '' }}
           # The exclusive suite (server restarts, killed connections, idle binlog rotation) restarts this job's own disposable server; compose names the container <project>-<service>-1 and the project is the checkout dir (lazyview).
           LAZYVIEW_TEST_EXCLUSIVE: ${{ matrix.flavor }}=lazyview-${{ matrix.flavor }}-1
-        # --no-fail-fast: run every suite and report all failures, not just the first.
-        # The chaos binary (chaos_* scenarios + selftest_toxi_*) runs for real in its own steps
-        # below (strict there); filtered out here so it never runs twice.
+        # --no-fail-fast semantics: scripts/ci-run-binaries.sh runs EVERY named binary even when
+        # one fails, one binary at a time (what the GLOBAL-mutation suites require, as before), and
+        # a failing binary fails the step. The shard picks the binaries by the measured times
+        # (the matrix comment above): "all" = every server-sensitive suite (main's cell: enumerate
+        # tests/*.rs so a NEW suite joins automatically, the way --test '*' used to take every new
+        # one; the si suites and the chaos binary are its own cells and are skipped here); "b1" =
+        # regressions + rename_invariance; "b2" = the rest (migration, exclusive and the 20 small
+        # ones); "si" = health, bench_throughput, supervisor on mysql84 only.
+        # The chaos binary (chaos_* scenarios + selftest_toxi_*) runs for real in its own cells and
+        # steps below (strict there); filtered out here so it never runs twice.
         # The gate below is scripts/chaos-gate.sh with tests/integration-known-red.txt, used exactly
         # as the chaos steps use it: any failing test this file does not list FAILS the step (a
         # ::error:: per test names the file to fix), and the one listed test
@@ -304,20 +426,38 @@ jobs:
         # and owner-approved (2026-11-22) and #319's fix PR deletes it, and with the file empty this
         # step is strict exactly as it stands. The gate's SKIP guard is chaos-specific, so the skip
         # discipline of this step stays what LAZYVIEW_TEST_STRICT above already enforces.
-        # --color never: the gate's greps read these lines as plain text. The exit status of cargo
-        # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
+        # --color never: the gate's greps read these lines as plain text. The exit status of the
+        # runner (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
         run: |
+          case "${{ matrix.run }}" in
+            si) names=(health bench_throughput supervisor);;
+            b1) names=(regressions rename_invariance);;
+            all|b2)
+              names=()
+              for f in tests/*.rs; do
+                b=${f#tests/}; b=${b%.rs}
+                case " health bench_throughput supervisor chaos " in *" $b "*) continue;; esac
+                if [ "${{ matrix.run }}" = b2 ]; then
+                  case " regressions rename_invariance " in *" $b "*) continue;; esac
+                fi
+                names+=("$b")
+              done;;
+          esac
           set +o pipefail
-          cargo test --locked --no-fail-fast --test '*' -- --test-threads=1 --color never \
-            --skip targets_pg_ --skip chaos_ --skip selftest_toxi_ 2>&1 | tee integration-tests.log
-          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "$FLAVOR integration" \
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv "${names[@]}" -- \
+            --test-threads=1 --color never --skip targets_pg_ --skip chaos_ --skip selftest_toxi_ \
+            2>&1 | tee integration-tests.log
+          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "$FLAVOR shard ${{ matrix.shard }} integration" \
             integration-tests.log tests/integration-known-red.txt
-      # The chaos binary over the toxiproxy daemon (compose profile `chaos`, started above): the
-      # harness arms real network faults between the engines and this job's server. always() so a
-      # suite failing above never hides these results; a dead daemon or a lost opt-in env fails
-      # loudly instead of skipping, because LAZYVIEW_TEST_STRICT turns every SKIP into a failure.
+      # The chaos binary over the toxiproxy daemon (compose profile `chaos`, started above) runs
+      # only in the two run:"chaos" cells (mysql84 and mariadb114 -- owner 2026-11-26: the faults
+      # arm the link between the harness and THIS job's server, so two flavors, one per product and
+      # both in the PR set, cover it; 13 flavors no longer pay 7.3 min for it). The harness arms
+      # real network faults between the engines and this job's server. always() so a suite failing
+      # above never hides these results; a dead daemon or a lost opt-in env fails loudly instead of
+      # skipping, because LAZYVIEW_TEST_STRICT turns every SKIP into a failure.
       - name: toxi self-tests
-        if: always() && !cancelled()
+        if: always() && !cancelled() && matrix.run == 'chaos'
         # The harness's own pins (proxy passthrough, each toxic's effect, daemon restart): not
         # known-red, so this step is required (no continue-on-error).
         timeout-minutes: 10
@@ -333,12 +473,13 @@ jobs:
           # the proxies, which is the point; setup and oracle queries stay on the admin account (Q4).
           LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           LAZYVIEW_HEALTH_ADDR: "off"
-        run: cargo test --locked --test chaos -- --test-threads=1 selftest_toxi_
+        run: scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv chaos -- --test-threads=1 selftest_toxi_
       - name: chaos scenarios
-        if: always() && !cancelled()
+        if: always() && !cancelled() && matrix.run == 'chaos'
         # Required, like the self-tests above: scripts/chaos-gate.sh fails this step on any chaos
         # test that FAILED and is not listed in tests/chaos-known-red.txt, so a NEW chaos failure on
-        # any flavor turns this job red (it used to be advisory, and a new failure showed nowhere).
+        # either chaos flavor turns this job red (it used to be advisory, and a new failure showed
+        # nowhere).
         # A listed failure passes and is written to the job summary with its issue. With that file
         # empty the step is strict exactly as it stands: every chaos failure fails the job, so
         # nothing has to be flipped when the last entry leaves the list.
@@ -353,11 +494,12 @@ jobs:
           LAZYVIEW_TEST_REQUIRE_MULTI: "0"
           LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           LAZYVIEW_HEALTH_ADDR: "off"
-        # --color never: the gate's greps read these lines as plain text. The exit status of cargo
-        # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
+        # --color never: the gate's greps read these lines as plain text. The exit status of the
+        # runner (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
         run: |
           set +o pipefail
-          cargo test --locked --test chaos -- --test-threads=1 --color never chaos_ --skip chaos_tgt_pg_ 2>&1 \
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv chaos -- \
+            --test-threads=1 --color never chaos_ --skip chaos_tgt_pg_ 2>&1 \
             | tee chaos-scenarios.log
           scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "$FLAVOR" chaos-scenarios.log
       - name: advisory flavor failed
@@ -379,7 +521,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: integration-logs-${{ matrix.flavor }}${{ matrix.supervisor && format('-supervisor-{0}', matrix.supervisor) || '' }}
+          # The cell's own name: mysql84 and mariadb114 each hold two shard-A cells (the si cell and
+          # the chaos cell), so the shard and the run kind are part of the artifact name.
+          name: integration-logs-${{ matrix.flavor }}${{ matrix.supervisor && format('-supervisor-{0}', matrix.supervisor) || '' }}-${{ matrix.shard }}${{ matrix.run == 'chaos' && '-chaos' || '' }}
           path: |
             server-logs/
             tmp/out/test-logs/
@@ -396,31 +540,28 @@ jobs:
     # MySQL 8.4 LTS, Percona 9.7 and MariaDB 13.0, whose default utf8mb4_uca1400_ai_ci
     # collation the MySQL targets lack.
     name: integration (multi-server, mysql84 + percona97 + mariadb130)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
+    needs: build-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       COMPOSE_FILE: docker-compose.test.yml
       SERVICES: mysql84 percona97 mariadb130
+      LAZYVIEW_TEST_ENGINE_BIN: ci-bins/lazyview
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: get the test binaries (built once by build-tests)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-bins
+          path: ci-bins
+      - run: chmod +x ci-bins/deps/* ci-bins/lazyview
       - name: start the servers (in the background)
         run: |
           read -ra services <<<"$SERVICES"
           docker compose up -d --quiet-pull "${services[@]}"
-      - name: rust ${{ env.RUST_TOOLCHAIN }}
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Reads the integration matrix's cache (its mysql84 job writes it).
-          shared-key: integration
-          save-if: false
-      - name: build the targets and regressions tests
-        run: cargo test --locked --test targets --test regressions --no-run
       - name: wait for the servers
         run: |
           read -ra services <<<"$SERVICES"
@@ -442,8 +583,8 @@ jobs:
         # known ones must show up as passed (a rename would otherwise leave this job green
         # without running them).
         run: |
-          cargo test --locked --no-fail-fast --test targets --test regressions -- --test-threads=1 \
-            --color never targets_ reg_multi_target_with_one_down 2>&1 | tee multi-server-tests.log
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv targets regressions -- \
+            --test-threads=1 --color never targets_ reg_multi_target_with_one_down 2>&1 | tee multi-server-tests.log
           for t in targets_fan_out_and_retarget targets_invalid_configurations_error \
                    targets_one_target_down reg_multi_target_with_one_down; do
             grep -q "^test $t \.\.\. ok$" multi-server-tests.log || { echo "::error::$t did not run and pass"; exit 1; }
@@ -482,10 +623,11 @@ jobs:
     # against its own server on its own host port, with LAZYVIEW_TEST_REQUIRE_PG=1 so no PostgreSQL
     # test may skip. The source is a normal matrix flavor; PostgreSQL is only ever a target here.
     name: integration (postgres target, mysql84 + pg14-pg18 blocking, pg19rc2 advisory)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
+    needs: build-tests
     runs-on: ubuntu-24.04
     # 5 blocking target legs + the advisory one + the chaos_tgt_pg_ scenarios (3 x ~120 s worst
-    # case) + build/wait.
+    # case) + the servers' wait (no compile: the binaries are the build-tests artifact).
     timeout-minutes: 90
     env:
       COMPOSE_FILE: docker-compose.test.yml
@@ -493,27 +635,23 @@ jobs:
       # network faults on the link to the PostgreSQL target, the same daemon the matrix jobs use.
       COMPOSE_PROFILES: chaos
       SERVICES: mysql84 pg14 pg15 pg16 pg17 pg18 pg19rc2 toxiproxy
+      LAZYVIEW_TEST_ENGINE_BIN: ci-bins/lazyview
     steps:  # identical to integration-multi: start servers (toxiproxy with them, profile `chaos`),
-            # rust, rust-cache (shared-key integration, save-if false), build --test targets --test
-            # chaos, wait, print versions, then the targets suite and the chaos_tgt_pg_ scenarios
+            # wait, print versions, then the targets suite and the chaos_tgt_pg_ scenarios -- all on
+            # the build-tests artifact's binaries (this job compiles nothing itself)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: get the test binaries (built once by build-tests)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-bins
+          path: ci-bins
+      - run: chmod +x ci-bins/deps/* ci-bins/lazyview
       - name: start the servers (in the background)
         run: |
           read -ra services <<<"$SERVICES"
           docker compose up -d --quiet-pull "${services[@]}"
-      - name: rust ${{ env.RUST_TOOLCHAIN }}
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Reads the integration matrix's cache (its mysql84 job writes it).
-          shared-key: integration
-          save-if: false
-      - name: build the targets and chaos tests
-        run: cargo test --locked --test targets --test chaos --no-run
       - name: wait for the servers
         run: |
           read -ra services <<<"$SERVICES"
@@ -527,8 +665,8 @@ jobs:
           # The daemon the chaos step below arms its faults through; a dead one shows here, not at
           # the first scenario.
           curl -fsS http://127.0.0.1:18474/version
-      # The blocking majors, one leg per major against its own server. The binary is built above, so
-      # a leg only runs; each leg's five named gates must be seen passing in its own log, and
+      # The blocking majors, one leg per major against its own server. The binary is in the artifact
+      # above, so a leg only runs; each leg's five named gates must be seen passing in its own log, and
       # LAZYVIEW_TEST_REQUIRE_PG=1 turns any PG skip into a failure (a major that is not up cannot
       # leave the job green). Ports: pg16 keeps its historic 35432, pg15/pg17/pg18 are the ones
       # integration-pgsrc uses, pg14 35436 and the pre-release 35437 are C2's.
@@ -544,7 +682,8 @@ jobs:
           pgtarget() {
             local name=$1 port=$2 log="pg-target-$1.log"
             LAZYVIEW_TEST_PG_DSNS="$name=postgres://lv:lv@127.0.0.1:$port/lvtest" \
-              cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
+              scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv targets -- \
+              --test-threads=1 --color never targets_pg_ 2>&1 \
               | tee "$log"
             for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
                      targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others \
@@ -572,7 +711,8 @@ jobs:
           LAZYVIEW_TEST_REQUIRE_MULTI: "1"
           LAZYVIEW_TEST_STRICT: "targets_pg_"
         run: |
-          cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv targets -- \
+            --test-threads=1 --color never targets_pg_ 2>&1 \
             | tee pg-target-pg19rc2.log
           for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
                    targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others \
@@ -592,8 +732,9 @@ jobs:
       # Strict, so a scenario that cannot reach the daemon or the PG server fails instead of
       # skipping, and required, gated by scripts/chaos-gate.sh on tests/chaos-known-red.txt: these
       # scenarios used to be filtered out of every job that had a server for them and ran nowhere.
-      # In the 15 MySQL-family jobs they stay filtered out (`--skip chaos_tgt_pg_`): no PostgreSQL
-      # there, so strict would refuse their skip and every one of those jobs would be red.
+      # In the MySQL-family jobs they run nowhere: the chaos binary is excluded from the plain
+      # shards (its suites run only in the two run:"chaos" cells) and those cells have no PostgreSQL
+      # server, so strict would refuse their skip and every one of them would be red.
       - name: chaos scenarios (postgres target)
         if: always() && !cancelled()
         # 3 scenarios x ~120 s worst case + the tee.
@@ -613,7 +754,8 @@ jobs:
         # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
         run: |
           set +o pipefail
-          cargo test --locked --test chaos -- --test-threads=1 --color never chaos_tgt_pg_ 2>&1 \
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv chaos -- \
+            --test-threads=1 --color never chaos_tgt_pg_ 2>&1 \
             | tee chaos-pg-target-tests.log
           scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "postgres target" chaos-pg-target-tests.log
       - name: collect server logs
@@ -654,15 +796,16 @@ jobs:
     # ONE job on ONE runner with the sources looped inside it, the way integration-multi loops
     # flavors and integration-pg loops target majors: the repo is runner-bound, so these 14 legs cost
     # minutes, not runners (each leg is the same five targets_pg_ gates, ~20 s once the binary comes
-    # out of the matrix's rust-cache; the job's own minutes are quoted in the PR). CI only: no Rust
+    # out of the build-tests artifact; the job's own minutes are quoted in the PR). CI only: no Rust
     # file, no cost per binlog event, no allocation on any hot path, no view ever rebuilt. Each leg
     # keeps LAZYVIEW_TEST_REQUIRE_PG=1 and LAZYVIEW_TEST_STRICT=targets_pg_ — neither the PostgreSQL
     # target nor any targets_pg_ scenario may skip — and the five gates must be seen passing in that
     # leg's own log.
     name: integration (postgres target, mysql-family sources + pg16)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
     runs-on: ubuntu-24.04
-    # 10 blocking legs + 4 advisory legs + 15 image pulls + build and the server wait.
+    # 10 blocking legs + 4 advisory legs + 15 image pulls + the servers' wait (no build: the
+    # binaries are the build-tests artifact).
     timeout-minutes: 45
     # The target baseline is proven by integration-pg before the sources are fanned out over it.
     needs: integration-pg
@@ -672,6 +815,7 @@ jobs:
       # profile the integration matrix runs them under). No `chaos`: the chaos_tgt_pg_ scenarios need
       # the toxiproxy daemon and run once, in integration-pg, against this same pg16.
       COMPOSE_PROFILES: prerelease
+      LAZYVIEW_TEST_ENGINE_BIN: ci-bins/lazyview
       SERVICES: >-
         pg16
         mysql80 mysql84 mysql97 percona84 percona97
@@ -681,21 +825,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: get the test binaries (built once by build-tests)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-bins
+          path: ci-bins
+      - run: chmod +x ci-bins/deps/* ci-bins/lazyview
       - name: start the servers (in the background)
         run: |
           read -ra services <<<"$SERVICES"
           docker compose up -d --quiet-pull "${services[@]}"
-      - name: rust ${{ env.RUST_TOOLCHAIN }}
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Reads the integration matrix's cache (its mysql84 job writes it).
-          shared-key: integration
-          save-if: false
-      - name: build the targets tests
-        run: cargo test --locked --test targets --no-run
       - name: wait for the servers
         # 15 servers boot side by side on this runner, so the healthchecks get the wider window.
         run: |
@@ -725,7 +864,8 @@ jobs:
           pgsource() {
             local name=$1 port=$2 log="pg-target-$1-to-pg16.log"
             LAZYVIEW_TEST_DSNS="$name=mysql://lv:lv@127.0.0.1:$port/lvtest" \
-              cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
+              scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv targets -- \
+              --test-threads=1 --color never targets_pg_ 2>&1 \
               | tee "$log"
             for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
                      targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others \
@@ -760,7 +900,8 @@ jobs:
           pgsource() {
             local name=$1 port=$2 log="pg-target-$1-to-pg16.log"
             LAZYVIEW_TEST_DSNS="$name=mysql://lv:lv@127.0.0.1:$port/lvtest" \
-              cargo test --locked --no-fail-fast --test targets -- --test-threads=1 --color never targets_pg_ 2>&1 \
+              scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv targets -- \
+              --test-threads=1 --color never targets_pg_ 2>&1 \
               | tee "$log"
             for t in targets_pg_fan_out_and_retarget targets_pg_incremental_never_rebuilds \
                      targets_pg_swap_keeps_readers targets_pg_target_down_does_not_hold_the_others \
@@ -819,33 +960,29 @@ jobs:
     # annotates the run but does not block it, exactly like the target matrix's advisory pre-release
     # tier.
     name: integration (postgres source, pg14 + pg15 + pg16 + pg17 + pg18 blocking, pg19rc2 advisory)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
     needs: integration-pg
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       COMPOSE_FILE: docker-compose.test.yml
       SERVICES: pg14 pg15 pg16 pg17 pg18 pg19rc2
-    steps:  # identical to integration-pg, on the source side: start servers, rust, rust-cache
-            # (shared-key integration, save-if false), build the lib tests, wait, print version
+      LAZYVIEW_TEST_ENGINE_BIN: ci-bins/lazyview
+    steps:  # identical to integration-pg, on the source side: start servers, download the
+            # build-tests artifact (this job compiles nothing), wait, print versions
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: get the test binaries (built once by build-tests)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-bins
+          path: ci-bins
+      - run: chmod +x ci-bins/deps/* ci-bins/lazyview
       - name: start the servers (in the background)
         run: |
           read -ra services <<<"$SERVICES"
           docker compose up -d --quiet-pull "${services[@]}"
-      - name: rust ${{ env.RUST_TOOLCHAIN }}
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Reads the integration matrix's cache (its mysql84 job writes it).
-          shared-key: integration
-          save-if: false
-      - name: build the lib + replication-smoke tests
-        run: cargo test --locked --lib --test pgsrc_replication --no-run
       - name: wait for the servers
         run: |
           read -ra services <<<"$SERVICES"
@@ -863,7 +1000,7 @@ jobs:
           LAZYVIEW_HEALTH_ADDR: "off"
           LAZYVIEW_TEST_REQUIRE_PG: "1"
         run: |
-          cargo test --locked --no-fail-fast --lib -- --color never --exact \
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv lib -- --color never --exact \
             dialect::postgres::tests::parse_profile_is_the_postgresql_one \
             dialect::postgres::tests::pg_only_constructs_are_refused \
             pgsrc::tests::pg_catalog_rows_build_a_table_info \
@@ -885,15 +1022,15 @@ jobs:
       # majors that are blocking in the grid (pg14 is the AWS-only tier, pg18 the latest GA) plus the
       # baseline. Each version gets its own server via LAZYVIEW_TEST_PG_DSNS (its own host port),
       # LAZYVIEW_TEST_REQUIRE_PG=1 (a missing server fails) and LAZYVIEW_TEST_STRICT=pgsrc_ (a SKIP
-      # fails), so a missing or skipped run fails the grep gate. The binaries are already built above;
-      # each version only runs (fast).
+      # fails), so a missing or skipped run fails the grep gate. The binaries came from the
+      # build-tests artifact above; each version only runs (fast).
       - name: logical replication smoke (pg16 + pg15 + pg17 + pg18 + pg14, blocking)
         run: |
           smoke() {
             local name=$1 port=$2 log="smoke-$1.log"
             LAZYVIEW_TEST_PG_DSNS="$name=postgres://lv:lv@127.0.0.1:$port/lvtest" \
             LAZYVIEW_HEALTH_ADDR="off" LAZYVIEW_TEST_REQUIRE_PG="1" LAZYVIEW_TEST_STRICT="pgsrc_" \
-              cargo test --locked --no-fail-fast --test pgsrc_replication -- --color never --exact \
+              scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv pgsrc_replication -- --color never --exact \
                 pgsrc_replication_decodes_insert_update_delete 2>&1 | tee "$log"
             grep -q "^test pgsrc_replication_decodes_insert_update_delete \.\.\. ok$" "$log" \
               || { echo "::error::$name: pgsrc_replication_decodes_insert_update_delete did not run and pass"; exit 1; }
@@ -912,7 +1049,7 @@ jobs:
         run: |
           LAZYVIEW_TEST_PG_DSNS="pg19rc2=postgres://lv:lv@127.0.0.1:35437/lvtest" \
           LAZYVIEW_HEALTH_ADDR="off" LAZYVIEW_TEST_REQUIRE_PG="1" LAZYVIEW_TEST_STRICT="pgsrc_" \
-            cargo test --locked --no-fail-fast --test pgsrc_replication -- --color never --exact \
+            scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv pgsrc_replication -- --color never --exact \
               pgsrc_replication_decodes_insert_update_delete 2>&1 | tee smoke-pg19rc2.log
           grep -q "^test pgsrc_replication_decodes_insert_update_delete \.\.\. ok$" smoke-pg19rc2.log \
             || { echo "::error::pg19rc2 smoke failed"; exit 1; }
@@ -946,7 +1083,7 @@ jobs:
 
   e2e:
     name: image smoke + end-to-end
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -1079,6 +1216,7 @@ jobs:
     name: image scan (trivy)
     # Needs e2e so the GHA build cache below is warm: this rebuild is a cache hit.
     needs: e2e
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft  # a draft PR runs only the fast jobs
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -1165,29 +1303,27 @@ jobs:
     # window. The full five kinds of smoke chaos need the nightly's 30-minute smoke (10 events
     # per hour).
     name: soak smoke (mysql84, bounded 5 min)
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}  # a draft PR runs only the fast jobs; marking it ready starts this (and it needs the build-tests binaries)
+    needs: build-tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       COMPOSE_FILE: docker-compose.test.yml
       FLAVOR: mysql84
+      # The engine the harness spawns: this job compiles nothing, the binary is the artifact's.
+      LAZYVIEW_TEST_ENGINE_BIN: ci-bins/lazyview
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: get the test binaries (built once by build-tests)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-bins
+          path: ci-bins
+      - run: chmod +x ci-bins/deps/* ci-bins/lazyview
       - name: start mysql84 (in the background)
         run: docker compose up -d --quiet-pull "$FLAVOR"
-      - name: rust ${{ env.RUST_TOOLCHAIN }}
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Reads the integration matrix's cache (its mysql84 job writes it); never a second writer.
-          shared-key: integration
-          save-if: false
-      - name: build the soak tests
-        run: cargo test --locked --test soak --no-run
       - name: wait for mysql84
         run: docker compose up -d --wait --wait-timeout 300 "$FLAVOR"
       - name: server version
@@ -1203,7 +1339,7 @@ jobs:
           LAZYVIEW_TEST_STRICT: soak_
         shell: bash
         run: |
-          cargo test --locked --test soak -- --test-threads=1 --color never soak_smoke_30m 2>&1 | tee soak-pr.log
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv soak -- --test-threads=1 --color never soak_smoke_30m 2>&1 | tee soak-pr.log
           grep -q "^test soak_smoke_30m \.\.\. ok$" soak-pr.log \
             || { echo "::error::soak_smoke_30m did not run and pass (the bounded soak skipped?)"; exit 1; }
       - name: upload the soak report
@@ -1249,7 +1385,9 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Reads the integration matrix's cache; never a writer here.
+          # Reads the shared `integration` cache (build-tests is its one writer, on pushes and
+          # ready PRs); on the nightly this job is the only builder, but it stays a reader so the
+          # cache has a single writer.
           shared-key: integration
           save-if: false
       - name: build the soak tests
