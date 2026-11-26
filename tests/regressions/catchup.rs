@@ -755,4 +755,293 @@ fn reg_lineage_without_primary_key() {
     });
 }
 
+/// #391 (the 1 in 10 left of `chaos_tgt_blackhole_during_flush`): at most one lag retry may be
+/// in flight per view and target. `lag_service` drains the retries' results, folds them (the
+/// fold of a catch-up awaits its state row), and then frees the target of every retry whose task
+/// has ended as "lost". A retry that sent its result during that fold has ended, yet its result
+/// still waits in the channel: the target is claimed again, the late fold then removes the new
+/// claim's handle, and a third claim starts next to the second. Two retries write the same units
+/// at once. On a view without row identity both insert the rows of a unit the target never had,
+/// and since the later fold finds no entry left to owe them, the target keeps them twice: extra
+/// rows after convergence, on that target only.
+///
+/// Each step is placed by the test, none is raced. A `BEFORE INSERT` trigger on each target's
+/// table reads a gate row `FOR UPDATE`, so the test refuses the writes (gate 0), holds them (the
+/// gate row locked) or lets them through. The fold of `t2`'s catch-up is held on the test's lock
+/// of its state row, and `t1`'s retry is let through only while that fold is held. The result is
+/// read at convergence.
+#[test]
+fn reg_one_lag_retry_per_target_at_a_time() {
+    scenario("reg_lag_claims", |ctx| async move {
+        use std::collections::HashMap;
+        let db = ctx.new_db("reg_lag_claims").await?;
+        let t1 = ctx.new_db("reg_lag_claims_t1").await?;
+        let t2 = ctx.new_db("reg_lag_claims_t2").await?;
+        let mut c = db.conn().await?;
+        exec_all(&mut c, DDL).await?;
+        exec_all(
+            &mut c,
+            &[
+                "CREATE TABLE payments (id INT PRIMARY KEY, order_id INT NOT NULL, \
+                 amount DECIMAL(10,2) NOT NULL)",
+                "INSERT INTO payments VALUES (100, 10, 5.00), (101, 11, 7.50)",
+            ],
+        )
+        .await?;
+        ensure_lazyview_table(&mut c).await?;
+        let specs = vec![
+            // `p` is a unit alias: no row identity, written per unit, no unique key on a target.
+            ViewSpec::new(
+                "r_lag_units",
+                Kind::Incremental,
+                "SELECT o.id, o.status, p.id AS pay_id, p.amount FROM orders o \
+                 LEFT JOIN payments p ON p.order_id = o.id",
+            )
+            .with_targets("source,t1"),
+            // The view whose catch-up on `t2` is held in the middle of its fold.
+            ViewSpec::new(
+                "r_lag_hold",
+                Kind::Incremental,
+                "SELECT id, name FROM customers",
+            )
+            .with_targets("source,t2"),
+        ];
+        add_views(&mut c, &specs).await?;
+        let mut ov = target_env(&[("t1", t1.dsn.as_str()), ("t2", t2.dsn.as_str())]);
+        // A held write waits for the test: it never times out on its own.
+        ov.push(("LAZYVIEW_TARGET_TIMEOUT_MS".into(), "300000".into()));
+        let ov: Vec<(&str, &str)> = ov.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut eng = ctx.start_engine(&db, &ov)?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        let targets: HashMap<String, Db> = [
+            ("t1".to_string(), t1.clone()),
+            ("t2".to_string(), t2.clone()),
+        ]
+        .into();
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &targets,
+            &HashMap::new(),
+            &specs,
+            "initial",
+        )
+        .await?;
+
+        let mut g1 = t1.conn().await?;
+        let mut g2 = t2.conn().await?;
+        for (g, table) in [(&mut g1, "r_lag_units"), (&mut g2, "r_lag_hold")] {
+            exec_all(
+                g,
+                &[
+                    format!(
+                        "CREATE TABLE lv_gate_{table} (id INT PRIMARY KEY, v TINYINT NOT NULL)"
+                    ),
+                    format!("INSERT INTO lv_gate_{table} VALUES (1, 0)"),
+                ],
+            )
+            .await?;
+            exec(
+                g,
+                &format!(
+                    "CREATE TRIGGER lv_gate_{table} BEFORE INSERT ON {table} FOR EACH ROW BEGIN \
+                     DECLARE gv TINYINT; \
+                     SELECT v INTO gv FROM lv_gate_{table} WHERE id = 1 FOR UPDATE; \
+                     IF gv = 0 THEN \
+                     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'lazyview test: the gate is closed'; \
+                     END IF; \
+                     END"
+                ),
+            )
+            .await?;
+        }
+        let log = eng.log_path.clone();
+        let logged = |view: &str, target: &str, what: &str, from: u64| -> usize {
+            let text = std::fs::read(&log).unwrap_or_default();
+            let tail =
+                String::from_utf8_lossy(&text[(from as usize).min(text.len())..]).into_owned();
+            let (v, t) = (format!("view={view} "), format!("target={target}"));
+            tail.lines()
+                .filter(|l| l.contains(what) && l.contains(&v) && l.contains(&t))
+                .count()
+        };
+        // Engine writes of `view` held at its gate on `on`. The process list names either the
+        // INSERT or the statement of its trigger that waits (servers differ), so both are matched;
+        // the INSERT by its schema, as the source's own table has the same name.
+        async fn at_gate(on: &Db, view: &str) -> Result<usize> {
+            let mut p = on.conn().await?;
+            let filter = format!(
+                "(INFO LIKE 'INSERT%{}%{view}%' OR INFO LIKE '%FROM lv_gate_{view} %')",
+                on.name
+            );
+            let n = session_ids(&mut p, &filter).await?.len();
+            p.disconnect().await.ok();
+            Ok(n)
+        }
+        // The fold's state-row write held by the test's lock.
+        async fn state_held(on: &Db) -> Result<usize> {
+            let mut p = on.conn().await?;
+            let filter = format!(
+                "DB = '{}' AND INFO LIKE 'INSERT INTO `_lazyview_state`%'",
+                on.name
+            );
+            let n = session_ids(&mut p, &filter).await?.len();
+            p.disconnect().await.ok();
+            Ok(n)
+        }
+        let state_at = |name: &'static str| {
+            let db = db.clone();
+            async move {
+                let mut p = db.conn().await?;
+                let at = scalar(
+                    &mut p,
+                    &format!(
+                        "SELECT CAST(refreshed_at AS CHAR) FROM _lazyview_state \
+                         WHERE name = '{name}' AND target = 'source'"
+                    ),
+                )
+                .await?;
+                p.disconnect().await.ok();
+                anyhow::Ok(at)
+            }
+        };
+
+        // 1. Both gates refuse: one change per view, and each target lags.
+        let hold_touched = state_at("r_lag_hold").await?;
+        exec_all(
+            &mut c,
+            &[
+                "START TRANSACTION",
+                "INSERT INTO orders VALUES (20, 2, 'new')",
+                "INSERT INTO payments VALUES (200, 20, 3.00)",
+                "UPDATE customers SET name = 'ann2' WHERE id = 1",
+                "COMMIT",
+            ],
+        )
+        .await?;
+        wait_until("each target's first write refused", t_ready(), || {
+            let n = logged("r_lag_units", "t1", "write failed", 0)
+                * logged("r_lag_hold", "t2", "write failed", 0);
+            async move { Ok(n > 0) }
+        })
+        .await?;
+        // 2. Both gates hold instead: each target's next retry waits at its gate.
+        exec_all(
+            &mut g1,
+            &[
+                "START TRANSACTION",
+                "UPDATE lv_gate_r_lag_units SET v = 1 WHERE id = 1",
+            ],
+        )
+        .await?;
+        exec_all(
+            &mut g2,
+            &[
+                "START TRANSACTION",
+                "UPDATE lv_gate_r_lag_hold SET v = 1 WHERE id = 1",
+            ],
+        )
+        .await?;
+        let (t1r, t2r) = (&t1, &t2);
+        wait_until("a retry held at each gate", t_ready(), || async move {
+            Ok(at_gate(t1r, "r_lag_units").await? >= 1 && at_gate(t2r, "r_lag_hold").await? >= 1)
+        })
+        .await?;
+        // 3. While `t1`'s retry is held, a second unit is owed to it (the source's table has it).
+        exec_all(
+            &mut c,
+            &[
+                "START TRANSACTION",
+                "INSERT INTO orders VALUES (21, 2, 'new')",
+                "INSERT INTO payments VALUES (210, 21, 4.00)",
+                "COMMIT",
+            ],
+        )
+        .await?;
+        let dbr = &db;
+        wait_until("the second unit on the source", t_ready(), || async move {
+            let mut p = dbr.conn().await?;
+            let n = scalar_i64(&mut p, "SELECT COUNT(*) FROM r_lag_units WHERE id = 21").await?;
+            p.disconnect().await.ok();
+            Ok(n == 1)
+        })
+        .await?;
+        // 4. The periodic `refreshed_at` touch of `r_lag_hold` is behind us, so the only write to
+        // its state row from here on is the catch-up's.
+        wait_until("r_lag_hold's refreshed_at touched", t_ready(), || {
+            let (now, before) = (state_at("r_lag_hold"), hold_touched.clone());
+            async move { Ok(now.await? != before) }
+        })
+        .await?;
+        let mut ls = db.conn().await?;
+        exec(&mut ls, "START TRANSACTION").await?;
+        exec(
+            &mut ls,
+            "SELECT name FROM _lazyview_state WHERE name = 'r_lag_hold' AND target = 't2' FOR UPDATE",
+        )
+        .await?;
+        // 5. `t2`'s retry goes through; the fold of its catch-up waits on the state row.
+        exec(&mut g2, "COMMIT").await?;
+        wait_until("t2's catch-up held in its fold", t_ready(), || async move {
+            Ok(state_held(dbr).await? == 1)
+        })
+        .await?;
+        // 6. Inside that fold, `t1`'s held retry goes through and ends.
+        exec(&mut g1, "COMMIT").await?;
+        wait_until("t1's held retry written", t_ready(), || async move {
+            let mut p = t1r.conn().await?;
+            let n = scalar_i64(&mut p, "SELECT COUNT(*) FROM r_lag_units WHERE id = 20").await?;
+            p.disconnect().await.ok();
+            Ok(n == 1 && at_gate(t1r, "r_lag_units").await? == 0)
+        })
+        .await?;
+        // 7. Hold `t1` again, then let the fold finish: every retry of `t1` claimed from now on
+        // waits at the gate after its read.
+        exec(&mut g1, "START TRANSACTION").await?;
+        exec(
+            &mut g1,
+            "SELECT v FROM lv_gate_r_lag_units WHERE id = 1 FOR UPDATE",
+        )
+        .await?;
+        let mark = std::fs::metadata(&log)?.len();
+        exec(&mut ls, "COMMIT").await?;
+        // The held retry's result folds (the group still owes the second unit), and a retry
+        // claimed after it is held; every claim since the mark is held at the gate.
+        wait_until("each claim of t1 held at its gate", t_ready(), || {
+            let text = std::fs::read(&log).unwrap_or_default();
+            let tail =
+                String::from_utf8_lossy(&text[(mark as usize).min(text.len())..]).into_owned();
+            let mine: Vec<&str> = tail
+                .lines()
+                .filter(|l| l.contains("view=r_lag_units ") && l.contains("target=t1"))
+                .collect();
+            let fold = mine
+                .iter()
+                .position(|l| l.contains("lag retry wrote its claim"));
+            let after =
+                fold.is_some_and(|f| mine[f..].iter().any(|l| l.contains("lag refresh claimed")));
+            let claims = mine
+                .iter()
+                .filter(|l| l.contains("lag refresh claimed"))
+                .count();
+            async move { Ok(after && at_gate(t1r, "r_lag_units").await? == claims) }
+        })
+        .await?;
+        let claims = logged("r_lag_units", "t1", "lag refresh claimed", mark);
+        exec(&mut g1, "COMMIT").await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &targets,
+            &HashMap::new(),
+            &specs,
+            &format!("after the catch-up ({claims} claim(s) of t1 since the held fold)"),
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
 // Helpers of the mv-level JSON unit tests (they drive `mv::apply` directly).
