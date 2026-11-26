@@ -2442,7 +2442,10 @@ fn chaos_fragmented_link_catches_up_with_a_fragmented_cursor() {
                 proxied_engine_dsn(&db, meta_p.listen)?,
             ),
             ("LAZYVIEW_HEARTBEAT_MS".to_string(), "200".to_string()),
-            ("LAZYVIEW_POSITION_PERSIST_MS".to_string(), "200".to_string()),
+            (
+                "LAZYVIEW_POSITION_PERSIST_MS".to_string(),
+                "200".to_string(),
+            ),
         ];
         let (mut eng, _) = start_with_views(&ctx, &db, &specs, &ov_refs(&ov)).await?;
         verify_targets(

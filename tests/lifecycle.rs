@@ -1881,6 +1881,36 @@ async fn saved_cursor_row(c: &mut mysql_async::Conn, instance: &str) -> Result<(
     .context("no status row for the instance")
 }
 
+/// The same row's other half: the position the pre-cursor columns hold. [`saved_row_shape`] is the
+/// pair read together, for the legs that have to watch a row through a migration no save is making.
+async fn saved_position_row(c: &mut mysql_async::Conn, instance: &str) -> Result<(String, u64)> {
+    use mysql_async::prelude::Queryable;
+    c.query_first(format!(
+        "SELECT `binlog_file`, `binlog_pos` FROM _lazyview_status WHERE instance_id = {}",
+        q(instance)
+    ))
+    .await?
+    .context("no status row for the instance")
+}
+
+/// Both halves of one instance's row as the server reads them: its cursor text (empty when the
+/// column is NULL), and the `binlog_file`/`binlog_pos` the same save wrote. A row that has been
+/// through an ALTER, a refused start and a migration should answer the same twice — and only the
+/// server's own reading of it says so.
+async fn saved_row_shape(
+    c: &mut mysql_async::Conn,
+    instance: &str,
+) -> Result<(String, String, u64)> {
+    use mysql_async::prelude::Queryable;
+    c.query_first(format!(
+        "SELECT COALESCE(CAST(binlog_cursor AS CHAR), ''), `binlog_file`, `binlog_pos` \
+         FROM _lazyview_status WHERE instance_id = {}",
+        q(instance)
+    ))
+    .await?
+    .context("no status row for the instance")
+}
+
 /// The whole consumed set rides `binlog_cursor` and the restart reads it back — #347, and the
 /// ruling that replaced #356's shed: a cursor between the 65,535 bytes the column used to hold and
 /// the 16 MB it holds now is stored **whole**, and the resume by GTID that needs it still works.
@@ -2031,9 +2061,12 @@ fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
         // product's own rule, asked of the product (`source::dump_state_covers`, the function the
         // engine gates on) rather than asserted from a log line. Either anchor has to catch up
         // below; what must not happen is the run dying, or a rebuild hiding the gap.
-        let node_state = scalar(&mut c, "SELECT COALESCE(@@GLOBAL.gtid_binlog_state, '')")
-            .await?
-            .unwrap_or_default();
+        // Read in the variable *this* family has: `gtid_binlog_state` is MariaDB's own, and asking
+        // a MySQL server for it is `ERROR 1193 (HY000): Unknown system variable`, which is how this
+        // leg went red on every MySQL flavor of CI run 45670984231. `common::server_gtid_set` picks
+        // per flavor (`@@GLOBAL.gtid_executed` on the MySQL family), which is also the set the rule
+        // is really asked against there.
+        let node_state = common::server_gtid_set(&mut c, maria).await?;
         let covers = !maria || lazyview::source::dump_state_covers(&node_state, set);
         let anchored = if covers {
             "binlog dump anchored on the consumed GTID set"
@@ -2465,8 +2498,9 @@ fn lifecycle_setup_widens_an_old_cursor_column() {
 /// against a schema whose `binlog_cursor` still has the width an old install left it **refuses to
 /// start** (exit 2, naming the column and `lazyview setup`) rather than starting and truncating its
 /// own saves; `lazyview setup` widens the column without touching the row; and the next run resumes
-/// on the cursor that row still holds — byte for byte the one the run before the migration saved —
-/// and brings the writes that landed while every run was down up to the view with no whole rebuild.
+/// on the position that row still holds — the pre-cursor columns an install from before #347 left —
+/// and brings the writes that landed while every run was down up to the view with no whole rebuild,
+/// and fills the widened column with its whole consumed set.
 ///
 /// Provenance, stated once and plainly: this scenario is **new**, and its four legs are not equal
 /// evidence. The refusal leg is the reproduced failure: at the PR's base commit 1068cbb (`git
@@ -2539,10 +2573,25 @@ fn lifecycle_setup_refuses_and_migrates_a_narrow_cursor_column() {
                 "the cursor this server assigns GTIDs on holds no set: {saved}"
             );
         }
-        // The old install, as the next run sees it: the width `ensure` left before #347 widened it.
-        // The row's value fits a TEXT (the truncation of a set that does *not* fit is the story
-        // `lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid` tells; here the point is
-        // the column, so the value has to survive the ALTER for the legs below to mean anything).
+        // The old install, as the next run sees it: the width `ensure` left before #347 widened it,
+        // and the row such an install actually holds — no cursor text, the position in the two
+        // pre-cursor columns, which is where [`lazyview::meta::load_position`] reads a row written
+        // before the cursor existed. Clearing the text is not a convenience: on the server CI's legs
+        // share, where every earlier run's injector has been writing GTIDs for hours, the set a run
+        // carries is larger than a TEXT can hold, and the ALTER below answers `ERROR 1406 (22001):
+        // Data too long for column 'binlog_cursor'` (every MySQL and MariaDB leg of CI run
+        // 45670984231) — a story about the value, not about the column. What the set costs is
+        // `lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid`'s to tell. This leg is
+        // about the column, and about a row that keeps its position through all three steps.
+        exec(
+            &mut c,
+            &format!(
+                "UPDATE `_lazyview_status` SET `binlog_cursor` = NULL WHERE `instance_id` = {}",
+                q(&instance)
+            ),
+        )
+        .await?;
+        let (at_file, at_pos) = saved_position_row(&mut c, &instance).await?;
         exec(
             &mut c,
             "ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` TEXT NULL",
@@ -2552,11 +2601,11 @@ fn lifecycle_setup_refuses_and_migrates_a_narrow_cursor_column() {
             cursor_column_type(&mut c).await? == "text",
             "the simulated old install is not a TEXT column"
         );
-        let (kept, kept_stored) = saved_cursor_row(&mut c, &instance).await?;
+        let (kept, kept_file, kept_pos) = saved_row_shape(&mut c, &instance).await?;
         ensure!(
-            kept == saved && kept_stored as usize == saved.len(),
-            "narrowing the column changed the cursor the run had saved: {kept_stored} of {} bytes",
-            saved.len()
+            kept.is_empty() && kept_file == at_file && kept_pos == at_pos,
+            "narrowing the column disturbed the row: it holds cursor {kept:?} at \
+             {kept_file}:{kept_pos}, expected no cursor at {at_file}:{at_pos}"
         );
 
         // 1. The refusal, as the operator sees it: the *binary*, because the exit code is the
@@ -2581,16 +2630,12 @@ fn lifecycle_setup_refuses_and_migrates_a_narrow_cursor_column() {
                 && log.contains("lazyview setup"),
             "the refusal names neither the column, its width, and the fix; log:\n{log}"
         );
-        let (kept, kept_stored) = saved_cursor_row(&mut c, &instance).await?;
+        let col = cursor_column_type(&mut c).await?;
+        let (kept, kept_file, kept_pos) = saved_row_shape(&mut c, &instance).await?;
         ensure!(
-            kept == saved
-                && kept_stored as usize == saved.len()
-                && cursor_column_type(&mut c).await? == "text",
-            "the refused run left its mark: it saved {} bytes over the row or widened the column \
-             itself (column {}, {kept_stored} of {} bytes)",
-            kept_stored,
-            cursor_column_type(&mut c).await?,
-            saved.len()
+            kept.is_empty() && kept_file == at_file && kept_pos == at_pos && col == "text",
+            "the refused run left its mark: the row reads cursor {kept:?} at {kept_file}:{kept_pos} \
+             under a {col:?} column — expected no cursor at {at_file}:{at_pos} under a text column"
         );
         ctx.log("the operations run refused on the narrow column and touched nothing");
 
@@ -2612,11 +2657,11 @@ fn lifecycle_setup_refuses_and_migrates_a_narrow_cursor_column() {
             cursor_column_type(&mut c).await? == "mediumtext",
             "`lazyview setup` left the cursor column narrow"
         );
-        let (kept, kept_stored) = saved_cursor_row(&mut c, &instance).await?;
+        let (kept, kept_file, kept_pos) = saved_row_shape(&mut c, &instance).await?;
         ensure!(
-            kept == saved && kept_stored as usize == saved.len(),
-            "the migration rewrote the cursor out of the row it widened: {kept_stored} of {} bytes",
-            saved.len()
+            kept.is_empty() && kept_file == at_file && kept_pos == at_pos,
+            "the migration rewrote the row it widened: it reads cursor {kept:?} at \
+             {kept_file}:{kept_pos}, expected no cursor at {at_file}:{at_pos}"
         );
 
         // 3. The resume, on that surviving cursor. The writes below land while no run is up, so a
@@ -2631,12 +2676,13 @@ fn lifecycle_setup_refuses_and_migrates_a_narrow_cursor_column() {
         }
         let resumed_on = lazyview::meta::load_position(&mut c, &instance, flavor)
             .await?
-            .context("the cursor did not survive the migration and the refusal")?;
+            .context("the row did not survive the migration and the refusal")?;
         ensure!(
-            resumed_on.to_string() == saved,
-            "the cursor reads back as {resumed_on} after the migration, not the {} bytes the run \
-             saved",
-            saved.len()
+            resumed_on.gtid().is_none()
+                && resumed_on.to_position().file == at_file
+                && resumed_on.to_position().pos == at_pos,
+            "the row the refusal and the migration left reads back as {resumed_on}, not the \
+             position the run stopped at ({at_file}:{at_pos})"
         );
         let from = resumed_on.to_position();
         let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_POSITION_PERSIST_MS", "200")])?;
@@ -2678,6 +2724,25 @@ fn lifecycle_setup_refuses_and_migrates_a_narrow_cursor_column() {
             "the cursor the resumed run saved ({}) is not one this server covers",
             back
         );
+        // And the widened column is what the run fills: whole in the server's own reading, and past
+        // the 65,535 bytes the old column stopped at whenever the set is that big. A fresh server's
+        // set is smaller than that, and there the leg has nothing to prove about the width.
+        let (text, stored) = saved_cursor_row(&mut c, &instance).await?;
+        ensure!(
+            stored as usize == text.len() && back.to_string() == text,
+            "the resumed run's cursor is not the row's own word: the server holds {stored} of {} \
+             bytes and the row parses as {back}",
+            text.len()
+        );
+        if has_gtid && saved.len() > 65_535 {
+            ensure!(
+                text.len() > 65_535 && text.contains("[g="),
+                "the resumed run wrote back a {}-byte cursor through the widened column although \
+                 the run before the migration carried {} bytes of set: the set was shed",
+                text.len(),
+                saved.len()
+            );
+        }
         c.disconnect().await.ok();
         Ok(())
     });
