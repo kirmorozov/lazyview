@@ -80,9 +80,9 @@ fn labels() {
 #[test]
 fn params_and_families() {
     let b = Column::new("b", "binary", "binary(4)", None, None, Some(4), false);
-    assert_eq!(b.param, "CAST(? AS BINARY(4))");
+    assert_eq!(b.param, "CAST(UNHEX(?) AS BINARY(4))");
     let vb = Column::new("b", "varbinary", "varbinary(4)", None, None, Some(4), false);
-    assert_eq!(vb.param, "CAST(? AS BINARY)");
+    assert_eq!(vb.param, "UNHEX(?)");
     let bit = Column::new("f", "bit", "bit(3)", None, None, None, false);
     assert_eq!(bit.param, "CAST(? AS UNSIGNED)");
     assert_eq!(bit.family(), TypeFamily::Bit);
@@ -144,13 +144,13 @@ fn opaque_types_and_default_collations() {
     );
     assert_eq!(
         s.param,
-        "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_0900_ai_ci"
+        "CAST(UNHEX(?) AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_0900_ai_ci"
     );
     assert_eq!(
         s.clone()
             .with_default_collation(Some("utf8mb4_0900_ai_ci"))
             .param,
-        "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET utf8mb4)"
+        "CAST(UNHEX(?) AS CHAR CHARACTER SET utf8mb4)"
     );
     assert_eq!(
         s.clone()
@@ -161,7 +161,8 @@ fn opaque_types_and_default_collations() {
     );
     assert_eq!(s.clone().with_default_collation(None).param, s.param);
     // A non-UTF8 charset: the bytes of the row image are reinterpreted, never converted (MariaDB
-    // turned a byte invalid in the connection's utf8mb4 into `?` inside `CONVERT(... USING ...)`).
+    // turned a byte invalid in the connection's utf8mb4 into `?` inside `CONVERT(... USING ...)`),
+    // and they arrive as hex (#394, see `byte_images_bind_as_hex`).
     let l = Column::new(
         "l",
         "varchar",
@@ -173,13 +174,13 @@ fn opaque_types_and_default_collations() {
     );
     assert_eq!(
         l.param,
-        "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1) COLLATE latin1_swedish_ci"
+        "CAST(UNHEX(?) AS CHAR CHARACTER SET latin1) COLLATE latin1_swedish_ci"
     );
     assert_eq!(
         l.clone()
             .with_default_collation(Some("latin1_swedish_ci"))
             .param,
-        "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)",
+        "CAST(UNHEX(?) AS CHAR CHARACTER SET latin1)",
         "the probe's answer drops the collation of a non-UTF8 column too"
     );
     assert!(!l.exact_key(), "latin1 binlog bytes are not unit keys");
@@ -198,4 +199,105 @@ fn opaque_types_and_default_collations() {
         e.with_default_collation(Some("utf8mb4_general_ci")).param,
         "?"
     );
+}
+
+/// The hex text [`HEX_PARAM`] decodes, decoded the way the server's `UNHEX` does.
+fn unhex(t: &[u8]) -> Vec<u8> {
+    assert!(t.len().is_multiple_of(2), "odd hex text {t:?}");
+    t.chunks(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+        .collect()
+}
+
+/// #394: the bytes of a string or binary row image reach the server as hex text, and the
+/// placeholder decodes them. As a plain string parameter they were utf8mb4 text to the server,
+/// and MariaDB sizes such a parameter by its utf8mb4 characters: bytes that only begin a
+/// multi-byte character (latin1 `É` = 0xC9, sjis `ﾊ` = 0xCA, a VARBINARY 0xE282) are none, so
+/// the lookup's literal row held `''` and the lookup named the wrong unit. Every byte string the
+/// rule can bite (each 1- and 2-byte value, each 3-byte start of a 4-byte character, the empty
+/// value) binds as ASCII, which every character set reads as itself, and decodes to its bytes.
+#[test]
+fn byte_images_bind_as_hex() {
+    let text = |dt: &str, ct: &str, cs: &str, co: &str| {
+        Column::new("c", dt, ct, Some(cs), Some(co), Some(40), false)
+    };
+    let bytes_cols = [
+        text("varchar", "varchar(10)", "latin1", "latin1_swedish_ci"),
+        text("char", "char(10)", "latin1", "latin1_bin")
+            .with_default_collation(Some("latin1_swedish_ci")),
+        text("varchar", "varchar(10)", "sjis", "sjis_japanese_ci")
+            .with_default_collation(Some("sjis_japanese_ci")),
+        text("text", "text", "utf16", "utf16_general_ci"),
+        text("varchar", "varchar(10)", "utf8mb4", "utf8mb4_0900_ai_ci"),
+        Column::new("b", "binary", "binary(4)", None, None, Some(4), false),
+        Column::new("b", "varbinary", "varbinary(4)", None, None, Some(4), false),
+        Column::new("b", "blob", "blob", None, None, None, false),
+    ];
+    let mut values: Vec<Vec<u8>> = vec![Vec::new()];
+    values.extend((0..=255u8).map(|x| vec![x]));
+    values.extend((0..=u16::MAX).map(|x| x.to_be_bytes().to_vec()));
+    for lead in 0xF0..=0xF4u8 {
+        for a in 0x80..=0xBFu8 {
+            values.extend((0x80..=0xBFu8).map(|b| vec![lead, a, b]));
+        }
+    }
+    for c in &bytes_cols {
+        assert!(
+            c.hex && c.param.contains(HEX_PARAM),
+            "{}: {}",
+            c.column_type,
+            c.param
+        );
+        for v in &values {
+            match c.bind(&Datum::Bytes(v.clone())) {
+                Value::Bytes(t) => {
+                    assert!(t.is_ascii(), "{}: {v:02X?} bound as {t:?}", c.column_type);
+                    assert_eq!(&unhex(&t), v, "{}", c.column_type);
+                }
+                other => panic!("{}: {v:02X?} bound as {other:?}", c.column_type),
+            }
+        }
+        assert_eq!(c.bind(&Datum::Null), Value::NULL, "{}", c.column_type);
+    }
+    // The other placeholders take the value as it is.
+    let others = [
+        (Column::simple("i", "int"), Datum::Int(-3)),
+        (
+            Column::simple("d", "decimal"),
+            Datum::Bytes(b"-12.50".to_vec()),
+        ),
+        (
+            Column::simple("t", "time"),
+            Datum::Bytes(b"838:00:00.500000".to_vec()),
+        ),
+        (
+            Column::new(
+                "e",
+                "enum",
+                "enum('é')",
+                Some("latin1"),
+                Some("latin1_swedish_ci"),
+                None,
+                false,
+            ),
+            Datum::Bytes("é".as_bytes().to_vec()),
+        ),
+        (
+            Column::new("s", "timestamp", "timestamp(3)", None, None, None, false),
+            Datum::Bytes(b"1700000000.125".to_vec()),
+        ),
+        (
+            Column::new("j", "json", "json", None, None, None, true),
+            Datum::Bytes(br#"{"a":1}"#.to_vec()),
+        ),
+    ];
+    for (c, d) in &others {
+        assert!(
+            !c.hex && !c.param.contains(HEX_PARAM),
+            "{}: {}",
+            c.column_type,
+            c.param
+        );
+        assert_eq!(c.bind(d), d.to_value(), "{}", c.column_type);
+    }
 }

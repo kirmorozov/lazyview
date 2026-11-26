@@ -6,9 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::datum::Datum;
 use crate::source::SourceCaps;
 use anyhow::Result;
-use mysql_async::Conn;
+use mysql_async::{Conn, Value};
 
 /// How a binlog value of this column must be normalized / bound back as a parameter.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,8 +39,12 @@ pub struct Column {
     pub name: String,
     pub kind: ColKind,
     /// Typed placeholder for a binlog value of this column, so literal rows keep the column's
-    /// type and collation (and joins against them can use indexes).
+    /// type and collation (and joins against them can use indexes). Its parameter is
+    /// [`Column::bind`]'s.
     pub param: String,
+    /// The placeholder decodes the value's bytes from hex text ([`HEX_PARAM`]): string and
+    /// binary columns.
+    pub hex: bool,
     /// Whether binlog values of this column equal what the server returns for it in queries.
     pub exact: bool,
     /// INVISIBLE column (excluded from `SELECT *`).
@@ -123,10 +128,10 @@ impl Column {
             (ColKind::Bit(_), _) => "CAST(? AS UNSIGNED)".to_string(),
             // Fixed-length BINARY(n): keep the declared length so padded values compare equal.
             (ColKind::Binary, "binary") => match octet_len {
-                Some(n) => format!("CAST(? AS BINARY({n}))"),
-                None => "CAST(? AS BINARY)".to_string(),
+                Some(n) => format!("CAST({HEX_PARAM} AS BINARY({n}))"),
+                None => HEX_PARAM.to_string(),
             },
-            (ColKind::Binary, _) => "CAST(? AS BINARY)".to_string(),
+            (ColKind::Binary, _) => HEX_PARAM.to_string(),
             // The JSON param answer belongs to the flavor (F6): the MySQL family renders the
             // cast, MariaDB (whose caps say no JSON cast) binds the JSON text as a plain string.
             (ColKind::Json, _) if caps.json_cast => crate::source::mysql::json_param(),
@@ -145,9 +150,11 @@ impl Column {
             ColKind::Plain => utf8_like,
             _ => true,
         };
+        let hex = param.contains(HEX_PARAM);
         Column {
             name: name.to_string(),
             kind,
+            hex,
             param,
             exact,
             invisible: false,
@@ -203,6 +210,17 @@ impl Column {
         self.exact && !self.generated.as_ref().is_some_and(|g| !g.stored)
     }
 
+    /// The parameter [`Self::param`] takes for `d`, a binlog value of this column
+    /// ([`Datum::from_binlog`]): the bytes of a string or binary value as hex text (see
+    /// [`HEX_PARAM`]), every other value as it is. One allocation per value, as
+    /// [`Datum::to_value`]'s copy of the bytes.
+    pub fn bind(&self, d: &Datum) -> Value {
+        match d {
+            Datum::Bytes(b) if self.hex => Value::Bytes(hex_text(b)),
+            d => d.to_value(),
+        }
+    }
+
     /// Drops the `COLLATE` of a string param when the column has `default`, the collation that
     /// `CAST(... AS CHAR CHARACTER SET charset)` yields on the server. The param then has the
     /// column's own IMPLICIT coercibility; an EXPLICIT one clashes with any `COLLATE` in the view
@@ -217,21 +235,45 @@ impl Column {
     }
 }
 
+/// The bytes of a string or binary value, bound as hex text ([`Column::bind`]) and decoded by the
+/// server. A string parameter is text in the connection's character set (utf8mb4), and MariaDB
+/// (10.6, 10.11 and 11.4 measured, issue #394) sizes it by its utf8mb4 character count, in which
+/// bytes that only begin a multi-byte character count nothing: a latin1 `É` (0xC9), a sjis `ﾊ`
+/// (0xCA), a VARBINARY 0xE282 is zero characters long. The literal rows of a lookup (the derived
+/// table `(SELECT <param> AS a UNION ALL ...)`) then hold `''`, so the lookup named the unit `''`
+/// instead of the changed row's, and that unit was never refreshed: the view lost the row's group
+/// with nothing left to owe it. Hex text is ASCII, the same bytes in every character set and on
+/// every server, so the server sizes it by its bytes. It costs twice the value's length in the
+/// statement, and nothing per binlog event: a lookup binds its images once per refresh.
+pub(crate) const HEX_PARAM: &str = "UNHEX(?)";
+
 /// The start of a bound string's placeholder ([`text_param`]'s shape). The collation probes of the
 /// flavors (`crate::source::mysql::default_collation`, `crate::source::maria::default_collation`)
 /// ask the server about this same expression, and the lookup that drops a `COLLATE`
 /// (`crate::engine::without_collate`) recognizes a bound string by this prefix: one text, four
 /// places that have to change together.
-pub(crate) const TEXT_PARAM_PREFIX: &str = "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET ";
+pub(crate) const TEXT_PARAM_PREFIX: &str = "CAST(UNHEX(?) AS CHAR CHARACTER SET ";
+
+/// Upper-case hex text of `b` (what [`HEX_PARAM`] decodes).
+fn hex_text(b: &[u8]) -> Vec<u8> {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = Vec::with_capacity(2 * b.len());
+    for &x in b {
+        out.push(DIGITS[usize::from(x >> 4)]);
+        out.push(DIGITS[usize::from(x & 0x0F)]);
+    }
+    out
+}
 
 /// Typed placeholder for a string value: its bytes in the column's charset (and collation), with
-/// the column's collation when it is not the charset's default. Not `CONVERT(CAST(? AS BINARY)
-/// USING charset)`: that is a CONVERSION, and MariaDB (10.11 and 13.0, issue #25) replaces every
-/// byte that is not valid in the connection's character set (utf8mb4) with `?` on the way, so a
-/// latin1 `ï` (0xEF) became `?` and the lookup of such a key matched no row: the view kept its old
-/// aggregates and stayed `ready`. `CAST(... AS CHAR CHARACTER SET charset)` reinterprets the bytes
-/// instead, which both server families keep, and yields the same collation and coercibility; MySQL
-/// documents the two forms as equivalent.
+/// the column's collation when it is not the charset's default. The bytes arrive as hex
+/// ([`HEX_PARAM`]), so no character set ever reads them before the `CAST`. Not
+/// `CONVERT(... USING charset)`: that is a CONVERSION, and MariaDB (10.11 and 13.0, issue #25)
+/// replaced every byte that is not valid in the connection's character set (utf8mb4) with `?` on
+/// the way, so a latin1 `ï` (0xEF) became `?` and the lookup of such a key matched no row: the
+/// view kept its old aggregates and stayed `ready`. `CAST(... AS CHAR CHARACTER SET charset)`
+/// reinterprets the bytes instead, which both server families keep, and yields the same collation
+/// and coercibility; MySQL documents the two forms as equivalent.
 fn text_param(charset: &str, collation: Option<&str>) -> String {
     match collation {
         Some(co) => format!("{TEXT_PARAM_PREFIX}{charset}) COLLATE {co}"),
