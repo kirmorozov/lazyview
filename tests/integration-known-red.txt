@@ -17,7 +17,6 @@
 # Fix will follow (owner 2026-11-24: temporary, so main is mostly green while these are fixed). Each line
 # is a real failure with an open issue and a fix in flight; the fix PR (or the keeper pass that lands it)
 # deletes its line. These are not by-design reds and must not stay.
-bench_throughput_shapes #378
 #
 # The two entries the saved-position branch `kirmorozov/lv-worker-mode1-c1c2` removed (the frozen
 # live buffer and the build replacing it, `pending_floor` / `persist_position`):

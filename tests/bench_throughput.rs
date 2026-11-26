@@ -324,10 +324,19 @@ async fn run_shape(
         specs.len(),
     ));
 
+    // A chained view reads the engine's own writes to its upstream table, which reach the binlog only
+    // after the source position the writers left: a round per level of the chain plus the shared
+    // helper's margin (#378). The chain is at most `chained.len()` levels deep.
+    let rounds = if shape.chained.is_empty() {
+        1
+    } else {
+        2 + shape.chained.len()
+    };
+
     // Warm-up: the first window measures a cold engine (builds just finished, caches empty), so it
     // is written and drained without being measured.
     write_burst(&db, cfg, &shape, 0, seed, cfg.min_window / 2).await?;
-    drain(ctx, &mut eng, &mut c, T_CATCHUP).await?;
+    drain(&mut eng, &mut c, T_CATCHUP, rounds).await?;
 
     let mut out = Vec::new();
     for rep in 1..=cfg.reps {
@@ -336,7 +345,7 @@ async fn run_shape(
         let t0 = Instant::now();
         let budget = write_burst(&db, cfg, &shape, rep * 64, seed, cfg.min_window).await?;
         let write_s = t0.elapsed();
-        drain(ctx, &mut eng, &mut c, T_CATCHUP).await?;
+        drain(&mut eng, &mut c, T_CATCHUP, rounds).await?;
         let after = eng.scrape().await?;
         let usage = eng.stop_sampler()?;
         let window_s = t0.elapsed().as_secs_f64().max(0.001);
@@ -520,27 +529,13 @@ async fn one_phase(db: &Db, cfg: &Config, shape: &Shape, phase: usize, seed: u64
     Ok(total)
 }
 
-/// Catch-up: the applied position reaches the source position the writes left behind, and the
-/// engine says `ready` (the plan's `start → caught up` boundary).
-async fn drain(ctx: &Ctx, eng: &mut EngineProc, c: &mut Conn, timeout: Duration) -> Result<()> {
-    let want = server_position(c).await?;
+/// Catch-up: the engine says `ready` (the plan's `start → caught up` boundary) and has applied the
+/// source position the writes left behind, `rounds` times: a chained view reads the engine's own
+/// writes to its upstream table, which reach the binlog only after the first position, so the
+/// shared wait takes the position again per chain level (#378).
+async fn drain(eng: &mut EngineProc, c: &mut Conn, timeout: Duration, rounds: usize) -> Result<()> {
     eng.wait_ready(timeout).await?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        let s = eng.scrape().await?;
-        if s.applied_position().is_some_and(|p| p >= want) {
-            return Ok(());
-        }
-        if Instant::now() > deadline {
-            bail!(
-                "{}: the engine did not catch up with {:?} in {timeout:?} ({})",
-                ctx.test,
-                want,
-                s.state_line(),
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    eng.wait_caught_up_rounds(c, timeout, rounds).await
 }
 
 /// Polls `_lazyview_state` until every named view has rows and all of them are `ready` (the

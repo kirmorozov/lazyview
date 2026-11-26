@@ -1021,6 +1021,30 @@ impl EngineProc {
         Scraped::parse(Instant::now(), &body)
     }
 
+    /// Captures the source's binlog end and waits until the engine applied it, `rounds` times: the
+    /// process-leg twin of `Engine::wait_caught_up_rounds` (the engine's own writes to an upstream
+    /// view advance the binlog, so a chained view needs one more round per chain level). One
+    /// `timeout` bounds all rounds.
+    pub async fn wait_caught_up_rounds(
+        &self,
+        src: &mut Conn,
+        timeout: Duration,
+        rounds: usize,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        for _ in 0..rounds.max(1) {
+            let target = server_position(src).await?;
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            self.wait_scrape(left, &format!("applied position {target}"), |s| {
+                s.applied_position().is_some_and(|p| p >= target)
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     /// `/metrics` without the token: the gate's verdict (401 when `LAZYVIEW_HEALTH_TOKEN` is set).
     pub async fn scrape_unauthorized(&self) -> Result<u16> {
         Ok(self.get("/metrics", false).await?.0)
