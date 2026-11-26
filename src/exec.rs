@@ -1846,6 +1846,11 @@ mod tests {
         let prefix =
             over("SELECT e.id, e.name, l.w FROM entities e JOIN links l ON l.entity_id = e.id");
         assert!(Dedup::routed(&prefix), "the join fixture is a core plan");
+        assert!(
+            Dedup::core_refusal(&prefix).is_none(),
+            "nothing about it is a cascade or a hop, so no other gate takes it off the core: {}",
+            Dedup::core_refusal(&prefix).unwrap_or_default()
+        );
         assert_eq!(
             Dedup::layout_refusal(&prefix, &LAYOUTS),
             None,
@@ -1940,6 +1945,33 @@ mod tests {
             Dedup::layout_refusal(&join_prefix, &LAYOUTS),
             None,
             "two prefixes are still a prefix"
+        );
+        // The shape the integration test (`join_and_cascade_shapes_are_maintained_on_both_routes`,
+        // `v_cascade`) asserts against the engine's own route line: the parent joined to the
+        // cascading child, reading only prefixes. It is a core plan by its access route and the
+        // layout gate has nothing to say about it, so the ONLY reason it keeps the executor is
+        // `core_refusal`'s blanket hold on cascade plans — which is what makes the mapped
+        // `feed_cascade_with_image` the reader of the kept child rows a parent's delete answers
+        // from. Without this pin the integration test would assert a route it never proved.
+        let cascade_join = over(
+            "SELECT e.id AS eid, i.id AS iid, i.qty FROM entities e \
+             JOIN items i ON i.entity_id = e.id",
+        );
+        assert!(
+            Dedup::routed(&cascade_join),
+            "the static route is the core: only a refusal moves it"
+        );
+        assert_eq!(
+            Dedup::layout_refusal(&cascade_join, &LAYOUTS),
+            None,
+            "both aliases read only what every layout preserves"
+        );
+        let why = Dedup::core_refusal(&cascade_join)
+            .expect("the cascade is what keeps it on the executor");
+        assert!(
+            why.contains("cascade `entities` -> `items`"),
+            "the reason is the one the engine logs, so the integration test's line match is \
+             the same decision: {why}"
         );
     }
 
