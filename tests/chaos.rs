@@ -3146,6 +3146,13 @@ fn chaos_lock_slow_loop_no_takeover() {
 /// no FIN, so the server keeps its sessions until the lease says otherwise. The old instance here is
 /// a real process and gets SIGSTOP; the replacement starts and takes over by the lease; then the old
 /// one is SIGCONTinued and must write nothing — it self-fences (ruling 1) and exits.
+///
+/// "Write nothing" is what is checked, by the counters of its writes and of the epoch it must not
+/// move again: bar (a) of lv-super's ruling of 2026-11-26. The applied watermark scraped between the
+/// wake and the exit is deliberately not compared — it is an in-memory reading taken mid-way, before
+/// the instance had reached its own exit, and the owner's rule is to compare at convergence. The
+/// convergence this scenario compares is the one at its bottom: the replacement's views against the
+/// oracle once the writers have stopped.
 #[test]
 fn chaos_lock_frozen_old_instance_writes_nothing() {
     let _one = toxi::exclusive();
@@ -3184,7 +3191,20 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
             // gone — the only thing that can end its lock session is the lease.
             let pre = a.scrape().await?;
             let pre_rows = pre.counter("mv_rows_inserted");
-            let pre_applied = pre.applied_position();
+            let pre_deletes = pre.counter("mv_rows_deleted");
+            let pre_upserts = pre.counter("mv_rows_upserted");
+            let pre_rebuilds = pre.counter("full_rebuilds");
+            // A metric the endpoint does not carry reads as 0 (`Scraped::counter`), and every
+            // "wrote nothing" below would then be proved by a typo in a name. This instance has
+            // built its views and streamed rows since it started, so the counters the scenario
+            // holds at zero have to have counted something by now.
+            ensure!(
+                pre_rows > 0 && pre.counter("mv_queries") > 0,
+                "the instance had written no view row and issued no statement against a target \
+                 before the freeze, so the counters this scenario holds at zero say nothing; log \
+                 tail:\n{}",
+                a.log_tail(15)
+            );
             a.freeze()?;
             let pid = a.pid();
             wait_until("the old process to be stopped (state T)", BOUND, || async {
@@ -3229,15 +3249,35 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
                 .as_ref()
                 .map_or(pre_rows, |s| s.counter("mv_rows_inserted"));
             if let Some(s) = &post {
+                // Bar (a) of the fencing property, and the only one a test can decide: an instance
+                // the replacement has fenced WRITES NOTHING — no view row by any of the three write
+                // paths, no whole rebuild (lv-super's ruling of 2026-11-26). What it does in memory
+                // on the way to noticing is not a safety property: the applied watermark scraped
+                // here would have been read after SIGCONT and before its exit, i.e. mid-way, and the
+                // owner's rule is to compare at convergence (the convergence this scenario does
+                // compare is the one at the bottom of it — the replacement's views against the
+                // oracle, once the writers have stopped). So the position the woken instance had
+                // reached is deliberately not compared; its writes are.
                 ensure!(
                     s.counter("mv_rows_inserted") == pre_rows,
                     "the woken instance wrote {} row(s) to the targets after its lock was gone",
                     s.counter("mv_rows_inserted").saturating_sub(pre_rows)
                 );
                 ensure!(
-                    s.applied_position() == pre_applied,
-                    "the woken instance advanced its applied position from {pre_applied:?} to {:?}",
-                    s.applied_position()
+                    s.counter("mv_rows_deleted") == pre_deletes,
+                    "the woken instance deleted {} row(s) from the targets after its lock was gone",
+                    s.counter("mv_rows_deleted").saturating_sub(pre_deletes)
+                );
+                ensure!(
+                    s.counter("mv_rows_upserted") == pre_upserts,
+                    "the woken instance upserted {} row(s) into the targets after its lock was \
+                     gone",
+                    s.counter("mv_rows_upserted").saturating_sub(pre_upserts)
+                );
+                ensure!(
+                    s.counter("full_rebuilds") == pre_rebuilds,
+                    "the woken instance rebuilt {} view(s) after its lock was gone",
+                    s.counter("full_rebuilds").saturating_sub(pre_rebuilds)
                 );
             }
             let st = a.wait_exit(Duration::from_secs(90))?;
@@ -3253,6 +3293,15 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
                 fenced,
                 "the woken instance left without ever naming the takeover; log tail:\n{}",
                 a.log_tail(15)
+            );
+            // The row half of bar (a). Both position saves of a run are `UPDATE … WHERE instance_id
+            // = ? AND epoch = ?`, so a fenced instance cannot move the row the replacement owns —
+            // unless it re-claimed the lock, which is what the epoch would show. One takeover, ever.
+            ensure!(
+                lock_epoch(&db).await? == epoch_before + 1,
+                "the fencing epoch moved a second time: the woken instance re-claimed the lock, and \
+                 with it the row the saved position lives in — the epoch guard of its two position \
+                 saves is what a fenced run is supposed to be refused by"
             );
             measured(format!(
                 "chaos_lock_frozen_old_instance_writes_nothing: old process wrote {} row(s) after \
