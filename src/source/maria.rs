@@ -226,7 +226,7 @@ pub(crate) fn plan_refusal(
 
 /// Whether a `VERSION()` string is MariaDB 11.4 or later (`11.4.2-MariaDB`, `10.11.14-MariaDB`;
 /// the `5.5.5-` replication prefix is skipped).
-fn at_least_11_4(version: &str) -> bool {
+pub(crate) fn at_least_11_4(version: &str) -> bool {
     let v = version.strip_prefix("5.5.5-").unwrap_or(version);
     let mut parts = v
         .split(|c: char| !c.is_ascii_digit())

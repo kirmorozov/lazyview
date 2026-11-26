@@ -21,10 +21,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::accumulate::{
-    self, extend_partial, feed, feed_cascade, feed_map, Fed, KeySet, UnitChunk, UnitSet, ViewDirty,
+    self, extend_partial, feed_cascade_with_image, feed_map_with_image, feed_with_image, Fed,
+    KeySet, UnitChunk, UnitSet, ViewDirty,
 };
 use crate::analyze::{self, Mode, ViewPlan};
-use crate::binlog::{self, BinlogReader, Flavor, Item, Position};
+use crate::binlog::{self, BinlogReader, Flavor, ImageMap, Item, Position};
 use crate::cascade;
 use crate::catalog::{Catalog, TableInfo, TableRef};
 use crate::config::{Config, MissingBinlog, StartMode};
@@ -805,7 +806,15 @@ fn unit_cols(plan: &ViewPlan, ai: usize) -> Option<Box<[u16]>> {
         .then(|| cols.iter().map(|&c| c as u16).collect())
 }
 
-type XaRow = (TableRef, Option<BinlogRow>, Option<BinlogRow>);
+/// C-01 (#7): the row kind travels with the staged row: at XA COMMIT the image
+/// layout is resolved per (table, kind), the same resolution the live rows event
+/// got (an INSERT's full image and an UPDATE's base-only image differ).
+type XaRow = (
+    TableRef,
+    binlog::RowsKind,
+    Option<BinlogRow>,
+    Option<BinlogRow>,
+);
 /// An XA transaction read from the binlog; its rows are applied at XA COMMIT.
 struct XaTxn {
     /// The cursor before it (replaying from there re-reads its rows); `Cursor::is_some`
@@ -1701,13 +1710,28 @@ async fn server_identity(
 
 /// Whether an UPDATE changed any column marked in `cols`. Images that are not full rows
 /// (`binlog_row_image` other than FULL) count as changed; so do partial JSON updates.
-fn columns_changed(before: &BinlogRow, after: &BinlogRow, cols: &[bool]) -> bool {
-    if before.len() != cols.len() || after.len() != cols.len() {
+/// C-01 (#7): `image` maps this table's image slots to catalog ordinals — the
+/// width check and each comparison read the slots the image really uses, and a
+/// marked column the layout leaves out counts as changed (its change could be
+/// invisible in the image).
+fn columns_changed(
+    before: &BinlogRow,
+    after: &BinlogRow,
+    cols: &[bool],
+    image: Option<&ImageMap>,
+) -> bool {
+    let width = image.map_or(cols.len(), |m| m.len());
+    if before.len() != width || after.len() != width {
         return true;
     }
     cols.iter().enumerate().any(|(c, &read)| {
-        read && (before.as_ref(c) != after.as_ref(c)
-            || matches!(after.as_ref(c), Some(BinlogValue::JsonDiff(_))))
+        read && match image.and_then(|m| m.slot_of(c)) {
+            Some(s) => {
+                before.as_ref(s) != after.as_ref(s)
+                    || matches!(after.as_ref(s), Some(BinlogValue::JsonDiff(_)))
+            }
+            None => image.is_some(),
+        }
     })
 }
 
@@ -2367,7 +2391,7 @@ impl Engine {
         // The one total every byte budget was derived from, and where it came from (the line an
         // operator reads when comparing the container's limit with the buffers, review N-06).
         info!("{}", cfg.mem.summary());
-        let dedup = crate::exec::Dedup::new(
+        let mut dedup = crate::exec::Dedup::new(
             zero.clone(),
             cfg.batch_max_keys.max(1),
             cfg.query_chunk.max(1),
@@ -2375,6 +2399,11 @@ impl Engine {
             // reading (dedup::over_bound), never allocates past it.
             cfg.mem.dedup_max_bytes,
         );
+        // C-01 (#7): on a server that logs generated columns out of its row images, a plan
+        // reading past the first of them cannot be served by the core, whose consumer indexes
+        // an image by catalog position: `Dedup::layout_refusal` keeps such a plan on the
+        // viewplan executor, which reads the images through the reader's image map.
+        dedup.set_image_layouts(source::image_layouts(info.flavor, &info.version));
         // Detached: the task ends when the engine, owner of its only sender, is dropped.
         let (stats_tx, stats_task) = crate::stats::spawn_aggregator(metrics.view_stats.clone());
         drop(stats_task);
@@ -2973,7 +3002,9 @@ impl Engine {
 
     /// Refuses an incremental plan that the source cannot maintain from its row images
     /// ([`source::plan_refusal`], per flavor and server version). Full-refresh plans re-read the
-    /// source and are never refused here.
+    /// source and are never refused here. C-01 (#7) adds the cascade-map arm
+    /// ([`crate::exec::Dedup::map_refusal`]): one decision per plan, beside the layout decision
+    /// that keeps core plans off positional image reads, never re-decided per row.
     fn refuse_for_source(&self, plan: &ViewPlan) -> Result<()> {
         if matches!(plan.mode, Mode::Full(_)) {
             return Ok(());
@@ -2984,6 +3015,12 @@ impl Engine {
             {
                 bail!("{why}");
             }
+        }
+        if let Some(why) = crate::exec::Dedup::map_refusal(
+            plan,
+            source::image_layouts(self.flavor, &self.server_version),
+        ) {
+            bail!("{why}");
         }
         Ok(())
     }
@@ -5473,6 +5510,37 @@ impl Engine {
                         src = self.dedup.core.source(&key, Some(columns as usize));
                     }
                 }
+                // C-01 (#7): reconcile this table's image layouts against the
+                // catalog — cold path, once per (table, layout): the reader turns
+                // image slots into catalog ordinals for every slot-indexed reader
+                // (`accumulate::value_at` and friends). The TABLE_MAP of every
+                // later transaction of an unchanged table hits the reader's memo
+                // and passes here without the catalog lookup or a rebuild (R3):
+                // only a DDL (which drops the entry) or a new table-map shape
+                // reaches the catalog again. A table no view reads gets no
+                // map (identity), and the core never reads one it cannot index:
+                // `Dedup::layout_refusal` keeps a plan that reads past a generated
+                // column on the viewplan executor, which maps its images.
+                if (route.is_some() || src.is_some())
+                    && !reader.image_maps_reconciled(&key, columns)
+                {
+                    let cands = source::image_layouts(self.flavor, &self.server_version);
+                    match self.table_info(&key).await {
+                        Ok(Some(info)) => {
+                            if let Err(e) =
+                                reader.set_image_maps(key.clone(), &info, columns, cands)
+                            {
+                                warn!(
+                                    "row image map for `{}`.`{}` refused: {e} (issue #7): its rows \
+                                   events are refused until the table reconciles",
+                                    key.0, key.1
+                                );
+                            }
+                        }
+                        // No catalog: the rows are refused rather than guessed.
+                        Ok(None) | Err(_) => reader.poison_image_maps(key.clone()),
+                    }
+                }
                 self.table_ids.insert(table_id, (key, route, src, need));
             }
             Item::Rows {
@@ -5529,7 +5597,7 @@ impl Engine {
                             let rows = reader.rows(table_id, &event)?;
                             xa.bytes += rows.len() * KEY_BYTES;
                             xa.rows
-                                .extend(rows.into_iter().map(|(b, a)| (key.clone(), b, a)));
+                                .extend(rows.into_iter().map(|(b, a)| (key.clone(), kind, b, a)));
                         } else {
                             xa.other_tables.insert(key);
                         }
@@ -5586,15 +5654,34 @@ impl Engine {
                     }
                 }
                 let rows = reader.rows(table_id, &event)?;
+                // C-01 (#7): resolve the image layout once per rows event; an image of a
+                // width no layout the server can log has is never read by guessed positions
+                // — by either executor, since both would be wrong — and the views that read
+                // the table re-read their source rather than lose the change.
+                let image = if route.is_some() || src.is_some() {
+                    match Self::rows_image(reader, &key, &rows) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            self.drop_unreadable(&key, &e.to_string(), &since);
+                            if let Some((_, xa)) = self.xa_current.as_mut() {
+                                // The buffered rows must not be re-fed at COMMIT either.
+                                xa.other_tables.insert(key.clone());
+                            }
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                };
                 if let Some(route) = &route {
-                    self.feed_rows(route, &rows, &since);
+                    self.feed_rows(route, &rows, image.as_ref(), &since);
                 }
                 if let Some(s) = &src {
                     self.feed_core(s, &rows, None, route.is_none());
                 }
                 if let Some((_, xa)) = self.xa_current.as_mut() {
                     xa.rows
-                        .extend(rows.into_iter().map(|(b, a)| (key.clone(), b, a)));
+                        .extend(rows.into_iter().map(|(b, a)| (key.clone(), kind, b, a)));
                 }
             }
             Item::XaStart { xid } => {
@@ -5642,7 +5729,7 @@ impl Engine {
                                 self.executed_dirty = true;
                             }
                         }
-                        self.xa_committed(&xid, xa)
+                        self.xa_committed(reader, &xid, xa)?
                     }
                     Some(_) => {}
                     None if commit => {
@@ -5718,6 +5805,18 @@ impl Engine {
                 let tables = effects.tables;
                 if !tables.is_empty() {
                     tracing::trace!(%query, "statement affects tables {tables:?}");
+                    // C-01 (#7): a DDL boundary — a layout reconciled against the
+                    // old catalog must never be applied to the new one; the next
+                    // TABLE_MAP reconciles against the new catalog. A `(db, "*")`
+                    // effect (a dropped or unanalysable database) drops the memo
+                    // entirely, the way `on_tables_changed` clears the catalog.
+                    for t in &tables {
+                        if t.1 == "*" {
+                            reader.forget_all_image_maps();
+                            break;
+                        }
+                        reader.forget_image_maps(t);
+                    }
                     self.on_tables_changed(&tables, effects.rows_kept, &before)
                         .await;
                     if first_keyword(&query).eq_ignore_ascii_case("TRUNCATE") {
@@ -5820,18 +5919,32 @@ impl Engine {
     }
 
     /// XA COMMIT of a transaction read in this run: its rows become visible now.
-    fn xa_committed(&mut self, xid: &str, xa: XaTxn) {
-        let mut by_table: Vec<(TableRef, Vec<(Option<BinlogRow>, Option<BinlogRow>)>)> = Vec::new();
-        for (t, b, a) in xa.rows {
+    fn xa_committed(&mut self, reader: &BinlogReader, xid: &str, xa: XaTxn) -> Result<()> {
+        let mut by_table: Vec<(
+            TableRef,
+            binlog::RowsKind,
+            Vec<(Option<BinlogRow>, Option<BinlogRow>)>,
+        )> = Vec::new();
+        for (t, kind, b, a) in xa.rows {
             match by_table.last_mut() {
-                Some((lt, v)) if *lt == t => v.push((b, a)),
-                _ => by_table.push((t, vec![(b, a)])),
+                Some((lt, lk, v)) if *lt == t && *lk == kind => v.push((b, a)),
+                _ => by_table.push((t, kind, vec![(b, a)])),
             }
         }
-        for (t, rows) in by_table {
+        for (t, _kind, rows) in by_table {
             if let Some(route) = self.routes.get(&t).cloned() {
                 self.mark_any(&route, &xa.start.to_position());
-                self.feed_rows(&route, &rows, &xa.start.to_position());
+                // C-01 (#7): the staged rows decode under the layout they were
+                // read with; resolve it again (the map outlives the transaction). Rows
+                // whose image cannot be read are dropped as a whole and cost the views
+                // that read the table a re-read of their source, never a read by guessed
+                // positions.
+                match Self::rows_image(reader, &t, &rows) {
+                    Ok(image) => {
+                        self.feed_rows(&route, &rows, image.as_ref(), &xa.start.to_position())
+                    }
+                    Err(e) => self.drop_unreadable(&t, &e.to_string(), &xa.start.to_position()),
+                }
             }
             if let Some(s) = self.dedup.core.source(&t, None) {
                 self.feed_core(
@@ -5845,7 +5958,7 @@ impl Engine {
         // Only the tables whose rows were dropped (past `Config::mem.xa_hold_bytes`) still cost a view a
         // rebuild: say so, it is the one case this run could not trace the change.
         if xa.other_tables.is_empty() {
-            return;
+            return Ok(());
         }
         for s in self.slots.iter_mut() {
             for (p, d, since) in s
@@ -5872,6 +5985,79 @@ impl Engine {
             }
         }
         self.first_dirty.get_or_insert_with(Instant::now);
+        Ok(())
+    }
+
+    /// C-01 (#7): a rows event whose image cannot be read at all (its width matches no
+    /// layout this server logs, or its table's map was refused): the rows are not applied
+    /// by guessed positions, so the views that read the table have lost that change and
+    /// re-read their source instead — the whole-view refresh an unreadable image earns
+    /// elsewhere. This is a rare path, and mostly a bounded one: a DDL in flight, or rows
+    /// replayed from before the catalog was read, put an image of the *other* side of the
+    /// change next to a catalog that has moved. The next TABLE_MAP of the table reconciles
+    /// it (the reader's `image_maps_reconciled` fast path) and the table leaves this path; a permanent
+    /// disagreement is caught at plan time (`Dedup::layout_refusal`,
+    /// [`crate::exec::Dedup::map_refusal`]), not decided again per row.
+    fn drop_unreadable(&mut self, key: &TableRef, why: &str, since: &Position) {
+        warn!(
+            table = %format!("{}.`{}`", key.0, key.1),
+            "row images refused: {why}; the views that read the table re-read their source"
+        );
+        let want = (key.0.clone(), key.1.clone());
+        for s in self.slots.iter_mut() {
+            for (p, d, v) in s
+                .live
+                .iter_mut()
+                .map(|l| (&l.plan, &mut l.dirty, &mut l.since))
+                .chain(
+                    s.next
+                        .iter_mut()
+                        .map(|n| (&n.plan, &mut n.dirty, &mut n.since)),
+                )
+            {
+                let reads = p.tables.contains(&want)
+                    || p.cascades.iter().any(|c| {
+                        (c.parent.schema.as_str(), c.parent.name.as_str())
+                            == (want.0.as_str(), want.1.as_str())
+                    });
+                if reads {
+                    d.rebuild = true;
+                    d.all = true;
+                    v.get_or_insert_with(|| since.clone());
+                }
+            }
+        }
+        self.first_dirty.get_or_insert_with(Instant::now);
+    }
+
+    /// C-01 (#7): the image layout of one rows event — the slot map of `key`'s
+    /// table for this image's width (`None`: no map was built for the table, the
+    /// plain positional read), and an error — never a guess — when the width
+    /// matches no layout this server logs.
+    fn rows_image(
+        reader: &BinlogReader,
+        key: &TableRef,
+        rows: &[(Option<BinlogRow>, Option<BinlogRow>)],
+    ) -> Result<Option<ImageMap>> {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let width = rows
+            .first()
+            .and_then(|(b, a)| a.as_ref().or(b.as_ref()))
+            .map_or(0, |r| r.len());
+        match reader.image_map(key, width) {
+            None => Ok(None),
+            Some(Some(m)) => Ok(Some(m)),
+            Some(None) => Err(anyhow!(
+                "row images of `{}`.`{}` ({} columns) match no image layout this server logs \
+                 (issue #7): refusing to read them by guessed positions; the catalog and the \
+                 table's generated columns disagree — the view retries once they reconcile",
+                key.0,
+                key.1,
+                width
+            )),
+        }
     }
 
     fn update_gauges(&mut self) {
@@ -6005,6 +6191,7 @@ impl Engine {
         &mut self,
         route: &[RouteT],
         rows: &[(Option<BinlogRow>, Option<BinlogRow>)],
+        image: Option<&ImageMap>,
         since: &Position,
     ) {
         let (mut seen, mut skipped) = (0u64, 0u64);
@@ -6027,7 +6214,9 @@ impl Engine {
                     continue;
                 };
                 let fed = match r.kind {
-                    RouteKind::Alias(a) => feed(plan, a, dirty, before.as_ref(), after.as_ref()),
+                    RouteKind::Alias(a) => {
+                        feed_with_image(plan, a, dirty, before.as_ref(), after.as_ref(), image)
+                    }
                     RouteKind::Cascade(c) => {
                         if let Some(gap_until) = dirty.cache.gap_until.clone() {
                             let gap = since < &gap_until;
@@ -6037,7 +6226,14 @@ impl Engine {
                             }
                         }
                         if !blind[ri] {
-                            feed_cascade(plan, c, dirty, before.as_ref(), after.as_ref())
+                            feed_cascade_with_image(
+                                plan,
+                                c,
+                                dirty,
+                                before.as_ref(),
+                                after.as_ref(),
+                                image,
+                            )
                         } else {
                             dirty.rebuild = true;
                             ver_since.get_or_insert_with(|| since.clone());
@@ -6046,7 +6242,14 @@ impl Engine {
                     }
                     RouteKind::MapChild(c) => {
                         if !blind[ri] {
-                            feed_map(plan, c, dirty, before.as_ref(), after.as_ref())
+                            feed_map_with_image(
+                                plan,
+                                c,
+                                dirty,
+                                before.as_ref(),
+                                after.as_ref(),
+                                image,
+                            )
                         } else {
                             dirty.rebuild = true;
                             ver_since.get_or_insert_with(|| since.clone());
@@ -6054,7 +6257,7 @@ impl Engine {
                         }
                     }
                     RouteKind::All(ti) => match (before, after, &plan.table_columns[ti]) {
-                        (Some(b), Some(a), Some(cols)) if !columns_changed(b, a, cols) => {
+                        (Some(b), Some(a), Some(cols)) if !columns_changed(b, a, cols, image) => {
                             Fed::Skipped
                         }
                         _ => {

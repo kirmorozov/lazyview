@@ -7,6 +7,7 @@ use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
 
 use crate::analyze::{AliasPlan, CascadeRoute, ConstFilter, Mode, ViewPlan};
+use crate::binlog::ImageMap;
 use crate::cascade;
 pub use crate::cascade::{kept_image, KeptRow};
 use crate::catalog::FkAction;
@@ -471,17 +472,8 @@ pub enum Fed {
     Recorded,
 }
 
-fn value_at(row: &BinlogRow, c: usize) -> Option<&BinlogValue<'_>> {
-    row.as_ref(c)
-}
-
-fn project(row: &BinlogRow, a: &AliasPlan, cols: &[usize]) -> Key {
-    cols.iter()
-        .map(|&c| Datum::from_binlog(value_at(row, c), &a.table.columns[c]))
-        .collect()
-}
-
-/// Records the effect of one row change of `alias` on `plan`.
+/// The identity entry point of [`feed_with_image`] (issue #7 / C-01): the image carries
+/// every catalog column, so each value is read at its own position.
 pub fn feed(
     plan: &ViewPlan,
     alias: usize,
@@ -489,17 +481,205 @@ pub fn feed(
     before: Option<&BinlogRow>,
     after: Option<&BinlogRow>,
 ) -> Fed {
+    feed_with_image(plan, alias, dirty, before, after, None)
+}
+
+/// The identity entry point of [`feed_cascade_with_image`] (issue #7 / C-01).
+pub fn feed_cascade(
+    plan: &ViewPlan,
+    ci: usize,
+    dirty: &mut ViewDirty,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+) -> Fed {
+    feed_cascade_with_image(plan, ci, dirty, before, after, None)
+}
+
+/// The identity entry point of [`feed_map_with_image`] (issue #7 / C-01).
+pub fn feed_map(
+    plan: &ViewPlan,
+    ci: usize,
+    dirty: &mut ViewDirty,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+) -> Fed {
+    feed_map_with_image(plan, ci, dirty, before, after, None)
+}
+
+/// The identity entry point of [`replay_with_image`] (issue #7 / C-01): a row re-read from
+/// the source, or one [`crate::cascade::kept_image`] synthesizes, is laid out at catalog
+/// positions.
+pub fn replay(
+    plan: &ViewPlan,
+    table: &crate::catalog::TableRef,
+    dirty: &mut ViewDirty,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+) -> Fed {
+    replay_with_image(plan, table, dirty, before, after, None)
+}
+
+/// The value of catalog column `c` of a row image. `row.as_ref()` returns `None`
+/// for both "missing" and "NULL", so the two are deliberately not distinguished.
+///
+/// C-01 (#7): a server that logs generated columns out of the image shifts every
+/// column after the first generated one — the map, built once per (table, image
+/// layout) in the binlog reader, turns the catalog ordinal into the slot that
+/// actually holds the value. One array index per value, no allocation; `None`
+/// keeps the plain positional read (an unmapped table, or the identity layout).
+fn value_at<'a>(
+    row: &'a BinlogRow,
+    image: Option<&ImageMap>,
+    c: usize,
+) -> Option<&'a BinlogValue<'a>> {
+    match image {
+        None => row.as_ref(c),
+        Some(m) => m.slot_of(c).and_then(|s| row.as_ref(s)),
+    }
+}
+
+/// [`crate::dedup::consumer::changed`] over image slots (C-01, #7): with no map it *is*
+/// the copy-set comparator, untouched; under a map a column the image does not carry
+/// could have changed without the change being visible, so its absence counts as
+/// changed. Mirrored only for the mapped case, so the consumer keeps its untouched
+/// status.
+fn changed_mapped(
+    before: &BinlogRow,
+    after: &BinlogRow,
+    mask: &[bool],
+    image: Option<&ImageMap>,
+) -> bool {
+    let Some(m) = image else {
+        return changed(before, after, mask);
+    };
+    mask.iter().enumerate().any(|(c, &on)| {
+        on && match m.slot_of(c) {
+            Some(s) => {
+                before.as_ref(s) != after.as_ref(s)
+                    || matches!(after.as_ref(s), Some(BinlogValue::JsonDiff(_)))
+            }
+            // The column is in no image of this layout: invisible either way.
+            None => true,
+        }
+    })
+}
+
+/// [`ConstFilter::passes`] over image slots (C-01, #7): with no map it *is* the
+/// copy-set comparator, untouched; under a map the filtered column is read at the slot
+/// this layout puts it in, and a column the layout leaves out passes (the same
+/// conservative rule as a value missing from the image).
+fn const_passes(
+    filters: &[ConstFilter],
+    row: &BinlogRow,
+    table: &crate::catalog::TableInfo,
+    image: Option<&ImageMap>,
+) -> bool {
+    let Some(m) = image else {
+        return ConstFilter::passes(filters, row, table);
+    };
+    filters.is_empty()
+        || row.len() != table.columns.len()
+        || filters.iter().all(|f| match m.slot_of(f.col) {
+            None => true,
+            Some(s) => match row.as_ref(s) {
+                None => true,
+                v => f
+                    .values
+                    .contains(&Datum::from_binlog(v, &table.columns[f.col])),
+            },
+        })
+}
+
+/// [`crate::analyze::MapPlan::keeps`] over image slots (C-01, #7): a row is kept when it
+/// passes some alias's constant filters, compared at the slots this layout uses.
+fn map_keeps(
+    m: &crate::analyze::MapPlan,
+    row: &BinlogRow,
+    table: &crate::catalog::TableInfo,
+    image: Option<&ImageMap>,
+) -> bool {
+    m.filters.is_empty() || m.filters.iter().any(|f| const_passes(f, row, table, image))
+}
+
+/// [`crate::cascade::kept`] over image slots (C-01, #7): with no map it *is* the
+/// copy-set comparator, untouched; under a map the kept key, FK and stored columns are
+/// read at the slots this layout uses, and a stored column the layout leaves out marks
+/// the row incomplete (the documented safety net: a parent cascade over it rebuilds)
+/// instead of reading its neighbour's value.
+fn kept_mapped(
+    c: &CascadeRoute,
+    r: &BinlogRow,
+    image: Option<&ImageMap>,
+) -> Option<(Key, KeptRow)> {
+    let Some(im) = image else {
+        return cascade::kept(c, r);
+    };
+    let m = c.map.as_ref()?;
+    let t = &c.child_table;
+    // A nested fn (not a closure): the returned borrow is tied to the row, which a
+    // closure's elided lifetimes cannot express.
+    fn value<'r>(r: &'r BinlogRow, im: &ImageMap, k: usize) -> Option<&'r BinlogValue<'r>> {
+        im.slot_of(k).and_then(|s| r.as_ref(s))
+    }
+    let datum = |r: &BinlogRow, k: usize| Datum::from_binlog(value(r, im, k), &t.columns[k]);
+    if !map_keeps(m, r, t, Some(im)) {
+        return None;
+    }
+    let fk: Key = c.child_cols.iter().map(|&k| datum(r, k)).collect();
+    if fk.iter().any(Datum::is_null) {
+        return None;
+    }
+    // A stored column this layout leaves out is not carried: the row is incomplete, so
+    // a parent cascade over it rebuilds instead of propagating a neighbour's value.
+    let mut complete = true;
+    let values = m
+        .cols
+        .iter()
+        .map(|&k| match value(r, im, k) {
+            None | Some(BinlogValue::JsonDiff(_)) => {
+                complete = false;
+                None
+            }
+            v => Some(Datum::from_binlog(v, &t.columns[k])),
+        })
+        .collect();
+    let key = m.key.iter().map(|&k| datum(r, k)).collect();
+    Some((
+        key,
+        KeptRow {
+            fk,
+            values,
+            complete,
+        },
+    ))
+}
+
+fn project(row: &BinlogRow, image: Option<&ImageMap>, a: &AliasPlan, cols: &[usize]) -> Key {
+    cols.iter()
+        .map(|&c| Datum::from_binlog(value_at(row, image, c), &a.table.columns[c]))
+        .collect()
+}
+
+/// Records the effect of one row change of `alias` on `plan`.
+pub(crate) fn feed_with_image(
+    plan: &ViewPlan,
+    alias: usize,
+    dirty: &mut ViewDirty,
+    before: Option<&BinlogRow>,
+    after: Option<&BinlogRow>,
+    image: Option<&ImageMap>,
+) -> Fed {
     let a = &plan.aliases[alias];
     if let (Some(b), Some(af)) = (before, after) {
-        if !changed(b, af, &a.referenced) {
+        if !changed_mapped(b, af, &a.referenced, image) {
             return Fed::Skipped;
         }
     }
     // A side failing the alias's constant filters is never its row (an alias pinned by constant
     // filters ignores the rows of the others): the change is an insert, a delete, or nothing to it.
     let filters = plan.filters_of(alias);
-    let before = before.filter(|r| ConstFilter::passes(filters, r, &a.table));
-    let after = after.filter(|r| ConstFilter::passes(filters, r, &a.table));
+    let before = before.filter(|r| const_passes(filters, r, &a.table, image));
+    let after = after.filter(|r| const_passes(filters, r, &a.table, image));
     if before.is_none() && after.is_none() {
         return Fed::Skipped;
     }
@@ -508,9 +688,18 @@ pub fn feed(
         return Fed::Recorded;
     }
     if let Some(cols) = &a.direct_unit {
+        // C-01 (#7): a unit column the layout leaves out of the image (a STORED
+        // generated column under a base-only layout) cannot say which unit moved:
+        // every unit could be affected, so mark them all (the refresh reads the
+        // source and settles it — the same net as the non-Spj mode below).
+        if image.is_some_and(|m| cols.iter().any(|&c| m.slot_of(c).is_none())) {
+            dirty.mark_all(plan);
+            return Fed::Recorded;
+        }
         if let [c] = cols[..] {
             // One-column unit: compare the Datums, an integer never builds a `Key`.
-            let datum = |row: &BinlogRow| Datum::from_binlog(value_at(row, c), &a.table.columns[c]);
+            let datum =
+                |row: &BinlogRow| Datum::from_binlog(value_at(row, image, c), &a.table.columns[c]);
             let new = after.map(datum);
             let old = before.map(datum).filter(|o| new.as_ref() != Some(o));
             for x in [old, new].into_iter().flatten() {
@@ -520,9 +709,9 @@ pub fn feed(
             return Fed::Recorded;
         }
         // An update that keeps its unit marks it once.
-        let new = after.map(|row| project(row, a, cols));
+        let new = after.map(|row| project(row, image, a, cols));
         let old = before
-            .map(|row| project(row, a, cols))
+            .map(|row| project(row, image, a, cols))
             .filter(|o| new.as_ref() != Some(o));
         for key in [old, new].into_iter().flatten() {
             dirty.mark(key);
@@ -530,12 +719,19 @@ pub fn feed(
         return Fed::Recorded;
     }
     if let Some((set, cols)) = plan.partial_of(alias) {
+        // C-01 (#7): as for the unit above — a marked column absent from the
+        // image marks everything rather than guessing the neighbour's value.
+        if image.is_some_and(|m| cols.iter().any(|&c| m.slot_of(c).is_none())) {
+            dirty.mark_all(plan);
+            return Fed::Recorded;
+        }
         if dirty.partial.len() <= set {
             dirty.partial.resize_with(set + 1, UnitSet::default);
         }
         if let [c] = cols[..] {
             // One-column partial unit: as above, but into the partial set.
-            let datum = |row: &BinlogRow| Datum::from_binlog(value_at(row, c), &a.table.columns[c]);
+            let datum =
+                |row: &BinlogRow| Datum::from_binlog(value_at(row, image, c), &a.table.columns[c]);
             let new = after.map(datum);
             let old = before.map(datum).filter(|o| new.as_ref() != Some(o));
             for x in [old, new].into_iter().flatten() {
@@ -545,9 +741,9 @@ pub fn feed(
             return Fed::Recorded;
         }
         // As for units: an update that keeps its key marks it once.
-        let new = after.map(|row| project(row, a, cols));
+        let new = after.map(|row| project(row, image, a, cols));
         let old = before
-            .map(|row| project(row, a, cols))
+            .map(|row| project(row, image, a, cols))
             .filter(|o| new.as_ref() != Some(o));
         for key in [old, new].into_iter().flatten() {
             let fresh = dirty.partial[set].insert(key);
@@ -555,18 +751,24 @@ pub fn feed(
         }
         return Fed::Recorded;
     }
+    if image.is_some_and(|m| a.image_cols.iter().any(|&c| m.slot_of(c).is_none())) {
+        // C-01 (#7): an image column absent from the layout: the buffered image
+        // could be wrong in either direction — mark everything instead.
+        dirty.mark_all(plan);
+        return Fed::Recorded;
+    }
     if dirty.images.len() <= alias {
         dirty.images.resize(plan.aliases.len(), KeySet::default());
     }
     let membership_changed = match (before, after) {
-        (Some(b), Some(af)) => changed(b, af, &a.membership),
+        (Some(b), Some(af)) => changed_mapped(b, af, &a.membership, image),
         _ => true,
     };
-    let new = after.map(|af| project(af, a, &a.image_cols));
+    let new = after.map(|af| project(af, image, a, &a.image_cols));
     if let Some(b) = before {
         // Also when only the image changed: a lineage image is the primary key, and the
         // materialized rows still carry the old one.
-        let old = project(b, a, &a.image_cols);
+        let old = project(b, image, a, &a.image_cols);
         if membership_changed || new.as_ref() != Some(&old) {
             let fresh = dirty.images[alias].insert(old);
             dirty.tally.image(fresh);
@@ -581,12 +783,13 @@ pub fn feed(
 
 /// Records the effect of a parent-row change that the storage engine cascades into a child
 /// table the view reads (cascade `ci` of the plan).
-pub fn feed_cascade(
+pub(crate) fn feed_cascade_with_image(
     plan: &ViewPlan,
     ci: usize,
     dirty: &mut ViewDirty,
     before: Option<&BinlogRow>,
     after: Option<&BinlogRow>,
+    image: Option<&ImageMap>,
 ) -> Fed {
     let c = &plan.cascades[ci];
     let Some(b) = before else { return Fed::Skipped };
@@ -596,7 +799,7 @@ pub fn feed_cascade(
             let changed = c
                 .parent_cols
                 .iter()
-                .any(|&p| value_at(b, p) != value_at(a, p));
+                .any(|&p| value_at(b, image, p) != value_at(a, image, p));
             if !changed {
                 return Fed::Skipped;
             }
@@ -611,9 +814,9 @@ pub fn feed_cascade(
     if let Some((pc, values)) = &c.reach {
         let reaches = |r: &BinlogRow| {
             r.len() != c.parent.columns.len()
-                || value_at(r, *pc).is_none()
+                || value_at(r, image, *pc).is_none()
                 || values.contains(&Datum::from_binlog(
-                    value_at(r, *pc),
+                    value_at(r, image, *pc),
                     &c.parent.columns[*pc],
                 ))
         };
@@ -627,11 +830,11 @@ pub fn feed_cascade(
         return Fed::Recorded;
     }
     if c.derived {
-        return feed_derived_cascade(c, action, dirty, b, after);
+        return feed_derived_cascade(c, action, dirty, b, after, image);
     }
     let Some(pcols) = &c.unit_from_parent else {
         if c.map.is_some() {
-            return feed_mapped_cascade(plan, c, ci, action, dirty, b, after);
+            return feed_mapped_cascade(plan, c, ci, action, dirty, b, after, image);
         }
         dirty.rebuild = true;
         return Fed::Recorded;
@@ -639,7 +842,7 @@ pub fn feed_cascade(
     let unit = |row: &BinlogRow| -> Key {
         pcols
             .iter()
-            .map(|&p| Datum::from_binlog(value_at(row, p), &c.parent.columns[p]))
+            .map(|&p| Datum::from_binlog(value_at(row, image, p), &c.parent.columns[p]))
             .collect()
     };
     dirty.mark(unit(b));
@@ -665,6 +868,7 @@ fn feed_derived_cascade(
     dirty: &mut ViewDirty,
     b: &BinlogRow,
     after: Option<&BinlogRow>,
+    image: Option<&ImageMap>,
 ) -> Fed {
     let full = |r: &BinlogRow| r.len() == c.parent.columns.len();
     // The children's FK after the change: the new key (CASCADE update) or NULL (SET NULL).
@@ -674,7 +878,8 @@ fn feed_derived_cascade(
         dirty.rebuild = true;
         return Fed::Recorded;
     }
-    let datum = |r: &BinlogRow, p: usize| Datum::from_binlog(value_at(r, p), &c.parent.columns[p]);
+    let datum =
+        |r: &BinlogRow, p: usize| Datum::from_binlog(value_at(r, image, p), &c.parent.columns[p]);
     let mut fed = Fed::Skipped;
     for pin in &c.pinned {
         let key = |r: &BinlogRow| {
@@ -734,6 +939,7 @@ fn feed_mapped_cascade(
     dirty: &mut ViewDirty,
     b: &BinlogRow,
     after: Option<&BinlogRow>,
+    image: Option<&ImageMap>,
 ) -> Fed {
     let full = |r: &BinlogRow| r.len() == c.parent.columns.len();
     if !full(b) || after.is_some_and(|a| !full(a)) {
@@ -744,7 +950,7 @@ fn feed_mapped_cascade(
     let key = |r: &BinlogRow| -> Key {
         c.parent_cols
             .iter()
-            .map(|&p| Datum::from_binlog(value_at(r, p), &c.parent.columns[p]))
+            .map(|&p| Datum::from_binlog(value_at(r, image, p), &c.parent.columns[p]))
             .collect()
     };
     let new = match (after, action) {
@@ -887,7 +1093,11 @@ fn expand(
         }
         let before = kept_image(c, row, None);
         let after = new.map(|fk| kept_image(c, row, Some(fk)));
-        if replay(plan, &c.child, dirty, Some(&before), after.as_ref()) == Fed::Recorded {
+        // The kept rows are re-laid out at catalog positions by `kept_image`,
+        // so they replay unmapped (identity) whatever layout the live images use.
+        if replay_with_image(plan, &c.child, dirty, Some(&before), after.as_ref(), None)
+            == Fed::Recorded
+        {
             fed = Fed::Recorded;
         }
     }
@@ -899,27 +1109,51 @@ fn expand(
 /// pass any more). An update of no stored column, or of a row the map does not keep, is
 /// skipped. A stored column missing from the image (not a full image, a partial JSON update)
 /// leaves the row incomplete: replaying it is the documented safety net (`crate::cascade`).
-pub fn feed_map(
+pub(crate) fn feed_map_with_image(
     plan: &ViewPlan,
     ci: usize,
     dirty: &mut ViewDirty,
     before: Option<&BinlogRow>,
     after: Option<&BinlogRow>,
+    image: Option<&ImageMap>,
 ) -> Fed {
     let c = &plan.cascades[ci];
     let Some(m) = &c.map else {
         return Fed::Skipped;
     };
+    // C-01 (#7), R1: the PLAN-TIME decision for this condition is
+    // `Dedup::map_refusal` (engine.rs `refuse_for_source`): a view whose map key
+    // or FK is a generated column is refused at plan time on a server that logs
+    // them out of its images, so this arm never decides a permanent condition
+    // per row. What can still arrive here is bounded: rows that reached the live
+    // version between an ALTER making a kept column generated and the view's
+    // re-plan refusing it. A kept row that cannot be read from the image is
+    // never cached: the view is marked for a rebuild instead.
+    if image.is_some_and(|im| {
+        c.child_cols
+            .iter()
+            .chain(m.key.iter())
+            .any(|&k| im.slot_of(k).is_none())
+    }) {
+        dirty.rebuild = true;
+        return Fed::Recorded;
+    }
     if let (Some(b), Some(a)) = (before, after) {
-        if !m.cols.iter().any(|&k| {
-            value_at(b, k) != value_at(a, k)
-                || matches!(value_at(a, k), Some(BinlogValue::JsonDiff(_)))
-        }) {
+        // Under a layout that does not carry every stored column, an update of a
+        // stored column could be invisible in the image: compare only a layout
+        // that carries the whole catalog, and never skip on a partial one.
+        let invisible = image.is_some_and(|im| im.len() != c.child_table.columns.len());
+        if !invisible
+            && !m.cols.iter().any(|&k| {
+                value_at(b, image, k) != value_at(a, image, k)
+                    || matches!(value_at(a, image, k), Some(BinlogValue::JsonDiff(_)))
+            })
+        {
             return Fed::Skipped;
         }
     }
-    let old = before.and_then(|r| cascade::kept(c, r));
-    let new = after.and_then(|r| cascade::kept(c, r));
+    let old = before.and_then(|r| kept_mapped(c, r, image));
+    let new = after.and_then(|r| kept_mapped(c, r, image));
     if old.is_none() && new.is_none() {
         return Fed::Skipped;
     }
@@ -944,18 +1178,19 @@ pub fn feed_map(
 /// does for a logged row (`Engine::rebuild_routes`): its aliases, the cascades out of it, and the
 /// maps that keep its rows. Replays the child rows a mapped cascade changed (`crate::cascade`).
 /// `Recorded` when some route buffered the change for a refresh.
-pub fn replay(
+pub(crate) fn replay_with_image(
     plan: &ViewPlan,
     table: &(String, String),
     dirty: &mut ViewDirty,
     before: Option<&BinlogRow>,
     after: Option<&BinlogRow>,
+    image: Option<&ImageMap>,
 ) -> Fed {
     let is = |schema: &str, name: &str| (schema, name) == (table.0.as_str(), table.1.as_str());
     let mut fed = Fed::Skipped;
     for (ai, a) in plan.aliases.iter().enumerate() {
         if is(&a.table.schema, &a.table.name)
-            && feed(plan, ai, dirty, before, after) == Fed::Recorded
+            && feed_with_image(plan, ai, dirty, before, after, image) == Fed::Recorded
         {
             fed = Fed::Recorded;
         }
@@ -963,13 +1198,13 @@ pub fn replay(
     for (ci, c) in plan.cascades.iter().enumerate() {
         if !c.traced
             && is(&c.parent.schema, &c.parent.name)
-            && feed_cascade(plan, ci, dirty, before, after) == Fed::Recorded
+            && feed_cascade_with_image(plan, ci, dirty, before, after, image) == Fed::Recorded
         {
             fed = Fed::Recorded;
         }
         if c.map.is_some()
             && c.child == *table
-            && feed_map(plan, ci, dirty, before, after) == Fed::Recorded
+            && feed_map_with_image(plan, ci, dirty, before, after, image) == Fed::Recorded
         {
             fed = Fed::Recorded;
         }
@@ -1173,12 +1408,15 @@ mod tests {
         let mut dirty = ViewDirty::for_aliases(p.aliases.len());
         let (before, after) = (row(-1, "x"), row(-3, "x"));
         assert_eq!(
-            feed(&p, 1, &mut dirty, Some(&before), Some(&after)),
+            feed_with_image(&p, 1, &mut dirty, Some(&before), Some(&after), None),
             Fed::Recorded
         );
         // Both images are buffered (one entry when they are equal).
         let images = |b: &BinlogRow, af: &BinlogRow| {
-            [project(b, a, &a.image_cols), project(af, a, &a.image_cols)]
+            [
+                project(b, None, a, &a.image_cols),
+                project(af, None, a, &a.image_cols),
+            ]
         };
         let [old, new] = images(&before, &after);
         assert!(dirty.images[1].contains(&old) && dirty.images[1].contains(&new));
@@ -1186,7 +1424,7 @@ mod tests {
         // A membership column changes (the key stays): both images again.
         let mut dirty = ViewDirty::for_aliases(p.aliases.len());
         let moved = row(-1, "y");
-        feed(&p, 1, &mut dirty, Some(&before), Some(&moved));
+        feed_with_image(&p, 1, &mut dirty, Some(&before), Some(&moved), None);
         let [old, new] = images(&before, &moved);
         assert!(dirty.images[1].contains(&old) && dirty.images[1].contains(&new));
         // Each buffered image is counted, a repeat as absorbed.
@@ -1195,7 +1433,7 @@ mod tests {
             (dirty.tally.images_marked, dirty.tally.images_absorbed),
             (2, same)
         );
-        feed(&p, 1, &mut dirty, Some(&before), Some(&moved));
+        feed_with_image(&p, 1, &mut dirty, Some(&before), Some(&moved), None);
         assert_eq!(
             (dirty.tally.images_marked, dirty.tally.images_absorbed),
             (4, 2 + same)
@@ -1205,10 +1443,31 @@ mod tests {
         // by the buffer, an update that moves it marks the old and the new unit.
         assert!(p.aliases[0].direct_unit.is_some());
         let mut dirty = ViewDirty::for_aliases(p.aliases.len());
-        feed(&p, 0, &mut dirty, Some(&row(1, "x")), Some(&row(1, "y")));
-        feed(&p, 0, &mut dirty, Some(&row(1, "y")), Some(&row(1, "z")));
-        feed(&p, 0, &mut dirty, None, Some(&row(2, "x")));
-        feed(&p, 0, &mut dirty, Some(&row(2, "x")), Some(&row(3, "x")));
+        feed_with_image(
+            &p,
+            0,
+            &mut dirty,
+            Some(&row(1, "x")),
+            Some(&row(1, "y")),
+            None,
+        );
+        feed_with_image(
+            &p,
+            0,
+            &mut dirty,
+            Some(&row(1, "y")),
+            Some(&row(1, "z")),
+            None,
+        );
+        feed_with_image(&p, 0, &mut dirty, None, Some(&row(2, "x")), None);
+        feed_with_image(
+            &p,
+            0,
+            &mut dirty,
+            Some(&row(2, "x")),
+            Some(&row(3, "x")),
+            None,
+        );
         assert_eq!((dirty.tally.ids_marked, dirty.tally.ids_absorbed), (5, 2));
         assert_eq!(dirty.units.len(), 3);
         // The counters stay with the buffer when its changes are taken, and a merge (a failed
@@ -1276,9 +1535,23 @@ mod tests {
             )
         };
         let mut dirty = ViewDirty::for_aliases(p.aliases.len());
-        feed(&p, 0, &mut dirty, None, Some(&row(1, "x")));
-        feed(&p, 0, &mut dirty, Some(&row(1, "x")), Some(&row(1, "y")));
-        feed(&p, 0, &mut dirty, Some(&row(1, "y")), Some(&row(2, "y")));
+        feed_with_image(&p, 0, &mut dirty, None, Some(&row(1, "x")), None);
+        feed_with_image(
+            &p,
+            0,
+            &mut dirty,
+            Some(&row(1, "x")),
+            Some(&row(1, "y")),
+            None,
+        );
+        feed_with_image(
+            &p,
+            0,
+            &mut dirty,
+            Some(&row(1, "y")),
+            Some(&row(2, "y")),
+            None,
+        );
         assert_eq!((dirty.tally.ids_marked, dirty.tally.ids_absorbed), (4, 2));
         assert_eq!(dirty.units.ints.len(), 2);
         assert!(dirty.units.keys.is_empty());
@@ -1313,7 +1586,7 @@ mod tests {
             )
         };
         let mut dirty = ViewDirty::for_aliases(p.aliases.len());
-        feed(&p, 0, &mut dirty, None, Some(&row("a", 1)));
+        feed_with_image(&p, 0, &mut dirty, None, Some(&row("a", 1)), None);
         assert_eq!((dirty.tally.ids_marked, dirty.tally.ids_absorbed), (1, 0));
         assert!(dirty.units.ints.is_empty());
         assert!(dirty
@@ -1418,7 +1691,7 @@ mod tests {
                 && p.partial_of(2).is_none()
         );
         let a = &p.aliases[2];
-        let img = |r: &BinlogRow| project(r, a, &a.image_cols);
+        let img = |r: &BinlogRow| project(r, None, a, &a.image_cols);
         // (before, after, expected images; None: skipped)
         let cases: [(Option<&BinlogRow>, Option<&BinlogRow>, Option<Vec<Key>>); 9] = [
             (
@@ -1437,7 +1710,7 @@ mod tests {
         ];
         for (i, (b, af, want)) in cases.iter().enumerate() {
             let mut d = ViewDirty::for_aliases(p.aliases.len());
-            let fed = feed(&p, 2, &mut d, *b, *af);
+            let fed = feed_with_image(&p, 2, &mut d, *b, *af, None);
             match want {
                 None => {
                     assert_eq!(fed, Fed::Skipped, "case {i}");
@@ -1458,14 +1731,17 @@ mod tests {
         );
         assert!(p.lineage_of(1).is_some());
         let mut d = ViewDirty::for_aliases(p.aliases.len());
-        assert_eq!(feed(&p, 1, &mut d, Some(&other), Some(&null)), Fed::Skipped);
         assert_eq!(
-            feed(&p, 1, &mut d, Some(&pass2), Some(&other)),
+            feed_with_image(&p, 1, &mut d, Some(&other), Some(&null), None),
+            Fed::Skipped
+        );
+        assert_eq!(
+            feed_with_image(&p, 1, &mut d, Some(&pass2), Some(&other), None),
             Fed::Skipped
         );
         assert!(d.is_empty());
         assert_eq!(
-            feed(&p, 1, &mut d, Some(&pass), Some(&other)),
+            feed_with_image(&p, 1, &mut d, Some(&pass), Some(&other), None),
             Fed::Recorded
         );
         assert_eq!(
@@ -1475,7 +1751,7 @@ mod tests {
         );
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed(&p, 1, &mut d, Some(&other_scope), Some(&pass)),
+            feed_with_image(&p, 1, &mut d, Some(&other_scope), Some(&pass), None),
             Fed::Recorded
         );
         assert_eq!(d.images[1], KeySet::from_iter([Key::from([Datum::Int(1)])]));
@@ -1487,16 +1763,22 @@ mod tests {
         assert!(p.aliases[1].direct_unit.is_some());
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed(&p, 1, &mut d, Some(&other), Some(&other_scope)),
+            feed_with_image(&p, 1, &mut d, Some(&other), Some(&other_scope), None),
             Fed::Skipped
         );
-        assert_eq!(feed(&p, 1, &mut d, None, Some(&null)), Fed::Skipped);
+        assert_eq!(
+            feed_with_image(&p, 1, &mut d, None, Some(&null), None),
+            Fed::Skipped
+        );
         assert!(d.is_empty());
         assert_eq!(
-            feed(&p, 1, &mut d, Some(&other), Some(&pass)),
+            feed_with_image(&p, 1, &mut d, Some(&other), Some(&pass), None),
             Fed::Recorded
         );
-        assert_eq!(feed(&p, 1, &mut d, Some(&pass2), None), Fed::Skipped);
+        assert_eq!(
+            feed_with_image(&p, 1, &mut d, Some(&pass2), None, None),
+            Fed::Skipped
+        );
         assert_eq!(
             (d.units.len(), d.units.contains(&[Datum::Int(1)])),
             (1, true),
@@ -1509,14 +1791,17 @@ mod tests {
                 .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
                 .collect(),
         );
-        assert_eq!(feed(&p, 1, &mut d, None, Some(&short)), Fed::Recorded);
+        assert_eq!(
+            feed_with_image(&p, 1, &mut d, None, Some(&short), None),
+            Fed::Recorded
+        );
         // Without filters nothing changes: every alias of the table sees every row.
         let p =
             view("SELECT e.id, MAX(a.v) AS v FROM ent e JOIN attrs a ON a.e = e.id GROUP BY e.id");
         assert!(p.filters_of(1).is_empty());
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed(&p, 1, &mut d, Some(&other), Some(&null)),
+            feed_with_image(&p, 1, &mut d, Some(&other), Some(&null), None),
             Fed::Recorded
         );
     }
@@ -1618,16 +1903,37 @@ mod tests {
         };
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed(&p, 2, &mut d, Some(&row(1, 7, 9)), Some(&row(1, 7, 8))),
+            feed_with_image(
+                &p,
+                2,
+                &mut d,
+                Some(&row(1, 7, 9)),
+                Some(&row(1, 7, 8)),
+                None
+            ),
             Fed::Skipped
         );
         assert!(d.is_empty());
         assert_eq!(
-            feed(&p, 2, &mut d, Some(&row(1, 7, 7)), Some(&row(1, 8, 7))),
+            feed_with_image(
+                &p,
+                2,
+                &mut d,
+                Some(&row(1, 7, 7)),
+                Some(&row(1, 8, 7)),
+                None
+            ),
             Fed::Recorded
         );
         assert_eq!(
-            feed(&p, 2, &mut d, Some(&row(2, 9, 9)), Some(&row(2, 10, 7))),
+            feed_with_image(
+                &p,
+                2,
+                &mut d,
+                Some(&row(2, 9, 9)),
+                Some(&row(2, 10, 7)),
+                None
+            ),
             Fed::Recorded
         );
         assert!(d.units.is_empty() && d.images.iter().all(HashSet::is_empty));
@@ -1640,7 +1946,7 @@ mod tests {
         assert_eq!(got, vec![7, 8, 10], "entity 9 only had another key");
         // Each partial key counts as a marked id.
         assert_eq!((d.tally.ids_marked, d.tally.ids_absorbed), (3, 0));
-        feed(&p, 2, &mut d, None, Some(&row(3, 8, 7)));
+        feed_with_image(&p, 2, &mut d, None, Some(&row(3, 8, 7)), None);
         assert_eq!((d.tally.ids_marked, d.tally.ids_absorbed), (4, 1));
     }
 
@@ -1744,18 +2050,18 @@ mod tests {
         // A key no alias reads: nothing to do.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed_cascade(&p, kind, &mut d, Some(&row(50)), None),
+            feed_cascade_with_image(&p, kind, &mut d, Some(&row(50)), None, None),
             Fed::Skipped
         );
         assert_eq!(
-            feed_cascade(&p, kind, &mut d, Some(&row(50)), Some(&row(51))),
+            feed_cascade_with_image(&p, kind, &mut d, Some(&row(50)), Some(&row(51)), None),
             Fed::Skipped
         );
         assert!(d.is_empty());
         // The pinned key: the units the presence column marks; a key update into it: the
         // units holding such rows now; out of it: the marked ones. Never a rebuild.
         assert_eq!(
-            feed_cascade(&p, kind, &mut d, Some(&row(7)), None),
+            feed_cascade_with_image(&p, kind, &mut d, Some(&row(7)), None, None),
             Fed::Recorded
         );
         assert_eq!(
@@ -1763,13 +2069,13 @@ mod tests {
             (vec![(0, Datum::Int(7))], vec![])
         );
         let mut d = ViewDirty::for_aliases(p.aliases.len());
-        feed_cascade(&p, kind, &mut d, Some(&row(50)), Some(&row(7)));
+        feed_cascade_with_image(&p, kind, &mut d, Some(&row(50)), Some(&row(7)), None);
         assert_eq!(
             (d.marks.clone(), d.holds.clone()),
             (vec![], vec![(0, Datum::Int(7))])
         );
-        feed_cascade(&p, kind, &mut d, Some(&row(7)), Some(&row(51)));
-        feed_cascade(&p, kind, &mut d, Some(&row(7)), None);
+        feed_cascade_with_image(&p, kind, &mut d, Some(&row(7)), Some(&row(51)), None);
+        feed_cascade_with_image(&p, kind, &mut d, Some(&row(7)), None, None);
         assert_eq!(
             d.marks,
             vec![(0, Datum::Int(7))],
@@ -1779,10 +2085,10 @@ mod tests {
         // The partial unit from the parent's key: deleted key, old and new key on an update.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed_cascade(&p, obj, &mut d, Some(&row(5)), None),
+            feed_cascade_with_image(&p, obj, &mut d, Some(&row(5)), None, None),
             Fed::Recorded
         );
-        feed_cascade(&p, obj, &mut d, Some(&row(6)), Some(&row(9)));
+        feed_cascade_with_image(&p, obj, &mut d, Some(&row(6)), Some(&row(9)), None);
         assert!(!d.rebuild && d.units.is_empty());
         let got: Vec<i64> = d.partial[0]
             .ints
@@ -1813,11 +2119,11 @@ mod tests {
         assert!(!p.cascades[kind].derived && p.cascades[kind].reach.is_some());
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed_cascade(&p, kind, &mut d, Some(&row(50)), None),
+            feed_cascade_with_image(&p, kind, &mut d, Some(&row(50)), None, None),
             Fed::Skipped
         );
         assert_eq!(
-            feed_cascade(&p, kind, &mut d, Some(&row(50)), Some(&row(51))),
+            feed_cascade_with_image(&p, kind, &mut d, Some(&row(50)), Some(&row(51)), None),
             Fed::Skipped
         );
         assert!(d.is_empty() && !d.rebuild);
@@ -1828,12 +2134,12 @@ mod tests {
             (row(8), Some(row(50))),
         ] {
             let mut d = ViewDirty::for_aliases(p.aliases.len());
-            feed_cascade(&p, kind, &mut d, Some(&b), a.as_ref());
+            feed_cascade_with_image(&p, kind, &mut d, Some(&b), a.as_ref(), None);
             assert!(!d.rebuild && d.cache.rows(kind).is_none(), "{b:?} -> {a:?}");
         }
         let short = BinlogRow::new(vec![], Arc::from(Vec::new()));
         let mut d = ViewDirty::for_aliases(p.aliases.len());
-        feed_cascade(&p, kind, &mut d, Some(&short), None);
+        feed_cascade_with_image(&p, kind, &mut d, Some(&short), None, None);
         assert!(d.rebuild && d.cache.rows(kind).is_none());
     }
 
@@ -1940,12 +2246,12 @@ mod tests {
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         let r1 = row(&[1, 10, 7, 5]);
         assert_eq!(
-            feed_map(&p, to_attrs, &mut d, None, Some(&r1)),
+            feed_map_with_image(&p, to_attrs, &mut d, None, Some(&r1), None),
             Fed::Skipped
         );
         assert!(d.is_empty() && d.cache.under(to_attrs, &fk10).len() == 1);
         assert_eq!(
-            feed_map(&p, to_attrs, &mut d, None, Some(&row(&[2, 10, 8, 5]))),
+            feed_map_with_image(&p, to_attrs, &mut d, None, Some(&row(&[2, 10, 8, 5])), None),
             Fed::Skipped
         );
         let kept = d.cache.under(to_attrs, &fk10)[0].clone();
@@ -1955,24 +2261,39 @@ mod tests {
         );
         // An update of a column no route takes values from: skipped, the kept row stands.
         assert_eq!(
-            feed_map(&p, to_attrs, &mut d, Some(&r1), Some(&row(&[1, 10, 7, 6]))),
+            feed_map_with_image(
+                &p,
+                to_attrs,
+                &mut d,
+                Some(&r1),
+                Some(&row(&[1, 10, 7, 6])),
+                None
+            ),
             Fed::Skipped
         );
         assert_eq!(d.cache.under(to_attrs, &fk10).len(), 1);
         // A new FK: kept under it (same key, no removal); out of the filter: removed; deleted:
         // removed.
-        feed_map(&p, to_attrs, &mut d, Some(&r1), Some(&row(&[1, 11, 7, 5])));
+        feed_map_with_image(
+            &p,
+            to_attrs,
+            &mut d,
+            Some(&r1),
+            Some(&row(&[1, 11, 7, 5])),
+            None,
+        );
         assert!(d.cache.under(to_attrs, &fk10).is_empty());
         assert_eq!(d.cache.under(to_attrs, &fk11)[0].fk, fk11);
-        feed_map(
+        feed_map_with_image(
             &p,
             to_attrs,
             &mut d,
             Some(&row(&[1, 11, 7, 5])),
             Some(&row(&[1, 11, 9, 5])),
+            None,
         );
         assert!(d.cache.under(to_attrs, &fk11).is_empty());
-        feed_map(&p, to_attrs, &mut d, Some(&row(&[3, 12, 7, 5])), None);
+        feed_map_with_image(&p, to_attrs, &mut d, Some(&row(&[3, 12, 7, 5])), None, None);
         assert!(d.cache.under(to_attrs, &fk12).is_empty());
         // A short image passes the filters (conservatively) and is kept, but incomplete: its
         // replay is the safety net.
@@ -1987,19 +2308,26 @@ mod tests {
             ]),
         );
         let mut d2 = ViewDirty::for_aliases(p.aliases.len());
-        feed_map(&p, to_attrs, &mut d2, None, Some(&short));
+        feed_map_with_image(&p, to_attrs, &mut d2, None, Some(&short), None);
         assert!(!d2.cache.under(to_attrs, &fk10)[0].complete);
         // The parent's delete / key update on a ready cache: kept children resolve, no rebuild.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
-        feed_map(&p, to_attrs, &mut d, None, Some(&r1));
+        feed_map_with_image(&p, to_attrs, &mut d, None, Some(&r1), None);
         assert_eq!(
-            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
+            feed_cascade_with_image(&p, to_attrs, &mut d, Some(&row(&[10])), None, None),
             Fed::Recorded
         );
         assert!(!d.rebuild && d.cache.rows(to_attrs).unwrap().rows.is_empty());
         // A parent with no kept children: irrelevant, so it holds no replay position.
         assert_eq!(
-            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[20])), Some(&row(&[21]))),
+            feed_cascade_with_image(
+                &p,
+                to_attrs,
+                &mut d,
+                Some(&row(&[20])),
+                Some(&row(&[21])),
+                None
+            ),
             Fed::Skipped
         );
         assert!(!d.rebuild && d.cache.rows(to_attrs).unwrap().rows.is_empty());
@@ -2011,13 +2339,13 @@ mod tests {
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         d.cache.gap = true;
         assert_eq!(
-            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
+            feed_cascade_with_image(&p, to_attrs, &mut d, Some(&row(&[10])), None, None),
             Fed::Recorded
         );
         assert!(d.all && !d.rebuild && d.units.is_empty());
         assert_eq!(d.tally.cascade_gaps, 1);
         assert_eq!(
-            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[11])), None),
+            feed_cascade_with_image(&p, to_attrs, &mut d, Some(&row(&[11])), None, None),
             Fed::Recorded
         );
         assert!(d.all && d.tally.cascade_gaps == 2);
@@ -2027,10 +2355,10 @@ mod tests {
         // the vanished ones left. The kept row is marked and the whole view is marked too — a
         // refresh of the view, never a rebuild.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
-        feed_map(&p, to_attrs, &mut d, None, Some(&r1));
+        feed_map_with_image(&p, to_attrs, &mut d, None, Some(&r1), None);
         d.cache.gap = true;
         assert_eq!(
-            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
+            feed_cascade_with_image(&p, to_attrs, &mut d, Some(&row(&[10])), None, None),
             Fed::Recorded
         );
         assert!(
@@ -2040,7 +2368,7 @@ mod tests {
         assert_eq!(d.tally.cascade_gaps, 1);
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed_cascade(&p, to_attrs, &mut d, Some(&row(&[10])), None),
+            feed_cascade_with_image(&p, to_attrs, &mut d, Some(&row(&[10])), None, None),
             Fed::Skipped
         );
         assert!(d.is_empty() && d.cache.rows(to_attrs).is_none());
@@ -2048,18 +2376,18 @@ mod tests {
         let mut s = ViewDirty::for_aliases(p.aliases.len());
         s.cache = crate::cascade::Cache::seeding();
         assert_eq!(
-            feed_cascade(&p, to_attrs, &mut s, Some(&row(&[10])), None),
+            feed_cascade_with_image(&p, to_attrs, &mut s, Some(&row(&[10])), None, None),
             Fed::Recorded
         );
         // Replayed: the same images (and cache removal) as the logged delete of that row.
         let c = &p.cascades[to_attrs];
         let mut logged = ViewDirty::for_aliases(p.aliases.len());
-        feed_map(&p, to_attrs, &mut logged, None, Some(&r1));
-        replay(&p, &c.child, &mut logged, Some(&r1), None);
+        feed_map_with_image(&p, to_attrs, &mut logged, None, Some(&r1), None);
+        replay_with_image(&p, &c.child, &mut logged, Some(&r1), None, None);
         let mut replayed = ViewDirty::for_aliases(p.aliases.len());
-        feed_map(&p, to_attrs, &mut replayed, None, Some(&r1));
+        feed_map_with_image(&p, to_attrs, &mut replayed, None, Some(&r1), None);
         let image = kept_image(c, &kept, None);
-        replay(&p, &c.child, &mut replayed, Some(&image), None);
+        replay_with_image(&p, &c.child, &mut replayed, Some(&image), None, None);
         assert!(!logged.images[a].is_empty());
         assert_eq!(replayed.images, logged.images);
         assert!(logged.cache.under(to_attrs, &fk10).is_empty());
@@ -2071,21 +2399,22 @@ mod tests {
         let mut moved = ViewDirty::for_aliases(p.aliases.len());
         let new_fk: Key = vec![Datum::Int(30)].into();
         let after = kept_image(c, &kept, Some(&new_fk));
-        replay(&p, &c.child, &mut moved, Some(&image), Some(&after));
+        replay_with_image(&p, &c.child, &mut moved, Some(&image), Some(&after), None);
         assert_eq!(moved.images[a].len(), 2);
         assert!(moved.cache.under(to_attrs, &fk10).is_empty());
         assert_eq!(moved.cache.under(to_attrs, &new_fk)[0].fk, new_fk);
         // The link table's kept row replays to its unit (the group) directly.
         let l = &p.cascades[to_link];
         let mut d = ViewDirty::for_aliases(p.aliases.len());
-        feed_map(&p, to_link, &mut d, None, Some(&row(&[4, 10])));
+        feed_map_with_image(&p, to_link, &mut d, None, Some(&row(&[4, 10])), None);
         let kept = d.cache.under(to_link, &fk10)[0].clone();
         let mut r = ViewDirty::for_aliases(p.aliases.len());
-        replay(
+        replay_with_image(
             &p,
             &l.child,
             &mut r,
             Some(&kept_image(l, &kept, None)),
+            None,
             None,
         );
         assert!(
@@ -2169,23 +2498,23 @@ mod tests {
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         // A new row of the level the view does not read: kept, nothing to refresh, skipped.
         assert_eq!(
-            feed_map(&p, to_mid, &mut d, None, Some(&row(&[5, 1]))),
+            feed_map_with_image(&p, to_mid, &mut d, None, Some(&row(&[5, 1])), None),
             Fed::Skipped
         );
         assert!(d.is_empty() && d.cache.rows(to_mid).is_some_and(|r| r.rows.len() == 1));
         // Its parent deleted: the kept mid row replays, but no leaf row is kept under it, so
         // nothing is buffered: skipped, not rebuilt.
         assert_eq!(
-            feed_cascade(&p, to_mid, &mut d, Some(&row(&[1])), None),
+            feed_cascade_with_image(&p, to_mid, &mut d, Some(&row(&[1])), None, None),
             Fed::Skipped
         );
         assert!(d.is_empty() && d.cache.rows(to_mid).unwrap().rows.is_empty());
         // With a kept leaf row below: its units are buffered, recorded.
-        feed_map(&p, to_mid, &mut d, None, Some(&row(&[6, 2])));
-        feed_map(&p, to_leaf, &mut d, None, Some(&row(&[6, 1, 3])));
+        feed_map_with_image(&p, to_mid, &mut d, None, Some(&row(&[6, 2])), None);
+        feed_map_with_image(&p, to_leaf, &mut d, None, Some(&row(&[6, 1, 3])), None);
         assert!(d.is_empty());
         assert_eq!(
-            feed_cascade(&p, to_mid, &mut d, Some(&row(&[2])), None),
+            feed_cascade_with_image(&p, to_mid, &mut d, Some(&row(&[2])), None, None),
             Fed::Recorded
         );
         assert!(!d.is_empty() && !d.rebuild);
@@ -2193,7 +2522,7 @@ mod tests {
         let mut s = ViewDirty::for_aliases(p.aliases.len());
         s.cache = crate::cascade::Cache::seeding();
         assert_eq!(
-            feed_map(&p, to_mid, &mut s, None, Some(&row(&[5, 1]))),
+            feed_map_with_image(&p, to_mid, &mut s, None, Some(&row(&[5, 1])), None),
             Fed::Recorded
         );
     }
@@ -2800,7 +3129,7 @@ mod tests {
         let nulls: Key = vec![Datum::Null].into();
         let kept = |p: &ViewPlan, d: &mut ViewDirty| {
             assert_eq!(
-                feed_map(p, notes, d, None, Some(&full_row(&[1, 10, 5]))),
+                feed_map_with_image(p, notes, d, None, Some(&full_row(&[1, 10, 5])), None),
                 Fed::Skipped,
                 "the child is kept under the old FK (a ready cache is in memory only)"
             );
@@ -2810,12 +3139,13 @@ mod tests {
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         kept(&p, &mut d);
         assert_eq!(
-            feed_cascade(
+            feed_cascade_with_image(
                 &p,
                 notes,
                 &mut d,
                 Some(&full_row(&[10, 1])),
-                Some(&full_row(&[11, 1]))
+                Some(&full_row(&[11, 1])),
+                None,
             ),
             Fed::Recorded
         );
@@ -2829,7 +3159,7 @@ mod tests {
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         kept(&p, &mut d);
         assert_eq!(
-            feed_cascade(&p, notes, &mut d, Some(&full_row(&[10, 1])), None),
+            feed_cascade_with_image(&p, notes, &mut d, Some(&full_row(&[10, 1])), None, None),
             Fed::Recorded
         );
         assert!(
@@ -2878,17 +3208,25 @@ mod tests {
         // left behind.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed_map(&p, subs, &mut d, None, Some(&full_row(&[1, 10, 2, 5]))),
+            feed_map_with_image(
+                &p,
+                subs,
+                &mut d,
+                None,
+                Some(&full_row(&[1, 10, 2, 5])),
+                None
+            ),
             Fed::Skipped
         );
         d.cache.gap = true;
         assert_eq!(
-            feed_cascade(
+            feed_cascade_with_image(
                 &p,
                 subs,
                 &mut d,
                 Some(&full_row(&[10, 2])),
-                Some(&part_row(&[None, None]))
+                Some(&part_row(&[None, None])),
+                None,
             ),
             Fed::Recorded
         );
@@ -2900,17 +3238,25 @@ mod tests {
         // kept rows heal them and the whole view must NOT be refreshed.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed_map(&p, subs, &mut d, None, Some(&full_row(&[1, 10, 2, 5]))),
+            feed_map_with_image(
+                &p,
+                subs,
+                &mut d,
+                None,
+                Some(&full_row(&[1, 10, 2, 5])),
+                None
+            ),
             Fed::Skipped
         );
         d.cache.gap = true;
         assert_eq!(
-            feed_cascade(
+            feed_cascade_with_image(
                 &p,
                 subs,
                 &mut d,
                 Some(&full_row(&[10, 2])),
-                Some(&part_row(&[Some(11), None]))
+                Some(&part_row(&[Some(11), None])),
+                None,
             ),
             Fed::Recorded
         );
@@ -2924,17 +3270,25 @@ mod tests {
         // vanish, and refreshing the whole view for it would be a spurious cost.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed_map(&p, subs, &mut d, None, Some(&full_row(&[1, 11, 2, 5]))),
+            feed_map_with_image(
+                &p,
+                subs,
+                &mut d,
+                None,
+                Some(&full_row(&[1, 11, 2, 5])),
+                None
+            ),
             Fed::Skipped
         );
         d.cache.gap = true;
         assert_eq!(
-            feed_cascade(
+            feed_cascade_with_image(
                 &p,
                 subs,
                 &mut d,
                 Some(&full_row(&[10, 2])),
-                Some(&full_row(&[11, 2]))
+                Some(&full_row(&[11, 2])),
+                None,
             ),
             Fed::Recorded
         );
@@ -2944,5 +3298,169 @@ mod tests {
         );
         assert!(!d.is_empty(), "the moved rows are marked: {d:?}");
         assert_eq!(d.tally.cascade_gaps, 1);
+    }
+
+    /// A row image of INTEGER slots, all NOT NULL: the shape the layout probes of
+    /// C-01 (#7) measure on the server.
+    fn image_slots(slots: &[i64]) -> BinlogRow {
+        use std::sync::Arc;
+
+        use mysql_async::consts::ColumnType;
+        let cols: Arc<[mysql_async::Column]> = (0..slots.len())
+            .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_LONG))
+            .collect();
+        BinlogRow::new(
+            slots
+                .iter()
+                .map(|v| Some(BinlogValue::Value(mysql_async::Value::Int(*v))))
+                .collect(),
+            cols,
+        )
+    }
+
+    /// A table of INTEGER columns with column `gen` STORED generated (a VIRTUAL column
+    /// is the same shape with `stored: false`): the catalog shape a MariaDB 11.4+ image
+    /// leaves out.
+    fn generated_table(names: &[&str], gen: usize) -> crate::catalog::TableInfo {
+        use crate::catalog::{Column, Generated};
+        let mut columns = names
+            .iter()
+            .map(|n| Column::simple(n, "int"))
+            .collect::<Vec<_>>();
+        columns[gen].generated = Some(Generated {
+            expr: format!("(`{}` + 1)", names[gen - 1]),
+            stored: false,
+            deps: None,
+        });
+        crate::catalog::TableInfo {
+            schema: "db".into(),
+            name: "t".into(),
+            columns,
+            pk: vec![0],
+            unique_keys: vec![],
+            cascades: vec![],
+            is_view: false,
+            view_bases: vec![],
+        }
+    }
+
+    fn slot_value(
+        row: &BinlogRow,
+        image: Option<&ImageMap>,
+        c: usize,
+    ) -> Option<mysql_async::Value> {
+        value_at(row, image, c).and_then(|v| match v {
+            BinlogValue::Value(v) => Some(v.clone()),
+            _ => None,
+        })
+    }
+
+    /// C-01 (#7), the acceptance case: a real column after a VIRTUAL one reads its own
+    /// value through the map. The catalog is (id, name, g VIRTUAL, base, extra) and the
+    /// image carries (id, name, base, extra): the positional read finds `extra` where
+    /// `base` lives, the mapped read finds `base`.
+    #[test]
+    fn value_at_reads_through_the_image_map() {
+        use mysql_async::Value;
+        let t = generated_table(&["id", "name", "g", "base", "extra"], 2);
+        assert_eq!(t.columns.len(), 5);
+        // The image of a MariaDB 11.4+ WORK/DELETE event: id, name, base, extra.
+        let row = image_slots(&[1, 9, 42, 7]);
+        let map = ImageMap::new(vec![0, 1, 3, 4]);
+
+        assert_eq!(
+            Some(Value::Int(42)),
+            slot_value(&row, Some(&map), 3),
+            "base column after a VIRTUAL reads its own value, not the neighbor's"
+        );
+        assert_eq!(
+            Some(Value::Int(7)),
+            slot_value(&row, Some(&map), 4),
+            "the last column keeps its own value too"
+        );
+        assert_eq!(
+            None,
+            slot_value(&row, Some(&map), 2),
+            "the VIRTUAL column is in no image: nothing is read for it"
+        );
+        // Without the map the same read is the neighbour's value or nothing at all:
+        // that is C-01 (#7).
+        assert_eq!(
+            Some(Value::Int(7)),
+            slot_value(&row, None, 3),
+            "unmapped, the positional read is one slot off"
+        );
+        assert_eq!(
+            None,
+            slot_value(&row, None, 4),
+            "and past the end for the column after it"
+        );
+        assert_eq!(t.columns[3].name, "base");
+    }
+
+    /// A column the layout leaves out of the image could have changed without the change
+    /// being visible, so under a map its absence counts as changed (C-01, #7).
+    #[test]
+    fn a_column_the_image_omits_counts_as_changed() {
+        let a = image_slots(&[1, 9, 42, 7]);
+        let b = image_slots(&[1, 9, 42, 7]);
+        let map = ImageMap::new(vec![0, 1, 3, 4]);
+        // Catalog column 2 (the VIRTUAL one) is in no image of this layout.
+        let reads_it = [true, true, true, true, true];
+        let skips_it = [true, true, false, true, true];
+        assert!(
+            !changed_mapped(&b, &a, &skips_it, None),
+            "an identical pair is unchanged when nothing hidden is read"
+        );
+        assert!(
+            !changed_mapped(&b, &a, &skips_it, Some(&map)),
+            "the omitted column is not read: its absence changes nothing"
+        );
+        assert!(
+            !changed_mapped(&b, &a, &reads_it, None),
+            "unmapped, every column is visible: an identical pair is unchanged"
+        );
+        assert!(
+            changed_mapped(&b, &a, &reads_it, Some(&map)),
+            "catalog column 2 is in no image: it could have changed"
+        );
+        let full = ImageMap::new(vec![0, 1, 2, 3, 4]);
+        assert!(
+            !changed_mapped(&b, &a, &reads_it, Some(&full)),
+            "a layout carrying every column compares like the positional one"
+        );
+        let moved = image_slots(&[1, 9, 43, 7]);
+        assert!(
+            changed_mapped(&b, &moved, &skips_it, Some(&map)),
+            "a visible change is still a change"
+        );
+    }
+
+    /// Constant filters are compared at the slots the image really uses (C-01, #7). A
+    /// row that is not a full image passes, as [`ConstFilter::passes`] does.
+    #[test]
+    fn const_filters_read_mapped_slots() {
+        use crate::datum::Datum;
+        let t = generated_table(&["id", "a", "b", "c", "k"], 2);
+        let filters = [ConstFilter {
+            col: 4,
+            values: vec![Datum::Int(42)],
+        }];
+        // A full-width image whose slots the map reorders: catalog 4 lives in slot 3.
+        let row = image_slots(&[1, 5, 6, 42, 9]);
+        let map = ImageMap::new(vec![0, 1, 2, 4, 3]);
+        assert!(
+            const_passes(&filters, &row, &t, Some(&map)),
+            "slot 3 holds the filtered column"
+        );
+        assert!(
+            !const_passes(&filters, &row, &t, None),
+            "unmapped, the same read finds 9 and drops the row"
+        );
+        let partial = image_slots(&[1, 5, 42, 9]);
+        assert!(
+            const_passes(&filters, &partial, &t, Some(&map)),
+            "an image that is not the whole catalog passes, as before"
+        );
     }
 }
