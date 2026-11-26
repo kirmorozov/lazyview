@@ -484,3 +484,50 @@ fn parallel_chunk_writes_to_the_same_rows_never_deadlock() {
         Ok(())
     });
 }
+
+/// #331: a chunk is written as separate autocommit statements, so a crash can land between them.
+/// The resume position is saved only after the whole chunk, so the chunk is replayed: this is
+/// the state a crash after the delete of the chunk's vanished units (and before its upserts) leaves,
+/// and the replay must bring the view to the source exactly, once and for good.
+#[test]
+fn a_chunk_cut_between_its_statements_converges_on_replay() {
+    scenario("mv_cut_chunk_331", |ctx| async move {
+        let db = ctx.new_db("mv_cc_331").await?;
+        let mut c = db.conn().await?;
+        for s in DDL {
+            exec(&mut c, s).await?;
+        }
+        seed(&mut c, 50, 2).await?;
+        let plan = plan_of(&db, "mv_cc_view", JOIN).await?;
+        let layout = mv::probe(&mut c, &db.name, &plan).await?;
+        let table = "mv_cc_target";
+        let m = lazyview::Metrics::default();
+        let w = build_target(&db, &plan, &layout, table, &m).await?;
+        let unit = layout.unit_cols()[0].clone();
+        // The source moves on: unit 3 loses its rows, unit 4's values change, unit 60 appears.
+        exec(&mut c, "DELETE FROM links WHERE entity_id = 3").await?;
+        exec(&mut c, "DELETE FROM entities WHERE id = 3").await?;
+        exec(&mut c, "UPDATE links SET v = v + 1000 WHERE entity_id = 4").await?;
+        exec(&mut c, "INSERT INTO entities VALUES (60, 1)").await?;
+        exec(&mut c, "INSERT INTO links VALUES (1000, 60, 7)").await?;
+        // The crash: the delete of unit 3's row went through, nothing else of the chunk did.
+        exec(&mut c, &format!("DELETE FROM `{table}` WHERE {unit} = 3")).await?;
+        // The replay: read the source, diff against what the target holds now, write.
+        for pass in 0..2 {
+            let rows = mv::read_source(&mut c, &plan, &layout, None, &m, false).await?;
+            let new = mv::prepare(&layout, rows);
+            let a =
+                mv::apply_prepared(&mut c, &db.name, table, &layout, None, &new, &w, &m).await?;
+            if pass == 1 {
+                assert_eq!(a.units_changed, 0, "converged after one replay: {a:?}");
+            }
+        }
+        let got = rows(
+            &mut c,
+            &format!("SELECT {unit}, COUNT(*) FROM `{table}` GROUP BY {unit} ORDER BY 1"),
+        )
+        .await?;
+        assert_eq!(got.len(), 50, "units 1-2, 4-50 and 60");
+        Ok(())
+    });
+}
