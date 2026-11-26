@@ -987,6 +987,27 @@ struct Built {
     cache: cascade::Cache,
 }
 
+/// Why a build runs: what it does to the unchanged live version, and how it is counted. The reason
+/// strings it produces are the engine's vocabulary of a whole-view rebuild —
+/// `tests/common/soakcheck.rs` (`UNOWNED_REASONS`) and `tests/soak_widen.rs` read them, so the two
+/// existing ones are contract.
+enum BuildKind {
+    /// Replaces the live version: a new definition, target list or source schema, a rebuild
+    /// request, a Full-mode cadence refresh, or an unknown-units heal of an incremental view.
+    Replace,
+    /// Builds `targets` onto the unchanged live version: targets the view was never built on
+    /// (startup resume, a target that was down and answered again — `Engine::retry_down`). Counted
+    /// as a whole rebuild, which is what the soak suite's budget expects for "a target that came
+    /// back is rebuilt as a whole" (`docs/operations.md:248`).
+    Rejoin,
+    /// Builds one target onto the unchanged live version because that lagging target owes the WHOLE
+    /// view (`Engine::lag_build`, #265 guard R1): its table was never filled — rows did not change.
+    /// Counted as a build and not a whole refresh (`stats::built`), so an incremental view's
+    /// `whole_view_refreshes` stays 0 through a lag catch-up, which is what `assert_no_rebuilds`
+    /// (tests/chaos.rs) reads.
+    LagCatchUp,
+}
+
 struct BuildDone {
     def_id: u64,
     generation: u64,
@@ -3639,9 +3660,15 @@ impl Engine {
             if build.is_empty() {
                 continue;
             }
-            let partial = self.slots[idx].live.is_some();
+            // What resume did not find live is built onto the live version (`Rejoin`); with no live
+            // version at all this is the view's first build (`Replace`).
+            let kind = if self.slots[idx].live.is_some() {
+                BuildKind::Rejoin
+            } else {
+                BuildKind::Replace
+            };
             let name = plan.name.clone();
-            self.start_next(idx, plan, name, build, partial).await;
+            self.start_next(idx, plan, name, build, kind).await;
         }
         // Chained views defined before an upstream that was resumed after them.
         let live: Vec<String> = self
@@ -3986,8 +4013,9 @@ impl Engine {
         plan: Arc<ViewPlan>,
         name: String,
         targets: Vec<String>,
-        partial: bool,
+        kind: BuildKind,
     ) {
+        let partial = !matches!(kind, BuildKind::Replace);
         if let Some(n) = self.slots[idx].next.take() {
             n.task.abort();
             if n.name != name || n.targets != targets {
@@ -4103,16 +4131,26 @@ impl Engine {
             }
         }
         Metrics::add(&self.metrics.full_rebuilds, 1);
-        let reason = if partial {
-            "build on a target that was down"
-        } else if !routine {
-            "new version: definition, targets or source schema changed, or rebuild requested"
-        } else if matches!(plan.mode, Mode::Full(_)) {
-            "full-mode view: the definition is not maintained incrementally"
-        } else {
-            "affected ids unknown (cascading foreign key, lookup overflow or untraced change)"
+        let reason = match kind {
+            // Not one of the two reasons the soak ledger accepts for a refresh no event owns: this
+            // build is never counted as a whole refresh, so it never reaches that check.
+            BuildKind::LagCatchUp => "lagging target owes the whole view: it is built for it",
+            BuildKind::Rejoin => "build on a target that was down",
+            BuildKind::Replace if !routine => {
+                "new version: definition, targets or source schema changed, or rebuild requested"
+            }
+            BuildKind::Replace if matches!(plan.mode, Mode::Full(_)) => {
+                "full-mode view: the definition is not maintained incrementally"
+            }
+            BuildKind::Replace => {
+                "affected ids unknown (cascading foreign key, lookup overflow or untraced change)"
+            }
         };
-        let replaces_live = self.slots[idx].live.is_some();
+        // A lag catch-up adds a target to the live version: nothing is replaced and no row
+        // changed, so it is a build (`stats::built`'s `false`), not a whole refresh. Both other
+        // kinds keep main's counting exactly.
+        let replaces_live =
+            !matches!(kind, BuildKind::LagCatchUp) && self.slots[idx].live.is_some();
         self.slots[idx].stats.built(replaces_live, reason);
         self.slots[idx].last_full = Some(Instant::now());
         // Building again: views waiting for this one no longer show its error.
@@ -4251,7 +4289,7 @@ impl Engine {
             } else {
                 info!(view = %name, "definition changed; building the new version online (current version stays live)");
             }
-            self.start_next(idx, plan, name, d.targets.clone(), false)
+            self.start_next(idx, plan, name, d.targets.clone(), BuildKind::Replace)
                 .await;
         }
         self.rebuild_routes();
@@ -7766,7 +7804,8 @@ impl Engine {
                 if freeze {
                     info!(view = %name, "source schema changed; rebuilding online");
                 }
-                self.start_next(i, plan, name, targets, false).await;
+                self.start_next(i, plan, name, targets, BuildKind::Replace)
+                    .await;
             }
             Err(e)
                 if e.downcast_ref::<WaitingFor>().is_some()
@@ -7843,7 +7882,7 @@ impl Engine {
                 continue;
             }
             let (plan, name) = (l.plan.clone(), l.name.clone());
-            self.start_next(i, plan, name, due, true).await;
+            self.start_next(i, plan, name, due, BuildKind::Rejoin).await;
         }
     }
 
@@ -8283,16 +8322,39 @@ impl Engine {
             // debt is ever paid (guard R1). The accounting is `lag_end`'s, not a delete: what the
             // flushes fed to the entry while the build ran is still owed, so those units stay for
             // a later retry, and a whole-view ask that came in meanwhile builds again.
-            let paid = self.slots[i]
+            let (paid, was_down) = self.slots[i]
                 .live
                 .as_mut()
                 .filter(|l| l.name == n.name)
                 .and_then(|l| l.lag.get_mut(t))
-                .is_some_and(|g| g.pay_whole_view());
+                .map(|g| (g.pay_whole_view(), g.down))
+                .unwrap_or((false, false));
             if paid {
                 self.slots[i].live.as_mut().and_then(|l| l.lag.remove(t));
                 info!(view = %n.name, target = %t, "target caught up");
                 Metrics::add(&self.metrics.target_catchups, 1);
+                // The target is maintained again from now on, the way `lag_end` readmits one whose
+                // writes finally landed: back into the live version's targets (the cap took it out,
+                // and a partial build swaps only what it built on), its `Down` entry gone with the
+                // entry, and the Part B gauge back to 0 with the one line that pairs with the down
+                // one — the same authority `lag_end` reads, so the pair is what `/metrics` shows.
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    if !l.targets.contains(t) {
+                        l.targets.push(t.clone());
+                        l.targets.sort();
+                    }
+                }
+                if was_down {
+                    self.rebuild_routes();
+                    if self.target_is_pg(t)
+                        && !self.target_held_down(t)
+                        && self.metrics.set_target_down(t, false, "")
+                    {
+                        warn!(view = %n.name, target = %t,
+                              "target answers again: the changes kept for it were written \
+                               (lazyview_target_down back to 0)");
+                    }
+                }
             }
         }
         let s = &mut self.slots[i];
@@ -8671,7 +8733,8 @@ impl Engine {
                         g.all = true;
                     }
                 }
-                self.start_next(i, plan, name, all, false).await;
+                self.start_next(i, plan, name, all, BuildKind::Replace)
+                    .await;
             } else {
                 // Not due yet: stay stale until the next refresh slot (see flush_deadline).
                 l.dirty.all = true;
@@ -8907,7 +8970,8 @@ impl Engine {
                             l.dirty.rebuild = true;
                             self.slots[i].retry_at = Some(Instant::now() + connect_retry_delay(1));
                         } else {
-                            self.start_next(i, plan, name, all, false).await;
+                            self.start_next(i, plan, name, all, BuildKind::Replace)
+                                .await;
                         }
                     } else {
                         l.dirty.rebuild = true;
@@ -9206,9 +9270,13 @@ impl Engine {
     /// building — its cadence rebuild, another target's catch-up, a pending re-plan — is not
     /// interrupted: the attempt moves to the entry's own backoff, which `lag_wake` reads, so nothing
     /// spins. `finish_next` discharges the debt of a target it swaps in; `next_failed` re-arms it
-    /// through [`Self::lag_after_build_fail`]; after [`LAG_MAX_FAILURES`] attempts the target is
-    /// reported down the way a failed write is (its entry keeps the debt, so a peer that answers
-    /// later is still caught up), so a peer that never answers stops asking.
+    /// through [`Self::lag_after_build_fail`]; at [`LAG_MAX_FAILURES`] attempts the target is
+    /// reported down the way a failed write is, ONCE (`lag_end`'s rule) — the attempts are not
+    /// capped, because this entry is the only thing that can ever bring the target in: `retry_down`
+    /// builds targets with no lag entry and the flush skips a lagging one, so an entry that stopped
+    /// trying would strand its target for the life of the view and `applied` could never pass it.
+    /// A peer that never answers is retried at the capped backoff, which is what `lag_end` does for
+    /// a units entry whose writes never land.
     ///
     /// Cost (guard R3): one call per due whole-view entry per backoff period, nothing per event.
     async fn lag_build(&mut self, i: usize, t: &str) {
@@ -9232,28 +9300,36 @@ impl Engine {
             None => return,
         };
         if failures >= LAG_MAX_FAILURES {
-            // Reported down once, exactly the way `lag_end` reports a target whose writes never
-            // land — and the entry KEEPS its whole-view debt: `retry_down` builds only targets
-            // with no lag entry, so this one keeps making its own attempts at the capped backoff
-            // until one lands (which is the catch-up `finish_next` counts).
-            match self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
-                Some(g) if g.down => return,
-                Some(g) => g.down = true,
+            // Reported down ONCE, `lag_end`'s rule (`>= LAG_MAX_FAILURES && !g.down`). The report is
+            // once per target; the ATTEMPTS are not capped — and that is not a loose end, it is the
+            // only thing that can bring this target in: `retry_down` builds targets with no lag
+            // entry and the flush skips a lagging one, so an entry that stopped trying would strand
+            // its target for the life of the view and `applied` could never pass it (which is the
+            // class of bug #214 is about: a target silently left behind). At the capped backoff it
+            // keeps building until one attempt lands, and that swap is the catch-up `finish_next`
+            // counts and readmits.
+            let report = match self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
+                Some(g) if g.down => false,
+                Some(g) => {
+                    g.down = true;
+                    true
+                }
                 None => return,
+            };
+            if report {
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    l.targets.retain(|x| x != t);
+                }
+                warn!(view = %name, target = %t, failures,
+                      "the whole view never reached the target: it is reported down");
+                let e = anyhow!("the whole view never reached the target {t}");
+                self.target_down(i, &name, t, Some(&plan), &e).await;
+                self.rebuild_routes();
             }
-            if let Some(l) = self.slots[i].live.as_mut() {
-                l.targets.retain(|x| x != t);
-            }
-            warn!(view = %name, target = %t, failures,
-                  "the whole view never reached the target: it is reported down");
-            let e = anyhow!("the whole view never reached the target {t}");
-            self.target_down(i, &name, t, Some(&plan), &e).await;
-            self.rebuild_routes();
-            return;
         }
         debug!(view = %name, target = %t, failures,
                "the whole view is owed to a lagging target: its catch-up is the streamed build");
-        self.start_next(i, plan, name, vec![t.to_string()], true)
+        self.start_next(i, plan, name, vec![t.to_string()], BuildKind::LagCatchUp)
             .await;
     }
 

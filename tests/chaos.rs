@@ -1693,7 +1693,7 @@ fn assert_no_rebuilds(
 ) -> Result<()> {
     let d = eng.snapshot().since(before);
     let mut full_whole = 0u64;
-    let mut full_builds = 0u64;
+    let mut builds = 0u64;
     for s in specs {
         let vs = eng.stats_of(db, &s.name)?;
         if vs.mode.eq_ignore_ascii_case("incremental") {
@@ -1705,20 +1705,23 @@ fn assert_no_rebuilds(
             );
         } else {
             full_whole += vs.whole_view_refreshes;
-            // #265 (guard R1, owner rule 2026-11-26): what a Full-mode view owes a single lagging
-            // target arrives by the streamed build (`Engine::lag_build`), which is a build and not
-            // a whole-view refresh — so a build of a Full-mode view is inside the budget too. What
-            // stays outside it, and is the point of the check, is a build of an INCREMENTAL view.
-            full_builds += vs.builds;
         }
+        // Every build the engine counts as a rebuild is accounted here, whatever the view's mode:
+        // the view's first build, a target that was never built on (`retry_down`), and a lagging
+        // target's whole-view catch-up (`Engine::lag_build`, #265 guard R1), which is a build onto
+        // the unchanged live version and not a whole refresh — so it moves the engine's
+        // `full_rebuilds` and this counter together and stays inside the budget. What stays outside
+        // it, and is the point of the check, is a whole refresh of an INCREMENTAL view: rows
+        // changed and the view was read whole instead of maintained.
+        builds += vs.builds;
     }
     ensure!(
-        d.full_rebuilds <= full_whole + full_builds,
-        "{what}: engine full_rebuilds delta {} exceeds the {} whole refreshes and {} builds of \
-         the Full-mode views — an incremental view was rebuilt, not refreshed",
+        d.full_rebuilds <= full_whole + builds,
+        "{what}: engine full_rebuilds delta {} exceeds the {} whole refreshes of the Full-mode \
+         views and {} builds of all of them — an incremental view was rebuilt, not refreshed",
         d.full_rebuilds,
         full_whole,
-        full_builds,
+        builds,
     );
     Ok(())
 }
