@@ -269,6 +269,11 @@ pub(crate) async fn snapshot_position(
     if fail_first.is_some_and(|n| try_no <= n) {
         bail!("injected snapshot fence failure");
     }
+    // The one transaction lazyview keeps on a source (lv-super ruling 2026-11-26): read-only, no
+    // row locks, and the only way MariaDB exposes the position readers can see
+    // (`binlog_snapshot_*`). This is a visibility wait before reads, not a replay anchor, so a
+    // plain position read (the raw write position passes commits in flight) would allow stale
+    // rows nothing later corrects: `tests/visibility.rs` `visibility_snapshot_fence_exact`.
     // The session reads with READ COMMITTED; the snapshot needs REPEATABLE READ.
     conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .await?;
