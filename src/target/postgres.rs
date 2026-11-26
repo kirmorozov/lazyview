@@ -1102,21 +1102,25 @@ impl PgConn {
         began.store(true, Ordering::SeqCst);
         let c = &self.client;
         if d.by_unit {
-            if d.deleted_rows > 0 {
-                let (cols, types) = unit_cols(layout, &layout.unit_pos);
-                let chunk = crate::mv::keys_chunk(&d.changed);
-                let (f, bound) =
-                    filter_bind(&chunk, &cols, &layout.write_kinds(&layout.unit_pos), &types);
-                let sql = format!(
-                    "DELETE FROM {}.{} WHERE {f}",
-                    quote_ident(schema),
-                    quote_ident(table)
+            // A keyless unit is written as a multiset and is never absent in between (the #399
+            // invariant, owner ruling 2026-11-26, the same order as `crate::mv::write_tx_mysql`):
+            // the surplus new copies go in first, then the surplus old copies are deleted one
+            // per copy by their exact values. Deleting the unit first (the shape until #399)
+            // lost every unit that only a lineage lookup could reach once the lineage row
+            // itself was gone; a reader may briefly see the old and the new row together.
+            insert_rows_on(c, schema, table, layout, &d.inserts, w, false, metrics).await?;
+            if !d.delete_rows.is_empty() {
+                // The cost line per chunk: the per-copy delete is the price of the order.
+                tracing::debug!(
+                    table,
+                    units = d.changed.len(),
+                    values = d.delete_rows.len(),
+                    rows = d.deleted_rows,
+                    "keyless chunk: row-value deletes after the inserts"
                 );
-                exec(c, &sql, bound).await?;
-                Metrics::add(&metrics.mv_queries, 1);
+                delete_rows_exact(c, schema, table, layout, &d.delete_rows, metrics).await?;
             }
             Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
-            insert_rows_on(c, schema, table, layout, &d.inserts, w, false, metrics).await?;
         } else {
             // Sorted by row key; the order is only for lock consistency across chunks.
             let sorted_rows;
@@ -1336,6 +1340,66 @@ async fn delete_keys_on<C: GenericClient>(
         let (f, bound) = filter_bind(&chunk, &cols, &[], &types);
         let sql = format!(
             "DELETE FROM {}.{} WHERE {f}",
+            quote_ident(schema),
+            quote_ident(table)
+        );
+        exec(c, &sql, bound).await?;
+        Metrics::add(&metrics.mv_queries, 1);
+    }
+    Ok(())
+}
+
+/// Deletes the surplus old copies of a keyless chunk (see [`PgConn::write_tx`], #399): one
+/// statement per row value, the unit filter (which takes the row locks in the unit order) ANDed
+/// with the whole-row match, at most `copies` rows - a PostgreSQL `DELETE` has no `LIMIT`, so
+/// the copies are picked by `ctid` in a subselect of the same statement (one snapshot, the
+/// statement's own). The chunk's new copies are already in the table (their value differs from
+/// every value deleted here, or it would not be surplus on both sides), so the delete can only
+/// reach the old ones. A text column compares under its own collation: unlike the MySQL family
+/// (see `crate::mv::exact_conj`) PostgreSQL's default collation is case sensitive, and a value
+/// another collation deems equal is the same value to a later diff too (its rows converge).
+async fn delete_rows_exact<C: GenericClient>(
+    c: &C,
+    schema: &str,
+    table: &str,
+    layout: &Layout,
+    rows: &[(Vec<Datum>, u64)],
+    metrics: &Metrics,
+) -> Result<()> {
+    let mut all_cols: Vec<String> = Vec::with_capacity(layout.cols.len());
+    let mut all_types: Vec<&MvCol> = Vec::with_capacity(layout.cols.len());
+    for col in &layout.cols {
+        all_cols.push(quote_ident(&col.name));
+        all_types.push(col);
+    }
+    for (datums, copies) in rows {
+        let (assist, mut bound) = if layout.unit_pos.is_empty() {
+            ("TRUE".to_string(), Vec::new())
+        } else {
+            let uk: Key = layout
+                .unit_pos
+                .iter()
+                .map(|&pp| datums[pp].clone())
+                .collect();
+            let (cols, types) = unit_cols(layout, &layout.unit_pos);
+            filter_bind(
+                &UnitChunk::Keys(vec![uk]),
+                &cols,
+                &layout.write_kinds(&layout.unit_pos),
+                &types,
+            )
+        };
+        let (exact, ep) = filter_bind(
+            &UnitChunk::Keys(vec![datums.clone().into_boxed_slice()]),
+            &all_cols,
+            &[],
+            &all_types,
+        );
+        bound.extend(ep);
+        let sql = format!(
+            "DELETE FROM {}.{} WHERE ctid IN (SELECT ctid FROM {}.{} WHERE ({assist}) AND ({exact}) LIMIT {copies})",
+            quote_ident(schema),
+            quote_ident(table),
             quote_ident(schema),
             quote_ident(table)
         );
