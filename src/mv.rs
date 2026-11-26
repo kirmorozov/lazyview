@@ -1384,13 +1384,16 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
     }
     // One order for every writer: two chunks that touch the same keys take their row locks in
     // the same order, so their statements queue instead of deadlocking (#331).
+    // Unit (or row key) first, then the whole row: a total order, so the same on every writer even
+    // when the view's row key is none for its most restrictive target (a keyless diff still goes
+    // out in one order; a target that upserts uses the same identity columns, see `row_key_for`).
     let order = row_key.unwrap_or(&layout.unit_pos[..]);
     ins.sort_by(|a, b| {
         order
             .iter()
             .map(|&p| a.0[p].cmp(&b.0[p]))
             .find(|o| o.is_ne())
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or_else(|| a.0.cmp(&b.0))
     });
     d.inserts = ins.iter().map(|r| r.1.clone()).collect();
     d.delete_keys.sort_unstable();
@@ -2298,6 +2301,49 @@ mod tests {
         let d = diff(&l3, old.clone(), &prepare(&l3, new));
         assert!(d.by_unit && d.delete_keys.is_empty());
         assert_eq!((d.inserts.len(), d.deleted_rows), (3, 3));
+    }
+
+    /// #331: the write order does not depend on the order the rows were read in, also for a view
+    /// whose most restrictive target (PostgreSQL) cannot hold the row key. The key budget is the
+    /// view's, so no MySQL target upserts by a row key the diff does not know (`row_key_for` is
+    /// `Some` for a family only when the view-wide `row_key` is): the diff is per unit for all
+    /// of them, and its rows still come out in one total order.
+    #[test]
+    fn writes_are_ordered_in_a_mixed_family_view() {
+        let mut l = layout(
+            vec![
+                col("u", "int", "int", None),
+                col("s", "varchar", "varchar(700)", Some("utf8mb4")),
+            ],
+            2,
+            vec![0],
+            false,
+        );
+        l.hidden = vec![];
+        l.identity = vec![0, 1];
+        l.key_budget = crate::target::PG_KEY_BYTES;
+        assert!(l.row_key().is_none(), "too wide for the PostgreSQL index");
+        assert!(
+            l.row_key_for(Kind::Mysql).is_none(),
+            "the same budget and widths: no family upserts where the view has no row key"
+        );
+        let r = |u: i64, s: &str| vec![Value::Int(u), Value::Bytes(s.as_bytes().to_vec())];
+        let rows: Vec<Vec<Value>> = (0..30)
+            .map(|i| r(i % 3, &format!("v{:02}", (i * 7) % 30)))
+            .collect();
+        let mut rev = rows.clone();
+        rev.reverse();
+        let a = diff(&l, Vec::new(), &prepare(&l, rows));
+        let b = diff(&l, Vec::new(), &prepare(&l, rev));
+        assert!(a.by_unit);
+        assert_eq!(a.inserts, b.inserts, "one order for every writer");
+        assert!(a.inserts.windows(2).all(|w| {
+            let k = |x: &Vec<Value>| match &x[0] {
+                Value::Int(i) => *i,
+                _ => unreachable!(),
+            };
+            k(&w[0]) <= k(&w[1])
+        }));
     }
 
     /// The DDL entry of a MySQL-family target: `Layout` renders nothing of its own, the family
