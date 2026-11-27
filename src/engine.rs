@@ -764,6 +764,47 @@ fn since_after_round(kept: &ViewDirty, since: Option<Position>) -> Option<Positi
     }
 }
 
+/// What the slot keeps of a flush round that found no eligible target
+/// ([`Engine::live_begin`]'s no-target arm). Kept apart from the arm because both of its rules were
+/// measured and one is a guard rule, so each has its own line and its own test.
+///
+/// A rebuild round keeps its WHOLE buffer: the view's own maintenance lives in it, and clearing it
+/// left a Full view with nothing pending — after the black-holed `t1` failed one build,
+/// `w_union_kinds` was never rebuilt again and its HEALTHY targets froze at the rows of the last
+/// swap (percona84, seed 472297954799: `rebuilding view=w_union_kinds` appears exactly once in the
+/// run), and with the writers stopped no new change would ever re-arm it. Any other round keeps only
+/// the base-row keys no owed set can name (`images`, `marks`, `holds`): their units exist only after
+/// a lookup against the materialized table, which is exactly what a round with no target cannot do.
+///
+/// The whole-view flag goes with a Full-mode view alone (guard R1, owner rule 2026-11-26): what a
+/// re-derive changes is not knowable per key, so a Full view's owed maintenance IS the view. An
+/// Incremental view's owed debt stays `rebuild` and is paid by the slot's streamed build
+/// ([`Engine::lag_build`] / `BuildKind::LagCatchUp`, `mv::fill` into `<name>__lv_new` and the swap) —
+/// never by `refresh`'s in-memory `dirty.all` arm (`mv::read_source(…, chunk: None …)` plus one
+/// `mv::prepare`), which is the owner's memory rule. `ViewDirty::is_empty` counting `rebuild` is what
+/// lets the Incremental arm keep its debt, and wake the flush for it
+/// ([`Engine::flush_deadline`]'s `rebuild` test), without the flag.
+fn kept_after_no_target_round(taken: ViewDirty, full_mode: bool) -> ViewDirty {
+    if taken.rebuild {
+        let mut kept = taken;
+        kept.all = full_mode;
+        kept
+    } else {
+        let ViewDirty {
+            images,
+            marks,
+            holds,
+            ..
+        } = taken;
+        ViewDirty {
+            images,
+            marks,
+            holds,
+            ..Default::default()
+        }
+    }
+}
+
 /// The lowest pin of [`floor_pins_of`]: what the position is actually stuck behind. `None` when
 /// nothing holds it back at all, when the floor is simply what the reader has read.
 fn floor_pin_of<'a>(
@@ -9017,7 +9058,7 @@ impl Engine {
         if l.frozen || l.dirty.is_empty() || backing_off {
             return None;
         }
-        let mut dirty = l.dirty.take();
+        let dirty = l.dirty.take();
         let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
         // Two kinds of excluded target, and they are not alike. `lag` holds the ones whose WRITES
         // failed: the round must not hand them another connection. `behind` holds the ones that
@@ -9134,29 +9175,17 @@ impl Engine {
                 // are owed either way, and delivering a unit twice is idempotent (a unit write
                 // deletes then inserts). Cost: these three fields live in the buffer instead of being
                 // dropped, which is main's lifetime for them.
-                if !dirty.rebuild {
-                    l.dirty.merge(ViewDirty {
-                        images: std::mem::take(&mut dirty.images),
-                        marks: std::mem::take(&mut dirty.marks),
-                        holds: std::mem::take(&mut dirty.holds),
-                        ..Default::default()
-                    });
-                } else {
-                    // A rebuild is not carried by the owed sets alone. The view's own maintenance
-                    // IS this buffer: `flush_deadline` wakes the loop for `rebuild` / for `all` on a
-                    // Full-mode plan (`src/engine.rs:6423`), and the Full branch below starts the
-                    // cadence rebuild from it. Clearing it left the Full view with nothing pending:
-                    // after the black-holed `t1` failed one build, `w_union_kinds` was never rebuilt
-                    // again and its HEALTHY targets froze at the rows of the last swap (percona84,
-                    // seed 472297954799: `rebuilding view=w_union_kinds` appears exactly once in the
-                    // run) — and with the writers stopped no new change would ever re-arm it. Same
-                    // keeping as the Full branch's own `all.is_empty()` case: the whole buffer goes
-                    // back (a later round may answer it per key), and the excluded targets are
-                    // additionally owed the view itself by the `all` above.
-                    l.dirty.merge(dirty);
-                    l.dirty.rebuild = true;
-                    l.dirty.all = true;
-                }
+                // What the round leaves in the slot is [`kept_after_no_target_round`]: a rebuild
+                // round keeps its whole buffer (its view's maintenance lives there) and a units round
+                // keeps only the base-row keys no owed set can name, and in both cases the whole-view
+                // flag goes with a Full-mode plan only — guard R1, the owner's memory rule of
+                // 2026-11-26, so an Incremental view's owed rebuild is paid by the slot's streamed
+                // build and never by `refresh`'s in-memory `dirty.all` arm. `ViewDirty::merge` folds
+                // `rebuild` and `all` in, so the flags need no second setting here.
+                l.dirty.merge(kept_after_no_target_round(
+                    dirty,
+                    matches!(plan.mode, Mode::Full(_)),
+                ));
             } else {
                 // Nothing owed (the usual round of a quiescing schema): keep it for the round
                 // that has a target to write to.
@@ -12894,6 +12923,59 @@ mod tests {
             posted: UnitSet::default(),
             posted_partial: Vec::new(),
             posted_all: false,
+        }
+    }
+
+    /// Guard R1 (owner rule 2026-11-26) at the site lv-super's verdict of 2026-11-27 named: the
+    /// flush round that found no eligible target ([`kept_after_no_target_round`], called from
+    /// [`Engine::live_begin`]). Both modes keep the owed rebuild — `ViewDirty::is_empty` counts it,
+    /// which is what wakes the flush for it — but only a Full-mode view keeps the whole-view flag.
+    /// An Incremental view's catch-up is the slot's streamed build
+    /// ([`Engine::lag_build`] / `BuildKind::LagCatchUp`), never `refresh`'s in-memory read of the
+    /// whole view. And a units-only round keeps neither flag: what the owed sets already carry is
+    /// not kept a second time in the slot.
+    #[test]
+    fn no_eligible_target_keeps_the_whole_view_for_a_full_mode_view_only() {
+        // The shape the guard found: an Incremental view whose `rebuild` was set (a cascade gap
+        // window, a distrust rebuild) while every one of its targets was excluded.
+        let owed = || {
+            let mut d = ViewDirty::for_aliases(1);
+            d.rebuild = true;
+            d.units.insert_int(21);
+            d
+        };
+
+        let incremental = kept_after_no_target_round(owed(), false);
+        assert!(incremental.rebuild, "the owed rebuild stays owed");
+        assert!(
+            !incremental.all,
+            "guard R1: an Incremental view is owed units, never the whole view"
+        );
+        assert!(
+            !incremental.is_empty(),
+            "and the buffer still wakes the flush for it, on `rebuild` alone"
+        );
+        assert!(
+            !incremental.units.is_empty(),
+            "a rebuild round keeps its whole buffer: its maintenance lives there"
+        );
+
+        let full = kept_after_no_target_round(owed(), true);
+        assert!(
+            full.rebuild && full.all,
+            "a Full view's maintenance IS the view: what a re-derive changes is not knowable per key"
+        );
+
+        // A round with no rebuild keeps only the base-row keys no owed set can name, in either mode,
+        // so nothing here can reach the in-memory whole-view arm of a refresh.
+        for full_mode in [false, true] {
+            let mut units_only = ViewDirty::for_aliases(1);
+            units_only.units.insert_int(21);
+            let kept = kept_after_no_target_round(units_only, full_mode);
+            assert!(
+                kept.is_empty() && !kept.all && !kept.rebuild,
+                "units belong to the owed sets, not to the slot, in mode {full_mode:?}"
+            );
         }
     }
 
