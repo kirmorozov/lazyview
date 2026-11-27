@@ -643,6 +643,75 @@ const SET_WRITE_BACKLOG_BUDGET_MULTIPLIER: u32 = 8;
 /// its budget is the loop's own cadence: one [`Config::position_persist_interval`] is what it
 /// schedules per save, and [`SET_WRITE_BACKLOG_BUDGET_MULTIPLIER`] says how far a single one may
 /// overrun that.
+/// How many flush intervals a refused whole-row save may be held for while the apply loop has
+/// nothing waiting, after which the row goes **regardless of price**.
+///
+/// A price that can deny a save forever is a defect, and CI proved it on a required check:
+/// `visibility_gtid_fence_covers_xa_commit` (run `46046921423`, shard D — mysql97 at 193.3 s,
+/// percona97 at 197.3 s, base seed 843114013558) died in
+/// `wait_until("the engine to save past the marker", t_catchup(), …)`, a wait on
+/// `binlog_file`/`binlog_pos` (`tests/common/soakchaos.rs`'s `saved_position`) — columns that since
+/// [`pair_publishes_the_rows_set`] move only together with the whole row. The test is exactly the
+/// case a price cannot serve by waiting: it slows the meta server's own commits **on purpose**
+/// (GLOBAL `sync_binlog`, `binlog_group_commit_sync_delay`, `binlog_order_commits` — its own opt-in
+/// text names all three), so every sample the price reads is inflated by commit latency rather than
+/// by bytes; the worst per-byte rate the run ever saw stays inflated for the life of the run, and an
+/// ~80 KB rewrite is refused on every flush, forever, while a reader waits on the row. This is the
+/// "self-lock" this PR used to document as a limitation — a refused rewrite never refreshes the
+/// write's own sample, so the refusal feeds on itself — and a documented limitation that breaks a
+/// required check is a defect, not a limitation.
+///
+/// Measured from the two deadlines that have to land on opposite sides of it, the way
+/// [`SET_WRITE_BACKLOG_BUDGET_MULTIPLIER`] is:
+///
+///  - a reader must see the row move inside its own bound. That reader's bound is
+///    `t_catchup() = 180 s` (`tests/common/engine.rs`), and CI's two failures were 193.3 s and
+///    197.3 s into legs whose wait is exactly that 180 s. At the shipped
+///    [`Config::position_persist_interval`] of 1 s the bound is 30 s, so a starved row moves about
+///    six times inside such a wait instead of never.
+///  - the apply loop must not live inside a statement it waits on. That half is why 30 is not
+///    smaller, and why the bound only fires with no backlog: CI run 45896362347 measured what one
+///    whole-set save per flush costs on a link sliced to a byte per 2 ms — `chaos_both_sides_fragmented`
+///    red on five flavors, "3.5 KB of tail unconsumed in 120 s" at six flushes. An idle loop is the
+///    one state where waiting on such a statement costs the run nothing; under a backlog the price
+///    keeps ruling outright, because a lagging row costs a replay while a starved apply loop costs
+///    the run.
+const SET_WRITE_HOLD_BOUND_MULTIPLIER: u32 = 30;
+
+fn set_write_hold_bound(interval: Duration) -> Duration {
+    interval * SET_WRITE_HOLD_BOUND_MULTIPLIER
+}
+
+/// The price's own question: may the loop wait on a statement that [`Engine::price_set_write`] priced
+/// at `cost`, against the `budget` [`set_write_budget`] chose for whether work is waiting? `None` —
+/// nothing of this shape timed yet — goes: the first write buys the next one its price.
+fn set_write_affordable(cost: Option<Duration>, budget: Duration) -> bool {
+    cost.is_none_or(|c| c < budget)
+}
+
+/// The one rule that overrides the price: **a save may be delayed, never denied.**
+///
+/// `held_for` is how long the run has owed a set that the price would not let it send. Once that
+/// passes [`set_write_hold_bound`] the row goes — but only with `backlog == false`, for the reason in
+/// that bound's doc: the price exists to keep the apply loop out of a statement it cannot interrupt,
+/// and an idle loop is the one moment where waiting on one is free. A row held under a backlog costs
+/// a longer replay after a restart and nothing else, the path
+/// `lifecycle_resumes_from_a_cursor_behind_the_applied_position` exists to prove.
+///
+/// Either way the row is written whole or not at all: the bound decides *whether* the statement goes,
+/// never half of one, because a half that runs ahead of its set is the bug
+/// [`pair_publishes_the_rows_set`] exists to make impossible.
+fn set_write_due(
+    cost: Option<Duration>,
+    budget: Duration,
+    backlog: bool,
+    held_for: Option<Duration>,
+    interval: Duration,
+) -> bool {
+    set_write_affordable(cost, budget)
+        || (!backlog && held_for.is_some_and(|h| h >= set_write_hold_bound(interval)))
+}
+
 /// The one rule the fixed-size position statement obeys: it may publish the position **the set the
 /// row carries belongs to**, and nothing else.
 ///
@@ -1273,6 +1342,12 @@ struct Engine {
     /// The held-back rewrite has been reported once: the next refusal of the same hold costs no
     /// second line, and a write that goes clears it (see [`Self::persist_position`]).
     set_held_logged: bool,
+    /// When the loop first owed a set the price would not let it send, or `None` while the row is
+    /// current. The clock behind the bound in [`set_write_due`].
+    set_held_since: Option<Instant>,
+    /// Consecutive refused rewrites since the row last moved — kept for the log line, so a leg read
+    /// off its own log can say how many intervals the price held and which decision broke the hold.
+    set_refusals: u32,
     in_txn: bool,
     /// The current transaction touched something besides our own metadata tables.
     txn_foreign: bool,
@@ -2547,6 +2622,8 @@ impl Engine {
             last_cheap_write: None,
             set_pending: false,
             set_held_logged: false,
+            set_held_since: None,
+            set_refusals: 0,
             in_txn: false,
             txn_foreign: false,
             persist_needed: false,
@@ -9753,16 +9830,23 @@ impl Engine {
     /// `chaos_both_sides_fragmented` red on five flavors, "applied never caught up through the
     /// fragmentation — 3.5 KB of tail unconsumed in 120 s" at six flushes to that deadline).
     ///
-    /// Compares the priced cost against the budget the loop can afford right now
-    /// ([`set_write_budget`], which is the caller's `budget`), not against one fixed number: what the
-    /// run can spend on a statement it waits for depends on whether it has work waiting. `None` —
-    /// nothing of this shape timed yet — goes: the first write buys the next one its price. When the
-    /// gate refuses, **nothing** is written: the row keeps the position its own set belongs to (see
-    /// [`pair_publishes_the_rows_set`]) and the loop asks again on the next interval. A refusal costs
-    /// a longer replay after a restart and nothing else — consuming the stream never depended on the
-    /// row, which records where the run got to rather than licensing it to read.
-    fn set_write_affordable(&self, cost: Option<Duration>, budget: Duration) -> bool {
-        cost.is_none_or(|c| c < budget)
+    /// Whether the whole row goes on this flush: the price's answer, or the bound's. Delegates to
+    /// the free [`set_write_due`], where the rule and its measured numbers live; this only supplies
+    /// the run's own persist interval.
+    fn set_write_due(
+        &self,
+        cost: Option<Duration>,
+        budget: Duration,
+        backlog: bool,
+        held_for: Option<Duration>,
+    ) -> bool {
+        set_write_due(
+            cost,
+            budget,
+            backlog,
+            held_for,
+            self.cfg.position_persist_interval,
+        )
     }
 
     /// Writes the fixed-size `binlog_file`/`binlog_pos` half and **times** it, which is the second
@@ -9901,7 +9985,11 @@ impl Engine {
         //    else ([`pair_publishes_the_rows_set`]). Everything else in this function is that rule. A
         //    refused rewrite therefore writes nothing at all and is asked again on the next interval,
         //    so it costs a longer replay after a restart — never a stale position, never a shed set,
-        //    and never a position the row's set does not back.
+        //    and never a position the row's set does not back. And a refusal is a **delay, never a
+        //    denial**: once the run has owed this set for [`SET_WRITE_HOLD_BOUND_MULTIPLIER`] flush
+        //    intervals with nothing waiting to apply, [`set_write_due`] sends the row regardless of
+        //    price — the whole row, never half of it, so the bound buys the row's truth without ever
+        //    putting the position ahead of its set.
         //
         // The save is the engine's own word that the row holds this cursor byte for byte:
         // `meta::save_position` refuses a cursor the column cannot hold whole with an error naming
@@ -9936,7 +10024,24 @@ impl Engine {
             self.cfg.target_timeout,
             self.cfg.position_persist_interval,
         );
-        let cursor_due = text_changed && (force || self.set_write_affordable(cost, budget));
+        let cursor_due = text_changed
+            && (force
+                || self.set_write_due(
+                    cost,
+                    budget,
+                    backlog,
+                    // How long a set has been owed without reaching the row: armed by the refusal
+                    // below, cleared by the save that ends the hold. The clock behind the bound in
+                    // [`set_write_due`], counted in the loop's own intervals by way of the clock
+                    // that schedules them.
+                    self.set_held_since.map(|since| since.elapsed()),
+                ));
+        if text_changed && !cursor_due {
+            // The streak the bound counts: whoever refuses, arms the clock, so a price that never
+            // relents cannot hold the row past `SET_WRITE_HOLD_BOUND_MULTIPLIER` intervals.
+            self.set_held_since.get_or_insert_with(Instant::now);
+            self.set_refusals += 1;
+        }
         if !cursor_due && text_changed && !self.set_held_logged {
             // A held-back rewrite is otherwise invisible: the cursor column simply stops growing and
             // nothing says which rule held it or against what number — the same reason a set-less
@@ -9947,6 +10052,15 @@ impl Engine {
                 cost_ms = cost.map_or(0, |c| c.as_millis() as u64),
                 budget_ms = budget.as_millis() as u64,
                 backlog,
+                refusals = self.set_refusals as u64,
+                held_ms = self
+                    .set_held_since
+                    .map_or(0, |since| since.elapsed().as_millis() as u64),
+                bound_ms =
+                    set_write_hold_bound(self.cfg.position_persist_interval).as_millis() as u64,
+                // Whether the bound can end this hold at all: `false` says the loop has work waiting,
+                // and then the price rules alone until it does not — the row lags, by design.
+                bound_fires = !backlog,
                 last_set_write_ms = self
                     .last_set_write
                     .map_or(0, |(_, d, _)| d.as_millis() as u64),
@@ -9996,6 +10110,24 @@ impl Engine {
                 pair_age_ms = self.pair_sample_age().map_or(0, |d| d.as_millis() as u64),
                 "the status row's whole cursor went: position and set in one statement"
             );
+            if !set_write_affordable(cost, budget) {
+                // The bound's decision rather than the price's, logged apart from the accept line
+                // because the two are indistinguishable there — and this is the difference between a
+                // row that lags and a row that froze: the number the refusal called unaffordable is
+                // the number the loop has now waited on, once, deliberately.
+                info!(
+                    bytes = text_len,
+                    cost_ms = cost.map_or(0, |c| c.as_millis() as u64),
+                    budget_ms = budget.as_millis() as u64,
+                    refusals = self.set_refusals as u64,
+                    held_ms = self
+                        .set_held_since
+                        .map_or(0, |since| since.elapsed().as_millis() as u64),
+                    "a save may be delayed, never denied: the row went past its hold bound"
+                );
+            }
+            self.set_held_since = None;
+            self.set_refusals = 0;
             self.set_held_logged = false;
             // What the row holds, which `save_position` has just measured and read back byte for byte:
             // `persisted`'s set is the one later saves carry forward when the position is held below
@@ -11231,6 +11363,65 @@ mod tests {
             &row
         )
         .is_err());
+    }
+
+    /// The bound on a refusal, pinned at the two numbers CI measured — the direction the price has
+    /// to win, and the direction it must not.
+    #[test]
+    fn a_refused_save_is_delayed_and_never_denied_when_the_loop_has_nothing_waiting() {
+        // The chaos legs' `LAZYVIEW_POSITION_PERSIST_MS=200`, and the no-backlog bound of a
+        // 60 s `Config::target_timeout`.
+        let interval = Duration::from_millis(200);
+        let budget = set_write_budget(true, Duration::from_secs(60), interval);
+        // 83,512 bytes — the size CI's fragmentation legs put on the row — at a link sliced to a byte
+        // per 2 ms: what `chaos_both_sides_fragmented` prices, and what CI run 45896362347 showed the
+        // apply loop cannot survive waiting on ("3.5 KB of tail unconsumed in 120 s").
+        let sliced = Duration::from_secs(167);
+        // Work waiting: the price rules outright, at any age. This is the direction the bound must
+        // not touch, or the starvation that PR exists to prevent comes back.
+        assert!(!set_write_due(Some(sliced), budget, true, None, interval));
+        assert!(!set_write_due(
+            Some(sliced),
+            budget,
+            true,
+            Some(set_write_hold_bound(interval) * 4),
+            interval
+        ));
+        // Idle but inside the bound: the price still rules. The bound is a last resort, not a bypass.
+        assert!(!set_write_due(
+            Some(sliced),
+            budget,
+            false,
+            Some(set_write_hold_bound(interval) - Duration::from_millis(1)),
+            interval
+        ));
+        // Idle and past the bound: the row goes. This is the assertion CI's shard D is the
+        // counterexample for — `visibility_gtid_fence_covers_xa_commit` waiting 180 s (193.3 s and
+        // 197.3 s of wall clock, mysql97 and percona97, base seed 843114013558) for `binlog_file`/
+        // `binlog_pos` to pass a marker that a self-sustaining refusal never let them reach.
+        assert!(set_write_due(
+            Some(sliced),
+            budget,
+            false,
+            Some(set_write_hold_bound(interval)),
+            interval
+        ));
+        // Nothing measured yet, or something cheap: no bound needed, the price already said yes.
+        assert!(set_write_due(None, budget, true, None, interval));
+        assert!(set_write_due(
+            Some(Duration::from_millis(5)),
+            budget,
+            true,
+            None,
+            interval
+        ));
+        // And the bound is intervals, not a wall-clock guess: thirty of them, whatever one is. At the
+        // shipped 1 s interval that is 30 s, about six saves inside the harness's 180 s `t_catchup()`.
+        assert_eq!(set_write_hold_bound(interval), Duration::from_secs(6));
+        assert_eq!(
+            set_write_hold_bound(Duration::from_secs(1)),
+            Duration::from_secs(30)
+        );
     }
 
     /// The two directions the cursor's price has to get right, at the numbers the chaos legs
