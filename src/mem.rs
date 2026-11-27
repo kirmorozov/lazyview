@@ -24,6 +24,13 @@
 //! container limit cannot disagree any more: with the limit as the total, the budgets *are* the
 //! limit, and a manifest that is too small for them is no longer possible.
 //!
+//! The fifth hold — the changes buffered for lagging targets' whole-view catch-up builds, all of
+//! them together — is deliberately not another share of `U`: it is a quarter of the build hold,
+//! itself capped by `R`. The reason is the one rule that holds it: that buffer is the one the
+//! engine must be free to give up rather than pause the shared binlog reader for, so its size is
+//! bounded by what the engine already keeps outside the budgets and not by the memory the holds
+//! were promised (lv-super ruling 2026-11-27, `MemoryBudget::lag_build_hold_bytes`).
+//!
 //! All of this runs once, in `Config::from_lookup` at startup. The hot path only reads the
 //! numbers `Config` carries; nothing here is called per binlog event.
 
@@ -114,7 +121,16 @@ pub struct MemoryBudget {
     /// Binlog read-ahead queue ([`crate::engine`]: beyond it the stream waits).
     pub drain_max_bytes: usize,
     /// Changes buffered for building versions, all of them together (past it the reader waits).
+    /// A lagging target's whole-view catch-up build is NOT part of this one: it has its own budget
+    /// below, because pausing the shared reader for one target's catch-up is what #265 exists to
+    /// stop (see [`crate::engine`]'s `Engine::build_budget_action`).
     pub build_hold_bytes: usize,
+    /// The byte budget of ALL the changes buffered for lagging targets' whole-view catch-up builds
+    /// together, past which the largest attempts are dropped and re-armed at each target's own
+    /// backoff — never is the binlog reader paused for them (lv-super ruling 2026-11-27). A
+    /// sub-share of [`Self::build_hold_bytes`] (a quarter of it), itself capped by
+    /// [`Self::reserve`], so the holds plus this one still fit the total the rule was given.
+    pub lag_build_hold_bytes: usize,
     /// Rows one prepared XA transaction keeps for tables no view reads (past it they are dropped).
     pub xa_hold_bytes: usize,
     /// The keys kept for targets that are behind (past it the engine reports; the bound that
@@ -133,6 +149,12 @@ impl MemoryBudget {
         let u = total.saturating_sub(reserve);
         let drain = (u / DRAIN_DIVISOR).max(MIN_BYTES);
         let hold = (u / HOLD_DIVISOR).max(MIN_BYTES);
+        // The hold of a lag catch-up is a SUB-SHARE of the build hold (a quarter of it), itself
+        // capped by the reserve the rule already keeps outside the budgets: whatever the total, the
+        // four holds plus this fifth still fit it, which is the whole point of deriving them from
+        // one number (and the catch-up is the one hold that must never be traded against the
+        // shared binlog reader — see `MemoryBudget::lag_build_hold_bytes`).
+        let catch_up = (hold / 4).min(reserve).max(MIN_BYTES);
         let as_usize = |b: u64| b.min(usize::MAX as u64) as usize;
         Self {
             source,
@@ -140,6 +162,7 @@ impl MemoryBudget {
             reserve: as_usize(reserve),
             drain_max_bytes: as_usize(drain),
             build_hold_bytes: as_usize(hold),
+            lag_build_hold_bytes: as_usize(catch_up),
             xa_hold_bytes: as_usize(hold),
             lag_hold_bytes: as_usize(hold),
             dedup_max_bytes: as_usize(hold),
@@ -181,11 +204,12 @@ impl MemoryBudget {
     /// The startup log line: the total, where it came from, and the budgets it gave (MiB).
     pub fn summary(&self) -> String {
         format!(
-            "memory budget {} MiB from {}: queue {} MiB, build/xa/lag/dedup holds {} MiB each, {} MiB kept outside them",
+            "memory budget {} MiB from {}: queue {} MiB, build/xa/lag/dedup holds {} MiB each, lag catch-up {} MiB, {} MiB kept outside them",
             self.total >> 20,
             self.source.as_str(),
             self.drain_max_bytes >> 20,
             self.build_hold_bytes >> 20,
+            self.lag_build_hold_bytes >> 20,
             self.reserve >> 20,
         )
     }
@@ -262,6 +286,8 @@ mod tests {
         assert_eq!(m.lag_hold_bytes, 256 * MIB_US);
         assert_eq!(m.dedup_max_bytes, 256 * MIB_US);
         assert_eq!(m.reserve, 128 * MIB_US);
+        // A quarter of the build hold, under the reserve: the catch-up never trades the reader.
+        assert_eq!(m.lag_build_hold_bytes, 64 * MIB_US);
         // The same answer from a machine whose cgroup files are simply not there.
         let same = MemoryBudget::resolve_with(None, &CgroupPaths::default(), &mut reader(&[]));
         assert_eq!(same, m);
@@ -281,6 +307,11 @@ mod tests {
         );
         assert_eq!(m.lag_hold_bytes, 224 * MIB_US);
         assert_eq!(m.dedup_max_bytes, 224 * MIB_US);
+        assert_eq!(
+            m.lag_build_hold_bytes,
+            56 * MIB_US,
+            "the catch-up hold is a quarter of the build hold"
+        );
         // 48 MiB: the reserve is 32 MiB (its floor), so U is 16 MiB: the queue sits at the
         // floor of 1 MiB, the holds are a quarter of U.
         let m = MemoryBudget::from_total(48 * MIB, BudgetSource::CgroupV2);
@@ -298,6 +329,30 @@ mod tests {
         assert_eq!(m.xa_hold_bytes, MIB_US);
         assert_eq!(m.lag_hold_bytes, MIB_US);
         assert_eq!(m.dedup_max_bytes, MIB_US);
+        assert_eq!(
+            m.lag_build_hold_bytes, MIB_US,
+            "a quarter of a 1 MiB hold would be no buffer at all"
+        );
+    }
+
+    /// The cap that keeps the fifth hold inside the plan: a container large enough for a quarter
+    /// of its build hold to exceed the reserve gets the reserve, not more — the whole reason the
+    /// catch-up hold is not another share of `U` is that the engine must be able to drop it
+    /// instead of pausing the shared reader (lv-super ruling 2026-11-27).
+    #[test]
+    fn catch_up_hold_is_capped_by_the_reserve() {
+        let m = MemoryBudget::from_total(64 * 1024 * MIB, BudgetSource::CgroupV2);
+        assert_eq!(m.reserve, 128 * MIB_US, "the ceiling of the reserve");
+        assert!(
+            m.build_hold_bytes > 4 * m.reserve,
+            "a 64 GiB machine: the build hold is GiB, so the cap is what binds: {}",
+            m.build_hold_bytes
+        );
+        assert_eq!(
+            m.lag_build_hold_bytes, m.reserve,
+            "and the catch-up hold stops at the reserve: {}",
+            m.lag_build_hold_bytes
+        );
     }
 
     /// The v2 `max` means no limit: the v1 file is consulted next, and the fallback after it.

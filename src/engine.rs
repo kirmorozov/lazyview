@@ -556,11 +556,6 @@ impl Lag {
     }
 
     /// The streamed build ([`Engine::lag_build`]) swapped the whole view onto this target: that is
-    /// what pays the entry's `all` debt, and it is the ONLY way an entry's `all` is ever paid — a
-    /// single lagging target never goes through `refresh`'s `dirty.all` arm, which reads the whole
-    /// source into memory (guard R1, owner rule 2026-11-26).
-    ///
-    /// The streamed build ([`Engine::lag_build`]) swapped the whole view onto this target: that is
     /// what pays the entry's whole-view debt, and it is the ONLY way an entry's `all` is ever paid —
     /// a single lagging target never goes through `refresh`'s `dirty.all` arm, which reads the whole
     /// source into memory (guard R1, owner rule 2026-11-26).
@@ -599,14 +594,164 @@ fn lower_pos(floor: &mut Position, p: Option<&Position>) {
     }
 }
 
-/// Lowers `floor` to the oldest `since` among the changes kept for targets that are behind,
-/// a target reported down included. The kept keys live only in memory, so the saved position
-/// waits for them and a restart replays the outage from the binlog, rebuilding the same key
-/// sets, instead of leaving that target silently stale.
-fn lag_floor(floor: &mut Position, lag: &BTreeMap<String, Lag>) {
-    for g in lag.values() {
-        lower_pos(floor, Some(&g.since));
+/// One thing that holds the reported and saved position back, and the position it holds it at
+/// (see [`floor_pins_of`]).
+///
+/// The floor is a minimum, and a minimum names nothing: `/stats`, `/livez` and a harness's
+/// liveliness failure all print the position, never the reason. This is the reason, so
+/// [`Engine::report_floor_stall`] can say which view, which target and which kind of wait the
+/// position is stuck behind — on 2026-11-27 three CI reds of the "a target never catches up"
+/// family were argued from an applied position and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloorPin<'a> {
+    /// A view whose definition changed and is not reconciled yet.
+    Stale { def_id: u64 },
+    /// What the live version still owes its table: the replay position of its oldest buffered
+    /// change. A frozen version counts as a maintained one (see [`pending_floor_of`]).
+    LiveSince { def_id: u64 },
+    /// The dedup core's oldest buffered id of the definition.
+    Dedup { def_id: u64 },
+    /// Images remembered for a lookup still to run (the save's hold, not the report's).
+    Lookback { def_id: u64 },
+    /// A target that is behind: what it owes, and since when. `all` is the whole view, which the
+    /// streamed build alone pays ([`Engine::lag_build`]), so waiting for this pin is waiting for
+    /// that build to be claimed, to read and to swap.
+    Lag {
+        def_id: u64,
+        target: &'a str,
+        all: bool,
+    },
+    /// A build in flight that is not the routine rebuild of the live version: the position stops
+    /// at its read. `catch_up` says it is a lagging target's whole-view catch-up, whose buffer is
+    /// bounded on its own account ([`Engine::build_budget_action`]).
+    Building { def_id: u64, catch_up: bool },
+}
+
+impl FloorPin<'_> {
+    /// The view this pin belongs to, for the log line.
+    fn def_id(&self) -> u64 {
+        match self {
+            FloorPin::Stale { def_id }
+            | FloorPin::LiveSince { def_id }
+            | FloorPin::Dedup { def_id }
+            | FloorPin::Lookback { def_id }
+            | FloorPin::Lag { def_id, .. }
+            | FloorPin::Building { def_id, .. } => *def_id,
+        }
     }
+
+    /// What an operator needs to act on it: the words the rest of the engine uses for the same
+    /// waits, so this line reads like the reports that already name them.
+    fn what(&self) -> &'static str {
+        match self {
+            FloorPin::Stale { .. } => "a definition change not reconciled yet",
+            FloorPin::LiveSince { .. } => "changes the live version still owes its table",
+            FloorPin::Dedup { .. } => "an id the dedup core holds",
+            FloorPin::Lookback { .. } => "images remembered for a lookup still to run",
+            FloorPin::Lag { all: true, .. } => {
+                "a target owed the whole view: its streamed catch-up build has not landed"
+            }
+            FloorPin::Lag { all: false, .. } => "a target owed units its flush has not written",
+            FloorPin::Building { catch_up: true, .. } => {
+                "a whole-view catch-up build in flight for one lagging target"
+            }
+            FloorPin::Building { .. } => "a build in flight of a version that is not live yet",
+        }
+    }
+}
+
+/// Calls `visit` for every pin [`pending_floor_of` ]takes the minimum over, in the order the rule
+/// looks at them, without the rest of the engine. One enumeration on purpose: the reported floor,
+/// the saved floor and the witness of a stalled position can then never disagree about what holds
+/// the position back.
+fn floor_pins_of<'a>(
+    slots: &'a [Slot],
+    mut pinned: impl FnMut(u64) -> Option<Position>,
+    held: bool,
+    mut visit: impl FnMut(FloorPin<'a>, &Position),
+) {
+    for s in slots.iter().filter(|s| s.error.is_none()) {
+        if let Some(p) = s.stale_since.as_ref() {
+            visit(FloorPin::Stale { def_id: s.def_id }, p);
+        }
+        // A frozen live version holds the floor as a maintained one does. The freeze only says its
+        // buffer is no longer being appended to and it is no longer refreshed: the table is still
+        // what readers see and the one a restart resumes on, and the changes it owes until the new
+        // version swaps are kept in memory alone, so the save waits for them too (C1, #345 #319).
+        // `Version::since`'s own contract — "the saved and the reported position never pass it" —
+        // never asked whether the version was frozen.
+        if let Some(l) = s.live.as_ref() {
+            if let Some(p) = l.since.as_ref() {
+                visit(FloorPin::LiveSince { def_id: s.def_id }, p);
+            }
+            if let Some(p) = pinned(s.def_id) {
+                visit(FloorPin::Dedup { def_id: s.def_id }, &p);
+            }
+            // The images remembered for later lookups are held only for a version that will still
+            // run them: a frozen one refreshes no more, and `after_boundary` stops pruning its
+            // lookback while its buffer holds images, which would pin the position for the whole
+            // freeze instead of for the lookback window.
+            if held && !l.frozen {
+                if let Some(p) = l.recent.floor() {
+                    visit(FloorPin::Lookback { def_id: s.def_id }, p);
+                }
+            }
+            // The changes kept for targets that are behind, a target reported down included: they
+            // live only in memory, so the saved position waits for them and a restart replays the
+            // outage from the binlog, rebuilding the same key sets, instead of leaving that target
+            // silently stale.
+            for (t, g) in &l.lag {
+                visit(
+                    FloorPin::Lag {
+                        def_id: s.def_id,
+                        target: t,
+                        all: g.all,
+                    },
+                    &g.since,
+                );
+            }
+        }
+        if let Some(p) = building_floor(s) {
+            visit(
+                FloorPin::Building {
+                    def_id: s.def_id,
+                    catch_up: s.next.as_ref().is_some_and(|n| n.catch_up),
+                },
+                p,
+            );
+        }
+    }
+}
+
+/// The lowest pin of [`floor_pins_of`]: what the position is actually stuck behind. `None` when
+/// nothing holds it back at all, when the floor is simply what the reader has read.
+fn floor_pin_of<'a>(
+    boundary: &Position,
+    slots: &'a [Slot],
+    pinned: impl FnMut(u64) -> Option<Position>,
+    held: bool,
+) -> Option<(FloorPin<'a>, Position)> {
+    let mut best: Option<(FloorPin<'_>, Position)> = None;
+    floor_pins_of(slots, pinned, held, |kind, p| {
+        if best.as_ref().is_none_or(|(_, at)| p < at) {
+            best = Some((kind, p.clone()));
+        }
+    });
+    best.filter(|(_, at)| *at < *boundary)
+}
+
+/// [`Engine::pending_floor`] over `slots` at `boundary`, without the rest of the engine (the
+/// method says what it means). `pinned` answers the dedup core's oldest buffered id of a
+/// definition.
+fn pending_floor_of(
+    boundary: &Position,
+    slots: &[Slot],
+    pinned: impl FnMut(u64) -> Option<Position>,
+    held: bool,
+) -> Position {
+    let mut floor = boundary.clone();
+    floor_pins_of(slots, pinned, held, |_, p| lower_pos(&mut floor, Some(p)));
+    floor
 }
 
 /// The position a build in flight holds the floor at: `Some(started)` unless the version being
@@ -628,41 +773,6 @@ fn building_floor(s: &Slot) -> Option<&Position> {
         .as_ref()
         .is_some_and(|l| Arc::ptr_eq(&l.plan, &n.plan) && !l.frozen);
     (!routine).then_some(&n.started)
-}
-
-/// [`Engine::pending_floor`] over `slots` at `boundary`, without the rest of the engine (the
-/// method says what it means). `pinned` answers the dedup core's oldest buffered id of a
-/// definition.
-fn pending_floor_of(
-    boundary: &Position,
-    slots: &[Slot],
-    mut pinned: impl FnMut(u64) -> Option<Position>,
-    held: bool,
-) -> Position {
-    let mut floor = boundary.clone();
-    for s in slots.iter().filter(|s| s.error.is_none()) {
-        lower_pos(&mut floor, s.stale_since.as_ref());
-        // A frozen live version holds the floor as a maintained one does. The freeze only says its
-        // buffer is no longer being appended to and it is no longer refreshed: the table is still
-        // what readers see and the one a restart resumes on, and the changes it owes until the new
-        // version swaps are kept in memory alone, so the save waits for them too (C1, #345 #319).
-        // `Version::since`'s own contract — "the saved and the reported position never pass it" —
-        // never asked whether the version was frozen.
-        if let Some(l) = s.live.as_ref() {
-            lower_pos(&mut floor, l.since.as_ref());
-            lower_pos(&mut floor, pinned(s.def_id).as_ref());
-            // The images remembered for later lookups are held only for a version that will still
-            // run them: a frozen one refreshes no more, and `after_boundary` stops pruning its
-            // lookback while its buffer holds images, which would pin the position for the whole
-            // freeze instead of for the lookback window.
-            if held && !l.frozen {
-                lower_pos(&mut floor, l.recent.floor());
-            }
-            lag_floor(&mut floor, &l.lag);
-        }
-        lower_pos(&mut floor, building_floor(s));
-    }
-    floor
 }
 
 /// [`Engine::persist_position`]'s floor: [`pending_floor_of`] with the images held, lowered to the
@@ -697,6 +807,11 @@ struct Next {
     done: Option<Result<Built>>,
     /// Only adds these targets to the unchanged live version.
     partial: bool,
+    /// A lagging target's whole-view catch-up ([`BuildKind::LagCatchUp`]): the slot's optional work
+    /// for ONE target, which is why its buffer is bounded on its own account — past its budget the
+    /// attempt is dropped rather than pausing the binlog reader that every other view reads
+    /// through ([`Engine::build_budget_action`], lv-super ruling 2026-11-27).
+    catch_up: bool,
     hash: String,
     /// Targets already swapped (a swap interrupted on one target is resumed on the rest).
     swapped: HashSet<String>,
@@ -1362,6 +1477,13 @@ struct Engine {
     /// (`Config::mem.lag_hold_bytes`), not per housekeeping
     /// tick (re-armed when the estimate falls back within the budget).
     lag_budget_warned: bool,
+    /// The reported position at the last stall check and when it first stopped moving
+    /// ([`Engine::report_floor_stall`]); `None` while the engine publishes everything it reads.
+    floor_held: Option<(Position, Instant)>,
+    /// The last time the stall check looked (once a second, never per event).
+    floor_checked: Instant,
+    /// When the stall was last reported, so a long one keeps a record without a flood.
+    floor_warned_at: Option<Instant>,
     /// (slot, targets written) of every live refresh of the flush in progress (`note_refresh`
     /// fills it, `flush_draining` reads it once when the flush is through, #215).
     flush_wrote: Vec<(usize, Vec<String>)>,
@@ -2584,6 +2706,9 @@ impl Engine {
             },
             ready_logged: false,
             lag_budget_warned: false,
+            floor_held: None,
+            floor_checked: Instant::now(),
+            floor_warned_at: None,
             flush_wrote: Vec::new(),
             refreshed: HashSet::new(),
             last_touch: Instant::now(),
@@ -4189,6 +4314,7 @@ impl Engine {
             task,
             done: None,
             partial,
+            catch_up: matches!(kind, BuildKind::LagCatchUp),
             hash,
             swapped: HashSet::new(),
             lock_wait: HashSet::new(),
@@ -4641,7 +4767,7 @@ impl Engine {
     /// (`Synced::lost_cache`, taken by `exec::Dedup::sync` / `advance_replacements` before
     /// `remove_target`) - restore it into the live version, so executor (b) keeps resolving
     /// cascaded and mapped child rows from the real map. Rows the core had already applied sit
-    /// at or after `boundary` (a target that is behind holds it back, see `lag_floor`), so no
+    /// at or after `boundary` (a target that is behind holds it back, see `floor_pins_of`), so no
     /// replay floor is lowered for them; a version whose own cache is seeding keeps its
     /// in-flight seed (the build's `deliver_cache` moves the fresh one in).
     fn restore_lost_caches(&mut self, synced: &mut crate::exec::Synced) {
@@ -5043,9 +5169,16 @@ impl Engine {
                 if !self.in_txn && flush {
                     self.flush_draining(&mut reader, &mut drained, &mut last_event)
                         .await?;
-                    // Once per flush, never per event: building versions over their budget hold
-                    // the reader until a build is applied.
-                    if self.builds_over_budget().is_some()
+                    // Once per flush, never per event: the builds a view will be served from, over
+                    // their budget, hold the reader until one is applied — a lagging target's
+                    // whole-view catch-up is dropped past its own budget instead, so one starved
+                    // target never pauses the reader the other views read through (lv-super
+                    // ruling 2026-11-27).
+                    let (dropped, held) = self.build_budget_action();
+                    if !dropped.is_empty() {
+                        self.drop_catch_up_builds(&dropped).await;
+                    }
+                    if held.is_some()
                         && !self
                             .hold_for_builds(
                                 &mut reader,
@@ -5358,13 +5491,17 @@ impl Engine {
         }
     }
 
-    /// Holds the binlog reader while [`Self::builds_over_budget`]: a building version cannot take
+    /// Holds the binlog reader while [`Self::build_budget_action`] says the builds a view will be
+    /// served from are over their budget: a building version cannot take
     /// its buffered changes before its build is done, and dropping them would cost the view a
     /// rebuild after the swap (owner rule: never). Nothing is read meanwhile, so the server's
     /// socket fills and the stream waits; build results are taken, a due flush runs (applying a
     /// finished build's changes is what lifts the hold), and the loop keeps beating (`/livez`)
     /// and housekeeping. Called only after a flush, between transactions; counted once per hold
-    /// in `binlog_backpressure`. `Ok(false)`: shutdown was requested meanwhile.
+    /// in `binlog_backpressure`. A lagging target's whole-view catch-up is NEVER a reason to be
+    /// here: past its own budget it is dropped ([`Self::drop_catch_up_builds`]), because one
+    /// starved target must not pause the reader every other view reads through (lv-super ruling
+    /// 2026-11-27). `Ok(false)`: shutdown was requested meanwhile.
     async fn hold_for_builds(
         &mut self,
         reader: &mut BinlogReader,
@@ -5374,14 +5511,14 @@ impl Engine {
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<bool> {
         Metrics::add(&self.metrics.binlog_backpressure, 1);
-        let held = self.builds_over_budget().unwrap_or(0);
+        let held = self.build_budget_action().1.unwrap_or(0);
         warn!(buffered_mib = held >> 20, "changes buffered for building views exceed their budget; binlog reading paused until a build is applied");
         let since = Instant::now();
         // Freshness (review O-01): while the reader is held, the source keeps writing changes
         // nobody has read, so the stream is not at its head and a view's lag grows from here —
         // which is the number the "paused reader" alert reads.
         self.clock.reading = false;
-        while self.builds_over_budget().is_some() {
+        while self.build_budget_action().1.is_some() {
             let tick = Instant::now() + Duration::from_secs(1);
             let wake = self.flush_deadline().map_or(tick, |d| d.min(tick));
             tokio::select! {
@@ -5393,6 +5530,13 @@ impl Engine {
             self.metrics.beat();
             if self.flush_due() {
                 self.flush_draining(reader, drained, last_event).await?;
+            }
+            // The flush path above claims lag retries, so a catch-up can join the set of builds
+            // even here: past their budget they are dropped on the spot rather than left to add a
+            // reason for holding the reader (lv-super ruling 2026-11-27).
+            let (dropped, _) = self.build_budget_action();
+            if !dropped.is_empty() {
+                self.drop_catch_up_builds(&dropped).await;
             }
             self.housekeeping().await?;
         }
@@ -6222,6 +6366,9 @@ impl Engine {
             Some(_) => {}
             None => self.lag_budget_warned = false,
         }
+        // And when the position itself has stopped, what stopped it (the one pass per second this
+        // is gated to, never per tick).
+        self.report_floor_stall();
         Ok(())
     }
 
@@ -6754,7 +6901,7 @@ impl Engine {
     /// here re-reads everything still pending. Views in error do not hold it back (they are
     /// rebuilt after a restart). A target that is behind does, whether or not it was reported
     /// down: the keys kept for it live only in memory, so the saved position waits for them and
-    /// a restart replays the outage into them (see [`lag_floor`]). With `held`, also the oldest
+    /// a restart replays the outage into them (see [`floor_pins_of`]). With `held`, also the oldest
     /// change whose images are remembered for later lookups (applied, but a restart must read
     /// them again to have them; see [`Lookback`]). A version being built does too, at the
     /// position its build started at (see [`building_floor`]).
@@ -7088,18 +7235,150 @@ impl Engine {
         }
     }
 
-    /// The estimated bytes buffered for building versions, when they exceed their budget
-    /// (`Config::mem.build_hold_bytes`; `LAZYVIEW_TEST_BUILD_HOLD_BYTES` in tests). One pass over the
-    /// slots: evaluated once per flush, never per event.
-    fn builds_over_budget(&self) -> Option<usize> {
-        let budget = self.cfg.mem.build_hold_bytes;
-        let held: usize = self
+    /// What the build byte budget asks of the binlog loop, over the two kinds of build in flight
+    /// (lv-super ruling 2026-11-27). `catch_ups` is `(slot, estimated bytes, swapping)` for each
+    /// whole-view catch-up a slot is doing for ONE lagging target; `ordinary` is what the other
+    /// builds buffer together.
+    ///
+    /// The rule is an escalation, not two budgets that ignore each other: a catch-up is the slot's
+    /// optional work for one target, so its buffer may cost THAT target its attempt but never the
+    /// shared reader — together the catch-ups get `catch_up_budget`, and while they are over it the
+    /// largest ones are dropped (each target keeps its `Lag` entry and its backoff) until the sum
+    /// fits — while the builds a view will actually be served from keep main's rule: over
+    /// `build_budget` the reader waits until one is applied. So one starved target can no longer
+    /// hold every other view's reading behind it — the stall #265 exists to remove — and the
+    /// memory the catch-ups may hold is one shared number, not one per view. (The CI stalls of
+    /// `chaos_tgt_bandwidth_starvation` are NOT this pause: their metric dumps carry
+    /// `binlog_backpressure: 0`, so the reader never stopped there. The rule is held anyway,
+    /// because this code path was open.)
+    ///
+    /// A catch-up whose swap is already running is never droppable: the rename is the point of no
+    /// return, and by then the table on the target is half the view.
+    ///
+    /// Pure, so the escalation is testable without a build or a server, as [`Engine::report_is_lost`]
+    /// is the state machine of a lost report.
+    fn build_budget_decision(
+        catch_ups: &[(usize, usize, bool)],
+        ordinary: usize,
+        catch_up_budget: usize,
+        build_budget: usize,
+    ) -> (Vec<usize>, Option<usize>) {
+        // Biggest first: the attempt that costs the most memory goes for the least lost work.
+        let mut droppable: Vec<(usize, usize)> = catch_ups
+            .iter()
+            .filter(|(_, _, swapping)| !*swapping)
+            .map(|(i, held, _)| (*i, *held))
+            .collect();
+        droppable.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut total: usize = droppable.iter().map(|(_, held)| *held).sum();
+        let mut dropped: Vec<usize> = Vec::new();
+        for (i, held) in droppable {
+            if total <= catch_up_budget {
+                break;
+            }
+            dropped.push(i);
+            total -= held;
+        }
+        dropped.sort_unstable();
+        (dropped, (ordinary > build_budget).then_some(ordinary))
+    }
+
+    /// What the build byte budget asks NOW: the slots to drop the catch-up build of, because the
+    /// catch-ups together passed their budget ([`Engine::drop_catch_up_builds`],
+    /// `Config::mem.lag_build_hold_bytes`), and the bytes that make the binlog reader wait
+    /// ([`Engine::hold_for_builds`], `Config::mem.build_hold_bytes`;
+    /// `LAZYVIEW_TEST_BUILD_HOLD_BYTES` in tests). One pass over the slots: evaluated once per
+    /// flush, never per event. The two kinds never trade against each other — a catch-up's bytes
+    /// cannot make the reader wait, and no ordinary build is ever dropped for them.
+    fn build_budget_action(&self) -> (Vec<usize>, Option<usize>) {
+        let mem = self.cfg.mem;
+        let catch_ups: Vec<(usize, usize, bool)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Some((i, s.next.as_ref()?)))
+            .filter(|(_, n)| n.catch_up)
+            .map(|(i, n)| (i, buffer_bytes(&n.dirty), n.swapping))
+            .collect();
+        let ordinary: usize = self
             .slots
             .iter()
             .filter_map(|s| s.next.as_ref())
+            .filter(|n| !n.catch_up)
             .map(|n| buffer_bytes(&n.dirty))
             .sum();
-        (held > budget).then_some(held)
+        Self::build_budget_decision(
+            &catch_ups,
+            ordinary,
+            mem.lag_build_hold_bytes,
+            mem.build_hold_bytes,
+        )
+    }
+
+    /// Drops the whole-view catch-up builds of these slots — the step [`Self::build_budget_action`]
+    /// chose over pausing the binlog reader (lv-super ruling 2026-11-27). The task is aborted and
+    /// its shadow table dropped the way [`Engine::retire_slot`] drops one; the changes the build
+    /// buffered while it ran go back to the live version, because the flush owed them to it and a
+    /// buffered change is never simply dropped (#214, the same return `next_failed` makes); and the
+    /// target keeps its `Lag` entry, so it still owes the whole view and waits for its next backoff
+    /// with its `failures` count UNCHANGED: passing a memory budget is this process's condition,
+    /// not the peer's, and `g.down` reports a peer that does not answer — counting these would let
+    /// memory pressure report a healthy target down. Called from the binlog loop after each flush
+    /// and from [`Self::hold_for_builds`], where the flush path can still start one.
+    async fn drop_catch_up_builds(&mut self, slots: &[usize]) {
+        for i in slots {
+            // Droppable: the slot's optional catch-up, its swap not started, no target renamed
+            // yet, and a live version to take its buffered changes back. That last test is what
+            // keeps this free of #214's failure mode — a slot without a live version to return
+            // to keeps its build, because a dropped change is never an option.
+            let droppable = self.slots[*i].live.is_some()
+                && self.slots[*i]
+                    .next
+                    .as_ref()
+                    .is_some_and(|n| n.catch_up && !n.swapping && n.swapped.is_empty());
+            if !droppable {
+                continue;
+            }
+            let n = self.slots[*i]
+                .next
+                .take()
+                .expect("the catch-up build was just checked");
+            let held = buffer_bytes(&n.dirty);
+            n.task.abort();
+            for t in &n.targets {
+                self.drop_shadow(t, &n.name).await;
+            }
+            let l = self.slots[*i]
+                .live
+                .as_mut()
+                .expect("the live version was just checked");
+            if Arc::ptr_eq(&l.plan, &n.plan) || matches!(l.plan.mode, Mode::Full(_)) {
+                l.dirty.merge(n.dirty);
+                if matches!(l.plan.mode, Mode::Full(_)) {
+                    l.dirty.all = true;
+                }
+                if let Some(p) = n.since {
+                    if l.since.as_ref().is_none_or(|s| p < *s) {
+                        l.since = Some(p);
+                    }
+                }
+            }
+            for t in &n.targets {
+                if let Some(g) = self.slots[*i]
+                    .live
+                    .as_mut()
+                    .and_then(|l| l.lag.get_mut(t.as_str()))
+                {
+                    // One step further along the LAG ladder, without touching `failures`: that
+                    // field reports a peer that does not answer, and this is our own budget.
+                    g.retry_at = Instant::now() + connect_retry_delay(g.failures + 1);
+                }
+                warn!(view = %n.name, target = %t, buffered_mib = held >> 20,
+                      "the whole view is owed and its catch-up passed its own byte budget: the \
+                       attempt is dropped, the reader keeps reading");
+            }
+            self.rebuild_routes();
+        }
     }
 
     /// The estimated bytes kept for targets that are behind, when they exceed their budget
@@ -7122,7 +7401,7 @@ impl Engine {
     /// The budget of the changes kept for targets that are behind was passed: report only, take
     /// no action. A target that is down has nothing draining its keys while it is unreachable,
     /// but they are sets, bounded by the distinct ids the view can have, so it keeps them until
-    /// it catches up; the saved position waits for them ([`lag_floor`]), so a restart replays
+    /// it catches up; the saved position waits for them ([`floor_pins_of`]), so a restart replays
     /// the outage instead of losing the changes silently. Names the target that has been behind
     /// longest: it is the one keeping keys the longest, usually the unreachable one. Called
     /// once per crossing (the `lag_budget_warned` latch), not per housekeeping tick.
@@ -7145,6 +7424,85 @@ impl Engine {
             warn!(view = %view, target = %target, buffered_mib = held >> 20,
                 "the changes kept for this target exceed their {budget} byte budget; they are kept until it catches up, and the saved position waits for them");
         }
+    }
+
+    /// A reported position that stops moving is the one failure `/stats` cannot explain: it
+    /// prints the number, never the reason. Once the reader is ahead of the published position
+    /// and that has not closed for [`FLOOR_STALL_WARN`], name the pin — which view, which target,
+    /// which kind of wait. A flush that never completes, a whole-view debt whose catch-up build
+    /// never lands and a build whose report went missing all look the same from outside (an
+    /// `applied` that does not move) and want different answers; on 2026-11-27 three CI reds of
+    /// the "a target never catches up" family were argued from a position and nothing else.
+    ///
+    /// At most one pass over the slots per second, and one line per minute of a continuing stall
+    /// (the `floor_held` and `floor_warned_at` latches), so it is never per event and never per
+    /// tick. The counters stay the alerting signal (`/livez`'s beat, `lag_over_budget`); this is
+    /// the diagnosis an operator or a CI log reads once something is already wrong.
+    fn report_floor_stall(&mut self) {
+        if self.floor_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.floor_checked = Instant::now();
+        let read = self.boundary.to_position();
+        let floor = self.pending_floor(false);
+        if floor >= read {
+            // Nothing read is unapplied: the engine publishes everything it has, the one state in
+            // which a still position means nothing is wrong (an idle engine over a quiet source).
+            self.floor_held = None;
+            self.floor_warned_at = None;
+            return;
+        }
+        let now = Instant::now();
+        match &self.floor_held {
+            Some((at, since)) if *at == floor => {
+                if *since + FLOOR_STALL_WARN > now {
+                    return;
+                }
+                if self
+                    .floor_warned_at
+                    .is_some_and(|w| w.elapsed() < Duration::from_secs(60))
+                {
+                    return;
+                }
+                self.floor_warned_at = Some(now);
+            }
+            _ => {
+                self.floor_held = Some((floor.clone(), now));
+                self.floor_warned_at = None;
+                return;
+            }
+        }
+        let Some((pin, at)) = floor_pin_of(&read, &self.slots, |id| self.dedup.pinned(id), false)
+        else {
+            return;
+        };
+        let view = self
+            .slots
+            .iter()
+            .find(|s| s.def_id == pin.def_id())
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let target = match pin {
+            FloorPin::Lag { target, .. } => target.to_string(),
+            _ => self
+                .slots
+                .iter()
+                .find(|s| s.def_id == pin.def_id())
+                .and_then(|s| s.live.as_ref())
+                .and_then(|l| {
+                    l.lag
+                        .keys()
+                        .next()
+                        .cloned()
+                        .or_else(|| l.targets.first().cloned())
+                })
+                .unwrap_or_else(|| "-".to_string()),
+        };
+        let held = now.duration_since(self.floor_held.as_ref().expect("just latched").1);
+        warn!(view = %view, target = %target, since = %at, read = %read, held_s = held.as_secs(),
+              "the reported position has not advanced for {}s: {}",
+              held.as_secs(),
+              pin.what());
     }
 
     fn key_count(&self) -> usize {
@@ -8585,7 +8943,7 @@ impl Engine {
         // target's writes failing (the case left here, the fallback above having kept the healthy
         // ones in) the buffer grew forever while its rows reached the survivors only as re-fed
         // claims. What a flush would have owed them, it owes them HERE: the taken buffer becomes
-        // their owed set, the entries are what `lag_end` writes and `lag_floor` pins into the saved
+        // their owed set, the entries are what `lag_end` writes and `floor_pins_of` pins into the saved
         // position, and the buffer is cleared as a flush clears it. Cost (guard R3): one set feed
         // per excluded target per round that carries something — never per binlog event.
         if targets.is_empty() {
@@ -8827,7 +9185,7 @@ impl Engine {
         // (`chaos_tgt_blackhole_during_flush` on percona84). A target excluded by `live_begin`
         // owes what the refresh carried, whether or not the flag still stands. From here the
         // accounting is the one a down target gets: kept keys over the budget reported, the
-        // saved position waiting at its `since` (`lag_floor`), `retry_lag` catching it up and
+        // saved position waiting at its `since` (`floor_pins_of`), `retry_lag` catching it up and
         // counting the catch-up.
         //
         // An entry is opened only for a debt that exists: a refresh that carried nothing for the
@@ -11081,6 +11439,12 @@ const MAX_FILTER_PARAMS: usize = 60_000;
 /// A lagging target is reported down after this many failed retries.
 const LAG_MAX_FAILURES: u32 = 5;
 
+/// How long the reported position may stand still while the reader is ahead of it before the
+/// engine says *why* ([`Engine::report_floor_stall`]). Well past any bounded wait the engine
+/// itself takes — a connect cycle, a statement timeout, one build — so the line means "something
+/// is owed and nothing is coming", not "the engine is busy".
+const FLOOR_STALL_WARN: Duration = Duration::from_secs(30);
+
 /// One target of a build, with the ownership checks it needs there.
 struct BuildSpec {
     target: String,
@@ -12181,6 +12545,76 @@ mod tests {
         assert_eq!(m.xa_hold_bytes, 256 << 20);
         assert_eq!(m.lag_hold_bytes, 256 << 20);
         assert_eq!(m.dedup_max_bytes, 256 << 20);
+        assert_eq!(
+            m.lag_build_hold_bytes,
+            64 << 20,
+            "the catch-up hold is a quarter of the build hold"
+        );
+    }
+
+    /// The escalation of the build byte budget (lv-super ruling 2026-11-27): a lagging target's
+    /// catch-up builds, together over their budget, are dropped and the shared reader keeps
+    /// reading; the builds a view will be served from still hold it; and the two kinds never
+    /// borrow each other's threshold. What the catch-ups hold is bounded by one number and is
+    /// always the thing given up, never the reader's progress.
+    #[test]
+    fn a_catch_up_over_budget_is_dropped_and_never_holds_the_reader() {
+        let (catch_up_budget, build_budget) = (4 << 20, 64 << 20);
+        // One catch-up over the whole budget by itself: the attempt goes, the reader does not stop.
+        let (drop, hold) =
+            Engine::build_budget_decision(&[(3, 8 << 20, false)], 0, catch_up_budget, build_budget);
+        assert_eq!(drop, vec![3]);
+        assert_eq!(
+            hold, None,
+            "one target's catch-up never pauses the shared reader"
+        );
+        // Exactly at the budget, not over it: the attempt stands (the budget is a strict over).
+        let (drop, hold) = Engine::build_budget_decision(
+            &[(3, catch_up_budget, false)],
+            0,
+            catch_up_budget,
+            build_budget,
+        );
+        assert!(drop.is_empty());
+        assert_eq!(hold, None);
+        // Over the budget together: the LARGEST goes first, and only as many as it takes to fit.
+        let (drop, hold) = Engine::build_budget_decision(
+            &[(1, 1 << 20, false), (2, 6 << 20, false)],
+            0,
+            catch_up_budget,
+            build_budget,
+        );
+        assert_eq!(
+            drop,
+            vec![2],
+            "7 MiB over a 4 MiB budget: the 6 MiB attempt goes"
+        );
+        assert_eq!(hold, None);
+        // An ordinary build over its budget: the reader waits, and no catch-up is dropped for it.
+        let (drop, hold) = Engine::build_budget_decision(
+            &[(3, 1 << 20, false)],
+            96 << 20,
+            catch_up_budget,
+            build_budget,
+        );
+        assert!(drop.is_empty(), "those catch-ups are inside their budget");
+        assert_eq!(hold, Some(96 << 20));
+        // Both over: the optional work for one target goes first, and the hold is decided by the
+        // ordinary bytes alone — the catch-up's bytes are never counted against them.
+        let (drop, hold) = Engine::build_budget_decision(
+            &[(1, 40 << 20, false), (2, 40 << 20, false)],
+            96 << 20,
+            catch_up_budget,
+            build_budget,
+        );
+        assert_eq!(drop, vec![1, 2]);
+        assert_eq!(hold, Some(96 << 20), "96 MiB of ordinary builds, not 176");
+        // A catch-up whose swap is running is past the point of no return: whatever its buffer, it
+        // is not abandoned here, and it is still not the reason for a hold.
+        let (drop, hold) =
+            Engine::build_budget_decision(&[(7, 40 << 20, true)], 0, catch_up_budget, build_budget);
+        assert!(drop.is_empty(), "a swap in flight is not abandoned here");
+        assert_eq!(hold, None);
     }
 
     fn lag(since: (&str, u64), down: bool) -> Lag {
@@ -12285,15 +12719,14 @@ mod tests {
         assert!(!g.units.is_empty());
     }
 
-    /// The saved position waits for a lagging target reported down (`pending_floor` keeps
-    /// every `lag_floor` entry): its kept keys live only in memory, so a restart must replay
-    /// the outage into them instead of leaving the target silently stale.
+    /// The saved position waits for a lagging target reported down (`pending_floor` keeps every
+    /// lag entry): its kept keys live only in memory, so a restart must replay the outage into
+    /// them instead of leaving the target silently stale. And the witness of a stalled position
+    /// names THAT entry, not the healthy version's own buffer.
     #[test]
     fn the_saved_position_waits_for_a_down_target() {
-        let mut floor = Position {
-            file: "binlog.000009".to_string(),
-            pos: 500,
-        };
+        let p = Arc::new(plan("CREATE VIEW v AS SELECT i.id FROM items i"));
+        let boundary = pos("binlog.000009", 500);
         let lag: BTreeMap<String, Lag> = [
             ("t2", lag(("binlog.000003", 42), false)),
             ("t1", lag(("binlog.000002", 7), true)),
@@ -12302,14 +12735,100 @@ mod tests {
         .map(|(t, g)| (t.to_string(), g))
         .collect();
         assert!(lag["t1"].down);
-        lag_floor(&mut floor, &lag);
+        let mut l = live(&p, false, Some(pos("binlog.000004", 400)));
+        l.lag = lag;
+        let slots = [slot(Some(l), None)];
         assert_eq!(
-            floor,
-            Position {
-                file: "binlog.000002".to_string(),
-                pos: 7
+            pending_floor_of(&boundary, &slots, |_| None, true),
+            pos("binlog.000002", 7),
+            "the down target's `since` holds the saved position back, past the version's own buffer"
+        );
+        let (pin, at) = floor_pin_of(&boundary, &slots, |_| None, true).expect("a pin holds it");
+        assert_eq!(at, pos("binlog.000002", 7));
+        assert_eq!(
+            pin,
+            FloorPin::Lag {
+                def_id: 7,
+                target: "t1",
+                all: false
             },
-            "the down target's `since` holds the saved position back"
+            "the witness names the down target's units, which is the wait an operator can act on"
+        );
+    }
+
+    /// The other two shapes of a stalled position, the ones no counter shows: a whole-view debt
+    /// whose catch-up build has not landed, and a build in flight that is not the routine rebuild
+    /// of the live version. `applied` not moving looks the same from `/stats` for both of them and
+    /// for a flush that never completes, which is why the witness is part of the floor rule and
+    /// not of the reporting code.
+    #[test]
+    fn a_stalled_position_names_the_debt_and_the_build_that_owe_it() {
+        let p = Arc::new(plan("CREATE VIEW v AS SELECT i.id FROM items i"));
+        let boundary = pos("binlog.000009", 500);
+
+        // A target owed the WHOLE view: waiting for this pin is waiting for the streamed catch-up
+        // build to be claimed, to read and to swap (R1 — no other code pays `all`).
+        let mut l = live(&p, false, Some(pos("binlog.000008", 480)));
+        let mut g = lag(("binlog.000005", 100), false);
+        g.all = true;
+        l.lag = [("t1".to_string(), g)].into_iter().collect();
+        let slots = [slot(Some(l), None)];
+        let (pin, at) = floor_pin_of(&boundary, &slots, |_| None, false).expect("the debt pins it");
+        assert_eq!(at, pos("binlog.000005", 100));
+        assert_eq!(
+            pin,
+            FloorPin::Lag {
+                def_id: 7,
+                target: "t1",
+                all: true
+            },
+            "a whole-view debt is named as such, not as a units wait"
+        );
+        assert!(
+            pin.what().contains("catch-up build"),
+            "and the line points at the build that pays it: {}",
+            pin.what()
+        );
+
+        // A build in flight that the view will be served from: the position stops at its read, and
+        // the witness says whether it is one target's catch-up or the view's own replacement.
+        let n = next(&p, pos("binlog.000004", 90), None);
+        let slots = [slot(None, Some(n))];
+        let (pin, at) =
+            floor_pin_of(&boundary, &slots, |_| None, false).expect("the build pins it");
+        assert_eq!(at, pos("binlog.000004", 90), "the floor stops at the read");
+        assert_eq!(
+            pin,
+            FloorPin::Building {
+                def_id: 7,
+                catch_up: false
+            }
+        );
+        let mut n = next(&p, pos("binlog.000004", 90), None);
+        n.catch_up = true;
+        let slots = [slot(None, Some(n))];
+        let (pin, _) = floor_pin_of(&boundary, &slots, |_| None, false).expect("the build pins it");
+        assert_eq!(
+            pin,
+            FloorPin::Building {
+                def_id: 7,
+                catch_up: true
+            },
+            "a catch-up is the optional kind: it is the one the byte budget drops, never the reader"
+        );
+        assert!(pin.what().contains("one lagging target"), "{}", pin.what());
+
+        // Nothing owed: an unmoving position over an idle source means nothing is wrong, and the
+        // reporting latch must not invent a reason for it.
+        let l = live(&p, false, Some(pos("binlog.000009", 500)));
+        let slots = [slot(Some(l), None)];
+        assert_eq!(
+            pending_floor_of(&boundary, &slots, |_| None, false),
+            boundary
+        );
+        assert!(
+            floor_pin_of(&boundary, &slots, |_| None, false).is_none(),
+            "a position at the reader's head is not a stall"
         );
     }
 
@@ -12375,6 +12894,7 @@ mod tests {
             task: idle_task(),
             done: None,
             partial: false,
+            catch_up: false,
             hash: "h".to_string(),
             swapped: HashSet::new(),
             lock_wait: HashSet::new(),

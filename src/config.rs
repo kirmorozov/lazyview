@@ -179,6 +179,11 @@ pub struct Config {
     /// for targets that are behind instead of the budget the total gave it (see
     /// `Engine::lag_over_budget`: past it the engine only reports).
     pub test_lag_hold_bytes: Option<usize>,
+    /// Test hook `LAZYVIEW_TEST_LAG_BUILD_HOLD_BYTES=<bytes>`: the byte budget of the changes
+    /// buffered for lagging targets' whole-view catch-up builds, all of them together, instead of
+    /// the budget the total gave it (see `Engine::build_budget_action`: past it an attempt is
+    /// dropped and the shared binlog reader keeps reading).
+    pub test_lag_build_hold_bytes: Option<usize>,
     /// The engine's byte budgets — the read-ahead queue, the build hold, the XA hold, the lag
     /// hold and the dedup core — derived once at startup from `LAZYVIEW_MEMORY_BUDGET_BYTES`,
     /// the container's cgroup limit, or the historical constants (the rule and the order in
@@ -476,6 +481,8 @@ impl Config {
             Some(num("LAZYVIEW_TEST_BUILD_HOLD_BYTES", 0)? as usize).filter(|&b| b > 0);
         let test_lag_hold_bytes =
             Some(num("LAZYVIEW_TEST_LAG_HOLD_BYTES", 0)? as usize).filter(|&b| b > 0);
+        let test_lag_build_hold_bytes =
+            Some(num("LAZYVIEW_TEST_LAG_BUILD_HOLD_BYTES", 0)? as usize).filter(|&b| b > 0);
         let mut mem = crate::mem::MemoryBudget::resolve_with(
             explicit_total,
             &crate::mem::CgroupPaths::default(),
@@ -487,6 +494,9 @@ impl Config {
         }
         if let Some(b) = test_lag_hold_bytes {
             mem.lag_hold_bytes = b;
+        }
+        if let Some(b) = test_lag_build_hold_bytes {
+            mem.lag_build_hold_bytes = b;
         }
         Ok(Config {
             dsn,
@@ -517,6 +527,7 @@ impl Config {
             test_build_delay: marker_delay("LAZYVIEW_TEST_BUILD_DELAY")?,
             test_build_hold_bytes,
             test_lag_hold_bytes,
+            test_lag_build_hold_bytes,
             mem,
             test_fail_identity: Some(num("LAZYVIEW_TEST_FAIL_IDENTITY", 0)? as usize)
                 .filter(|&n| n > 0),
@@ -1036,9 +1047,10 @@ mod tests {
             (
                 c.test_build_delay.clone(),
                 c.test_build_hold_bytes,
-                c.test_lag_hold_bytes
+                c.test_lag_hold_bytes,
+                c.test_lag_build_hold_bytes
             ),
-            (None, None, None)
+            (None, None, None, None)
         );
         let c = cfg(&[
             ("LAZYVIEW_DSN", "x"),
@@ -1047,6 +1059,7 @@ mod tests {
             ("LAZYVIEW_TEST_BUILD_DELAY", "/*long_build*/:20000"),
             ("LAZYVIEW_TEST_BUILD_HOLD_BYTES", "1700000"),
             ("LAZYVIEW_TEST_LAG_HOLD_BYTES", "32"),
+            ("LAZYVIEW_TEST_LAG_BUILD_HOLD_BYTES", "4096"),
             ("LAZYVIEW_TEST_LOCK_WAIT_S", "2"),
             ("LAZYVIEW_SWAP_LOCK_WAIT_S", "3"),
         ])
