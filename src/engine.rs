@@ -1168,10 +1168,16 @@ struct Engine {
     /// one of the two measurements the link's cost per byte is read from.
     last_set_write: Option<(Instant, Duration, usize)>,
     /// The same for the fixed-size `binlog_file`/`binlog_pos` save ([`meta::save_position_at`]), the
-    /// one the flush loop sends every interval: it is the measurement that knows what the meta link
-    /// costs *now*, which is what a cursor write is priced with (see
-    /// [`Self::set_write_affordable`]).
+    /// one the flush loop sends every interval. Not a slope — 150 bytes on a wire cost a statement
+    /// round-trip, and scaling that by a set's size is the mistake that left CI's rows with an empty
+    /// cursor — but the link's speed **now**: against its duration at the moment of the last cursor
+    /// write ([`Self::cheap_at_set_write`]) it says how far the link has moved since that write, which
+    /// is what [`Self::set_write_cost`] scales it by (see [`Self::set_write_affordable`]).
     last_cheap_write: Option<(Instant, Duration, usize)>,
+    /// How long the fixed-size file/pos save took **at the moment of the last cursor write**: the
+    /// other half of the ratio [`Self::set_write_cost`] scales the last write's cost by. Two saves of
+    /// the same size, so their ratio is the link's speed change since, with the round trip out of it.
+    cheap_at_set_write: Option<Duration>,
     /// The source server's identity as this run read it (`@@server_uuid`, or MariaDB's
     /// `server_id:gtid_domain_id`): written next to every position save, so the row says which
     /// server its `binlog_file`/`binlog_pos` are exact on. Re-read when the source link is rebuilt
@@ -2463,6 +2469,7 @@ impl Engine {
             last_persist: Instant::now(),
             last_set_write: None,
             last_cheap_write: None,
+            cheap_at_set_write: None,
             source_identity: String::new(),
             pair_ahead: None,
             set_write_now: false,
@@ -9639,35 +9646,44 @@ impl Engine {
             .is_none_or(|(at, _, _)| at.elapsed() >= self.set_write_bound())
     }
 
-    /// What a statement of `bytes` would cost on the meta link **now**, from the last statement the
-    /// flush loop timed on it: the fixed-size `binlog_file`/`binlog_pos` save it sends every interval,
-    /// or the last cursor write, whichever finished more recently. Both are statements of known size
-    /// on the link a cursor write would travel, and their duration is the only clock that knows the
-    /// link's speed at this moment rather than at the moment of the last cursor write. `None` when
-    /// nothing has been timed yet — a run's very first save.
-    fn link_statement_cost(&self, bytes: usize) -> Option<Duration> {
-        let (_at, dur, size) = match (self.last_cheap_write, self.last_set_write) {
-            (Some(c), Some(s)) => {
-                if c.0 >= s.0 {
-                    c
-                } else {
-                    s
-                }
-            }
-            (Some(c), None) => c,
-            (None, Some(s)) => s,
-            (None, None) => return None,
-        };
-        if size == 0 || dur.is_zero() {
+    /// What a cursor rewrite of `bytes` would cost on the meta link **now**, read only from statements
+    /// the flush loop itself timed.
+    ///
+    /// The slope — nanoseconds per byte on this link — comes from the one statement of the same shape
+    /// the run has measured: its own last cursor write, whose duration and size went on the wire
+    /// together. The fixed-size file/pos save cannot supply a slope. Its duration is a statement
+    /// round-trip, and scaling that by a set's size priced CI's 234,528-byte cursor at 234,528
+    /// round-trips, so no periodic cursor write ever went and the row kept an empty one
+    /// (run 45833736674: `chaos_frag_cursor` "only 0 bytes and the server's set to 234528 bytes",
+    /// `lc_cursor_upgrade` "stored 0 of 0 bytes", `lc_pair_anchor` reading a 21-byte, set-less
+    /// cursor). What that save *is* good for is the link's speed **since**: both saves are the same
+    /// fixed size, so the ratio of the pair save's duration now to its duration at the moment of the
+    /// set write says how much slower or faster the link has become, with the round trip cancelling
+    /// instead of being multiplied into the estimate.
+    ///
+    /// `None` — no price, the bound governs — until the run has written a cursor once: there is
+    /// nothing of the same shape to scale, and the first write is what buys the next one its price.
+    fn set_write_cost(&self, bytes: usize) -> Option<Duration> {
+        let (_at, set_dur, set_size) = self.last_set_write?;
+        if set_size == 0 || set_dur.is_zero() {
             // A duration the clock could not see is a fast link, not an unknown one: the estimate
             // that follows would refuse nothing, and a link too quick to measure is a link a cursor
             // write can afford.
             return None;
         }
-        let ns = dur
+        let mut ns = set_dur
             .as_nanos()
             .saturating_mul(bytes as u128)
-            .checked_div(size as u128)?;
+            .checked_div(set_size as u128)?;
+        // The link's speed since that write, from the two fixed-size saves. Either sample missing, or
+        // the clock blind on one of them, and the price stays where the write left it.
+        if let (Some((_, now, _)), Some(then)) = (self.last_cheap_write, self.cheap_at_set_write) {
+            if !now.is_zero() && !then.is_zero() {
+                ns = ns
+                    .saturating_mul(now.as_nanos())
+                    .checked_div(then.as_nanos())?;
+            }
+        }
         Some(Duration::from_nanos(ns.min(u128::from(u64::MAX)) as u64))
     }
 
@@ -9677,10 +9693,9 @@ impl Engine {
     /// the budget the position save already works on. The bound alone is a rate limit with no
     /// knowledge of the link; this is the price. When it refuses, the file/pos half still moves (a
     /// fixed-size statement the same measurement says is affordable), so the run's own resume point
-    /// stays current and a start on this server opens there; and the three moments a resume is
-    /// actually read from the row write the set regardless.
+    /// stays current and a start on this server opens there.
     fn set_write_affordable(&self, text_bytes: usize) -> bool {
-        match self.link_statement_cost(text_bytes) {
+        match self.set_write_cost(text_bytes) {
             None => true,
             Some(cost) => cost < self.cfg.position_persist_interval,
         }
@@ -9790,27 +9805,36 @@ impl Engine {
         // costs the link about a tenth of its time, near every flush where the link is fast and
         // rarely where it is not, with nothing to tune. The second is a price ([`Self::
         // set_write_affordable`], lv-super's ruling of 2026-11-26): what a statement of this size
-        // would cost on that link *as measured since*, from the file/pos save the loop sends every
-        // interval — and a rewrite the loop could not afford between two flushes is not sent at all.
-        // The rate alone was not enough: CI's `chaos_both_sides` (four flavors, seed 930018769523)
-        // starts unfragmented, so its first rewrite was cheap, and the toxics that arrived afterwards
-        // made the *next* one — allowed by the expired bound and by a ceiling on the last write's
-        // cost, both of which only remember the fast link — a 147-second statement the apply loop
-        // waited for. A price read from the link has no such memory.
+        // would cost on that link *as measured since* — the nanoseconds per byte of the run's own last
+        // cursor write, scaled by how much slower or faster that link has become since, which the
+        // fixed-size pair save the loop sends every interval is the right instrument to measure and
+        // the wrong one to take a slope from (its ~150 bytes cost a round trip, and pricing a set by
+        // them priced CI's 234,528-byte cursor at 234,528 round trips: run 45833736674, rows left
+        // with no set at all). A rewrite the loop could not send between two flushes is not sent. The
+        // rate alone was not enough: CI's `chaos_both_sides` (four flavors, seed 930018769523) starts
+        // unfragmented, so its first rewrite was cheap, and the toxics that arrived afterwards made
+        // the *next* one — allowed by the expired bound and by a ceiling on the last write's cost,
+        // both of which only remember the fast link — a 147-second statement the apply loop waited
+        // for. A price read from the link, and read *now*, has no such memory.
         //
         // What a held-back rewrite costs is a restart that re-reads the binlog its cursor has not
         // reached yet: safe, because re-applying a change is idempotent (the rule
         // `lifecycle_resumes_from_a_cursor_behind_the_applied_position` exists to prove, not to
         // assert), and cheap when the run resumes on this same server, where the row's own
         // `binlog_file`/`binlog_pos` pair — which the loop keeps current whatever the price says — is
-        // the anchor the start prefers (see the start's preference for the pair). The three moments a
-        // resume is actually read from the row — a clean stop, a source switch, a rejoin after the
-        // leadership gate closed — write it at once, whatever the bound and the price say.
+        // the anchor the start prefers (see the start's preference for the pair).
+        //
+        // The three moments a resume is read from the row are not priced alike (lv-super,
+        // 2026-11-26). A clean stop or start writes both halves whatever it costs: the run is ending,
+        // nothing waits for that statement. A source switch and a rejoin after the leadership gate
+        // closed happen *mid-run*, on the flush path the apply loop waits for, and there an unpriced
+        // tens-of-kilobytes write on CI's one-byte-per-2 ms meta link is the 150-to-470-second
+        // statement that made `chaos_both_sides` red to begin with: those two write the pair always
+        // and carry the set only when the price affords it, the same price the periodic rewrite pays.
         let wanted_text = wanted.to_string();
+        let affordable = self.set_write_affordable(wanted_text.len());
         let cursor_due = wanted_text != self.persisted.to_string()
-            && (force
-                || self.set_write_now
-                || (self.set_write_ready() && self.set_write_affordable(wanted_text.len())));
+            && (force || ((self.set_write_now || self.set_write_ready()) && affordable));
         if cursor_due {
             // The save is the engine's own word that the row holds this cursor byte for byte:
             // `meta::save_position` refuses a cursor the column cannot hold whole with an error
@@ -9831,6 +9855,9 @@ impl Engine {
             .await?;
             // Measured on the real link, which is the only clock the bound and the price can use.
             self.last_set_write = Some((Instant::now(), began.elapsed(), wanted_text.len()));
+            // And the pair save's duration at this same instant, the other end of the ratio the next
+            // price is scaled by: this is what "as the link is now" is measured against.
+            self.cheap_at_set_write = self.last_cheap_write.map(|(_, dur, _)| dur);
             self.set_write_now = false;
             // What the row holds, which `save_position` has just measured: `persisted`'s set is the
             // one later saves carry forward.
