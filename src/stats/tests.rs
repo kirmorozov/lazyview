@@ -63,6 +63,7 @@ fn tally_counts_marks_and_absorbed() {
             cascade_rows: 0,
             cascade_gaps: 0,
             xa_unknown_commits: 0,
+            cascade_short_images: 0,
         }
     );
     assert_eq!(buf.len(), 3);

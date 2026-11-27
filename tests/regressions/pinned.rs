@@ -1118,7 +1118,9 @@ fn reg_cascade_window_parent_update() {
         ];
         ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into());
         ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into());
-        ddl.push("INSERT INTO links VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into());
+        ddl.push(
+            "INSERT INTO links (gid, eid, pos) VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into(),
+        );
         let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
         let specs = vec![ViewSpec::new(
             "r_win_upd",
@@ -1201,7 +1203,9 @@ fn reg_cascade_window_parent_delete() {
         ];
         ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into());
         ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into());
-        ddl.push("INSERT INTO links VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into());
+        ddl.push(
+            "INSERT INTO links (gid, eid, pos) VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into(),
+        );
         let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
         let specs = vec![ViewSpec::new(
             "r_win_del",
@@ -2128,6 +2132,350 @@ fn reg_cascade_window_seed_replay() {
         }
         ctx.log(format!(
             "seed replay {SEED:#x}: crash@+104s exact, cascade views within budget"
+        ));
+        eng.stop().await
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Short row images on the cascade path (#58, C-02): an image that omits a column the view reads
+// is answered on the streamed path — the cascade feed takes its rebuild (main's answer, the
+// `mv::fill` cursor build), the engine's reader guard its #167 whole-view refresh — and the view
+// is never left stale. The in-memory whole-view read (`dirty.all`) is closed to new uses until
+// the streamed whole-view refresh lands (path-to-green step 1c, the owner's rule), which is why
+// these sites keep `dirty.rebuild` rather than `mark_all`. The fail-before
+// pair for the rule is `reg_cascade_short_image_minimal`, which every flavor in the entry's list
+// runs (both families write MINIMAL and NOBLOB images), and `reg_cascade_partial_child_json`,
+// which only the MySQL family can make. `reg_cascade_virtual_only_image` is the guard, not a
+// fail-before case, and what it pins is per-statement legality, not a per-flavor layout: the
+// measured servers differ on the trailing VIRTUAL column (tmp/out/lvs-virtual/pr1/facts.md
+// §F.2) — mysql84 writes it into every image, mariadb114 leaves it out of UPDATE/DELETE images
+// and of INSERT under MINIMAL — and `provable_omission` admits exactly the leaving-out (§F.3:
+// there is no per-flavour layout constant to assume).
+
+/// The three short-image regressions share one shape: `entities` is the parent of a MAP route
+/// into `links` and is not an alias of the view (an alias of it would trace the change itself),
+/// so only the cache knows what a parent change moved; `items` pins nothing. `extra` adds one
+/// column to `links` beyond the key, the FK and `pos`: a TEXT column MINIMAL and NOBLOB may leave
+/// out, or a VIRTUAL column no route reads. `json` adds a JSON column instead, seeded so that
+/// updating one key of it is a partial update.
+fn short_img_ddl(extra: &str, json: bool) -> Vec<String> {
+    let tail = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(", {extra}")
+    };
+    let links = if json {
+        "INSERT INTO links (gid, eid, pos, js) VALUES \
+         (1, 5, 10, '{\"k\":\"v1\"}'), (2, 5, 20, '{\"k\":\"v2\"}'), (3, 6, 30, '{\"k\":\"v3\"}')"
+            .into()
+    } else {
+        "INSERT INTO links (gid, eid, pos) VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into()
+    };
+    vec![
+        "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+        "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+        format!(
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL{tail}, PRIMARY KEY (gid, eid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))"
+        ),
+        "INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into(),
+        "INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into(),
+        links,
+    ]
+}
+
+/// The view over `links` the three regressions keep exact: grouped by `gid`, aggregating the
+/// stored `pos`; with `json` it also reads `js`, so the map must store it.
+fn short_img_view(name: &str, json: bool) -> ViewSpec {
+    let k = if json {
+        ", JSON_UNQUOTE(JSON_EXTRACT(l.js, '$.k')) AS k"
+    } else {
+        ""
+    };
+    let by = if json {
+        ", JSON_UNQUOTE(JSON_EXTRACT(l.js, '$.k'))"
+    } else {
+        ""
+    };
+    ViewSpec::new(
+        name,
+        Kind::Incremental,
+        &format!("SELECT l.gid, COUNT(*) AS n, SUM(l.pos) AS s{k} FROM links l GROUP BY l.gid{by}"),
+    )
+}
+
+/// Waits for `/stats` to publish a view whose short-image counter reached `want` (a flush
+/// publishes it, and after a quiet workload only the periodic flush does). The counter is
+/// cumulative, so a step asks for its own number and publication lag cannot make it wrong.
+async fn wait_short_images(eng: &Engine, db: &Db, view: &str, want: u64) -> Result<ViewStats> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(s) = eng.view_stats(db, view) {
+            if s.cascade_short_images >= want {
+                return Ok(s);
+            }
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "the unreadable image was never counted in /stats within 20 s ({} short images so \
+             far, wanted {want})",
+            eng.view_stats(db, view)
+                .map_or(0, |s| s.cascade_short_images)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// `PARTIAL_JSON` (the MySQL family only): a child row the map keeps whose JSON column arrives as
+/// a diff is not readable, so the units its cascade changes are unknown — the row goes uncounted
+/// never, and the view is never left stale: the unreadable row is counted and leaves the map
+/// unable to vouch for what it keeps (`Cache::distrust`), and the parent delete that follows is
+/// answered on the streamed path (the distrust rebuild). On MariaDB there is no partial JSON
+/// update to make: the same workload runs as an ordinary full image and must cost neither a
+/// count nor a distrust-driven rebuild (the flavor-neutral half, asserted rather than skipped).
+#[test]
+fn reg_cascade_partial_child_json() {
+    scenario("reg_casc_part_json", |ctx| async move {
+        let ddl = short_img_ddl("js JSON NULL", true);
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![short_img_view("r_part_json", true)];
+        let (db, mut eng) = setup(&ctx, "reg_casc_part_json", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let partial = !ctx.flavor().to_ascii_lowercase().contains("maria");
+        if partial {
+            exec_all(
+                &mut sc,
+                &["SET SESSION binlog_row_value_options='PARTIAL_JSON'"],
+            )
+            .await?;
+        } else {
+            ctx.log(format!(
+                "no partial JSON updates on {}: the same workload as a full image",
+                ctx.flavor()
+            ));
+        }
+        let s0 = eng.stats_of(&db, "r_part_json")?;
+        let f0 = eng.snapshot();
+        // The kept row of (1, 5) changes one key of its JSON column: the map must store it, so
+        // the row is kept from an image the view cannot read (the diff is not a value).
+        exec_all(
+            &mut sc,
+            &["UPDATE links SET js = JSON_SET(js, '$.k', 'v9') WHERE gid = 1 AND eid = 5"],
+        )
+        .await?;
+        // The parent delete cascades to that row: expanding it is where the unreadable row bites.
+        exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 5"]).await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the group after a partial JSON child update",
+        )
+        .await?;
+        let want = u64::from(partial);
+        let s = wait_short_images(&eng, &db, "r_part_json", want).await?;
+        let d = eng.snapshot().since(&f0);
+        // The unreadable row is counted once, and leaves the map unable to vouch for what it
+        // keeps (`Cache::distrust`), so the parent delete that follows is not trusted to the
+        // map either: measured on mysql84, the two of them pay the streamed path one rebuild
+        // each (feed_map's own site, then the distrust arm before the first build swaps). On
+        // MariaDB the workload is a full image and none of this fires (`want` is 0 there).
+        ensure!(
+            d.full_rebuilds <= want + 1
+                && s.cascade_short_images - s0.cascade_short_images == want
+                && s.whole_view_refreshes - s0.whole_view_refreshes <= want + 2,
+            "a partial JSON child update cost more rebuilds than the two its unreadable row and \
+             its distrusted parent change pay, was not counted, or refreshed the whole view \
+             beyond one per flush: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!(
+            "partial JSON child update ({}): answered on the streamed path within budget, {} \
+             short image(s)",
+            ctx.flavor(),
+            s.cascade_short_images - s0.cascade_short_images
+        ));
+        eng.stop().await
+    });
+}
+
+/// A session that overrides `binlog_row_image` (the misconfiguration #58 is made of): a kept child
+/// row and a cascade parent that arrive as short images are unreadable, so each is counted once
+/// and answered on the streamed path — the feed's sites take their rebuild (main's answer), the
+/// engine's reader guard its #167 whole-view refresh — and the view is never left stale. Both
+/// server families take the same case: `MINIMAL` and `NOBLOB` exist on both, and both ship the
+/// present-column bitmaps the reader's C-02 guard tests, so the short events are answered there,
+/// ahead of the cascade feed — and the guard charges what the feed's own sites charge (count and
+/// map distrust, `Engine::note_short_image`), which is what this test proves reaches `/stats`.
+/// Such an image also leaves the cascade map unable to vouch for the rows it keeps
+/// (`Cache::distrust`), so the parent change that follows is answered by the distrust rebuild
+/// rather than trusted to the map (which heals it by seeding again): steps (1) and (3)'s parent
+/// deletes are the cases that pinned that rule down, whose child rows the map still filed under
+/// the keys the unreadable updates should have moved them from.
+#[test]
+fn reg_cascade_short_image_minimal() {
+    scenario("reg_casc_short_min", |ctx| async move {
+        let ddl = short_img_ddl("note TEXT NULL", false);
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![short_img_view("r_short_min", false)];
+        let (db, mut eng) = setup(&ctx, "reg_casc_short_min", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let s0 = eng.stats_of(&db, "r_short_min")?;
+        let f0 = eng.snapshot();
+        // (1) A kept child row whose stored `pos` arrives in a MINIMAL image; the parent delete
+        // that takes it is a full image, so the refresh is the row's doing (`expand`).
+        exec_all(&mut sc, &["SET SESSION binlog_row_image=MINIMAL"]).await?;
+        exec_all(
+            &mut sc,
+            &["UPDATE links SET pos = 42 WHERE gid = 1 AND eid = 5"],
+        )
+        .await?;
+        exec_all(&mut sc, &["SET SESSION binlog_row_image=FULL"]).await?;
+        exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 5"]).await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the group after a MINIMAL child update",
+        )
+        .await?;
+        let s = wait_short_images(&eng, &db, "r_short_min", 1).await?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            d.full_rebuilds <= 1
+                && s.cascade_short_images - s0.cascade_short_images >= 1
+                && s.whole_view_refreshes - s0.whole_view_refreshes <= 3,
+            "a MINIMAL child update and the parent delete that took it cost more than the one \
+             counted short image and the one rebuild its distrusted map pays, or more than one \
+             whole-view refresh per flush: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        // (2) A cascade parent in a MINIMAL image: its key is there and the rest is not, so the
+        // units its key update moves are unknown.
+        let f1 = eng.snapshot();
+        exec_all(&mut sc, &["SET SESSION binlog_row_image=MINIMAL"]).await?;
+        exec_all(&mut sc, &["UPDATE entities SET eid = 7 WHERE eid = 6"]).await?;
+        exec_all(&mut sc, &["SET SESSION binlog_row_image=FULL"]).await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the group after a MINIMAL parent key update",
+        )
+        .await?;
+        let s = wait_short_images(&eng, &db, "r_short_min", 2).await?;
+        let d = eng.snapshot().since(&f1);
+        ensure!(
+            d.full_rebuilds <= 1
+                && s.cascade_short_images - s0.cascade_short_images >= 2
+                && s.whole_view_refreshes - s0.whole_view_refreshes <= 6,
+            "a MINIMAL parent key update cost a rebuild, went uncounted, or cost more than one \
+             whole-view refresh per flush: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        // (3) NOBLOB: the image of a child update leaves the TEXT column out, which no route
+        // reads and nothing in the event names: the row is unreadable all the same, because a
+        // shorter image packs the values it carries and which column is missing is unknowable.
+        let f2 = eng.snapshot();
+        exec_all(&mut sc, &["SET SESSION binlog_row_image=NOBLOB"]).await?;
+        exec_all(
+            &mut sc,
+            &["UPDATE links SET pos = 43 WHERE gid = 3 AND eid = 7"],
+        )
+        .await?;
+        exec_all(&mut sc, &["SET SESSION binlog_row_image=FULL"]).await?;
+        exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 7"]).await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the group after a NOBLOB child update",
+        )
+        .await?;
+        let s = wait_short_images(&eng, &db, "r_short_min", 3).await?;
+        let d = eng.snapshot().since(&f2);
+        ensure!(
+            d.full_rebuilds <= 1
+                && s.cascade_short_images - s0.cascade_short_images >= 3
+                && s.whole_view_refreshes - s0.whole_view_refreshes <= 9,
+            "a NOBLOB child update and the parent delete that took it cost more than the one \
+             counted short image and the one rebuild its distrusted map pays, or more than one \
+             whole-view refresh per flush: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!(
+            "session row-image overrides ({}): every unreadable image was counted, the streamed \
+             path answered it, and the view never went stale",
+            ctx.flavor()
+        ));
+        eng.stop().await
+    });
+}
+
+/// A VIRTUAL generated column no route reads is legal, not a limitation, in both image shapes:
+/// mysql84 writes a trailing VIRTUAL into every image, mariadb114 leaves it out of UPDATE/DELETE
+/// images and of INSERT under MINIMAL (measured per statement and mode, issue #7:
+/// `tmp/out/lvs-virtual/pr1/facts.md` §F.2) — carrying it and omitting it are both a full image
+/// for the route, because `provable_omission` admits exactly an omission of trailing VIRTUAL
+/// columns. So neither the kept child row nor the view is short: no count, no whole-view
+/// refresh, and no rebuild, on every flavor. Before the fix this was the column-count test's
+/// doing on the flavors that leave VIRTUAL columns out: every kept row incomplete, every parent
+/// change a rebuild.
+#[test]
+fn reg_cascade_virtual_only_image() {
+    scenario("reg_casc_virtual", |ctx| async move {
+        let ddl = short_img_ddl(
+            "tag VARCHAR(32) GENERATED ALWAYS AS (CONCAT('t', pos)) VIRTUAL",
+            false,
+        );
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        let specs = vec![short_img_view("r_virtual", false)];
+        let (db, mut eng) = setup(&ctx, "reg_casc_virtual", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        let s0 = eng.stats_of(&db, "r_virtual")?;
+        let f0 = eng.snapshot();
+        exec_all(
+            &mut sc,
+            &["UPDATE links SET pos = 44 WHERE gid = 1 AND eid = 5"],
+        )
+        .await?;
+        exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 5"]).await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the group after a VIRTUAL-column table's change",
+        )
+        .await?;
+        let s = eng.stats_of(&db, "r_virtual")?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            d.full_rebuilds == 0
+                && s.cascade_short_images == s0.cascade_short_images
+                && s.whole_view_refreshes == s0.whole_view_refreshes,
+            "a table whose only generated column is VIRTUAL cost a rebuild, a short-image count \
+             or a whole-view refresh: {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!(
+            "VIRTUAL column read by no route ({}): kept rows complete, no refresh, no rebuild",
+            ctx.flavor()
         ));
         eng.stop().await
     });
