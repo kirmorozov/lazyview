@@ -2066,6 +2066,26 @@ fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
         // leg went red on every MySQL flavor of CI run 45670984231. `common::server_gtid_set` picks
         // per flavor (`@@GLOBAL.gtid_executed` on the MySQL family), which is also the set the rule
         // is really asked against there.
+        // Both sides of that prediction are taken at rest, never one mid-flight (lv-super's ruling,
+        // CI run 45896362347, red on every MariaDB leg). The engine decides the anchor from the set
+        // it *loads* when it starts — the row as the final flush of `stop()` left it (the flush loop
+        // writes the truth about what the run consumed whenever that truth changed) — while the row
+        // read above was taken while this run was still writing. That last save can be newer and
+        // wider than the read above: the INSERT two lines back is itself a GTID, and so is whatever
+        // the flush still owed. A `domain-server` pair the newer set names and the older one omits
+        // is exactly what flips MariaDB's answer (`contains_all_slave_gtid`), which is how the leg
+        // came to say "the saved set names its pairs false" next to a log line saying the dump
+        // anchored on the set. So: re-read the row now that the writer has stopped, and read the
+        // server's state in the same moment. One snapshot of a quiet system — the only point where
+        // what the engine will load and what the server can locate are comparable at all.
+        let at_rest = lazyview::meta::load_position(&mut c, &instance, flavor)
+            .await?
+            .context("the final flush saved no cursor at all")?;
+        let set = at_rest.gtid().unwrap_or_default();
+        ensure!(
+            !set.is_empty(),
+            "the final flush saved a cursor with no set in it: {at_rest}"
+        );
         let node_state = common::server_gtid_set(&mut c, maria).await?;
         let covers = !maria || lazyview::source::dump_state_covers(&node_state, set);
         let anchored = if covers {

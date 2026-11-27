@@ -825,6 +825,59 @@ pub async fn save_position(
     Ok(c.clone())
 }
 
+/// The size of the statement [`save_position_pair`] puts on the wire, to within the packet header:
+/// its fixed text plus the four parameters. The engine reads a measured duration of that save
+/// against this number to know how fast the meta link is, and prices a cursor rewrite with the
+/// answer ([`Cursor`] text is `file:pos[g=…]` ASCII, so its bytes and its characters are the same) —
+/// which is why the estimate is written next to the statement it estimates, not guessed at the call
+/// site.
+pub fn cheap_save_bytes(at: &crate::binlog::Position, instance: &str, epoch: u64) -> usize {
+    const FIXED: usize = "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ? \
+                          WHERE `instance_id` = ? AND `epoch` = ?"
+        .len();
+    FIXED + at.file.len() + at.pos.to_string().len() + instance.len() + epoch.to_string().len() + 16
+}
+
+/// Saves the **position** alone — `binlog_file`/`binlog_pos`, the same `WHERE epoch = ?` as the full
+/// save — and leaves `binlog_cursor` exactly as the row holds it. This is the half a flush sends when
+/// the consumed set has grown to a size the link cannot carry between two flushes
+/// ([`crate::engine`] prices it): the row keeps the last set a save afforded, and its position moves,
+/// so a restart from here reads the cursor the row holds (a position behind where this run got to) and
+/// re-applies what it missed. Re-applying is idempotent, and that path is what
+/// `lifecycle_resumes_from_a_cursor_behind_the_applied_position` proves rather than asserts.
+///
+/// The two columns are the pair a start falls back to when the cursor column is empty or unreadable
+/// ([`load_position`]), so they stay the position this run really read; writing them apart from the
+/// cursor never leaves a position *ahead* of a set (the direction that would let a resume skip
+/// transactions), only a set behind a position, which is the safe direction. Fails when another
+/// instance took the row over.
+pub async fn save_position_pair(
+    conn: &mut Conn,
+    instance: &str,
+    at: &crate::binlog::Position,
+    epoch: u64,
+) -> Result<()> {
+    conn.exec_drop(
+        "UPDATE `_lazyview_status` SET `binlog_file` = ?, `binlog_pos` = ? WHERE `instance_id` = ? AND `epoch` = ?",
+        (&at.file, at.pos, instance, epoch),
+    )
+    .await?;
+    if conn.affected_rows() == 0 {
+        let cur: Option<u64> = conn
+            .exec_first(
+                "SELECT `epoch` FROM `_lazyview_status` WHERE `instance_id` = ?",
+                (instance,),
+            )
+            .await?;
+        if cur != Some(epoch) {
+            anyhow::bail!(
+                "another lazyview instance took over (epoch {cur:?}, ours {epoch}); stopping"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
