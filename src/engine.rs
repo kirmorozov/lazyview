@@ -5609,8 +5609,10 @@ impl Engine {
                         other_tables: HashSet::new(),
                         prepared_at: Instant::now(),
                         unpinned: false,
-                        // The GTID belongs to the XA transaction, not to the ordinary
-                        // end-of-transaction merge: it waits here for the XA COMMIT.
+                        // The GTID of the prepared body belongs to the XA transaction, not to
+                        // the ordinary end-of-transaction merge: it waits here until the
+                        // transaction is resolved (XA COMMIT, XA ROLLBACK, or the ONE PHASE
+                        // commit that ends it right away).
                         gtid: self.pending_gtid.take(),
                     },
                 ));
@@ -5627,28 +5629,36 @@ impl Engine {
                 self.after_boundary();
             }
             Item::XaEnd { xid, commit, pos } => {
-                // An ordinary transaction may be mid-read here (XA COMMIT is a separate
-                // event): its number merges at its own commit, not at this one.
-                let carry = self.pending_gtid.take();
-                let before = self.end_txn(pos);
-                self.pending_gtid = carry;
+                // The XA COMMIT / XA ROLLBACK is a transaction of its own: its GTID event opened
+                // it and this event ends it, so `end_txn` merges that number like any commit's
+                // (#319). Kept out, the set the visibility fence waits on (`fence`, the MySQL
+                // family's `WAIT_FOR_EXECUTED_GTID_SET`) lacked it: the server logs an XA COMMIT
+                // before InnoDB makes it visible, the wait returned at once, and a flush that
+                // ended on the commit read its rows as they were before it.
                 match self.xa_pending.remove(&xid) {
-                    Some(mut xa) if commit => {
-                        // The XA COMMIT read: its transaction is fully seen, its number joins
-                        // the consumed set now (a rollback drops it: the set under-claims, and
-                        // an under-claiming dump only ever re-reads).
+                    Some(mut xa) => {
+                        // The prepared body is resolved either way, so its number joins the set
+                        // too, a rollback's as well. Left out, a GTID dump re-sends that body
+                        // without the rollback that resolved it, and the re-read prepare holds
+                        // every later save back as an open XA transaction.
                         if let Some(g) = xa.gtid.take() {
-                            if source::merge_gtid(self.flavor, &mut self.executed, &g) {
-                                self.executed_dirty = true;
-                            }
+                            self.consume_gtid(&g);
                         }
-                        self.xa_committed(&xid, xa)
+                        if commit {
+                            // Fed before this commit's boundary (`end_txn` below): the dedup core
+                            // releases what a transaction touched when it ends. Fed after it, the
+                            // rows waited for the next transaction to end, which an idle source
+                            // never sends: the view never showed the commit and the position it
+                            // reports stayed pinned at the transaction's start (#319).
+                            self.xa_committed(&xid, xa);
+                        }
+                        self.end_txn(pos);
                     }
-                    Some(_) => {}
                     None if commit => {
-                        // Its number is one the consumed set cannot name either: the stream
-                        // anchors on file and position from here (a GTID dump would replay
-                        // this commit on every connect).
+                        let before = self.end_txn(pos);
+                        // Its prepared body is one the consumed set cannot name (this run never
+                        // read it): the stream anchors on file and position from here (a GTID
+                        // dump on that set would re-send the body on every connect).
                         self.xa_gap_no_gtid_dump = true;
                         if self.stream_by_gtid && self.xa_orphan_rollback {
                             // The dump's own artifact, not a failover: the server does not
@@ -5697,15 +5707,23 @@ impl Engine {
                         }
                         self.first_dirty.get_or_insert_with(Instant::now);
                     }
-                    None => {}
+                    None => {
+                        self.end_txn(pos);
+                    }
                 }
                 self.persist_needed = true;
                 self.after_boundary();
             }
             Item::Commit { pos } => {
                 self.end_txn(pos);
-                // One-phase XA commits like a normal transaction.
-                self.xa_current = None;
+                // One-phase XA commits like a normal transaction; its number moved into the
+                // `XaTxn` at XA START, so it joins the consumed set here (#319: dropped with the
+                // `XaTxn`, the fence did not wait for this commit either).
+                if let Some((_, xa)) = self.xa_current.take() {
+                    if let Some(g) = xa.gtid {
+                        self.consume_gtid(&g);
+                    }
+                }
                 self.persist_needed |= std::mem::take(&mut self.txn_foreign);
                 self.after_boundary();
             }
@@ -5800,7 +5818,7 @@ impl Engine {
         // The commit arrived: the whole transaction was read (the stream is sequential), so
         // its number joins the consumed set — once per transaction, the in-place fast path of
         // `mysql::merge_interval`, allocation only for a first-time source id (ruling 6). An
-        // XA transaction's number waits in its `XaTxn` for the XA COMMIT instead.
+        // XA transaction's prepared body waits in its `XaTxn` until it is resolved instead.
         if let Some(g) = self.pending_gtid.take() {
             if self.in_xa_txn {
                 if let Some((_, xa)) = self.xa_current.as_mut() {
@@ -5808,8 +5826,8 @@ impl Engine {
                         xa.gtid = Some(g);
                     }
                 }
-            } else if source::merge_gtid(self.flavor, &mut self.executed, &g) {
-                self.executed_dirty = true;
+            } else {
+                self.consume_gtid(&g);
             }
         }
         self.in_xa_txn = false;
@@ -5817,6 +5835,13 @@ impl Engine {
         self.dedup.boundary(&pos, Instant::now());
         std::mem::replace(&mut self.boundary, Cursor::from_position(self.flavor, &pos))
             .to_position()
+    }
+
+    /// `g` joins the consumed set (the in-place fast path of `mysql::merge_interval`; ruling 6).
+    fn consume_gtid(&mut self, g: &str) {
+        if source::merge_gtid(self.flavor, &mut self.executed, g) {
+            self.executed_dirty = true;
+        }
     }
 
     /// XA COMMIT of a transaction read in this run: its rows become visible now.

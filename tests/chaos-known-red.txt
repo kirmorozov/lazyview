@@ -10,19 +10,3 @@
 # step: every chaos failure fails the job.
 chaos_tgt_blackhole_during_flush #214
 chaos_tgt_pg_blackhole_during_flush #214
-#
-# A real, still-red lock-fencing failure on main, declared here so it is never a hidden red (owner
-# rule). `chaos_lock_frozen_old_instance_writes_nothing` (tests/chaos.rs:2980) and
-# `chaos_lock_blackhole_takeover` (tests/chaos.rs:2627) fail on 1 to 5 of the 15 MySQL-family legs per
-# run since at least 47920a7: a woken or replaced instance advances its applied position, or (the
-# serious case, mysql2610/5245562) writes rows to the targets, after its lock is gone. Until #392 they
-# showed nowhere: their own `MEASURED …` stderr (tests/common/engineproc.rs measured()) pushed the
-# libtest verdict onto the next line and the one-line gate grep never saw the FAILED, so the run read
-# "11 ran, 1 failed, 0 blocking" beside the always-red #214. scripts/chaos-gate.sh now counts every
-# FAILED line whatever follows it, so the honest state is that these two are red on main, and they are
-# declared rather than left hidden. Fix will follow in #393 (the fix PR, or the keeper pass that lands
-# it, deletes these two lines): a fail-before/pass-after on a real post-wake write, or a test change
-# that still fails on one. Until then they still run and are reported in the job summary with #393,
-# exactly like the #214 pair above — green because declared, not because hidden.
-chaos_lock_frozen_old_instance_writes_nothing #393
-chaos_lock_blackhole_takeover #393
