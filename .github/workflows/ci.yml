@@ -528,9 +528,15 @@ jobs:
           for n in 1 2 3; do
             [ "$(q pxc84-$n "SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size'" | awk '{print $2}')" = 3 ] || { echo "::error::pxc84-$n does not see 3 members"; exit 1; }
             [ "$(q pxc84-$n "SELECT @@GLOBAL.gtid_mode REGEXP '^ON'")" = 1 ] || { echo "::error::pxc84-$n has gtid_mode off: no MySQL GTIDs to resume by"; exit 1; }
-            [ "$(q pxc84-$n "SELECT @@GLOBAL.enforce_gtid_consistency")" = 1 ] || { echo "::error::pxc84-$n has enforce_gtid_consistency off: gtid_mode=ON requires it"; exit 1; }
+            # enforce_gtid_consistency is an enum here (OFF/ON/MASTER), measured locally: it answers
+            # ON, not 1. wsrep_on is a SESSION variable on this image - @@GLOBAL.wsrep_on answers
+            # nothing at all - so the scope is said, and wsrep_ready (the member's own "I accept
+            # traffic") is asserted with it, since the session switch means nothing on a member that
+            # is not ready.
+            [ "$(q pxc84-$n "SELECT @@GLOBAL.enforce_gtid_consistency REGEXP '^ON'")" = 1 ] || { echo "::error::pxc84-$n has enforce_gtid_consistency off: gtid_mode=ON requires it"; exit 1; }
             [ "$(q pxc84-$n "SELECT @@GLOBAL.log_replica_updates")" = 1 ] || { echo "::error::pxc84-$n has log_replica_updates off: its binlog would not carry the cluster"; exit 1; }
-            [ "$(q pxc84-$n "SELECT @@GLOBAL.wsrep_on")" = 1 ] || { echo "::error::pxc84-$n is not running wsrep at all"; exit 1; }
+            [ "$(q pxc84-$n "SELECT @@SESSION.wsrep_on")" = 1 ] || { echo "::error::pxc84-$n is not running wsrep at all"; exit 1; }
+            [ "$(q pxc84-$n "SHOW GLOBAL STATUS LIKE 'wsrep_ready'" | awk '{print $2}')" = ON ] || { echo "::error::pxc84-$n is not ready to serve"; exit 1; }
           done
           q pxc84-1 "CREATE DATABASE IF NOT EXISTS lvcl; CREATE TABLE IF NOT EXISTS lvcl.entities (id INT PRIMARY KEY, v INT NOT NULL); INSERT INTO lvcl.entities VALUES (1,1),(2,2),(777,777);"
           SET=$(q pxc84-1 "SELECT @@GLOBAL.gtid_executed" | tr -d '\n ')
