@@ -1384,6 +1384,20 @@ pub fn grep_log(path: &PathBuf, needle: &str) -> Result<Option<String>> {
         .map(|l| l.chars().take(200).collect()))
 }
 
+/// [`Self::grep_log`] for a witness that needs more than one field of the SAME line, which one
+/// substring cannot say: the first line `pred` accepts, truncated like `grep_log`'s answer.
+pub fn grep_log_where(path: &PathBuf, pred: impl Fn(&str) -> bool) -> Result<Option<String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read engine log {}", path.display())),
+    };
+    Ok(text
+        .lines()
+        .find(|l| pred(l))
+        .map(|l| l.chars().take(200).collect()))
+}
+
 /// Waits until this engine has flushed every one of `specs` at least once, so `/stats` carries a
 /// row for each (`Engine::view_stats`, `engine.rs:230`: a view is listed only after a flush listed
 /// it). The writers keep going through an event (§3), which is what makes them flush; the names

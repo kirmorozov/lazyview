@@ -2290,31 +2290,32 @@ async fn tgt_blackhole(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -
     );
     assert_no_rebuilds(&eng, &db, &specs, &before, sname)?;
     // Guard R1 (owner rule 2026-11-26), on the one site where a lagging target provably owed the
-    // whole view: what a target owes that can be listed per key is written by a units retry, and
-    // what cannot (a rebuild, a gap window, a Full-mode view) arrives by the streamed build
-    // (`Engine::lag_build`: `build_task` → `mv::fill`, one batch at a time into the shadow table).
-    // Neither reads the source whole, so an INCREMENTAL view of this run may never reach
-    // `refresh`'s `dirty.all` arm — `log_whole_refresh` logs that at INFO with the view's name, so
-    // the engine's own log is the witness. A line here means a lag catch-up grew a new way into the
-    // in-memory read, which is the whole point of the guard.
+    // whole view. What the engine's log can prove is the ROUTING, and the line that carries it is
+    // the claim's own: `lag refresh claimed view=<v> target=<t> all=<bool>` (`src/engine.rs:10075`)
+    // is printed only by `lag_service`'s and `retry_lag`'s claim, and the claim is the hand-off to
+    // `refresh`/`prepare_refresh`, whose `dirty.all` arm is the in-memory read (`mv::read_source`
+    // with `chunk: None`). So an `all=true` claim is exactly the violation the guard is about, in
+    // either maintenance mode, and both claim paths `debug_assert!` the same rule (the sequential
+    // `retry_lag` claim logs nothing, so for that path the assert, live in these debug binaries,
+    // is the guard). What the log CANNOT prove is the absence of a whole-source read in general:
+    // `whole-view refresh: reading the source again` is main's own line for the whole version
+    // (reason "a global aggregate view recomputes its one row", `log_whole_refresh`), which every
+    // one-row aggregate of this spec hits on the cadence while all its targets are served, and the
+    // same line for a lagging target would look identical. Grepping it here asserted a rule main
+    // never had and failed runs whose catch-up was correctly built (the 2026-11-27 bar probe:
+    // `target caught up` had been logged, the debt paid, and the witness still fired on the
+    // aggregate's cadence read).
     for s in &specs {
-        if !eng
-            .stats_of(&db, &s.name)?
-            .mode
-            .eq_ignore_ascii_case("incremental")
-        {
-            continue;
-        }
-        let needle = format!(
-            "whole-view refresh: reading the source again view={} table=",
-            s.name
-        );
-        if let Some(line) = soakchaos::grep_log(&eng.log_path, &needle)? {
+        let view = format!("view={} ", s.name);
+        if let Some(line) = soakchaos::grep_log_where(&eng.log_path, |l| {
+            l.contains("lag refresh claimed") && l.contains(&view) && l.contains("all=true")
+        })? {
             return Err(anyhow::anyhow!(
-                "{sname}: incremental view {} read its source whole: {line}\n\
-                 A lagging target's catch-up is the streamed build (Engine::lag_build), never \
-                 refresh's dirty.all arm (guard R1, owner rule 2026-11-26).",
-                s.name,
+                "{sname}: a lagging target's whole view was claimed by a refresh: {line}\n\
+                 A lag catch-up owes the streamed build (`Engine::lag_build`: `build_task` → \
+                 `mv::fill`, one batch at a time into the shadow table), never `refresh`'s \
+                 `dirty.all` arm, which reads the source into memory (guard R1, owner rule \
+                 2026-11-26).",
             ));
         }
     }
