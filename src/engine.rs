@@ -6395,6 +6395,7 @@ impl Engine {
         x.name == y.name
             && x.kind == y.kind
             && x.param == y.param
+            && x.hex == y.hex
             && x.exact == y.exact
             && x.invisible == y.invisible
             && x.data_type == y.data_type
@@ -9316,6 +9317,8 @@ impl Engine {
             rest: String,
             keys: Vec<&'a Key>,
             per: usize,
+            /// The image columns, which bind the keys' values ([`crate::catalog::Column::bind`]).
+            cols: Vec<&'a crate::catalog::Column>,
         }
         let mut subs = Vec::new();
         for &(alias, images) in parts {
@@ -9355,6 +9358,7 @@ impl Engine {
                 keys: images.iter().collect(),
                 per: (MAX_FILTER_PARAMS / (parts.len() * cols.len()))
                     .clamp(1, self.cfg.query_chunk),
+                cols,
             });
         }
         let parts = subs;
@@ -9384,12 +9388,14 @@ impl Engine {
                 [(a, derived)] => (plan.lookup_sql(*a, derived), vec![0]),
                 _ => plan.lookup_sql_multi(&subst)?,
             };
+            // Each value as its column's placeholder takes it (bytes as hex text, #394).
             let params: Vec<Value> = order
                 .iter()
                 .flat_map(|&k| {
+                    let cols = &parts[k].cols;
                     chunks[k]
                         .iter()
-                        .flat_map(|key| key.iter().map(Datum::to_value))
+                        .flat_map(move |key| key.iter().zip(cols).map(|(d, c)| c.bind(d)))
                 })
                 .collect();
             let fresh = self.caps.fresh_snapshot;
@@ -9637,7 +9643,7 @@ async fn run_pending(sup: &Supervisor, p: &mut PendingRefresh) -> Result<supervi
 }
 
 /// A bound string param without its trailing ` COLLATE <co>`: only for a param of the shape
-/// `CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET <cs>) COLLATE <co>` (a string column,
+/// `CAST(UNHEX(?) AS CHAR CHARACTER SET <cs>) COLLATE <co>` (a string column,
 /// [`crate::catalog::TEXT_PARAM_PREFIX`]), which is the one that carries a collation of its own; a
 /// param that has none, and one of any other shape, is returned as it is. See the lookup that
 /// uses it.
@@ -10685,15 +10691,13 @@ mod tests {
     #[test]
     fn a_lookup_param_loses_only_its_collate() {
         assert_eq!(
-            without_collate(
-                "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1) COLLATE latin1_bin",
-            ),
-            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)",
+            without_collate("CAST(UNHEX(?) AS CHAR CHARACTER SET latin1) COLLATE latin1_bin"),
+            "CAST(UNHEX(?) AS CHAR CHARACTER SET latin1)",
             "the collation of the view definition decides"
         );
         assert_eq!(
-            without_collate("CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)"),
-            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)",
+            without_collate("CAST(UNHEX(?) AS CHAR CHARACTER SET latin1)"),
+            "CAST(UNHEX(?) AS CHAR CHARACTER SET latin1)",
             "a param without one is as it was"
         );
         assert_eq!(without_collate("?"), "?");

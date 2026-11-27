@@ -1095,7 +1095,7 @@ pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<
     }
     let v = conn
         .query_first::<Option<String>, _>(format!(
-            "SELECT CAST(COLLATION(CAST(CAST('' AS BINARY) AS CHAR CHARACTER SET {charset})) AS CHAR)"
+            "SELECT CAST(COLLATION(CAST(UNHEX('') AS CHAR CHARACTER SET {charset})) AS CHAR)"
         ))
         .await
         .with_context(|| format!("default collation of character set {charset}"))?;
