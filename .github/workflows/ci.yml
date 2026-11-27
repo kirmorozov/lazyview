@@ -6,10 +6,11 @@ name: ci
 #   DRAFT pull_request  -> only the fast jobs: lint, unit, deny, features. No build, no container,
 #                          no server. Workers push WIP at least every 60 min (host rule); 30 such
 #                          runs in 24 h were filling the runners and queueing main's own run.
-#   pull_request        -> the fast jobs plus every heavy job ON THE 3-FLAVOR SET (below): marking
-#                          a PR ready (ready_for_review, in `on:`) is what starts the full run.
-#   push (main, v*), workflow_dispatch -> everything, on the FULL matrix: every landed commit
-#                          therefore shows its own full matrix, and a release tag pays for all of it.
+#   pull_request        -> the fast jobs plus every heavy job, on the SAME 20 integration cells as a
+#                          push (every supported flavor blocks PRs too): marking a PR ready
+#                          (ready_for_review, in `on:`) is what starts the full run.
+#   push (main, v*), workflow_dispatch -> everything: every landed commit shows its own full run,
+#                          and a release tag pays for all of it.
 # The jobs: lint, unit,
 # e2e, deny (cargo-deny advisories + licenses), features (the optional cargo features built and
 # tested; their clippy runs sit in `lint`), scan-image (trivy), the integration matrix,
@@ -156,6 +157,19 @@ jobs:
         # see the cfg(test) cases at all). Same command as the roaring step above; the feature's
         # build and unit tests stay in `features` (S-09).
         run: cargo clippy --locked --all-targets --features aws-secrets -- -D warnings
+      - name: chaos-gate self-test
+        # scripts/chaos-gate.sh gates the chaos and integration steps of this workflow: a failing
+        # chaos test that tests/chaos-known-red.txt (or tests/integration-known-red.txt) does not
+        # list fails the job. Issue #392: the gate's old one-line grep counted only
+        # `test <name> ... (ok|FAILED)$`, so a test whose own stderr (tests/common measured()) pushed
+        # libtest's verdict onto the next line was never seen FAILED — a real red (the #393 lock
+        # fencing failures) passed green beside the always-known-red #214. The gate now streams the
+        # log: the verdict from the `test` line whether it is same-line or the next bare one, libtest's
+        # `---- <name> stdout ----` failure headers as a second source, and cargo's `test result:`
+        # counts as a fail-closed net. This step runs the fixtures of those exact CI line shapes
+        # through the same script (scripts/chaos-gate.sh --self-test) so the gate cannot regress to
+        # hiding a red again. No cargo, no servers: it is the gate checking its own eyes.
+        run: scripts/chaos-gate.sh --self-test
 
   unit:
     name: unit tests
@@ -458,14 +472,15 @@ jobs:
         # steps below (strict there); filtered out here so it never runs twice.
         # The gate below is scripts/chaos-gate.sh with tests/integration-known-red.txt, used exactly
         # as the chaos steps use it: any failing test this file does not list FAILS the step (a
-        # ::error:: per test names the file to fix), and the one listed test
-        # (pinned::reg_cascade_refusal_seed_replay, #319) still runs and is reported in the job
-        # summary with its issue. No continue-on-error, no skip, no retry; the entry is temporary
-        # and owner-approved (2026-11-22) and #319's fix PR deletes it, and with the file empty this
-        # step is strict exactly as it stands. The gate's SKIP guard is chaos-specific, so the skip
-        # discipline of this step stays what LAZYVIEW_TEST_STRICT above already enforces.
-        # --color never: the gate's greps read these lines as plain text. The exit status of the
-        # runner (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
+        # ::error:: per test names the file to fix), and a listed one still runs and is reported in
+        # the job summary with its issue. No continue-on-error, no skip, no retry; every entry is
+        # temporary and owner-approved and its fix PR deletes it. Two entries went with the
+        # saved-position fix — `pinned::reg_cascade_refusal_seed_replay` (#319) and
+        # `lifecycle_crash_consistency` (#345), neither of which anyone has reproduced — so only
+        # `bench_throughput_shapes` (#378) is listed. The gate's SKIP guard is chaos-specific, so
+        # the skip discipline of this step stays what LAZYVIEW_TEST_STRICT above already enforces.
+        # --color never: the gate's greps read these lines as plain text. The exit status of the runner
+        # (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
         run: |
           export LAZYVIEW_TEST_DSNS="$GROUP_DSNS"
           case "${{ matrix.run }}" in

@@ -1071,12 +1071,17 @@ impl PgConn {
             .collect())
     }
 
-    /// Brings `table` in line with a diff in one transaction (T4.5): the unit DELETE or the
-    /// DELETEs by row key, then the INSERTs, then the commit — the shape of
-    /// `crate::mv::write_tx_mysql`, whose `start_transaction` (`src/mv.rs:1746`) this is the
-    /// analogue of. No `@lv_tz` session dance (§0.10): the session is UTC from connect (T1.4).
-    /// `began` is set where `write_diff` sets it, before the transaction is opened. Called by
-    /// `supervisor::write_once` on the op's own [`PgConn`] from the write pool (T5.1).
+    /// Brings `table` in line with a diff in autocommit statements, no transaction (owner
+    /// 2026-11-26, #331: a transaction holds every row lock until COMMIT, so parallel chunks with
+    /// overlapping keys deadlock). By row key: the upsert of inserted and changed rows, then the
+    /// DELETE of the keys that are gone, keys sorted so no two statements lock in opposite
+    /// orders; a reader never sees a hole. By unit (no row key): the unit DELETE, then the
+    /// INSERT (a reader may see a unit briefly empty, accepted). The caller saves the resume
+    /// position only after this returns, and a replay is idempotent (upsert, delete by key,
+    /// delete by unit then insert). Same statements as the transaction ran, minus BEGIN/COMMIT.
+    /// No `@lv_tz` session dance (§0.10): the session is UTC from connect (T1.4). `began` is set
+    /// where `write_diff` sets it. Called by `supervisor::write_once` on the op's own [`PgConn`]
+    /// from the write pool (T5.1).
     pub(crate) async fn write_tx(
         &mut self,
         schema: &str,
@@ -1095,29 +1100,57 @@ impl PgConn {
             unchanged: d.unchanged_rows,
         };
         began.store(true, Ordering::SeqCst);
-        let tx = self.client.transaction().await?;
-        if d.by_unit && d.deleted_rows > 0 {
-            let (cols, types) = unit_cols(layout, &layout.unit_pos);
-            let chunk = crate::mv::keys_chunk(&d.changed);
-            let (f, bound) =
-                filter_bind(&chunk, &cols, &layout.write_kinds(&layout.unit_pos), &types);
-            let sql = format!(
-                "DELETE FROM {}.{} WHERE {f}",
-                quote_ident(schema),
-                quote_ident(table)
-            );
-            exec(&tx, &sql, bound).await?;
-            Metrics::add(&metrics.mv_queries, 1);
+        let c = &self.client;
+        if d.by_unit {
+            if d.deleted_rows > 0 {
+                let (cols, types) = unit_cols(layout, &layout.unit_pos);
+                let chunk = crate::mv::keys_chunk(&d.changed);
+                let (f, bound) =
+                    filter_bind(&chunk, &cols, &layout.write_kinds(&layout.unit_pos), &types);
+                let sql = format!(
+                    "DELETE FROM {}.{} WHERE {f}",
+                    quote_ident(schema),
+                    quote_ident(table)
+                );
+                exec(c, &sql, bound).await?;
+                Metrics::add(&metrics.mv_queries, 1);
+            }
+            Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
+            insert_rows_on(c, schema, table, layout, &d.inserts, w, false, metrics).await?;
+        } else {
+            // Sorted by row key; the order is only for lock consistency across chunks.
+            let sorted_rows;
+            let rows: &[Vec<Value>] = match layout.row_key_for(Kind::Postgres) {
+                Some(key) => {
+                    let mut v: Vec<&Vec<Value>> = d.inserts.iter().collect();
+                    v.sort_by_cached_key(|r| {
+                        key.iter()
+                            .map(|&i| {
+                                r.get(i)
+                                    .cloned()
+                                    .map(Datum::from_value)
+                                    .unwrap_or(Datum::Null)
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    sorted_rows = v.into_iter().cloned().collect::<Vec<_>>();
+                    &sorted_rows
+                }
+                None => &d.inserts,
+            };
+            // A key with a NULL never conflicts in the unique index, so its row is not upserted
+            // but replaced: its old row goes first (after the upsert it would take the new row
+            // with it). Every other gone key is deleted after the upsert.
+            let mut gone = d.delete_keys.clone();
+            gone.sort_unstable();
+            let (nulls, gone): (Vec<Key>, Vec<Key>) = gone
+                .into_iter()
+                .partition(|k| k.iter().any(|v| matches!(v, Datum::Null)));
+            delete_keys_on(c, schema, table, layout, &nulls, w, metrics).await?;
+            insert_rows_on(c, schema, table, layout, rows, w, true, metrics).await?;
+            delete_keys_on(c, schema, table, layout, &gone, w, metrics).await?;
+            Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
         }
-        if !d.by_unit {
-            delete_keys_on(&tx, schema, table, layout, &d.delete_keys, w, metrics).await?;
-        }
-        Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
-        insert_rows_on(
-            &tx, schema, table, layout, &d.inserts, w, !d.by_unit, metrics,
-        )
-        .await?;
-        tx.commit().await?;
         Metrics::add(&metrics.units_changed, out.units_changed);
         Ok(out)
     }

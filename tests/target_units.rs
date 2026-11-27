@@ -416,3 +416,118 @@ fn vanished_deletes_only_the_units_the_source_has_lost() {
         Ok(())
     });
 }
+
+/// #331: parallel chunk writes to one target never deadlock each other. Every connection upserts
+/// the same units with its own values, so each round's diff changes every row; the statements
+/// of two connections meet on the same keys. A write transaction holding its row locks to the
+/// COMMIT while another asks for them in a different order is `ERROR 1213`; the writes are
+/// autocommit with sorted keys, so none of them ever fails (no retry here: `apply_prepared` has none).
+#[test]
+fn parallel_chunk_writes_to_the_same_rows_never_deadlock() {
+    scenario("mv_parallel_writes_331", |ctx| async move {
+        let db = ctx.new_db("mv_pw_331").await?;
+        let mut c = db.conn().await?;
+        for s in DDL {
+            exec(&mut c, s).await?;
+        }
+        let units = 400usize;
+        seed(&mut c, units, 2).await?;
+        let plan = plan_of(&db, "mv_pw_view", JOIN).await?;
+        let layout = mv::probe(&mut c, &db.name, &plan).await?;
+        let table = "mv_pw_target";
+        let m = lazyview::Metrics::default();
+        let w = build_target(&db, &plan, &layout, table, &m).await?;
+        let base = mv::read_source(&mut c, &plan, &layout, None, &m, false).await?;
+        assert_eq!(base.len(), units);
+        let base_final = base.clone();
+        let (writers, rounds) = (6usize, 25usize);
+        let mut tasks = Vec::new();
+        for t in 0..writers {
+            let (db_name, layout) = (db.name.clone(), layout.clone());
+            let mut conn = db.conn().await?;
+            let base = base.clone();
+            tasks.push(tokio::spawn(async move {
+                let m = lazyview::Metrics::default();
+                for r in 0..rounds {
+                    // Column 1 is COUNT(*): a value of this writer and round, so the old rows
+                    // (some other writer's) always differ.
+                    let rows: Vec<Vec<mysql_async::Value>> = base
+                        .iter()
+                        .cloned()
+                        .map(|mut row| {
+                            row[1] = mysql_async::Value::Int((1 + t * rounds + r) as i64);
+                            row
+                        })
+                        .collect();
+                    let new = mv::prepare(&layout, rows);
+                    mv::apply_prepared(&mut conn, &db_name, table, &layout, None, &new, &w, &m)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("writer {t} round {r}: {e:#}"))?;
+                }
+                anyhow::Ok(())
+            }));
+        }
+        for t in tasks {
+            t.await??;
+        }
+        // Converged: the writers are done, one more pass with the source's own rows brings the
+        // view to the source exactly, and a second pass finds nothing left to write.
+        let new = mv::prepare(&layout, base_final);
+        mv::apply_prepared(&mut c, &db.name, table, &layout, None, &new, &w, &m).await?;
+        let again =
+            mv::apply_prepared(&mut c, &db.name, table, &layout, None, &new, &w, &m).await?;
+        assert_eq!(
+            again.units_changed, 0,
+            "the view equals the source: {again:?}"
+        );
+        assert_eq!(again.unchanged, units as u64);
+        Ok(())
+    });
+}
+
+/// #331: a chunk is written as separate autocommit statements, so a crash can land between them.
+/// The resume position is saved only after the whole chunk, so the chunk is replayed: this is
+/// the state a crash after the delete of the chunk's vanished units (and before its upserts) leaves,
+/// and the replay must bring the view to the source exactly, once and for good.
+#[test]
+fn a_chunk_cut_between_its_statements_converges_on_replay() {
+    scenario("mv_cut_chunk_331", |ctx| async move {
+        let db = ctx.new_db("mv_cc_331").await?;
+        let mut c = db.conn().await?;
+        for s in DDL {
+            exec(&mut c, s).await?;
+        }
+        seed(&mut c, 50, 2).await?;
+        let plan = plan_of(&db, "mv_cc_view", JOIN).await?;
+        let layout = mv::probe(&mut c, &db.name, &plan).await?;
+        let table = "mv_cc_target";
+        let m = lazyview::Metrics::default();
+        let w = build_target(&db, &plan, &layout, table, &m).await?;
+        let unit = layout.unit_cols()[0].clone();
+        // The source moves on: unit 3 loses its rows, unit 4's values change, unit 60 appears.
+        exec(&mut c, "DELETE FROM links WHERE entity_id = 3").await?;
+        exec(&mut c, "DELETE FROM entities WHERE id = 3").await?;
+        exec(&mut c, "UPDATE links SET v = v + 1000 WHERE entity_id = 4").await?;
+        exec(&mut c, "INSERT INTO entities VALUES (60, 1)").await?;
+        exec(&mut c, "INSERT INTO links VALUES (1000, 60, 7)").await?;
+        // The crash: the delete of unit 3's row went through, nothing else of the chunk did.
+        exec(&mut c, &format!("DELETE FROM `{table}` WHERE {unit} = 3")).await?;
+        // The replay: read the source, diff against what the target holds now, write.
+        for pass in 0..2 {
+            let rows = mv::read_source(&mut c, &plan, &layout, None, &m, false).await?;
+            let new = mv::prepare(&layout, rows);
+            let a =
+                mv::apply_prepared(&mut c, &db.name, table, &layout, None, &new, &w, &m).await?;
+            if pass == 1 {
+                assert_eq!(a.units_changed, 0, "converged after one replay: {a:?}");
+            }
+        }
+        let got = rows(
+            &mut c,
+            &format!("SELECT {unit}, COUNT(*) FROM `{table}` GROUP BY {unit} ORDER BY 1"),
+        )
+        .await?;
+        assert_eq!(got.len(), 50, "units 1-2, 4-50 and 60");
+        Ok(())
+    });
+}

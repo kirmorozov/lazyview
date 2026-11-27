@@ -1274,32 +1274,12 @@ async fn seed_reads(conn: &mut mysql_async::Conn, db: &Db) -> Result<usize> {
     Ok(session_ids(conn, &filter).await?.len())
 }
 
-/// Whether this server reports the binlog position of a consistent snapshot at all: the same read
-/// `engine::snapshot_position` makes. Without it the gap window falls back to the position read
-/// after the seed, which is the wider (over-counting) shape.
-async fn snapshot_reported(conn: &mut mysql_async::Conn) -> Result<bool> {
-    exec(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
-    exec(conn, "START TRANSACTION WITH CONSISTENT SNAPSHOT").await?;
-    let read = common::rows(conn, "SHOW SESSION STATUS LIKE 'binlog_snapshot_%'").await;
-    exec(conn, "COMMIT").await?;
-    Ok(read?.iter().any(|r| {
-        r.first().and_then(|k| k.as_ref()).is_some_and(|k| {
-            k.eq_ignore_ascii_case("binlog_snapshot_file")
-                && r.get(1)
-                    .and_then(|v| v.as_ref())
-                    .is_some_and(|v| !v.trim().is_empty())
-        })
-    }))
-}
-
-/// Restart gap, where the window ENDS (issue #167): the startup seed of the cascade cache and the
-/// position that closes the gap window are one consistent read of the source, so the window stops
-/// where the seed stopped rather than where the seed finished. A parent key update that commits
-/// while the seed is reading was seen by no seed query: the cache still holds its children under
-/// the old key, the replay expands them from its own images, and it is NOT a gap (the old shape of
-/// the window counted it as one, over the range that replays correctly). A parent key update from
-/// BEFORE that read still is a gap: the seed read the children already moved, so the lookup under
-/// the old key hits nothing and only the window's remedy reaches them.
+/// Restart gap, where the window ENDS (issue #167; owner 2026-11-26: no source transaction for
+/// the seed): the startup seed of the cascade cache is plain reads and the position that closes
+/// the gap window is read right after it, so the window is the wide shape: a parent key update
+/// that commits while the seed is reading may have been seen by the seed (the children already
+/// under the new key), so it counts as a gap and the window's remedy reaches them. The view is
+/// exact at convergence either way. A parent key update from BEFORE the seed read is a gap too.
 ///
 /// A MAP route as in [`reg_cascade_window_parent_update`]: `entities` is the cascade's parent, is
 /// not an alias of the view, and its key gives no unit. The bulk of `links` under one group is what
@@ -1352,7 +1332,6 @@ fn reg_cascade_window_ends_at_seed() {
         let (db, mut eng) = setup(&ctx, "reg_casc_seed_pos", &ddl, &specs, &[]).await?;
         let mut sc = db.conn().await?;
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
-        let reports = snapshot_reported(&mut sc).await?;
         eng.stop().await?;
 
         // (1) The parent key update of the rows that will move (the units (1,'ta') and (2,'tb'))
@@ -1410,8 +1389,8 @@ fn reg_cascade_window_ends_at_seed() {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let s = eng.stats_of(&db, "r_seed_pos")?;
         let d = eng.snapshot().since(&f0);
-        // The replay reached the cache; only the window's tally differs: the seed's own snapshot
-        // ends it where the server reports a position. TWO shapes of source reach it, and the
+        // The replay reached the cache; the window is the wide shape (the position is read after
+        // the seed), so the change counts as one gap. TWO shapes of source reach it, and the
         // `rows_seen` of this one transaction says which one this server is. A source that logs
         // only the parent's own row change (rows_seen 1) is expanded by the parent's event, so it
         // tallies the 2 kept rows. A source that also logs the rows its own FK cascade moved
@@ -1420,7 +1399,7 @@ fn reg_cascade_window_ends_at_seed() {
         // (its remedy, `kept_under_new`, is a gap-window remedy only) and the child rows are what
         // named the units. Either way the view is exact (`verify` below) and `ids_marked` says the
         // units of BOTH moved groups were named, so neither shape passes by doing nothing.
-        let want = if reports { 0 } else { 1 };
+        let want = 1;
         let source_logged_cascade_rows = d.rows_seen >= 3;
         ensure!(
             s.ids_marked >= 2
@@ -1428,8 +1407,8 @@ fn reg_cascade_window_ends_at_seed() {
                 && s.cascade_gaps == want
                 && s.whole_view_refreshes == 0
                 && d.full_rebuilds == 0,
-            "the parent change the seed never saw was replayed wrong: counted as {} gap(s) (a \
-             server without a snapshot position counts one), or it named no unit of the moved key \
+            "the parent change the seed never saw was replayed wrong: counted as {} gap(s) (the \
+             wide window counts one), or it named no unit of the moved key \
              and reached neither the parent's expansion nor the cascade's own rows, or it \
              refreshed the whole view or rebuilt: {s:?} {}",
             s.cascade_gaps,
@@ -1445,10 +1424,7 @@ fn reg_cascade_window_ends_at_seed() {
             "the groups the change made during the seed read moved",
         )
         .await?;
-        ctx.log(format!(
-            "in-window key update (snapshot reported: {reports}): {s:?} {}",
-            fmt_snapshot(&d)
-        ));
+        ctx.log(format!("in-window key update: {s:?} {}", fmt_snapshot(&d)));
         eng.stop().await?;
 
         // (2) The lower bound: a parent key update from BEFORE the seed's read still opens a gap

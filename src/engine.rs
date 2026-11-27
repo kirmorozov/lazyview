@@ -526,6 +526,77 @@ fn lag_floor(floor: &mut Position, lag: &BTreeMap<String, Lag>) {
     }
 }
 
+/// The position a build in flight holds the floor at: `Some(started)` unless the version being
+/// built is the routine rebuild of the live one (same plan, live version not frozen), when it is
+/// `None`. The one rule the saved position and the reported one share, so neither can claim more
+/// than the other (C1, #345 #319).
+///
+/// A routine build leaves the live version maintained as usual, so that version's own `since`
+/// holds the floor and the build holds nothing extra back. Any other build — a new definition or
+/// targets, a source schema change that froze the live version, a first build — is what the view
+/// will be served from once it swaps, and it reflects only what its read saw at `started`
+/// ([`Next::started`]). Every change after that is kept for it in memory alone, in a shadow table
+/// a restart throws away, so the floor stops at the read: a restart re-reads from there and
+/// buffers them again instead of leaving the view without them.
+fn building_floor(s: &Slot) -> Option<&Position> {
+    let n = s.next.as_ref()?;
+    let routine = s
+        .live
+        .as_ref()
+        .is_some_and(|l| Arc::ptr_eq(&l.plan, &n.plan) && !l.frozen);
+    (!routine).then_some(&n.started)
+}
+
+/// [`Engine::pending_floor`] over `slots` at `boundary`, without the rest of the engine (the
+/// method says what it means). `pinned` answers the dedup core's oldest buffered id of a
+/// definition.
+fn pending_floor_of(
+    boundary: &Position,
+    slots: &[Slot],
+    mut pinned: impl FnMut(u64) -> Option<Position>,
+    held: bool,
+) -> Position {
+    let mut floor = boundary.clone();
+    for s in slots.iter().filter(|s| s.error.is_none()) {
+        lower_pos(&mut floor, s.stale_since.as_ref());
+        // A frozen live version holds the floor as a maintained one does. The freeze only says its
+        // buffer is no longer being appended to and it is no longer refreshed: the table is still
+        // what readers see and the one a restart resumes on, and the changes it owes until the new
+        // version swaps are kept in memory alone, so the save waits for them too (C1, #345 #319).
+        // `Version::since`'s own contract — "the saved and the reported position never pass it" —
+        // never asked whether the version was frozen.
+        if let Some(l) = s.live.as_ref() {
+            lower_pos(&mut floor, l.since.as_ref());
+            lower_pos(&mut floor, pinned(s.def_id).as_ref());
+            // The images remembered for later lookups are held only for a version that will still
+            // run them: a frozen one refreshes no more, and `after_boundary` stops pruning its
+            // lookback while its buffer holds images, which would pin the position for the whole
+            // freeze instead of for the lookback window.
+            if held && !l.frozen {
+                lower_pos(&mut floor, l.recent.floor());
+            }
+            lag_floor(&mut floor, &l.lag);
+        }
+        lower_pos(&mut floor, building_floor(s));
+    }
+    floor
+}
+
+/// [`Engine::persist_position`]'s floor: [`pending_floor_of`] with the images held, lowered to the
+/// cursor before an XA transaction that is still open or prepared (`held` is `true` for the save,
+/// see the method for why its rows must be re-read after a restart). Split from the method so the
+/// rule a restart depends on can be tested without a server.
+fn save_floor_of(
+    boundary: &Position,
+    slots: &[Slot],
+    pinned: impl FnMut(u64) -> Option<Position>,
+    unresolved: Option<&Position>,
+) -> Position {
+    let mut floor = pending_floor_of(boundary, slots, pinned, true);
+    lower_pos(&mut floor, unresolved);
+    floor
+}
+
 /// A target the view could not be built on (unreachable, refused): retried by a partial build,
 /// unless its changes are kept in `Lag` (see `retry_lag`).
 struct Down {
@@ -1056,6 +1127,11 @@ struct Engine {
     >,
     /// (table, binlog column count) → column count of the table's current definition.
     shapes: HashMap<(TableRef, u64), Option<usize>>,
+    /// Tables an in-place plan swap read the definition of from a catalog ahead of the DDL's
+    /// binlog position (#359), mapped to whether a TABLE_MAP of the table was read since: the
+    /// rows between that DDL and the next one were decoded with a layout that may be a later
+    /// one's. Empty (and free per event) outside such a window; see [`Engine::swap_in_place`].
+    readahead: HashMap<TableRef, bool>,
     /// XA transaction being read: (xid, position before it, rows of routed tables).
     xa_current: Option<(String, XaTxn)>,
     /// Prepared XA transactions awaiting XA COMMIT / ROLLBACK.
@@ -1911,13 +1987,19 @@ async fn run_lock_beat<D: LockBeat + Send + 'static, F: WriteFence>(
     mut stop: watch::Receiver<bool>,
 ) {
     let uncertain_after = 2 * heartbeat;
-    let mut last_ok = Instant::now();
+    // The loop's own clock is `tokio::time`'s, not `std`'s, because the two windows below and the
+    // sleeps that bound them must be measured by the same clock (#375): with a `std::time::Instant`
+    // here, the beats' progress depended on the runner's scheduler as well as on the beats, and a
+    // loaded CI runner could stretch the wall time of one unanswered beat past `uncertain_after`
+    // and close the gates on a single blip. A paused clock (the tests) now moves this only when a
+    // beat period passes; outside one, `tokio::time::Instant` is the very instant `std` reads.
+    let mut last_ok = tokio::time::Instant::now();
     let mut fencing: Option<JoinHandle<usize>> = None;
     loop {
         match d.beat().await {
             Ok(Beat::Held) => {
                 metrics.leader_beat_ok();
-                last_ok = Instant::now();
+                last_ok = tokio::time::Instant::now();
                 publish_leader(&state, LeaderState::Active);
             }
             Ok(Beat::Taken(why)) => {
@@ -1945,7 +2027,7 @@ async fn run_lock_beat<D: LockBeat + Send + 'static, F: WriteFence>(
                 match tokio::time::timeout(uncertain_after, d.rejoin()).await {
                     Ok(Ok(())) => {
                         metrics.leader_beat_ok();
-                        last_ok = Instant::now();
+                        last_ok = tokio::time::Instant::now();
                         publish_leader(&state, LeaderState::Active);
                         info!("leadership lock: session re-opened, the lock and epoch confirmed; still the active instance");
                     }
@@ -2319,6 +2401,7 @@ impl Engine {
             core_reads: HashMap::new(),
             table_ids: HashMap::new(),
             shapes: HashMap::new(),
+            readahead: HashMap::new(),
             xa_current: None,
             xa_pending: HashMap::new(),
             defs_dirty: false,
@@ -3725,26 +3808,20 @@ impl Engine {
         if resumed.is_empty() {
             return Ok(targets);
         }
-        // Seed the in-memory cascade cache on the source, and end the gap window at the position
-        // that same consistent read includes: a parent replayed from before it is a gap (the seed
-        // read saw its children already moved), one replayed from at or after it was seen by no
-        // seed read and expands correctly from its own images. The position read is the one extra
-        // statement of a resume; where the server reports no snapshot position the window keeps
-        // the wider shape of the position read after the seed. (The Cascade arm of feed_rows
-        // clears gap_until once the log passes it.)
+        // Seed the in-memory cascade cache on the source (plain reads, no transaction), and end
+        // the gap window at the binlog position read right after the seed: a parent replayed from
+        // before it is a gap (the seed read may have seen its children already moved), one
+        // replayed from at or after it was seen by no seed read and expands correctly from its
+        // own images. (The Cascade arm of feed_rows clears gap_until once the log passes it.)
         // One wait before the seed (PR G §3.4): the cache is built from reads on the read
         // connection. The gap window then ends at a position of the **source's** binlog: the
         // reader's own snapshot coordinates name its relaying log, never the writer's stream,
-        // so under the read split the window keeps the wider shape of the position read after
-        // the seed — on the writer connection.
+        // so under the read split the position is read on the writer connection.
         self.read_barrier().await?;
-        let (mut cache, seed_pos) = seed_cache_at_snapshot(&mut self.src, plan).await?;
-        cache.gap_until = Some(match seed_pos.filter(|_| self.read_role.is_none()) {
-            Some(p) => p,
-            None => match &mut self.read_role {
-                Some(rr) => binlog::current_position(&mut rr.ctrl).await?,
-                None => binlog::current_position(&mut self.src).await?,
-            },
+        let mut cache = seed_cache(&mut self.src, plan).await?;
+        cache.gap_until = Some(match &mut self.read_role {
+            Some(rr) => binlog::current_position(&mut rr.ctrl).await?,
+            None => binlog::current_position(&mut self.src).await?,
         });
         let rest: Vec<String> = targets
             .iter()
@@ -5244,6 +5321,11 @@ impl Engine {
             } => {
                 self.in_txn = true;
                 let key = (schema, table);
+                if !self.readahead.is_empty() {
+                    if let Some(seen) = self.readahead.get_mut(&key) {
+                        *seen = true;
+                    }
+                }
                 // Our own tables: the commit fence's rows are not a foreign change, and no view
                 // reads them.
                 if !(key.0 == self.schema
@@ -6406,22 +6488,15 @@ impl Engine {
     /// down: the keys kept for it live only in memory, so the saved position waits for them and
     /// a restart replays the outage into them (see [`lag_floor`]). With `held`, also the oldest
     /// change whose images are remembered for later lookups (applied, but a restart must read
-    /// them again to have them; see [`Lookback`]).
+    /// them again to have them; see [`Lookback`]). A version being built does too, at the
+    /// position its build started at (see [`building_floor`]).
     fn pending_floor(&self, held: bool) -> Position {
-        let mut floor = self.boundary.to_position();
-        for s in self.slots.iter().filter(|s| s.error.is_none()) {
-            lower_pos(&mut floor, s.stale_since.as_ref());
-            if let Some(l) = s.live.as_ref().filter(|l| !l.frozen) {
-                lower_pos(&mut floor, l.since.as_ref());
-                let pin = self.dedup.pinned(s.def_id);
-                lower_pos(&mut floor, pin.as_ref());
-                if held {
-                    lower_pos(&mut floor, l.recent.floor());
-                }
-                lag_floor(&mut floor, &l.lag);
-            }
-        }
-        floor
+        pending_floor_of(
+            &self.boundary.to_position(),
+            &self.slots,
+            |id| self.dedup.pinned(id),
+            held,
+        )
     }
 
     /// Reports the position the views reflect: everything up to it is applied to every live
@@ -6439,18 +6514,9 @@ impl Engine {
         if self.defs_dirty {
             return;
         }
-        let mut floor = self.pending_floor(false);
-        for s in self.slots.iter().filter(|s| s.error.is_none()) {
-            if let Some(n) = &s.next {
-                let routine = s
-                    .live
-                    .as_ref()
-                    .is_some_and(|l| Arc::ptr_eq(&l.plan, &n.plan) && !l.frozen);
-                if !routine && n.started < floor {
-                    floor = n.started.clone();
-                }
-            }
-        }
+        // The same floor the save takes, the building version's `started` included: what the
+        // engine reports as applied and what a restart resumes from are the one claim.
+        let floor = self.pending_floor(false);
         if self.metrics.applied().is_none_or(|a| a < floor) {
             self.metrics.set_applied(floor);
         }
@@ -6458,6 +6524,20 @@ impl Engine {
 
     async fn on_tables_changed(&mut self, tables: &[TableRef], rows_kept: bool, since: &Position) {
         self.shapes.clear();
+        // The tables of this DDL whose rows since the last swap provably decoded with the layout
+        // they had (no TABLE_MAP read in the read-ahead window); the window ends here.
+        let hit_t = |x: &TableRef| {
+            tables
+                .iter()
+                .any(|t| t.0 == x.0 && (t.1 == "*" || t.1 == x.1))
+        };
+        let clean: Vec<TableRef> = self
+            .readahead
+            .iter()
+            .filter(|(t, seen)| !**seen && hit_t(t))
+            .map(|(t, _)| t.clone())
+            .collect();
+        self.readahead.retain(|t, _| !hit_t(t));
         for t in tables {
             if t.1 == "*" {
                 self.catalog.clear();
@@ -6508,7 +6588,7 @@ impl Engine {
         for (id, freeze) in todo {
             // A schema change that keeps every row: the same reads swap in place. Anything else
             // (a table swapped in or rows removed) rebuilds online.
-            if freeze && rows_kept && self.swap_in_place(id, since, tables).await {
+            if freeze && rows_kept && self.swap_in_place(id, since, tables, &clean).await {
                 continue;
             }
             let from = self.stale_from(id, since, tables);
@@ -6530,8 +6610,22 @@ impl Engine {
     /// definition of each was read when the binlog ended at or before `at` (its head; after a
     /// restart or a catch-up the plan may come from a later catalog). The new read's head likewise
     /// bounds the DDLs it may include: a later DDL of those tables before it fails this check and
-    /// rebuilds the view, stale since this swap (see [`Self::stale_from`]). DDL path only.
-    async fn swap_in_place(&mut self, id: u64, at: &Position, tables: &[TableRef]) -> bool {
+    /// rebuilds the view, stale since this swap (see [`Self::stale_from`]).
+    ///
+    /// The exception (#359), `clean`: a table whose live definition this engine itself put in
+    /// place by an earlier swap, reading the catalog ahead of that DDL, and of which no TABLE_MAP
+    /// was read since. Nothing was decoded with the read-ahead layout, so the later DDL the read
+    /// already included is adopted like any other (the new read is compared by `same_reads`).
+    /// Once a row of the table was read in that window it may have been decoded, or skipped as
+    /// "predating the plan" by `check_shapes`, with the wrong layout: the head check then
+    /// rebuilds from the earlier swap. DDL path only.
+    async fn swap_in_place(
+        &mut self,
+        id: u64,
+        at: &Position,
+        tables: &[TableRef],
+        clean: &[TableRef],
+    ) -> bool {
         let Some(i) = self.idx_of(id) else {
             return false;
         };
@@ -6574,6 +6668,7 @@ impl Engine {
                 .map(|h| &h.0)
                 .or(l.catalog_head.as_ref())
                 .is_some_and(|h| h <= at)
+                || (l.table_heads.contains_key(t) && clean.contains(t))
         };
         if touched.is_empty() || !touched.iter().all(predates) {
             return false;
@@ -6612,8 +6707,9 @@ impl Engine {
         }
         let plan = Arc::new(plan_swap::adopt(&l.plan, &plan));
         l.plan = plan.clone();
-        for t in touched {
-            l.table_heads.insert(t, (head.clone(), at.clone()));
+        let ahead = head > *at;
+        for t in &touched {
+            l.table_heads.insert(t.clone(), (head.clone(), at.clone()));
         }
         info!(
             view = %l.name,
@@ -6623,6 +6719,11 @@ impl Engine {
         let s = &mut self.slots[i];
         s.last_plan = Some(plan);
         s.last_plan_head = plan_head;
+        if ahead {
+            for t in touched {
+                self.readahead.entry(t).or_insert(false);
+            }
+        }
         self.rebuild_routes();
         true
     }
@@ -8334,6 +8435,58 @@ impl Engine {
         }
     }
 
+    /// One INFO line per whole-view refresh (C2, #345 #319): the view, why the whole view is
+    /// being re-read, the position the read is taken at, and whether an XA transaction is
+    /// unresolved at that moment. A source `SELECT` cannot see the rows a prepared XA transaction
+    /// still holds, so a whole-view read taken inside one comes back without them and the view is
+    /// left without them: until this line the only trace of such a refresh was the
+    /// `whole_view_refreshes` counter (`src/stats.rs`), and a counter cannot be tied to a binlog
+    /// position, which is what makes a red's log able to answer the question.
+    ///
+    /// Cost: one line per refresh, from the refresh path, never per event — the read it reports is
+    /// a full `SELECT` over the view's source, so the line is nothing next to the work it
+    /// describes. Nothing is queried for it: it reads the boundary and the XA maps the caller
+    /// already holds, and formats the one or two position texts it prints.
+    fn log_whole_refresh(&self, plan: &ViewPlan, table: &str, dirty: &ViewDirty, global: bool) {
+        let reason = if global {
+            "a global aggregate view recomputes its one row"
+        } else if matches!(plan.mode, Mode::Full(_)) {
+            "a full-mode view re-reads its source"
+        } else if dirty.tally.xa_unknown_commits > 0 {
+            "an XA COMMIT prepared before this run: the reader never saw its rows"
+        } else if dirty.tally.cascade_gaps > 0 {
+            "a cascade gap window: the children a parent change took are not in the cache"
+        } else {
+            "changes no trace could follow (a whole-view route or a short row image)"
+        };
+        // The oldest unresolved XA transaction of the run: its start is the position a lost row's
+        // binlog position has to be compared against. `unpinned` ones are listed too — an XA that
+        // stopped holding the saved position is exactly the one that can strand a row.
+        let mut oldest: Option<&Cursor> = None;
+        if let Some((_, xa)) = &self.xa_current {
+            if xa.start.is_some() {
+                oldest = Some(&xa.start);
+            }
+        }
+        for xa in self.xa_pending.values() {
+            if xa.start.is_some() && oldest.is_none_or(|o| xa.start < *o) {
+                oldest = Some(&xa.start);
+            }
+        }
+        let read_at = self.boundary.to_position();
+        match oldest {
+            Some(c) => info!(
+                view = %plan.name, table, reason, read_at = %read_at,
+                xa_open = true, xa_start = %c,
+                "whole-view refresh: reading the source again",
+            ),
+            None => info!(
+                view = %plan.name, table, reason, read_at = %read_at, xa_open = false,
+                "whole-view refresh: reading the source again",
+            ),
+        }
+    }
+
     /// Refreshes the units in `dirty` on table `table` of every target in `targets`. Sources are
     /// read once per chunk and each target is written independently: one that fails is skipped
     /// from then on and reported. `dirty` is cleared (except a pending rebuild) unless reading
@@ -8358,6 +8511,12 @@ impl Engine {
         }
         let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
         let mut work = crate::stats::Work::default();
+        // The unsupervised form of the whole-view read: `dirty.all` is exactly the two branches
+        // below (a global view without it returns without reading), so this is the once-per-
+        // refresh site for the line the supervised path logs in `prepare_refresh`.
+        if dirty.all {
+            self.log_whole_refresh(plan, table, dirty, matches!(plan.mode, Mode::Global));
+        }
         if matches!(plan.mode, Mode::Global) {
             if !dirty.all {
                 return Ok(Refreshed::default());
@@ -8623,6 +8782,13 @@ impl Engine {
                 timeout: self.cfg.target_timeout,
                 fresh: self.caps.fresh_snapshot,
             });
+        }
+        // The supervised form of the whole-view read (see `log_whole_refresh`): logged here
+        // because `refresh_all_live` prepares every view's refresh before running any of them,
+        // so the line belongs with the job that is about to read. `p.whole` and `p.global` are
+        // both set only under `dirty.all`, and a refresh with no writable target reads nothing.
+        if p.job.is_some() && (p.whole || p.global) {
+            self.log_whole_refresh(plan, table, dirty, p.global);
         }
         self.metrics.beat();
         Ok(p)
@@ -9256,7 +9422,19 @@ impl Engine {
             debug!("position save held: the leadership lock does not allow new writes right now");
             return Ok(());
         }
-        let mut pos = self.pending_floor(true);
+        // The holds of the XA transactions still open or prepared (see [`save_floor_of`]): their
+        // rows sit in memory and a source read cannot see them, so the save waits for the cursor
+        // before them and a restart re-reads the transaction. One that has been prepared for
+        // longer than `XA_PIN_MAX` is reported once and stops holding the position back.
+        let mut unresolved: Option<Position> = None;
+        let mut hold = |start: &Cursor| {
+            if start.is_some() {
+                let at = start.to_position();
+                if unresolved.as_ref().is_none_or(|p| at < *p) {
+                    unresolved = Some(at);
+                }
+            }
+        };
         for (xid, xa) in self.xa_pending.iter_mut() {
             if !xa.start.is_some() {
                 continue;
@@ -9268,13 +9446,17 @@ impl Engine {
                 }
                 continue;
             }
-            pos = pos.min(xa.start.to_position());
+            hold(&xa.start);
         }
         if let Some((_, xa)) = &self.xa_current {
-            if xa.start.is_some() {
-                pos = pos.min(xa.start.to_position());
-            }
+            hold(&xa.start);
         }
+        let pos = save_floor_of(
+            &self.boundary.to_position(),
+            &self.slots,
+            |id| self.dedup.pinned(id),
+            unresolved.as_ref(),
+        );
         if !force && (pos == self.persisted.to_position() || !self.persist_needed) {
             // Held back where it was saved: look again one interval later (the flush deadline
             // is `last_persist` + interval; leaving it in the past would spin the loop).
@@ -9761,44 +9943,8 @@ async fn prepare_target(
 
 /// Seeds this build's in-memory cascade cache from the source before the table is filled: a
 /// cascade after this read is in the binlog this version replays, so none falls between the
-/// two reads.
-/// The startup seed of the cascade cache together with the binlog position its own consistent
-/// read includes (issue #167): the seed queries and the position read are ONE transaction, so the
-/// parent changes that read never saw are exactly the ones from before that position, and a change
-/// committed while the seed was reading replays from its own images instead of counting as a gap.
-/// `None` is the server reporting no snapshot position (`source::maria::snapshot_position`), where the caller
-/// keeps the wider window of the position read after the seed.
-async fn seed_cache_at_snapshot(
-    conn: &mut Conn,
-    plan: &ViewPlan,
-) -> Result<(cascade::Cache, Option<Position>)> {
-    // The session reads with READ COMMITTED; the snapshot needs REPEATABLE READ.
-    conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        .await?;
-    conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-        .await?;
-    // The commit must run whatever the seed or the position read did: an open snapshot would
-    // poison the session for every later read the engine makes on it.
-    let cache = match seed_cache(conn, plan).await {
-        Ok(cache) => cache,
-        Err(e) => {
-            let _ = conn.query_drop("COMMIT").await;
-            return Err(e);
-        }
-    };
-    let pos = match crate::source::maria::snapshot_status(conn).await {
-        Ok(pos) => pos,
-        Err(e) => {
-            let _ = conn.query_drop("COMMIT").await;
-            return Err(e);
-        }
-    };
-    conn.query_drop("COMMIT")
-        .await
-        .context("committing the cascade seed transaction")?;
-    Ok((cache, pos))
-}
-
+/// two reads. Plain reads, no transaction: the caller reads the binlog position AFTER the seed,
+/// so the gap window covers every change the seed may have seen (replay re-derives the rest).
 async fn seed_cache(conn: &mut Conn, plan: &ViewPlan) -> Result<cascade::Cache> {
     let mut cache = cascade::Cache::default();
     for (ci, c) in plan.cascades.iter().enumerate() {
@@ -10191,6 +10337,14 @@ mod lock_task_tests {
     /// Runs the lock task over a script and reports what it left behind. The task ends by itself
     /// when it fences, and with the script otherwise (the driver closes the stop channel), so a
     /// run that needs neither would hang and fails on the bound below instead.
+    ///
+    /// The runtime's clock starts paused (#375), which is what makes a script mean what it says:
+    /// every `sleep(heartbeat)` in [`run_lock_beat`] advances the clock by exactly one period and
+    /// costs no wall time, so `last_ok.elapsed()` can only ever be a whole number of periods and
+    /// one `Script::Lost` can never be measured as two unanswered beats however loaded the runner
+    /// is. The 5 s bound below is virtual time on that clock, so a run that never ends fails on
+    /// it rather than hanging. `tokio`'s `test-util` (Cargo.toml's `[dev-dependencies]`) is what
+    /// the paused clock needs; it reaches no release build.
     fn drive(beats: &[Script], rejoins: &[Rejoin]) -> Run {
         let (stop_tx, stop_rx) = watch::channel(false);
         let (beats_done, rejoins_done) =
@@ -10209,6 +10363,7 @@ mod lock_task_tests {
         let published = Arc::new(std::sync::Mutex::new(Vec::new()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .start_paused(true)
             .build()
             .unwrap();
         let ended = rt
@@ -10262,6 +10417,36 @@ mod lock_task_tests {
             fences: stops.load(Ordering::Relaxed),
             published: states,
         }
+    }
+
+    /// The guard every run above rests on: the beat loop reads a clock the script moves, not the
+    /// runner's. Five hundred periods of beat time pass in no wall time at all — the margin below
+    /// is one second of the runner's time for 2.5 s of beat time, which no busy CI runner can eat.
+    /// Drop `start_paused` from [`drive`] and this is the test that says so before a scripted
+    /// `Script::Lost` starts meaning "however long the scheduler got round in" (#375).
+    #[test]
+    fn the_beat_clock_is_the_scripts_not_the_runners() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let wall = std::time::Instant::now();
+        let (beat_time, wall_time) = rt.block_on(async {
+            let before = tokio::time::Instant::now();
+            tokio::time::sleep(500 * Duration::from_millis(5)).await;
+            (before.elapsed(), wall.elapsed())
+        });
+        assert!(
+            beat_time >= Duration::from_secs(2),
+            "the beat clock must move with the beats: {beat_time:?} of beat time, {wall_time:?} \
+             of wall time"
+        );
+        assert!(
+            wall_time < Duration::from_secs(1),
+            "{wall_time:?} of wall time for {beat_time:?} of beat time: the clock is the runner's, \
+             not the script's, and how far one beat is worth depends on how loaded the machine is"
+        );
     }
 
     /// A healthy instance: every beat answered, the state stays `Active`, the beat clock moves,
@@ -10600,6 +10785,217 @@ mod tests {
                 pos: 7
             },
             "the down target's `since` holds the saved position back"
+        );
+    }
+
+    /// A planned view over the star schema, for the floors a slot holds.
+    fn plan(sql: &str) -> ViewPlan {
+        use crate::analyze::{parse_definition, plan_block};
+        use crate::catalog::test_catalog::linked_catalog;
+
+        plan_block(&parse_definition(sql).unwrap(), "db", &linked_catalog()).unwrap()
+    }
+
+    fn pos(file: &str, at: u64) -> Position {
+        Position {
+            file: file.to_string(),
+            pos: at,
+        }
+    }
+
+    /// A layout that never saw a target (nothing here reads it: the floor is positions only).
+    fn layout() -> Layout {
+        Layout {
+            cols: Vec::new(),
+            n_visible: 0,
+            hidden: Vec::new(),
+            unit_pos: Vec::new(),
+            primary: false,
+            lineage: Vec::new(),
+            epoch: Vec::new(),
+            identity: Vec::new(),
+            partial: Vec::new(),
+            key_budget: 3072,
+        }
+    }
+
+    /// The live version of a view: `frozen` is the source schema change's freeze (`replan_slot`),
+    /// `since` the oldest change its table still owes.
+    fn live(plan: &Arc<ViewPlan>, frozen: bool, since: Option<Position>) -> Version {
+        Version {
+            plan: plan.clone(),
+            layout: layout(),
+            name: plan.name.clone(),
+            targets: vec!["t1".to_string()],
+            dirty: ViewDirty::for_aliases(plan.aliases.len()),
+            frozen,
+            since,
+            lag: BTreeMap::new(),
+            behind: BTreeMap::new(),
+            recent: Lookback::default(),
+            catalog_head: None,
+            table_heads: HashMap::new(),
+        }
+    }
+
+    /// A version being built: `started` is the position its read ran at ([`Next::started`]),
+    /// `since` the oldest change buffered for it.
+    fn next(plan: &Arc<ViewPlan>, started: Position, since: Option<Position>) -> Next {
+        Next {
+            plan: plan.clone(),
+            name: plan.name.clone(),
+            targets: vec!["t1".to_string()],
+            dirty: ViewDirty::for_aliases(plan.aliases.len()),
+            generation: 1,
+            task: idle_task(),
+            done: None,
+            partial: false,
+            hash: "h".to_string(),
+            swapped: HashSet::new(),
+            lock_wait: HashSet::new(),
+            started,
+            since,
+            recent: Lookback::default(),
+            routine: false,
+            swapping: false,
+            catalog_head: None,
+        }
+    }
+
+    /// A task handle for a build the test never runs: the floor reads only the positions of a
+    /// `Next`, never its task.
+    fn idle_task() -> JoinHandle<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime to hand a Next its task")
+            .spawn(async {})
+    }
+
+    /// A slot with these two versions and nothing else holding it back.
+    fn slot(live: Option<Version>, next: Option<Next>) -> Slot {
+        Slot {
+            def_id: 7,
+            name: "db.v".to_string(),
+            definition: String::new(),
+            hash: "h".to_string(),
+            targets: vec!["t1".to_string()],
+            live,
+            next,
+            error: None,
+            retired: Vec::new(),
+            last_full: None,
+            wanted: Vec::new(),
+            stale_since: None,
+            waiting: None,
+            blocked: None,
+            retry_at: None,
+            down: BTreeMap::new(),
+            last_plan: None,
+            last_plan_head: None,
+            refresh_failures: 0,
+            replan_after: false,
+            rebuild_asked: None,
+            plan_timed_out: None,
+            stats: crate::stats::Flush::default(),
+            applied_ts: 0,
+        }
+    }
+
+    /// C1 (#345 #319), the shape both recorded mode-1 reds had: a (b) route view whose live
+    /// version a source schema change froze while the rebuild that replaces it is in flight — the
+    /// losing views were the route views, never the dedup-core one, and the rows that went missing
+    /// were XA writers' rows. The changes it still owes live in memory alone: the shadow table a
+    /// restart throws away, and a restart loads the frozen table back as an ordinary live view, so
+    /// nothing re-reads them once the saved position has passed them. `pending_floor` consulted
+    /// neither the frozen buffer nor the building version (only `after_boundary` knew the build's
+    /// `started`), so the save ran to the reader's head and the row was gone for that one view.
+    #[test]
+    fn the_saved_position_waits_for_a_frozen_view_and_the_build_that_replaces_it() {
+        let p = Arc::new(plan("CREATE VIEW v AS SELECT i.id FROM items i"));
+        // The reader is far ahead of everything the view owes.
+        let boundary = pos("binlog.000009", 9000);
+        // The freeze found the view owing the change at 5:500; the build that replaces the frozen
+        // table read at 6:600, and one more change has been buffered for it since.
+        let owed = pos("binlog.000005", 500);
+        let started = pos("binlog.000006", 600);
+        let buffered = pos("binlog.000007", 700);
+        let slots = [slot(
+            Some(live(&p, true, Some(owed.clone()))),
+            Some(next(&p, started.clone(), Some(buffered.clone()))),
+        )];
+        let saved = save_floor_of(&boundary, &slots, |_| None, None);
+        assert!(
+            saved <= owed,
+            "the save passed a change nothing has applied: {saved} is past {owed}, so a restart \
+             from it never re-reads it and this view alone loses the row"
+        );
+        assert_eq!(
+            saved, owed,
+            "the save stops at the oldest change the view still owes, frozen or not"
+        );
+        // The building version holds the same floor on its own: with the live version's buffer
+        // empty (everything it owed is in the source the build read), what must not be passed is
+        // the change buffered for the version that is not live yet.
+        let slots = [slot(
+            Some(live(&p, true, None)),
+            Some(next(&p, started.clone(), Some(buffered.clone()))),
+        )];
+        assert_eq!(
+            save_floor_of(&boundary, &slots, |_| None, None),
+            started,
+            "with no build done and no live marks left, the save stops at the position the build \
+             read at: everything after it is kept for the shadow table in memory alone"
+        );
+        // What the engine reports as applied and what a restart resumes from are the one claim:
+        // `after_boundary` takes this same floor, so the two cannot drift apart.
+        assert_eq!(
+            pending_floor_of(&boundary, &slots, |_| None, false),
+            save_floor_of(&boundary, &slots, |_| None, None),
+            "the reported position and the saved one disagree about the building version"
+        );
+        // An unresolved XA transaction still holds it back further, as before: its rows are in
+        // memory and invisible to a source read, which is how a whole-view read can miss them.
+        let held = save_floor_of(
+            &boundary,
+            &slots,
+            |_| None,
+            Some(&pos("binlog.000004", 400)),
+        );
+        assert_eq!(held, pos("binlog.000004", 400), "the XA hold still applies");
+    }
+
+    /// The other half of the rule, so the fix above is not "the position stops for every build":
+    /// a routine rebuild (the live version keeps its plan and is not frozen) is maintained as
+    /// usual, so it holds nothing back that the live version's own buffer does not hold — and an
+    /// empty buffer lets the save reach the reader's head, which is what `LAZYVIEW_FULL_REFRESH_MS`
+    /// rebuilds and every "affected ids unknown" rebuild depend on.
+    #[test]
+    fn a_routine_rebuild_holds_the_position_no_further_than_its_live_version() {
+        let p = Arc::new(plan("CREATE VIEW v AS SELECT i.id FROM items i"));
+        let boundary = pos("binlog.000009", 9000);
+        // Routine: same plan, live version unfrozen and caught up. Its build started long ago.
+        let s = slot(
+            Some(live(&p, false, None)),
+            Some(next(&p, pos("binlog.000002", 200), None)),
+        );
+        assert_eq!(
+            save_floor_of(&boundary, &[s], |_| None, None),
+            boundary,
+            "a routine rebuild must not hold the saved position back: it would stop the save for \
+             every cadence rebuild"
+        );
+        // With a change the live table still owes, that version's own `since` is what the save
+        // waits for — and it is older than the build's read, so the routine test above is what
+        // keeps the build's `started` from lowering the floor here.
+        let since = pos("binlog.000003", 300);
+        let s = slot(
+            Some(live(&p, false, Some(since.clone()))),
+            Some(next(&p, pos("binlog.000002", 200), None)),
+        );
+        assert_eq!(
+            save_floor_of(&boundary, &[s], |_| None, None),
+            since,
+            "the live version's own debt, not the routine build's read"
         );
     }
 

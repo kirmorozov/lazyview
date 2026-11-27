@@ -33,7 +33,7 @@ pub enum ColKind {
     Opaque,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub name: String,
     pub kind: ColKind,
@@ -60,7 +60,7 @@ pub struct Column {
 }
 
 /// A generated column's definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Generated {
     pub expr: String,
     /// STORED (in the row and its binlog images) rather than VIRTUAL (computed on read).
@@ -239,7 +239,7 @@ fn text_param(charset: &str, collation: Option<&str>) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
     pub schema: String,
     pub name: String,
@@ -275,7 +275,7 @@ impl FkAction {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForeignKey {
     pub parent: TableRef,
     /// Child column ordinals, in constraint order.
