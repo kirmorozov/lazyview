@@ -51,6 +51,18 @@ render() {
   return 0
 }
 
+# render_as <release> <name> [helm args...]: as render, under a chosen release name. An assertion on
+# `<release>-<chart>` names (the fullname helper's output) must render under that release — `render`
+# is always `lazyview`, so asserting lv-prod-* through it can only be red, and relaxing the assertion
+# to fit the wrong render would let a rule stop following the release name unnoticed.
+render_as() {
+  local release=$1 name=$2; shift 2
+  if ! "$HELM" template "$release" "$CHART" "$@" >"$OUT/$name.yaml" 2>"$OUT/$name.err"; then
+    bad "helm template $name (release $release) failed: $(tr '\n' ' ' <"$OUT/$name.err" | tail -c 300)"
+  fi
+  return 0
+}
+
 # show_only <name> <template-path> [helm args...]: one template file, for assertions that must not
 # see the rest of the render.
 show_only() {
@@ -167,9 +179,11 @@ has "$OUT/defaults.yaml" 'topologyKey: kubernetes.io/hostname'
 
 # The probes, exactly as deploy/k8s/base/deployment.yaml ships them (the paths, not just presence).
 # tests/health.rs pins the readiness path as K8S_READY.
-has "$OUT/defaults.yaml" 'path: /readyz\?standby=ok&building=ok'
-has "$OUT/defaults.yaml" 'path: /livez'
-has "$OUT/defaults.yaml" 'path: /startupz'
+# The three probe endpoints, quoted as the template renders them (`| quote`, so the exact quoted form
+# is the contract: a probe path that is not a YAML string is a probe that never reaches the pod).
+has "$OUT/defaults.yaml" 'path: "/readyz\?standby=ok&building=ok"'
+has "$OUT/defaults.yaml" 'path: "/livez"'
+has "$OUT/defaults.yaml" 'path: "/startupz"'
 has "$OUT/defaults.yaml" 'periodSeconds: 2'
 has "$OUT/defaults.yaml" 'failureThreshold: 30'
 has "$OUT/defaults.yaml" 'periodSeconds: 10'
@@ -310,9 +324,7 @@ has "$OUT/netpol-on.yaml" 'policyTypes:'
 has "$OUT/netpol-on.yaml" '- port: http'
 
 # A differently named release renames everything and re-points every selector.
-if ! "$HELM" template lv-prod "$CHART" >"$OUT/lv-prod.yaml" 2>"$OUT/lv-prod.err"; then
-  bad "helm template lv-prod failed: $(tr '\n' ' ' <"$OUT/lv-prod.err" | tail -c 300)"
-fi
+render_as lv-prod lv-prod
 # The standard Helm fullname helper, kept as it is: a release whose name does not contain the chart
 # name gets `<release>-<chart>` (the substring assertions below are what the helper really renders —
 # an earlier version of this check asserted lv-prod-metrics and was the red CI job).
@@ -320,8 +332,9 @@ has "$OUT/lv-prod.yaml" 'name: lv-prod-lazyview-metrics'
 has "$OUT/lv-prod.yaml" 'name: lv-prod-lazyview-config'
 has "$OUT/lv-prod.yaml" 'app.kubernetes.io/instance: lv-prod'
 has "$OUT/lv-prod.yaml" 'name: lv-prod-lazyview$'
-# And its alert rules followed the names rather than keeping a literal one.
-render lv-prod-prom --set prometheus.enabled=true
+# And its alert rules followed the names rather than keeping a literal one. This is the case that
+# catches a rule file hard-coding a name: under release `lv-prod` every selector must move.
+render_as lv-prod lv-prod-prom --set prometheus.enabled=true
 has "$OUT/lv-prod-prom.yaml" 'up\{job="lv-prod-lazyview-metrics"\}'
 has "$OUT/lv-prod-prom.yaml" 'deployment="lv-prod-lazyview"'
 

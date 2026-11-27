@@ -111,14 +111,20 @@ LAZYVIEW_HEALTH_TOKEN_FILE) are paths, not credentials, so the match is anchored
 {{/*
 The OpenTelemetry source: {type: configMap|secret, name: <object name>, key: <key inside it>}.
 `existingSecret` wins over `existingConfigMap` wins over the inline `otel.config`.
+
+Each branch is `toYaml`'d, not a bare `dict`: `include` renders what the template PRINTS, and text/template
+prints a Go map as `map[key:otel.yaml name:otel-cfg type:secret]`, which `fromYaml` hands back as an empty
+dict. Callers read this with `include ... | fromYaml`, so a bare dict there means `$src.type` is empty — the
+secret branch is never taken and the volume lands as `configMap:` with an empty `name`, i.e. a pod that can
+never start, from a values file that says `otel.existingSecret`.
 */}}
 {{- define "lazyview.otel.source" -}}
 {{- if .Values.otel.existingSecret -}}
-{{- dict "type" "secret" "name" .Values.otel.existingSecret "key" .Values.otel.key -}}
+{{- toYaml (dict "type" "secret" "name" .Values.otel.existingSecret "key" .Values.otel.key) -}}
 {{- else if .Values.otel.existingConfigMap -}}
-{{- dict "type" "configMap" "name" .Values.otel.existingConfigMap "key" .Values.otel.key -}}
+{{- toYaml (dict "type" "configMap" "name" .Values.otel.existingConfigMap "key" .Values.otel.key) -}}
 {{- else -}}
-{{- dict "type" "configMap" "name" (include "lazyview.otelConfigMapName" .) "key" .Values.otel.key -}}
+{{- toYaml (dict "type" "configMap" "name" (include "lazyview.otelConfigMapName" .) "key" .Values.otel.key) -}}
 {{- end -}}
 {{- end -}}
 
