@@ -582,6 +582,169 @@ fn pending_floor_of(
     floor
 }
 
+/// What a statement of `bytes` costs at the **worst** per-byte rate the run measured on the meta
+/// link. Each sample is one statement the flush loop itself timed: how long it took and how many
+/// bytes it put on the wire. `duration / bytes` is the only number that transfers between a
+/// 150-byte save and a 78-kilobyte one, and the worse rate is the one the apply loop would have to
+/// wait out, so it is the one to price with — [`Engine::set_write_cost`] says why the two shapes
+/// this replaced had to go.
+///
+/// `None` when no sample can speak (nothing timed yet, or a duration the clock could not see), which
+/// the caller reads as *no price*: the write goes, and it is what buys the next one its estimate.
+fn price_at_worst_rate(
+    samples: impl IntoIterator<Item = (Duration, usize)>,
+    bytes: usize,
+) -> Option<Duration> {
+    let rate = samples
+        .into_iter()
+        .filter(|(dur, size)| !dur.is_zero() && *size > 0)
+        .map(|(dur, size)| dur.as_nanos() / size as u128)
+        .max()?;
+    Some(Duration::from_nanos(
+        (bytes as u128)
+            .saturating_mul(rate)
+            .min(u128::from(u64::MAX)) as u64,
+    ))
+}
+
+/// The multiple of one flush interval the apply loop may be made to wait for a set save while it has
+/// work waiting. Chosen from two measured statements, not from taste:
+///
+/// ```text
+///   must ALLOW  65,536-byte rewrite, healthy link   715 ms   (rA8: 2,348 bytes in 26 ms = 11 µs/byte)
+///   must REFUSE  5,000-byte rewrite, sliced link   10,000 ms (rA8: 2 ms/byte, and it went every flush:
+///                                                             11 flushes, 120 s, 0 units refreshed)
+/// ```
+///
+/// One flush interval (200 ms on these legs) is too tight — it refuses the 715 ms save the
+/// fragmentation leg's own precondition needs (`saved >= 65_536`); the engine's `target_timeout`
+/// (60 s) is far too loose — it lets the 10 s save through, and ten of them in a row is exactly the
+/// starvation rA8 measured. Anything in between separates them by an order of magnitude each way, and
+/// eight intervals (1.6 s here, 8 s at the shipped 1 s cadence) sits closest to the middle of that
+/// range on a log scale.
+const SET_WRITE_BACKLOG_BUDGET_MULTIPLIER: u32 = 8;
+
+/// The time the apply loop may be made to wait for one statement of its own — the yardstick a
+/// mid-run cursor rewrite is priced against.
+///
+/// Two different numbers, because the loop is in two different situations when a save comes due.
+/// With **nothing to apply** (`backlog` false: the save floor has reached the boundary, the stream
+/// is caught up), the wait costs nobody anything, and the row is better off holding this run's set
+/// now: a restart reads it, and the run is not being kept from work. So the bound is the engine's
+/// own [`Config::target_timeout`] — what one write round-trip of the data path is already allowed
+/// to cost — which is how a long-lived cluster's 234 KB set reaches the row at all.
+///
+/// With a **backlog** it is the opposite decision, and the measurement that says so is rA8's
+/// (mysql84, base seed 505564981914): the 73,978-byte rewrite was refused correctly
+/// (`cost_ms=78626 budget_ms=60000`), and the run still left 14 KB of stream unconsumed in 120 s,
+/// 21 flushes to that deadline — because the writes that *did* go were a few kilobytes each at the
+/// sliced link's ~1 ms a byte, 2-to-5 s apiece, comfortably under a 60 s bound and repeated every
+/// flush. A statement the apply loop waits on competes with the work it is supposed to be doing, so
+/// its budget is the loop's own cadence: one [`Config::position_persist_interval`] is what it
+/// schedules per save, and [`SET_WRITE_BACKLOG_BUDGET_MULTIPLIER`] says how far a single one may
+/// overrun that.
+/// How many flush intervals a refused whole-row save may be held for while the apply loop has
+/// nothing waiting, after which the row goes **regardless of price**.
+///
+/// A price that can deny a save forever is a defect, and CI proved it on a required check:
+/// `visibility_gtid_fence_covers_xa_commit` (run `46046921423`, shard D — mysql97 at 193.3 s,
+/// percona97 at 197.3 s, base seed 843114013558) died in
+/// `wait_until("the engine to save past the marker", t_catchup(), …)`, a wait on
+/// `binlog_file`/`binlog_pos` (`tests/common/soakchaos.rs`'s `saved_position`) — columns that since
+/// [`pair_publishes_the_rows_set`] move only together with the whole row. The test is exactly the
+/// case a price cannot serve by waiting: it slows the meta server's own commits **on purpose**
+/// (GLOBAL `sync_binlog`, `binlog_group_commit_sync_delay`, `binlog_order_commits` — its own opt-in
+/// text names all three), so every sample the price reads is inflated by commit latency rather than
+/// by bytes; the worst per-byte rate the run ever saw stays inflated for the life of the run, and an
+/// ~80 KB rewrite is refused on every flush, forever, while a reader waits on the row. This is the
+/// "self-lock" this PR used to document as a limitation — a refused rewrite never refreshes the
+/// write's own sample, so the refusal feeds on itself — and a documented limitation that breaks a
+/// required check is a defect, not a limitation.
+///
+/// Measured from the two deadlines that have to land on opposite sides of it, the way
+/// [`SET_WRITE_BACKLOG_BUDGET_MULTIPLIER`] is:
+///
+///  - a reader must see the row move inside its own bound. That reader's bound is
+///    `t_catchup() = 180 s` (`tests/common/engine.rs`), and CI's two failures were 193.3 s and
+///    197.3 s into legs whose wait is exactly that 180 s. At the shipped
+///    [`Config::position_persist_interval`] of 1 s the bound is 30 s, so a starved row moves about
+///    six times inside such a wait instead of never.
+///  - the apply loop must not live inside a statement it waits on. That half is why 30 is not
+///    smaller, and why the bound only fires with no backlog: CI run 45896362347 measured what one
+///    whole-set save per flush costs on a link sliced to a byte per 2 ms — `chaos_both_sides_fragmented`
+///    red on five flavors, "3.5 KB of tail unconsumed in 120 s" at six flushes. An idle loop is the
+///    one state where waiting on such a statement costs the run nothing; under a backlog the price
+///    keeps ruling outright, because a lagging row costs a replay while a starved apply loop costs
+///    the run.
+const SET_WRITE_HOLD_BOUND_MULTIPLIER: u32 = 30;
+
+fn set_write_hold_bound(interval: Duration) -> Duration {
+    interval * SET_WRITE_HOLD_BOUND_MULTIPLIER
+}
+
+/// The price's own question: may the loop wait on a statement that [`Engine::price_set_write`] priced
+/// at `cost`, against the `budget` [`set_write_budget`] chose for whether work is waiting? `None` —
+/// nothing of this shape timed yet — goes: the first write buys the next one its price.
+fn set_write_affordable(cost: Option<Duration>, budget: Duration) -> bool {
+    cost.is_none_or(|c| c < budget)
+}
+
+/// The one rule that overrides the price: **a save may be delayed, never denied.**
+///
+/// `held_for` is how long the run has owed a set that the price would not let it send. Once that
+/// passes [`set_write_hold_bound`] the row goes — but only with `backlog == false`, for the reason in
+/// that bound's doc: the price exists to keep the apply loop out of a statement it cannot interrupt,
+/// and an idle loop is the one moment where waiting on one is free. A row held under a backlog costs
+/// a longer replay after a restart and nothing else, the path
+/// `lifecycle_resumes_from_a_cursor_behind_the_applied_position` exists to prove.
+///
+/// Either way the row is written whole or not at all: the bound decides *whether* the statement goes,
+/// never half of one, because a half that runs ahead of its set is the bug
+/// [`pair_publishes_the_rows_set`] exists to make impossible.
+fn set_write_due(
+    cost: Option<Duration>,
+    budget: Duration,
+    backlog: bool,
+    held_for: Option<Duration>,
+    interval: Duration,
+) -> bool {
+    set_write_affordable(cost, budget)
+        || (!backlog && held_for.is_some_and(|h| h >= set_write_hold_bound(interval)))
+}
+
+/// The one rule the fixed-size position statement obeys: it may publish the position **the set the
+/// row carries belongs to**, and nothing else.
+///
+/// `binlog_file`/`binlog_pos` are not decoration. They are the resume point for every reader that
+/// does not parse `binlog_cursor` — an older build taking over (`meta::save_position` promises them
+/// "filled through the bump, so an older build and the harness still find the position there"), the
+/// no-cursor fallback in [`meta::load_position`], and an operator's `SELECT * FROM _lazyview_status`.
+/// Publishing a position ahead of the durable set tells all three that events up to it are consumed
+/// when nothing recorded that, and a resume from there never reads them: #347's loss, in the
+/// opposite direction from the one the column widening was about. CI measured the symptom as
+/// `chaos_lock_blackhole_takeover` red on four flavors — the takeover seeded its start from the row's
+/// set, and its first save pulled the position columns back to where that set actually was.
+///
+/// Returning an error rather than clamping keeps the caller honest: a call site that reaches here
+/// with the run's read position had decided to publish it, and that decision is the bug.
+fn pair_publishes_the_rows_set(at: &Position, row_at: &Position) -> Result<()> {
+    if at != row_at {
+        anyhow::bail!(
+            "the position columns would be published at {at:?} while the row's set belongs to \
+             {row_at:?}: a resume from them would skip events nothing recorded as consumed"
+        );
+    }
+    Ok(())
+}
+
+fn set_write_budget(backlog: bool, target_timeout: Duration, interval: Duration) -> Duration {
+    if backlog {
+        interval * SET_WRITE_BACKLOG_BUDGET_MULTIPLIER
+    } else {
+        target_timeout
+    }
+}
+
 /// [`Engine::persist_position`]'s floor: [`pending_floor_of`] with the images held, lowered to the
 /// cursor before an XA transaction that is still open or prepared (`held` is `true` for the save,
 /// see the method for why its rows must be re-read after a restart). Split from the method so the
@@ -1156,7 +1319,35 @@ struct Engine {
     last_publish: Instant,
     boundary: Cursor,
     persisted: Cursor,
+    /// The position the status row holds: seeded at the start from the row's own columns
+    /// ([`meta::load_position_row`], which is what makes a row whose cursor column is empty or
+    /// unreadable a starting point rather than a bootstrap) and updated by every save that went.
+    /// `persisted` is the same row's cursor column; the two name different positions when an older
+    /// build wrote them apart.
+    persisted_at: Position,
     last_persist: Instant,
+    /// When the last **cursor** write — the one that also writes `binlog_cursor`, and so the one
+    /// [`meta::save_position`] reads back byte for byte — finished, how long it took on the meta
+    /// link, and how many bytes it put on it: one of the two samples the price reads (see
+    /// [`Self::set_write_cost`]).
+    last_set_write: Option<(Instant, Duration, usize)>,
+    /// The same three for the fixed-size `binlog_file`/`binlog_pos` save
+    /// ([`meta::save_position_pair`]), the half that goes whenever the position moves and the run's
+    /// only sample of what a statement costs on this link *now* — a cursor write is rare next to it,
+    /// and it is what notices the link slowing down between two cursor writes.
+    last_cheap_write: Option<(Instant, Duration, usize)>,
+    /// The cursor this run would write is not the one the row holds: nothing has moved the position
+    /// to make the next save notice, so this is what tells the flush loop a save is still owed.
+    set_pending: bool,
+    /// The held-back rewrite has been reported once: the next refusal of the same hold costs no
+    /// second line, and a write that goes clears it (see [`Self::persist_position`]).
+    set_held_logged: bool,
+    /// When the loop first owed a set the price would not let it send, or `None` while the row is
+    /// current. The clock behind the bound in [`set_write_due`].
+    set_held_since: Option<Instant>,
+    /// Consecutive refused rewrites since the row last moved — kept for the log line, so a leg read
+    /// off its own log can say how many intervals the price held and which decision broke the hold.
+    set_refusals: u32,
     in_txn: bool,
     /// The current transaction touched something besides our own metadata tables.
     txn_foreign: bool,
@@ -2422,7 +2613,17 @@ impl Engine {
             last_publish: Instant::now(),
             boundary: Cursor::none(info.flavor),
             persisted: Cursor::none(info.flavor),
+            persisted_at: Position {
+                file: String::new(),
+                pos: 0,
+            },
             last_persist: Instant::now(),
+            last_set_write: None,
+            last_cheap_write: None,
+            set_pending: false,
+            set_held_logged: false,
+            set_held_since: None,
+            set_refusals: 0,
             in_txn: false,
             txn_foreign: false,
             persist_needed: false,
@@ -2536,7 +2737,8 @@ impl Engine {
             return Ok(Some((e, None)));
         }
 
-        let stored = meta::load_position(&mut e.meta, &e.cfg.instance_id, e.flavor).await?;
+        let (stored, row_at) =
+            meta::load_position_row(&mut e.meta, &e.cfg.instance_id, e.flavor).await?;
         let mut rebuild_all =
             matches!(e.cfg.start_mode, StartMode::Rebuild | StartMode::Once) || stored.is_none();
         let mut start = match &stored {
@@ -2676,8 +2878,15 @@ impl Engine {
         e.executed_text = None;
         e.executed_dirty = true;
         // The status row already holds this cursor: `persisted` starts from it, so a save held
-        // below the boundary keeps the set the row carries instead of losing it.
+        // below the boundary keeps the set the row carries instead of losing it. The two pre-cursor
+        // columns start from what the ROW says they hold, not from `start`: a takeover's row is
+        // inserted with them empty (`coord`'s `bump_epoch`), and a run that assumed they already
+        // named its own start concluded on its first flush that they were current and wrote them
+        // again never — leaving the row every operator's first query reads silent about where the run
+        // began, which is what `lifecycle_bootstrap_and_live_definitions` waits 60 s for. `('', 0)`
+        // is no real position, so the first save moves them.
         e.persisted = start.clone();
+        e.persisted_at = row_at;
         e.boundary = start.clone();
         // Read the definitions only now that `start` is fixed: a definition committed while the engine
         // starts is then in this snapshot, in the stream from `start`, or both (reloading an unchanged
@@ -4663,13 +4872,28 @@ impl Engine {
             // anchor back: a seeding read whose high-water mark the stream has not consumed
             // through yet — that set claims transactions after `pos` it has not applied, and a
             // dump anchored on it would skip exactly those.
+            // Which of them held the run back, when a set existed to offer: `set_bytes=0` alone
+            // cannot tell an operator (or a test log) whether the server would refuse this state,
+            // whether the set is not proven yet, or whether there is no set at all. The branch was
+            // taken anyway, so naming it costs a `&'static str`.
+            let mut held_back: Option<&'static str> = None;
+            let mut held_back_pair: Option<String> = None;
             let mut gtid = if self.gtid_seed_hiw.is_some() {
+                held_back = Some("the seeding read's high-water mark is not consumed through yet");
                 None
             } else {
                 self.executed_gtid_text()
             };
+            if gtid.is_none() && held_back.is_none() {
+                held_back = if self.gtid_seed_unproven {
+                    Some("the seed's over-claim can never be proven for this run")
+                } else {
+                    Some("no consumed set: GTIDs off, nothing consumed, or no set in the cursor")
+                };
+            }
             if gtid.is_some() && !self.xa_gap_no_gtid_dump && self.flavor.is_mysql_family() {
-                let purged_ok = match binlog::gtid_state(&mut self.src).await {
+                let read = binlog::gtid_state(&mut self.src).await;
+                let purged_ok = match &read {
                     Ok(st) => {
                         let purged =
                             source::parse_set(self.flavor, st.purged.as_deref().unwrap_or(""));
@@ -4679,12 +4903,56 @@ impl Engine {
                     Err(_) => false,
                 };
                 if !purged_ok {
+                    held_back = Some(if read.is_ok() {
+                        "the server has purged a transaction the set does not name"
+                    } else {
+                        "the server's purged set could not be read"
+                    });
                     gtid = None;
                 }
             } else if gtid.is_some() && self.xa_gap_no_gtid_dump {
+                held_back = Some("an XA commit arrived without its prepared transaction");
                 gtid = None;
             }
+            // A fourth condition, MariaDB's own ([`crate::source::maria::dump_state_covers`]): the
+            // server can only *locate* a dump on a state that names every `domain-server` pair it
+            // has written, so a set that never saw such a pair — a writer with its own
+            // `gtid_domain_id`, a restored or multi-source history — cannot anchor a dump at all,
+            // whatever its intervals look like. Asking anyway is not a
+            // slower path but a dead connect (`Could not find GTID state requested by slave in any
+            // binlog files`), which the run reports as a lost position; the file/pos dump asks for
+            // nothing the server has to recognize, so that is the resume that stands. (Cost note:
+            // the same one status read per connect attempt as the purged check above, on the
+            // connect path only.)
+            if gtid.is_some() && self.flavor == Flavor::MariaDb {
+                let unnamed = match binlog::gtid_state(&mut self.src).await {
+                    Ok(st) => source::maria::dump_state_unnamed(
+                        st.binlog_state.as_deref().unwrap_or(""),
+                        gtid.as_deref().unwrap_or(""),
+                    ),
+                    // Cannot ask, cannot anchor: a state checked against nothing is no check.
+                    Err(_) => Some("<gtid_binlog_state unreadable>".to_string()),
+                };
+                if let Some(pair) = unnamed {
+                    held_back = Some("the server's state carries a domain this set never saw");
+                    held_back_pair = Some(pair);
+                    gtid = None;
+                }
+            }
             self.stream_by_gtid = gtid.is_some();
+            // Which of the two anchors this round got, and when the run had a set to offer and did
+            // not use it, which rule said so: the four conditions above can each hold a run back to
+            // file/pos for the whole run, and the difference shows up to the operator only as a
+            // resume that takes longer or rebuilds more than it should. It costs one line per
+            // connect (and is what a resume-by-GTID test can assert on).
+            info!(
+                position = %pos,
+                set_bytes = gtid.as_deref().map_or(0, str::len),
+                held_back = held_back,
+                held_back_pair = held_back_pair.as_deref(),
+                "binlog dump anchored on the {}",
+                if gtid.is_some() { "consumed GTID set" } else { "file and position" }
+            );
             // A connect is a repeat (the reader resumes from `boundary`, and delete-before-
             // insert tolerates re-applied events): the one helper with Policy::CONNECT, and no
             // nested retry inside BinlogReader::connect.
@@ -6955,8 +7223,7 @@ impl Engine {
         }
         let urgent = due.into_iter().min();
         let batch = self.first_dirty.map(|t| t + self.cfg.batch_window);
-        let persist = self
-            .persist_needed
+        let persist = (self.persist_needed || self.set_pending)
             .then(|| self.last_persist + self.cfg.position_persist_interval);
         // A closed leadership gate holds the flush: the loop wakes at the end of the hold rather
         // than on every due change, and since `flush_due_within` reads this deadline, neither the
@@ -9469,6 +9736,151 @@ impl Engine {
         self.executed_text.clone()
     }
 
+    /// What a cursor rewrite of `bytes` would cost on the meta link **now**, from the one number that
+    /// transfers between statements of different sizes: what a **byte** costs on this link, as the
+    /// run's own timed statements reported it.
+    ///
+    /// Two statements put bytes on this link and the flush loop times both — the cursor rewrite, whose
+    /// size is the size of the consumed set, and the fixed-size `binlog_file`/`binlog_pos` save. Each
+    /// one says `duration / bytes`, and the price uses the **worse** of the two rates, because the risk
+    /// this gate exists to bound is asymmetric: a write sent on a link slower than the estimate makes
+    /// the apply loop wait out a statement it cannot interrupt (the chaos suite's sliced link turned a
+    /// 78,766-byte cursor into a 157 s statement, which is `chaos_both_sides_fragmented` red on five
+    /// flavors in run 45896362347), while a write refused on a link faster than the estimate costs a
+    /// longer replay after a restart — a path `lifecycle_resumes_from_a_cursor_behind_the_applied_position`
+    /// exists to prove, not to assert.
+    ///
+    /// Two earlier shapes of this price are worth naming, because CI measured both of them wrong. The
+    /// first scaled **one** statement's duration by bytes: the ~150-byte pair save's, which is one
+    /// round trip whatever it carries. That priced CI's 234,528-byte cursor at 234,528 round trips —
+    /// about 130 µs at the harness's `LAZYVIEW_POSITION_PERSIST_MS=200` — so no periodic write was ever
+    /// affordable, none ever went, and the sample that would have corrected the estimate was exactly the
+    /// one the estimate refused: `chaos_frag_cursor` "the run saved only 0 bytes while the server's set
+    /// had grown to 234528", `lc_cursor_upgrade` "stored 0 of 0 bytes", `lc_pair_anchor` reading a
+    /// 21-byte, set-less cursor back. The second scaled the last *cursor* write by the pair save's
+    /// duration now over its duration then, a ratio meant to cancel the round trip out; the
+    /// fragmentation leg showed that failing too (rA7, mysql84): a sliced link charges **per byte**, and
+    /// a fixed-size statement says nothing whatever about per byte, so a write estimated at seconds
+    /// cost 157 of them. Per byte from both samples, a sliced link reports itself honestly — its
+    /// 150-byte save takes 300 ms, so the whole set prices at hundreds of seconds and is refused — while
+    /// a healthy link's 150-byte save takes about a millisecond, prices the same set inside a second,
+    /// and the row gets its set.
+    ///
+    /// `None` — no price, the write goes — until the run has timed one of these statements: there is
+    /// nothing to scale yet, and the first write is what buys the next one its price.
+    fn set_write_cost(&self, bytes: usize) -> Option<Duration> {
+        price_at_worst_rate(
+            [self.last_cheap_write, self.last_set_write]
+                .into_iter()
+                .flatten()
+                .map(|(_, dur, size)| (dur, size)),
+            bytes,
+        )
+    }
+
+    /// How long ago the run timed its last fixed-size save on the meta link — the sample the price's
+    /// freshness is judged by ([`Self::price_set_write`]) — or [`Duration::MAX`] when it has timed
+    /// none yet, which is the same as "the link is unknown to me".
+    /// How long ago the run last timed a fixed-size pair statement, or `None` when it has never
+    /// timed one: an age of `u64::MAX` in a log reads like a measurement, and it is not one.
+    fn pair_sample_age(&self) -> Option<Duration> {
+        self.last_cheap_write.map(|(taken, _, _)| taken.elapsed())
+    }
+
+    /// Prices a cursor rewrite of `bytes`, keeping that price honest with a probe (see
+    /// [`Self::price_set_write`]).
+    ///
+    /// The probe: whenever a rewrite is being considered, the loop first times **one fixed-size
+    /// statement on the wire right now** ([`Self::save_pair_and_time`]) and prices from *it*. A price
+    /// is a statement about the moment it was measured, and a meta link can be sliced *between* two
+    /// cursor writes — that is exactly what the chaos suite's fragmentation legs do to it — so the
+    /// measurement a multi-second decision rests on has to be a measurement of *this* instant. What
+    /// it costs: one ~150-byte save per rewrite considered, and on the branch where the position moved
+    /// anyway that statement is the one the flush was always going to send, so the probe is genuinely
+    /// extra only when a set is owed while the position stands still — plus one small save when the
+    /// price then allows the rewrite, which is the price of not being surprised by the link instead.
+    ///
+    /// Two weaker rules were measured red before this one:
+    ///
+    ///  - pricing from the newest sample with **no** probe: rA8, mysql84, base seed 999771064752
+    ///    armed the slicer at +26 s beside a fresh sample of the pre-slice link, and the next rewrite
+    ///    — 76,078 bytes, priced at about a second by that sample — went and cost 152 of them, with
+    ///    **no** refusal in the log.
+    ///  - probing only when the pair sample looked *stale*, judged as "older than one flush interval":
+    ///    rA8, mysql84, base seed 465737730495, where the sample was a couple of hundred milliseconds
+    ///    old — taken on the link before the slicer went in, which was honest — so no probe fired, the
+    ///    82,924-byte rewrite was priced at about a second and accepted, and the flush loop was still
+    ///    waiting inside it when the leg's 120 s expired (`flushes` frozen at 24, no refusal, no
+    ///    accept, no slow-save line: the accept line prints after the await, and the await never
+    ///    returned). A sample a runner could call fresh is not good enough to accept a write that is
+    ///    five hundred times its size; the only sample that is fresh for that decision is one taken
+    ///    for it.
+    async fn price_set_write(&mut self, bytes: usize, probe: bool) -> Result<Option<Duration>> {
+        if probe {
+            // The probe writes what the row **already holds**, never what the run has just read: it is
+            // a measuring statement, not a publish (see the invariant in `persist_position`).
+            let at = self.persisted_at.clone();
+            self.save_pair_and_time(&at).await?;
+        }
+        Ok(self.set_write_cost(bytes))
+    }
+
+    /// The price gate on a mid-run cursor rewrite (lv-super's ruling of 2026-11-26, on CI run
+    /// 45896362347, where one whole-set save per flush starved a fragmented link:
+    /// `chaos_both_sides_fragmented` red on five flavors, "applied never caught up through the
+    /// fragmentation — 3.5 KB of tail unconsumed in 120 s" at six flushes to that deadline).
+    ///
+    /// Whether the whole row goes on this flush: the price's answer, or the bound's. Delegates to
+    /// the free [`set_write_due`], where the rule and its measured numbers live; this only supplies
+    /// the run's own persist interval.
+    fn set_write_due(
+        &self,
+        cost: Option<Duration>,
+        budget: Duration,
+        backlog: bool,
+        held_for: Option<Duration>,
+    ) -> bool {
+        set_write_due(
+            cost,
+            budget,
+            backlog,
+            held_for,
+            self.cfg.position_persist_interval,
+        )
+    }
+
+    /// Writes the fixed-size `binlog_file`/`binlog_pos` half and **times** it, which is the second
+    /// thing the price needs: the run's sample of what one statement costs on this meta link *now*
+    /// (its size is known exactly — [`meta::cheap_save_bytes`]). Its only caller is the probe in
+    /// [`Self::price_set_write`], and the position it publishes is checked by
+    /// [`pair_publishes_the_rows_set`]: this statement measures the link, it does not move the resume
+    /// point.
+    async fn save_pair_and_time(&mut self, at: &Position) -> Result<()> {
+        pair_publishes_the_rows_set(at, &self.persisted_at)?;
+        let began = Instant::now();
+        meta::save_position_pair(&mut self.meta, &self.cfg.instance_id, at, self.leader.epoch)
+            .await?;
+        let took = began.elapsed();
+        // A fixed-size statement that cost more than the loop's own interval is the link saying it
+        // has changed — the fact every price here turns on. Said out loud, so a leg that timed out
+        // can be read off its own log instead of reconstructed from a toxiproxy dump.
+        if took >= self.cfg.position_persist_interval {
+            debug!(
+                elapsed_ms = took.as_millis() as u64,
+                bytes = meta::cheap_save_bytes(at, &self.cfg.instance_id, self.leader.epoch),
+                budget_ms = self.cfg.target_timeout.as_millis() as u64,
+                "the fixed-size position save cost more than one flush interval: the meta link is \
+                 slower than the last time this run measured it"
+            );
+        }
+        self.last_cheap_write = Some((
+            Instant::now(),
+            took,
+            meta::cheap_save_bytes(at, &self.cfg.instance_id, self.leader.epoch),
+        ));
+        Ok(())
+    }
+
     async fn persist_position(&mut self, force: bool) -> Result<()> {
         // The leadership gate (ruling 1): the saved position is a row of the coordination store,
         // and an instance whose lock it cannot prove does not own it — the replacement writes it
@@ -9514,9 +9926,15 @@ impl Engine {
             |id| self.dedup.pinned(id),
             unresolved.as_ref(),
         );
-        if !force && (pos == self.persisted.to_position() || !self.persist_needed) {
-            // Held back where it was saved: look again one interval later (the flush deadline
-            // is `last_persist` + interval; leaving it in the past would spin the loop).
+        // Nothing has anything to store: the position the row holds did not move since the last time
+        // the reader was allowed to claim it (`persist_needed`, so a run that read nothing of its own
+        // writes nothing), the cursor column already carries the set this run has (`set_pending`,
+        // cleared by the save that wrote it), and the consumed set has not grown since
+        // (`executed_dirty`, the one thing that can make the row's cursor wrong without moving the
+        // position). Look again one interval later (the flush deadline is `last_persist` + interval;
+        // leaving it in the past would spin the loop).
+        let position_moved = self.persist_needed && pos != self.persisted_at;
+        if !force && !position_moved && !self.set_pending && !self.executed_dirty {
             self.last_persist = Instant::now();
             return Ok(());
         }
@@ -9546,16 +9964,204 @@ impl Engine {
             None
         };
         self.persist_needed = true;
-        meta::save_position(
-            &mut self.meta,
-            &self.cfg.instance_id,
-            &Cursor::from_position(self.flavor, &pos).with_gtid(gtid.clone()),
-            self.leader.epoch,
-        )
-        .await?;
+        let wanted = Cursor::from_position(self.flavor, &pos).with_gtid(gtid);
+        // Two halves of one row, written by what they cost. The whole row — `binlog_file`/`binlog_pos`
+        // and `binlog_cursor` in one statement, so the row never holds a position ahead of the set
+        // written with it — costs the size of the consumed set: tens of kilobytes on a long-lived or
+        // fragmented source, which on the link the chaos suite fragments to one byte per 2 ms is a
+        // 150-to-470-second statement, and the flush loop that waits for it stops consuming the stream
+        // altogether (CI run 45896362347: `chaos_both_sides_fragmented` red on five flavors with six
+        // flushes and 3.5 KB of tail left unconsumed in 120 s). So:
+        //
+        //  - the **whole row** goes when the set the row holds is not the set this run has *and* the
+        //    price says one statement of that size is inside what the data path already allows
+        //    ([`Self::set_write_affordable`], read off the per-byte cost this run's own timed statements
+        //    report — [`Self::price_set_write`] makes sure that reading is current), or when `force` says
+        //    the run is starting or ending —
+        //    where nothing waits on the statement and the row must tell the whole truth (the confirmed
+        //    rule of 2026-11-26: a clean stop writes both halves whatever they cost);
+        //  - the **position alone** never goes on its own: what the row's `binlog_file`/`binlog_pos`
+        //    columns may publish is the position belonging to the set the row carries, and nothing
+        //    else ([`pair_publishes_the_rows_set`]). Everything else in this function is that rule. A
+        //    refused rewrite therefore writes nothing at all and is asked again on the next interval,
+        //    so it costs a longer replay after a restart — never a stale position, never a shed set,
+        //    and never a position the row's set does not back. And a refusal is a **delay, never a
+        //    denial**: once the run has owed this set for [`SET_WRITE_HOLD_BOUND_MULTIPLIER`] flush
+        //    intervals with nothing waiting to apply, [`set_write_due`] sends the row regardless of
+        //    price — the whole row, never half of it, so the bound buys the row's truth without ever
+        //    putting the position ahead of its set.
+        //
+        // The save is the engine's own word that the row holds this cursor byte for byte:
+        // `meta::save_position` refuses a cursor the column cannot hold whole with an error naming
+        // its size, the limit and the cause (a pathologically fragmented `gtid_executed`) — never
+        // shortened, and `meta::MAX_CURSOR_BYTES` says why: the set is what a resume on another
+        // server is checked against, so shedding it (what #356 did) silently disables resume-by-GTID
+        // for the long-lived clusters whose set outgrows a column. An error here stops the run: a
+        // position we cannot prove is stored is a resume we cannot prove is safe.
+        // Whether the row's cursor column would say something new — decided **without rendering the
+        // set**, because this is the flush path and the set is tens of kilobytes: the cursor's text is
+        // its position plus an optional `[g=…]`, so the position and the two set texts answer that
+        // question between them. The text is rendered once below, and only when it did change, because
+        // what the price needs of it is a length.
+        let text_changed = pos != self.persisted_at || self.persisted.gtid() != wanted.gtid();
+        let wanted_text = text_changed.then(|| wanted.to_string());
+        let text_len = wanted_text.as_ref().map_or(0, String::len);
+        // Priced before the decision, by the rule in [`Self::price_set_write`]: a sample of the link
+        // older than the write it predicts describes a link the run may no longer be on, and the pair
+        // save is the statement that finds out — sent for the row's own position, so measuring costs
+        // a statement and not a claim about the resume point.
+        let cost = if text_changed {
+            self.price_set_write(text_len, !force).await?
+        } else {
+            None
+        };
+        // What the loop can spend on a statement it waits for depends on whether it has work waiting:
+        // the floor below the boundary means rows are still unapplied, and a save then competes with
+        // applying them (see [`set_write_budget`], which is where both bounds come from).
+        let backlog = pos < self.boundary.to_position();
+        let budget = set_write_budget(
+            backlog,
+            self.cfg.target_timeout,
+            self.cfg.position_persist_interval,
+        );
+        let cursor_due = text_changed
+            && (force
+                || self.set_write_due(
+                    cost,
+                    budget,
+                    backlog,
+                    // How long a set has been owed without reaching the row: armed by the refusal
+                    // below, cleared by the save that ends the hold. The clock behind the bound in
+                    // [`set_write_due`], counted in the loop's own intervals by way of the clock
+                    // that schedules them.
+                    self.set_held_since.map(|since| since.elapsed()),
+                ));
+        if text_changed && !cursor_due {
+            // The streak the bound counts: whoever refuses, arms the clock, so a price that never
+            // relents cannot hold the row past `SET_WRITE_HOLD_BOUND_MULTIPLIER` intervals.
+            self.set_held_since.get_or_insert_with(Instant::now);
+            self.set_refusals += 1;
+        }
+        if !cursor_due && text_changed && !self.set_held_logged {
+            // A held-back rewrite is otherwise invisible: the cursor column simply stops growing and
+            // nothing says which rule held it or against what number — the same reason a set-less
+            // dump anchor has to name `held_back=`. Once per hold, not once per flush.
+            self.set_held_logged = true;
+            info!(
+                bytes = text_len,
+                cost_ms = cost.map_or(0, |c| c.as_millis() as u64),
+                budget_ms = budget.as_millis() as u64,
+                backlog,
+                refusals = self.set_refusals as u64,
+                held_ms = self
+                    .set_held_since
+                    .map_or(0, |since| since.elapsed().as_millis() as u64),
+                bound_ms =
+                    set_write_hold_bound(self.cfg.position_persist_interval).as_millis() as u64,
+                // Whether the bound can end this hold at all: `false` says the loop has work waiting,
+                // and then the price rules alone until it does not — the row lags, by design.
+                bound_fires = !backlog,
+                last_set_write_ms = self
+                    .last_set_write
+                    .map_or(0, |(_, d, _)| d.as_millis() as u64),
+                last_set_bytes = self.last_set_write.map_or(0, |(_, _, n)| n as u64),
+                pair_write_ms = self
+                    .last_cheap_write
+                    .map_or(0, |(_, d, _)| d.as_millis() as u64),
+                pair_age_ms = self.pair_sample_age().map_or(0, |d| d.as_millis() as u64),
+                pair_sample = self.last_cheap_write.is_some(),
+                "the cursor's set is not saved this time: the priced rewrite would cost more than \
+                 one statement of the data path may cost; nothing is published, the row keeps the \
+                 position its set belongs to"
+            );
+        }
+        if cursor_due {
+            // Said *before* the await, deliberately. The line after it can only print if the statement
+            // returns, and a save the loop ends up waiting out is precisely the case a stalled flush
+            // has to be read from: rA8, mysql84, base seed 465737730495 accepted an 82,924-byte rewrite
+            // on a link sliced a moment earlier and left `flushes` frozen at 24 with no line of any
+            // kind in the log, because the only line this path had printed afterwards.
+            debug!(
+                bytes = text_len,
+                cost_ms = cost.map_or(0, |c| c.as_millis() as u64),
+                budget_ms = budget.as_millis() as u64,
+                backlog,
+                "the status row's whole cursor goes: position and set in one statement"
+            );
+            let began = Instant::now();
+            let saved = meta::save_position(
+                &mut self.meta,
+                &self.cfg.instance_id,
+                &wanted,
+                self.leader.epoch,
+            )
+            .await?;
+            let took = began.elapsed();
+            // Measured on the real link, which is the only clock the price can use: this statement's
+            // own bytes are one of the two rates a cursor rewrite is priced with.
+            self.last_set_write = Some((Instant::now(), took, text_len));
+            // The accepted half of the same honesty as the refusal below: a leg that times out with
+            // no line in its log cannot say which statement it waited on, and these legs are exactly
+            // where that question is the finding.
+            debug!(
+                bytes = text_len,
+                cost_ms = cost.map_or(0, |c| c.as_millis() as u64),
+                elapsed_ms = took.as_millis() as u64,
+                pair_age_ms = self.pair_sample_age().map_or(0, |d| d.as_millis() as u64),
+                "the status row's whole cursor went: position and set in one statement"
+            );
+            if !set_write_affordable(cost, budget) {
+                // The bound's decision rather than the price's, logged apart from the accept line
+                // because the two are indistinguishable there — and this is the difference between a
+                // row that lags and a row that froze: the number the refusal called unaffordable is
+                // the number the loop has now waited on, once, deliberately.
+                info!(
+                    bytes = text_len,
+                    cost_ms = cost.map_or(0, |c| c.as_millis() as u64),
+                    budget_ms = budget.as_millis() as u64,
+                    refusals = self.set_refusals as u64,
+                    held_ms = self
+                        .set_held_since
+                        .map_or(0, |since| since.elapsed().as_millis() as u64),
+                    "a save may be delayed, never denied: the row went past its hold bound"
+                );
+            }
+            self.set_held_since = None;
+            self.set_refusals = 0;
+            self.set_held_logged = false;
+            // What the row holds, which `save_position` has just measured and read back byte for byte:
+            // `persisted`'s set is the one later saves carry forward when the position is held below
+            // the boundary (ruling 6).
+            self.persisted = saved;
+            self.persisted_at = pos.clone();
+        }
+        // A refused rewrite publishes **nothing**. The first version of this branch sent the
+        // fixed-size `binlog_file`/`binlog_pos` half at the position the run had merely *read*, so the
+        // row kept the last set a save afforded while its position columns ran ahead of it — and
+        // those two columns are exactly what a reader that does not parse the cursor trusts: an
+        // older build resuming from them (`meta::save_position`'s own promise that they "stay filled
+        // through the bump, so an older build and the harness still find the position there"), an
+        // operator's `SELECT * FROM _lazyview_status`, and `load_position`'s no-cursor fallback. A
+        // position no durable set backs is #347's loss in the other direction: such a reader starts
+        // past events nothing recorded as consumed, and never sees them. CI measured it as
+        // `chaos_lock_blackhole_takeover` red on four flavors — "the saved position went backwards
+        // from `binlog.000003:2709040` to `binlog.000003:2542134` while the replaced instance was
+        // still running": the takeover seeded its start from the row's set, and its first save pulled
+        // the position columns back down to where that set actually was. The same lie is why
+        // `chaos_src_binlog_catchup_after_a_slow_reconnect` stopped reproducing its own shape (21.7 s
+        // where the leg needs a slow catch-up): a start from the runaway pair had less to read.
+        //
+        // What a refusal now costs is what it always should have cost and what the comment above
+        // promises: a longer replay after a restart, never a position the row cannot back with a set.
+        // The loop keeps asking — `set_pending` below stays true while the row lags, and
+        // `last_persist` spaces the attempts — and the probe above is still what keeps the price
+        // honest, because a probe writes what the row already holds and so measures the link without
+        // deciding anything about the resume point.
         // Held back: save again once the pending changes are applied.
         self.persist_needed = pos < self.boundary.to_position();
-        self.persisted = Cursor::from_position(self.flavor, &pos).with_gtid(gtid);
+        // Still owed: the row does not say what this run would say. Asked the same allocation-free
+        // way as above, and of the row as the saves left it.
+        self.set_pending = pos != self.persisted_at || self.persisted.gtid() != wanted.gtid();
         self.last_persist = Instant::now();
         Ok(())
     }
@@ -10709,6 +11315,214 @@ mod lock_task_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule the fixed-size position statement obeys, measured at the shape CI caught:
+    /// `chaos_lock_blackhole_takeover` failed on four flavors because a refused set write had moved
+    /// `binlog_file`/`binlog_pos` to `binlog.000003:2709040` while the `binlog_cursor` in the same row
+    /// still described `binlog.000003:2542134`. The takeover seeded its start from the set — the only
+    /// half that is a resume point — and its first save pulled the position columns back, which is the
+    /// "went backwards" the leg named. A reader that trusts those columns (an older build, the
+    /// no-cursor fallback, an operator) would have started at the higher number and never read the
+    /// 166,906 bytes between them.
+    #[test]
+    fn the_position_columns_never_publish_ahead_of_the_set_the_row_carries() {
+        let row = Position {
+            file: "binlog.000003".into(),
+            pos: 2_542_134,
+        };
+        // The row's own position: allowed, because it says nothing the set does not back — this is
+        // what the probe writes while it measures the link.
+        pair_publishes_the_rows_set(&row, &row).expect("the row's own position is publishable");
+        // The position the run has merely read: refused, at any distance.
+        let read = Position {
+            file: "binlog.000003".into(),
+            pos: 2_709_040,
+        };
+        let e = pair_publishes_the_rows_set(&read, &row)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("2709040") && e.contains("2542134"),
+            "the refusal has to name both positions, the one it was asked for and the one the row's \
+             set belongs to: {e}"
+        );
+        // A file the set's position does not name is refused too: a lower `pos` in a later file is
+        // ahead, and comparing numbers alone would have let it through.
+        let later_file = Position {
+            file: "binlog.000004".into(),
+            pos: 4,
+        };
+        assert!(pair_publishes_the_rows_set(&later_file, &row).is_err());
+        // And a position behind the row's own is refused as well: it is not what the row's set says,
+        // so publishing it would be a save deciding the row's meaning on its own.
+        assert!(pair_publishes_the_rows_set(
+            &Position {
+                file: "binlog.000003".into(),
+                pos: 2_542_133,
+            },
+            &row
+        )
+        .is_err());
+    }
+
+    /// The bound on a refusal, pinned at the two numbers CI measured — the direction the price has
+    /// to win, and the direction it must not.
+    #[test]
+    fn a_refused_save_is_delayed_and_never_denied_when_the_loop_has_nothing_waiting() {
+        // The chaos legs' `LAZYVIEW_POSITION_PERSIST_MS=200`, and the no-backlog bound of a
+        // 60 s `Config::target_timeout`.
+        let interval = Duration::from_millis(200);
+        let budget = set_write_budget(true, Duration::from_secs(60), interval);
+        // 83,512 bytes — the size CI's fragmentation legs put on the row — at a link sliced to a byte
+        // per 2 ms: what `chaos_both_sides_fragmented` prices, and what CI run 45896362347 showed the
+        // apply loop cannot survive waiting on ("3.5 KB of tail unconsumed in 120 s").
+        let sliced = Duration::from_secs(167);
+        // Work waiting: the price rules outright, at any age. This is the direction the bound must
+        // not touch, or the starvation that PR exists to prevent comes back.
+        assert!(!set_write_due(Some(sliced), budget, true, None, interval));
+        assert!(!set_write_due(
+            Some(sliced),
+            budget,
+            true,
+            Some(set_write_hold_bound(interval) * 4),
+            interval
+        ));
+        // Idle but inside the bound: the price still rules. The bound is a last resort, not a bypass.
+        assert!(!set_write_due(
+            Some(sliced),
+            budget,
+            false,
+            Some(set_write_hold_bound(interval) - Duration::from_millis(1)),
+            interval
+        ));
+        // Idle and past the bound: the row goes. This is the assertion CI's shard D is the
+        // counterexample for — `visibility_gtid_fence_covers_xa_commit` waiting 180 s (193.3 s and
+        // 197.3 s of wall clock, mysql97 and percona97, base seed 843114013558) for `binlog_file`/
+        // `binlog_pos` to pass a marker that a self-sustaining refusal never let them reach.
+        assert!(set_write_due(
+            Some(sliced),
+            budget,
+            false,
+            Some(set_write_hold_bound(interval)),
+            interval
+        ));
+        // Nothing measured yet, or something cheap: no bound needed, the price already said yes.
+        assert!(set_write_due(None, budget, true, None, interval));
+        assert!(set_write_due(
+            Some(Duration::from_millis(5)),
+            budget,
+            true,
+            None,
+            interval
+        ));
+        // And the bound is intervals, not a wall-clock guess: thirty of them, whatever one is. At the
+        // shipped 1 s interval that is 30 s, about six saves inside the harness's 180 s `t_catchup()`.
+        assert_eq!(set_write_hold_bound(interval), Duration::from_secs(6));
+        assert_eq!(
+            set_write_hold_bound(Duration::from_secs(1)),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// The two directions the cursor's price has to get right, at the numbers the chaos legs
+    /// measured: the same 78,766-byte statement is a 157 s one on the link sliced to a byte per
+    /// 2 ms (so the apply loop must not wait on it) and a fraction of a second on the honest link
+    /// that carried it (so the row must get its set). Priced from the run's worst observed byte,
+    /// never from a round-trip count.
+    #[test]
+    fn a_cursor_write_is_priced_at_the_worst_per_byte_rate_the_run_measured() {
+        let bound = Duration::from_millis(crate::config::DEFAULT_TARGET_TIMEOUT_MS);
+        let set = 78_766;
+        // The fragmentation leg after the slice: a 150-byte pair save taking 300 ms on that link,
+        // beside the 20 ms the same set cost while the link was still honest. The fresh sample of
+        // the sliced link has to overrule the old write, or the loop waits out a 157 s statement.
+        let sliced = price_at_worst_rate(
+            [
+                (Duration::from_millis(300), 150),
+                (Duration::from_millis(20), set),
+            ],
+            set,
+        );
+        assert!(
+            sliced > Some(bound),
+            "a link that costs 2 ms a byte prices the run's set at {sliced:?}, which the apply \
+             loop may not wait out"
+        );
+        // The same set, on the link that actually carried it: affordable, so the row is not left
+        // without the set (which is what left CI's rows holding 0 bytes).
+        let honest = price_at_worst_rate(
+            [
+                (Duration::from_millis(1), 150),
+                (Duration::from_millis(20), set),
+            ],
+            set,
+        );
+        assert!(
+            honest < Some(bound),
+            "a healthy link prices the same set at {honest:?}: refusing that is the self-refusing \
+             estimate that leaves the cursor column empty"
+        );
+        // And the shape the first version got wrong: pricing CI's 234,528-byte set from the
+        // fixed-size save alone cost 234,528 *round trips* (~130 µs at the harness's
+        // LAZYVIEW_POSITION_PERSIST_MS=200), so nothing was ever affordable. A per-byte price of
+        // the same statement is a real cost — far above one flush interval — and still allowed.
+        let from_pair_only = price_at_worst_rate([(Duration::from_millis(1), 150)], 234_528);
+        assert!(
+            from_pair_only > Some(Duration::from_millis(200)),
+            "{from_pair_only:?}"
+        );
+        assert!(from_pair_only < Some(bound), "{from_pair_only:?}");
+        // Nothing timed yet, or a duration the clock could not see, is no price at all: the write
+        // goes, and it is what buys the next one its estimate.
+        assert_eq!(price_at_worst_rate([], set), None);
+        assert_eq!(price_at_worst_rate([(Duration::ZERO, 150)], set), None);
+    }
+
+    /// What the price is compared *against*, which is the half rA8 found missing. The apply loop's
+    /// budget for a statement it waits on is its own cadence when it has work waiting, and
+    /// `target_timeout` only when it does not — one number cannot serve both, because CI run
+    /// 45896362347 starved under writes a 60 s bound happily allowed.
+    #[test]
+    fn a_backlog_prices_a_set_save_against_the_loops_own_cadence() {
+        let timeout = Duration::from_millis(crate::config::DEFAULT_TARGET_TIMEOUT_MS);
+        let interval = Duration::from_millis(200); // the legs' LAZYVIEW_POSITION_PERSIST_MS
+        let backlog = set_write_budget(true, timeout, interval);
+        let caught_up = set_write_budget(false, timeout, interval);
+        assert_eq!(
+            caught_up, timeout,
+            "with nothing to apply the wait costs nobody"
+        );
+        assert!(
+            backlog < timeout,
+            "a waiting loop may not be made to wait out a target write"
+        );
+
+        // rA8, mysql84, base seed 505564981914: the rewrite that went (a few kilobytes at the sliced
+        // link's rate, every flush, 21 of them in 120 s) has to be refused by the backlog budget,
+        // while the healthy link's big rewrite — the one the leg's `saved >= 65_536` needs — stays
+        // affordable, or the cursor column is left holding nothing.
+        let sliced_5kb = price_at_worst_rate([(Duration::from_millis(300), 150)], 5_000);
+        assert!(
+            sliced_5kb >= Some(backlog),
+            "a 5 KB write on a link that costs 2 ms a byte prices at {sliced_5kb:?}: the loop has \
+             10 transactions to apply and must not wait it out"
+        );
+        let healthy_65kb = price_at_worst_rate([(Duration::from_millis(26), 2_348)], 65_536);
+        assert!(
+            healthy_65kb < Some(backlog),
+            "the same size on the link that carries 2,348 bytes in 26 ms prices at {healthy_65kb:?}: \
+             refusing that is what leaves a fragmented cursor unsaved"
+        );
+        // A long-lived cluster's whole set, written while the stream is caught up: allowed, because
+        // nothing is waiting on it (`set_write_affordable`'s `None`-means-go aside, this is the case
+        // that keeps `lifecycle_resumes_from_a_cursor_behind_the_applied_position` honest).
+        let idle_234kb = price_at_worst_rate([(Duration::from_millis(1), 150)], 234_528);
+        assert!(
+            idle_234kb < Some(caught_up),
+            "the set a long-lived cluster has to keep in the column prices at {idle_234kb:?} on a \
+             link that carries 150 bytes in a millisecond: refusing that is the empty-column bug"
+        );
+    }
 
     /// A bound string loses its `COLLATE`; a param that has none, and a param that is not a bound
     /// string, come back as they were (the lookup binds strings without a collation only where the
