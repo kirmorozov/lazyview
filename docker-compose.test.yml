@@ -711,8 +711,38 @@ services:
       - galera114-3:/var/lib/mysql
 
   # ---- Percona XtraDB Cluster 8.4 (Galera on MySQL, real MySQL GTIDs) ---------------------------
-  # PXC's own requirement set for a continuous GTID state (gtid_mode + wsrep_gtid_mode + a fixed
-  # wsrep_gtid_domain_id + log_replica_updates on every node); the lane resumes by GTID on any member.
+  # PXC's requirement set on this major: gtid_mode=ON + enforce_gtid_consistency=ON +
+  # log_replica_updates=ON + wsrep_on + the provider, on every node; the lane resumes by GTID on any
+  # member and asserts the property that matters there - every member's gtid_executed covers node 1's
+  # set (MySQL's GTID_SUBSET), which is what makes a member change a non-event for the cursor.
+  # What is deliberately NOT here: wsrep_gtid_mode and wsrep_gtid_domain_id, the two options the
+  # 5.7/8.0 line needed for a cluster-continuous GTID state. PXC 8.4 has no such server options, and
+  # passing them is not a warning: node 1 aborts and leaves its data directory unusable. Measured on
+  # this host (tmp/out/lvs-gtid/ci-cluster-families/cluster/pxc84/pxc84-1.compose.log, run of
+  # 2026-11-23T07:43Z, during the entrypoint's `mysqld --initialize-insecure`):
+  #   0 [ERROR] [MY-000067] [Server] unknown variable 'wsrep-gtid-mode=ON'.
+  #   0 [ERROR] [MY-013236] [Server] The designated data directory /var/lib/mysql/ is unusable. You
+  #     can remove all files that the server added to it.
+  #   0 [ERROR] [MY-010119] [Server] Aborting
+  # Checked against the pinned image rather than guessed: neither name is a string in its mysqld nor
+  # in the provider it ships (`strings -a mysqld | grep -cxF wsrep_gtid_mode` -> 0, and
+  # `wsrep_gtid_domain_id` -> 0, while wsrep_provider_options, wsrep_on and wsrep_sst_method are
+  # there, and wsrep_sst_auth, removed on this same line, is absent too) - so `--loose-` would only
+  # hide a value the server never applies, and the lane asserts the real thing instead (see below).
+  # One more thing this major needs saying out loud: gcomm transport TLS. PXC 8.4 ships socket.ssl=YES
+  # with ca.pem / server-cert.pem / server-key.pem that the entrypoint generates inside each data
+  # directory, so the three nodes hold three unrelated self-signed certificates and a joiner can
+  # never verify its donor. Measured on this host (pxc84-2.compose.log, run of 2026-11-27T17:49Z,
+  # the same two lines repeating until the join gave up):
+  #   0 [Note] [MY-000000] [Galera] Failed to establish connection: invalid padding: certificate
+  #     signature failure
+  #   0 [ERROR] [MY-000000] [Galera] failed to open gcomm backend connection: 110: failed to reach
+  #     primary view (pc.wait_prim_timeout)
+  # So all three services pass socket.ssl=no in wsrep_provider_options - Galera 4's own default, and
+  # what the galera114 family in this file already runs (MariaDB leaves it off). That is a property of
+  # this throwaway single-host bridge network, not of the product: a real PXC deployment keeps
+  # socket.ssl=YES and provisions one CA all members trust. Nothing the lane asserts gets weaker for
+  # it - it asserts GTIDs, membership, causal reads and the resume, and TLS is not among them.
   # The image is pinned by digest (its tag moves with PXC's own build number), and the SST hash key is
   # a fixed test value: all three nodes must share it, and the containers are dropped after every run.
   # Start order as in Galera: PXC_ADDRESS_1=gcomm:// + PXC_BOOTSTRAP=ON on node 1, then the docker0
@@ -749,10 +779,13 @@ services:
       - --wsrep-on=ON
       - --wsrep-provider=/usr/lib64/galera4/libgalera_smm.so
       - --wsrep-cluster-address=${PXC_ADDRESS_1:-gcomm://}
-      - --wsrep-provider-options=pc.bootstrap=${PXC_BOOTSTRAP:-OFF};gcache.size=128M
+      # gcomm transport TLS off: PXC 8.4 turns it on by default with per-node certificates
+      # the entrypoint generates in each data directory, so no two nodes share a CA and the join
+      # never completes (measured line in the header above). Galera's own default, which is what
+      # the galera114 family already runs. Test network only - production keeps socket.ssl=YES
+      # with a CA all members trust.
+      - --wsrep-provider-options=pc.bootstrap=${PXC_BOOTSTRAP:-OFF};gcache.size=128M;socket.ssl=no
       - --wsrep-node-name=pxc84-1
-      - --wsrep-gtid-mode=ON
-      - --wsrep-gtid-domain-id=42
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - pxc84-1:/var/lib/mysql
@@ -784,10 +817,13 @@ services:
       - --wsrep-on=ON
       - --wsrep-provider=/usr/lib64/galera4/libgalera_smm.so
       - --wsrep-cluster-address=${PXC_ADDRESS_2:-gcomm://}
-      - --wsrep-provider-options=gcache.size=128M
+      # gcomm transport TLS off: PXC 8.4 turns it on by default with per-node certificates
+      # the entrypoint generates in each data directory, so no two nodes share a CA and the join
+      # never completes (measured line in the header above). Galera's own default, which is what
+      # the galera114 family already runs. Test network only - production keeps socket.ssl=YES
+      # with a CA all members trust.
+      - --wsrep-provider-options=gcache.size=128M;socket.ssl=no
       - --wsrep-node-name=pxc84-2
-      - --wsrep-gtid-mode=ON
-      - --wsrep-gtid-domain-id=42
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - pxc84-2:/var/lib/mysql
@@ -819,10 +855,13 @@ services:
       - --wsrep-on=ON
       - --wsrep-provider=/usr/lib64/galera4/libgalera_smm.so
       - --wsrep-cluster-address=${PXC_ADDRESS_3:-gcomm://}
-      - --wsrep-provider-options=gcache.size=128M
+      # gcomm transport TLS off: PXC 8.4 turns it on by default with per-node certificates
+      # the entrypoint generates in each data directory, so no two nodes share a CA and the join
+      # never completes (measured line in the header above). Galera's own default, which is what
+      # the galera114 family already runs. Test network only - production keeps socket.ssl=YES
+      # with a CA all members trust.
+      - --wsrep-provider-options=gcache.size=128M;socket.ssl=no
       - --wsrep-node-name=pxc84-3
-      - --wsrep-gtid-mode=ON
-      - --wsrep-gtid-domain-id=42
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
       - pxc84-3:/var/lib/mysql
@@ -835,6 +874,19 @@ services:
   # SET GLOBAL (both dynamic) and bootstraps node 1 with START GROUP_REPLICATION.
   # group_replication_local_address uses port 33061 on each node's own docker0 address; the nodes talk
   # to each other on docker0, nothing here publishes those ports.
+  # Distributed recovery is the part that does not work out of the box on this network: the joiner
+  # connects the `group_replication_recovery` channel as lvdoc to the donor's MEMBER_HOST, 8.4's
+  # default plugin is caching_sha2_password, and over an unencrypted connection it refuses the
+  # password. Measured on this host (tmp/out/lvs-gtid/ci-cluster-families/cluster/gr84/
+  # gr84-members.txt, run of 2026-11-23T07:44Z), every 60 s on both joiners:
+  #   [ERROR] [MY-010584] [Repl] Replica I/O for channel 'group_replication_recovery': Error
+  #   connecting to source 'lvdoc@...:3306' ... Message: Authentication plugin
+  #   'caching_sha2_password' reported error: Authentication requires secure connection.
+  #   [ERROR] [MY-011582] [Repl] Plugin group_replication reported: 'There was an error when
+  #   connecting to the donor server...'
+  # and both members sat in RECOVERING while the primary served alone. 8.4's own answer is the last
+  # option below: the recovery channel asks the donor for its public key and scrambles the password
+  # with it, so no certificate is needed on a throwaway network.
   # The three group_replication mode flags are interpolated (GR_SINGLE_PRIMARY / GR_ENFORCE_EVERYWHERE
   # / GR_ISOLATION, defaulting to single primary): the blocking `gr84` lane runs the group as
   # single-primary and the advisory nightly `gr84-mp` starts the same three services in multi-primary
@@ -863,6 +915,7 @@ services:
       - --loose-group-replication-single-primary-mode=${GR_SINGLE_PRIMARY:-ON}
       - --loose-group-replication-enforce-update-everywhere-checks=${GR_ENFORCE_EVERYWHERE:-OFF}
       - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
+      - --loose-group-replication-recovery-get-public-key=ON
       - --loose-group-replication-member-weight=100
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
@@ -892,6 +945,7 @@ services:
       - --loose-group-replication-single-primary-mode=${GR_SINGLE_PRIMARY:-ON}
       - --loose-group-replication-enforce-update-everywhere-checks=${GR_ENFORCE_EVERYWHERE:-OFF}
       - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
+      - --loose-group-replication-recovery-get-public-key=ON
       - --loose-group-replication-member-weight=50
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
@@ -921,6 +975,7 @@ services:
       - --loose-group-replication-single-primary-mode=${GR_SINGLE_PRIMARY:-ON}
       - --loose-group-replication-enforce-update-everywhere-checks=${GR_ENFORCE_EVERYWHERE:-OFF}
       - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
+      - --loose-group-replication-recovery-get-public-key=ON
       - --loose-group-replication-member-weight=50
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro

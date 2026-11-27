@@ -98,10 +98,25 @@ on:
       - ".claude/**"
       - ".github/**"
   workflow_dispatch:
+    inputs:
+      # The two advisory cluster legs (gr84 in multi-primary, Galera RSU/IST churn) are best-effort
+      # and slow, so they are not part of a normal run: check this box to run them too. nightly.yml's
+      # schedule runs them without a box (see each job's `if`).
+      long_soak:
+        description: 'also run the advisory cluster legs (gr84 multi-primary, Galera RSU churn)'
+        required: false
+        type: boolean
+        default: false
   # Called by nightly.yml (the nightly on main HEAD). Its caller's event is `schedule`, so every
   # regular job skips and only the soak jobs and report run; workflow_call is listed alongside
   # schedule in those `if`s so the split holds whichever event name the called workflow sees.
   workflow_call:
+    inputs:
+      long_soak:
+        description: 'also run the advisory cluster legs (gr84 multi-primary, Galera RSU churn)'
+        required: false
+        type: boolean
+        default: false
 
 # A newer run for the same ref and event cancels the superseded one, except on main, where
 # cancel-in-progress stays false: a running main verification is never cancelled. On main the
@@ -126,47 +141,20 @@ env:
 
 # The cluster lanes below (failover-async, galera114, pxc84, gr84 and the two advisory nightly legs)
 # share these steps; YAML anchors are resolved before Actions reads the file.
-x-cluster-steps:
-  - &cluster-checkout
-    uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-    with:
-      persist-credentials: false
-  - &cluster-rust
-    name: rust ${{ env.RUST_TOOLCHAIN }}
-    run: |
-      rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-      rustup default "$RUST_TOOLCHAIN"
-  - &cluster-cache
-    uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-    with:
-      # Reads the integration matrix's cache (its mysql84 job writes it); never writes one.
-      shared-key: integration
-      save-if: false
-  - &cluster-logs
-    name: collect server logs
-    if: failure()
-    run: |
-      mkdir -p server-logs
-      for s in $SERVICES; do
-        docker compose logs --no-color --timestamps "$s" > "server-logs/$s.log" 2>&1 || true
-      done
-      docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
-  - &cluster-upload
-    name: upload logs
-    if: failure()
-    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-    with:
-      name: cluster-logs-${{ github.job }}
-      path: |
-        server-logs/
-        tmp/out/test-logs/
-      retention-days: 7
-      if-no-files-found: ignore
-  - &cluster-down
-    name: stop the family
-    if: always()
-    run: docker compose down -v
-
+#
+# Which of them block, and the only continue-on-error in the family (lv-super's ruling on item 1 and
+# item 2, 2026-11-27): failover-async, galera114, pxc84 and gr84 are the owner's four contractual
+# topologies (async + Multi-AZ, Galera, PXC 8.4, GR single-primary), so all four are BLOCKING - a
+# contractual lane behind continue-on-error reports a failure nobody acts on, which is "fix later".
+# gr84-mp (multi-primary) and galera114-rsu (RSU / IST churn) are best-effort topologies: they stay
+# advisory and nightly, and they are the only two jobs here that carry continue-on-error.
+# The cluster lanes below (failover-async, galera114, pxc84, gr84 and the two advisory nightly legs)
+# repeat their six shared steps (checkout, rust, the shared cargo cache, collect logs, upload logs,
+# stop the family) the way the rest of this file is written: Actions accepts anchors only inside
+# jobs, and a top-level key of its own (`x-cluster-steps`) makes the whole workflow file invalid -
+# GitHub then starts the run with no jobs at all, which is what the first four runs of this branch
+# did (0 jobs, run 45240882616). Hand-repeated lists are also what docker-compose.test.yml does for
+# the same reason. Keep the six identical across the lanes.
 jobs:
   cluster-changes:
     # The path filter the cluster lanes gate on (the workflow itself runs everything on every PR, so
@@ -175,6 +163,17 @@ jobs:
     # the lanes. The lanes also run when the topology definition or this workflow itself changes:
     # the cluster jobs are the proof that the compose services and these steps still work, so a
     # change to them must never arrive untested.
+    #
+    # What the filter covers is the whole resume-by-GTID path, not only the two directories that read
+    # the binlog (lv-super, 2026-11-27, item 3): a change to any file that path runs through has to
+    # bring the families up, because these lanes are the only place the topology is proven. So, next
+    # to src/source/**, src/binlog/** and src/engine.rs: src/meta.rs (save_position, the cursor a
+    # resume reads back), src/coord.rs (the lock a source change has to take), src/fence.rs and
+    # src/fence/** (the fence that waits for the position the new source must cover) and src/config.rs
+    # (the DSN and fence settings a family exercises).
+    #
+    # This filter never hides a broken lane from main: `push` runs all of them unconditionally, so a
+    # lane that is red only inside its own PR job still has to be explained before it lands.
     name: cluster lanes (path filter)
     if: github.event_name != 'schedule' && github.event_name != 'workflow_call'
     runs-on: ubuntu-24.04
@@ -197,12 +196,12 @@ jobs:
             files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename' 2>/dev/null || true)
             if [ -z "$files" ]; then
               echo "::warning title=cluster lanes::the PR's file list is unavailable, so the cluster lanes run instead of silently skipping"
-            elif ! printf '%s\n' "$files" | grep -qE '^(src/(source|binlog)/|src/engine\.rs$|tests/failover_source\.rs$|docker-compose\.test\.yml$|\.github/workflows/ci\.yml$)'; then
+            elif ! printf '%s\n' "$files" | grep -qE '^(src/(source|binlog|fence)/|src/(engine|meta|coord|fence|config)\.rs$|tests/failover_source\.rs$|docker-compose\.test\.yml$|\.github/workflows/ci\.yml$)'; then
               run=false
             fi
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
-          echo "cluster lanes: run=$run (src/source, src/binlog, src/engine.rs, tests/failover_source.rs, docker-compose.test.yml, ci.yml)" >> "$GITHUB_STEP_SUMMARY"
+          echo "cluster lanes: run=$run (src/source, src/binlog, src/fence, src/engine.rs, src/meta.rs, src/coord.rs, src/config.rs, tests/failover_source.rs, docker-compose.test.yml, ci.yml)" >> "$GITHUB_STEP_SUMMARY"
 
   failover-async:
     # A-01's own shape: the writer and a promoted-replica candidate of the same flavor, both with a
@@ -224,14 +223,20 @@ jobs:
       COMPOSE_PROFILES: cluster
       SERVICES: mysql84a mysql84b mariadb114a mariadb114b
     steps:
-      - *cluster-checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: start the writers (in the background)
         run: docker compose up -d --quiet-pull mysql84a mariadb114a
       - name: rust ${{ env.RUST_TOOLCHAIN }}
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-      - *cluster-cache
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache (its mysql84 job writes it); never writes one.
+          shared-key: integration
+          save-if: false
       - name: build the streaming suite
         run: cargo test --locked --test binlog_stream --no-run
       - name: wait for the writers
@@ -248,7 +253,7 @@ jobs:
           addr() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "lazyview-$1-1" | awk '{print; exit}'; }
           A=$(addr mysql84a-1); M=$(addr mariadb114a-1)
           echo "writers at $A / $M"
-          [ -n "$A" ] && [ -n "$M" ] || { echo "::error::no address for the writers"; exit 1; }
+          if [ -z "$A" ] || [ -z "$M" ]; then echo "::error::no address for the writers"; exit 1; fi
           q mysql84a "CREATE DATABASE IF NOT EXISTS lvcl; CREATE TABLE IF NOT EXISTS lvcl.entities (id INT PRIMARY KEY, v INT NOT NULL); INSERT INTO lvcl.entities VALUES (1,1),(2,2),(777,777);"
           q mariadb114a "CREATE DATABASE IF NOT EXISTS lvcl; CREATE TABLE IF NOT EXISTS lvcl.entities (id INT PRIMARY KEY, v INT NOT NULL); INSERT INTO lvcl.entities VALUES (1,1),(2,2),(777,777);"
           q mysql84b "STOP REPLICA; RESET REPLICA ALL; CHANGE REPLICATION SOURCE TO SOURCE_HOST='$A', SOURCE_PORT=3306, SOURCE_USER='lvdoc', SOURCE_PASSWORD='doc', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1; START REPLICA;"
@@ -302,9 +307,27 @@ jobs:
                    stream_resume_by_gtid_requires_the_source_to_cover_the_state; do
             grep -q "^test $t \.\.\. ok$" async-mariadb114a.log || { echo "::error::$t did not run and pass on mariadb114a"; exit 1; }
           done
-      - *cluster-logs
-      - *cluster-upload
-      - *cluster-down
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          for s in $SERVICES; do
+            docker compose logs --no-color --timestamps "$s" > "server-logs/$s.log" 2>&1 || true
+          done
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-logs-${{ github.job }}
+          path: |
+            server-logs/
+            tmp/out/test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the family
+        if: always()
+        run: docker compose down -v
 
   galera114:
     # MariaDB Galera on the LTS line (3 x mariadb:11.4.13, the mariadb114 pin): the topology whose
@@ -324,7 +347,9 @@ jobs:
       COMPOSE_PROFILES: cluster
       SERVICES: galera114-1 galera114-2 galera114-3
     steps:
-      - *cluster-checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: bootstrap node 1 (in the background)
         env:
           GALERA_BOOTSTRAP: "ON"
@@ -334,7 +359,11 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-      - *cluster-cache
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache (its mysql84 job writes it); never writes one.
+          shared-key: integration
+          save-if: false
       - name: build the streaming suite
         run: cargo test --locked --test binlog_stream --no-run
       - name: wait for node 1 (Synced)
@@ -388,23 +417,49 @@ jobs:
                    stream_resume_by_gtid_requires_the_source_to_cover_the_state; do
             grep -q "^test $t \.\.\. ok$" galera-tests.log || { echo "::error::$t did not run and pass on galera114-1"; exit 1; }
           done
-      - *cluster-logs
-      - *cluster-upload
-      - *cluster-down
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          for s in $SERVICES; do
+            docker compose logs --no-color --timestamps "$s" > "server-logs/$s.log" 2>&1 || true
+          done
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-logs-${{ github.job }}
+          path: |
+            server-logs/
+            tmp/out/test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the family
+        if: always()
+        run: docker compose down -v
 
   pxc84:
-    # Percona XtraDB Cluster 8.4 (3 nodes, the image pinned by digest): PXC's own requirement set for
-    # a continuous GTID state (gtid_mode + wsrep_gtid_mode + wsrep_gtid_domain_id +
-    # log_replica_updates) is asserted on every member, then the same two questions as in Galera -
-    # a causal read of node 1's write from another member, and MySQL's GTID_SUBSET over node 1's
-    # gtid_executed. The PXC rules themselves live in src/source/percona.rs; this lane is the
-    # topology's proof.
+    # Percona XtraDB Cluster 8.4 (3 nodes, the image pinned by digest). BLOCKING: PXC 8.4 is one of
+    # the owner's four default topologies (async + Multi-AZ, Galera, PXC 8.4, GR single-primary), and
+    # a contractual lane behind continue-on-error reports a failure nobody acts on - "fix later",
+    # lv-super's ruling on item 1 (Handbook 4h point 2). The settings this major really has
+    # (gtid_mode, enforce_gtid_consistency, log_replica_updates, wsrep_on) are asserted on every
+    # member, then the property they exist for: GTID_SUBSET(node 1's gtid_executed,
+    # @@GLOBAL.gtid_executed) on every member and a causal read of node 1's write from the other two,
+    # which is what makes a member change a non-event for the cursor. The PXC rules themselves live in
+    # src/source/percona.rs; this lane is the topology's proof.
+    #
+    # What stood here before, and why it could never pass: the lane asserted wsrep_gtid_mode=ON and
+    # wsrep_gtid_domain_id=42, which are MariaDB Galera options PXC 8.4 does not have (lv-super's
+    # ruling of 2026-11-27 on this worker's ask: a defect in the approved runner, not a requirement).
+    # Node 1's own words, from the entrypoint's `mysqld --initialize-insecure`
+    # (tmp/out/lvs-gtid/ci-cluster-families/cluster/pxc84/pxc84-1.compose.log, run 2026-11-23T07:43Z):
+    #   0 [ERROR] [MY-000067] [Server] unknown variable 'wsrep-gtid-mode=ON'.
+    #   0 [ERROR] [MY-013236] [Server] The designated data directory /var/lib/mysql/ is unusable.
+    #   0 [ERROR] [MY-010119] [Server] Aborting
     name: cluster (pxc, percona xtradb 8.4)
     if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && needs.cluster-changes.outputs.run == 'true'
-    # Advisory until it is proven on a dev host: node 1 aborts during startup on this host, so a red run here is a known
-    # gap and not a regression in the change under review. It still runs for real and its
-    # logs are an artifact; tmp/lvs-cluster.sh pxc84 reproduces it.
-    continue-on-error: true
     needs: cluster-changes
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -413,7 +468,9 @@ jobs:
       COMPOSE_PROFILES: cluster
       SERVICES: pxc84-1 pxc84-2 pxc84-3
     steps:
-      - *cluster-checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: bootstrap node 1 (in the background)
         env:
           PXC_BOOTSTRAP: "ON"
@@ -423,7 +480,11 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-      - *cluster-cache
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache (its mysql84 job writes it); never writes one.
+          shared-key: integration
+          save-if: false
       - name: build the streaming suite
         run: cargo test --locked --test binlog_stream --no-run
       - name: wait for node 1 (Synced)
@@ -444,19 +505,26 @@ jobs:
         shell: bash
         run: |
           q() { docker compose exec -T -e Q="$2" "$1" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -uroot -proot -NB -e "$Q"'; }
+          # lv-super 2026-11-27 (ruling on item 1): the two MariaDB-only assertions that were here
+          # (wsrep_gtid_mode, wsrep_gtid_domain_id) are gone - PXC 8.4 has no such server options and
+          # node 1 aborts on them (the quoted abort in the job comment above). In their place: the
+          # four settings this major does have, and the continuity property itself, asserted on every
+          # member rather than on the two secondaries alone. Nothing here is advisory, skipped or retried.
           for n in 1 2 3; do
             [ "$(q pxc84-$n "SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size'" | awk '{print $2}')" = 3 ] || { echo "::error::pxc84-$n does not see 3 members"; exit 1; }
-            [ "$(q pxc84-$n "SELECT @@GLOBAL.wsrep_gtid_mode")" = 1 ] || { echo "::error::pxc84-$n has wsrep_gtid_mode off"; exit 1; }
-            [ "$(q pxc84-$n "SELECT @@GLOBAL.wsrep_gtid_domain_id")" = 42 ] || { echo "::error::pxc84-$n has no fixed wsrep_gtid_domain_id"; exit 1; }
             [ "$(q pxc84-$n "SELECT @@GLOBAL.gtid_mode REGEXP '^ON'")" = 1 ] || { echo "::error::pxc84-$n has gtid_mode off: no MySQL GTIDs to resume by"; exit 1; }
-            [ "$(q pxc84-$n "SELECT @@GLOBAL.log_replica_updates")" = 1 ] || { echo "::error::pxc84-$n has log_replica_updates off"; exit 1; }
+            [ "$(q pxc84-$n "SELECT @@GLOBAL.enforce_gtid_consistency")" = 1 ] || { echo "::error::pxc84-$n has enforce_gtid_consistency off: gtid_mode=ON requires it"; exit 1; }
+            [ "$(q pxc84-$n "SELECT @@GLOBAL.log_replica_updates")" = 1 ] || { echo "::error::pxc84-$n has log_replica_updates off: its binlog would not carry the cluster"; exit 1; }
+            [ "$(q pxc84-$n "SELECT @@GLOBAL.wsrep_on")" = 1 ] || { echo "::error::pxc84-$n is not running wsrep at all"; exit 1; }
           done
           q pxc84-1 "CREATE DATABASE IF NOT EXISTS lvcl; CREATE TABLE IF NOT EXISTS lvcl.entities (id INT PRIMARY KEY, v INT NOT NULL); INSERT INTO lvcl.entities VALUES (1,1),(2,2),(777,777);"
           SET=$(q pxc84-1 "SELECT @@GLOBAL.gtid_executed" | tr -d '\n ')
           echo "node 1 gtid_executed=$SET"
+          for n in 1 2 3; do
+            [ "$(q pxc84-$n "SELECT GTID_SUBSET('$SET', @@GLOBAL.gtid_executed)")" = 1 ] || { echo "::error::pxc84-$n does not cover $SET: a cursor saved on any member could not resume on it"; exit 1; }
+          done
           for n in 2 3; do
             [ "$(q pxc84-$n "SET SESSION wsrep_sync_wait=1; SELECT COUNT(*) FROM lvcl.entities WHERE id=777 AND v=777")" = 1 ] || { echo "::error::pxc84-$n causal read missed node 1's write"; exit 1; }
-            [ "$(q pxc84-$n "SELECT GTID_SUBSET('$SET', @@GLOBAL.gtid_executed)")" = 1 ] || { echo "::error::pxc84-$n does not cover $SET"; exit 1; }
           done
       - name: stream a pxc member's binlog
         timeout-minutes: 10
@@ -476,23 +544,57 @@ jobs:
                    stream_resume_by_gtid_requires_the_source_to_cover_the_state; do
             grep -q "^test $t \.\.\. ok$" pxc-tests.log || { echo "::error::$t did not run and pass on pxc84-1"; exit 1; }
           done
-      - *cluster-logs
-      - *cluster-upload
-      - *cluster-down
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          for s in $SERVICES; do
+            docker compose logs --no-color --timestamps "$s" > "server-logs/$s.log" 2>&1 || true
+          done
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-logs-${{ github.job }}
+          path: |
+            server-logs/
+            tmp/out/test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the family
+        if: always()
+        run: docker compose down -v
 
   gr84:
-    # MySQL Group Replication, single primary (3 x mysql:8.4.13, the mysql84 pin). The property that
-    # makes a primary change a non-event for the cursor is that members stamp transactions with the
-    # GROUP uuid, so the lane asserts the membership is real (3 ONLINE, exactly one PRIMARY) and
-    # that the secondaries cover the primary's gtid_executed - and it waits for it, which is also the
-    # fence the read-endpoint plan uses on a secondary. start_on_boot=OFF plus the two dynamic
-    # group_replication options is what lets the lane seed the addresses on a bridge network.
+    # MySQL Group Replication, single primary (3 x mysql:8.4.13, the mysql84 pin). BLOCKING, for the
+    # same reason as pxc84: GR single-primary is one of the owner's four default topologies, so this
+    # lane is contractual and cannot ship behind continue-on-error (lv-super's ruling on item 1,
+    # Handbook 4h point 2). The property that makes a primary change a non-event for the cursor is
+    # that members stamp transactions with the GROUP uuid, so the lane asserts the membership is real
+    # (3 ONLINE, exactly one PRIMARY) and that the secondaries cover the primary's gtid_executed -
+    # and it waits for it, which is also the fence the read-endpoint plan uses on a secondary.
+    # start_on_boot=OFF plus the two dynamic group_replication options is what lets the lane seed the
+    # addresses on a bridge network.
+    #
+    # Two things had to be fixed for a joiner to reach ONLINE, both of them in the topology, neither
+    # of them a loosened bound:
+    #   - a joiner carries its own initdb transactions, and the group expels it for that ("this member
+    #     has more executed transactions than those present in the group"), so each joiner is emptied
+    #     with RESET BINARY LOGS AND GTIDS before START GROUP_REPLICATION and the empty set is
+    #     asserted, not assumed - the standard GR bootstrap step, in the step below;
+    #   - distributed recovery could not authenticate: the recovery channel connects as lvdoc over an
+    #     unencrypted connection and 8.4's caching_sha2_password refuses it, so both joiners sat in
+    #     RECOVERING forever. Measured on this host (tmp/out/lvs-gtid/ci-cluster-families/cluster/
+    #     gr84/gr84-members.txt, run 2026-11-23T07:44Z), once a minute on each joiner:
+    #       [ERROR] [MY-010584] [Repl] Replica I/O for channel 'group_replication_recovery': Error
+    #       connecting to source 'lvdoc@...:3306' ... Message: Authentication plugin
+    #       'caching_sha2_password' reported error: Authentication requires secure connection.
+    #       [ERROR] [MY-011582] [Repl] Plugin group_replication reported: 'There was an error when
+    #       connecting to the donor server...'
+    #     fixed by group_replication_recovery_get_public_key=ON on the three services.
     name: cluster (group replication, mysql 8.4)
     if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && needs.cluster-changes.outputs.run == 'true'
-    # Advisory until it is proven on a dev host: the joiners are expelled by the group for carrying their own initdb GTIDs, so a red run here is a known
-    # gap and not a regression in the change under review. It still runs for real and its
-    # logs are an artifact; tmp/lvs-cluster.sh gr84 reproduces it.
-    continue-on-error: true
     needs: cluster-changes
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -501,14 +603,20 @@ jobs:
       COMPOSE_PROFILES: cluster
       SERVICES: gr84-1 gr84-2 gr84-3
     steps:
-      - *cluster-checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: start node 1 (in the background)
         run: docker compose up -d --quiet-pull gr84-1
       - name: rust ${{ env.RUST_TOOLCHAIN }}
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-      - *cluster-cache
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration matrix's cache (its mysql84 job writes it); never writes one.
+          shared-key: integration
+          save-if: false
       - name: build the streaming suite
         run: cargo test --locked --test binlog_stream --no-run
       - name: wait for node 1
@@ -574,16 +682,38 @@ jobs:
                    stream_resume_by_gtid_requires_the_source_to_cover_the_state; do
             grep -q "^test $t \.\.\. ok$" gr-tests.log || { echo "::error::$t did not run and pass on gr84-1"; exit 1; }
           done
-      - *cluster-logs
-      - *cluster-upload
-      - *cluster-down
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          for s in $SERVICES; do
+            docker compose logs --no-color --timestamps "$s" > "server-logs/$s.log" 2>&1 || true
+          done
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-logs-${{ github.job }}
+          path: |
+            server-logs/
+            tmp/out/test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the family
+        if: always()
+        run: docker compose down -v
 
   gr84-mp:
     # ADVISORY nightly: Group Replication in multi-primary mode (the same three services started with
     # the interpolated single-primary/consistency/isolation flags). Tested, not supported (the GTID
     # plan's Q-O1 recommendation, accepted by lv-super's ruling 5), so it annotates and never blocks.
     name: cluster (group replication, multi-primary, advisory)
-    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.event.inputs.long_soak == true
+    # Runs on the nightly (schedule) and on a manual run only with the long_soak box; never on a PR
+    # or a push to main, where the four contractual lanes are the whole story. `inputs`, not
+    # `github.event.inputs`: the box is declared under on.workflow_dispatch / on.workflow_call.
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.long_soak == true || github.event_name == 'schedule')
+    # Best-effort leg, and one of only two `continue-on-error: true` in these lanes (lv-super's ruling on item 2, 2026-11-27): multi-primary GR is a best-effort topology, not one of the owner's four contractual ones, so it annotates the nightly and never blocks.
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -595,7 +725,9 @@ jobs:
       GR_ENFORCE_EVERYWHERE: "ON"
       GR_ISOLATION: READ-COMMITTED
     steps:
-      - *cluster-checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: start node 1 and bootstrap the group (multi-primary)
         shell: bash
         run: |
@@ -632,16 +764,38 @@ jobs:
             [ "$(q gr84-$n "SELECT COUNT(*) FROM lvcl.entities WHERE id IN (101,102,103)")" = 3 ] || { echo "::error::gr84-$n did not receive every member's write"; exit 1; }
           done
           echo ":warning: multi-primary GR is advisory (tested, not supported): see the GTID plan Q-O1." >> "$GITHUB_STEP_SUMMARY"
-      - *cluster-logs
-      - *cluster-upload
-      - *cluster-down
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          for s in $SERVICES; do
+            docker compose logs --no-color --timestamps "$s" > "server-logs/$s.log" 2>&1 || true
+          done
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-logs-${{ github.job }}
+          path: |
+            server-logs/
+            tmp/out/test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the family
+        if: always()
+        run: docker compose down -v
 
   galera114-rsu:
     # ADVISORY nightly: the Galera churn the blocking lane cannot afford the time for - an RSU DDL
     # (which replicates nothing, so the plan's rule is "run it on every node"), and a node that leaves
     # and rejoins through IST. Advisory: it annotates the nightly and never blocks a release.
     name: cluster (galera, RSU and rejoin churn, advisory)
-    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.event.inputs.long_soak == true
+    # Runs on the nightly (schedule) and on a manual run only with the long_soak box; never on a PR
+    # or a push to main, where the four contractual lanes are the whole story. `inputs`, not
+    # `github.event.inputs`: the box is declared under on.workflow_dispatch / on.workflow_call.
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.long_soak == true || github.event_name == 'schedule')
+    # Best-effort leg, and the other of only two `continue-on-error: true` in these lanes (lv-super's ruling on item 2, 2026-11-27): Galera RSU/IST churn is best-effort, not one of the owner's four contractual topologies, so it annotates the nightly and never blocks.
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -650,7 +804,9 @@ jobs:
       COMPOSE_PROFILES: cluster
       SERVICES: galera114-1 galera114-2 galera114-3
     steps:
-      - *cluster-checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: bootstrap the cluster and run the churn
         shell: bash
         run: |
@@ -692,9 +848,27 @@ jobs:
           [ "$(q galera114-3 "SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size'" | awk '{print $2}')" = 3 ] || { echo "::error::galera114-3 never rejoined the cluster"; exit 1; }
           [ "$(q galera114-3 "SET SESSION wsrep_sync_wait=1; SELECT COUNT(*) FROM lvcl.entities WHERE id=777")" = 1 ] || { echo "::error::the rejoined node missed the write it was down for"; exit 1; }
           echo ":warning: Galera RSU / IST churn is advisory: see the GTID plan 3.3." >> "$GITHUB_STEP_SUMMARY"
-      - *cluster-logs
-      - *cluster-upload
-      - *cluster-down
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          for s in $SERVICES; do
+            docker compose logs --no-color --timestamps "$s" > "server-logs/$s.log" 2>&1 || true
+          done
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-logs-${{ github.job }}
+          path: |
+            server-logs/
+            tmp/out/test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the family
+        if: always()
+        run: docker compose down -v
 
   lint:
     name: lint (fmt + clippy)
