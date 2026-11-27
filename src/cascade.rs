@@ -9,7 +9,8 @@
 //! through every route of the child table, as the change the storage engine made; a server that
 //! logs the cascaded rows itself only marks the same ids twice.
 //!
-//! One cache per version, in the dirty buffer. Contents: [`KeptRow`], [`kept`], [`kept_image`],
+//! One cache per version, in the dirty buffer. Contents: [`KeptRow`], [`kept`], [`carries`],
+//! [`kept_image`],
 //! [`seed_sql`], [`seed_row`] (the caller runs the query) and [`Cache`] (routes grown on use, the
 //! seeding log, the restart gap and its once-a-minute warning).
 //!
@@ -25,17 +26,67 @@ use mysql_async::Value;
 
 use crate::analyze::{int_sql, quote_ident, CascadeRoute};
 use crate::binlog::Position;
-use crate::catalog::{ColKind, Column};
+use crate::catalog::{ColKind, Column, TableInfo};
 use crate::datum::{Datum, Key};
 
 /// A child row as a cascade map keeps it: its FK value and, per stored column (`MapPlan::cols`),
-/// the datum its image carried (`None`: not in the image). `complete`: every stored column was
-/// in the image (the host's change feed decides it).
+/// the datum its image carried (`None`: not in the image). `complete`: every column the map
+/// stores was in the image as a value, read at its own index — [`carries`] decides it, from the
+/// columns the route reads and the table, never from a bare column count.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeptRow {
     pub fk: Key,
     pub values: Vec<Option<Datum>>,
     pub complete: bool,
+}
+
+/// The highest column index an image `omitted` columns shorter than `t` can still be read at,
+/// or `None` when the shortening is not one the catalog can account for.
+///
+/// A row event that omits a column leaves no hole in its image: it shortens it, so the values of
+/// the columns it does carry stand in table order from slot 0 and no column of a shorter image
+/// can be told absent by looking at it. The one shortening the catalog can prove without the
+/// event is a table's VIRTUAL generated columns: neither server family writes them to an UPDATE
+/// or DELETE image (issue #7), no route reads one (the planner inlines it into its base columns,
+/// [`crate::catalog::Column::exact_key`]), and a VIRTUAL column can be neither updated nor
+/// indexed, so no image can carry one in place of a real column and the columns before the first
+/// of them are all present, in order, at their own index. A STORED column rules the shortening
+/// out: the server writes it into some images and not into others, so the image's length says
+/// nothing about which columns it holds.
+fn provable_omission(t: &TableInfo, omitted: usize) -> Option<usize> {
+    if omitted == 0 {
+        return t.columns.len().checked_sub(1);
+    }
+    let mut virtuals = 0;
+    let mut first = None;
+    for (i, c) in t.columns.iter().enumerate() {
+        match &c.generated {
+            Some(g) if !g.stored => {
+                virtuals += 1;
+                first.get_or_insert(i);
+            }
+            Some(_) => return None,
+            None => {}
+        }
+    }
+    (virtuals != 0 && virtuals == omitted).then(|| first.expect("counted one").saturating_sub(1))
+}
+
+/// Whether the image `r` of table `t` can be read by column index for the columns `need`: every
+/// one of them stands in the image, as a value, at its own index.
+///
+/// A column that is not in the image is not readable (see [`provable_omission`]), and neither is
+/// one the image carries as a partial-JSON diff (`PARTIAL_JSON`): the diff must be applied to the
+/// row's old value, which an image of the change does not hold. The caller treats such a row as
+/// short and answers it on the streamed path (the counted rebuild in `accumulate`, the #167
+/// whole-view refresh at the engine's reader guard); a full image — `binlog_row_image = FULL` with no
+/// partial JSON updates, the shape of every ordinary write — pays the one length comparison and
+/// one presence test per column read, as before.
+pub fn carries(t: &TableInfo, r: &BinlogRow, mut need: impl Iterator<Item = usize>) -> bool {
+    let Some(highest) = provable_omission(t, t.columns.len().saturating_sub(r.len())) else {
+        return false;
+    };
+    need.all(|k| k <= highest && !matches!(r.as_ref(k), None | Some(BinlogValue::JsonDiff(_))))
 }
 
 /// Whether `c`'s map keeps the child row `r` of its binlog event, and if so as what: its
@@ -51,15 +102,12 @@ pub fn kept(c: &CascadeRoute, r: &BinlogRow) -> Option<(Key, KeptRow)> {
     if fk.iter().any(Datum::is_null) {
         return None;
     }
-    let mut complete = r.len() == t.columns.len();
+    let complete = carries(t, r, m.cols.iter().copied());
     let values = m
         .cols
         .iter()
         .map(|&k| match r.as_ref(k) {
-            None | Some(BinlogValue::JsonDiff(_)) => {
-                complete = false;
-                None
-            }
+            None | Some(BinlogValue::JsonDiff(_)) => None,
             v => Some(Datum::from_binlog(v, &t.columns[k])),
         })
         .collect();
@@ -233,6 +281,13 @@ pub struct Cache {
     log: Option<Vec<Logged>>,
     pub gap_until: Option<Position>,
     pub gap: bool,
+    /// The map cannot vouch for what it keeps: a row it had to keep arrived in an image it could
+    /// not read (neither its key nor its FK is provable from it), or a parent change whose image it
+    /// could not read never moved the rows it keeps. Until the cache is seeded again, no kept row
+    /// of a route may be trusted to name the units a parent change moves: such a change is not
+    /// trusted to the map at all — it costs the streamed rebuild, which seeds the cache again
+    /// (unlike a [`Cache::gap`] window, whose mark is healed by the window's seed read).
+    pub distrust: bool,
     pub warned_at: u64,
 }
 
@@ -325,6 +380,7 @@ impl Cache {
             log: Some(Vec::new()),
             gap_until: None,
             gap: false,
+            distrust: false,
             warned_at: 0,
         }
     }
@@ -383,6 +439,9 @@ impl Cache {
                 self.put(ci, key, row);
             }
         }
+        // `distrust` is NOT healed here: the rows of a seed read say what the map holds, not what
+        // an image it could not read left behind. It stands until the version's cache is seeded
+        // again, which is what a rebuild does.
         self.log.take().unwrap_or_default()
     }
 }
@@ -391,7 +450,7 @@ impl Cache {
 mod tests {
     use super::*;
     use crate::analyze::{ConstFilter, MapPlan};
-    use crate::catalog::{FkAction, TableInfo};
+    use crate::catalog::{FkAction, Generated, TableInfo};
     use std::sync::Arc;
 
     /// A table in schema `db` with the given columns and `pk` over column 0.
@@ -567,5 +626,71 @@ mod tests {
             ]
         );
         assert!(row.complete);
+    }
+
+    /// A binlog image of `vals`, one value per column it carries (an image that omits a column
+    /// is short: the values it does hold stand in table order from slot 0).
+    fn image(vals: Vec<Option<BinlogValue<'static>>>) -> BinlogRow {
+        use mysql_async::consts::ColumnType;
+        let columns: Vec<mysql_async::Column> = (0..vals.len())
+            .map(|_| mysql_async::Column::new(ColumnType::MYSQL_TYPE_NULL))
+            .collect();
+        BinlogRow::new(vals, std::sync::Arc::from(columns))
+    }
+
+    fn int(i: i64) -> Option<BinlogValue<'static>> {
+        Some(BinlogValue::Value(Value::Int(i)))
+    }
+
+    /// The `items` route with a trailing generated column no route reads: VIRTUAL, or STORED.
+    fn route_generated(stored: bool) -> CascadeRoute {
+        let mut c = route(vec![]);
+        let mut t = (*c.child_table).clone();
+        t.columns.push(Column {
+            generated: Some(Generated {
+                expr: "concat(`p1`,'x')".into(),
+                stored,
+                deps: None,
+            }),
+            ..Column::simple("g", "varchar")
+        });
+        c.child_table = Arc::new(t);
+        c
+    }
+
+    #[test]
+    fn completeness_is_about_the_columns_the_routes_read() {
+        let c = route(vec![]);
+        let t = &c.child_table;
+        // id, p1, p2, ts, flag: the stored columns (3, 4) are in the image.
+        let full = image(vec![int(1), int(100), int(200), int(7), int(9)]);
+        assert!(carries(t, &full, 3..=4));
+        assert!(kept(&c, &full).unwrap().1.complete);
+        // A column the map does not store may be missing from the image: the row is still
+        // readable where it matters, so it is complete.
+        let short = image(vec![int(1), int(100), int(200), int(7)]);
+        assert!(!carries(t, &short, 3..=4), "flag is missing");
+        assert!(!carries(t, &short, 4..=4));
+        assert!(!kept(&c, &short).unwrap().1.complete);
+        // A column past the end of the image is not readable either.
+        assert!(!carries(t, &full, 3..=9));
+        // A VIRTUAL generated column is in no UPDATE or DELETE image: an image of the other
+        // columns is a full one for the route, and the row is never charged as short.
+        let v = route_generated(false);
+        assert!(carries(&v.child_table, &full, 3..=4));
+        assert!(kept(&v, &full).unwrap().1.complete);
+        // The image that lacks the VIRTUAL column and one real column is not readable.
+        let shorter = image(vec![int(1), int(100), int(200)]);
+        assert!(!carries(&v.child_table, &shorter, 3..=4));
+        assert!(!kept(&v, &shorter).unwrap().1.complete);
+        // A STORED column is written into some images and not others, so a short image says
+        // nothing about which columns it holds.
+        let s = route_generated(true);
+        assert!(!carries(&s.child_table, &short, 3..=4));
+        assert!(!kept(&s, &short).unwrap().1.complete);
+        // The full image of that table (its STORED column included) is readable.
+        let with_stored = image(vec![int(1), int(100), int(200), int(7), int(9), int(20)]);
+        assert!(carries(&s.child_table, &with_stored, 3..=4));
+        assert!(kept(&s, &with_stored).unwrap().1.complete);
     }
 }

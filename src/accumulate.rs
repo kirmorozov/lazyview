@@ -456,6 +456,18 @@ impl ViewDirty {
         push_once(&mut self.name_pending, (route, old));
     }
 
+    /// Counts one row image the view cannot read (a short image, a partial JSON update): the
+    /// view cannot be maintained from it, so this counts the view, not the row — however many
+    /// rows of one flush are unreadable, the answer (and the counter) is one. The sites that
+    /// charge it answer with the streamed rebuild (their `dirty.rebuild`, as on main), or, at
+    /// the engine's reader guard, with its #167 whole-view refresh.
+    #[inline]
+    pub fn short_image(&mut self) {
+        if self.tally.cascade_short_images == 0 {
+            self.tally.cascade_short_images = 1;
+        }
+    }
+
     pub fn take(&mut self) -> ViewDirty {
         let n = self.images.len();
         let mut out = std::mem::take(self);
@@ -648,7 +660,7 @@ pub fn feed_cascade(
         return Fed::Recorded;
     }
     if c.derived {
-        return feed_derived_cascade(c, action, dirty, b, after);
+        return feed_derived_cascade(plan, c, action, dirty, b, after);
     }
     let Some(pcols) = &c.unit_from_parent else {
         if c.map.is_some() {
@@ -678,20 +690,42 @@ pub fn feed_cascade(
 /// A derived cascade (see `CascadeRoute::derived`): partial unit keys from the parent's old key
 /// (and its new key, or NULLs, as the action sets the children's FK), and for each pinned alias
 /// whose values hold the old or new key, the presence lookups that give the units of those
-/// child rows. A parent row that is not a full image cannot be read: the documented safety net
-/// is a rebuild, with a warning.
+/// child rows. A parent row the view cannot read (an image that omits a column the route reads,
+/// or a partial JSON update of one) takes one counted streamed rebuild ([`ViewDirty::rebuild`]),
+/// with a warning: those units are unknown, and a build from the source is exact for all of them.
 fn feed_derived_cascade(
+    plan: &ViewPlan,
     c: &CascadeRoute,
     action: FkAction,
     dirty: &mut ViewDirty,
     b: &BinlogRow,
     after: Option<&BinlogRow>,
 ) -> Fed {
-    let full = |r: &BinlogRow| r.len() == c.parent.columns.len();
+    // The parent columns the route reads: the key, the pinned ones, and the ones the partial
+    // unit keys are made of.
+    let readable = |r: &BinlogRow| {
+        cascade::carries(
+            &c.parent,
+            r,
+            c.parent_cols
+                .iter()
+                .copied()
+                .chain(c.pinned.iter().map(|p| p.parent_col))
+                .chain(
+                    c.partial_from_parent
+                        .iter()
+                        .flat_map(|(_, ps)| ps.iter().copied()),
+                ),
+        )
+    };
     // The children's FK after the change: the new key (CASCADE update) or NULL (SET NULL).
     let new_key = after.filter(|_| action == FkAction::Cascade);
-    if !full(b) || new_key.is_some_and(|a| !full(a)) {
-        partial_parent_image(&c.parent.name);
+    if !readable(b) || new_key.is_some_and(|a| !readable(a)) {
+        partial_parent_image(&plan.name, &c.parent.name);
+        dirty.short_image();
+        // The streamed rebuild, as on main: the units the change moves are unknown, and the
+        // in-memory whole-view read (`mark_all`) is closed to new uses until the streamed
+        // whole-view refresh lands (path-to-green step 1c, the owner's rule).
         dirty.rebuild = true;
         return Fed::Recorded;
     }
@@ -745,8 +779,8 @@ fn feed_derived_cascade(
 
 /// A cascade the map follows: the parent's old key, and the children's new FK (the new key of a
 /// CASCADE update, NULLs for SET NULL; none when they are deleted), for the next refresh to
-/// resolve. A parent row that is not a full image cannot be read: the safety net of
-/// [`feed_derived_cascade`].
+/// resolve. A parent row the view cannot read is handled as in [`feed_derived_cascade`]: one
+/// counted streamed rebuild.
 fn feed_mapped_cascade(
     plan: &ViewPlan,
     c: &CascadeRoute,
@@ -756,9 +790,16 @@ fn feed_mapped_cascade(
     b: &BinlogRow,
     after: Option<&BinlogRow>,
 ) -> Fed {
-    let full = |r: &BinlogRow| r.len() == c.parent.columns.len();
-    if !full(b) || after.is_some_and(|a| !full(a)) {
-        partial_parent_image(&c.parent.name);
+    // The route reads the parent's key, and nothing else of it.
+    let readable = |r: &BinlogRow| cascade::carries(&c.parent, r, c.parent_cols.iter().copied());
+    if !readable(b) || after.is_some_and(|a| !readable(a)) {
+        partial_parent_image(&plan.name, &c.parent.name);
+        dirty.short_image();
+        // The change is not recorded, so the rows the map keeps under the parent's old key are
+        // no longer known to belong to it: the map is distrusted until it is seeded again.
+        dirty.cache.distrust = true;
+        // The streamed rebuild, as on main (see the derived-cascade site for why `mark_all`
+        // is closed to new uses until step 1c).
         dirty.rebuild = true;
         return Fed::Recorded;
     }
@@ -774,6 +815,11 @@ fn feed_mapped_cascade(
         _ => Some(c.parent_cols.iter().map(|_| Datum::Null).collect()),
     };
     let old = key(b);
+    // A map that cannot vouch for its kept rows (see `Cache::distrust`: an image it had to keep,
+    // or a parent change it could not read) cannot name the units this change moves: whatever it
+    // holds, the whole view is refreshed for it. `parent` below still moves what the map does
+    // hold, and the cost stays one refresh of the view per flush.
+    let distrust = dirty.cache.distrust;
     if dirty.cache.gap {
         dirty.tally.cascade_gaps += 1;
         cascade_gap(&plan.name, &c.parent.name, &old, &mut dirty.cache.warned_at);
@@ -785,7 +831,7 @@ fn feed_mapped_cascade(
         (Some(n), true, FkAction::Cascade) => kept_under_new(c, &dirty.cache, ci, &old, n),
         _ => Vec::new(),
     };
-    match dirty.cache.parent(ci, &old, new.as_ref()) {
+    let fed = match dirty.cache.parent(ci, &old, new.as_ref()) {
         // Logged while seeding: `drain` expands it once the cache is installed, so the
         // version must hold this change's position until then.
         None => Fed::Recorded,
@@ -836,7 +882,15 @@ fn feed_mapped_cascade(
             }
             fed
         }
+    };
+    // A distrusted map names nothing: the units this parent change moved are unknown whatever the
+    // cache says, so the view is rebuilt (the streamed answer, as on main; the marks and
+    // expansions above stand). Rebuilding seeds the cache again, which heals the distrust.
+    if distrust {
+        dirty.rebuild = true;
+        return Fed::Recorded;
     }
+    fed
 }
 
 /// Whether the children of a parent change have vanished from where the cascade map keeps them:
@@ -895,8 +949,9 @@ fn kept_under_new(
 
 /// The kept child rows of a parent change, expanded into child row changes at event time: a
 /// complete row replays through the map (`replay`) with its kept image before, and after
-/// carrying the new FK (none when the children are deleted); an incomplete row (a stored
-/// column missing from the image) warns and marks the view for rebuild.
+/// carrying the new FK (none when the children are deleted); an incomplete row (a column the map
+/// stores that the image does not carry as a value) warns and takes one counted streamed
+/// rebuild (`ViewDirty::rebuild`), which seeds the cache again and heals its distrust.
 fn expand(
     plan: &ViewPlan,
     ci: usize,
@@ -912,6 +967,12 @@ fn expand(
     for row in &rows {
         if !row.complete {
             incomplete_cascade_row(&plan.name, &c.child.1);
+            dirty.short_image();
+            // The map holds a row whose stored columns it cannot read: what it keeps is no longer
+            // known, so the route is distrusted until the cache is seeded again. The streamed
+            // rebuild is both the answer and that seeding (as on main; see the derived-cascade
+            // site for why `mark_all` is closed to new uses until step 1c).
+            dirty.cache.distrust = true;
             dirty.rebuild = true;
             fed = Fed::Recorded;
             continue;
@@ -928,8 +989,10 @@ fn expand(
 /// Records a change of a child row of cascade `ci` for its map (see `MapPlan`): the row entering
 /// or changing in the map, or leaving it (deleted, a new key, a NULL FK, or no alias's filters
 /// pass any more). An update of no stored column, or of a row the map does not keep, is
-/// skipped. A stored column missing from the image (not a full image, a partial JSON update)
-/// leaves the row incomplete: replaying it is the documented safety net (`crate::cascade`).
+/// skipped. A row whose image cannot be read at a column the map decides with (the server left
+/// it out of the image, or updated it as a partial JSON diff) cannot be classified at all, so
+/// it costs one counted streamed rebuild (`ViewDirty::short_image`, `dirty.rebuild`, as on main
+/// until the streamed whole-view refresh lands).
 pub fn feed_map(
     plan: &ViewPlan,
     ci: usize,
@@ -941,7 +1004,40 @@ pub fn feed_map(
     let Some(m) = &c.map else {
         return Fed::Skipped;
     };
+    // The columns the map decides with: the key it addresses the row by, the FK that groups the
+    // row under a parent, and the stored columns it replays. An image that cannot be read at one
+    // of them cannot say whether the map keeps the row at all (`kept` reads the FK, the filters
+    // and the stored columns), so neither keeping it nor dropping it is provable — and a row
+    // whose key is not in the image cannot be recovered from the source by key either. Such a
+    // row costs one counted streamed rebuild.
+    let readable = |r: &BinlogRow| {
+        cascade::carries(
+            &c.child_table,
+            r,
+            m.key
+                .iter()
+                .copied()
+                .chain(c.child_cols.iter().copied())
+                .chain(m.cols.iter().copied()),
+        )
+    };
+    if before.is_some_and(|r| !readable(r)) || after.is_some_and(|r| !readable(r)) {
+        incomplete_cascade_row(&plan.name, &c.child.1);
+        dirty.short_image();
+        // The row is not classified into the map (its key may be absent too), and what the map
+        // does hold can no longer be trusted to name the units a parent change moves: the route
+        // is distrusted until the cache is seeded again. The streamed rebuild is both the
+        // answer and that seeding (as on main; see the derived-cascade site for why `mark_all`
+        // is closed to new uses until step 1c).
+        dirty.cache.distrust = true;
+        dirty.rebuild = true;
+        return Fed::Recorded;
+    }
     if let (Some(b), Some(a)) = (before, after) {
+        // Both images are readable here (an unreadable one returned above), so they may be
+        // compared for "nothing stored changed": an image that omits a column packs the values
+        // it does carry, so equal values at a position would be an accident of it, not the row's
+        // own, and a row the map keeps must not keep its old value.
         if !m.cols.iter().any(|&k| {
             value_at(b, k) != value_at(a, k)
                 || matches!(value_at(a, k), Some(BinlogValue::JsonDiff(_)))
@@ -1104,29 +1200,32 @@ fn cascade_gap(view: &str, parent: &str, old: &Key, warned_at: &mut u64) {
     }
 }
 
-/// Warns (at most once a minute) that a child row the cascade map keeps lacked a stored column
-/// (not a full image, or a partial JSON update), so the units its cascade changes are unknown
-/// and the view is rebuilt (`binlog_row_image` FULL, no `PARTIAL_JSON` row value option).
+/// Warns (at most once a minute) that a child row the cascade map keeps lacked a column the map
+/// stores (an image that omits it, or a partial JSON update of it), so the units its cascade
+/// changes are unknown and the view is refreshed as a whole: the operator fixes the server
+/// (`binlog_row_image` FULL, no `PARTIAL_JSON` row value option) or accepts the refresh.
 pub fn incomplete_cascade_row(view: &str, child: &str) {
     static LAST: AtomicU64 = AtomicU64::new(0);
     warn_throttled(&LAST, || {
         tracing::warn!(
             view,
             child,
-            "a cascaded child row was kept without all its columns (binlog_row_image must be FULL, without partial JSON updates): the units its cascade changes are unknown, rebuilding the view"
+            "a cascaded child row was kept without a column the view reads (binlog_row_image must be FULL, without partial JSON updates): the units its cascade changes are unknown, rebuilding the view from the source"
         );
     });
 }
 
-/// Warns (at most once a minute) that a cascade parent's row image lacked columns, so the units
-/// its cascade changes were unknown and the view is rebuilt (`binlog_row_image` other than FULL,
-/// or a server leaving generated columns out of the image).
-fn partial_parent_image(parent: &str) {
+/// Warns (at most once a minute) that a cascade parent's row image omitted a column the route
+/// reads (a session `binlog_row_image` other than FULL, or a server leaving a generated column
+/// out of the image), so the units its cascade changes are unknown and the view is rebuilt from
+/// the source.
+fn partial_parent_image(view: &str, parent: &str) {
     static LAST: AtomicU64 = AtomicU64::new(0);
     warn_throttled(&LAST, || {
         tracing::warn!(
+            view,
             parent,
-            "a cascade parent's row image lacks columns (binlog_row_image must be FULL): the units its cascade changes are unknown, rebuilding the view"
+            "a cascade parent's row image omits a column the view reads (binlog_row_image must be FULL): the units its cascade changes are unknown, rebuilding the view from the source"
         );
     });
 }
@@ -1833,7 +1932,8 @@ mod tests {
         assert_eq!(got, vec![5, 6, 9]);
         // Not derived (a HAVING over the NULL-side pinned alias), but bounded by the pins: a
         // key outside them is skipped; the pinned key, or a key update into or out of it, is
-        // resolved through the cascade map; a short image is the safety net (a rebuild).
+        // resolved through the cascade map; a short image is the safety net (a counted streamed
+        // rebuild).
         let p = plan(
             &parse_definition(
                 "CREATE VIEW v AS SELECT c.gid, c.oid, MAX(b.val) AS y FROM link c \
@@ -1871,10 +1971,16 @@ mod tests {
             feed_cascade(&p, kind, &mut d, Some(&b), a.as_ref());
             assert!(!d.rebuild && d.cache.rows(kind).is_none(), "{b:?} -> {a:?}");
         }
+        // A parent image the view cannot read costs one counted streamed rebuild: the answer
+        // main gives it (path-to-green step 1c closes the in-memory whole-view read to new uses).
         let short = BinlogRow::new(vec![], Arc::from(Vec::new()));
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         feed_cascade(&p, kind, &mut d, Some(&short), None);
-        assert!(d.rebuild && d.cache.rows(kind).is_none());
+        assert!(
+            d.rebuild && !d.all && d.tally.cascade_short_images == 1,
+            "an unreadable parent image must cost one counted streamed rebuild: {d:?}"
+        );
+        assert!(d.cache.rows(kind).is_none());
     }
 
     /// The cascade map's side of the feed: child rows kept where an alias's filters pass,
@@ -2014,8 +2120,8 @@ mod tests {
         assert!(d.cache.under(to_attrs, &fk11).is_empty());
         feed_map(&p, to_attrs, &mut d, Some(&row(&[3, 12, 7, 5])), None);
         assert!(d.cache.under(to_attrs, &fk12).is_empty());
-        // A short image passes the filters (conservatively) and is kept, but incomplete: its
-        // replay is the safety net.
+        // A short image cannot say whether the map keeps the row at all: the row is not
+        // classified, and the view takes one counted streamed rebuild.
         let short = BinlogRow::new(
             vec![
                 Some(BinlogValue::Value(Value::Int(4))),
@@ -2027,8 +2133,31 @@ mod tests {
             ]),
         );
         let mut d2 = ViewDirty::for_aliases(p.aliases.len());
-        feed_map(&p, to_attrs, &mut d2, None, Some(&short));
-        assert!(!d2.cache.under(to_attrs, &fk10)[0].complete);
+        assert_eq!(
+            feed_map(&p, to_attrs, &mut d2, None, Some(&short)),
+            Fed::Recorded
+        );
+        assert!(
+            !d2.all && d2.rebuild && d2.cache.distrust && d2.tally.cascade_short_images == 1,
+            "an unreadable child row must cost one counted streamed rebuild: {d2:?}"
+        );
+        assert!(
+            d2.cache.rows(to_attrs).is_none(),
+            "an unreadable child row is not classified into the map: {:?}",
+            d2.cache.rows(to_attrs)
+        );
+        // The parent change that follows cannot be named by a map that lost the row: it takes
+        // the streamed rebuild too (the regression the stale-group finding is made of — the map
+        // kept the row under a key its unreadable change should have moved it from).
+        d2.rebuild = false;
+        assert_eq!(
+            feed_cascade(&p, to_attrs, &mut d2, Some(&row(&[10])), None),
+            Fed::Recorded
+        );
+        assert!(
+            d2.rebuild,
+            "a parent change of a distrusted map must cost the streamed rebuild: {d2:?}"
+        );
         // The parent's delete / key update on a ready cache: kept children resolve, no rebuild.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         feed_map(&p, to_attrs, &mut d, None, Some(&r1));
@@ -2724,6 +2853,29 @@ mod tests {
         part_row(&vals.iter().map(|&v| Some(v)).collect::<Vec<_>>())
     }
 
+    /// An image that carries every column, `None` standing for a SQL NULL (a server `SET NULL`
+    /// of the FK) — as opposed to [`part_row`], whose `None` is a column the image does not
+    /// carry at all, which no image of this table can be and which the view cannot read.
+    fn null_row(vals: &[Option<i64>]) -> BinlogRow {
+        BinlogRow::new(
+            vals.iter()
+                .map(|v| {
+                    Some(BinlogValue::Value(match v {
+                        Some(v) => mysql_async::Value::Int(*v),
+                        None => mysql_async::Value::NULL,
+                    }))
+                })
+                .collect(),
+            std::sync::Arc::from(
+                vals.iter()
+                    .map(|_| {
+                        mysql_async::Column::new(mysql_async::consts::ColumnType::MYSQL_TYPE_LONG)
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    }
+
     /// The #167 gap fixtures for `feed_mapped_cascade` and [`drain`]: `ent` is a parent the view
     /// does not read, with a two-column key; `notes` hangs under it on one of its columns and
     /// `subs` on both. Both routes are cascade maps (the child has a key, nothing pins the FK),
@@ -2928,13 +3080,14 @@ mod tests {
                 subs,
                 &mut d,
                 Some(&full_row(&[10, 2])),
-                Some(&part_row(&[None, None]))
+                Some(&null_row(&[None, None]))
             ),
             Fed::Recorded
         );
         assert!(
-            d.all && !d.rebuild,
-            "an all-NULL composite key must mark the view: {d:?}"
+            d.all && !d.rebuild && d.tally.cascade_short_images == 0,
+            "an all-NULL composite key must mark the view, from the vanishing FK and not from \
+             an unreadable image: {d:?}"
         );
         // A partly-NULL new FK: the children are still under a nameable key, so the marks on the
         // kept rows heal them and the whole view must NOT be refreshed.
@@ -2950,12 +3103,12 @@ mod tests {
                 subs,
                 &mut d,
                 Some(&full_row(&[10, 2])),
-                Some(&part_row(&[Some(11), None]))
+                Some(&null_row(&[Some(11), None]))
             ),
             Fed::Recorded
         );
         assert!(
-            !d.all && !d.rebuild,
+            !d.all && !d.rebuild && d.tally.cascade_short_images == 0,
             "a partly-NULL key still names its rows: {d:?}"
         );
         assert!(!d.is_empty(), "the kept rows are marked: {d:?}");

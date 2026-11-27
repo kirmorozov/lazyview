@@ -6151,9 +6151,14 @@ impl Engine {
     /// way: when the event names the unit keys of all its routes on this table — the unit
     /// columns present in both images — exactly those units are marked and the refresh reads
     /// their current rows from the source; otherwise the view is marked for one whole-view
-    /// refresh (`accumulate::mark_all`, the #167 path: a refresh, not a rebuild). Versions
-    /// whose rows the dedup core's consumer takes always take the whole-view refresh: the
-    /// consumer is copy-set code and cannot tell the compacted image from a full one.
+    /// refresh (`accumulate::mark_all`, the #167 path: a refresh, not a rebuild). A version
+    /// that follows a cascade route on this table is charged what the cascade feed charges an
+    /// image it cannot read — the counted `ViewDirty::short_image()` and `Cache::distrust`, the
+    /// #58 sites in accumulate.rs — because the guard above consumes the event and the feed
+    /// never classifies the row itself. (The feed answers such an image with its streamed
+    /// rebuild; the guard keeps its own #167 whole-view answer, main's.) Versions whose rows
+    /// the dedup core's consumer takes always take the whole-view refresh: the consumer is
+    /// copy-set code and cannot tell the compacted image from a full one.
     #[allow(clippy::too_many_arguments)]
     fn note_short_image(
         &mut self,
@@ -6265,6 +6270,19 @@ impl Engine {
                 // keys from the images; whole-view otherwise.
                 let mut al: Vec<(usize, &[u16])> = Vec::new();
                 let mut unitwise = true;
+                // Whether this version answers this table through a cascade route: the parent
+                // of a cascading FK, or a child whose rows the cascade map keeps. The caller
+                // consumed the event here (`feed_rows` never runs for it), so the cascade feed
+                // never gets to decide on this image — the whole-view refresh below is the
+                // answer its own unreadable-image sites would have given it (the three
+                // `ViewDirty::short_image` sites in accumulate.rs). That answer is owed here,
+                // charge included. Computed before the scan below, which stops at the first
+                // route that rules out unit-wise marking.
+                let cascade = route.iter().any(|x| {
+                    x.slot == r.slot
+                        && x.next == r.next
+                        && matches!(x.kind, RouteKind::Cascade(_) | RouteKind::MapChild(_))
+                });
                 for (i, x) in route.iter().enumerate() {
                     if x.slot != r.slot || x.next != r.next {
                         continue;
@@ -6302,6 +6320,14 @@ impl Engine {
                     }
                 } else {
                     dirty.mark_all(plan);
+                    if cascade {
+                        // The map never classified this row either: same one count per view
+                        // per flush and the same distrust the feed path charges a short image
+                        // with (its answer is the streamed rebuild), so /stats tells the
+                        // operator why the view keeps being answered as a whole.
+                        dirty.short_image();
+                        dirty.cache.distrust = true;
+                    }
                 }
                 ver_since.get_or_insert_with(|| since.clone());
             }
@@ -6372,6 +6398,7 @@ impl Engine {
         x.name == y.name
             && x.kind == y.kind
             && x.param == y.param
+            && x.hex == y.hex
             && x.exact == y.exact
             && x.invisible == y.invisible
             && x.data_type == y.data_type
@@ -9364,6 +9391,8 @@ impl Engine {
             rest: String,
             keys: Vec<&'a Key>,
             per: usize,
+            /// The image columns, which bind the keys' values ([`crate::catalog::Column::bind`]).
+            cols: Vec<&'a crate::catalog::Column>,
         }
         let mut subs = Vec::new();
         for &(alias, images) in parts {
@@ -9403,6 +9432,7 @@ impl Engine {
                 keys: images.iter().collect(),
                 per: (MAX_FILTER_PARAMS / (parts.len() * cols.len()))
                     .clamp(1, self.cfg.query_chunk),
+                cols,
             });
         }
         let parts = subs;
@@ -9432,12 +9462,14 @@ impl Engine {
                 [(a, derived)] => (plan.lookup_sql(*a, derived), vec![0]),
                 _ => plan.lookup_sql_multi(&subst)?,
             };
+            // Each value as its column's placeholder takes it (bytes as hex text, #394).
             let params: Vec<Value> = order
                 .iter()
                 .flat_map(|&k| {
+                    let cols = &parts[k].cols;
                     chunks[k]
                         .iter()
-                        .flat_map(|key| key.iter().map(Datum::to_value))
+                        .flat_map(move |key| key.iter().zip(cols).map(|(d, c)| c.bind(d)))
                 })
                 .collect();
             let fresh = self.caps.fresh_snapshot;
@@ -9685,7 +9717,7 @@ async fn run_pending(sup: &Supervisor, p: &mut PendingRefresh) -> Result<supervi
 }
 
 /// A bound string param without its trailing ` COLLATE <co>`: only for a param of the shape
-/// `CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET <cs>) COLLATE <co>` (a string column,
+/// `CAST(UNHEX(?) AS CHAR CHARACTER SET <cs>) COLLATE <co>` (a string column,
 /// [`crate::catalog::TEXT_PARAM_PREFIX`]), which is the one that carries a collation of its own; a
 /// param that has none, and one of any other shape, is returned as it is. See the lookup that
 /// uses it.
@@ -10733,15 +10765,13 @@ mod tests {
     #[test]
     fn a_lookup_param_loses_only_its_collate() {
         assert_eq!(
-            without_collate(
-                "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1) COLLATE latin1_bin",
-            ),
-            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)",
+            without_collate("CAST(UNHEX(?) AS CHAR CHARACTER SET latin1) COLLATE latin1_bin"),
+            "CAST(UNHEX(?) AS CHAR CHARACTER SET latin1)",
             "the collation of the view definition decides"
         );
         assert_eq!(
-            without_collate("CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)"),
-            "CAST(CAST(? AS BINARY) AS CHAR CHARACTER SET latin1)",
+            without_collate("CAST(UNHEX(?) AS CHAR CHARACTER SET latin1)"),
+            "CAST(UNHEX(?) AS CHAR CHARACTER SET latin1)",
             "a param without one is as it was"
         );
         assert_eq!(without_collate("?"), "?");
