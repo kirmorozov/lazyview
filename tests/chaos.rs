@@ -2394,6 +2394,230 @@ fn chaos_tgt_pg_bandwidth_starvation() {
     });
 }
 
+/// CI run 45446296665's `chaos_both_sides` red, made deliberate: the fragmentation that matters
+/// there is not only the link's, it is the **set's**. `chaos_both_sides_fragmented` below puts a
+/// one-byte-per-2 ms link in front of an engine whose consumed set is a fresh server's — a few
+/// hundred bytes — so every save of the cursor column was cheap and the run caught up; on CI the
+/// same leg ran against a server every earlier job had written to, the set was tens of kilobytes,
+/// each flush rewrote it, and the leg sat at `flushes: 6` in 120 s with `applied` never reaching the
+/// target. So this leg fragments the stream **first** — the engine's own saved cursor grows to what
+/// a long-lived source holds — and only then puts the one-byte link in front of the link that
+/// carries those saves, and asks the one question ruling (A) of #356 answers: does the apply loop
+/// still catch up?
+///
+/// Only the `meta` link is sliced, deliberately: the cursor save is the only thing on it, so the leg
+/// measures the price of a save and nothing else (the binlog and query links stay honest, and the
+/// leg below is not about how fast events arrive). The bound is a wall clock on `wait_applied`, and
+/// a run that never gets there is the finding, spelled out in its own message.
+///
+/// This is the fail-before of the fix as much as its pass-after: with `binlog_cursor` rewritten on
+/// every flush (the shape of the first cursor fix — the byte-exact read-back plus the whole set,
+/// every 200 ms, over a link that costs 2 ms per byte) this leg is red on `mysql84` at CI's seed
+/// 864590356776; with the set going only when the link can carry its size
+/// (`Engine::set_write_affordable`, priced at the worst per-byte cost the run's own timed statements
+/// report on that link) while the position
+/// goes whenever it moves, it is green — and what the run pays instead is a restart that re-reads
+/// binlog it has already applied, the case
+/// `lifecycle_resumes_from_a_cursor_behind_the_applied_position` holds to the oracle.
+#[test]
+fn chaos_fragmented_link_catches_up_with_a_fragmented_cursor() {
+    let _one = toxi::exclusive();
+    scenario("chaos_frag_cursor", |ctx| async move {
+        let Some(toxi) = toxi::open_if_enabled(&ctx).await? else {
+            return Ok(());
+        };
+        let db = ctx.new_db("chaos_frag_cursor").await?;
+        let _clean = toxi.for_schema(&db.name);
+        let ids = setup_soak(&db, ctx.sub_seed("chaos_frag_cursor"), Sizes::tiny()).await?;
+        let specs = chaos_specs("source");
+        // The proxies exist from the start — the engine's DSNs have to name them — but carry no
+        // toxic yet: the set has to grow over an honest link, or the leg times the growing of it
+        // rather than the cost of carrying it.
+        let meta_p = toxi
+            .proxy(&db.name, "meta", &toxi::upstream(&db.flavor))
+            .await?;
+        toxi.wait_listening(&meta_p).await?;
+        // The save cadence the CI leg had, so a flush that carries a save is a flush every 200 ms
+        // and the leg asks the question the red leg asked.
+        let ov: Vec<(String, String)> = vec![
+            (
+                "LAZYVIEW_TEST_META_DSN".to_string(),
+                proxied_engine_dsn(&db, meta_p.listen)?,
+            ),
+            ("LAZYVIEW_HEARTBEAT_MS".to_string(), "200".to_string()),
+            (
+                "LAZYVIEW_POSITION_PERSIST_MS".to_string(),
+                "200".to_string(),
+            ),
+        ];
+        let (mut eng, _) = start_with_views(&ctx, &db, &specs, &ov_refs(&ov)).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &HashMap::new(),
+            &HashMap::new(),
+            &specs,
+            "initial build, unfragmented",
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        let maria = db.flavor.starts_with("mariadb");
+        let flavor = if maria {
+            lazyview::source::Flavor::MariaDb
+        } else {
+            lazyview::source::Flavor::MySql
+        };
+        // What this leg prices is the cost of a save on the link the apply loop shares with it, and
+        // the expensive saves are the cursor's, because its size is the size of the consumed GTID
+        // set. A `gtid_mode = OFF` server — `mysql80` and `percona84`, CI's own flavors — has no such
+        // set: the injector's `SET @@SESSION.GTID_NEXT = '<uuid>:<n>'` answers `ERROR 1781 (HY000):
+        // @@SESSION.GTID_NEXT cannot be set to UUID:NUMBER when @@GLOBAL.GTID_MODE = OFF`, and no
+        // made-up set can stand in for one, because the leg asks its resume question of the server
+        // (`source::gtid_covers`). CI's `LAZYVIEW_TEST_STRICT=chaos_` refuses a skip from this binary,
+        // and it is right to: on such a server the only save the apply loop can be waiting on is the
+        // ~60-byte `binlog_file`/`binlog_pos` half — and *that* one must not throttle the reader
+        // either. So the leg runs both ways and says, in its own log, which way it ran.
+        let has_set = maria
+            || scalar(&mut c, "SELECT CAST(@@GLOBAL.gtid_mode AS CHAR)")
+                .await?
+                .as_deref()
+                == Some("ON");
+        // What the server was already carrying before this leg wrote a line to it. On a CI leg server
+        // the suites that ran earlier in the same job leave a consumed set of tens of kilobytes, and
+        // that size — not the workload — is what a cursor write costs (it is what
+        // `chaos_both_sides_fragmented` drowned at, seed 930018769523); on a per-run server the leg
+        // starts near zero. The line is what tells those two states apart from the log alone.
+        let ambient = server_gtid_set(&mut c, maria).await?;
+        ctx.log(format!(
+            "this server's consumed set is {} bytes before this leg writes anything",
+            ambient.len()
+        ));
+        exec(
+            &mut c,
+            "CREATE TABLE frag_noise (id INT PRIMARY KEY, pad VARCHAR(8) NOT NULL)",
+        )
+        .await?;
+        let instance: String = c
+            .query_first("SELECT CAST(instance_id AS CHAR) FROM _lazyview_status")
+            .await?
+            .context("no status row to measure the cursor of")?;
+        // The row's own two halves before the link gets expensive: the cursor text (the quantity
+        // under price) and the position the cheap half holds (what a set-less run lives on).
+        let (row_cursor, at0) =
+            lazyview::meta::load_position_row(&mut c, &instance, flavor).await?;
+        let mut saved = row_cursor.as_ref().map_or(0, |cur| cur.to_string().len());
+        if has_set {
+            // The size CI's leg was carrying: `lc_cursor_whole` read a 73,362-byte cursor back off the
+            // mysql84 leg's row. It is past the limit the cursor column used to have, and the size
+            // that turns one save into 147 s on a link that costs 2 ms a byte — the bill this leg
+            // exists to price, not a smaller one that flatters it.
+            let (groups, s, server_bytes) =
+                fragment_gtid_stream(&mut c, &instance, maria, "frag_noise", 70_000).await?;
+            saved = s;
+            ctx.log(format!(
+                "fragmented the server's stream with {groups} transactions: the engine's saved cursor is \
+                 {saved} bytes (the server's own set {server_bytes}) — the quantity every save has to \
+                 carry on the meta link"
+            ));
+            ensure!(
+                saved >= 65_536,
+                "the saved cursor reached only {saved} bytes after {groups} transactions: below the \
+                 size the CI leg was carrying, so this leg would be pricing a save anyone could afford"
+            );
+        } else {
+            ctx.log(format!(
+                "no GTIDs on this server, so there is no set to grow: this leg prices the {}-byte \
+                 file/pos save the row holds ({}) on a one-byte-per-2 ms meta link",
+                saved,
+                row_cursor.map_or_else(|| "no cursor yet".to_string(), |c| c.to_string())
+            ));
+        }
+        let before = eng.snapshot();
+        // One byte every 2 ms, both ways, on the link the saves ride.
+        toxi.arm(
+            &meta_p,
+            &Toxic::slicer(1, 0, 2_000, Dir::Upstream).named("su"),
+        )
+        .await?;
+        toxi.arm(
+            &meta_p,
+            &Toxic::slicer(1, 0, 2_000, Dir::Downstream).named("sd"),
+        )
+        .await?;
+        let mut wl = SoakWorkload::new(ctx.sub_seed("chaos_frag_cursor_w"), ids.clone());
+        let n = run_soak_batches(&mut c, &mut wl, 10).await?;
+        let pos = server_position(&mut c).await?;
+        let began = std::time::Instant::now();
+        // The same bound CI's `chaos_both_sides_fragmented` gives itself: 120 s. That is the bar the
+        // red was measured against, and the arithmetic it failed — a 73,338-byte set at 2 ms a byte
+        // is 147 s of one statement, so a save the loop has to wait for cannot fit inside this wait
+        // and must not have to.
+        eng.wait_applied(&pos, Duration::from_secs(120))
+            .await
+            .with_context(|| format!(
+                "chaos_frag_cursor: {n} transactions never applied while the meta link had to carry \
+                 a {saved}-byte cursor on every flush — the finding ruling (A) is about: a save the \
+                 apply loop has to wait for is a link that throttles applying by the size of the \
+                 consumed set"
+            ))?;
+        ctx.log(format!(
+            "chaos_frag_cursor: {n} transactions applied in {:?} on a one-byte-per-2 ms meta link \
+             with a {saved}-byte cursor: {}",
+            began.elapsed(),
+            fmt_snapshot(&eng.snapshot().since(&before))
+        ));
+        toxi.remove_toxic(&meta_p, "su").await?;
+        toxi.remove_toxic(&meta_p, "sd").await?;
+        let pos = server_position(&mut c).await?;
+        eng.wait_applied(&pos, t_catchup()).await?;
+        verify_targets(
+            &ctx,
+            &mut eng,
+            &db,
+            &HashMap::new(),
+            &HashMap::new(),
+            &specs,
+            "final under a fragmented meta link",
+        )
+        .await?;
+        assert_no_rebuilds(&eng, &db, &specs, &before, "chaos_frag_cursor")?;
+        // The cursor the run holds is still its own complete word, read after the writers stopped
+        // and the applied-wait passed: pacing a write must never mean storing a set that does not
+        // answer for what the run consumed.
+        let back = lazyview::meta::load_position(&mut c, &instance, flavor)
+            .await?
+            .context("the run saved no cursor")?;
+        if has_set {
+            ensure!(
+                lazyview::source::gtid_covers(&mut c, &back).await?,
+                "the cursor the run saved ({}) is not one this server covers",
+                back
+            );
+        } else {
+            // Nothing to carry, and so nothing to hold back: what the run owes on such a server is
+            // that its own resume point kept moving while the link cost 2 ms a byte. Read here, at
+            // convergence, with the writers stopped and the applied-wait passed.
+            ensure!(
+                back.gtid().unwrap_or_default().is_empty(),
+                "a server with `gtid_mode = OFF` saved a set in the cursor: {back}"
+            );
+            let at1 = lazyview::meta::load_position_row(&mut c, &instance, flavor)
+                .await?
+                .1;
+            ensure!(
+                at1.pos > at0.pos || (!at1.file.is_empty() && at1.file != at0.file),
+                "with no set to write, the row's own file/pos half never moved while the meta link \
+                 was sliced: {at0:?} -> {at1:?} while the source reached {pos:?} — the one save a \
+                 set-less run has is the one the apply loop waits on, and it did not run",
+            );
+        }
+        eng.check_alive()?;
+        eng.stop().await?;
+        Ok(())
+    });
+}
+
 /// #9 (§3): both sides fragmented at once — `slicer{average_size:1,size_variation:0,delay:2000µs}`
 /// upstream **and** downstream on every source link of the engine (the T3 role proxies: binlog,
 /// query, meta), `slicer{average_size:16}` + `latency{latency:40,jitter:40}` on the target link.
@@ -2533,7 +2757,7 @@ fn chaos_both_sides_fragmented() {
 // asked for the recovery numbers to be measured and reported.
 // =============================================================================================
 
-use common::engineproc::{measured, proc_state, EngineProc};
+use common::engineproc::{measured, proc_state, EngineProc, Scraped};
 
 /// The lock's own settings for these three scenarios: the floor the rules allow (a 1 s beat, and a
 /// lease of exactly the `4 x` `Lease::new` demands), so a scenario runs in seconds and asserts about
@@ -2775,12 +2999,35 @@ fn chaos_lock_blackhole_takeover() {
             "the replaced instance kept writing while its lock was gone: {}",
             fmt_snapshot(&d)
         );
+        // What it *reports* as its applied position is not a write, and the gates do not close the
+        // reader — they must not: reading the binlog writes nothing, and an instance that stopped
+        // reading could never learn it had been replaced. `after_boundary` moves that position on the
+        // read path itself (`Item::Commit` / `Item::Heartbeat`, src/engine.rs), so a replaced instance
+        // whose stream is still delivering moves it while not one row reaches a target (#393: it was
+        // this line, not a write, that the nightly caught). "Wrote nothing since the gate closed" is
+        // what the counters above and the saved row below decide — lv-super's ruling D on #356. What
+        // has to hold is the two claims being consistent, so that is what is asserted here: a position
+        // that moved *with* a statement is the fencing bug; a position that moved while every write
+        // counter stood where the closed gate left it is the reader doing its job.
+        let since_gate = f.eng.snapshot().since(&held);
+        let applied_now = f.eng.applied();
         ensure!(
-            f.eng.applied() == applied_held,
-            "the replaced instance advanced its applied position from {applied_held:?} to {:?} \
-             after its gates closed",
-            f.eng.applied()
+            applied_now.as_ref() == applied_held.as_ref()
+                || (since_gate.flushes == 0
+                    && since_gate.mv_queries == 0
+                    && since_gate.mv_rows_inserted == 0
+                    && since_gate.mv_rows_deleted == 0),
+            "the replaced instance advanced its applied position from {applied_held:?} to \
+             {applied_now:?} while its write counters moved since the gates closed: {}",
+            fmt_snapshot(&since_gate)
         );
+        measured(format!(
+            "chaos_lock_blackhole_takeover: the replaced instance reported {applied_held:?} at the \
+             closed gate and {applied_now:?} at the takeover, with {} flush(es) and {} target \
+             statement(s) between them — the reported position is the reader's own claim \
+             (`after_boundary`), the write counters are the bar",
+            since_gate.flushes, since_gate.mv_queries,
+        ));
         ensure!(
             ctr(&am, "leader_beat_failures") > beats_before,
             "no beat of the black-holed session ever failed"
@@ -2972,10 +3219,123 @@ fn chaos_lock_slow_loop_no_takeover() {
     });
 }
 
+/// Milliseconds since the epoch, for the timelines the lock scenarios log (#393): what happened in
+/// which order, in the one clock every line of a run can be lined up against.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The holder at rest (#393): everything the source holds is applied *and* its row counters have
+/// stood still across three scrapes. Convergence, never a pause (`BOUND` bounds the wait, 20 ms is
+/// the polling step). The frozen-instance scenario compares an instance against its *own* counters,
+/// so the number it compares against has to be one the instance cannot legitimately move
+/// afterwards: a scrape taken while the writers hammer moves between the scrape and the `SIGSTOP`,
+/// and charges the holder — as a write made after its lock was gone — for work it was still entitled
+/// to do as the leader. That drift is what made #393 red; it is not a fencing verdict.
+async fn wait_at_rest(db: &Db, a: &EngineProc, what: &str) -> Result<Scraped> {
+    let head = {
+        let mut c = db.conn().await?;
+        let p = server_position(&mut c).await?;
+        c.disconnect().await.ok();
+        p
+    };
+    let (_, at) = a
+        .wait_scrape(t_catchup(), what, |s| {
+            s.applied_position().as_ref().is_some_and(|p| p >= &head)
+        })
+        .await?;
+    let mut last = at.counter("mv_rows_inserted") + at.counter("mv_rows_deleted");
+    let mut still = 0;
+    let deadline = Instant::now() + BOUND;
+    loop {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let s = a.scrape().await?;
+        let now = s.counter("mv_rows_inserted") + s.counter("mv_rows_deleted");
+        if now == last {
+            still += 1;
+            if still >= 3 {
+                return Ok(s);
+            }
+        } else {
+            still = 0;
+            last = now;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the holder's row counters never settled {what} within {BOUND:?}; log tail:\n{}",
+            a.log_tail(15)
+        );
+    }
+}
+
+/// What the woken instance did, sampled from the instant of the `SIGCONT` until the process is gone.
+/// The *largest* value every write counter ever showed, not the value of one last scrape: a fenced
+/// instance leaves on its own schedule, and the sample that saw a row is the one the bar is about
+/// (#393 — the scenario that could not see the write is the scenario that cannot test it).
+#[derive(Default)]
+struct Woken {
+    /// Successful `/metrics` reads between the wake and the exit. Zero of them means the bar below
+    /// was never measured, which the scenario reports as a failure rather than as a pass.
+    samples: usize,
+    rows: u64,
+    queries: u64,
+    flushes: u64,
+    rebuilds: u64,
+    applied: Option<lazyview::binlog::Position>,
+    /// The lowest position `_lazyview_status` carried while the woken instance was awake, with the
+    /// epoch that wrote it. While the writers are quiet and the replacement has caught up, nothing
+    /// but the woken instance itself could move that row.
+    saved: Option<(lazyview::binlog::Position, u64)>,
+}
+
+impl Woken {
+    fn observe(&mut self, s: &Scraped) {
+        self.samples += 1;
+        self.rows = self
+            .rows
+            .max(s.counter("mv_rows_inserted") + s.counter("mv_rows_deleted"));
+        self.queries = self.queries.max(s.counter("mv_queries"));
+        self.flushes = self.flushes.max(s.counter("flushes"));
+        self.rebuilds = self.rebuilds.max(s.counter("full_rebuilds"));
+        if let Some(p) = s.applied_position() {
+            if self.applied.as_ref().is_none_or(|a| a < &p) {
+                self.applied = Some(p);
+            }
+        }
+    }
+
+    fn observe_saved(&mut self, row: (lazyview::binlog::Position, u64)) {
+        if self.saved.as_ref().is_none_or(|(p, _)| row.0 < *p) {
+            self.saved = Some(row);
+        }
+    }
+}
+
 /// The owner's "connection crash / pull the plug / power out case" (2026-11-17): a frozen host sends
 /// no FIN, so the server keeps its sessions until the lease says otherwise. The old instance here is
 /// a real process and gets SIGSTOP; the replacement starts and takes over by the lease; then the old
 /// one is SIGCONTinued and must write nothing — it self-fences (ruling 1) and exits.
+///
+/// The bar is lv-super's ruling D on #356 (2026-11-26): a replaced instance writes nothing — no view
+/// row, no saved position, no target statement — from the moment the replacement holds the lease.
+/// Every number it is measured against is therefore taken while the instance can still be *idle*:
+///
+///  * the writers are stopped and the holder has applied everything ([`wait_at_rest`]) before the
+///    baseline is scraped, so those counters belong to an instance with nothing left to apply. The
+///    #393 red came from scraping them while the writers hammered: what the holder applied between
+///    that scrape and the `SIGSTOP` landing then reads as a write made after its lock was gone;
+///  * the work the woken instance could write is created *after* the freeze — the writers run again
+///    while it is stopped, so at its wake a whole backlog waits that it never read. A gate that
+///    closes late is therefore a row count above the baseline, not drift lost in the noise of a
+///    mid-way scrape: the scenario still fails on a real post-wake write, and
+///    [`Woken`] reads the instance repeatedly so a write cannot hide between two scrapes;
+///  * the wake itself happens with the writers quiet and the replacement caught up, so from the
+///    `SIGCONT` on the woken instance is the only one who could still write, and the
+///    `_lazyview_status` row can only stand still — the saved position is checked on the target
+///    side, where a stale instance's save would show, and not from the instance's memory.
 #[test]
 fn chaos_lock_frozen_old_instance_writes_nothing() {
     let _one = toxi::exclusive();
@@ -3009,18 +3369,48 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
             })
             .await?;
             let epoch_before = lock_epoch(&db).await?;
-            let mut w = spawn_writers(&db, &ids, seed);
+            // Pressure, then rest. The holder has to have been the leader *doing work* — that is the
+            // deployment being frozen mid-refresh — and it then has to run out of work before a single
+            // number of its own is read as a baseline (#393).
+            let mut w1 = spawn_writers(&db, &ids, seed);
+            a.wait_scrape(BOUND, "the holder applying rows of its own", |s| {
+                s.counter("mv_rows_inserted") > 0
+            })
+            .await?;
+            set_writers(&w1.0, true);
+            let early = quiesce_writers(&mut w1).await?;
+            let pre = wait_at_rest(&db, &a, "before the plug was pulled").await?;
             // Pull the plug: the process stops, its sockets stay open, and the server cannot know it is
             // gone — the only thing that can end its lock session is the lease.
-            let pre = a.scrape().await?;
-            let pre_rows = pre.counter("mv_rows_inserted");
+            let pre_rows = pre.counter("mv_rows_inserted") + pre.counter("mv_rows_deleted");
+            let pre_queries = pre.counter("mv_queries");
+            let pre_flushes = pre.counter("flushes");
+            let pre_rebuilds = pre.counter("full_rebuilds");
             let pre_applied = pre.applied_position();
+            // A baseline of nothing would make the bar below vacuous: `/metrics` read from a process
+            // on its way out can answer with a truncated body, and every counter missing from it
+            // parses as zero. Compared against a real number of applied rows, a scrape that shows
+            // less than the baseline is caught by the `==` below; compared against zero it would be
+            // a pass the scenario never measured.
+            ensure!(
+                pre_rows > 0 && pre_queries > 0,
+                "the holder came to rest without one applied row or one target statement (rows \
+                 {pre_rows}, statements {pre_queries}, {early} writer batch(es) quiesced): the bar \
+                 below would measure nothing; log tail:\n{}",
+                a.log_tail(15)
+            );
+            let (position_pre, _) = saved_row(&db).await?;
             a.freeze()?;
             let pid = a.pid();
             wait_until("the old process to be stopped (state T)", BOUND, || async {
                 Ok(proc_state(pid) == Some('T'))
             })
             .await?;
+            // The work the woken instance could write is created now, while it cannot read it: the
+            // source keeps taking writes through the takeover, so at its wake a whole backlog of
+            // events it never read is waiting for it. The bar is only worth anything if something
+            // really could be written, which is what `backlog` below says out loud.
+            let mut w2 = spawn_writers(&db, &ids, derive_seed(seed, "frozen-backlog"));
             let t0 = Instant::now();
             wait_until("the replacement streaming", TAKEOVER, || {
                 let bm = bm.clone();
@@ -3042,35 +3432,97 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
                 lock_epoch(&db).await? == epoch_before + 1,
                 "the epoch did not move exactly once on the takeover by the replacement"
             );
+            // Quiet again, and the replacement has applied everything: from here the woken instance is
+            // the only one left who could write, so every counter it moves and every byte the saved row
+            // moves is its own doing. The frozen one keeps its backlog — it was stopped before it could
+            // read any of it.
+            set_writers(&w2.0, true);
+            let backlog = quiesce_writers(&mut w2).await?;
+            ensure!(
+                backlog > 0,
+                "the writers wrote nothing while the holder was frozen: the woken instance would have \
+                 had no backlog to apply, and a bar of `no rows written` measured against nothing is \
+                 not a bar"
+            );
+            let mut c = db.conn().await?;
+            b.wait_caught_up(&mut c, t_catchup()).await?;
+            c.disconnect().await.ok();
+            let (position_woken, _) = saved_row(&db).await?;
             // Wake the frozen one. Its lock session is the one the server ended at the end of the lease,
             // so it must notice on its next beat, close every gate, and leave; between the wake and its
             // exit not one row may reach a target.
+            ctx.log(format!(
+                "t={}ms SIGCONT on the frozen holder: {backlog} writer batch(es) of backlog it never \
+                 read, baseline rows {} / statements {} / applied {pre_applied:?} / saved {position_pre:?}, \
+                 the replacement's saved row now {position_woken:?}",
+                unix_ms(),
+                pre_rows,
+                pre_queries,
+            ));
             a.resume()?;
-            let mut post = None;
+            let mut woken = Woken::default();
             let tw = Instant::now();
-            while post.is_none() && common::engineproc::pid_alive(pid) && tw.elapsed() < BOUND {
-                if let Ok(s) = a.scrape().await {
-                    post = Some(s);
-                } else {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut fails = 0usize;
+            loop {
+                // The instance is on its way out, so a scrape that does not answer in a quarter second
+                // is a failed sample, not a wait: the loop must still be reading while it can.
+                match tokio::time::timeout(Duration::from_millis(250), a.scrape()).await {
+                    Ok(Ok(s)) => {
+                        woken.observe(&s);
+                        fails = 0;
+                    }
+                    _ => fails += 1,
                 }
+                if let Ok(r) = saved_row(&db).await {
+                    woken.observe_saved(r);
+                }
+                if !common::engineproc::pid_alive(pid) && fails >= 3 {
+                    break;
+                }
+                if tw.elapsed() >= TAKEOVER {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            let post_rows = post
-                .as_ref()
-                .map_or(pre_rows, |s| s.counter("mv_rows_inserted"));
-            if let Some(s) = &post {
-                ensure!(
-                    s.counter("mv_rows_inserted") == pre_rows,
-                    "the woken instance wrote {} row(s) to the targets after its lock was gone",
-                    s.counter("mv_rows_inserted").saturating_sub(pre_rows)
-                );
-                ensure!(
-                    s.applied_position() == pre_applied,
-                    "the woken instance advanced its applied position from {pre_applied:?} to {:?}",
-                    s.applied_position()
-                );
-            }
+            ensure!(
+                woken.samples > 0,
+                "the woken instance left ({fails} failed scrape(s) over {:?}) without one readable \
+                 /metrics sample between the SIGCONT and its exit: the bar below would not have been \
+                 measured; log tail:\n{}",
+                tw.elapsed(),
+                a.log_tail(15)
+            );
             let st = a.wait_exit(Duration::from_secs(90))?;
+            ensure!(
+                woken.rows == pre_rows && woken.queries == pre_queries && woken.rebuilds == pre_rebuilds,
+                "the woken instance wrote {} row(s) and issued {} target statement(s) after its lock \
+                 was gone: {} sample(s) of its /metrics between the SIGCONT and its exit, against the \
+                 baseline of a holder at rest (rows {pre_rows}, statements {pre_queries}, rebuilds \
+                 {pre_rebuilds}) with {backlog} writer batch(es) of backlog it had never read and the \
+                 replacement's saved row {position_woken:?} to compare against; log tail:\n{}",
+                woken.rows.saturating_sub(pre_rows),
+                woken.queries.saturating_sub(pre_queries),
+                woken.samples,
+                a.log_tail(15)
+            );
+            // The saved position is checked where a stale save would show: on the target. The row is
+            // one row for both engines (`LOCK_INSTANCE`), and `meta::save_position` writes it under
+            // `WHERE epoch = ?` — the takeover moved the epoch, so a save by the replaced instance can
+            // only be a row that carries the epoch it still believes is its own, or a position that
+            // went backwards. Neither may appear while it is awake.
+            if let Some((p, e)) = &woken.saved {
+                ensure!(
+                    *e == epoch_before + 1,
+                    "the row of `_lazyview_status` carried epoch {e}, not the replacement's {}, while \
+                     the woken instance was awake: the replaced instance saved to it",
+                    epoch_before + 1
+                );
+                ensure!(
+                    p >= &position_woken,
+                    "the woken instance moved the saved position backwards from {position_woken:?} to \
+                     {p:?} after its lock was gone"
+                );
+            }
             ensure!(
             !st.success(),
             "the woken instance exited successfully ({st}) — a replaced instance must leave as the \
@@ -3084,14 +3536,32 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
                 "the woken instance left without ever naming the takeover; log tail:\n{}",
                 a.log_tail(15)
             );
+            // The row half of bar (a). Both position saves of a run are `UPDATE … WHERE instance_id
+            // = ? AND epoch = ?`, so a fenced instance cannot move the row the replacement owns —
+            // unless it re-claimed the lock, which is what the epoch would show. One takeover, ever.
+            ensure!(
+                lock_epoch(&db).await? == epoch_before + 1,
+                "the fencing epoch moved a second time: the woken instance re-claimed the lock, and \
+                 with it the row the saved position lives in — the epoch guard of its two position \
+                 saves is what a fenced run is supposed to be refused by"
+            );
             measured(format!(
-                "chaos_lock_frozen_old_instance_writes_nothing: old process wrote {} row(s) after \
-             SIGCONT and exited {st} having named the takeover",
-                post_rows.saturating_sub(pre_rows)
+                "chaos_lock_frozen_old_instance_writes_nothing: old process wrote 0 row(s) of a \
+             {backlog}-batch backlog over {} sample(s) after SIGCONT and exited {st} having named the \
+             takeover ({} completed flush(es), {} target statement(s)); its reader moved the reported \
+             position from {pre_applied:?} to {:?} while writing nothing — the position is the reader's \
+             own claim (`after_boundary`), not a write",
+                woken.samples,
+                woken.flushes.saturating_sub(pre_flushes),
+                woken.queries.saturating_sub(pre_queries),
+                woken.applied,
+            ));
+            ctx.log(format!(
+                "the holder had applied {early} writer batch(es) of its own before the baseline; its \
+                 saved row at rest was {position_pre:?}"
             ));
             // The replacement owns the schema: everything the writers did — during the freeze and after
             // the wake — is in the views exactly, and no incremental view was rebuilt for it.
-            quiesce_writers(&mut w).await?;
             let mut c = db.conn().await?;
             b.wait_caught_up(&mut c, t_catchup()).await?;
             c.disconnect().await.ok();

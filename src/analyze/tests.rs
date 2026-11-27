@@ -3137,3 +3137,81 @@ fn executable_comments_are_refused() {
         assert!(parse_definition(sql).is_ok(), "{sql}");
     }
 }
+/// The arm `ViewPlan::rows_identified` gained for the keyed chunk write (#399): a FROM table
+/// that is not identified by a lineage key but carries the unit itself is identified the same
+/// way — when every column of its own row key is one of the columns the unit is read from
+/// (`AliasPlan::direct_unit`), the unit has at most that one row of it. The same view written
+/// the equivalent ways (the equality in ON or in WHERE, `=` or `IN (x)` with either side first,
+/// a comma join, the FROM order permuted, an extra semi-join table) reads the same, and the near
+/// misses stay unidentified: a composite row key with a column the unit does not carry, a table
+/// the unit reaches by only part of its key, and a table without a row key at all.
+#[test]
+fn rows_identified_by_the_unit_a_from_table_carries() {
+    let cat: std::collections::HashMap<
+        crate::catalog::TableRef,
+        std::sync::Arc<crate::catalog::TableInfo>,
+    > = [
+        table("entity", &[("id", "int"), ("v", "int")], &[0]),
+        table(
+            "attr",
+            &[("id", "int"), ("ent_id", "int"), ("v", "int")],
+            &[0],
+        ),
+        table("link", &[("id", "int"), ("ent_id", "int")], &[0]),
+        table("pair", &[("a", "int"), ("b", "int"), ("v", "int")], &[0, 1]),
+        table("notes", &[("ent_id", "int"), ("body", "int")], &[]),
+    ]
+    .into_iter()
+    .collect();
+    let pl = |sql: &str| -> ViewPlan {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        plan_block(&d, "db", &cat).unwrap()
+    };
+    // `attr` joined by its own primary key: one row of it per unit, and no lineage columns.
+    for sql in [
+        "SELECT e.id, e.v, a.v AS av FROM entity e LEFT JOIN attr a ON a.id = e.id",
+        // The equality in WHERE instead of ON (a comma join), ...
+        "SELECT e.id, e.v, a.v AS av FROM entity e, attr a WHERE a.id = e.id",
+        // ... with the sides swapped, ...
+        "SELECT e.id, e.v, a.v AS av FROM entity e JOIN attr a ON e.id = a.id",
+        // ... as `IN (x)`, on either side, ...
+        "SELECT e.id, e.v, a.v AS av FROM entity e LEFT JOIN attr a ON a.id IN (e.id)",
+        "SELECT e.id, e.v, a.v AS av FROM entity e LEFT JOIN attr a ON e.id IN (a.id)",
+        // ... with the FROM order permuted and another unit-carrying table added (a semi-join
+        // subquery, which adds no rows of its own, is the analyzer's: see its own test).
+        "SELECT a.id, a.v, e.v AS ev, l.id AS link_id FROM attr a JOIN entity e ON e.id = a.id \
+         LEFT JOIN link l ON l.id = a.id",
+    ] {
+        let v = pl(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert!(v.rows_identified(), "{sql}");
+        // It is the unit arm that says so: the unit-carrying table has no lineage key, and the
+        // first table is identified by its own key.
+        let carried = (1..v.aliases.len())
+            .filter(|&a| v.aliases[a].semi.is_none() && v.aliases[a].pos.0 != usize::MAX)
+            .find(|&a| {
+                v.aliases[a]
+                    .table
+                    .row_key()
+                    .is_some_and(|rk| !rk.is_empty() && v.lineage_of(a).is_none())
+            });
+        assert!(
+            carried.is_some(),
+            "{sql}: identified without the unit arm being used"
+        );
+    }
+    for sql in [
+        // A composite row key with a column the unit does not carry: the unit can still hold
+        // several of these rows, so the rows are not identified.
+        "SELECT e.id, e.v, p.v AS pv FROM entity e LEFT JOIN pair p ON p.a = e.id",
+        "SELECT e.id, p.v AS pv FROM entity e LEFT JOIN pair p ON p.a = e.id AND p.b = e.id",
+        // The unit reaches the table by a column that is not its row key: several rows per unit.
+        "SELECT e.id, a.v AS av FROM entity e LEFT JOIN attr a ON a.ent_id = e.id",
+        // A table without a row key: equal rows of it are duplicates.
+        "SELECT e.id, n.body FROM entity e LEFT JOIN notes n ON n.ent_id = e.id",
+    ] {
+        let v = pl(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert!(!v.rows_identified(), "{sql}");
+    }
+}
