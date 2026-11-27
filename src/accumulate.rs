@@ -2993,50 +2993,14 @@ mod tests {
     /// hangs under it on `eid` (a CASCADE delete), `eid` being the leading column of the primary
     /// key `(eid, seq)` and a projected column.
     fn name_plan() -> ViewPlan {
-        use std::sync::Arc;
-
-        use crate::analyze::{parse_definition, plan};
-        use crate::catalog::{Column, FkAction, ForeignKey, TableInfo};
-
+        use crate::catalog::Column;
         let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
-        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades| {
-            (
-                ("db".to_string(), name.to_string()),
-                Arc::new(TableInfo {
-                    schema: "db".into(),
-                    name: name.into(),
-                    columns,
-                    pk,
-                    unique_keys: vec![],
-                    cascades,
-                    is_view: false,
-                    view_bases: vec![],
-                }),
-            )
-        };
-        let tables: std::collections::HashMap<_, _> = [
-            table("ent", vec![int("id"), int("ver")], vec![0], vec![]),
-            table(
-                "notes",
-                vec![int("eid"), int("seq"), int("val")],
-                vec![0, 1],
-                vec![ForeignKey {
-                    parent: ("db".into(), "ent".into()),
-                    child_cols: vec![0],
-                    parent_cols: vec!["id".to_string()],
-                    on_delete: FkAction::Cascade,
-                    on_update: FkAction::Cascade,
-                }],
-            ),
-        ]
-        .into_iter()
-        .collect();
-        plan(
-            &parse_definition("CREATE VIEW v AS SELECT eid, seq, val FROM notes").unwrap(),
-            "db",
-            &tables,
+        gate_plan(
+            vec![int("eid"), int("seq"), int("val")],
+            vec![0, 1],
+            vec![0],
+            "CREATE VIEW v AS SELECT eid, seq, val FROM notes",
         )
-        .unwrap()
     }
 
     /// The nameable route: `Spj`, a map, and the projected FK `eid` gives its materialized column
@@ -3076,7 +3040,7 @@ mod tests {
         use std::sync::Arc;
 
         use crate::analyze::{parse_definition, plan};
-        use crate::catalog::{FkAction, TableInfo};
+        use crate::catalog::{Column, FkAction, ForeignKey, TableInfo};
 
         let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades| {
             (
@@ -3161,7 +3125,10 @@ mod tests {
             "CREATE VIEW v AS SELECT seq, eid, val FROM notes",
         );
         let c = p.cascades.iter().find(|c| c.child.1 == "notes").unwrap();
-        assert!(c.map.is_some(), "still a mapped cascade (a map route is required to name)");
+        assert!(
+            c.map.is_some(),
+            "still a mapped cascade (a map route is required to name)"
+        );
         assert!(
             c.name_cols.is_none(),
             "an FK that is not a leading prefix of the row key would scan unindexed: {c:?}"
@@ -3189,22 +3156,51 @@ mod tests {
         );
     }
 
-    /// Gate branch: the FK reaches the projection only through a CTE. A `WITH` (or a derived table
-    /// in FROM) makes the plan a full-refresh one (`build` returns `full(..)`), so it is not a
-    /// `Spj` select/join and has no mapped cascade route to name from: `name_cols` stays `None`.
+    /// Gate branch, positive: the FK reaches the projection through a PASSTHROUGH CTE (a plain
+    /// projection, no grouping). The analyzer flattens such a CTE into the same `Spj` select/join,
+    /// so a materialized row is still one child row and the FK is still a bare leading row-key
+    /// column — the route stays nameable, `name_cols == Some(["eid"])`. The gate keys on the
+    /// flattened projection + row key, not on the SQL text, so a renaming wrapper does not defeat it.
     #[test]
-    fn fk_renamed_through_a_cte_is_not_nameable() {
+    fn fk_through_a_passthrough_cte_is_nameable() {
         use crate::catalog::Column;
         let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
         let p = gate_plan(
             vec![int("eid"), int("seq"), int("val")],
             vec![0, 1],
             vec![0],
-            "CREATE VIEW v AS WITH t AS (SELECT eid, seq, val FROM notes) SELECT eid, seq, val FROM t",
+            "CREATE VIEW v AS WITH t AS (SELECT eid, seq, val FROM notes) \
+             SELECT eid, seq, val FROM t",
+        );
+        assert!(
+            matches!(p.mode, Mode::Spj),
+            "a passthrough CTE flattens to a select/join: mode={:?}",
+            p.mode
+        );
+        assert_eq!(
+            notes_route_name_cols(&p).as_deref(),
+            Some(&["eid".to_string()][..]),
+            "the flattened CTE still carries the FK as a bare leading row-key column"
+        );
+    }
+
+    /// Gate branch: the CTE GROUPs, so the view is not a `Spj` select/join (one materialized row is
+    /// no longer one child row), so there is nothing per-child to name: `name_cols` stays `None` and
+    /// the window keeps its whole-view refresh.
+    #[test]
+    fn grouped_cte_is_not_nameable() {
+        use crate::catalog::Column;
+        let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+        let p = gate_plan(
+            vec![int("eid"), int("seq"), int("val")],
+            vec![0, 1],
+            vec![0],
+            "CREATE VIEW v AS WITH t AS (SELECT eid, COUNT(*) AS n FROM notes GROUP BY eid) \
+             SELECT eid, n FROM t",
         );
         assert!(
             !matches!(p.mode, Mode::Spj) && p.cascades.iter().all(|c| c.name_cols.is_none()),
-            "a CTE view is a full-refresh plan (not `Spj`), so it has no nameable map route: \
+            "a grouping CTE is not a `Spj` select/join, so it has no nameable map route: \
              mode={:?} cascades={:?}",
             p.mode,
             p.cascades

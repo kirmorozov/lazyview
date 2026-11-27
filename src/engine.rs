@@ -9211,7 +9211,8 @@ impl Engine {
             return Ok(());
         }
         // Group by route so a flush with many windows pays one chunked read per route, not per key.
-        let mut by_route: std::collections::BTreeMap<usize, UnitSet> = std::collections::BTreeMap::new();
+        let mut by_route: std::collections::BTreeMap<usize, UnitSet> =
+            std::collections::BTreeMap::new();
         for (ci, old) in pending {
             by_route.entry(*ci).or_default().insert(old.clone());
         }

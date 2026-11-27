@@ -1355,6 +1355,162 @@ fn reg_cascade_window_parent_delete_named() {
     });
 }
 
+/// Issue #408 R4 — the analyzer's name-ability gate, exercised end to end. Every scenario is the
+/// same gap-window parent delete of `reg_cascade_window_parent_delete_named`, but the child table
+/// and the view differ so the analyzer's plan fact (`CascadeRoute::name_cols`) lands on a different
+/// gate branch. The two live paths are pinned:
+///
+/// - nameable (FK projected AND a leading prefix of the child's row key): the vanished children are
+///   named by one bounded read of the materialized table, so `whole_view_refreshes == 0`;
+/// - not nameable (FK not projected, or not a leading row-key prefix): the window keeps its
+///   whole-view refresh, so `whole_view_refreshes == 1`.
+///
+/// `whole_view_refreshes == 1` for a non-nameable branch is the correct behaviour, not a failure:
+/// naming from an unindexed column would scan the whole materialized table (costing more than the
+/// refresh it replaces), so `mark_all` stands. The analyzer's per-branch decision is locked
+/// deterministically by the `*_nameable` lib tests in `accumulate` (which read `name_cols` off the
+/// plan with no server); these scenarios prove the same decision holds against a real engine.
+async fn gap_named_branch(
+    ctx: &Ctx,
+    id: &str,
+    links_ddl: &str,
+    view_sql: &str,
+    want_whole: u64,
+) -> Result<()> {
+    let mut ddl: Vec<String> = vec![
+        "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+        "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+        links_ddl.into(),
+    ];
+    ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into());
+    ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into());
+    ddl.push("INSERT INTO links VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into());
+    let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+    let specs = vec![ViewSpec::new(id, Kind::Incremental, view_sql)];
+    let (db, mut eng) = setup(ctx, id, &ddl, &specs, &[]).await?;
+    let mut sc = db.conn().await?;
+    eng.wait_caught_up(&mut sc, t_catchup()).await?;
+    // `links (3, 6)` is the only row under entity 6: the parent delete cascades it away.
+    eng.stop().await?;
+    exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 6"]).await?;
+    let mut eng = ctx.start_engine(&db, &[])?;
+    wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+    let f0 = eng.snapshot();
+    eng.wait_caught_up(&mut sc, t_catchup()).await?;
+    // /stats is published at the end of a flush; nothing else writes after the resume, so wait for
+    // the periodic flush (position save, 5 s) to publish the gap of the replay.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let _s = loop {
+        if let Some(s) = eng.view_stats(&db, id) {
+            if s.cascade_gaps >= 1 {
+                break s;
+            }
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "the replayed parent delete was never counted as a gap in /stats within 15 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        "the rows the replayed parent delete removed",
+    )
+    .await?;
+    let s = eng.stats_of(&db, id)?;
+    let d = eng.snapshot().since(&f0);
+    ensure!(
+        s.cascade_gaps >= 1 && s.whole_view_refreshes == want_whole && d.full_rebuilds == 0,
+        "expected whole_view_refreshes == {want_whole} for the {id} gate branch \
+         (nameable -> 0, non-nameable -> 1), got {s:?} {}",
+        fmt_snapshot(&d)
+    );
+    ctx.log(format!("{id}: {s:?} {}", fmt_snapshot(&d)));
+    eng.stop().await
+}
+
+/// #408 R4, nameable: the FK `eid` is projected and the leading primary-key column, so the read is
+/// a row-key range and the vanished children are named — `whole_view_refreshes == 0`.
+#[test]
+fn reg_cascade_window_named_branch_nameable() {
+    scenario("reg_casc_named_nameable", |ctx| async move {
+        gap_named_branch(
+            &ctx,
+            "reg_casc_named_nameable",
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (eid, gid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))",
+            "SELECT l.gid, l.eid, l.pos FROM links l",
+            0u64,
+        )
+        .await
+    });
+}
+
+/// #408 R4, not nameable — the view omits the FK column. `name_cols` stays `None`, so the window
+/// keeps its whole-view refresh: `whole_view_refreshes == 1`.
+#[test]
+fn reg_cascade_window_named_branch_omits_fk() {
+    scenario("reg_casc_named_omits", |ctx| async move {
+        gap_named_branch(
+            &ctx,
+            "reg_casc_named_omits",
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (eid, gid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))",
+            "SELECT l.gid, l.pos FROM links l",
+            1u64,
+        )
+        .await
+    });
+}
+
+/// #408 R4, not nameable — the FK `eid` is projected but the primary key is `(gid, eid)`, so `eid`
+/// is not a leading row-key prefix; the read would scan unindexed, so `name_cols` stays `None` and
+/// the window keeps its whole-view refresh: `whole_view_refreshes == 1`.
+#[test]
+fn reg_cascade_window_named_branch_fk_not_leading() {
+    scenario("reg_casc_named_notlead", |ctx| async move {
+        gap_named_branch(
+            &ctx,
+            "reg_casc_named_notlead",
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (gid, eid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))",
+            "SELECT l.gid, l.eid, l.pos FROM links l",
+            1u64,
+        )
+        .await
+    });
+}
+
+/// #408 R4, nameable through an alias: the FK is projected as `l.eid AS fk`. It is still one bare
+/// column of the single alias and a leading row-key prefix, so the route is nameable and `name_cols`
+/// carries the materialized name `fk` — the read filters the column the target actually has, so the
+/// children are still named: `whole_view_refreshes == 0`.
+#[test]
+fn reg_cascade_window_named_branch_aliased_fk() {
+    scenario("reg_casc_named_aliased", |ctx| async move {
+        gap_named_branch(
+            &ctx,
+            "reg_casc_named_aliased",
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (eid, gid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))",
+            "SELECT l.gid, l.eid AS fk, l.pos FROM links l",
+            0u64,
+        )
+        .await
+    });
+}
+
 /// The sessions of `db` whose running statement is the startup seed read of the cascade cache:
 /// one SELECT of every kept child row of a cascade (`cascade::seed_sql`), schema-qualified and
 /// filtered on the child's own FK columns.
