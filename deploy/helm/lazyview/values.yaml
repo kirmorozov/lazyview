@@ -39,8 +39,13 @@ imagePullSecrets: []
 # restarted by Kubernetes and resumes from the saved binlog position. Set 2 for a hot standby:
 # the replicas compete for a MySQL named lock (GET_LOCK) on the source, the loser waits (alive,
 # /readyz "hot standby") and takes over within about 5 s of the winner releasing the lock. A pod
-# whose node died keeps the lock until the server ends that session (its `wait_timeout`, or a
-# failed TCP keepalive), so a node loss without a database restart can take longer.
+# whose node died keeps the lock only until the source waits out the lock session's own
+# `wait_timeout`, which that session sets to LAZYVIEW_LOCK_LEASE_MS (20 s) and beats with a
+# heartbeat of its own (a `DO 1` and an ownership check every LAZYVIEW_LOCK_HEARTBEAT_MS, 5 s): the
+# standby streams after about one lease plus its own poll and its start, with no `KILL`, no database
+# restart and no human in the loop. Set the lease from your recovery objective — it is the time a
+# partitioned node still holds the lock; both knobs go under `config` below. Lowering the server's
+# `wait_timeout` or the host's `net.ipv4.tcp_keepalive_*` is no longer required for that recovery.
 replicas: 1
 
 # -- Old ReplicaSets to keep for `kubectl rollout undo`.
