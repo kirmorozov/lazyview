@@ -502,6 +502,9 @@ services:
     <<: *mysql-common
     image: mysql:8.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33484:3306"]
     command:
       - --server-id=33484
@@ -528,6 +531,9 @@ services:
     <<: *mysql-common
     image: mysql:8.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33485:3306"]
     command:
       - --server-id=33485
@@ -557,6 +563,9 @@ services:
     <<: *mariadb-common
     image: mariadb:11.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33414:3306"]
     command:
       - --server-id=33414
@@ -579,6 +588,9 @@ services:
     <<: *mariadb-common
     image: mariadb:11.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33415:3306"]
     command:
       - --server-id=33415
@@ -612,6 +624,9 @@ services:
     <<: *mariadb-common
     image: mariadb:11.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33511:3306"]
     command:
       - --server-id=33511
@@ -646,6 +661,9 @@ services:
     <<: *mariadb-common
     image: mariadb:11.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33512:3306"]
     command:
       - --server-id=33512
@@ -680,6 +698,9 @@ services:
     <<: *mariadb-common
     image: mariadb:11.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33513:3306"]
     command:
       - --server-id=33513
@@ -743,6 +764,13 @@ services:
   # this throwaway single-host bridge network, not of the product: a real PXC deployment keeps
   # socket.ssl=YES and provisions one CA all members trust. Nothing the lane asserts gets weaker for
   # it - it asserts GTIDs, membership, causal reads and the resume, and TLS is not among them.
+  # The state transfer needs the same treatment from its own side: PXC 8.4 also encrypts the SST, with
+  # socat's openssl-connect (verify=1) against those same per-node certificates, and it dies the same
+  # way. That one is not a command-line option: wsrep_sst_xtrabackup-v2 reads
+  # pxc-encrypt-cluster-traffic and [sst] encrypt out of the config file rather than out of mysqld's
+  # argv, so the three services
+  # also mount docker/pxc/lv-cluster-traffic.cnf into the image's last include directory. That file
+  # carries the measured SST failure and what giving up TLS on this network costs.
   # The image is pinned by digest (its tag moves with PXC's own build number), and the SST hash key is
   # a fixed test value: all three nodes must share it, and the containers are dropped after every run.
   # Start order as in Galera: PXC_ADDRESS_1=gcomm:// + PXC_BOOTSTRAP=ON on node 1, then the docker0
@@ -753,6 +781,9 @@ services:
     <<: *mysql-common
     image: percona/percona-xtradb-cluster:8.4.11-12.1@sha256:1a93f0a886a23872f3fc97858ff3dc7c17664a77336a8c8f31de9e2b29c70907
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33611:3306"]
     environment:
       MYSQL_ROOT_PASSWORD: root
@@ -788,18 +819,29 @@ services:
       - --wsrep-node-name=pxc84-1
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      # PXC 8.4 encrypts cluster traffic (gcomm and the state transfer) with certificates each
+      # container self-signs in its own data directory, so no two nodes share a CA and a joiner
+      # never finishes joining. The drop-in turns that off for this throwaway network; its header
+      # carries the measured failure and what it costs.
+      - ./docker/pxc/lv-cluster-traffic.cnf:/etc/percona-xtradb-cluster.conf.d/lv-cluster-traffic.cnf:ro
       - pxc84-1:/var/lib/mysql
 
   pxc84-2:
     <<: *mysql-common
     image: percona/percona-xtradb-cluster:8.4.11-12.1@sha256:1a93f0a886a23872f3fc97858ff3dc7c17664a77336a8c8f31de9e2b29c70907
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33612:3306"]
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: lvtest
       XTRADB_INTERNAL_HASH_KEY: lv-test-sst-hash-key
       CLUSTER_NAME: lvpxc84
+      # (see the note on node 2: this is what makes the entrypoint treat the node as a
+      # joiner and let mysqld join from the command line instead of initialising).
+      CLUSTER_JOIN: ${PXC_ADDRESS_2:-}
     command:
       - --server-id=33612
       - --log-bin=binlog
@@ -826,15 +868,26 @@ services:
       - --wsrep-node-name=pxc84-2
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      # PXC 8.4 encrypts cluster traffic (gcomm and the state transfer) with certificates each
+      # container self-signs in its own data directory, so no two nodes share a CA and a joiner
+      # never finishes joining. The drop-in turns that off for this throwaway network; its header
+      # carries the measured failure and what it costs.
+      - ./docker/pxc/lv-cluster-traffic.cnf:/etc/percona-xtradb-cluster.conf.d/lv-cluster-traffic.cnf:ro
       - pxc84-2:/var/lib/mysql
 
   pxc84-3:
     <<: *mysql-common
     image: percona/percona-xtradb-cluster:8.4.11-12.1@sha256:1a93f0a886a23872f3fc97858ff3dc7c17664a77336a8c8f31de9e2b29c70907
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33613:3306"]
     environment:
       MYSQL_ROOT_PASSWORD: root
+      # (see the note on node 2: this is what makes the entrypoint treat the node as a
+      # joiner and let mysqld join from the command line instead of initialising).
+      CLUSTER_JOIN: ${PXC_ADDRESS_3:-}
       MYSQL_DATABASE: lvtest
       XTRADB_INTERNAL_HASH_KEY: lv-test-sst-hash-key
       CLUSTER_NAME: lvpxc84
@@ -864,6 +917,11 @@ services:
       - --wsrep-node-name=pxc84-3
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      # PXC 8.4 encrypts cluster traffic (gcomm and the state transfer) with certificates each
+      # container self-signs in its own data directory, so no two nodes share a CA and a joiner
+      # never finishes joining. The drop-in turns that off for this throwaway network; its header
+      # carries the measured failure and what it costs.
+      - ./docker/pxc/lv-cluster-traffic.cnf:/etc/percona-xtradb-cluster.conf.d/lv-cluster-traffic.cnf:ro
       - pxc84-3:/var/lib/mysql
 
   # ---- MySQL Group Replication / InnoDB Cluster, single primary ---------------------------------
@@ -895,6 +953,9 @@ services:
     <<: *mysql-common
     image: mysql:8.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33711:3306"]
     command:
       - --server-id=33711
@@ -925,6 +986,9 @@ services:
     <<: *mysql-common
     image: mysql:8.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33712:3306"]
     command:
       - --server-id=33712
@@ -955,6 +1019,9 @@ services:
     <<: *mysql-common
     image: mysql:8.4.13
     profiles: [cluster]
+    # docker0, not a per-project network: see the cluster-family header above. The nodes
+    # address each other by the docker0 address the lane reads with docker inspect.
+    network_mode: bridge
     ports: ["127.0.0.1:33713:3306"]
     command:
       - --server-id=33713

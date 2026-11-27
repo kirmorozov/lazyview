@@ -213,7 +213,10 @@ jobs:
     # resume-on-another-node suites are tests/failover_source.rs (PR F, after this one); the suites
     # this lane runs stream the binlog of both writers for real.
     name: cluster (async pair, mysql84 + mariadb114)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && needs.cluster-changes.outputs.run == 'true'
+    # The nightly runs only the soak jobs, a draft PR runs only the fast jobs (the owner's rule of
+    # 2026-11-26, same clause as the other heavy jobs), and a PR runs them only when its diff touches
+    # the resume-by-GTID path (needs.cluster-changes).
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.cluster-changes.outputs.run == 'true'
     needs: cluster-changes
     runs-on: ubuntu-24.04
     # bootstrap 4 servers 8 + channel + 2 suites x 8 + logs.
@@ -250,8 +253,10 @@ jobs:
         run: |
           q() { docker compose exec -T -e Q="$2" "$1" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -uroot -proot -NB -e "$Q"'; }
           vert() { docker compose exec -T -e Q="$2" "$1" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -uroot -proot -E -e "$Q"'; }
-          addr() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "lazyview-$1-1" | awk '{print; exit}'; }
-          A=$(addr mysql84a-1); M=$(addr mariadb114a-1)
+          # The container, not a guessed name: compose's own ps gives it, so this holds whatever
+          # project name the runner used.
+          addr() { local c; c=$(docker compose ps -aq "$1" | head -1); [ -n "$c" ] || { echo "::error::no container for $1" >&2; return 1; }; docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" | awk '{print; exit}'; }
+          A=$(addr mysql84a); M=$(addr mariadb114a)
           echo "writers at $A / $M"
           if [ -z "$A" ] || [ -z "$M" ]; then echo "::error::no address for the writers"; exit 1; fi
           q mysql84a "CREATE DATABASE IF NOT EXISTS lvcl; CREATE TABLE IF NOT EXISTS lvcl.entities (id INT PRIMARY KEY, v INT NOT NULL); INSERT INTO lvcl.entities VALUES (1,1),(2,2),(777,777);"
@@ -337,7 +342,10 @@ jobs:
     # node 1's write (wsrep_sync_wait), and every member's gtid_binlog_state covers node 1's domain-42
     # state - the subset question a resume on that node asks. SST (mariabackup) is the real minute.
     name: cluster (galera, mariadb 11.4)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && needs.cluster-changes.outputs.run == 'true'
+    # The nightly runs only the soak jobs, a draft PR runs only the fast jobs (the owner's rule of
+    # 2026-11-26, same clause as the other heavy jobs), and a PR runs them only when its diff touches
+    # the resume-by-GTID path (needs.cluster-changes).
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.cluster-changes.outputs.run == 'true'
     needs: cluster-changes
     runs-on: ubuntu-24.04
     # 3-node bootstrap with SST 12 + preflight 2 + suite 10 + logs.
@@ -371,13 +379,15 @@ jobs:
       - name: join nodes 2 and 3 by node 1's address
         shell: bash
         run: |
-          addr() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "lazyview-$1-1" | awk '{print; exit}'; }
-          G1=$(addr galera114-1-1); [ -n "$G1" ] || { echo "::error::no address for galera114-1"; exit 1; }
+          # The container, not a guessed name: compose's own ps gives it, so this holds whatever
+          # project name the runner used.
+          addr() { local c; c=$(docker compose ps -aq "$1" | head -1); [ -n "$c" ] || { echo "::error::no container for $1" >&2; return 1; }; docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" | awk '{print; exit}'; }
+          G1=$(addr galera114-1); [ -n "$G1" ] || { echo "::error::no address for galera114-1"; exit 1; }
           # gcomm speaks the wsrep port (4567), never the SQL port.
           export GALERA_ADDRESS_2=gcomm://$G1
           docker compose up -d --quiet-pull galera114-2
           docker compose up -d --wait --wait-timeout 300 galera114-2
-          G2=$(addr galera114-2-1); [ -n "$G2" ] || { echo "::error::no address for galera114-2"; exit 1; }
+          G2=$(addr galera114-2); [ -n "$G2" ] || { echo "::error::no address for galera114-2"; exit 1; }
           export GALERA_ADDRESS_3=gcomm://$G1,$G2
           docker compose up -d --quiet-pull galera114-3
           docker compose up -d --wait --wait-timeout 300 galera114-3
@@ -459,7 +469,10 @@ jobs:
     #   0 [ERROR] [MY-013236] [Server] The designated data directory /var/lib/mysql/ is unusable.
     #   0 [ERROR] [MY-010119] [Server] Aborting
     name: cluster (pxc, percona xtradb 8.4)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && needs.cluster-changes.outputs.run == 'true'
+    # The nightly runs only the soak jobs, a draft PR runs only the fast jobs (the owner's rule of
+    # 2026-11-26, same clause as the other heavy jobs), and a PR runs them only when its diff touches
+    # the resume-by-GTID path (needs.cluster-changes).
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.cluster-changes.outputs.run == 'true'
     needs: cluster-changes
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -492,12 +505,14 @@ jobs:
       - name: join nodes 2 and 3 by node 1's address
         shell: bash
         run: |
-          addr() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "lazyview-$1-1" | awk '{print; exit}'; }
-          X1=$(addr pxc84-1-1); [ -n "$X1" ] || { echo "::error::no address for pxc84-1"; exit 1; }
+          # The container, not a guessed name: compose's own ps gives it, so this holds whatever
+          # project name the runner used.
+          addr() { local c; c=$(docker compose ps -aq "$1" | head -1); [ -n "$c" ] || { echo "::error::no container for $1" >&2; return 1; }; docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" | awk '{print; exit}'; }
+          X1=$(addr pxc84-1); [ -n "$X1" ] || { echo "::error::no address for pxc84-1"; exit 1; }
           export PXC_ADDRESS_2=gcomm://$X1
           docker compose up -d --quiet-pull pxc84-2
           docker compose up -d --wait --wait-timeout 300 pxc84-2
-          X2=$(addr pxc84-2-1); [ -n "$X2" ] || { echo "::error::no address for pxc84-2"; exit 1; }
+          X2=$(addr pxc84-2); [ -n "$X2" ] || { echo "::error::no address for pxc84-2"; exit 1; }
           export PXC_ADDRESS_3=gcomm://$X1,$X2
           docker compose up -d --quiet-pull pxc84-3
           docker compose up -d --wait --wait-timeout 300 pxc84-3
@@ -594,7 +609,10 @@ jobs:
     #       connecting to the donor server...'
     #     fixed by group_replication_recovery_get_public_key=ON on the three services.
     name: cluster (group replication, mysql 8.4)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && needs.cluster-changes.outputs.run == 'true'
+    # The nightly runs only the soak jobs, a draft PR runs only the fast jobs (the owner's rule of
+    # 2026-11-26, same clause as the other heavy jobs), and a PR runs them only when its diff touches
+    # the resume-by-GTID path (needs.cluster-changes).
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.cluster-changes.outputs.run == 'true'
     needs: cluster-changes
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -625,12 +643,14 @@ jobs:
         shell: bash
         run: |
           q() { docker compose exec -T -e Q="$2" "$1" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -uroot -proot -NB -e "$Q"'; }
-          addr() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "lazyview-$1-1" | awk '{print; exit}'; }
-          R1=$(addr gr84-1-1); [ -n "$R1" ] || { echo "::error::no address for gr84-1"; exit 1; }
+          # The container, not a guessed name: compose's own ps gives it, so this holds whatever
+          # project name the runner used.
+          addr() { local c; c=$(docker compose ps -aq "$1" | head -1); [ -n "$c" ] || { echo "::error::no container for $1" >&2; return 1; }; docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" | awk '{print; exit}'; }
+          R1=$(addr gr84-1); [ -n "$R1" ] || { echo "::error::no address for gr84-1"; exit 1; }
           q gr84-1 "SET GLOBAL group_replication_local_address='$R1:33061'; SET GLOBAL group_replication_group_seeds='$R1:33061'; SET GLOBAL group_replication_bootstrap_group=ON; START GROUP_REPLICATION USER='lvdoc', PASSWORD='doc'; SET GLOBAL group_replication_bootstrap_group=OFF;"
           docker compose up -d --quiet-pull gr84-2
           docker compose up -d --wait --wait-timeout 300 gr84-2
-          R2=$(addr gr84-2-1); [ -n "$R2" ] || { echo "::error::no address for gr84-2"; exit 1; }
+          R2=$(addr gr84-2); [ -n "$R2" ] || { echo "::error::no address for gr84-2"; exit 1; }
           # A member that joins carrying its own bootstrap transactions is refused ("this member has
           # more executed transactions than those present in the group"), so it is emptied first and
           # the empty set is asserted: an unasserted reset hid this once already. 8.4's own name for
@@ -640,7 +660,7 @@ jobs:
           q gr84-2 "SET GLOBAL group_replication_local_address='$R2:33061'; SET GLOBAL group_replication_group_seeds='$R1:33061,$R2:33061'; START GROUP_REPLICATION USER='lvdoc', PASSWORD='doc';"
           docker compose up -d --quiet-pull gr84-3
           docker compose up -d --wait --wait-timeout 300 gr84-3
-          R3=$(addr gr84-3-1); [ -n "$R3" ] || { echo "::error::no address for gr84-3"; exit 1; }
+          R3=$(addr gr84-3); [ -n "$R3" ] || { echo "::error::no address for gr84-3"; exit 1; }
           q gr84-3 "RESET BINARY LOGS AND GTIDS;" || { echo "::error::gr84-3 could not be emptied"; exit 1; }
           [ -z "$(q gr84-3 "SELECT @@GLOBAL.gtid_executed" | tr -d '\r\n')" ] || { echo "::error::gr84-3 still holds its own transactions"; exit 1; }
           q gr84-3 "SET GLOBAL group_replication_local_address='$R3:33061'; SET GLOBAL group_replication_group_seeds='$R1:33061,$R2:33061,$R3:33061'; START GROUP_REPLICATION USER='lvdoc', PASSWORD='doc';"
@@ -732,15 +752,17 @@ jobs:
         shell: bash
         run: |
           q() { docker compose exec -T -e Q="$2" "$1" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -uroot -proot -NB -e "$Q"'; }
-          addr() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "lazyview-$1-1" | awk '{print; exit}'; }
+          # The container, not a guessed name: compose's own ps gives it, so this holds whatever
+          # project name the runner used.
+          addr() { local c; c=$(docker compose ps -aq "$1" | head -1); [ -n "$c" ] || { echo "::error::no container for $1" >&2; return 1; }; docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" | awk '{print; exit}'; }
           docker compose up -d --quiet-pull gr84-1
           docker compose up -d --wait --wait-timeout 300 gr84-1
-          R1=$(addr gr84-1-1); [ -n "$R1" ] || { echo "::error::no address for gr84-1"; exit 1; }
+          R1=$(addr gr84-1); [ -n "$R1" ] || { echo "::error::no address for gr84-1"; exit 1; }
           q gr84-1 "SET GLOBAL group_replication_local_address='$R1:33061'; SET GLOBAL group_replication_group_seeds='$R1:33061'; SET GLOBAL group_replication_bootstrap_group=ON; START GROUP_REPLICATION USER='lvdoc', PASSWORD='doc'; SET GLOBAL group_replication_bootstrap_group=OFF;"
           for n in 2 3; do
             docker compose up -d --quiet-pull gr84-$n
             docker compose up -d --wait --wait-timeout 300 gr84-$n
-            R=$(addr gr84-$n-1); [ -n "$R" ] || { echo "::error::no address for gr84-$n"; exit 1; }
+            R=$(addr gr84-$n); [ -n "$R" ] || { echo "::error::no address for gr84-$n"; exit 1; }
             q gr84-$n "RESET BINARY LOGS AND GTIDS;" || { echo "::error::gr84-$n could not be emptied"; exit 1; }
             q gr84-$n "SET GLOBAL group_replication_local_address='$R:33061'; SET GLOBAL group_replication_group_seeds='$R1:33061'; START GROUP_REPLICATION USER='lvdoc', PASSWORD='doc';"
           done
@@ -811,15 +833,17 @@ jobs:
         shell: bash
         run: |
           q() { docker compose exec -T -e Q="$2" "$1" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -uroot -proot -NB -e "$Q"'; }
-          addr() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "lazyview-$1-1" | awk '{print; exit}'; }
+          # The container, not a guessed name: compose's own ps gives it, so this holds whatever
+          # project name the runner used.
+          addr() { local c; c=$(docker compose ps -aq "$1" | head -1); [ -n "$c" ] || { echo "::error::no container for $1" >&2; return 1; }; docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" | awk '{print; exit}'; }
           export GALERA_BOOTSTRAP=ON GALERA_ADDRESS_1=gcomm://
           docker compose up -d --quiet-pull galera114-1
           docker compose up -d --wait --wait-timeout 300 galera114-1
-          G1=$(addr galera114-1-1)
+          G1=$(addr galera114-1)
           export GALERA_ADDRESS_2=gcomm://$G1
           docker compose up -d --quiet-pull galera114-2
           docker compose up -d --wait --wait-timeout 300 galera114-2
-          G2=$(addr galera114-2-1)
+          G2=$(addr galera114-2)
           export GALERA_ADDRESS_3=gcomm://$G1,$G2
           docker compose up -d --quiet-pull galera114-3
           docker compose up -d --wait --wait-timeout 300 galera114-3

@@ -1,0 +1,46 @@
+# Test-cluster drop-in for the pxc84 family (docker-compose.test.yml). It is mounted read-only into
+# /etc/percona-xtradb-cluster.conf.d/, which the image's /etc/my.cnf includes last, so it wins over
+# the image's own /etc/mysql/node.cnf.
+#
+# What it turns off, and why the family cannot come up without it: PXC 8.4 encrypts cluster traffic by
+# default - gcomm with socket.ssl=YES and the state transfer through socat's openssl-connect with
+# cert/key/ca and verify=1 - and the three containers get their certificates from three independently
+# generated self-signed CAs, because each entrypoint creates its own inside its own data directory. No
+# node can verify any other, so neither channel is ever established and a joiner never leaves
+# Donor/Joined. Measured on this host, run of 2026-11-27T18:32Z (tmp/out/lvs-gtid/ci-cluster-families/
+# cluster/pxc84/pxc84-2.compose.log); the gcomm side first:
+#
+#   0 [Note]  [MY-000000] [Galera] Failed to establish connection: invalid padding: certificate
+#              signature failure
+#   0 [ERROR] [MY-000000] [Galera] failed to open gcomm backend connection: 110: failed to reach
+#              primary view (pc.wait_prim_timeout)
+#
+# and after gcomm was switched off with socket.ssl=no in wsrep_provider_options (in the compose file,
+# where the provider options live), the state transfer died in the same way:
+#
+#   0 [Note]  [MY-000000] [WSREP-SST] socat[595] E Select(8, &0x100, NULL, NULL, {...}): Invalid argument
+#   0 [ERROR] [MY-000000] [WSREP-SST] FATAL ERROR: Error while getting data from donor node:
+#              exit codes: 0 1 0 0
+#   0 [ERROR] [MY-000000] [Galera] State transfer request failed unrecoverably: 11 (Resource
+#              temporarily unavailable). ... Restart required.
+#
+# Both lines below are needed, not one: wsrep_sst_xtrabackup-v2 reads pxc-encrypt-cluster-traffic out
+# of this file (`parse_cnf mysqld pxc-encrypt-cluster-traffic`, defaulting to on) and only when it is
+# off does it fall back to `[sst] encrypt`, which is what selects plain TCP instead of
+# openssl-connect with verify=1. They are `loose-` prefixed so a build that has dropped either name
+# warns instead of aborting node 1 (the `loose-` prefix in a config file is accepted by both the
+# server and the script's parse_cnf); on this image pxc_encrypt_cluster_traffic is a real server
+# variable, checked against the pinned binary rather than assumed.
+#
+# What this costs: nothing the lanes assert. They assert GTIDs, membership, causal reads and the
+# resume-by-GTID; encryption of the replication link between three containers on a throwaway
+# single-host bridge network is not among them, and a real deployment keeps TLS on with one CA all
+# members trust. The alternative - committing a CA, a certificate and a private key so that all three
+# nodes share one - was rejected deliberately: this repository ships no private key material anywhere
+# (`git ls-files` has no .pem/.crt/.key), and a test key would be scanned, flagged and argued about
+# by every future reader for no gain in what the lane proves.
+[mysqld]
+loose-pxc-encrypt-cluster-traffic=OFF
+
+[sst]
+encrypt=0
