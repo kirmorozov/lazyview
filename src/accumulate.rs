@@ -3157,6 +3157,71 @@ mod tests {
         }
     }
 
+    /// A cascade child grouped BY its FK (the `wc_notes_by_set` shape: `sets_notes` under a
+    /// `SET NULL` parent, `GROUP BY set_id`) is a UNIT route, not a map route — the group key IS
+    /// the FK, so `unit_from_parent` is `Some` and the parent's change marks the old and NULL
+    /// groups directly (see `feed_cascade`). It therefore never reaches `feed_mapped_cascade` or
+    /// the nameable read; the fix's `map.is_some()` gate leaves it alone. This pins why the gate
+    /// does not need to cover it, and that a grouped view is never nameable.
+    #[test]
+    fn cascade_child_grouped_by_its_fk_is_a_unit_route_not_a_map() {
+        use std::sync::Arc;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{Column, FkAction, ForeignKey, TableInfo};
+
+        let int = |n: &str| Column::new(n, "int", "int", None, None, None, false);
+        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades| {
+            (
+                ("db".to_string(), name.to_string()),
+                Arc::new(TableInfo {
+                    schema: "db".into(),
+                    name: name.into(),
+                    columns,
+                    pk,
+                    unique_keys: vec![],
+                    cascades,
+                    is_view: false,
+                    view_bases: vec![],
+                }),
+            )
+        };
+        let tables: std::collections::HashMap<_, _> = [
+            table("sets", vec![int("id")], vec![0], vec![]),
+            table(
+                "sets_notes",
+                vec![int("id"), int("set_id"), Column::simple("body", "varchar")],
+                vec![0],
+                vec![ForeignKey {
+                    parent: ("db".into(), "sets".into()),
+                    child_cols: vec![1],
+                    parent_cols: vec!["id".to_string()],
+                    on_delete: FkAction::SetNull,
+                    on_update: FkAction::Restrict,
+                }],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let p = plan(
+            &parse_definition("CREATE VIEW wc_notes_by_set AS SELECT set_id, COUNT(*) AS n FROM sets_notes GROUP BY set_id")
+                .unwrap(),
+            "db",
+            &tables,
+        )
+        .unwrap();
+        let ci = p
+            .cascades
+            .iter()
+            .position(|c| c.child.1 == "sets_notes")
+            .expect("a route from sets to sets_notes");
+        let c = &p.cascades[ci];
+        assert!(
+            c.unit_from_parent.is_some() && c.map.is_none() && c.name_cols.is_none(),
+            "a child grouped by its FK is a unit route, never a map route and never nameable: {c:?}"
+        );
+    }
+
     /// The other half of #408: where the FK is NOT carried in a materialized column (a grouped
     /// view), the plan fact is false and the gap window KEEPS its whole-view refresh — the fix must
     /// not under-name (which would silently leave stale rows), only avoid the refresh where naming
