@@ -1881,6 +1881,39 @@ async fn saved_cursor_row(c: &mut mysql_async::Conn, instance: &str) -> Result<(
     .context("no status row for the instance")
 }
 
+/// The three row polls the legs below run through [`wait_until`], each owning what it reads.
+///
+/// They are functions rather than closures, and each takes its DSN and instance **by value**, for
+/// one reason: `wait_until` polls an `FnMut() -> Fut`, and rustc will not let a future borrow out
+/// of the closure call that produced it — the borrow has to survive until the next turn, 50 ms
+/// later, while the closure itself is only borrowed while it runs ("captured variable cannot
+/// escape `FnMut` closure body"). So a poll reconnects on a DSN it owns, the way the other row
+/// waits in this file do (see the bootstrap wait at the top), and the leg reads the row it asserts
+/// on once the wait is over. Nothing here invents a wait of its own: the deadline is the caller's,
+/// and the 50 ms step is the helper's.
+async fn cursor_holds_whole_set(dsn: String, instance: String) -> Result<bool> {
+    let mut c = connect(&dsn).await?;
+    let row = saved_cursor_row(&mut c, &instance).await?;
+    c.disconnect().await.ok();
+    Ok(row.0.len() > 65_535)
+}
+
+/// The first cursor a run puts in the row — the one the resume leg later puts *back*.
+async fn cursor_written(dsn: String, instance: String) -> Result<bool> {
+    let mut c = connect(&dsn).await?;
+    let row = saved_cursor_row(&mut c, &instance).await?;
+    c.disconnect().await.ok();
+    Ok(!row.0.is_empty())
+}
+
+/// The row following the applied position instead of standing still on the cursor this leg seeded.
+async fn cursor_moved(dsn: String, instance: String, behind: String) -> Result<bool> {
+    let mut c = connect(&dsn).await?;
+    let row = saved_cursor_row(&mut c, &instance).await?;
+    c.disconnect().await.ok();
+    Ok(row.0 != behind)
+}
+
 /// The same row's other half: the position the pre-cursor columns hold. [`saved_row_shape`] is the
 /// pair read together, for the legs that have to watch a row through a migration no save is making.
 async fn saved_position_row(c: &mut mysql_async::Conn, instance: &str) -> Result<(String, u64)> {
@@ -1997,14 +2030,20 @@ fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
         // The row catches up with the last of them on the save cadence (200 ms here), so the read
         // waits for the cursor to pass the old limit instead of guessing how long that takes; the
         // deadline is the guard against a set that never got that big.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let (text, stored) = loop {
-            let row = saved_cursor_row(&mut c, &instance).await?;
-            if row.0.len() > 65_535 || std::time::Instant::now() >= deadline {
-                break row;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        };
+        let (dsn, inst) = (db.dsn.clone(), instance.clone());
+        let held_the_whole_set = wait_until(
+            "the row's cursor to pass the 65,535 bytes the column used to hold",
+            Duration::from_secs(60),
+            || cursor_holds_whole_set(dsn.clone(), inst.clone()),
+        )
+        .await
+        .is_ok();
+        let (text, stored) = saved_cursor_row(&mut c, &instance).await?;
+        ensure!(
+            held_the_whole_set && text.len() > 65_535,
+            "the run saved only {} bytes: the set never grew past the limit the column used to              have, so this proves nothing (fragmented with {groups} transactions)",
+            text.len()
+        );
         ensure!(
             stored as usize == text.len(),
             "the server reports {stored} bytes for the {} bytes of cursor the row holds",
@@ -2106,16 +2145,10 @@ fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
         // is written once per connect, so the wait is on the log rather than a guess at how long
         // a start takes — `wait_ready` above answers from the state rows, which the first run
         // already left `ready`.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let log = loop {
-            eng.check_alive()?;
-            let log = common::engineproc::tail_lines(&eng.log_path, 400);
-            if log.contains("binlog dump anchored on the") || std::time::Instant::now() >= deadline
-            {
-                break log;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
+        let log = eng
+            .wait_log_line("binlog dump anchored on the", Duration::from_secs(60))
+            .await
+            .with_context(|| "the restart never opened a dump at all".to_string())?;
         ensure!(
             log.contains(anchored),
             "the restart did not open the dump on the {anchored} this server's state allows (the \
@@ -2202,16 +2235,10 @@ fn lifecycle_saved_cursor_holds_the_whole_set_and_resumes_by_gtid() {
             )
             .await?;
         }
-        let died = {
-            let deadline = std::time::Instant::now() + Duration::from_secs(60);
-            loop {
-                match eng.check_alive() {
-                    Err(e) => break format!("{e:#}"),
-                    Ok(()) if std::time::Instant::now() >= deadline => break String::new(),
-                    Ok(()) => tokio::time::sleep(Duration::from_millis(100)).await,
-                }
-            }
-        };
+        let died = eng
+            .wait_death(Duration::from_secs(60))
+            .await
+            .unwrap_or_else(|| "it is still running".to_string());
         ctx.log(format!("the engine met the narrow column saying: {died}"));
         ensure!(
             died.contains("the server kept") && died.contains("2000"),
@@ -2810,18 +2837,15 @@ fn lifecycle_resumes_from_a_cursor_behind_the_applied_position() {
             .await?
             .context("no status row to save into")?;
         // The cursor of the run's first word: this is the one the row is put back to.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let (behind, _) = loop {
-            let row = saved_cursor_row(&mut c, &instance).await?;
-            if !row.0.is_empty() || std::time::Instant::now() >= deadline {
-                break row;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-        ensure!(
-            !behind.is_empty(),
-            "the run saved no cursor at all, so there is nothing to put back"
-        );
+        let (dsn, inst) = (db.dsn.clone(), instance.clone());
+        wait_until(
+            "the run's first cursor in the row",
+            Duration::from_secs(60),
+            || cursor_written(dsn.clone(), inst.clone()),
+        )
+        .await
+        .context("the run saved no cursor at all, so there is nothing to put back")?;
+        let (behind, _) = saved_cursor_row(&mut c, &instance).await?;
         // The applied position runs ahead of it, and the row follows on the save cadence.
         for id in 20..60 {
             exec(
@@ -2831,18 +2855,19 @@ fn lifecycle_resumes_from_a_cursor_behind_the_applied_position() {
             .await?;
         }
         eng.wait_caught_up(&mut c, t_catchup()).await?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let (ahead, _) = loop {
-            let row = saved_cursor_row(&mut c, &instance).await?;
-            if row.0 != behind || std::time::Instant::now() >= deadline {
-                break row;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
+        let (dsn, inst, seeded) = (db.dsn.clone(), instance.clone(), behind.clone());
+        let moved = wait_until(
+            "the row's cursor to move past the one this test puts back",
+            Duration::from_secs(60),
+            || cursor_moved(dsn.clone(), inst.clone(), seeded.clone()),
+        )
+        .await
+        .is_ok();
+        let (ahead, _) = saved_cursor_row(&mut c, &instance).await?;
         ensure!(
-            ahead != behind,
-            "the row's cursor never moved past the one this test puts back, so the restart below \
-             would prove nothing about a lagging cursor"
+            moved && ahead != behind,
+            "the row's cursor never moved past the {}-byte one this test puts back, so the              restart below would prove nothing about a lagging cursor",
+            behind.len()
         );
         ctx.log(format!(
             "the row holds a {}-byte cursor; the restart is put back to the {}-byte one behind it",
