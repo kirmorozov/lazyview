@@ -7498,11 +7498,91 @@ impl Engine {
                 })
                 .unwrap_or_else(|| "-".to_string()),
         };
+        // The floor's minimum names the debt; the slot's own account names why that debt is not
+        // being paid, which is the reason the line exists. From `/stats` alone the three states
+        // that matter print identically — a buffer no round can deliver, a catch-up declined by
+        // the work already in the slot, a claim whose task never came back — and CI's two
+        // bandwidth reds were argued from an applied position alone for exactly that reason.
+        let why = self
+            .slots
+            .iter()
+            .position(|s| s.def_id == pin.def_id())
+            .map(|i| self.slot_witness(i))
+            .unwrap_or_default();
         let held = now.duration_since(self.floor_held.as_ref().expect("just latched").1);
         warn!(view = %view, target = %target, since = %at, read = %read, held_s = held.as_secs(),
+              why = %why,
               "the reported position has not advanced for {}s: {}",
               held.as_secs(),
               pin.what());
+    }
+
+    /// The slot's own account of why its floor cannot move, for [`Engine::report_floor_stall`]:
+    /// what it maintains, what it owes and to whom, what it has buffered, and what work of its own
+    /// is in flight. The floor is a minimum over exactly these, so a position that has stood still
+    /// for minutes is a claim about one of them — and the witness has to say which, or the line
+    /// prints a position and a guess (the state of the three CI reds of 2026-11-27).
+    ///
+    /// Cost (guard R3): one formatted line per stalled view per minute, off every hot path.
+    fn slot_witness(&self, i: usize) -> String {
+        let Some(s) = self.slots.get(i) else {
+            return String::new();
+        };
+        let common = format!(
+            "error={} stale={} in_flight={} swapping={} catch_up={} build_targets=[{}] waiting={} replan={}",
+            s.error.is_some(),
+            s.stale_since.is_some(),
+            s.next.is_some(),
+            s.next.as_ref().is_some_and(|n| n.swapping),
+            s.next.as_ref().is_some_and(|n| n.catch_up),
+            s.next
+                .as_ref()
+                .map(|n| n.targets.join(","))
+                .unwrap_or_default(),
+            s.waiting.is_some(),
+            self.replan.contains_key(&s.def_id),
+        );
+        let Some(l) = s.live.as_ref() else {
+            return format!("live=none {common}");
+        };
+        let now = Instant::now();
+        let owed: Vec<String> = l
+            .lag
+            .iter()
+            .map(|(t, g)| {
+                format!(
+                    "{t}(all={} down={} units={} due={} failures={})",
+                    g.all,
+                    g.down,
+                    g.units.len() + g.partial.iter().map(UnitSet::len).sum::<usize>(),
+                    g.retry_at <= now,
+                    g.failures,
+                )
+            })
+            .collect();
+        let d = &l.dirty;
+        format!(
+            "frozen={} maintained=[{}] owed=[{}] behind=[{}] buffered(units={} images={} marks={} \
+             holds={} partial={} all={} rebuild={}) in_flight_since={} build_done={} claims={} {common}",
+            l.frozen,
+            l.targets.join(","),
+            owed.join(","),
+            l.behind.keys().cloned().collect::<Vec<_>>().join(","),
+            d.units.len(),
+            d.images.iter().map(KeySet::len).sum::<usize>(),
+            d.marks.len(),
+            d.holds.len(),
+            d.partial.iter().map(UnitSet::len).sum::<usize>(),
+            d.all,
+            d.rebuild,
+            s.next
+                .as_ref()
+                .and_then(|n| n.since.as_ref())
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            s.next.as_ref().is_some_and(|n| n.done.is_some()),
+            self.lag_retries.keys().filter(|(j, _)| *j == i).count(),
+        )
     }
 
     fn key_count(&self) -> usize {
@@ -9662,6 +9742,16 @@ impl Engine {
         };
         let s = &self.slots[i];
         if s.next.is_some() || s.waiting.is_some() || self.replan.contains_key(&s.def_id) {
+            // Why the attempt did not start, named: `applied` cannot pass this target until one of
+            // these builds lands, and without this line a decline is invisible — an entry that is
+            // due, declined and re-armed forever looks from `/stats` exactly like a build that is
+            // slow (which is how CI's two bandwidth reds were argued at positions alone). One line
+            // per paced attempt, never per event.
+            debug!(view = %name, target = %t,
+                   build_in_flight = s.next.is_some(),
+                   waiting = s.waiting.is_some(),
+                   replan = self.replan.contains_key(&s.def_id),
+                   "the whole view's catch-up waits for the work already in the slot");
             if let Some(g) = self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
                 g.retry_at = Instant::now() + connect_retry_delay(g.failures.max(1));
             }
