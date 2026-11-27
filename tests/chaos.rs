@@ -2414,7 +2414,8 @@ fn chaos_tgt_pg_bandwidth_starvation() {
 /// every flush (the shape of the first cursor fix — the byte-exact read-back plus the whole set,
 /// every 200 ms, over a link that costs 2 ms per byte) this leg is red on `mysql84` at CI's seed
 /// 864590356776; with the set going only when the link can carry its size
-/// (`Engine::set_write_affordable`, priced off the run's own last cursor write) while the position
+/// (`Engine::set_write_affordable`, priced at the worst per-byte cost the run's own timed statements
+/// report on that link) while the position
 /// goes whenever it moves, it is green — and what the run pays instead is a restart that re-reads
 /// binlog it has already applied, the case
 /// `lifecycle_resumes_from_a_cursor_behind_the_applied_position` holds to the oracle.

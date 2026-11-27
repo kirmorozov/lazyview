@@ -984,21 +984,25 @@ mod tests {
             fragmented.len()
         );
         let whole = at.clone().with_gtid(Some(fragmented.clone()));
+        // Rendered once: this is the byte-exactness the save's read-back depends on, and a
+        // `to_string()` per assertion is a copy of a set the test only wants to look at.
+        let whole_text = whole.to_string();
         assert!(
-            cursor_fits(whole.to_string().len()),
+            cursor_fits(whole_text.len()),
             "a set past the old TEXT limit must ride the save whole ({} B)",
-            whole.to_string().len()
+            whole_text.len()
         );
-        assert_eq!(whole.to_string(), format!("{at}[g={fragmented}]"));
+        assert_eq!(whole_text, format!("{at}[g={fragmented}]"));
         // Past the MEDIUMTEXT bound: refused, and the refusal names the three things to act on.
+        // The text is built from the same shape `Display` writes (asserted one line above), so the
+        // refusal is measured without holding a second 17 MB copy of the set alive.
         let monster = "1ec44047-e72e-11f1-81ab-7ab4f2cf23bf:1-346,".repeat(400_000);
-        let big = at.clone().with_gtid(Some(monster.clone()));
-        let big_len = big.to_string().len();
+        let big_len = format!("{at}[g={monster}]").len();
         assert!(
             !cursor_fits(big_len),
             "a cursor the column cannot hold whole must never be sent to it"
         );
-        let msg = format!("{:#}", cursor_too_long(big_len, big.gtid()));
+        let msg = format!("{:#}", cursor_too_long(big_len, Some(monster.as_str())));
         let size = big_len.to_string();
         let limit = MAX_CURSOR_BYTES.to_string();
         for names in [
