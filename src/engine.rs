@@ -10436,9 +10436,7 @@ const MAX_FILTER_PARAMS: usize = 60_000;
 /// single-column limit), keeping one chunked `IN` per (view, route) per flush within the server cap.
 /// `cols` of 0 (a route with no FK) or a `query_chunk` of 0 still yields at least 1.
 fn name_chunk_per(query_chunk: usize, cols: usize) -> usize {
-    query_chunk
-        .min(MAX_FILTER_PARAMS / cols.max(1))
-        .max(1)
+    query_chunk.min(MAX_FILTER_PARAMS / cols.max(1)).max(1)
 }
 
 /// A lagging target is reported down after this many failed retries.

@@ -1609,7 +1609,11 @@ fn reg_cascade_window_named_branch_two_col() {
             "INSERT INTO ch VALUES (1, 1, 1, 10), (1, 1, 2, 11), (1, 2, 1, 12), (2, 1, 1, 13), \
              (2, 2, 1, 14), (3, 1, 1, 15)",
         ];
-        let specs = vec![ViewSpec::new(id, Kind::Incremental, "SELECT a, b, seq, val FROM ch")];
+        let specs = vec![ViewSpec::new(
+            id,
+            Kind::Incremental,
+            "SELECT a, b, seq, val FROM ch",
+        )];
         let (db, mut eng) = setup(&ctx, id, &ddl, &specs, &[]).await?;
         let mut sc = db.conn().await?;
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
@@ -1637,8 +1641,7 @@ fn reg_cascade_window_named_branch_two_col() {
             ("forward", "(a, b) IN ((1, 1), (2, 1), (3, 1))"),
             ("reverse", "(b, a) IN ((1, 1), (1, 2), (1, 3))"),
         ] {
-            let sql =
-                format!("EXPLAIN SELECT DISTINCT a, b, seq FROM `{id}` WHERE {where_}");
+            let sql = format!("EXPLAIN SELECT DISTINCT a, b, seq FROM `{id}` WHERE {where_}");
             // Read the plan BY COLUMN NAME: MariaDB's `EXPLAIN` has no `partitions`/`filtered`
             // columns where MySQL's does, so positional reads would skew between families.
             let plan: Vec<mysql_async::Row> = sc.query(sql.as_str()).await?;
@@ -1648,10 +1651,8 @@ fn reg_cascade_window_named_branch_two_col() {
             let ty: Option<String> = row.get("type");
             let key: Option<String> = row.get("key");
             ensure!(
-                matches!(
-                    ty.as_deref(),
-                    Some("range") | Some("ref") | Some("eq_ref")
-                ) && matches!(key.as_deref(), Some("PRIMARY") | Some("_lv_row")),
+                matches!(ty.as_deref(), Some("range") | Some("ref") | Some("eq_ref"))
+                    && matches!(key.as_deref(), Some("PRIMARY") | Some("_lv_row")),
                 "the {order} two-column name read must use the row-key index (PRIMARY / _lv_row) \
                  as a range/ref, not a scan: type={ty:?} key={key:?}"
             );

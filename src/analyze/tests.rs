@@ -979,7 +979,12 @@ fn gate_nameable_plan(child_cols: Vec<usize>, parent_cols: &[&str], view_sql: &s
         )
     };
     let tables: std::collections::HashMap<_, _> = [
-        table("pair", vec![int("a"), int("b"), int("note")], vec![0, 1], vec![]),
+        table(
+            "pair",
+            vec![int("a"), int("b"), int("note")],
+            vec![0, 1],
+            vec![],
+        ),
         table(
             "ch",
             vec![int("a"), int("b"), int("seq"), int("val")],
