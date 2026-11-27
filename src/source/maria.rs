@@ -524,6 +524,54 @@ pub(crate) fn dump_gtid_list(text: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Whether MariaDB can locate a binlog dump on this cursor's set at all.
+///
+/// `SET @slave_connect_state` is not a set the server filters events out of: it is the state the
+/// dump starts *after*, and MariaDB answers it only for a state that names **every**
+/// `domain-server` pair the node has written. In `contains_all_slave_gtid` (`sql/sql_repl.cc`), a
+/// pair that a binlog file's `Gtid_list_log_event` carries but the requested state does not name
+/// means "this slave needs that domain from its very first transaction", so the server searches
+/// ever-older files; when none of the files it still has begins that domain, the dump dies with
+/// `Could not find GTID state requested by slave in any binlog files. Probably the slave state is
+/// too old and required binlog files have been purged` — and `@slave_gtid_strict_mode` never gets
+/// a say, because the request dies while the file is being chosen.
+///
+/// So a reader whose set does not name a pair this node has written cannot anchor on GTIDs at all
+/// — a writer with its own `gtid_domain_id`, a restored or multi-source history, a node whose
+/// `gtid_binlog_state` was reloaded by hand. The reader of this set is the one that has to know:
+/// a state the node cannot locate keeps the dump on its file/pos anchor, because the position asks
+/// for nothing the server has to recognize, so the resume still happens. `node_state` is
+/// `@@GLOBAL.gtid_binlog_state` and `saved` the cursor's `[g=…]` text; a node that has written
+/// nothing has no pair to name, so it answers true.
+pub fn dump_state_covers(node_state: &str, saved: &str) -> bool {
+    dump_state_unnamed(node_state, saved).is_none()
+}
+
+/// The pair [`dump_state_covers`] would refuse a dump over: the first `domain-server` pair this
+/// node's state carries that `saved` does not name, or `None` when the state can anchor a dump.
+///
+/// The engine logs it when one of its conditions holds a run back to the file/pos anchor, so an
+/// operator — and a test that has to say which rule fired — reads the pair out of the line instead
+/// of guessing from `set_bytes=0`. It is what `SHOW BINLOG EVENTS`' `Gtid_list` row names for that
+/// domain. Public because the rule is the engine's own: a test that expects one anchor or the other
+/// asks the product, rather than reading `sql_repl.cc` and writing its own copy of the check.
+pub fn dump_state_unnamed(node_state: &str, saved: &str) -> Option<String> {
+    let want = parse_gtid_set(saved);
+    let named = |pair: &str| {
+        want.get(pair)
+            .is_some_and(|ivals| ivals.iter().any(|&(_, hi)| hi > 0))
+    };
+    // Sorted, so the line an operator reads (and a test asserts on) names the same pair every time
+    // the same two states are compared: the map the parse yields has no order of its own.
+    let mut missing: Vec<String> = parse_gtid_set(node_state)
+        .into_iter()
+        .filter(|(pair, ivals)| ivals.iter().any(|&(_, hi)| hi > 0) && !named(pair))
+        .map(|(pair, _)| pair)
+        .collect();
+    missing.sort();
+    missing.into_iter().next()
+}
+
 /// The two session statements that make MariaDB answer the ordinary `COM_BINLOG_DUMP` of
 /// [`crate::binlog::stream`] (no file name, the minimum position) from a GTID position:
 /// `@slave_connect_state` is the list to resume after, and `@slave_gtid_strict_mode = 1` makes the
