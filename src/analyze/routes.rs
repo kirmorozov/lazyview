@@ -421,6 +421,7 @@ pub(crate) fn cascade_routes(
                 reach: None,
                 child_table: child.clone(),
                 map: None,
+                name_cols: None,
             });
             if depth < 8 && !read.contains(&fk.parent) {
                 // A cascade into the parent cascades further into the child: unknown units.

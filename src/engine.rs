@@ -1330,7 +1330,10 @@ fn units_bytes(units: &UnitSet, partial: &[UnitSet]) -> usize {
 /// Estimated memory of a change buffer, from the sizes of its sets (no walk over the keys).
 fn buffer_bytes(d: &ViewDirty) -> usize {
     units_bytes(&d.units, &d.partial)
-        + (d.images.iter().map(HashSet::len).sum::<usize>() + d.marks.len() + d.holds.len())
+        + (d.images.iter().map(HashSet::len).sum::<usize>()
+            + d.marks.len()
+            + d.holds.len()
+            + d.name_pending.len())
             * KEY_BYTES
 }
 
@@ -8608,6 +8611,14 @@ impl Engine {
             &mut units,
         )
         .await?;
+        self.name_lookups(
+            plan,
+            layout,
+            &dirty.name_pending,
+            (targets, table),
+            &mut units,
+        )
+        .await?;
         work.ids_resolved = (units.len() - resolve.0) as u64;
         work.lookup_queries = Metrics::get(&self.metrics.lookup_queries) - resolve.1;
         let partial = dirty.partial.clone();
@@ -8726,6 +8737,14 @@ impl Engine {
                 plan,
                 layout,
                 (&dirty.marks, &dirty.holds),
+                (targets, table),
+                &mut units,
+            )
+            .await?;
+            self.name_lookups(
+                plan,
+                layout,
+                &dirty.name_pending,
                 (targets, table),
                 &mut units,
             )
@@ -9167,6 +9186,41 @@ impl Engine {
             Metrics::add(&self.metrics.lookup_queries, 1);
             for r in rows {
                 units.insert(r.unwrap().into_iter().map(Datum::from_value).collect());
+            }
+        }
+        Ok(())
+    }
+
+    /// Units of mapped cascade children that vanished in a gap window and the route can name (see
+    /// `ViewDirty::name_pending`): one bounded read of the materialized table per (route, old key)
+    /// for the units whose FK column still carries the parent's old key — the rows the cascade
+    /// left stale, which the whole view used to be refreshed for.
+    async fn name_lookups(
+        &mut self,
+        plan: &ViewPlan,
+        layout: &Layout,
+        pending: &[(usize, Key)],
+        (targets, table): (&[String], &str),
+        units: &mut UnitSet,
+    ) -> Result<()> {
+        for (ci, old) in pending {
+            let Some(cols) = plan.cascades[*ci].name_cols.as_ref() else {
+                continue;
+            };
+            let chunk = UnitChunk::Keys(vec![old.clone()]);
+            let rows = self
+                .read_materialized(
+                    targets,
+                    table,
+                    layout,
+                    target::MvFilter::Keys {
+                        chunk: &chunk,
+                        cols,
+                    },
+                )
+                .await?;
+            for r in rows {
+                units.insert(r.into_iter().map(Datum::from_value).collect());
             }
         }
         Ok(())

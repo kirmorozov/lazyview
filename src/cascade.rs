@@ -440,6 +440,7 @@ mod tests {
                 cols: vec![3, 4],
                 filters,
             }),
+            name_cols: None,
         }
     }
 

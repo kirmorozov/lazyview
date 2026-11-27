@@ -1048,6 +1048,17 @@ pub fn plan_block(
     if matches!(mode, Mode::Spj | Mode::Grouped) {
         cascade_maps(&mut cascades, &alias_plans, &alias_filters, &partial);
     }
+    // A select/join over a single alias (one materialized row per child row) whose child FK
+    // reaches the projection names its vanished cascade children from the materialized table
+    // instead of refreshing the whole view in a gap window (see `CascadeRoute::name_cols`).
+    if matches!(mode, Mode::Spj) && n_alias == 1 {
+        name_mapped_cascades(
+            &mut cascades,
+            &select.projection,
+            output_names.as_deref(),
+            &alias_plans[0],
+        );
+    }
     let window_sql = if select.named_window.is_empty() {
         None
     } else {
@@ -1123,6 +1134,75 @@ pub fn plan_block(
         unit_refs: unit_refs_cols,
         has_explicit_collate,
     })
+}
+
+/// Marks each mapped cascade route whose children the refresh can NAME from the materialized
+/// table (see [`CascadeRoute::name_cols`]): `alias` (the view's single FROM alias) is the child
+/// table itself, and every FK column reaches the projection as a bare column. For such a route a
+/// materialized row is one child row, so `SELECT DISTINCT <units> ... WHERE <fk cols> = <old key>`
+/// names exactly the children a parent change vanished — the read is complete (every child of the
+/// parent still holds that FK) and never wider. The target column name is the one the materialized
+/// table gives the projection position: the `CREATE VIEW (…)` column list when given, else the
+/// column's own name (its alias, when it has one). A route that fails any test keeps `name_cols`
+/// `None`: the whole-view refresh stands.
+fn name_mapped_cascades(
+    cascades: &mut [CascadeRoute],
+    projection: &[SelectItem],
+    output_names: Option<&[String]>,
+    alias: &AliasPlan,
+) {
+    for c in cascades.iter_mut() {
+        if c.map.is_none()
+            || c.traced
+            || c.derived
+            || c.unit_from_parent.is_some()
+            || (c.child.0.as_str(), c.child.1.as_str())
+                != (alias.table.schema.as_str(), alias.table.name.as_str())
+        {
+            continue;
+        }
+        let mut cols: Vec<String> = Vec::with_capacity(c.child_cols.len());
+        let mut nameable = true;
+        for &k in &c.child_cols {
+            let want = alias.table.columns[k].name.as_str();
+            match projection.iter().enumerate().find_map(|(i, it)| {
+                bare_column(it)
+                    .filter(|(src, _)| src.eq_ignore_ascii_case(want))
+                    .map(|(_, name)| (i, name))
+            }) {
+                Some((i, natural)) => {
+                    cols.push(output_names.map(|o| o[i].clone()).unwrap_or(natural))
+                }
+                None => {
+                    nameable = false;
+                    break;
+                }
+            }
+        }
+        if nameable && !cols.is_empty() {
+            c.name_cols = Some(cols);
+        }
+    }
+}
+
+/// A projection item that is exactly one bare column (optionally `AS`-aliased): its source column
+/// name and the column name the materialized table gives it. `None` for any other item (an
+/// expression, an aggregate, a wildcard).
+fn bare_column(item: &SelectItem) -> Option<(String, String)> {
+    let (expr, alias) = match item {
+        SelectItem::UnnamedExpr(e) => (e, None),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, Some(ident_name(alias))),
+        _ => return None,
+    };
+    let col = match expr {
+        Expr::Identifier(id) => ident_name(id),
+        Expr::CompoundIdentifier(parts) => match parts.last() {
+            Some(i) => ident_name(i),
+            None => return None,
+        },
+        _ => return None,
+    };
+    Some((col.clone(), alias.unwrap_or(col)))
 }
 
 /// Expands an unqualified `*` over USING / NATURAL joins the way the servers do: the join's
