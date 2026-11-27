@@ -694,6 +694,8 @@ impl Dedup {
             cascade_rows: s.cascade_rows,
             cascade_gaps: s.cascade_gaps,
             xa_unknown_commits: 0,
+            // The core does not report a short image yet (`cascade-gap-core`'s host-side half).
+            cascade_short_images: 0,
         }
     }
 

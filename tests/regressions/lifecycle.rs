@@ -369,6 +369,114 @@ fn reg_crash_with_stale_full_view() {
     });
 }
 
+/// #399: a chunk is written as separate autocommit statements (#389), the old rows' deletes
+/// before the new rows' inserts, so a crash can land between them. The replay reads the chunk's
+/// changes again, but a unit reached through a lineage alias is found by `lineage_lookup`: the
+/// materialized rows that carry the changed key, and the source rows that hold it. A customer
+/// that was deleted is held by no source row, and the rows that carried it are the ones the cut
+/// chunk deleted, so neither read names the orders: the replay re-derives nothing for them and
+/// their rows stay lost (`lifecycle_crash_consistency`, `v_orders_left`). The cut is placed, not
+/// raced: a trigger refuses the views' inserts, so a write's deletes are the last of its
+/// statements that land, and the crash comes after that write failed. Both write shapes are
+/// covered: by row key (`r_cut_keyed`, whose key holds the customer's lineage) and by unit
+/// (`r_cut_units`, no row identity, the shape of `v_orders_left`).
+#[test]
+fn reg_crash_between_a_chunks_statements_keeps_its_units() {
+    scenario("reg_cut_chunk", |ctx| async move {
+        let specs = vec![
+            ViewSpec::new(
+                "r_cut_keyed",
+                Kind::Incremental,
+                "SELECT o.id, o.status, c.name FROM orders o \
+                 LEFT JOIN customers c ON c.id = o.customer_id",
+            ),
+            ViewSpec::new(
+                "r_cut_units",
+                Kind::Incremental,
+                "SELECT o.id, o.status, p.id AS pay_id, p.amount, c.name FROM orders o \
+                 LEFT JOIN payments p ON p.order_id = o.id \
+                 LEFT JOIN customers c ON c.id = o.customer_id",
+            ),
+        ];
+        let (db, eng) = setup(
+            &ctx,
+            "reg_cut_chunk",
+            &[
+                "CREATE TABLE payments (id INT PRIMARY KEY, order_id INT NOT NULL, \
+                 amount DECIMAL(10,2) NOT NULL)",
+                "INSERT INTO payments VALUES (100, 10, 5.00), (101, 10, 7.50), (102, 11, 9.00), \
+                 (103, 12, 1.00)",
+            ],
+            &specs,
+            &[("LAZYVIEW_POSITION_PERSIST_MS", "50")],
+        )
+        .await?;
+        let mut c = db.conn().await?;
+        // The resume position is past the seed, so the replay cannot re-derive the orders from
+        // their own inserts: only the customer's delete names them. The engine's saved position
+        // advances with the source events it applies, while `SHOW BINARY LOG STATUS` reports the
+        // binlog end including events of other sessions (and the engine's own writes to its
+        // target tables): a snapshot of it can sit past every position this engine will ever
+        // save, so the wait takes the snapshot BEFORE a write of ours and waits for the engine
+        // to pass it — a row of `orders` is an event every view here must apply.
+        let built = server_position(&mut c).await?;
+        exec(
+            &mut c,
+            "INSERT INTO orders (id, customer_id, status) VALUES (9998, 2, 'paid')",
+        )
+        .await?;
+        let dbr = &db;
+        wait_until("a position past the build saved", t_ready(), || {
+            let built = built.clone();
+            async move { Ok(soakchaos::saved_position(dbr).await? >= built) }
+        })
+        .await?;
+        for s in &specs {
+            exec(
+                &mut c,
+                &format!(
+                    "CREATE TRIGGER lv_cut_{0} BEFORE INSERT ON {0} FOR EACH ROW \
+                     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'lazyview test: the chunk is cut here'",
+                    s.name
+                ),
+            )
+            .await?;
+        }
+        // Orders 10 and 11 keep their rows with no customer; only `c`'s lineage leads to them.
+        exec(&mut c, "DELETE FROM customers WHERE id = 1").await?;
+        let log = eng.log_path.clone();
+        let want: Vec<String> = specs.iter().map(|s| format!("view={}", s.name)).collect();
+        wait_until(
+            "each view's write refused after its deletes",
+            t_ready(),
+            || {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let cut = want.iter().all(|v| {
+                    text.lines()
+                        .any(|l| l.contains("write failed") && l.contains(v.as_str()))
+                });
+                async move { Ok(cut) }
+            },
+        )
+        .await?;
+        eng.crash().await?;
+        for s in &specs {
+            exec(&mut c, &format!("DROP TRIGGER lv_cut_{}", s.name)).await?;
+        }
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "replayed after a crash between a chunk's statements",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
 /// A server identity that cannot be read keeps the resume guard: the read is repeated and the
 /// saved position refused (it used to read as `""`, leaving the "written by another server"
 /// check off for the whole run). A cursor that carries its GTID set is decided by the adoption

@@ -804,6 +804,12 @@ fn values_binary_padding() {
                 "SELECT l.id, l.attr, e.id AS eid FROM link l LEFT JOIN entity e ON e.b = l.b",
             ),
             ViewSpec::new("v_item", Kind::Incremental, "SELECT k, attr FROM item"),
+            // Grouped by an expression: its changes are looked up from VARBINARY images (#394).
+            ViewSpec::new(
+                "v_link_by_head",
+                Kind::Incremental,
+                "SELECT LEFT(b, 1) AS h, COUNT(*) AS n FROM link GROUP BY LEFT(b, 1)",
+            ),
         ];
         let ddl = [
             "CREATE TABLE entity (id INT PRIMARY KEY, b BINARY(4) NULL, g INT NULL, KEY k_b (b))",
@@ -873,6 +879,22 @@ fn values_binary_padding() {
                     "INSERT INTO entity VALUES (11, X'FF000000', 11), (12, X'FF', 12), (13, X'', 13)",
                     "DELETE FROM entity WHERE b = X'00000000'",
                     "DELETE FROM item WHERE k = X'FF000000'",
+                ],
+            ),
+            (
+                // #394: bytes that only begin a UTF-8 character were bound as a string that
+                // MariaDB sized at zero characters, so the lookup's literal row held X''.
+                "VARBINARY keys that only begin a UTF-8 character",
+                &[
+                    "UPDATE link SET b = X'C9' WHERE id = 5",
+                    "INSERT INTO link VALUES (7, X'E282', 'two'), (8, X'F09F98', 'three')",
+                ],
+            ),
+            (
+                "such VARBINARY keys move and go",
+                &[
+                    "UPDATE link SET b = X'C3' WHERE id = 5",
+                    "DELETE FROM link WHERE id = 8",
                 ],
             ),
         ];
@@ -1013,22 +1035,21 @@ fn values_non_utf8_charsets() {
     });
 }
 
-/// #394 fail-before (lv-worker-utf8-394): the `v_entity_by_a` group of the latin1 unit `É`
-/// (byte `0xC9`, which `latin1_swedish_ci` makes equal to `e`) holding row 11 alone never
-/// reaches the MV. Splitting the original `insert / delete a group of equal keys` step so a
-/// `verify` lands between the INSERT of row 11 and the `DELETE … a = 'e'` shows `('11','1','11')`
-/// missing from `v_entity_by_a` right after the insert — the mirror of the CI red that showed it
-/// as an extra kept row after the delete. Everything else here is that scenario copied verbatim;
-/// only its last step differs, and it drops two things with it: the INSERT's row 12 (`'ü '`, a
-/// group of its own) and the step's `DELETE … a = 'cafe'`. The red shows at the insert check,
-/// before either would matter, and the recorded runs used exactly this test. Same defect, caught
-/// one step earlier: the engine emits
-/// no `v_entity_by_a` refresh at all after that INSERT, silent through the catch-up and the extra
-/// 3 s re-check, so nothing was owed — the new group is never named for a refresh, and no later
-/// pass heals it (`mv::vanished`, the whole-view read that walks the units a view holds against
-/// the source, has no production caller). Red on `origin/main` at 9222872.. on mariadb106, 6/6
-/// seeds (the reported 785433886351 + five neighbours); green once the insert path names the
-/// `0xC9` unit and writes its group. Refs #394.
+/// #394: non-UTF-8 key bytes that only begin a UTF-8 character. A lookup binds the changed row's
+/// key as a literal row (`SELECT <param> AS a`, a derived table); bound as a string parameter, the
+/// bytes were utf8mb4 text to the server, and MariaDB sizes such a parameter by its utf8mb4
+/// characters, of which the latin1 `É` (0xC9) has none: the literal row held `''`, the lookup
+/// named the unit `''`, and the `É` group of the INSERT of row 11 never reached `v_entity_by_a`
+/// (the CI red at 9a09166 was the same miss on the DELETE that followed it, as a kept extra row).
+/// The key now travels as hex (`crate::catalog::HEX_PARAM`). The scenario is
+/// `values_non_utf8_charsets` copied verbatim up to its last step, which is split so a `verify`
+/// lands between the INSERT of row 11 and the `DELETE … a = 'e'`; the split drops two things with
+/// it: the INSERT's row 12 (`'ü '`, a group of its own) and the step's `DELETE … a = 'cafe'`. The
+/// red shows at the insert check, before either would matter. The steps after the split sweep the
+/// keys the rule bites: every latin1 byte that begins a multi-byte character (0xC2..=0xF4) alone,
+/// a two- and a three-byte start, sjis half-width katakana (`ﾊ` 0xCA, `ﾂ` 0xC2), as group keys,
+/// join keys and a latin1 primary key, inserted, moved and deleted. Red on MariaDB 10.6, 10.11 and
+/// 11.4 before the fix (6/6 seeds on 10.6), green on MySQL 8.4 either way.
 #[test]
 fn values_non_utf8_group_by_a_survives() {
     scenario("val_charsets394", |ctx| async move {
@@ -1094,6 +1115,15 @@ fn values_non_utf8_group_by_a_survives() {
         .await?;
         let mut c = db.conn().await?;
         ensure_incremental(&mut c, &specs).await?;
+        // Every latin1 byte that begins a multi-byte UTF-8 character, alone, as `a` of row `id`
+        // = the byte (194..=244).
+        let starts = format!(
+            "INSERT INTO entity VALUES {}",
+            (0xC2..=0xF4u8)
+                .map(|x| format!("({x}, _latin1 X'{x:02X}', NULL, NULL, NULL, {x})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let steps: &[(&str, &[&str])] = &[
             (
                 "other column changes, keys unchanged",
@@ -1133,8 +1163,8 @@ fn values_non_utf8_group_by_a_survives() {
                     "UPDATE item SET attr = 'y' WHERE attr = 'ÿ'",
                 ],
             ),
-            // #394 fail-before: the race removed — a verify lands after the insert and
-            // before the delete. The latin1 'É' (byte 0xC9, = 'e' under latin1_swedish_ci)
+            // #394: a verify lands between the insert and the delete of the original step.
+            // The latin1 'É' (byte 0xC9, = 'e' under latin1_swedish_ci)
             // group holds row 11 alone, so it is (11,1,11) after the insert and gone after.
             // The original step's other two pieces are not copied: its INSERT's row 12
             // ('ü ', its own group) and its DELETE FROM entity WHERE a = 'cafe'.
@@ -1145,6 +1175,30 @@ fn values_non_utf8_group_by_a_survives() {
             (
                 "#394 delete: the 'É' group by a = 'e'",
                 &["DELETE FROM entity WHERE a = 'e'"],
+            ),
+            (
+                "#394: keys that only begin a UTF-8 character, inserted",
+                &[
+                    starts.as_str(),
+                    "INSERT INTO entity VALUES (300, _latin1 X'E282', NULL, _sjis X'CA', NULL, 300), \
+                     (301, _latin1 X'F09F98', NULL, _sjis X'C2', NULL, 301)",
+                    "INSERT INTO item VALUES (_latin1 X'C9', _sjis X'CA'), (_latin1 X'E282', '能')",
+                ],
+            ),
+            (
+                "#394: such keys move to other such keys",
+                &[
+                    "UPDATE entity SET a = _latin1 X'E282' WHERE id BETWEEN 194 AND 200",
+                    "UPDATE entity SET a = _latin1 X'C9', c = _sjis X'C2' WHERE id = 300",
+                    "UPDATE item SET attr = _latin1 X'F09F98' WHERE attr = _latin1 X'E282'",
+                ],
+            ),
+            (
+                "#394: such keys go",
+                &[
+                    "DELETE FROM entity WHERE id >= 194",
+                    "DELETE FROM item WHERE attr IN (_latin1 X'C9', _latin1 X'F09F98')",
+                ],
             ),
         ];
         for (what, stmts) in steps {

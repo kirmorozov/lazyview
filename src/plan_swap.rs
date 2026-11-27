@@ -319,6 +319,7 @@ fn same_column(a: &Column, b: &Column, t: &TableInfo, m: &Ords) -> Result<(), St
         name,
         kind,
         param,
+        hex,
         exact,
         invisible,
         data_type,
@@ -338,8 +339,8 @@ fn same_column(a: &Column, b: &Column, t: &TableInfo, m: &Ords) -> Result<(), St
     eq("type", kind, &b.kind)?;
     eq(
         "type",
-        &(param, exact, octet_len),
-        &(&b.param, &b.exact, &b.octet_len),
+        &(param, hex, exact, octet_len),
+        &(&b.param, &b.hex, &b.exact, &b.octet_len),
     )?;
     eq(
         "collation",
