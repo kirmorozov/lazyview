@@ -1362,23 +1362,30 @@ fn reg_cascade_window_parent_delete_named() {
 /// Issue #408 R4 — the analyzer's name-ability gate, exercised end to end. Every scenario is the
 /// same gap-window parent delete of `reg_cascade_window_parent_delete_named`, but the child table
 /// and the view differ so the analyzer's plan fact (`CascadeRoute::name_cols`) lands on a different
-/// gate branch. All four assert the same engine invariant — a gap-window parent delete never costs
-/// a whole-view refresh (`whole_view_refreshes == 0`) and the view is exact at convergence.
+/// gate branch. All four assert the same guard — a gap-window parent delete never forces a STREAMED
+/// whole-view rebuild (`whole_view_refreshes == 0`; that counter counts only `built(whole = true)`)
+/// — and require `cascade_gaps == 1` with the view exact at convergence. Read the mechanism note
+/// below before reading `whole_view_refreshes == 0` as "no whole-view read happened".
 ///
 /// Why even the non-nameable legs are `whole_view_refreshes == 0`: the parent's DELETE reaches the
 /// engine only through the **cascade cache** — a row the server moves with `ON DELETE CASCADE` never
 /// appears on the source's binlog (`docs/views.md:340`, `docs/internals.md:81`), so after the restart
 /// the flush replays the parent change from the cache it seeds, not from a child binlog event. When
 /// the analyzer marks the route nameable the flush names the vanished children with one bounded read
-/// of the materialized table under the parent's old key (the #408 fix). When it does not, the replay
-/// reaches `mark_all`; on a unit (`Spj`) view `mark_all` is the in-place refresh (the `dirty.all`
-/// branch in `engine.rs`), which the code itself calls "a refresh, not a rebuild" — it never runs the
-/// streamed rebuild that `built(whole = true)` counts, so `whole_view_refreshes` stays 0 on BOTH
-/// branches (confirmed identical on mysql84 and percona84 at the CI seed 139106703940: the legs are
-/// pinned, so 0 is the exact per-branch value, not a fixture coincidence). The per-branch gate
-/// decision (`name_cols` Some/None) is pinned deterministically by the `gap_window_*` and
-/// `*_nameable` lib tests in `accumulate`, which read the plan directly with no server; these
-/// scenarios are the real-engine guard that none of these shapes costs a counted whole-view refresh.
+/// of the materialized table under the parent's old key (the #408 fix), and pays no source read at
+/// all. When it does not, the replay reaches `mark_all`; on a unit (`Spj`) view `mark_all` is the
+/// in-place `dirty.all` arm of `refresh` (`engine.rs`), which reads the WHOLE view source into
+/// memory and applies it in place — the code calls it "a refresh, not a rebuild".
+/// `whole_view_refreshes` counts only the streamed rebuild (`built(whole = true)`) that arm never
+/// runs, so on the non-nameable legs it stays 0 even though a whole-view source read DID happen.
+/// `whole_view_refreshes == 0` here is therefore a guard against a streamed rebuild, NOT a claim
+/// that no whole-view read occurred; the non-nameable legs genuinely take `mark_all` (the trace
+/// proved it: `FEED branch=empty+gap+vanish MARK_ALL`). Routing and counting that uncounted
+/// in-place whole-view refresh is step 1c's job, not this fix's — it is a known gap. The counters
+/// are confirmed identical on mysql84 and percona84 at the CI seed 139106703940 (the legs are
+/// pinned). The per-branch gate decision (`name_cols` Some/None) is pinned deterministically by the
+/// `gap_window_*` and `*_nameable` lib tests in `accumulate`, which read the plan directly with no
+/// server.
 async fn gap_named_branch(
     ctx: &Ctx,
     id: &str,
@@ -1432,9 +1439,11 @@ async fn gap_named_branch(
     let s = eng.stats_of(&db, id)?;
     let d = eng.snapshot().since(&f0);
     ensure!(
-        s.cascade_gaps >= 1 && s.whole_view_refreshes == want_whole && d.full_rebuilds == 0,
-        "expected whole_view_refreshes == {want_whole} for the {id} gap-window parent-delete \
-         (a gap heals without a whole-view refresh in every branch, see the helper doc), got {s:?} {}",
+        s.cascade_gaps == 1 && s.whole_view_refreshes == want_whole && d.full_rebuilds == 0,
+        "expected the {id} gap-window parent-delete to record exactly one cascade gap and take no \
+         streamed whole-view rebuild (whole_view_refreshes == {want_whole}); the non-nameable legs \
+         still take mark_all's in-place whole-view refresh, which this counter does not count (see \
+         the helper doc), got {s:?} {}",
         fmt_snapshot(&d)
     );
     ctx.log(format!("{id}: {s:?} {}", fmt_snapshot(&d)));
@@ -1463,10 +1472,11 @@ fn reg_cascade_window_named_branch_nameable() {
 /// #408 R4, non-nameable (gate branch `name_cols == None` in `build.rs` `name_mapped_cascades`): the
 /// view projects neither FK column, so no FK column reaches the projection as a bare column and the
 /// route cannot be named. The parent's DELETE, replayed from the cascade cache, therefore reaches
-/// `mark_all` — which on this unit view refreshes in place (see the helper doc), so NO whole view is
-/// counted and the view stays exact. The gate decision itself is locked by the lib test
-/// `single_alias_view_omitting_the_fk_is_not_nameable`; here it is the guard that the shape never
-/// spuriously refreshes the whole view.
+/// `mark_all` — on this unit view the in-place whole-view refresh (`dirty.all`: reads the whole view
+/// source into memory and applies it in place; see the helper doc), the arm the trace showed firing.
+/// `whole_view_refreshes` does NOT count that in-place refresh, so asserting it 0 only rules out a
+/// streamed rebuild; the leg still requires `cascade_gaps == 1` and exact convergence. The gate
+/// decision is locked by the lib test `single_alias_view_omitting_the_fk_is_not_nameable`.
 #[test]
 fn reg_cascade_window_named_branch_omits_fk() {
     scenario("reg_casc_named_omits", |ctx| async move {
@@ -1488,8 +1498,10 @@ fn reg_cascade_window_named_branch_omits_fk() {
 /// FK `eid` is carried as a bare column but the primary key is `(gid, eid)`, so `eid` is not the
 /// leading row-key prefix — the bounded `WHERE eid = <old>` read would scan the target unindexed, so
 /// the route keeps `name_cols == None`. As in [`reg_cascade_window_named_branch_omits_fk`] the replay
-/// reaches `mark_all` and refreshes in place, so `whole_view_refreshes == 0` and the view stays exact.
-/// The gate decision is locked by the lib test `non_indexed_fk_column_is_not_nameable`.
+/// reaches `mark_all` — the in-place whole-view refresh that `whole_view_refreshes` does not count
+/// (see the helper doc) — so `whole_view_refreshes == 0` is the streamed-rebuild guard only; the leg
+/// still requires `cascade_gaps == 1` with the view exact at convergence. The gate decision is locked
+/// by the lib test `non_indexed_fk_column_is_not_nameable`.
 #[test]
 fn reg_cascade_window_named_branch_fk_not_leading() {
     scenario("reg_casc_named_notlead", |ctx| async move {
