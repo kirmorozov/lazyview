@@ -26,3 +26,4 @@ soak_widen        idle_widening_refreshes_only_the_kind_readers               # 
 health            health_probe_transitions                                    # 32.6
 regressions       reg_down_target_keeps_its_keys                              # 32.4
 health            lag_idle_source_stays_zero                                  # 30.3
+health  this_test_does_not_exist_ci_ok_red_proof   # scratch: a slow-list line that matches nothing fails build-tests
