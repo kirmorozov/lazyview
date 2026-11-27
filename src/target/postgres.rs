@@ -147,7 +147,7 @@ pub(crate) fn unit_filter(
     cols: &[String],
     kinds: &[UnitKind],
 ) -> (String, Vec<Value>) {
-    let (f, params) = filter_bind(chunk, cols, kinds, &[]);
+    let (f, params) = filter_bind(chunk, cols, kinds, &[], 1);
     (
         f,
         params
@@ -163,8 +163,12 @@ pub(crate) fn unit_filter(
 /// `(predicate, parameters)` of `chunk` over `cols`: the shape of
 /// [`crate::accumulate::UnitChunk::filter_typed`] — every expression parenthesized, integer runs
 /// as `BETWEEN` ranges and inline `IN` literals, a key component that binds as NULL as an `IS NULL`
-/// literal — with `$n` placeholders numbered in statement order and **no** `CAST(? AS JSON)`: a
-/// jsonb column compares to an untyped parameter by jsonb equality.
+/// literal — with `$n` placeholders numbered from `first` in statement order and **no**
+/// `CAST(? AS JSON)`: a jsonb column compares to an untyped parameter by jsonb equality.
+///
+/// `first` is what lets one statement carry two filters (the unit filter ANDed with the whole-row
+/// match of [`delete_rows_exact`]): the second one numbers after the first, because a PostgreSQL
+/// parameter is named, not positional, and one number means one type to the server.
 ///
 /// `types[i]` is the target column of position `i`: it decides the text a key is bound as
 /// ([`param_text`], T2) and turns the zero date into the NULL the writer stored for it (D5); a
@@ -177,13 +181,14 @@ fn filter_bind(
     cols: &[String],
     _kinds: &[UnitKind],
     types: &[&MvCol],
+    first: usize,
 ) -> (String, Vec<Option<String>>) {
     if let UnitChunk::Partial(at, c) = chunk {
         // Only these positions are constrained (`src/accumulate.rs:241-248`); the callers pass one
         // column per position, so the two lists stay parallel here.
         let cols: Vec<String> = at.iter().map(|&u| cols[u].clone()).collect();
         let types: Vec<&MvCol> = at.iter().filter_map(|&u| types.get(u).copied()).collect();
-        return filter_bind(c, &cols, &[], &types);
+        return filter_bind(c, &cols, &[], &types, first);
     }
     if cols.is_empty() {
         // A view with no unit columns - the global aggregate, one unit: the whole table. An empty
@@ -204,7 +209,7 @@ fn filter_bind(
                 None => format!("{e} IS NULL"),
                 Some(t) => {
                     params.push(Some(t));
-                    format!("{e} = ${}", params.len())
+                    format!("{e} = ${}", first + params.len() - 1)
                 }
             })
             .collect()
@@ -214,7 +219,7 @@ fn filter_bind(
             .enumerate()
             .map(|(i, d)| {
                 params.push(bind_key(d, types.get(i).copied()));
-                format!("${}", params.len())
+                format!("${}", first + params.len() - 1)
             })
             .collect()
     };
@@ -1036,7 +1041,7 @@ impl PgConn {
         let (filter, bound) = match chunk {
             Some(c) => {
                 let (cols, types) = unit_cols(layout, &layout.unit_pos);
-                filter_bind(c, &cols, &layout.unit_kinds(), &types)
+                filter_bind(c, &cols, &layout.unit_kinds(), &types, 1)
             }
             None => ("TRUE".to_string(), Vec::new()),
         };
@@ -1073,12 +1078,16 @@ impl PgConn {
 
     /// Brings `table` in line with a diff in autocommit statements, no transaction (owner
     /// 2026-11-26, #331: a transaction holds every row lock until COMMIT, so parallel chunks with
-    /// overlapping keys deadlock). By row key: the upsert of inserted and changed rows, then the
-    /// DELETE of the keys that are gone, keys sorted so no two statements lock in opposite
-    /// orders; a reader never sees a hole. By unit (no row key): the unit DELETE, then the
-    /// INSERT (a reader may see a unit briefly empty, accepted). The caller saves the resume
-    /// position only after this returns, and a replay is idempotent (upsert, delete by key,
-    /// delete by unit then insert). Same statements as the transaction ran, minus BEGIN/COMMIT.
+    /// overlapping keys deadlock). By row key: the old rows of the keys the chunk replaces in
+    /// place, then the upsert of inserted and changed rows, then the DELETE of the keys that
+    /// vanished, keys sorted so no two statements lock in opposite orders. By unit (no row key):
+    /// the surplus new copies, then the surplus old copies deleted by their exact values (see
+    /// [`crate::mv::row_deletes`]) — a reader may briefly see the old and the new row of a unit
+    /// together, accepted. Both shapes keep the #399 invariant: no statement that commits on its
+    /// own may leave a unit absent from the view, because the replay from the saved position
+    /// resolves the chunk's units through the materialized rows and the source. The caller saves
+    /// the resume position only after this returns, and a replay is idempotent (upsert, delete by
+    /// key, delete by row value). Same statements as the transaction ran, minus BEGIN/COMMIT.
     /// No `@lv_tz` session dance (§0.10): the session is UTC from connect (T1.4). `began` is set
     /// where `write_diff` sets it. Called by `supervisor::write_once` on the op's own [`PgConn`]
     /// from the write pool (T5.1).
@@ -1104,21 +1113,24 @@ impl PgConn {
         if d.by_unit {
             // A keyless unit is written as a multiset and is never absent in between (the #399
             // invariant, owner ruling 2026-11-26, the same order as `crate::mv::write_tx_mysql`):
-            // the surplus new copies go in first, then the surplus old copies are deleted one
-            // per copy by their exact values. Deleting the unit first (the shape until #399)
-            // lost every unit that only a lineage lookup could reach once the lineage row
+            // the surplus new copies go in first, then the surplus old copies are deleted by
+            // their exact values (see [`crate::mv::row_deletes`]: one statement per unit, and one
+            // per value the new state keeps copies of). Deleting the unit first (the shape until
+            // #399) lost every unit that only a lineage lookup could reach once the lineage row
             // itself was gone; a reader may briefly see the old and the new row together.
             insert_rows_on(c, schema, table, layout, &d.inserts, w, false, metrics).await?;
             if !d.delete_rows.is_empty() {
-                // The cost line per chunk: the per-copy delete is the price of the order.
+                let plan = crate::mv::row_deletes(layout, w, &d.delete_rows);
+                // The cost line per chunk: the row-value deletes are the price of the order.
                 tracing::debug!(
                     table,
                     units = d.changed.len(),
                     values = d.delete_rows.len(),
+                    statements = plan.len(),
                     rows = d.deleted_rows,
                     "keyless chunk: row-value deletes after the inserts"
                 );
-                delete_rows_exact(c, schema, table, layout, &d.delete_rows, metrics).await?;
+                delete_rows_exact(c, schema, table, layout, &plan, metrics).await?;
             }
             Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
         } else {
@@ -1142,16 +1154,20 @@ impl PgConn {
                 }
                 None => &d.inserts,
             };
-            // A key with a NULL never conflicts in the unique index, so its row is not upserted
-            // but replaced: its old row goes first (after the upsert it would take the new row
-            // with it). Every other gone key is deleted after the upsert.
-            let mut gone = d.delete_keys.clone();
-            gone.sort_unstable();
-            let (nulls, gone): (Vec<Key>, Vec<Key>) = gone
-                .into_iter()
-                .partition(|k| k.iter().any(|v| matches!(v, Datum::Null)));
-            delete_keys_on(c, schema, table, layout, &nulls, w, metrics).await?;
+            // The keys the chunk replaces in place go first: a key with a NULL never conflicts
+            // in the unique index, so its row cannot be upserted — the old row has to go before
+            // the new one comes, and a key the table holds twice loses its copies the same way.
+            // Their new row carries the same identity, lineage values included, so the source
+            // half of a replay lookup still finds the unit. The keys that vanished — no new row
+            // carries them — are deleted LAST (#399): a crash between the statements leaves the
+            // old row, with its lineage, for the replay to resolve the chunk's units through.
+            // Sorted once, the one key order of #331.
+            let mut replaced = d.delete_keys.clone();
+            replaced.sort_unstable();
+            delete_keys_on(c, schema, table, layout, &replaced, w, metrics).await?;
             insert_rows_on(c, schema, table, layout, rows, w, true, metrics).await?;
+            let mut gone = d.delete_vanished.clone();
+            gone.sort_unstable();
             delete_keys_on(c, schema, table, layout, &gone, w, metrics).await?;
             Metrics::add(&metrics.mv_rows_deleted, d.deleted_rows);
         }
@@ -1233,7 +1249,7 @@ impl PgConn {
         let (f, bound) = match filter {
             MvFilter::Keys { chunk, cols: names } => {
                 let (fc, ft) = named_cols(layout, names)?;
-                filter_bind(chunk, &fc, &[], &ft)
+                filter_bind(chunk, &fc, &[], &ft, 1)
             }
             MvFilter::Presence { p, value } => (presence_marks(p, value), Vec::new()),
         };
@@ -1337,7 +1353,7 @@ async fn delete_keys_on<C: GenericClient>(
     let key_bytes = |k: &Key| 4 + k.iter().map(crate::mv::datum_bytes).sum::<usize>();
     for piece in crate::mv::batches(keys, per, w.batch_bytes, key_bytes) {
         let chunk = crate::mv::keys_chunk(piece);
-        let (f, bound) = filter_bind(&chunk, &cols, &[], &types);
+        let (f, bound) = filter_bind(&chunk, &cols, &[], &types, 1);
         let sql = format!(
             "DELETE FROM {}.{} WHERE {f}",
             quote_ident(schema),
@@ -1349,12 +1365,14 @@ async fn delete_keys_on<C: GenericClient>(
     Ok(())
 }
 
-/// Deletes the surplus old copies of a keyless chunk (see [`PgConn::write_tx`], #399): one
-/// statement per row value, the unit filter (which takes the row locks in the unit order) ANDed
-/// with the whole-row match, at most `copies` rows - a PostgreSQL `DELETE` has no `LIMIT`, so
-/// the copies are picked by `ctid` in a subselect of the same statement (one snapshot, the
-/// statement's own). The chunk's new copies are already in the table (their value differs from
-/// every value deleted here, or it would not be surplus on both sides), so the delete can only
+/// Deletes the surplus old copies of a keyless chunk (see [`PgConn::write_tx`], #399), one
+/// statement per [`crate::mv::row_deletes`] step: the unit filter (which takes the row locks in
+/// the unit order) ANDed with the whole-row match of the step's values. A step whose values the
+/// new state keeps none of needs no cap - every copy of such a value is surplus - so a unit's
+/// whole surplus is one DELETE; a value it keeps copies of stands alone, capped at its copies by
+/// picking them with `ctid` in a subselect of the same statement (a PostgreSQL `DELETE` has no
+/// `LIMIT`, and the subselect runs in the statement's own snapshot). The chunk's new copies are
+/// already in the table, and an uncapped value is one no new row carries, so the delete can only
 /// reach the old ones. A text column compares under its own collation: unlike the MySQL family
 /// (see `crate::mv::exact_conj`) PostgreSQL's default collation is case sensitive, and a value
 /// another collation deems equal is the same value to a later diff too (its rows converge).
@@ -1363,7 +1381,7 @@ async fn delete_rows_exact<C: GenericClient>(
     schema: &str,
     table: &str,
     layout: &Layout,
-    rows: &[(Vec<Datum>, u64)],
+    plan: &[crate::mv::RowDelete<'_>],
     metrics: &Metrics,
 ) -> Result<()> {
     let mut all_cols: Vec<String> = Vec::with_capacity(layout.cols.len());
@@ -1372,36 +1390,44 @@ async fn delete_rows_exact<C: GenericClient>(
         all_cols.push(quote_ident(&col.name));
         all_types.push(col);
     }
-    for (datums, copies) in rows {
+    for step in plan {
         let (assist, mut bound) = if layout.unit_pos.is_empty() {
             ("TRUE".to_string(), Vec::new())
         } else {
-            let uk: Key = layout
-                .unit_pos
-                .iter()
-                .map(|&pp| datums[pp].clone())
-                .collect();
             let (cols, types) = unit_cols(layout, &layout.unit_pos);
             filter_bind(
-                &UnitChunk::Keys(vec![uk]),
+                &UnitChunk::Keys(vec![step.unit.clone()]),
                 &cols,
                 &layout.write_kinds(&layout.unit_pos),
                 &types,
+                1,
             )
         };
-        let (exact, ep) = filter_bind(
-            &UnitChunk::Keys(vec![datums.clone().into_boxed_slice()]),
-            &all_cols,
-            &[],
-            &all_types,
-        );
-        bound.extend(ep);
+        // One statement, one numbering: the whole-row matches continue after the unit filter,
+        // because one `$n` is one parameter to the server, with one type.
+        let mut exact: Vec<String> = Vec::with_capacity(step.rows.len());
+        for s in &step.rows {
+            let (e, ep) = filter_bind(
+                &UnitChunk::Keys(vec![s.row.clone().into_boxed_slice()]),
+                &all_cols,
+                &[],
+                &all_types,
+                bound.len() + 1,
+            );
+            exact.push(format!("({e})"));
+            bound.extend(ep);
+        }
+        let limit = step
+            .limit
+            .map(|n| format!(" LIMIT {n}"))
+            .unwrap_or_default();
         let sql = format!(
-            "DELETE FROM {}.{} WHERE ctid IN (SELECT ctid FROM {}.{} WHERE ({assist}) AND ({exact}) LIMIT {copies})",
+            "DELETE FROM {}.{} WHERE ctid IN (SELECT ctid FROM {}.{} WHERE ({assist}) AND ({}){limit})",
             quote_ident(schema),
             quote_ident(table),
             quote_ident(schema),
-            quote_ident(table)
+            quote_ident(table),
+            exact.join(" OR ")
         );
         exec(c, &sql, bound).await?;
         Metrics::add(&metrics.mv_queries, 1);
@@ -2455,7 +2481,7 @@ mod tests {
         let ts = col("_lv_u1", "datetime", "datetime(6)");
         let types: Vec<&MvCol> = vec![&id, &day];
         let ints = UnitChunk::Ints(vec![1, 2, 3, 4, 9, 10]);
-        let (f, p) = filter_bind(&ints, &cols, &[], &types);
+        let (f, p) = filter_bind(&ints, &cols, &[], &types, 1);
         assert_eq!(
             f,
             "((\"_lv_u0\") BETWEEN 1 AND 4 OR (\"_lv_u0\") IN (9,10))"
@@ -2466,7 +2492,7 @@ mod tests {
             vec![Datum::Int(1), Datum::Date(2024, 2, 29, 0, 0, 0, 0)].into_boxed_slice(),
             vec![Datum::Int(2), Datum::Date(2024, 2, 29, 0, 0, 0, 0)].into_boxed_slice(),
         ]);
-        let (f, p) = filter_bind(&keys, &cols, &[], &types);
+        let (f, p) = filter_bind(&keys, &cols, &[], &types, 1);
         assert_eq!(f, "((\"_lv_u0\"), (\"_lv_u1\")) IN (($1,$2),($3,$4))");
         assert_eq!(
             p,
@@ -2484,7 +2510,7 @@ mod tests {
             Datum::Date(2020, 1, 2, 3, 4, 5, 6),
         ]
         .into_boxed_slice()]);
-        let (f, p) = filter_bind(&one, &cols, &[], &types);
+        let (f, p) = filter_bind(&one, &cols, &[], &types, 1);
         assert_eq!(f, "((\"_lv_u0\") = $1 AND (\"_lv_u1\") = $2)");
         assert_eq!(
             p,
@@ -2495,7 +2521,7 @@ mod tests {
         let nulls = UnitChunk::Keys(vec![
             vec![Datum::Null, Datum::Date(0, 0, 0, 0, 0, 0, 0)].into_boxed_slice()
         ]);
-        let (f, p) = filter_bind(&nulls, &cols, &[], &types);
+        let (f, p) = filter_bind(&nulls, &cols, &[], &types, 1);
         assert_eq!(f, "((\"_lv_u0\") IS NULL AND (\"_lv_u1\") IS NULL)");
         assert!(p.is_empty(), "{p:?}");
 
@@ -2506,7 +2532,7 @@ mod tests {
                 vec![vec![Datum::Int(5)].into_boxed_slice()],
             )),
         );
-        let (f, p) = filter_bind(&part, &cols, &[], &types);
+        let (f, p) = filter_bind(&part, &cols, &[], &types, 1);
         assert_eq!(f, "((\"_lv_u0\") = $1)");
         assert_eq!(p, vec![Some("5".into())]);
 
@@ -2521,6 +2547,51 @@ mod tests {
                 Value::Bytes(b"2020-01-02 03:04:05.000006".to_vec())
             ]
         );
+    }
+
+    /// The keyless delete of #399 puts the unit filter AND the whole-row match of two values in
+    /// one statement, so the second filter has to number after the first: one `$n` is one
+    /// parameter to the server, with one type, and reusing a number is the
+    /// `operator does not exist: bigint = text` that left a chunk retrying forever.
+    #[test]
+    fn composed_filters_number_their_parameters_once() {
+        let unit = col("_lv_u0", "text", "text");
+        let n = col("n", "bigint", "bigint");
+        let s = col("s", "varchar", "varchar(10)");
+        let unit_cols: Vec<String> = vec!["\"_lv_u0\"".into()];
+        let all_cols: Vec<String> = vec!["\"n\"".into(), "\"s\"".into(), "\"_lv_u0\"".into()];
+        let types: Vec<&MvCol> = vec![&n, &s, &unit];
+        let (assist, mut bound) = filter_bind(
+            &UnitChunk::Keys(vec![vec![Datum::Bytes(b"a".to_vec())].into_boxed_slice()]),
+            &unit_cols,
+            &[],
+            &[&unit],
+            1,
+        );
+        assert_eq!(assist, "((\"_lv_u0\") = $1)");
+        let mut parts: Vec<String> = Vec::new();
+        for i in 1..=2i64 {
+            let (e, ep) = filter_bind(
+                &UnitChunk::Keys(vec![vec![
+                    Datum::Int(i),
+                    Datum::Bytes(b"x".to_vec()),
+                    Datum::Bytes(b"a".to_vec()),
+                ]
+                .into_boxed_slice()]),
+                &all_cols,
+                &[],
+                &types,
+                bound.len() + 1,
+            );
+            parts.push(format!("({e})"));
+            bound.extend(ep);
+        }
+        assert_eq!(
+            parts.join(" OR "),
+            "(((\"n\") = $2 AND (\"s\") = $3 AND (\"_lv_u0\") = $4)) OR \
+             (((\"n\") = $5 AND (\"s\") = $6 AND (\"_lv_u0\") = $7))"
+        );
+        assert_eq!(bound.len(), 7, "one parameter per value and column, once");
     }
 
     #[test]

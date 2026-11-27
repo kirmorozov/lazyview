@@ -707,39 +707,44 @@ async fn delete_vanished_keys<C: Queryable>(
     Ok(())
 }
 
-/// Deletes the surplus old copies of a keyless chunk (see [`write_tx_mysql`], #399): one
-/// statement per row value, the unit filter (which takes the row locks in the unit order and
-/// uses the unit index) ANDed with the byte-exact whole-row match of [`exact_conj`], at most
-/// `copies` rows — one row per copy, so duplicates go as a multiset. The chunk's new copies are
-/// already in the table (their value differs byte for byte from every value deleted here, or it
-/// would not be surplus on both sides), so the delete can only reach the old ones.
+/// Deletes the surplus old copies of a keyless chunk (see [`write_tx_mysql`], #399), one
+/// statement per [`row_deletes`] step: the unit filter (which takes the row locks in the unit
+/// order and uses the unit index) ANDed with the byte-exact whole-row match of [`exact_conj`]
+/// of the step's values, capped by `LIMIT` only where the new state keeps copies of a value.
+/// The chunk's new copies are already in the table, and a value deleted uncapped is one no new
+/// row carries, so the delete can only reach the old ones.
 async fn delete_rows_exact<C: Queryable>(
     conn: &mut C,
     schema: &str,
     table: &str,
     layout: &Layout,
-    rows: &[(Vec<Datum>, u64)],
+    plan: &[RowDelete<'_>],
     metrics: &Metrics,
 ) -> Result<()> {
     let all: Vec<usize> = (0..layout.cols.len()).collect();
-    for (datums, copies) in rows {
+    for step in plan {
         let (assist, mut p) = if layout.unit_pos.is_empty() {
             ("TRUE".to_string(), Vec::new())
         } else {
-            let uk: Key = layout
-                .unit_pos
-                .iter()
-                .map(|&pp| datums[pp].clone())
-                .collect();
-            UnitChunk::Keys(vec![uk]).filter_typed(&layout.unit_cols(), &layout.unit_kinds())
+            UnitChunk::Keys(vec![step.unit.clone()])
+                .filter_typed(&layout.unit_cols(), &layout.unit_kinds())
         };
-        let (exact, ep) = exact_conj(layout, &all, datums);
-        p.extend(ep);
+        let mut exact: Vec<String> = Vec::with_capacity(step.rows.len());
+        for s in &step.rows {
+            let (e, ep) = exact_conj(layout, &all, &s.row);
+            exact.push(format!("({e})"));
+            p.extend(ep);
+        }
+        let limit = step
+            .limit
+            .map(|c| format!(" LIMIT {c}"))
+            .unwrap_or_default();
         conn.exec_drop(
             format!(
-                "DELETE FROM {}.{} WHERE ({assist}) AND ({exact}) LIMIT {copies}",
+                "DELETE FROM {}.{} WHERE ({assist}) AND ({}){limit}",
                 q(schema),
-                q(table)
+                q(table),
+                exact.join(" OR ")
             ),
             p,
         )
@@ -1453,9 +1458,9 @@ pub struct Diff {
     /// Row keys that vanished (no new row carries them), deleted after the upserts (#399).
     pub delete_vanished: Vec<Key>,
     /// Surplus old rows of a keyless diff, deleted after the inserts: per row value equal to
-    /// neither an old nor a new copy in full, the whole-row datums and the copies to delete
-    /// (multiset, one row per copy, see [`write_tx_mysql`]).
-    pub delete_rows: Vec<(Vec<Datum>, u64)>,
+    /// neither an old nor a new copy in full, its whole-row datums, the copies to delete and the
+    /// copies the new state keeps (multiset, one row per copy, see [`write_tx_mysql`]).
+    pub delete_rows: Vec<Surplus>,
     /// Old rows deleted.
     pub deleted_rows: u64,
     /// Of `inserts`, rows that replace the old row of their row key in place.
@@ -1466,6 +1471,99 @@ pub struct Diff {
     pub inserts: Vec<Vec<Value>>,
     /// Rows compared (old + new), for statistics.
     pub compared: usize,
+}
+
+/// One surplus old row value of a keyless chunk (see [`write_tx_mysql`], #399): what the unit
+/// loses when it is rewritten as a multiset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Surplus {
+    /// The row's values for every column of the layout, the hidden unit and lineage columns
+    /// included: the byte-exact match of the delete, and where the unit filter reads from.
+    pub row: Vec<Datum>,
+    /// Old copies beyond the new ones: the rows of this value that go.
+    pub copies: u64,
+    /// Copies of this value the new state keeps. `0` says no new row carries it, so the delete
+    /// may take every copy and one statement can cover a whole unit's values (see
+    /// [`row_deletes`]).
+    pub keeps: u64,
+}
+
+/// One statement of the keyless surplus delete (see [`row_deletes`]): the unit's whole values
+/// (empty for a global aggregate, whose one unit is the whole table), the row values it deletes,
+/// and the cap when one is needed.
+pub(crate) struct RowDelete<'a> {
+    pub(crate) unit: Key,
+    pub(crate) rows: Vec<&'a Surplus>,
+    pub(crate) limit: Option<u64>,
+}
+
+/// The plan of the surplus deletes of a keyless chunk (see [`write_tx_mysql`] and
+/// `crate::target::postgres::PgConn::write_tx`), one [`RowDelete`] per statement:
+///
+/// * the values no new row carries (`keeps == 0`) share one statement per unit: every copy of
+///   such a value is surplus, so no cap is needed and the unit's whole surplus is one DELETE,
+///   bounded by the parameter budget the way [`delete_vanished_keys`] bounds its own;
+/// * a value the new state keeps copies of stands alone, capped at its copies: the statement has
+///   to leave `keeps` copies in the table, and one cap cannot say that per value.
+///
+/// Statements run in the unit order of `Diff::delete_rows` and each takes the rows of one unit,
+/// so two chunks that touch the same units queue their locks in the one order of #331.
+pub(crate) fn row_deletes<'a>(
+    layout: &Layout,
+    w: &WriteOpts,
+    rows: &'a [Surplus],
+) -> Vec<RowDelete<'a>> {
+    // A row value binds one parameter per column, up to three for the hour-widening of a
+    // TIMESTAMP of a local-time session (see [`exact_conj`]), so a row budgets three.
+    let per = (MAX_PARAMS / (3 * layout.cols.len().max(1))).max(1);
+    let row_bytes = |s: &Surplus| 4 + s.row.iter().map(datum_bytes).sum::<usize>();
+    let same_unit =
+        |a: &Surplus, b: &Surplus| layout.unit_pos.iter().all(|&p| a.row[p] == b.row[p]);
+    let mut out: Vec<RowDelete<'a>> = Vec::new();
+    let mut at = 0;
+    while at < rows.len() {
+        // `diff` sorted the surplus by unit first, so a unit's values are one run.
+        let mut end = at + 1;
+        while end < rows.len() && same_unit(&rows[at], &rows[end]) {
+            end += 1;
+        }
+        let group = &rows[at..end];
+        let unit: Key = layout
+            .unit_pos
+            .iter()
+            .map(|&p| group[0].row[p].clone())
+            .collect();
+        // In the sorted order of the group: each value the new state keeps copies of is one
+        // statement of its own, a run of values it keeps none of shares statements by budget.
+        let mut i = 0;
+        while i < group.len() {
+            if group[i].keeps > 0 {
+                out.push(RowDelete {
+                    unit: unit.clone(),
+                    rows: vec![&group[i]],
+                    limit: Some(group[i].copies),
+                });
+                i += 1;
+                continue;
+            }
+            let mut stop = i + 1;
+            while stop < group.len() && group[stop].keeps == 0 {
+                stop += 1;
+            }
+            out.extend(
+                batches(&group[i..stop], per, w.batch_bytes, row_bytes)
+                    .into_iter()
+                    .map(|piece| RowDelete {
+                        unit: unit.clone(),
+                        rows: piece.iter().collect(),
+                        limit: None,
+                    }),
+            );
+            i = stop;
+        }
+        at = end;
+    }
+    out
 }
 
 /// Current MV rows of the units in `chunk` (all rows when `None`).
@@ -1560,17 +1658,22 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
                 for r in &n {
                     counts.entry(&r.0).or_default().1 += 1;
                 }
-                let mut surplus: Vec<(&Vec<Datum>, usize)> = counts
+                let mut surplus: Vec<(&Vec<Datum>, usize, usize)> = counts
                     .iter()
                     .filter_map(|(v, (oc, nc))| {
                         d.unchanged_rows += (*oc).min(*nc) as u64;
-                        (*oc > *nc).then(|| (*v, oc - nc))
+                        (*oc > *nc).then(|| (*v, oc - nc, *nc))
                     })
                     .collect();
-                surplus.sort_unstable_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
-                for (v, copies) in surplus {
+                surplus
+                    .sort_unstable_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+                for (v, copies, keeps) in surplus {
                     d.deleted_rows += copies as u64;
-                    d.delete_rows.push((v.clone(), copies as u64));
+                    d.delete_rows.push(Surplus {
+                        row: v.clone(),
+                        copies: copies as u64,
+                        keeps: keeps as u64,
+                    });
                 }
                 // The surplus new copies, in the new rows' own order.
                 let mut left: HashMap<&Vec<Datum>, usize> = counts
@@ -1604,7 +1707,16 @@ pub fn diff(layout: &Layout, old: Vec<Vec<Value>>, new: &Prepared) -> Diff {
     d.inserts = ins.iter().map(|r| r.1.clone()).collect();
     d.delete_keys.sort_unstable();
     d.delete_vanished.sort_unstable();
-    d.delete_rows.sort_unstable();
+    // The same unit-first order for the surplus deletes, so [`row_deletes`] sees one unit per
+    // run and its statements take their locks in that order.
+    d.delete_rows.sort_unstable_by(|a, b| {
+        order
+            .iter()
+            .map(|&p| a.row[p].cmp(&b.row[p]))
+            .find(|o| o.is_ne())
+            .unwrap_or_else(|| a.row.cmp(&b.row))
+            .then(a.copies.cmp(&b.copies))
+    });
     d.changed.sort_unstable();
     d
 }
@@ -1742,15 +1854,18 @@ async fn write_tx_mysql(
         // lineage row itself was gone.
         insert_rows(tx, schema, table, layout, &d.inserts, w, false, metrics).await?;
         if !d.delete_rows.is_empty() {
-            // The cost line per chunk: the per-copy delete is the price of the order.
+            let plan = row_deletes(layout, w, &d.delete_rows);
+            // The cost line per chunk: the row-value deletes are the price of the order, and
+            // one statement per unit (not per value) is what keeps it at the chunk's size.
             tracing::debug!(
                 table,
                 units = d.changed.len(),
                 values = d.delete_rows.len(),
+                statements = plan.len(),
                 rows = d.deleted_rows,
                 "keyless chunk: row-value deletes after the inserts"
             );
-            delete_rows_exact(tx, schema, table, layout, &d.delete_rows, metrics).await?;
+            delete_rows_exact(tx, schema, table, layout, &plan, metrics).await?;
         }
     } else {
         // Keyed: the keys the diff replaces in place (a NULL in them, or the table holding them
@@ -2554,7 +2669,10 @@ mod tests {
         let d = diff(&l3, old.clone(), &prepare(&l3, new));
         assert!(d.by_unit && d.delete_keys.is_empty() && d.delete_rows.len() == 1);
         assert_eq!((d.inserts.len(), d.deleted_rows), (1, 1));
-        assert_eq!(d.delete_rows[0].1, 1, "one copy of the old row value goes");
+        assert_eq!(
+            d.delete_rows[0].copies, 1,
+            "one copy of the old row value goes"
+        );
     }
 
     /// A keyless diff (#399) is a multiset per unit: rows both sides hold in equal copies are
@@ -2588,7 +2706,12 @@ mod tests {
         assert_eq!(d.deleted_rows, 1);
         assert_eq!(
             d.delete_rows,
-            vec![(vec![Datum::Int(1), Datum::Bytes(b"b".to_vec())], 1)]
+            vec![Surplus {
+                row: vec![Datum::Int(1), Datum::Bytes(b"b".to_vec())],
+                copies: 1,
+                // The new state holds one copy of `b`, so the delete is capped at one row.
+                keeps: 1,
+            }]
         );
         assert_eq!(d.unchanged_rows, 3);
         // An identical rewrite writes nothing at all.
@@ -2600,6 +2723,15 @@ mod tests {
         let d = diff(&l, vec![row(2, "x")], &prepare(&l, vec![]));
         assert_eq!(d.deleted_rows, 1);
         assert_eq!(d.delete_rows.len(), 1);
+        assert_eq!(
+            d.delete_rows[0],
+            Surplus {
+                row: vec![Datum::Int(2), Datum::Bytes(b"x".to_vec())],
+                copies: 1,
+                // Nothing keeps this value: the delete needs no cap and shares a statement.
+                keeps: 0,
+            }
+        );
         assert!(d.inserts.is_empty());
     }
 
@@ -2629,7 +2761,7 @@ mod tests {
         assert_eq!(
             d.delete_rows
                 .iter()
-                .map(|(k, _)| k[0].clone())
+                .map(|s| s.row[0].clone())
                 .collect::<Vec<_>>(),
             vec![Datum::Int(1), Datum::Int(2)]
         );
@@ -2637,6 +2769,83 @@ mod tests {
             d.inserts.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
             vec![Value::Int(1), Value::Int(2)]
         );
+    }
+
+    /// The plan of the keyless surplus deletes (#399): the values no new row carries share one
+    /// statement per unit (every copy of them is surplus, so no cap is needed), while a value the
+    /// new state keeps copies of needs its own statement, capped at its copies. One unit's rows
+    /// are one statement's locks, so the statements of two units keep the unit order of #331, and
+    /// the batch budget splits a unit's values without ever crossing to the next unit.
+    #[test]
+    fn keyless_surplus_deletes_are_one_statement_per_unit() {
+        let l = {
+            let mut l = layout(
+                vec![col("g", "int", "int", None), col("v", "int", "int", None)],
+                2,
+                vec![0],
+                false,
+            );
+            l.identity = vec![];
+            l
+        };
+        let w = WriteOpts::for_server(
+            Kind::Mysql,
+            "8.4.11",
+            64 << 20,
+            500,
+            DEFAULT_WRITE_BATCH_BYTES,
+        );
+        let s = |g: i64, v: i64, copies: u64, keeps: u64| Surplus {
+            row: vec![Datum::Int(g), Datum::Int(v)],
+            copies,
+            keeps,
+        };
+        // Unit 1: three values no new row carries, then one the new state keeps a copy of; unit 2:
+        // one value of its own.
+        let rows = vec![
+            s(1, 10, 1, 0),
+            s(1, 11, 1, 0),
+            s(1, 12, 1, 0),
+            s(1, 13, 2, 1),
+            s(2, 20, 1, 0),
+        ];
+        let plan = row_deletes(&l, &w, &rows);
+        assert_eq!(
+            plan.len(),
+            3,
+            "one uncapped statement per unit, plus the capped value's own"
+        );
+        assert_eq!(plan[0].unit, Key::from([Datum::Int(1)]));
+        assert_eq!(plan[0].rows.len(), 3);
+        assert_eq!(plan[0].limit, None, "no new row carries these values");
+        assert_eq!(plan[1].rows.len(), 1);
+        assert_eq!(
+            plan[1].limit,
+            Some(2),
+            "the new state keeps a copy: capped at its copies"
+        );
+        assert_eq!(plan[2].unit, Key::from([Datum::Int(2)]));
+        assert_eq!(plan[2].rows.len(), 1);
+        assert_eq!(plan[2].limit, None);
+        // The budget splits a big unit into several statements, never across units.
+        let many: Vec<Surplus> = (0..200).map(|i| s(1 + i / 100, i, 1, 0)).collect();
+        let tight = WriteOpts {
+            batch_bytes: 64,
+            ..w
+        };
+        let plan = row_deletes(&l, &tight, &many);
+        assert!(plan.len() > 2, "a 64-byte statement budget splits it");
+        assert_eq!(plan.iter().map(|st| st.rows.len()).sum::<usize>(), 200);
+        assert!(
+            plan.windows(2).all(|p| p[0].unit <= p[1].unit),
+            "the statements go in the unit order"
+        );
+        for st in &plan {
+            assert!(
+                st.rows.iter().all(|s| s.row[0] == st.unit[0]),
+                "one unit per statement"
+            );
+        }
     }
 
     /// #331: the write order does not depend on the order the rows were read in, also for a view
