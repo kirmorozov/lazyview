@@ -269,8 +269,14 @@ has "$OUT/prom-on.yaml" 'path: /metrics'
 has "$OUT/prom-on.yaml" 'interval: 30s'
 has "$OUT/prom-on.yaml" 'scrapeTimeout: 10s'
 has "$OUT/prom-on.yaml" 'app.kubernetes.io/component: metrics'
+# Every alert deploy/k8s/components/prometheus/prometheusrule.yaml ships must be named here: the
+# chart is the path of record, so a rule the chart drops silently is an alert an operator loses when
+# they move from the kustomize manifests to it (main added the six stall-state rules of review
+# O-01/O-02 after the chart was written, and the render check did not notice).
 for alert in LazyviewDown LazyviewUnavailable LazyviewNotScraped LazyviewNotStreaming \
-             LazyviewViewsInError LazyviewViewsNotLive LazyviewRefreshFailing LazyviewRefreshErrors; do
+             LazyviewViewsInError LazyviewViewsNotLive LazyviewRefreshFailing LazyviewRefreshErrors \
+             LazyviewViewBehindSource LazyviewBinlogReadingPaused LazyviewBinlogReadingStuck \
+             LazyviewTargetBehind LazyviewViewMetricAbsent LazyviewStreamUndecodable; do
   has "$OUT/prom-on.yaml" "alert: ${alert}$"
 done
 # The Prometheus templating of the rules survived the chart ({{ $labels.job }} is literal text).

@@ -296,8 +296,11 @@ prometheus:
   rules:
     # -- The alert rules of components/prometheus (LazyviewDown, LazyviewUnavailable,
     # LazyviewNotScraped, LazyviewNotStreaming, LazyviewViewsInError, LazyviewViewsNotLive,
-    # LazyviewRefreshFailing, LazyviewRefreshErrors). They alert on what the probes deliberately
-    # ignore, because a restart would not fix those.
+    # LazyviewRefreshFailing, LazyviewRefreshErrors, LazyviewViewBehindSource,
+    # LazyviewBinlogReadingPaused, LazyviewBinlogReadingStuck, LazyviewTargetBehind,
+    # LazyviewViewMetricAbsent, LazyviewStreamUndecodable). They alert on what the probes
+    # deliberately ignore, because a restart would not fix those. They are the same set the
+    # kustomize component ships, and the render check fails on any rule the chart drops.
     enabled: true
     # -- Set to your own rule groups (PrometheusRule spec.groups) to replace the shipped ones.
     # Leave empty to get the chart's own defaults, which select on this release's names.
