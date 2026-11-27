@@ -477,6 +477,194 @@ fn reg_crash_between_a_chunks_statements_keeps_its_units() {
     });
 }
 
+/// R4 on the #399 fix: which views the arm `rows_identified` gained (a joined table whose whole
+/// row key is one of the columns the unit is read from) routes to the keyed chunk write, over the
+/// shop workload of `tests/common`. Every keyed shape is the same join written an equivalent way:
+/// the equality in ON or in WHERE (a comma join), `=` or `IN (x)` with either side first, the
+/// joined table's id renamed or not selected at all, the alias reached by two and three hops, and
+/// the unit's own key INT, BIGINT, UNSIGNED or composite. A shape the arm identifies is
+/// materialized with the unique `_lv_row` index the keyed write upserts by, which is what
+/// `Layout::row_key()` reports: its deletes go by row key (`Diff::delete_vanished`, whose own
+/// rows are pinned by the diff tests in `crate::mv`) and its `Diff::delete_rows` stays empty; a
+/// shape it does not identify is rewritten per unit with no such index. Both routes must converge
+/// on the same rows through the same inserts, updates and deletes.
+#[test]
+fn reg_the_unit_a_joined_table_carries_routes_the_keyed_write() {
+    scenario("reg_unit_route", |ctx| async move {
+        let ddl = [
+            "ALTER TABLE customers ADD COLUMN region_id INT NULL",
+            "ALTER TABLE customers ADD COLUMN referrer_id INT NULL",
+            "CREATE TABLE regions (id INT PRIMARY KEY, name VARCHAR(30) NOT NULL, parent_id INT NULL)",
+            "INSERT INTO regions VALUES (1, 'north', NULL), (2, 'south', 1)",
+            "UPDATE customers SET region_id = 1, referrer_id = 2 WHERE id = 1",
+            "UPDATE customers SET region_id = 2 WHERE id = 2",
+            // One row per order, keyed by the order's own id: the unit IS the alias's row key.
+            "CREATE TABLE marks (id BIGINT PRIMARY KEY, order_id BIGINT NOT NULL, \
+             label VARCHAR(20), KEY (order_id))",
+            "INSERT INTO marks VALUES (10, 10, 'm10'), (11, 11, 'm11'), (13, 13, 'm13')",
+            // Several rows per order, and an UNSIGNED key of its own.
+            "CREATE TABLE tags (id INT UNSIGNED PRIMARY KEY, order_id BIGINT NOT NULL, \
+             label VARCHAR(20), KEY (order_id))",
+            "INSERT INTO tags VALUES (100, 10, 'a'), (101, 10, 'b'), (102, 11, 'c')",
+            // A composite key, only one column of which the order's id can be.
+            "CREATE TABLE parts (order_id BIGINT NOT NULL, seq INT NOT NULL, v INT NOT NULL, \
+             PRIMARY KEY (order_id, seq))",
+            "INSERT INTO parts VALUES (10, 1, 5), (10, 2, 6), (11, 1, 7)",
+            // No key at all.
+            "CREATE TABLE notes (order_id BIGINT NOT NULL, body VARCHAR(20))",
+            "INSERT INTO notes VALUES (10, 'n1'), (10, 'n2'), (12, 'n3')",
+        ];
+        let specs = vec![
+            // Identified by the unit: the joined table's row key is the unit's own column.
+            ViewSpec::new(
+                "r_rt_on",
+                Kind::Incremental,
+                "SELECT o.id, o.status, c.name FROM orders o \
+                 LEFT JOIN customers c ON c.id = o.customer_id",
+            ),
+            // ... the equality in WHERE instead of ON (a comma join), ...
+            ViewSpec::new(
+                "r_rt_where",
+                Kind::Incremental,
+                "SELECT o.id, o.status, c.name FROM orders o, customers c WHERE c.id = o.customer_id",
+            ),
+            // ... `IN (x)` with the sides swapped, and the id renamed, ...
+            ViewSpec::new(
+                "r_rt_in",
+                Kind::Incremental,
+                "SELECT o.id AS k, o.status, c.name FROM orders o \
+                 LEFT JOIN customers c ON o.customer_id IN (c.id)",
+            ),
+            // ... and the unit's column not selected at all.
+            ViewSpec::new(
+                "r_rt_unselected",
+                Kind::Incremental,
+                "SELECT o.status, c.name FROM orders o \
+                 LEFT JOIN customers c ON c.id = o.customer_id",
+            ),
+            // Reached by two and three hops from the unit: the customer, its region, its parent.
+            ViewSpec::new(
+                "r_rt_hops",
+                Kind::Incremental,
+                "SELECT o.id, c.name AS cname, r.name AS rname, p.name AS pname FROM orders o \
+                 LEFT JOIN customers c ON c.id = o.customer_id \
+                 LEFT JOIN regions r ON r.id = c.region_id \
+                 LEFT JOIN regions p ON p.id = r.parent_id",
+            ),
+            // The unit's key as BIGINT (the marks row of the order), UNSIGNED and composite: the
+            // first table's own row key decides the unit, these three carry it as their row key.
+            ViewSpec::new(
+                "r_rt_bigint",
+                Kind::Incremental,
+                "SELECT o.id, o.status, m.label FROM orders o LEFT JOIN marks m ON m.id = o.id",
+            ),
+            ViewSpec::new(
+                "r_rt_unsigned",
+                Kind::Incremental,
+                "SELECT t.id, t.label, o.status FROM tags t JOIN orders o ON o.id = t.order_id",
+            ),
+            ViewSpec::new(
+                "r_rt_composite",
+                Kind::Incremental,
+                "SELECT pt.order_id, pt.seq, pt.v, o.status FROM parts pt \
+                 JOIN orders o ON o.id = pt.order_id",
+            ),
+            // Not identified: several rows of the joined table per unit, so its row key is not the
+            // unit's column ...
+            ViewSpec::new(
+                "r_rt_many",
+                Kind::Incremental,
+                "SELECT o.id, o.status, t.label FROM orders o LEFT JOIN tags t ON t.order_id = o.id",
+            ),
+            // ... a composite row key with the column the unit does not carry ...
+            ViewSpec::new(
+                "r_rt_partial",
+                Kind::Incremental,
+                "SELECT o.id, o.status, pt.v FROM orders o LEFT JOIN parts pt ON pt.order_id = o.id",
+            ),
+            // ... and a table without a row key at all.
+            ViewSpec::new(
+                "r_rt_keyless",
+                Kind::Incremental,
+                "SELECT o.id, o.status, n.body FROM orders o LEFT JOIN notes n ON n.order_id = o.id",
+            ),
+        ];
+        let (db, mut eng) = setup(&ctx, "reg_unit_route", &ddl, &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        verify(&ctx, &mut eng, &db, &specs, "initial").await?;
+        for name in [
+            "r_rt_on",
+            "r_rt_where",
+            "r_rt_in",
+            "r_rt_unselected",
+            "r_rt_hops",
+            "r_rt_bigint",
+            "r_rt_unsigned",
+            "r_rt_composite",
+        ] {
+            let got = row_index(&mut c, name).await?;
+            ensure!(
+                got.is_some(),
+                "{name}: expected the keyed route (a unique _lv_row index to upsert by and \
+                 delete vanished rows by key), got none"
+            );
+        }
+        for name in ["r_rt_many", "r_rt_partial", "r_rt_keyless"] {
+            let got = row_index(&mut c, name).await?;
+            ensure!(
+                got.is_none(),
+                "{name}: expected the keyless route (no _lv_row, changed units rewritten), \
+                 got {got:?}"
+            );
+        }
+        // The same writes on both routes: a unit that gains and loses a row, a row whose joined
+        // side vanishes, a whole unit that vanishes (the keyed route deletes it by key, the
+        // keyless one as a surplus row value), and new units in every table.
+        exec_all(
+            &mut c,
+            &[
+                "UPDATE orders SET customer_id = 2 WHERE id = 10",
+                "UPDATE customers SET name = 'ann2' WHERE id = 1",
+                "UPDATE marks SET label = 'ten' WHERE id = 10",
+                "DELETE FROM tags WHERE id = 102",
+                "UPDATE parts SET v = 42 WHERE order_id = 10 AND seq = 1",
+                "DELETE FROM parts WHERE order_id = 11",
+                "DELETE FROM notes WHERE order_id = 12",
+                "DELETE FROM customers WHERE id = 3",
+                "INSERT INTO orders (id, customer_id, status) VALUES (14, NULL, 'new')",
+                "INSERT INTO tags (id, order_id, label) VALUES (105, 14, 'late')",
+                "INSERT INTO parts (order_id, seq, v) VALUES (11, 2, 8)",
+                "INSERT INTO notes VALUES (14, 'n4')",
+            ],
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "after inserts, updates and deletes",
+        )
+        .await?;
+        eng.stop().await
+    });
+}
+
+/// The unique row index of a materialized view (`_lv_row`, what `Layout::row_key()` upserts and
+/// deletes by), as its column list; `None` says the table has none and is written per unit.
+async fn row_index(c: &mut mysql_async::Conn, view: &str) -> Result<Option<String>> {
+    scalar(
+        c,
+        &format!(
+            "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} AND INDEX_NAME = '_lv_row' \
+               AND NON_UNIQUE = 0",
+            q(view)
+        ),
+    )
+    .await
+}
+
 /// A server identity that cannot be read keeps the resume guard: the read is repeated and the
 /// saved position refused (it used to read as `""`, leaving the "written by another server"
 /// check off for the whole run). A cursor that carries its GTID set is decided by the adoption
