@@ -1262,6 +1262,97 @@ fn reg_cascade_window_parent_delete() {
     });
 }
 
+/// Restart gap, a CASCADE delete whose children the view CAN name from the materialized table
+/// (issue #408): the parent is deleted while the engine is stopped, so the resume replays it from
+/// before the startup seed and the cache counts a gap. The storage engine deleted the children with
+/// it, so the cache's lookup under the parent's key hits nothing and the seed never held them. But
+/// the view carries the child's FK value in a materialized column, so the vanished children's units
+/// are named by ONE bounded read of the materialized table instead of `mark_all`: the view is exact
+/// at convergence and the incremental view never falls back to a whole-view refresh
+/// (`whole_view_refreshes == 0`).
+///
+/// The MAP route is `^entities:map` (`entities` is the cascade's parent and no alias of the view);
+/// its child `links` is read by the view and its FK `eid` is a selected column, so every materialized
+/// row a child under `entities` contributes to carries that child's FK value (the plan fact of the
+/// cascade map, issue #408), and no cascade continues out of `links`.
+#[test]
+fn reg_cascade_window_parent_delete_named() {
+    scenario("reg_casc_win_del_named", |ctx| async move {
+        let mut ddl: Vec<String> = vec![
+            "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)"
+                .into(),
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (gid, eid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))"
+                .into(),
+        ];
+        ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into());
+        ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into());
+        ddl.push("INSERT INTO links VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into());
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        // A child-only style view: it reads `links` and selects the FK `eid`, so the vanished
+        // children's units (the `links` primary keys) are nameable from the materialized table.
+        let specs = vec![ViewSpec::new(
+            "r_win_del_named",
+            Kind::Incremental,
+            "SELECT l.gid, l.eid, l.pos FROM links l",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_casc_win_del_named", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // `links (3, 6)` is the only row under entity 6: deleting that parent must drop it.
+        eng.stop().await?;
+        // Both the parent delete and the ON DELETE CASCADE that removed links (3, 6) sit inside
+        // the replay window: the startup seed read the row already gone.
+        exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 6"]).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        let f0 = eng.snapshot();
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // /stats is published at the end of a flush; nothing else writes after the resume, so wait
+        // for the periodic flush (position save, 5 s) to publish the gap of the replay.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let _s = loop {
+            if let Some(s) = eng.view_stats(&db, "r_win_del_named") {
+                if s.cascade_gaps >= 1 {
+                    break s;
+                }
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "the replayed parent delete was never counted as a gap in /stats within 15 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        // Nothing was written since the resume: the row under the deleted parent is gone at once and
+        // the other two are exact (the named units were refreshed, not the whole view).
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the rows the replayed parent delete removed",
+        )
+        .await?;
+        let s = eng.stats_of(&db, "r_win_del_named")?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            s.cascade_gaps >= 1 && s.whole_view_refreshes == 0 && d.full_rebuilds == 0,
+            "the replayed parent delete was not counted as a gap, or fell back to a whole-view \
+             refresh / rebuilt (the vanished children must be named from the materialized table, \
+             not mark_all): {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!(
+            "gap-window named parent delete: {s:?} {}",
+            fmt_snapshot(&d)
+        ));
+        eng.stop().await
+    });
+}
+
 /// The sessions of `db` whose running statement is the startup seed read of the cascade cache:
 /// one SELECT of every kept child row of a cascade (`cascade::seed_sql`), schema-qualified and
 /// filtered on the child's own FK columns.
