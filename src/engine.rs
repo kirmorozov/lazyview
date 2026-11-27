@@ -560,19 +560,35 @@ impl Lag {
     /// single lagging target never goes through `refresh`'s `dirty.all` arm, which reads the whole
     /// source into memory (guard R1, owner rule 2026-11-26).
     ///
-    /// A whole-view ask that arrived **while the fill read its source** (`posted_all`) is not in
-    /// what that read saw, so the debt stands and the next due attempt builds again. Units the
-    /// flushes fed meanwhile stay owed for a later units retry, exactly as [`Engine::lag_subtract`]
-    /// keeps them owed after a claim. Returns whether the owed set is empty now: the catch-up to
-    /// report and count (ruling 2026-11-22: "caught up" is said only once it is written).
+    /// The streamed build ([`Engine::lag_build`]) swapped the whole view onto this target: that is
+    /// what pays the entry's whole-view debt, and it is the ONLY way an entry's `all` is ever paid —
+    /// a single lagging target never goes through `refresh`'s `dirty.all` arm, which reads the whole
+    /// source into memory (guard R1, owner rule 2026-11-26).
+    ///
+    /// A rebuild computes the view from its sources, so the fill covers everything the entry owed
+    /// when its read started — the units and partial keys as much as the whole view. What stays
+    /// owed is what the flushes re-fed **after** that moment, which is exactly what these marks
+    /// hold: [`Engine::lag_build`] cleared them with [`Self::clear_posted`] when the attempt began,
+    /// so a feed after the read re-posted it (ruling lv-super 2026-11-27 — the fold of
+    /// [`Engine::lag_subtract`]'s, applied to a build's result; a build entry never reaches that
+    /// function, because `lag_due` deliberately leaves it in the map so the flush keeps skipping
+    /// the target). A whole-view ask re-fed after the read therefore costs another attempt and
+    /// never a lost row. Returns whether the owed set is empty now: the catch-up to report and
+    /// count (ruling 2026-11-22: "caught up" is said only once it is written).
     fn pay_whole_view(&mut self) -> bool {
-        if !self.all || self.posted_all {
+        if !self.all {
             return false;
         }
-        self.all = false;
+        self.units = std::mem::take(&mut self.posted);
+        let re_fed = std::mem::take(&mut self.posted_partial);
+        for set in self.partial.iter_mut() {
+            *set = UnitSet::default();
+        }
+        extend_partial(&mut self.partial, re_fed);
+        self.all = std::mem::take(&mut self.posted_all);
         self.failures = 0;
         self.retry_at = Instant::now();
-        self.units.is_empty() && self.partial.iter().all(UnitSet::is_empty)
+        self.units.is_empty() && self.partial.iter().all(UnitSet::is_empty) && !self.all
     }
 }
 
@@ -9329,8 +9345,30 @@ impl Engine {
                 self.rebuild_routes();
             }
         }
-        debug!(view = %name, target = %t, failures,
+        debug!(view = %name, target = %t, failures, posted_all = ?self.slots[i]
+            .live
+            .as_ref()
+            .and_then(|l| l.lag.get(t))
+            .is_some_and(|g| g.posted_all),
                "the whole view is owed to a lagging target: its catch-up is the streamed build");
+        // The fill's read starts here, so everything owed now IS in what it reads: clear the
+        // re-fed marks the way a claim does, or the swap would refuse to pay a debt the fill has
+        // just covered (that is what the bar's six reds were: generation after generation swapped,
+        // `posted_all` set by the flushes, `pay_whole_view` refusing forever). `pay_whole_view`
+        // then folds these marks back as the owed set of a build's result — `lag_subtract`'s rule
+        // for a claim's, which a build entry never reaches because `lag_due` leaves it in the map.
+        // All three marks, not just the whole-view one: a rebuild recomputes the view from its
+        // sources, so the units and partial keys the fill read are covered by it too (ruling
+        // lv-super 2026-11-27). A feed after this point re-posts, so it stays owed: never a lost
+        // row, at the price of one more attempt.
+        if let Some(g) = self.slots[i]
+            .live
+            .as_mut()
+            .filter(|l| !l.frozen)
+            .and_then(|l| l.lag.get_mut(t))
+        {
+            g.clear_posted();
+        }
         self.start_next(i, plan, name, vec![t.to_string()], BuildKind::LagCatchUp)
             .await;
     }
@@ -12165,11 +12203,13 @@ mod tests {
 
     /// Guard R1 (owner rule 2026-11-26) as a unit: the whole-view debt of a lagging target is paid
     /// by the streamed build's swap ([`Engine::lag_build`]) and by nothing else, and the swap pays
-    /// only what its read actually covered. The cases are the shapes an entry holds when
-    /// `finish_next` swaps such a build in: the whole view alone (paid: the catch-up to count), the
-    /// whole view plus the units the flushes fed while the fill read its source (the `all` is paid,
-    /// the units stay owed for a units retry), a whole-view ask that arrived during the fill (that
-    /// read does not cover it: the debt stands), and a units-only entry (the refresh's, untouched).
+    /// exactly what its read covered (lv-super's ruling of 2026-11-27). The cases are the shapes an
+    /// entry holds when `finish_next` swaps such a build in: the whole view alone (paid, the catch-up
+    /// to count); the whole view plus units owed when the read began — a rebuild computes the view
+    /// from its sources, so those are covered too; units and partial keys re-fed AFTER the read
+    /// started (they are not in it, so they stay owed and no catch-up is counted); a whole-view ask
+    /// re-fed after the read (the debt stands, another attempt builds); and a units-only entry, the
+    /// refresh's own business, untouched.
     #[test]
     fn the_whole_view_of_a_lagging_target_is_paid_by_the_build_alone() {
         let mut g = lag(("binlog.000003", 100), false);
@@ -12181,25 +12221,56 @@ mod tests {
             "a paid debt starts its backoff over"
         );
 
+        // What the entry owed when the fill's read began is covered by it: a rebuild recomputes
+        // every row, so units, partial keys and the whole view are paid together.
         let mut g = lag(("binlog.000003", 100), false);
         g.all = true;
         g.units.insert_int(21);
         assert!(
+            g.pay_whole_view(),
+            "the fill's read recomputed the units the entry owed at its start"
+        );
+        assert!(
+            g.units.is_empty() && !g.all,
+            "so both debts are gone, and the owed set is empty: the catch-up"
+        );
+
+        // Re-fed after the read started: not in what it read, so owed, and no catch-up yet.
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        assert!(
+            g.posted.insert_int(21),
+            "the flush fed this unit during the fill"
+        );
+        g.partial.push(UnitSet::default());
+        assert!(
             !g.pay_whole_view(),
-            "the units fed during the fill are still owed"
+            "a unit re-fed after the read is not covered by it"
         );
         assert!(!g.all, "the build's read paid the whole view");
         assert!(
             !g.units.is_empty(),
-            "and nothing else wrote those units: no catch-up to count yet"
+            "and the re-fed unit is owed: nothing was lost, only re-timed"
         );
+
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        let mut p = UnitSet::default();
+        p.insert_int(3);
+        g.posted_partial = vec![p];
+        assert!(
+            !g.pay_whole_view(),
+            "a partial key re-fed after the read stays owed too"
+        );
+        assert_eq!(g.partial.len(), 1, "and it is folded in, not dropped");
+        assert!(!g.partial[0].is_empty(), "the key is owed for its retry");
 
         let mut g = lag(("binlog.000003", 100), false);
         g.all = true;
         g.posted_all = true;
         assert!(
             !g.pay_whole_view(),
-            "a whole-view ask that came during the fill is not covered by its read"
+            "a whole-view ask that came after the read is not covered by it"
         );
         assert!(g.all, "the debt stands until a build reads past it");
 
