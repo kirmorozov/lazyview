@@ -177,6 +177,53 @@ impl Engine {
         }
     }
 
+    /// Waits until a line of this engine's log contains `needle`, checking every turn that the
+    /// engine is still alive, and returns the tail of the log last read.
+    ///
+    /// This belongs to the engine rather than to a leg: `Engine` owns the log path and the exit
+    /// status, and a test that polls either from its own closure would have to hold `&mut self`
+    /// across the `FnMut` boundary `wait_until` polls through, which does not compile. Same rule
+    /// as [`Self::wait_exit`] and [`Self::wait_applied`]: one bounded deadline, 50 ms a turn.
+    pub async fn wait_log_line(&mut self, needle: &str, timeout: Duration) -> Result<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.check_alive()?;
+            let log = engineproc::tail_lines(&self.log_path, 400);
+            if log.contains(needle) {
+                return Ok(log);
+            }
+            if Instant::now() > deadline {
+                bail!(
+                    "engine {} did not log {needle:?} within {timeout:?} — log tail:\n{}",
+                    self.label,
+                    super::clip(&log, 2000),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits up to `timeout` for the engine to exit on its own and returns how it ended — the
+    /// message it died with, or `None` if it is still running when the deadline passes. Whether a
+    /// death is the expected outcome is the caller's business: a leg that exists to prove the
+    /// engine *refuses* to run asserts on the message, and a leg that would be broken by a death
+    /// uses [`Self::check_alive`] instead.
+    pub async fn wait_death(&mut self, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(r) = self.exited() {
+                return Some(match r {
+                    Ok(()) => "engine exited Ok".to_string(),
+                    Err(e) => e.clone(),
+                });
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Waits until `applied() >= target`, with a fixed wall-clock `timeout`. The
     /// [`Self::wait_applied_progressive`] variant is what a *catch-up* uses (#248); this one is
     /// for the waits that want a hard wall — a scenario that proves the engine does *not* catch
