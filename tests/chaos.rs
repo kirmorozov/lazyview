@@ -3047,6 +3047,26 @@ async fn wait_at_rest(db: &Db, a: &EngineProc, what: &str) -> Result<Scraped> {
     }
 }
 
+/// Every MV table of `specs` on the `source` target, read the way the oracle reads one
+/// ([`oracle::fetch`]): its columns and its whole multiset of rows. The frozen-instance scenario
+/// reads this twice at rest — at the instant of the `SIGCONT`, and again after the woken instance
+/// left — and the difference between the two reads *is* the answer to "did the replaced instance
+/// write anything?" from the database side (#417): through that window the writers are quiet and the
+/// replacement has applied everything, so the instance being woken is the only one that could still
+/// write, and the takeover's own writes are attributed separately, by the oracle check at the end.
+async fn mv_tables(db: &Db, specs: &[ViewSpec]) -> Result<Vec<(String, oracle::Table)>> {
+    let mut c = db.conn().await?;
+    let mut out = Vec::with_capacity(specs.len());
+    for s in specs {
+        let t = oracle::fetch(&mut c, &format!("SELECT * FROM {}", ident(&s.name)))
+            .await
+            .with_context(|| format!("the table of view `{}` on the source", s.name))?;
+        out.push((s.name.clone(), t));
+    }
+    c.disconnect().await.ok();
+    Ok(out)
+}
+
 /// What the woken instance did, sampled from the instant of the `SIGCONT` until the process is gone.
 /// The *largest* value every write counter ever showed, not the value of one last scrape: a fenced
 /// instance leaves on its own schedule, and the sample that saw a row is the one the bar is about
@@ -3112,6 +3132,17 @@ impl Woken {
 ///    `SIGCONT` on the woken instance is the only one who could still write, and the
 ///    `_lazyview_status` row can only stand still — the saved position is checked on the target
 ///    side, where a stale instance's save would show, and not from the instance's memory.
+///
+/// The bar has two witnesses (#417, the main red on mysql2610 seed 561046900606): a readable
+/// `/metrics` sample of the woken instance, or its own exit with the takeover named in its log. A
+/// replaced instance that notices the takeover on its first beat after the `SIGCONT` is gone within
+/// milliseconds — that run exited 16 ms after the wake, having logged `another lazyview instance
+/// took over (epoch Some(2), ours 1); stopping`, and wrote nothing — so requiring a sample before it
+/// could be judged refused the fastest correct outcome. Zero samples now refuse only what they always
+/// refused: an instance that is still running while nothing can be read from it. When the instance
+/// fenced itself and left before one sample, "wrote nothing" is read from the database instead, at
+/// rest across the wake window ([`mv_tables`] plus the saved row), the witness that exists in both
+/// cases; with a sample the `/metrics` counters still carry the statement-level bar.
 #[test]
 fn chaos_lock_frozen_old_instance_writes_nothing() {
     let _one = toxi::exclusive();
@@ -3224,6 +3255,11 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
             b.wait_caught_up(&mut c, t_catchup()).await?;
             c.disconnect().await.ok();
             let (position_woken, _) = saved_row(&db).await?;
+            // The target as it stands at the instant of the wake, read at rest (#417): writers quiet,
+            // the replacement caught up, the frozen holder unable to move. Read again after the woken
+            // instance left, the two reads are `wrote nothing` measured from the database — the only
+            // witness when `/metrics` never answered once.
+            let state_woken = mv_tables(&db, &specs).await?;
             // Wake the frozen one. Its lock session is the one the server ended at the end of the lease,
             // so it must notice on its next beat, close every gate, and leave; between the wake and its
             // exit not one row may reach a target.
@@ -3260,24 +3296,98 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            // The bar needs a witness, and a replaced instance that fences at once leaves only one
+            // (#417, the main red on mysql2610 seed 561046900606): the woken holder logged `leadership
+            // lock: beat failed`, `holding every write gate until the lock is confirmed again` and
+            // `another lazyview instance took over (epoch Some(2), ours 1); stopping`, and was gone 16
+            // ms after the `SIGCONT` — three refused scrapes, no sample, and the scenario refused to
+            // judge the outcome it exists to test. A readable sample is therefore one witness, not the
+            // only one: the instance's own exit, with the takeover named in its log, is the other, and
+            // what it wrote is then read from the database below. The refusal keeps its teeth for the
+            // case it was written for — an instance still running while every scrape of it fails, where
+            // neither witness exists and no bar has been measured at all.
+            let gone = !common::engineproc::pid_alive(pid);
+            let fenced = soakchaos::grep_log(&a.log_path, "fenced")?.is_some()
+                || soakchaos::grep_log(&a.log_path, "another lazyview instance")?.is_some();
+            let unmeasured = if gone {
+                "it exited without ever naming the takeover".to_string()
+            } else {
+                format!(
+                    "it is still running (state {:?}) and answered no scrape",
+                    proc_state(pid)
+                )
+            };
             ensure!(
-                woken.samples > 0,
+                woken.samples > 0 || (gone && fenced),
                 "the woken instance left ({fails} failed scrape(s) over {:?}) without one readable \
-                 /metrics sample between the SIGCONT and its exit: the bar below would not have been \
-                 measured; log tail:\n{}",
+                 /metrics sample between the SIGCONT and {}, and {unmeasured}: the bar below would \
+                 not have been measured; log tail:\n{}",
                 tw.elapsed(),
+                if gone { "its exit" } else { "now" },
                 a.log_tail(15)
             );
             let st = a.wait_exit(Duration::from_secs(90))?;
+            if woken.samples > 0 {
+                ensure!(
+                    woken.rows == pre_rows && woken.queries == pre_queries && woken.rebuilds == pre_rebuilds,
+                    "the woken instance wrote {} row(s) and issued {} target statement(s) after its \
+                     lock was gone: {} sample(s) of its /metrics between the SIGCONT and its exit, \
+                     against the baseline of a holder at rest (rows {pre_rows}, statements \
+                     {pre_queries}, rebuilds {pre_rebuilds}) with {backlog} writer batch(es) of \
+                     backlog it had never read and the replacement's saved row {position_woken:?} to \
+                     compare against; log tail:\n{}",
+                    woken.rows.saturating_sub(pre_rows),
+                    woken.queries.saturating_sub(pre_queries),
+                    woken.samples,
+                    a.log_tail(15)
+                );
+            }
+            // The same bar from the database, at rest on both sides of the wake window (#417), and the
+            // only one when `/metrics` never answered: nothing else could have written through that
+            // window. The writers have been quiet since before the `SIGCONT`, the replacement has
+            // applied everything and owns the epoch, and the instance that could still write has just
+            // left — so a target row or a saved position that moved between the two reads moved while
+            // the replaced instance was awake. The takeover's own writes stay attributed separately, to
+            // the oracle check at the end.
+            let mut c = db.conn().await?;
+            b.wait_caught_up(&mut c, t_catchup()).await?;
+            c.disconnect().await.ok();
+            let (position_rest, epoch_rest) = saved_row(&db).await?;
             ensure!(
-                woken.rows == pre_rows && woken.queries == pre_queries && woken.rebuilds == pre_rebuilds,
-                "the woken instance wrote {} row(s) and issued {} target statement(s) after its lock \
-                 was gone: {} sample(s) of its /metrics between the SIGCONT and its exit, against the \
-                 baseline of a holder at rest (rows {pre_rows}, statements {pre_queries}, rebuilds \
-                 {pre_rebuilds}) with {backlog} writer batch(es) of backlog it had never read and the \
-                 replacement's saved row {position_woken:?} to compare against; log tail:\n{}",
-                woken.rows.saturating_sub(pre_rows),
-                woken.queries.saturating_sub(pre_queries),
+                epoch_rest != epoch_before,
+                "the row of `_lazyview_status` carries the replaced instance's epoch {epoch_before} at \
+                 rest: its save landed after the takeover bumped the epoch (the replacement's is {}); \
+                 log tail:\n{}",
+                epoch_before + 1,
+                a.log_tail(15)
+            );
+            ensure!(
+                position_rest >= position_woken,
+                "the saved position went backwards at rest, from {position_woken:?} to \
+                 {position_rest:?}, while the replaced instance was awake; log tail:\n{}",
+                a.log_tail(15)
+            );
+            let state_rest = mv_tables(&db, &specs).await?;
+            let mut moved_views = 0usize;
+            let mut moved_rows = 0usize;
+            let mut moved = String::new();
+            for (before, after) in state_woken.iter().zip(state_rest.iter()) {
+                debug_assert_eq!(before.0, after.0);
+                if let Some(d) = oracle::diff_tables(&before.1, &after.1, 8) {
+                    moved_views += 1;
+                    moved_rows += before.1.rows.len().abs_diff(after.1.rows.len());
+                    moved.push_str(&format!("view `{}`:\n{d}\n", before.0));
+                }
+            }
+            ensure!(
+                moved_views == 0,
+                "the replaced instance wrote to the target while it was fenced: {moved_rows} row(s) \
+                 of its {} view table(s) differ between the read at the instant of the SIGCONT and \
+                 the same tables read at rest after it exited ({moved_views} view(s)), with {} \
+                 sample(s) of its /metrics in between and the saved row at {position_rest:?}; the \
+                 writers were quiet and the replacement had applied everything, so nothing else could \
+                 have written them; diff:\n{moved}log tail:\n{}",
+                specs.len(),
                 woken.samples,
                 a.log_tail(15)
             );
@@ -3305,8 +3415,6 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
              fenced one; log tail:\n{}",
             a.log_tail(15)
         );
-            let fenced = soakchaos::grep_log(&a.log_path, "fenced")?.is_some()
-                || soakchaos::grep_log(&a.log_path, "another lazyview instance")?.is_some();
             ensure!(
                 fenced,
                 "the woken instance left without ever naming the takeover; log tail:\n{}",
@@ -3314,11 +3422,19 @@ fn chaos_lock_frozen_old_instance_writes_nothing() {
             );
             measured(format!(
                 "chaos_lock_frozen_old_instance_writes_nothing: old process wrote 0 row(s) of a \
-             {backlog}-batch backlog over {} sample(s) after SIGCONT and exited {st} having named the \
-             takeover ({} completed flush(es), {} target statement(s)); its reader moved the reported \
-             position from {pre_applied:?} to {:?} while writing nothing — the position is the reader's \
-             own claim (`after_boundary`), not a write",
+             {backlog}-batch backlog after SIGCONT and exited {st} having named the takeover, judged \
+             from {} ({} /metrics sample(s), {} of its {} view table(s) and its saved row moved \
+             between the read at the wake and the read at rest, {} completed flush(es), {} target \
+             statement(s)); its reader moved the reported position from {pre_applied:?} to {:?} while \
+             writing nothing — the position is the reader's own claim (`after_boundary`), not a write",
+                if woken.samples > 0 {
+                    "/metrics and the database"
+                } else {
+                    "the database: the fence beat every scrape"
+                },
                 woken.samples,
+                moved_views,
+                specs.len(),
                 woken.flushes.saturating_sub(pre_flushes),
                 woken.queries.saturating_sub(pre_queries),
                 woken.applied,
