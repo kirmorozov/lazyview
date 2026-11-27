@@ -1196,10 +1196,10 @@ fn bare_column(item: &SelectItem) -> Option<(String, String)> {
     };
     let col = match expr {
         Expr::Identifier(id) => ident_name(id),
-        Expr::CompoundIdentifier(parts) => match parts.last() {
-            Some(i) => ident_name(i),
-            None => return None,
-        },
+        Expr::CompoundIdentifier(parts) => {
+            let i = parts.last()?;
+            ident_name(i)
+        }
         _ => return None,
     };
     Some((col.clone(), alias.unwrap_or(col)))
