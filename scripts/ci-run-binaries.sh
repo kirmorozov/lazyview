@@ -18,6 +18,16 @@
 #                 scripts/chaos-gate.sh reads is plain libtest output, exactly as `cargo test
 #                 --test <name> -- <args>` used to produce.
 #
+# Tiers (owner 2026-11-27: fast checks for PRs, comprehensive on main): CI_TIER=fast makes every
+# listed suite skip the tests that tests/slow-tier.txt (CI_SLOW_LIST overrides the path) names for
+# it, with one `--skip <name>` each; any other value (the default, "all") runs every test. The list
+# is data, never #[ignore]: local runs still see every test. Format, one test per line:
+#   <suite> <test name as `--list` prints it>   # free text (measured seconds, reason)
+# `--skip` matches by substring, so a name that is also a prefix of another test would silently skip
+# both: `scripts/ci-run-binaries.sh --check-slow-list <manifest>` (run by build-tests on every build)
+# lists each listed suite and fails unless every entry matches EXACTLY ONE test -- a renamed or
+# deleted test breaks the build instead of quietly moving back into the fast tier.
+#
 # Semantics the callers rely on:
 #   SEQUENTIAL: one binary at a time, in the listed order -- the suites that mutate GLOBAL server
 #     state (time_zone, sql_mode, log_bin_compress, binlog commits; the LAZYVIEW_TEST_GLOBAL_*
@@ -45,6 +55,34 @@ usage() {
 }
 
 [ $# -ge 1 ] || usage
+slow_list=${CI_SLOW_LIST:-tests/slow-tier.txt}
+
+# Entries of the slow list for one suite: prints the test names, comments and blanks dropped.
+slow_names() {
+  [ -f "$slow_list" ] || return 0
+  awk -v n="$1" '$1 !~ /^#/ && NF >= 2 && $1 == n { print $2 }' "$slow_list"
+}
+
+if [ "$1" = "--check-slow-list" ]; then
+  [ $# -eq 2 ] || usage
+  manifest=$2
+  [ -f "$manifest" ] || { echo "::error title=slow tier::no manifest at ${manifest}" >&2; exit 1; }
+  [ -f "$slow_list" ] || { echo "::error title=slow tier::no slow list at ${slow_list}" >&2; exit 1; }
+  rc=0
+  while read -r suite name _; do
+    case "$suite" in ""|"#"*) continue;; esac
+    [ -n "${name:-}" ] || { echo "::error title=slow tier::${slow_list}: line for suite ${suite} has no test name" >&2; rc=1; continue; }
+    exe=$(awk -F'\t' -v n="$suite" '$1 == n { print $2; exit }' "$manifest")
+    [ -n "$exe" ] && [ -x "$exe" ] || { echo "::error title=slow tier::${slow_list}: suite ${suite} is not in the build" >&2; rc=1; continue; }
+    hits=$("$exe" --list 2>/dev/null | grep -c -F -- "${name}" || true)
+    if [ "$hits" -ne 1 ]; then
+      echo "::error title=slow tier::${slow_list}: ${suite} ${name} matches ${hits} tests (must be exactly 1): fix the name or delete the line" >&2
+      rc=1
+    fi
+  done < "$slow_list"
+  exit "$rc"
+fi
+
 manifest=$1
 shift
 [ -f "$manifest" ] || { echo "::error title=test runner::no manifest at ${manifest}: the run job did not get the build-tests artifact (or the name list above it is wrong)" >&2; exit 1; }
@@ -74,8 +112,12 @@ for n in ${names[@]+"${names[@]}"}; do
   fi
   # One header line per binary: running executables directly prints libtest's own "running N
   # tests" but no per-suite name, and this is the log a human reads in the artifact.
-  echo "==== suite ${n} (${exe}${extra[@]+" ${extra[*]}"}) ===="
-  "$exe" ${extra[@]+"${extra[@]}"}
+  args=(${extra[@]+"${extra[@]}"})
+  if [ "${CI_TIER:-all}" = fast ]; then
+    while read -r t; do [ -n "$t" ] && args+=(--skip "$t"); done < <(slow_names "$n")
+  fi
+  echo "==== suite ${n} (${exe}${args[@]+" ${args[*]}"}) ===="
+  "$exe" ${args[@]+"${args[@]}"}
   st=$?
   if [ "$st" -ne 0 ]; then
     echo "==== suite ${n} exited ${st} ===="

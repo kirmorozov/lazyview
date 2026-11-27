@@ -1,16 +1,31 @@
 name: ci
 
-# What runs when (owner, 2026-11-26, after measuring the integration matrix at 807 of the 818
-# runner-minutes of a main run -- "7 hours per pr? that is stupidity", "2 hours for ci still too
-# much", "we need to solve ci/cd congestion cycle and tests wall clock time"):
-#   DRAFT pull_request  -> only the fast jobs: lint, unit, deny, features. No build, no container,
-#                          no server. Workers push WIP at least every 60 min (host rule); 30 such
-#                          runs in 24 h were filling the runners and queueing main's own run.
-#   pull_request        -> the fast jobs plus every heavy job, on the SAME 20 integration cells as a
-#                          push (every supported flavor blocks PRs too): marking a PR ready
-#                          (ready_for_review, in `on:`) is what starts the full run.
-#   push (main, v*), workflow_dispatch -> everything: every landed commit shows its own full run,
-#                          and a release tag pays for all of it.
+# What runs when (owner, 2026-11-27: "fast checks run for prs and comprehensive only for master",
+# after 2026-11-26's "7 hours per pr? that is stupidity" and "we need to solve ci/cd congestion cycle
+# and tests wall clock time"). The `scope` job decides it once per run and the other jobs read it:
+#   code   = the run changes more than documentation (a PR whose every file is docs/** or *.md outside
+#            .claude/ and .github/ is docs-only; this replaces the old workflow-level paths filter,
+#            so the job named `unit tests` reports on EVERY pull request, which a required check needs)
+#   heavy  = code and not a draft PR: the integration cells and the other server jobs run
+#   full   = a push, a tag, a manual run, or a PR labelled `ci:full`: the COMPREHENSIVE set
+#   DOCS-ONLY pull_request -> lint + `unit tests` (which has nothing to run and says so): minutes.
+#   DRAFT pull_request     -> lint, unit tests (from the build-tests artifact), deny, features. No
+#                             server, no container. Workers push WIP at least every 60 min (host rule).
+#   pull_request (ready)   -> the FAST tier: the same, plus the integration cells of the LATEST LTS of
+#                             each family only (mysql97, percona97, mariadb123: one 3-server group,
+#                             shards A-E) without the slow tests of tests/slow-tier.txt, and the
+#                             PostgreSQL target on the newest GA major (pg18). Marking a PR ready
+#                             (ready_for_review, in `on:`) starts it. Label `ci:full` on a PR runs the
+#                             comprehensive set below before merge: authors add it when the diff touches
+#                             version-sensitive code (binlog decoding, GTID/positions, charsets and
+#                             collations, DDL handling).
+#   push (main, v*), workflow_dispatch, ci:full -> the COMPREHENSIVE set: every supported flavor in the
+#                             group cells with the slow tier included, the chaos binary on EVERY flavor
+#                             (one cell each), multi-server, every PostgreSQL grid, the soak smoke, the
+#                             image. Pushes to main queue (the concurrency group below): one run goes,
+#                             at most one waits, a newer merge replaces the waiting run, a started run
+#                             is never cancelled. A red here is handled at once: an issue with an
+#                             owner, fix forward or revert the same day.
 # The jobs: lint, unit,
 # e2e, deny (cargo-deny advisories + licenses), features (the optional cargo features built and
 # tested; their clippy runs sit in `lint`), scan-image (trivy), the integration matrix,
@@ -18,16 +33,20 @@ name: ci
 # as a TARGET: every supported major, on the baseline source mysql84), integration-pg-multi (the same
 # target grid the other way round: every MySQL-family source on the baseline target pg16) and
 # integration-pgsrc (PostgreSQL as a SOURCE, every major). The integration matrix runs ONE build
-# (`build-tests`, once) and then only RUN jobs -- (server group x binary shard) cells that download
+# (`build-tests`, once; the unit tests run from the same artifact, so a run compiles the test profile
+# once) and then only RUN jobs -- (server group x binary shard) cells that download
 # the binaries from the build artifact, start their group's servers with ONE `docker compose up`
 # and execute their shard against ALL of them at once, the way the PostgreSQL jobs run pg14-pg18
 # in one job (owner 2026-11-26: "build once, fan out the runs ... make sure we efficient on code";
-# "every supported flavor stays blocking on PRs and on main"): the SAME 20 cells run on a ready
-# pull_request and on a push -- mysql, mariadb, advisory and supervisor-off groups x binary shards,
-# at or under the runner concurrency so a run never queues behind itself. A flavor that goes red
-# on main after a landing is reverted or fixed forward the SAME DAY.
-# The network-chaos suite (tests/chaos.rs) runs only in the two shard-CHAOS jobs (the mysql group
-# armed on mysql84 and the mariadb group on mariadb114 -- the cells whose `run: "chaos"` entries start
+# "every supported flavor stays blocking on main"): the comprehensive set is 32 cells -- the mysql,
+# mariadb, advisory and supervisor-off groups x binary shards (18) plus one chaos cell per flavor
+# (14, see below) -- and a PR runs the 5 cells of the latest-LTS group (scripts/ci-cells.sh is the one
+# definition of both sets; the `scope` job feeds it to the matrix). A flavor that goes red on main
+# after a landing is reverted or fixed forward the SAME DAY.
+# The network-chaos suite (tests/chaos.rs) is SLOW tier as a whole: no PR cell runs it, and the
+# comprehensive set runs it on EVERY flavor, one cell per flavor (owner 2026-11-27: the faults arm the
+# harness-to-server link through ONE toxiproxy upstream, tests/common/toxi.rs:71-75, so a chaos cell
+# starts one server -- the cells whose `run: "chaos"` entries start
 # the toxiproxy daemon: the job's own server family reached through it (compose profile `chaos`), its
 # scenarios required (scripts/chaos-gate.sh fails the step on any failure tests/chaos-known-red.txt
 # does not list, and prints the listed ones in the job summary), the toxi self-tests required. The
@@ -40,8 +59,8 @@ name: ci
 # (integration-pg-multi pins that target and rotates the sources, so the faults are not paid for
 # twice; its legs are the targets_pg_ gates).
 # The soak jobs (bottom of the file) are the two bounded soaks: `soak-pr`, a bounded 5-minute smoke
-# on mysql84, runs on every pull_request (a check of its own, so its log shows soak_smoke_30m
-# passing for real); `soak-smoke` (30 minutes, mysql84 + mariadb1011) runs only for the nightly and
+# on mysql84, runs on pushes and ci:full pull requests (a check of its own, so its log shows
+# soak_smoke_30m passing for real); `soak-smoke` (30 minutes, mysql84 + mariadb1011) runs only for the nightly and
 # a manual run, and `report` opens or updates the one open issue labelled `nightly` after a failed
 # nightly. The nightly is nightly.yml calling this workflow on the schedule: the schedule event then
 # runs the soak jobs only (every regular job skips), because a push to main has already run the
@@ -60,28 +79,14 @@ name: ci
 #                       group cells must pass, its 4 advisory cells run with
 #                       continue-on-error and cannot block it)
 # Pull requests never get registry credentials and never push.
-# The one exception, and the only path filter in this file (#369): a pull_request whose every changed file
-# is documentation starts NO run here (paths below). Owner, 2026-11-23: "doc only prs can be
-# bundled and merged without test runs" -- the keeper's landing pass lands such a PR on its guard PASS
-# without waiting for CI (tmp/lvs-land-ready.sh), so a run here would only spend a runner on prose.
-# One truth, one filter: a PR that changes ONLY `docs/**`, or a markdown file outside `.claude/` and
-# `.github/`, starts no run; a PR that changes anything under `.claude/` or `.github/` -- markdown
-# included, `.claude/agents/generic-guard.md` included -- runs the full set. `**` takes every changed
-# path, the two `!` patterns after it take prose back out, and the two positive patterns after those put
-# the config trees back in: the LAST pattern a path matches decides it, so a negative pattern after a
-# positive one excludes and a positive one after a negative re-includes. The filter before #369 was the
-# ignore-list form of these same two prose patterns, and GitHub excludes a path that matches ANY ignore
-# pattern even when a positive one matches it too -- so the guard's own definition, an executable policy
-# artifact, started no run at all and tmp/lvs-land-ready.sh refused it twice: its docs_only() rejects
-# anything matching `^(src|tests)/|^\.` so it is not docs-only, and its normal path skips a PR whose
-# non-excluded checks are `0 not green of 0`. Config is not prose: the guard definition, the workflows and
-# the pinned actions are what CI and the keeper's landing pass actually execute, so an edit to them is
-# verified like code. A PR that changes a doc alongside anything else runs the full set exactly as it does
-# today.
-# `push` (main, v*) and `workflow_dispatch` keep NO filter on purpose -- every landed commit shows its own
-# full matrix, and a manual run is asked for.
+# There is no path filter any more (it was #369: a docs-only PR started no run, which a required
+# `unit tests` check cannot live with). The `scope` job below classifies the PR by its files instead:
+# docs-only = every file under docs/** or a *.md outside .claude/ and .github/ -- config is not
+# prose, the guard definition, the workflows and the pinned actions are what CI and the keeper's
+# landing pass execute, so a PR that touches them runs as code. A docs-only PR runs lint and
+# `unit tests` only. `push` (main, v*) and `workflow_dispatch` always get the comprehensive run.
 # ci.yml is the only workflow that triggers on pull_request (the others run on schedule,
-# workflow_dispatch or workflow_call), so a docs-only PR starts no Actions run at all.
+# workflow_dispatch or workflow_call).
 on:
   push:
     branches: [main]
@@ -90,13 +95,11 @@ on:
     # ready_for_review (owner 2026-11-26): a DRAFT PR runs only the fast jobs (see the header), so
     # marking it ready is what starts the heavy set -- without this type the full run would only
     # arrive on the next push to the branch.
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "**"
-      - "!docs/**"
-      - "!**/*.md"
-      - ".claude/**"
-      - ".github/**"
+    # `labeled`: adding the ci:full label starts the comprehensive run at once (a label event also
+    # starts a normal run for any other label; the concurrency group cancels the one it replaces).
+    # No `paths` filter any more: the `scope` job tells a docs-only PR apart, so `unit tests`
+    # reports on every PR (a required status check that never reports blocks the merge forever).
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
   # Called by nightly.yml (the nightly on main HEAD). Its caller's event is `schedule`, so every
   # regular job skips and only the soak jobs and report run; workflow_call is listed alongside
@@ -125,6 +128,57 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  scope:
+    # What this run runs (header of this file): the one place that reads the event, the draft flag,
+    # the labels and the changed files. Everything else reads the outputs. `cells` is the matrix of
+    # the `integration` job, from scripts/ci-cells.sh.
+    name: run scope
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.s.outputs.code }}
+      heavy: ${{ steps.s.outputs.heavy }}
+      full: ${{ steps.s.outputs.full }}
+      cells: ${{ steps.s.outputs.cells }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: classify the run
+        id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          code=true; heavy=true; full=true
+          if [ "$EVENT" = pull_request ]; then
+            full=false
+            jq -e 'index("ci:full")' <<<"$LABELS" >/dev/null && full=true
+            [ "$DRAFT" = true ] && heavy=false
+            # docs-only: no file outside docs/** and *.md, where .claude/ and .github/ always count as code
+            nondoc=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' \
+              | awk '/^(\.claude|\.github)\// { print; next } /^docs\// { next } /\.md$/ { next } { print }')
+            if [ -z "$nondoc" ]; then code=false; heavy=false; fi
+          fi
+          tier=fast; [ "$full" = true ] && tier=full
+          cells=$(scripts/ci-cells.sh "$tier")
+          {
+            echo "code=$code"; echo "heavy=$heavy"; echo "full=$full"; echo "cells=$cells"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### run scope"
+            echo "event \`$EVENT\`: code=$code heavy=$heavy full=$full ($(jq 'length' <<<"$cells") integration cells, tier $tier)"
+            [ "$code" = true ] || echo "docs-only: lint and unit tests report, nothing else runs"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   lint:
     name: lint (fmt + clippy)
     if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
@@ -172,28 +226,40 @@ jobs:
         run: scripts/chaos-gate.sh --self-test
 
   unit:
+    # The lib and bin unit tests, RUN from the build-tests artifact (owner 2026-11-27: "builds
+    # artifact all over again with every test in matrixes"): no compile here. The lib tests with
+    # the roaring feature run in `features` (cargo test --lib --bins --features roaring). A
+    # docs-only PR has no build to wait for: the job still runs, says so, and reports success, so
+    # `unit tests` is a check every PR has (a required status check).
     name: unit tests
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call'  # the nightly runs only the soak jobs
+    needs: [scope, build-tests]
+    if: ${{ always() && github.event_name != 'schedule' && github.event_name != 'workflow_call' && needs.scope.result == 'success' && (needs.scope.outputs.code != 'true' || needs.build-tests.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: docs-only run
+        if: needs.scope.outputs.code != 'true'
+        run: echo "docs-only pull request, no code changed, nothing to run (scope job)" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.scope.outputs.code == 'true'
         with:
           persist-credentials: false
-      - name: rust ${{ env.RUST_TOOLCHAIN }}
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: get the test binaries (built once by build-tests)
+        if: needs.scope.outputs.code == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: cargo test --lib --bins
-        run: cargo test --locked --lib --bins
-      - name: lib tests (feature roaring)
-        run: cargo test --locked --lib --features roaring
+          name: test-bins
+          path: ci-bins
+      - name: lib and bin unit tests
+        if: needs.scope.outputs.code == 'true'
+        run: |
+          chmod +x ci-bins/deps/* ci-bins/lazyview
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv lib lazyview -- --color never
 
   deny:
     name: "supply-chain (cargo-deny: advisories + licenses)"
+    needs: scope
+    if: needs.scope.outputs.code == 'true'  # a docs-only PR changes no dependency
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -220,6 +286,8 @@ jobs:
 
   features:
     name: optional features (${{ matrix.features }})
+    needs: scope
+    if: needs.scope.outputs.code == 'true'  # a docs-only PR builds nothing
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -257,7 +325,8 @@ jobs:
     # makes a draft cheap. On a cache miss the build is ~10-15 min (it was paid inside every matrix
     # job before); on a hit ~1-2 min + upload.
     name: build test binaries
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
+    needs: scope
+    if: needs.scope.outputs.code == 'true'  # not the nightly (scope skips), not a docs-only PR; a DRAFT builds too, `unit tests` runs from this artifact
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -299,6 +368,9 @@ jobs:
           # run jobs, so they name it with LAZYVIEW_TEST_ENGINE_BIN, which points here).
           cp target/debug/lazyview ci-bins/lazyview
           echo "manifest:"; column -t -s $'\t' ci-bins/ci-manifest.tsv
+          # tests/slow-tier.txt: every line must name exactly one test of its suite, or the fast tier
+          # would silently run (or skip) the wrong ones. Listing runs no test and needs no server.
+          scripts/ci-run-binaries.sh --check-slow-list ci-bins/ci-manifest.tsv
       - name: upload the test binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -345,17 +417,20 @@ jobs:
     #   shard E -- the exclusive suite as a LOOP over the group's flavors: it restarts its server's
     #              container (tests/exclusive.rs:14-20,40 names ONE container per invocation), so
     #              one invocation per flavor, ~2 min each (tmp/out/lv-git-keeper/multi-server-facts.md)
-    #   shard CHAOS -- the chaos binary over the toxiproxy daemon, in the mysql (mysql84) and
-    #              mariadb (mariadb114) cells ONLY: the faults arm the harness-to-server link, not
-    #              the server itself, so one flavor per product covers it (owner decision,
-    #              tmp/out/lv-git-keeper/multi-server-facts.md). These two cells are the only jobs
-    #              that start the toxiproxy daemon; chaos_tgt_pg_ runs in the postgres-target job.
-    # 6+6+4+4 = 20 cells = the runner concurrency, so a run never queues behind itself. The tier of
-    # a flavor is no longer in the title (a group mixes tiers); the cell is named e.g.
+    #   shard CHAOS-<flavor> -- the chaos binary over the toxiproxy daemon, ONE CELL PER FLAVOR on the
+    #              comprehensive set (14: owner 2026-11-27 restored it on every flavor after #390
+    #              had cut it to mysql84 and mariadb114): the harness arms one upstream
+    #              (tests/common/toxi.rs:71-75, tmp/out/lv-git-keeper/multi-server-facts.md), so
+    #              the cell starts that one server + the daemon. These cells are the only jobs that
+    #              start the toxiproxy daemon; chaos_tgt_pg_ runs in the postgres-target job.
+    # The comprehensive set is 5+5+4+4 = 18 binary-shard cells plus 14 chaos cells (the `supervisor
+    # off` path has no chaos cell of its own: mariadb1011 is in the mariadb group) = 32, more than
+    # the 20 runners of the repo: the last chaos cells queue behind the others on a push, which
+    # nobody waits for. A PR runs the 5 cells of the latest-LTS group. The cell is named e.g.
     # "integration (mysql group, shard B)" or "integration (advisory group, shard A, advisory)".
     name: integration (${{ matrix.group }} group, shard ${{ matrix.shard }}${{ matrix.supervisor && format(', supervisor {0}', matrix.supervisor) || '' }}${{ matrix.advisory && ', advisory' || '' }})
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
-    needs: build-tests
+    if: needs.scope.outputs.heavy == 'true'  # not a draft PR, not docs-only, not the nightly
+    needs: [scope, build-tests]
     runs-on: ubuntu-24.04
     # The group's servers + (for the chaos cell) toxiproxy start/wait (up to 6 image pulls), the
     # artifact download and the shard (worst cell: shard A ~12.5 min of measured test time, plus
@@ -365,14 +440,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One set for every event (PR and push alike -- owner: no reduced PR set). `shard` labels
-        # the job title; `run` picks the shard's binaries (a b c d | excl | chaos); `exclusive`
-        # means shard D also loops the exclusive suite over the group's flavors (the groups without
-        # `chaos_server` is the single flavor:port the chaos cell arms its faults on.
-        include: >-
-          ${{ fromJSON(
-          '[{"group":"mysql","servers":"mysql80:33080 mysql84:33084 mysql97:33097 mysql2610:33261 percona84:33184 percona97:33197","shard":"A","run":"a","advisory":false},{"group":"mysql","servers":"mysql80:33080 mysql84:33084 mysql97:33097 mysql2610:33261 percona84:33184 percona97:33197","shard":"B","run":"b","advisory":false},{"group":"mysql","servers":"mysql80:33080 mysql84:33084 mysql97:33097 mysql2610:33261 percona84:33184 percona97:33197","shard":"C","run":"c","advisory":false},{"group":"mysql","servers":"mysql80:33080 mysql84:33084 mysql97:33097 mysql2610:33261 percona84:33184 percona97:33197","shard":"D","run":"d","advisory":false},{"group":"mysql","servers":"mysql80:33080 mysql84:33084 mysql97:33097 mysql2610:33261 percona84:33184 percona97:33197","shard":"E","run":"excl","advisory":false},{"group":"mysql","servers":"mysql80:33080 mysql84:33084 mysql97:33097 mysql2610:33261 percona84:33184 percona97:33197","shard":"CHAOS","run":"chaos","advisory":false,"chaos_server":"mysql84:33084"},{"group":"mariadb","servers":"mariadb106:33106 mariadb1011:33111 mariadb114:33114 mariadb118:33118 mariadb123:33123 mariadb130:33130","shard":"A","run":"a","advisory":false},{"group":"mariadb","servers":"mariadb106:33106 mariadb1011:33111 mariadb114:33114 mariadb118:33118 mariadb123:33123 mariadb130:33130","shard":"B","run":"b","advisory":false},{"group":"mariadb","servers":"mariadb106:33106 mariadb1011:33111 mariadb114:33114 mariadb118:33118 mariadb123:33123 mariadb130:33130","shard":"C","run":"c","advisory":false},{"group":"mariadb","servers":"mariadb106:33106 mariadb1011:33111 mariadb114:33114 mariadb118:33118 mariadb123:33123 mariadb130:33130","shard":"D","run":"d","advisory":false},{"group":"mariadb","servers":"mariadb106:33106 mariadb1011:33111 mariadb114:33114 mariadb118:33118 mariadb123:33123 mariadb130:33130","shard":"E","run":"excl","advisory":false},{"group":"mariadb","servers":"mariadb106:33106 mariadb1011:33111 mariadb114:33114 mariadb118:33118 mariadb123:33123 mariadb130:33130","shard":"CHAOS","run":"chaos","advisory":false,"chaos_server":"mariadb114:33114"},{"group":"advisory","servers":"mariadb131-rc:33131 mariadb132-pre:33132","shard":"A","run":"a","advisory":true},{"group":"advisory","servers":"mariadb131-rc:33131 mariadb132-pre:33132","shard":"B","run":"b","advisory":true},{"group":"advisory","servers":"mariadb131-rc:33131 mariadb132-pre:33132","shard":"C","run":"c","advisory":true},{"group":"advisory","servers":"mariadb131-rc:33131 mariadb132-pre:33132","shard":"D","run":"d","advisory":true,"exclusive":true},{"group":"supervisor-off","servers":"mariadb1011:33111","shard":"A","run":"a","advisory":false,"supervisor":"off"},{"group":"supervisor-off","servers":"mariadb1011:33111","shard":"B","run":"b","advisory":false,"supervisor":"off"},{"group":"supervisor-off","servers":"mariadb1011:33111","shard":"C","run":"c","advisory":false,"supervisor":"off"},{"group":"supervisor-off","servers":"mariadb1011:33111","shard":"D","run":"d","advisory":false,"supervisor":"off","exclusive":true}]'
-          ) }}
+        # The cells come from the scope job (scripts/ci-cells.sh, the one definition of both sets):
+        # a PR runs the 5 cells of the latest-LTS group on the fast tier, a push or ci:full runs the
+        # 32 comprehensive ones. `shard` labels the job title; `run` picks the shard's binaries
+        # (a b c d | excl | chaos); `exclusive` means shard D also loops the exclusive suite over the
+        # group's flavors (the groups without a shard E); `tier` becomes CI_TIER (fast skips
+        # tests/slow-tier.txt); `chaos_server` is the single flavor:port a chaos cell arms its faults on.
+        include: ${{ fromJSON(needs.scope.outputs.cells) }}
     env:
       COMPOSE_FILE: docker-compose.test.yml
       # `prerelease` unlocks the pre-release flavors, `chaos` the toxiproxy service the two
@@ -382,6 +456,9 @@ jobs:
       # The engine the harness spawns (tests/common/engineproc.rs): these jobs hold no cargo, so the
       # binary comes from the build-tests artifact named here.
       LAZYVIEW_TEST_ENGINE_BIN: ci-bins/lazyview
+      # fast: scripts/ci-run-binaries.sh skips the tests tests/slow-tier.txt names (pull requests);
+      # all: every test (pushes to main, ci:full). The chaos cells name only the chaos binary.
+      CI_TIER: ${{ matrix.tier }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -427,7 +504,7 @@ jobs:
             printf '%s ' "$f"
             docker compose exec -T "$f" sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"'
           done
-          ${{ matrix.run == 'chaos' && 'curl -fsS http://127.0.0.1:18474/version' || 'echo "no toxiproxy on this cell (chaos runs on mysql84 and mariadb114 only)"' }}
+          ${{ matrix.run == 'chaos' && 'curl -fsS http://127.0.0.1:18474/version' || 'echo "no toxiproxy on this cell (this cell is not a chaos cell)"' }}
           # The group's memory/CPU on the real runner, in the job summary and the logs artifact
           # (the spec: record this and split a group if 6 servers do not fit -- the measured idle
           # numbers say they do, this step proves it under load).
@@ -504,10 +581,8 @@ jobs:
           scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "${{ matrix.group }} group shard ${{ matrix.shard }} integration" \
             integration-tests.log tests/integration-known-red.txt
       # The chaos binary over the toxiproxy daemon (compose profile `chaos`, started above) runs
-      # only in the two run:"chaos" cells (the mysql group armed on mysql84, the mariadb group on
-      # mariadb114 -- owner decision 2026-11-26: the faults arm the harness-to-server link, not the
-      # server itself, so one flavor per product covers it; the other 12 flavors no longer pay
-      # 7.3 min for it, tmp/out/lv-git-keeper/multi-server-facts.md). Each cell is ONE single-DSN
+      # only in the run:"chaos" cells, one per flavor on the comprehensive set (slow tier: no PR
+      # cell runs it; tmp/out/lv-git-keeper/multi-server-facts.md). Each cell is ONE single-DSN
       # invocation for its chaos_server, not the group's full DSN list (toxi::upstream takes a
       # single upstream, tests/common/toxi.rs:71-75). The harness arms
       # real network faults between the engines and that server. always() so a suite failing
@@ -639,8 +714,8 @@ jobs:
     # MySQL 8.4 LTS, Percona 9.7 and MariaDB 13.0, whose default utf8mb4_uca1400_ai_ci
     # collation the MySQL targets lack.
     name: integration (multi-server, mysql84 + percona97 + mariadb130)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
-    needs: build-tests
+    if: needs.scope.outputs.heavy == 'true' && needs.scope.outputs.full == 'true'  # the comprehensive set: not a draft or docs-only PR, and pushes, ci:full PRs and manual runs only
+    needs: [scope, build-tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -722,8 +797,8 @@ jobs:
     # against its own server on its own host port, with LAZYVIEW_TEST_REQUIRE_PG=1 so no PostgreSQL
     # test may skip. The source is a normal matrix flavor; PostgreSQL is only ever a target here.
     name: integration (postgres target, mysql84 + pg14-pg18 blocking, pg19rc2 advisory)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
-    needs: build-tests
+    if: needs.scope.outputs.heavy == 'true'  # not a draft PR, not docs-only, not the nightly; a PR (fast tier) runs the newest GA major pg18 only, the comprehensive set every major + the chaos scenarios
+    needs: [scope, build-tests]
     runs-on: ubuntu-24.04
     # 5 blocking target legs + the advisory one + the chaos_tgt_pg_ scenarios (3 x ~120 s worst
     # case) + the servers' wait (no compile: the binaries are the build-tests artifact).
@@ -732,8 +807,11 @@ jobs:
       COMPOSE_FILE: docker-compose.test.yml
       # toxiproxy (compose profile `chaos`) joins the servers: the chaos step below arms real
       # network faults on the link to the PostgreSQL target, the same daemon the matrix jobs use.
-      COMPOSE_PROFILES: chaos
-      SERVICES: mysql84 pg14 pg15 pg16 pg17 pg18 pg19rc2 toxiproxy
+      COMPOSE_PROFILES: ${{ needs.scope.outputs.full == 'true' && 'chaos' || '' }}
+      # The fast tier (a PR) starts the source and the newest GA major only (owner 2026-11-27: "the
+      # postgres-target job on the newest PG"); the comprehensive set every major and the daemon.
+      SERVICES: ${{ needs.scope.outputs.full == 'true' && 'mysql84 pg14 pg15 pg16 pg17 pg18 pg19rc2 toxiproxy' || 'mysql84 pg18' }}
+      FULL: ${{ needs.scope.outputs.full }}
       LAZYVIEW_TEST_ENGINE_BIN: ci-bins/lazyview
     steps:  # identical to integration-multi: start servers (toxiproxy with them, profile `chaos`),
             # wait, print versions, then the targets suite and the chaos_tgt_pg_ scenarios -- all on
@@ -759,11 +837,13 @@ jobs:
         run: |
           echo "mysql84: $(docker compose exec -T mysql84 sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -ulv -plv -NB -e "SELECT VERSION()"')"
           for s in pg14 pg15 pg16 pg17 pg18 pg19rc2; do
+            case " $SERVICES " in *" $s "*) ;; *) continue;; esac
             echo "$s: $(docker compose exec -T "$s" psql -U lv -d lvtest -Atc 'select version()')"
           done
           # The daemon the chaos step below arms its faults through; a dead one shows here, not at
           # the first scenario.
-          curl -fsS http://127.0.0.1:18474/version
+          [ "$FULL" = true ] && curl -fsS http://127.0.0.1:18474/version
+          exit 0
       # The blocking majors, one leg per major against its own server. The binary is in the artifact
       # above, so a leg only runs; each leg's five named gates must be seen passing in its own log, and
       # LAZYVIEW_TEST_REQUIRE_PG=1 turns any PG skip into a failure (a major that is not up cannot
@@ -791,16 +871,21 @@ jobs:
                 || { echo "::error::$name: $t did not run and pass"; exit 1; }
             done
           }
-          pgtarget pg16 35432
-          pgtarget pg15 35431
-          pgtarget pg17 35433
-          pgtarget pg18 35434
-          pgtarget pg14 35436
+          if [ "$FULL" = true ]; then
+            pgtarget pg16 35432
+            pgtarget pg15 35431
+            pgtarget pg17 35433
+            pgtarget pg18 35434
+            pgtarget pg14 35436
+          else
+            pgtarget pg18 35434  # fast tier: the newest GA major
+          fi
       # pg19rc2 is the current pre-release major: the matrix rule's pre-release tier, so it is
       # advisory (continue-on-error) — it annotates the run, never blocks it. When 19.0 ships, move
       # the pin to postgres:19.x and make this a plain `pgtarget pg19 35437` in the step above.
       - name: postgres target tests (pg19rc2, advisory)
         id: pg19
+        if: needs.scope.outputs.full == 'true'
         continue-on-error: true
         env:
           LAZYVIEW_TEST_DSNS: mysql84=mysql://lv:lv@127.0.0.1:33084/lvtest
@@ -832,10 +917,10 @@ jobs:
       # skipping, and required, gated by scripts/chaos-gate.sh on tests/chaos-known-red.txt: these
       # scenarios used to be filtered out of every job that had a server for them and ran nowhere.
       # In the MySQL-family jobs they run nowhere: the chaos binary is excluded from the plain
-      # shards (its suites run only in the two run:"chaos" cells) and those cells have no PostgreSQL
+      # shards (its suites run only in the run:"chaos" cells) and those cells have no PostgreSQL
       # server, so strict would refuse their skip and every one of them would be red.
       - name: chaos scenarios (postgres target)
-        if: always() && !cancelled()
+        if: always() && !cancelled() && needs.scope.outputs.full == 'true'
         # 3 scenarios x ~120 s worst case + the tee.
         timeout-minutes: 15
         env:
@@ -901,13 +986,13 @@ jobs:
     # target nor any targets_pg_ scenario may skip — and the five gates must be seen passing in that
     # leg's own log.
     name: integration (postgres target, mysql-family sources + pg16)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
+    if: needs.scope.outputs.heavy == 'true' && needs.scope.outputs.full == 'true'  # the comprehensive set: not a draft or docs-only PR, and pushes, ci:full PRs and manual runs only
     runs-on: ubuntu-24.04
     # 10 blocking legs + 4 advisory legs + 15 image pulls + the servers' wait (no build: the
     # binaries are the build-tests artifact).
     timeout-minutes: 45
     # The target baseline is proven by integration-pg before the sources are fanned out over it.
-    needs: integration-pg
+    needs: [scope, integration-pg]
     env:
       COMPOSE_FILE: docker-compose.test.yml
       # `prerelease` unlocks mariadb131-rc and mariadb132-pre, the two pre-release sources (the same
@@ -1059,8 +1144,8 @@ jobs:
     # annotates the run but does not block it, exactly like the target matrix's advisory pre-release
     # tier.
     name: integration (postgres source, pg14 + pg15 + pg16 + pg17 + pg18 blocking, pg19rc2 advisory)
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
-    needs: integration-pg
+    if: needs.scope.outputs.heavy == 'true' && needs.scope.outputs.full == 'true'  # the comprehensive set: not a draft or docs-only PR, and pushes, ci:full PRs and manual runs only
+    needs: [scope, integration-pg]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -1182,7 +1267,8 @@ jobs:
 
   e2e:
     name: image smoke + end-to-end
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_call' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)  # the nightly runs only the soak jobs; a draft PR runs only the fast jobs
+    needs: scope
+    if: needs.scope.outputs.heavy == 'true' && needs.scope.outputs.full == 'true'  # the comprehensive set: not a draft or docs-only PR, and pushes, ci:full PRs and manual runs only
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -1402,8 +1488,8 @@ jobs:
     # window. The full five kinds of smoke chaos need the nightly's 30-minute smoke (10 events
     # per hour).
     name: soak smoke (mysql84, bounded 5 min)
-    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}  # a draft PR runs only the fast jobs; marking it ready starts this (and it needs the build-tests binaries)
-    needs: build-tests
+    if: needs.scope.outputs.heavy == 'true' && needs.scope.outputs.full == 'true'  # slow tier: pushes to main, ci:full pull requests and manual runs (it needs the build-tests binaries)
+    needs: [scope, build-tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
