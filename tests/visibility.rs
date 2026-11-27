@@ -521,6 +521,197 @@ fn visibility_gtid_fence_exact() {
     });
 }
 
+/// #319: an XA transaction that is the last one before a flush, on an engine with nothing of its
+/// own in flight. The server logs `XA COMMIT` before InnoDB makes it visible (the same window
+/// `WIDEN` opens for any commit; measured: logged after 0.4 ms, visible after the whole delay, and
+/// absent from `gtid_executed` until then), so the GTID wait must name that commit's own GTID.
+/// The engine kept the XA COMMIT's / XA ROLLBACK's number (and a ONE PHASE commit's) out of the
+/// consumed set it waits on: the wait returned at once, the flush read the row as it was before
+/// the commit, and nothing ever marked it again. Each tail below is checked against the oracle,
+/// then the saved cursor's set must name every XA transaction the engine read: the set the
+/// fence waits on is the one the cursor saves (`executed_gtid_text`).
+#[test]
+fn visibility_gtid_fence_covers_xa_commit() {
+    let _serial = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+    scenario("visibility_gtid_fence_covers_xa_commit", |ctx| async move {
+        if !opted_in(OPT_IN) {
+            ctx.skip(OPT_IN_SKIP);
+            return Ok(());
+        }
+        let db = ctx.new_db("vis_xa_tail").await?;
+        let mut admin = db.conn().await?;
+        let f = Fences::probe(&mut admin).await?;
+        if !f.gtid_fence() {
+            ctx.log(format!(
+                "the GTID wait does not apply here: {} runs on this flavor",
+                f.covering_test()
+            ));
+            return Ok(());
+        }
+        let specs = vec![view()];
+        // A longer window than `WIDEN`'s: the engine's read must land inside it on a loaded runner.
+        let widen = [
+            ("sync_binlog", "0"),
+            ("binlog_group_commit_sync_delay", "500000"),
+        ];
+        let mut globals = Globals::set(&mut admin, &db.dsn, &widen).await?;
+        let r = xa_tail_run(&ctx, &db, &specs).await;
+        let restored = globals.restore(&mut admin).await;
+        let log_path = both(r, restored)?;
+        let log = std::fs::read_to_string(&log_path)?;
+        ensure_exact(&log, &log_path, &f)?;
+        Ok(())
+    });
+}
+
+/// The three tails of [`visibility_gtid_fence_covers_xa_commit`]: two-phase COMMIT, ONE PHASE and
+/// ROLLBACK, each on an idle engine, each checked; then the saved set. Returns the engine's log.
+async fn xa_tail_run(ctx: &Ctx, db: &Db, specs: &[ViewSpec]) -> Result<std::path::PathBuf> {
+    let (mut c, mut eng) = start(ctx, db, specs).await?;
+    // No view reads it: a row here only makes the engine save past it.
+    exec(&mut c, "CREATE TABLE vis_mark (id INT PRIMARY KEY)").await?;
+    let mut xa_gtids: Vec<String> = Vec::new();
+    for (i, (xid, end)) in [
+        ("vxa1", &["XA PREPARE 'vxa1'", "XA COMMIT 'vxa1'"][..]),
+        ("vxa2", &["XA COMMIT 'vxa2' ONE PHASE"][..]),
+        ("vxa3", &["XA PREPARE 'vxa3'", "XA ROLLBACK 'vxa3'"][..]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Nothing of the engine's own in flight: it saved past the marker (that save is visible),
+        // so the flush that reads the XA is the next thing it does and cannot land after the
+        // commit by being late.
+        let mark = marker(&mut c, i).await?;
+        wait_until("the engine to save past the marker", t_catchup(), || {
+            let (db, mark) = (db, mark.clone());
+            async move { Ok(saved_position(db).await?.is_some_and(|p| p >= mark)) }
+        })
+        .await?;
+        let from = server_position(&mut c).await?;
+        let mut stmts = vec![
+            format!("XA START '{xid}'"),
+            // id 3 stays even (in the view) and changes value: a stale read is visible.
+            "UPDATE t SET v = v + 100 WHERE id = 3".to_string(),
+            format!("XA END '{xid}'"),
+        ];
+        stmts.extend(end.iter().map(|s| s.to_string()));
+        exec_all(&mut c, &stmts).await?;
+        let what = format!("{} as the last transaction", end.join(" + "));
+        verify(ctx, &mut eng, db, specs, &what).await?;
+        xa_gtids.extend(xa_group_gtids(&mut c, &from).await?);
+    }
+    ensure!(
+        xa_gtids.len() == 5,
+        "expected the 5 GTIDs of the three XA transactions in the binlog, found {xa_gtids:?}"
+    );
+    let named = xa_gtids.join(",");
+    let covered = wait_until(
+        "the saved cursor's GTID set to name every XA transaction read",
+        t_catchup(),
+        || {
+            let (db, named) = (db, named.clone());
+            async move {
+                let mut c = db.conn().await?;
+                let Some(set) = saved_set(&mut c).await? else {
+                    return Ok(false);
+                };
+                let sql = format!("SELECT GTID_SUBSET({}, {})", q(&named), q(&set));
+                Ok(scalar_i64(&mut c, &sql).await? == 1)
+            }
+        },
+    )
+    .await;
+    if let Err(e) = covered {
+        let set = saved_set(&mut c).await?;
+        return Err(e.context(format!(
+            "the XA transactions {named} are not all in the saved set {set:?}"
+        )));
+    }
+    let log = eng.log_path.clone();
+    eng.stop().await?;
+    Ok(log)
+}
+
+/// Writes marker row `i` and returns the end of that transaction in the binlog (its XID event).
+async fn marker(c: &mut Conn, i: usize) -> Result<lazyview::source::Position> {
+    let from = server_position(c).await?;
+    exec(c, &format!("INSERT INTO vis_mark VALUES ({i})")).await?;
+    let events = rows(
+        c,
+        &format!("SHOW BINLOG EVENTS IN {} FROM {}", q(&from.file), from.pos),
+    )
+    .await?;
+    let mut ours = false;
+    for e in events {
+        let kind = e.get(2).cloned().flatten().unwrap_or_default();
+        let info = e.get(5).cloned().flatten().unwrap_or_default();
+        if kind == "Table_map" {
+            ours = info.contains(".vis_mark)");
+        } else if kind == "Xid" && ours {
+            let pos = e.get(4).cloned().flatten().unwrap_or_default().parse()?;
+            return Ok(lazyview::source::Position {
+                file: from.file,
+                pos,
+            });
+        }
+    }
+    bail!("marker row {i} not found in the binlog after {from}")
+}
+
+/// The GTID set the saved cursor carries (`file:pos[g=…]`), if it carries one.
+async fn saved_set(c: &mut Conn) -> Result<Option<String>> {
+    let cursor = scalar(c, "SELECT binlog_cursor FROM _lazyview_status")
+        .await?
+        .unwrap_or_default();
+    Ok(cursor
+        .split_once("[g=")
+        .and_then(|(_, r)| r.split_once(']'))
+        .map(|(g, _)| g.to_string()))
+}
+
+/// The position the engine last saved (`_lazyview_status`), if it saved one.
+async fn saved_position(db: &Db) -> Result<Option<lazyview::source::Position>> {
+    let mut c = db.conn().await?;
+    let r = rows(
+        &mut c,
+        "SELECT binlog_file, binlog_pos FROM _lazyview_status",
+    )
+    .await?;
+    Ok(r.into_iter().next().and_then(|r| {
+        let file = r.first().cloned().flatten().filter(|f| !f.is_empty())?;
+        let pos = r.get(1).cloned().flatten()?.parse().ok()?;
+        Some(lazyview::source::Position { file, pos })
+    }))
+}
+
+/// The GTIDs of the XA transactions logged since `from`: each one whose GTID event is followed by
+/// `XA START` (a prepared body or a ONE PHASE commit), `XA COMMIT` or `XA ROLLBACK`.
+async fn xa_group_gtids(c: &mut Conn, from: &lazyview::source::Position) -> Result<Vec<String>> {
+    let events = rows(
+        c,
+        &format!("SHOW BINLOG EVENTS IN {} FROM {}", q(&from.file), from.pos),
+    )
+    .await?;
+    let mut out = Vec::new();
+    let mut gtid: Option<String> = None;
+    for e in events {
+        let kind = e.get(2).cloned().flatten().unwrap_or_default();
+        let info = e.get(5).cloned().flatten().unwrap_or_default();
+        if kind.starts_with("Gtid") {
+            gtid = info.split('\'').nth(1).map(str::to_string);
+            continue;
+        }
+        if let Some(g) = gtid.take() {
+            let xa = ["XA START", "XA COMMIT", "XA ROLLBACK"];
+            if kind == "Query" && xa.iter().any(|p| info.starts_with(p)) {
+                out.push(g);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// F7's per-flavor fence (#219): on every flavor, under the widened window, the engine's
 /// dispatch must settle on this flavor's exact fence: the load is `visibility_commit_fence_exact`'s,
 /// the views are exact at every check, and no fallback WARN appears (each flavor's own test
