@@ -926,6 +926,48 @@ fn reg_one_lag_retry_per_target_at_a_time() {
             async move { Ok(n > 0) }
         })
         .await?;
+        // The sequential path — the `supervisor-off` CI leg — cannot show this race at all, and
+        // says so in its own log. One off-mode run measured it (mariadb1011, gate-r17 binaries,
+        // seed 446456367042): `refreshes run sequentially (LAZYVIEW_SUPERVISOR=off)`, then
+        // `slow flush: refresh r_lag_units 50005ms, refresh r_lag_hold 50004ms, refresh (dedup
+        // core) r_lag_units 0ms elapsed=100.011s` with `lagged target refresh failed: target t1:
+        // ... Lock wait timeout exceeded` before t2's attempt even began. One flush runs ONE
+        // refresh at a time, so a gated write holds the whole flush for the server's 50 s
+        // `innodb_lock_wait_timeout`, the two gates are never held at once, and at most one retry
+        // is ever in flight — which is the very thing this scenario pins, so its premise
+        // (step 2, and the fold overlap of steps 5 to 7) is unreachable here rather than broken.
+        // What off mode DOES owe, and what is asserted before standing down, is that the retry
+        // still lands and both targets come exact once the gates open.
+        if std::env::var("LAZYVIEW_SUPERVISOR").as_deref() == Ok("off") {
+            // OPENING the gates, not committing a hold: on this path step 2 never ran, so each
+            // gate row still says `v = 0` and its trigger still SIGNALs the write closed.
+            for (g, table) in [(&mut g1, "r_lag_units"), (&mut g2, "r_lag_hold")] {
+                exec_all(
+                    g,
+                    &[
+                        "START TRANSACTION",
+                        format!("UPDATE lv_gate_{table} SET v = 1 WHERE id = 1").as_str(),
+                        "COMMIT",
+                    ],
+                )
+                .await?;
+            }
+            verify_targets(
+                &ctx,
+                &mut eng,
+                &db,
+                &targets,
+                &HashMap::new(),
+                &specs,
+                "both targets caught up once the gates opened",
+            )
+            .await?;
+            eng.stop().await?;
+            ctx.skip(
+                "the supervisor is off: a flush runs one refresh at a time, so two lag retries are never in flight at once and the claim race #391 is made of cannot occur (the measured sequential flush is quoted above); the concurrent leg runs this scenario in full",
+            );
+            return Ok(());
+        }
         // 2. Both gates hold instead: each target's next retry waits at its gate.
         exec_all(
             &mut g1,

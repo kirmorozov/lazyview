@@ -2210,7 +2210,19 @@ fn short_img_view(name: &str, json: bool) -> ViewSpec {
 /// Waits for `/stats` to publish a view whose short-image counter reached `want` (a flush
 /// publishes it, and after a quiet workload only the periodic flush does). The counter is
 /// cumulative, so a step asks for its own number and publication lag cannot make it wrong.
-async fn wait_short_images(eng: &Engine, db: &Db, view: &str, want: u64) -> Result<ViewStats> {
+/// `since` is the snapshot the scenario took before the write that should produce the count: the
+/// failure names the flushes that ran in that window, because the counter is one per view per
+/// flush (guard `ViewDirty::short_image`, `src/accumulate.rs:444`) and reaches `/stats` only when a
+/// flush publishes it. A red at `flushes <= 1` says the two updates batched into one flush, which is
+/// the test's own premise failing, not the charge; a red at many flushes says the fold ran and the
+/// count did not arrive, which is the engine's.
+async fn wait_short_images(
+    eng: &Engine,
+    db: &Db,
+    view: &str,
+    want: u64,
+    since: &lazyview::Snapshot,
+) -> Result<ViewStats> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         if let Some(s) = eng.view_stats(db, view) {
@@ -2218,12 +2230,28 @@ async fn wait_short_images(eng: &Engine, db: &Db, view: &str, want: u64) -> Resu
                 return Ok(s);
             }
         }
+        // Named because the two ways a count goes missing are distinguishable only here: the
+        // tally can fail to be charged (an engine bug), or it can be charged and never arrive —
+        // the fold channel to the aggregator task is bounded and `src/stats.rs:21-24,484-486`
+        // drops a batch the full channel refuses, counting it in `batches_dropped`, and this
+        // counter is cumulative, so a dropped fold loses its contribution for good. A red with a
+        // non-zero `drop` is a publication loss, not a lost charge; the same naming is what
+        // `tests/common/soakcheck.rs:898` does for the same reason. `fl` separates the third way:
+        // the charge is one per view per flush, so a step that never got a second flush could not
+        // publish 2 however correct the engine was.
+        let fl = eng.snapshot().since(since).flushes;
+        let drop = eng.metrics.view_stats.snapshot().batches_dropped;
         ensure!(
             std::time::Instant::now() < deadline,
             "the unreadable image was never counted in /stats within 20 s ({} short images so \
-             far, wanted {want})",
+             far, wanted {want}, {fl} flushes in this step, /stats batches_dropped {drop}){}",
             eng.view_stats(db, view)
-                .map_or(0, |s| s.cascade_short_images)
+                .map_or(0, |s| s.cascade_short_images),
+            if drop > 0 {
+                " — this count may have been in a dropped batch, not uncharged"
+            } else {
+                ""
+            }
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -2279,7 +2307,7 @@ fn reg_cascade_partial_child_json() {
         )
         .await?;
         let want = u64::from(partial);
-        let s = wait_short_images(&eng, &db, "r_part_json", want).await?;
+        let s = wait_short_images(&eng, &db, "r_part_json", want, &f0).await?;
         let d = eng.snapshot().since(&f0);
         // The unreadable row is counted once, and leaves the map unable to vouch for what it
         // keeps (`Cache::distrust`), so the parent delete that follows is not trusted to the
@@ -2348,7 +2376,7 @@ fn reg_cascade_short_image_minimal() {
             "the group after a MINIMAL child update",
         )
         .await?;
-        let s = wait_short_images(&eng, &db, "r_short_min", 1).await?;
+        let s = wait_short_images(&eng, &db, "r_short_min", 1, &f0).await?;
         let d = eng.snapshot().since(&f0);
         ensure!(
             d.full_rebuilds <= 1
@@ -2374,7 +2402,7 @@ fn reg_cascade_short_image_minimal() {
             "the group after a MINIMAL parent key update",
         )
         .await?;
-        let s = wait_short_images(&eng, &db, "r_short_min", 2).await?;
+        let s = wait_short_images(&eng, &db, "r_short_min", 2, &f1).await?;
         let d = eng.snapshot().since(&f1);
         ensure!(
             d.full_rebuilds <= 1
@@ -2405,7 +2433,7 @@ fn reg_cascade_short_image_minimal() {
             "the group after a NOBLOB child update",
         )
         .await?;
-        let s = wait_short_images(&eng, &db, "r_short_min", 3).await?;
+        let s = wait_short_images(&eng, &db, "r_short_min", 3, &f2).await?;
         let d = eng.snapshot().since(&f2);
         ensure!(
             d.full_rebuilds <= 1
