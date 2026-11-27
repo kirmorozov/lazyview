@@ -78,7 +78,8 @@ fn provable_omission(t: &TableInfo, omitted: usize) -> Option<usize> {
 /// A column that is not in the image is not readable (see [`provable_omission`]), and neither is
 /// one the image carries as a partial-JSON diff (`PARTIAL_JSON`): the diff must be applied to the
 /// row's old value, which an image of the change does not hold. The caller treats such a row as
-/// short and refreshes what it cannot read; a full image — `binlog_row_image = FULL` with no
+/// short and answers it on the streamed path (the counted rebuild in `accumulate`, the #167
+/// whole-view refresh at the engine's reader guard); a full image — `binlog_row_image = FULL` with no
 /// partial JSON updates, the shape of every ordinary write — pays the one length comparison and
 /// one presence test per column read, as before.
 pub fn carries(t: &TableInfo, r: &BinlogRow, mut need: impl Iterator<Item = usize>) -> bool {
@@ -283,8 +284,9 @@ pub struct Cache {
     /// The map cannot vouch for what it keeps: a row it had to keep arrived in an image it could
     /// not read (neither its key nor its FK is provable from it), or a parent change whose image it
     /// could not read never moved the rows it keeps. Until the cache is seeded again, no kept row
-    /// of a route may be trusted to name the units a parent change moves: such a change refreshes
-    /// the view as a whole instead, as in a [`Cache::gap`] window.
+    /// of a route may be trusted to name the units a parent change moves: such a change is not
+    /// trusted to the map at all — it costs the streamed rebuild, which seeds the cache again
+    /// (unlike a [`Cache::gap`] window, whose mark is healed by the window's seed read).
     pub distrust: bool,
     pub warned_at: u64,
 }
@@ -672,7 +674,7 @@ mod tests {
         // A column past the end of the image is not readable either.
         assert!(!carries(t, &full, 3..=9));
         // A VIRTUAL generated column is in no UPDATE or DELETE image: an image of the other
-        // columns is a full one for the route, and the row needs no refresh.
+        // columns is a full one for the route, and the row is never charged as short.
         let v = route_generated(false);
         assert!(carries(&v.child_table, &full, 3..=4));
         assert!(kept(&v, &full).unwrap().1.complete);

@@ -68,7 +68,8 @@ pub struct Tally {
     pub xa_unknown_commits: u64,
     /// Flushes in which a row the cascade cache keeps, or a cascade parent's row, arrived in an
     /// image the view cannot read (a short image, a partial JSON update): counted once per view
-    /// per flush, because the remedy is one whole-view refresh, never a rebuild.
+    /// per flush, because every unreadable image of a flush costs that view one streamed answer
+    /// (the cascade feed's rebuild, or the engine reader guard's #167 whole-view refresh).
     pub cascade_short_images: u64,
 }
 

@@ -2139,7 +2139,11 @@ fn reg_cascade_window_seed_replay() {
 
 // ---------------------------------------------------------------------------------------------
 // Short row images on the cascade path (#58, C-02): an image that omits a column the view reads
-// refreshes the view as a whole; it never rebuilds it, and never leaves it stale. The fail-before
+// is answered on the streamed path — the cascade feed takes its rebuild (main's answer, the
+// `mv::fill` cursor build), the engine's reader guard its #167 whole-view refresh — and the view
+// is never left stale. The in-memory whole-view read (`dirty.all`) is closed to new uses until
+// the streamed whole-view refresh lands (path-to-green step 1c, the owner's rule), which is why
+// these sites keep `dirty.rebuild` rather than `mark_all`. The fail-before
 // pair for the rule is `reg_cascade_short_image_minimal`, which every flavor in the entry's list
 // runs (both families write MINIMAL and NOBLOB images), and `reg_cascade_partial_child_json`,
 // which only the MySQL family can make. `reg_cascade_virtual_only_image` is the guard, not a
@@ -2226,10 +2230,12 @@ async fn wait_short_images(eng: &Engine, db: &Db, view: &str, want: u64) -> Resu
 }
 
 /// `PARTIAL_JSON` (the MySQL family only): a child row the map keeps whose JSON column arrives as
-/// a diff is not readable, so the units its cascade changes are unknown — the view is refreshed
-/// as a whole, counted, and stays exact; never rebuilt. On MariaDB there is no partial JSON
+/// a diff is not readable, so the units its cascade changes are unknown — the row goes uncounted
+/// never, and the view is never left stale: the unreadable row is counted and leaves the map
+/// unable to vouch for what it keeps (`Cache::distrust`), and the parent delete that follows is
+/// answered on the streamed path (the distrust rebuild). On MariaDB there is no partial JSON
 /// update to make: the same workload runs as an ordinary full image and must cost neither a
-/// refresh nor a short-image count (the flavor-neutral half, asserted rather than skipped).
+/// count nor a distrust-driven rebuild (the flavor-neutral half, asserted rather than skipped).
 #[test]
 fn reg_cascade_partial_child_json() {
     scenario("reg_casc_part_json", |ctx| async move {
@@ -2275,26 +2281,23 @@ fn reg_cascade_partial_child_json() {
         let want = u64::from(partial);
         let s = wait_short_images(&eng, &db, "r_part_json", want).await?;
         let d = eng.snapshot().since(&f0);
-        // One refresh for the unreadable row, and one for the parent delete that follows it: the
-        // row left the map unable to vouch for what it keeps (`Cache::distrust`), so a parent
-        // change refreshes the view instead of trusting it. Two flushes' worth, with slack for a
-        // write that lands while a refresh is in flight.
+        // The unreadable row is counted once, and leaves the map unable to vouch for what it
+        // keeps (`Cache::distrust`), so the parent delete that follows is not trusted to the
+        // map either: measured on mysql84, the two of them pay the streamed path one rebuild
+        // each (feed_map's own site, then the distrust arm before the first build swaps). On
+        // MariaDB the workload is a full image and none of this fires (`want` is 0 there).
         ensure!(
-            d.full_rebuilds == 0
+            d.full_rebuilds <= want + 1
                 && s.cascade_short_images - s0.cascade_short_images == want
                 && s.whole_view_refreshes - s0.whole_view_refreshes <= want + 2,
-            "a partial JSON child update {} a rebuild, was not counted, or refreshed the whole \
-             view beyond one per flush: {s:?} {}",
-            if d.full_rebuilds == 0 {
-                "cost"
-            } else {
-                "caused"
-            },
+            "a partial JSON child update cost more rebuilds than the two its unreadable row and \
+             its distrusted parent change pay, was not counted, or refreshed the whole view \
+             beyond one per flush: {s:?} {}",
             fmt_snapshot(&d)
         );
         ctx.log(format!(
-            "partial JSON child update ({}): refreshed the whole view within budget, {} short \
-             image(s)",
+            "partial JSON child update ({}): answered on the streamed path within budget, {} \
+             short image(s)",
             ctx.flavor(),
             s.cascade_short_images - s0.cascade_short_images
         ));
@@ -2303,16 +2306,18 @@ fn reg_cascade_partial_child_json() {
 }
 
 /// A session that overrides `binlog_row_image` (the misconfiguration #58 is made of): a kept child
-/// row and a cascade parent that arrive as short images are unreadable, so each costs one
-/// whole-view refresh and one count — never a rebuild, and never a stale view. Both server
-/// families take the same case: `MINIMAL` and `NOBLOB` exist on both, and both ship the
+/// row and a cascade parent that arrive as short images are unreadable, so each is counted once
+/// and answered on the streamed path — the feed's sites take their rebuild (main's answer), the
+/// engine's reader guard its #167 whole-view refresh — and the view is never left stale. Both
+/// server families take the same case: `MINIMAL` and `NOBLOB` exist on both, and both ship the
 /// present-column bitmaps the reader's C-02 guard tests, so the short events are answered there,
 /// ahead of the cascade feed — and the guard charges what the feed's own sites charge (count and
 /// map distrust, `Engine::note_short_image`), which is what this test proves reaches `/stats`.
 /// Such an image also leaves the cascade map unable to vouch for the rows it keeps
-/// (`Cache::distrust`), so from then on a parent change refreshes the view rather than trusting
-/// the map: step (3)'s parent delete is the case that pinned that rule down, whose child row the
-/// map still filed under the key step (2)'s unreadable update should have moved it from.
+/// (`Cache::distrust`), so the parent change that follows is answered by the distrust rebuild
+/// rather than trusted to the map (which heals it by seeding again): steps (1) and (3)'s parent
+/// deletes are the cases that pinned that rule down, whose child rows the map still filed under
+/// the keys the unreadable updates should have moved them from.
 #[test]
 fn reg_cascade_short_image_minimal() {
     scenario("reg_casc_short_min", |ctx| async move {
@@ -2346,11 +2351,12 @@ fn reg_cascade_short_image_minimal() {
         let s = wait_short_images(&eng, &db, "r_short_min", 1).await?;
         let d = eng.snapshot().since(&f0);
         ensure!(
-            d.full_rebuilds == 0
+            d.full_rebuilds <= 1
                 && s.cascade_short_images - s0.cascade_short_images >= 1
                 && s.whole_view_refreshes - s0.whole_view_refreshes <= 3,
-            "a MINIMAL child update and the parent delete that took it cost a rebuild, nothing at \
-             all, or more than one whole-view refresh per flush: {s:?} {}",
+            "a MINIMAL child update and the parent delete that took it cost more than the one \
+             counted short image and the one rebuild its distrusted map pays, or more than one \
+             whole-view refresh per flush: {s:?} {}",
             fmt_snapshot(&d)
         );
         // (2) A cascade parent in a MINIMAL image: its key is there and the rest is not, so the
@@ -2371,7 +2377,7 @@ fn reg_cascade_short_image_minimal() {
         let s = wait_short_images(&eng, &db, "r_short_min", 2).await?;
         let d = eng.snapshot().since(&f1);
         ensure!(
-            d.full_rebuilds == 0
+            d.full_rebuilds <= 1
                 && s.cascade_short_images - s0.cascade_short_images >= 2
                 && s.whole_view_refreshes - s0.whole_view_refreshes <= 6,
             "a MINIMAL parent key update cost a rebuild, went uncounted, or cost more than one \
@@ -2402,16 +2408,17 @@ fn reg_cascade_short_image_minimal() {
         let s = wait_short_images(&eng, &db, "r_short_min", 3).await?;
         let d = eng.snapshot().since(&f2);
         ensure!(
-            d.full_rebuilds == 0
+            d.full_rebuilds <= 1
                 && s.cascade_short_images - s0.cascade_short_images >= 3
                 && s.whole_view_refreshes - s0.whole_view_refreshes <= 9,
-            "a NOBLOB child update and the parent delete that took it cost a rebuild, went \
-             uncounted, or cost more than one whole-view refresh per flush: {s:?} {}",
+            "a NOBLOB child update and the parent delete that took it cost more than the one \
+             counted short image and the one rebuild its distrusted map pays, or more than one \
+             whole-view refresh per flush: {s:?} {}",
             fmt_snapshot(&d)
         );
         ctx.log(format!(
-            "session row-image overrides ({}): every unreadable image refreshed the view once, \
-             never rebuilt it",
+            "session row-image overrides ({}): every unreadable image was counted, the streamed \
+             path answered it, and the view never went stale",
             ctx.flavor()
         ));
         eng.stop().await

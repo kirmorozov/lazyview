@@ -6148,13 +6148,14 @@ impl Engine {
     /// way: when the event names the unit keys of all its routes on this table — the unit
     /// columns present in both images — exactly those units are marked and the refresh reads
     /// their current rows from the source; otherwise the view is marked for one whole-view
-    /// refresh (`accumulate::mark_all`, the #167 path: a refresh, not a rebuild). A whole-view
-    /// answer for a version that follows a cascade route on this table is the answer the
-    /// cascade feed would have given this event, which it never sees (the guard above consumes
-    /// it): it charges the same counted short image and distrusts the cascade map the same way
-    /// (`ViewDirty::short_image`, `Cache::distrust`, the #58 sites in accumulate.rs). Versions
-    /// whose rows the dedup core's consumer takes always take the whole-view refresh: the
-    /// consumer is copy-set code and cannot tell the compacted image from a full one.
+    /// refresh (`accumulate::mark_all`, the #167 path: a refresh, not a rebuild). A version
+    /// that follows a cascade route on this table is charged what the cascade feed charges an
+    /// image it cannot read — the counted `ViewDirty::short_image()` and `Cache::distrust`, the
+    /// #58 sites in accumulate.rs — because the guard above consumes the event and the feed
+    /// never classifies the row itself. (The feed answers such an image with its streamed
+    /// rebuild; the guard keeps its own #167 whole-view answer, main's.) Versions whose rows
+    /// the dedup core's consumer takes always take the whole-view refresh: the consumer is
+    /// copy-set code and cannot tell the compacted image from a full one.
     #[allow(clippy::too_many_arguments)]
     fn note_short_image(
         &mut self,
@@ -6319,7 +6320,8 @@ impl Engine {
                     if cascade {
                         // The map never classified this row either: same one count per view
                         // per flush and the same distrust the feed path charges a short image
-                        // with, so /stats tells the operator why the view keeps refreshing.
+                        // with (its answer is the streamed rebuild), so /stats tells the
+                        // operator why the view keeps being answered as a whole.
                         dirty.short_image();
                         dirty.cache.distrust = true;
                     }
