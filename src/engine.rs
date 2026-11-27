@@ -27,7 +27,7 @@ use crate::analyze::{self, Mode, ViewPlan};
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position};
 use crate::cascade;
 use crate::catalog::{Catalog, TableInfo, TableRef};
-use crate::config::{Config, MissingBinlog, StartMode};
+use crate::config::{Config, LagOverBudget, MissingBinlog, StartMode};
 use crate::coord;
 use crate::datum::{Datum, Key};
 use crate::lookback::Lookback;
@@ -503,10 +503,23 @@ struct Lag {
     since: Position,
     failures: u32,
     retry_at: Instant,
+    /// When this target started being behind: the keys kept for it are held no longer than
+    /// `held_since.elapsed()` over [`Config::lag_hold_max`] (`exec::Dedup::lag_overflow`, the
+    /// bound that acts on them; review R-01). A `Lag` entry outlives its retries, so this is the
+    /// one place that says how long the engine has been waiting for this target.
+    held_since: Instant,
     /// Reported down (`Down`): excluded from the refresh's targets and retried here, with its
     /// keys kept. Its kept keys live only in memory, so the saved position waits for its
     /// `since` (`pending_floor`) and a restart replays the outage rather than losing them.
     down: bool,
+    /// The bound expired: the executor hook (`exec::Dedup::lag_overflow`) dropped this target's
+    /// key sets because it stayed behind past its own budget and past `Config::lag_hold_max`.
+    /// There is nothing left to apply, so `retry_lag` never calls it caught up, [`lag_floor`] no
+    /// longer waits for its `since`, and its state row names what was dropped and what the
+    /// operator must do (rebuild that target). Nothing here rebuilds it: a shed target is never
+    /// answered with a build of the live view (owner rule), not even by `retry_down`, which
+    /// leaves every target that still has a `lag` entry alone.
+    shed: bool,
 }
 
 /// Lowers `floor` to `p` when that is a known position older than it.
@@ -517,11 +530,15 @@ fn lower_pos(floor: &mut Position, p: Option<&Position>) {
 }
 
 /// Lowers `floor` to the oldest `since` among the changes kept for targets that are behind,
-/// a target reported down included. The kept keys live only in memory, so the saved position
+/// a target reported down included (a target whose keys were dropped by the lag bound is not:
+/// there is nothing left to replay them into). The kept keys live only in memory, so the saved position
 /// waits for them and a restart replays the outage from the binlog, rebuilding the same key
 /// sets, instead of leaving that target silently stale.
 fn lag_floor(floor: &mut Position, lag: &BTreeMap<String, Lag>) {
-    for g in lag.values() {
+    // A shed entry waits for nothing: its keys are gone (`exec::Dedup::lag_overflow`), so holding
+    // the position at its `since` would only grow the replay a restart has to do, for a target
+    // that may never come back at all.
+    for g in lag.values().filter(|g| !g.shed) {
         lower_pos(floor, Some(&g.since));
     }
 }
@@ -1310,7 +1327,8 @@ const STATS_PUBLISH_INTERVAL: u64 = 15;
 /// with no limit gets the constants the engine carried before: 32 MiB for this queue and 256 MiB
 /// for each of the three holds below (`Config::mem.build_hold_bytes`, `.xa_hold_bytes`,
 /// `.lag_hold_bytes`, documented where they act: `hold_for_builds`, the unrouted rows of a
-/// prepared XA in `on_rows`, and `lag_over_budget`).
+/// prepared XA in `on_rows`, and the keys kept for targets that are behind, bounded per target
+/// by the executor hook `exec::Dedup::lag_overflow` (the arm `Config::lag_over_budget` names).
 const DRAIN_MAX_EVENTS: usize = 100_000;
 /// Queue slots kept once a drained queue is empty again (a larger queue is shrunk to this).
 const DRAIN_KEEP_SLOTS: usize = 1024;
@@ -2375,6 +2393,16 @@ impl Engine {
             // reading (dedup::over_bound), never allocates past it.
             cfg.mem.dedup_max_bytes,
         );
+        // The lag bound's policy travels to the executor with the other budgets: the arm
+        // `LAZYVIEW_LAG_OVER_BUDGET` names, what ONE target behind may hold, and how long the
+        // engine holds a behind target's keys at all. The binlog reader loop has no branch on it
+        // (guard S4); `lag_overflow` is the only place that reads the arm.
+        let mut dedup = dedup;
+        dedup.set_lag_policy(crate::exec::LagPolicy {
+            arm: cfg.lag_over_budget,
+            target_bytes: cfg.mem.lag_target_bytes,
+            hold_max: cfg.lag_hold_max,
+        });
         // Detached: the task ends when the engine, owner of its only sender, is dropped.
         let (stats_tx, stats_task) = crate::stats::spawn_aggregator(metrics.view_stats.clone());
         drop(stats_task);
@@ -4887,6 +4915,11 @@ impl Engine {
                     {
                         break 'reconnect;
                     }
+                    // And no hold for the keys kept for a target that is behind: one target
+                    // that never comes back must never stop the shared reader, whose other
+                    // targets are healthy (review R-01, guard S4: any pause of the shared reader
+                    // for one target is a finding). That buffer is bounded per target where its
+                    // keys are consumed, by the executor hook `exec::Dedup::lag_overflow`.
                 }
                 if !self.in_txn {
                     self.housekeeping().await?;
@@ -5973,9 +6006,16 @@ impl Engine {
         if let LeaderState::Fenced(why) = &*self.leader_state.borrow() {
             bail!("fenced: {why}");
         }
-        // The changes kept for targets that are behind are bounded: past the budget the engine
-        // only reports (`lag_over_budget`) — nothing is dropped and nothing is rebuilt, the
-        // saved position waits for the kept keys instead (`pending_floor`).
+        // What the targets that are behind are owed in total is REPORTED here (review R-01): the
+        // gauge, the `lag_over_budget` counter and one warn per crossing. What acts on them is per
+        // target, at the site that consumes one target's keys (`retry_lag`, the executor hook
+        // `exec::Dedup::lag_overflow`) — never a pause of the shared reader, which one behind
+        // target may not cause. Cost (guard R3): one pass over the slots' lag entries per tick,
+        // never per event, and it is this pass that publishes `lag_bytes_held`.
+        Metrics::set(
+            &self.metrics.gauges.lag_bytes_held,
+            self.lag_held_bytes() as u64,
+        );
         match self.lag_over_budget() {
             Some(held) if !self.lag_budget_warned => self.report_lag_over_budget(held),
             Some(_) => {}
@@ -6822,13 +6862,11 @@ impl Engine {
         (held > budget).then_some(held)
     }
 
-    /// The estimated bytes kept for targets that are behind, when they exceed their budget
-    /// (`Config::mem.lag_hold_bytes`; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). One pass over the slots;
-    /// called from `housekeeping`, never per event and never per flush. The budget is a
-    /// reporting threshold only: passing it drops nothing and rebuilds nothing (see
-    /// [`Self::report_lag_over_budget`]).
-    fn lag_over_budget(&self) -> Option<usize> {
-        let budget = self.cfg.mem.lag_hold_bytes;
+    /// The estimated bytes kept for targets that are behind, over every view and target
+    /// (`Lag.units` + `Lag.partial`, at the `units_bytes` estimate). One pass over the slots' lag
+    /// entries; called from `housekeeping` (which publishes it as the `lag_bytes_held` gauge) and
+    /// from the per-target bound — never per event and never per flush on the event path.
+    fn lag_held_bytes(&self) -> usize {
         let held: usize = self
             .slots
             .iter()
@@ -6836,15 +6874,30 @@ impl Engine {
             .flat_map(|l| l.lag.values())
             .map(|g| units_bytes(&g.units, &g.partial))
             .sum();
-        (held > budget).then_some(held)
+        held
     }
 
-    /// The budget of the changes kept for targets that are behind was passed: report only, take
-    /// no action. A target that is down has nothing draining its keys while it is unreachable,
-    /// but they are sets, bounded by the distinct ids the view can have, so it keeps them until
-    /// it catches up; the saved position waits for them ([`lag_floor`]), so a restart replays
-    /// the outage instead of losing the changes silently. Names the target that has been behind
-    /// longest: it is the one keeping keys the longest, usually the unreachable one. Called
+    /// The estimated bytes kept for targets that are behind, when they exceed their budget
+    /// (`Config::mem.lag_hold_bytes`; `LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests). The aggregate is
+    /// what is REPORTED, on the crossing ([`Self::report_lag_over_budget`]); the bound that acts is
+    /// per target, on that target's own share (`Config::mem.lag_target_bytes`) and the hold's
+    /// deadline (`Config::lag_hold_max`), decided by the executor hook
+    /// `exec::Dedup::lag_overflow` at the site that consumes its keys. The arm
+    /// `Config::lag_over_budget` names which bound that is; `drop_refresh` is refused at config
+    /// time until M2b lands the bounded sweep it ends in.
+    fn lag_over_budget(&self) -> Option<usize> {
+        let held = self.lag_held_bytes();
+        (held > self.cfg.mem.lag_hold_bytes).then_some(held)
+    }
+
+    /// The budget of the changes kept for targets that are behind was passed: name it once. The
+    /// bound itself acts separately and per target, at the site that consumes that target's keys
+    /// (`retry_lag`, the executor hook `exec::Dedup::lag_overflow`) — this line is what tells an
+    /// operator which target is being waited for, and the shared reader is never held for it. A target that is down has nothing draining its keys while it is
+    /// unreachable, but they are sets, bounded by the distinct ids the view can have, so it keeps
+    /// them until it catches up; the saved position waits for them ([`lag_floor`]), so a restart
+    /// replays the outage instead of losing the changes silently. Names the target that has been
+    /// behind longest: it is the one keeping keys the longest, usually the unreachable one. Called
     /// once per crossing (the `lag_budget_warned` latch), not per housekeeping tick.
     fn report_lag_over_budget(&mut self, held: usize) {
         self.lag_budget_warned = true;
@@ -6862,8 +6915,12 @@ impl Engine {
             }
         }
         if let Some((view, target)) = best {
+            let acts = match self.cfg.lag_over_budget {
+                LagOverBudget::Pause => "its own share of the budget and the hold's deadline bound the keys kept for it, and past both the executor hook drops them and reports it",
+                LagOverBudget::DropRefresh => "its key set is dropped and the view refreshed",
+            };
             warn!(view = %view, target = %target, buffered_mib = held >> 20,
-                "the changes kept for this target exceed their {budget} byte budget; they are kept until it catches up, and the saved position waits for them");
+                "the changes kept for this target exceed their {budget} byte budget; they are kept until it catches up, the saved position waits for them, and {acts}");
         }
     }
 
@@ -8205,6 +8262,8 @@ impl Engine {
                 failures: 1,
                 retry_at: Instant::now() + connect_retry_delay(1),
                 down: false,
+                held_since: Instant::now(),
+                shed: false,
             });
         }
         // A target flagged behind (`mark_behind_targets`) that this refresh applied to none of:
@@ -8224,6 +8283,8 @@ impl Engine {
                         failures: 0,
                         retry_at: Instant::now() + connect_retry_delay(1),
                         down: false,
+                        held_since: Instant::now(),
+                        shed: false,
                     },
                 );
             }
@@ -8367,6 +8428,8 @@ impl Engine {
                     failures: 0,
                     retry_at: now,
                     down: false,
+                    held_since: now,
+                    shed: false,
                 };
                 l.lag.entry(t).or_insert(seed);
             }
@@ -8388,6 +8451,66 @@ impl Engine {
                 continue;
             };
             let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
+            // The bound that acts on the keys kept for THIS target, asked where they are consumed
+            // (review R-01, guard S4): the executor decides what one target behind costs, the
+            // engine carries that out for that target alone, and the shared binlog reader keeps
+            // serving the healthy ones. Cost (guard R3): one pass over one target's kept keys, at
+            // a site that already walks them, once per retry of that target; never per event.
+            let held = units_bytes(&g.units, &g.partial);
+            if self.dedup.lag_overflow(held, g.held_since.elapsed()) == crate::exec::LagAction::Shed
+            {
+                // Its keys go, and it is reported: the memory one unreachable replica holds stays
+                // one replica's, and the saved position stops waiting for keys that are gone
+                // (`lag_floor` skips a shed entry) — so the outage of a decommissioned target can
+                // no longer grow past `Config::lag_hold_max` into a purged binlog and a rebuild of
+                // every view, which is what the unbounded hold used to risk. Nothing is rebuilt:
+                // the target leaves `targets`, its state names the drop, and only an operator
+                // (`_lazyview.rebuild = 1`) brings its rows back.
+                g.units = UnitSet::default();
+                g.partial.clear();
+                g.all = false;
+                g.shed = true;
+                g.failures = g.failures.saturating_add(1);
+                g.retry_at = Instant::now() + connect_retry_delay(g.failures);
+                let was_owed = held > 0;
+                if was_owed {
+                    Metrics::add(&self.metrics.lag_keys_dropped, 1);
+                    warn!(view = %name, target = %t, held_bytes = held, budget = self.cfg.mem.lag_target_bytes,
+                    behind_for = ?g.held_since.elapsed(), hold_max = ?self.cfg.lag_hold_max,
+                    "the keys kept for this target passed its own budget and the hold's deadline: dropped, and this target is reported rather than held; rebuild it (`_lazyview.rebuild = 1`) when it is back");
+                    let (id, hash) = (self.slots[i].def_id, self.slots[i].hash.clone());
+                    self.set_state(
+                    &name,
+                    &t,
+                    id,
+                    &hash,
+                    Some(&plan),
+                    "error",
+                    Some(
+                        "the keys kept for this target were dropped past its lag budget and the hold's deadline: rebuild this target (`_lazyview.rebuild = 1`)",
+                    ),
+                )
+                .await;
+                }
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    l.targets.retain(|x| *x != t);
+                    l.lag.insert(t, g);
+                }
+                if was_owed {
+                    self.rebuild_routes();
+                }
+                continue;
+            }
+            if g.shed {
+                // Reported already and holding nothing: a retry has no keys to apply, and a build
+                // of the live view is never the answer to a dropped key set (owner rule). It stays
+                // behind, at the capped backoff, until an operator acts.
+                g.retry_at = Instant::now() + connect_retry_delay(g.failures.max(1));
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    l.lag.insert(t, g);
+                }
+                continue;
+            }
             let mut d = ViewDirty {
                 units: g.units.clone(),
                 partial: g.partial.clone(),
@@ -10787,6 +10910,8 @@ mod tests {
             failures: 0,
             retry_at: Instant::now(),
             down,
+            held_since: Instant::now(),
+            shed: false,
         }
     }
 

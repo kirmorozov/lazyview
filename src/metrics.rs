@@ -61,10 +61,17 @@ counters!(
     full_rebuilds,
     // Targets brought up to date from the changes kept for them (`retry_lag`).
     target_catchups,
-    // Crossings of the byte budget of the changes kept for targets that are behind: reported
-    // (a warn naming the view, the target and the estimate), never acted on — a target that
-    // is down keeps its keys until it catches up (see `Engine::lag_over_budget`).
+    // Crossings of the AGGREGATE byte budget of the changes kept for targets that are behind:
+    // reported (a warn naming the view, the target and the estimate) — the bound that acts is per
+    // target, and this says how much the instance owes its behind targets in total (see
+    // `Engine::lag_over_budget`, and `lag_keys_dropped` for what the bound cost).
     lag_over_budget,
+    // Key sets the lag bound shed (`exec::Dedup::lag_overflow`, review R-01): one per target that
+    // stayed behind past its own share of the lag budget or past `LAZYVIEW_LAG_HOLD_MAX_MS`. The
+    // target is reported (its state row names it) and never rebuilt: an operator catches it up
+    // with `_lazyview.rebuild = 1`. What keeps one decommissioned replica from holding keys, and
+    // the saved position, for hours.
+    lag_keys_dropped,
     // Failed refresh attempts of live views (each retried with backoff, never a rebuild).
     refresh_errors,
     definition_reloads,
@@ -144,6 +151,11 @@ pub struct Gauges {
     pub starting: AtomicU64,
     /// Rows read from the sources and not yet written to every target.
     pub inflight_rows: AtomicU64,
+    /// Estimated bytes of the keys kept for targets that are behind, all targets together
+    /// (`Engine::lag_held_bytes`), published at the housekeeping tick — never per binlog event.
+    /// Compare with `Config::mem.lag_hold_bytes`; the bound that acts is per target
+    /// (`Config::mem.lag_target_bytes`, `exec::Dedup::lag_overflow`).
+    pub lag_bytes_held: AtomicU64,
 }
 
 /// Gauges of one supervisor connection pool (`pool` = `read` | `write`, `endpoint` = `source` or

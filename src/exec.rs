@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use mysql_async::Conn;
@@ -55,6 +55,38 @@ pub struct Synced {
     pub refused: Vec<(u64, String)>,
 }
 
+/// What the executor's lag hook decided about the keys kept for one target that is behind
+/// ([`Dedup::lag_overflow`], review R-01 / guard S4: the overflow of that buffer is an executor
+/// hook, never a branch of the binlog reader loop — one target behind never stops the shared
+/// reader that the healthy targets are applied with).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LagAction {
+    /// Keep them: the target is inside its own byte share and inside the hold's deadline, so it is
+    /// still owed these units and `retry_lag` catches it up from what it has.
+    Keep,
+    /// Drop them: this target has been behind too long, or with too many keys, for them to be worth
+    /// the memory. The caller sheds that target's key sets alone and reports it; it never rebuilds
+    /// the view (owner rule — an operator does, `_lazyview.rebuild = 1`).
+    Shed,
+}
+
+/// The policy [`Dedup::lag_overflow`] decides with, carried in by the engine at startup
+/// ([`Dedup::set_lag_policy`]) so that the branch on `LAZYVIEW_LAG_OVER_BUDGET` lives on the
+/// executor interface rather than in the stream.
+#[derive(Debug, Clone, Copy)]
+pub struct LagPolicy {
+    /// The arm `Config::lag_over_budget` names.
+    pub arm: crate::config::LagOverBudget,
+    /// The bytes ONE target behind may keep (`Config::mem::lag_target_bytes`), never the instance's
+    /// aggregate: a replica that never comes back costs its own share, not the whole buffer's.
+    pub target_bytes: usize,
+    /// How long the keys kept for a behind target are held at all (`Config::lag_hold_max`). The
+    /// hold is a bound with an end, not a wait on a party that may never return: a decommissioned
+    /// replica, wrong credentials or a target DB down for hours must not be able to hold the
+    /// instance's memory and its saved position for longer than this.
+    pub hold_max: Duration,
+}
+
 /// The core and its targets, by definition id.
 pub struct Dedup {
     pub core: Core<Position>,
@@ -64,6 +96,10 @@ pub struct Dedup {
     gaps: HashMap<u64, Position>,
     /// Consecutive job failures per definition (the backoff of `backoff`).
     failures: HashMap<u64, u32>,
+    /// The bound that acts on the keys kept for targets that are behind, decided by
+    /// [`Self::lag_overflow`] (the engine sets it at startup, [`Self::set_lag_policy`]). Held
+    /// generously by default so a core built by hand (a test) keeps every key.
+    lag: LagPolicy,
     /// Definitions whose plan the core refused: they keep their `RouteT` routes and warn once,
     /// not on every `rebuild_routes` (retried each sync, warned the first time only).
     refused: std::collections::HashSet<u64>,
@@ -111,9 +147,42 @@ impl Dedup {
             waiting: std::collections::HashSet::new(),
             pending_replace: HashMap::new(),
             pending_remove: std::collections::HashSet::new(),
+            lag: LagPolicy {
+                arm: crate::config::LagOverBudget::default(),
+                target_bytes: usize::MAX,
+                hold_max: Duration::MAX,
+            },
             fed: 0,
             wake: None,
             shape_stale: std::collections::HashSet::new(),
+        }
+    }
+
+    /// The engine hands the lag bound's policy to the executor once, at startup, where it hands
+    /// over every other byte budget from `Config`.
+    pub fn set_lag_policy(&mut self, p: LagPolicy) {
+        self.lag = p;
+    }
+
+    /// The bound that acts on the keys kept for ONE target that is behind (review R-01): the engine
+    /// asks it where that target's keys are produced and consumed, so a target that never comes
+    /// back costs its own keys and never the shared binlog reader. `kept` is what that target alone
+    /// holds (its units and partial keys, at the engine's estimate) and `behind_for` how long it
+    /// has been owed them. A target keeps its keys while they fit `LagPolicy::target_bytes` AND it
+    /// is inside `LagPolicy::hold_max` — the byte share bounds the buffer, the deadline bounds the
+    /// wait — and past either the keys of that target alone are shed: an unreachable replica can
+    /// then neither grow its own buffer without end nor, through the position that waits for those
+    /// keys, outlive the source's binlog retention and force the full rebuild of every incremental
+    /// view the hold used to risk. `drop_refresh` (refused at config time until M2b's bounded sweep
+    /// lands) sheds at once, because there its target is answered by a refresh, not by a report.
+    pub fn lag_overflow(&self, kept: usize, behind_for: Duration) -> LagAction {
+        if self.lag.arm == crate::config::LagOverBudget::DropRefresh {
+            return LagAction::Shed;
+        }
+        if kept > self.lag.target_bytes || behind_for >= self.lag.hold_max {
+            LagAction::Shed
+        } else {
+            LagAction::Keep
         }
     }
 
@@ -954,6 +1023,53 @@ mod tests {
                                              JOIN item_values v2 ON v2.key_id = l.parent_id JOIN \
                                              item_values v1 ON v1.item_id = i.id AND v1.key_id = 7 \
                                              GROUP BY l.parent_id, i.id";
+
+    /// The lag bound's two answers (review R-01): the keys kept for ONE target that is behind are
+    /// held while they fit its own share of the buffer AND it is inside the hold's deadline, and
+    /// shed past either. The byte half is what one replica behind may not exceed; the deadline is
+    /// what stops a target that never comes back from holding keys, and the saved position that
+    /// waits for them, for hours. `drop_refresh` sheds at once: its target is answered by a
+    /// refresh, which is the half M2b has to land.
+    #[test]
+    fn lag_overflow_keeps_inside_both_bounds_and_sheds_past_either() {
+        let mut d = dedup();
+        d.set_lag_policy(LagPolicy {
+            arm: crate::config::LagOverBudget::Pause,
+            target_bytes: 4096,
+            hold_max: std::time::Duration::from_secs(60),
+        });
+        let s = std::time::Duration::from_secs;
+        assert_eq!(
+            d.lag_overflow(1, s(1)),
+            LagAction::Keep,
+            "a target inside its share and the deadline is still owed these keys"
+        );
+        assert_eq!(
+            d.lag_overflow(4096, s(59)),
+            LagAction::Keep,
+            "at the byte bound is not over it"
+        );
+        assert_eq!(
+            d.lag_overflow(4097, s(1)),
+            LagAction::Shed,
+            "one target alone may not hold more than its own share of the buffer"
+        );
+        assert_eq!(
+            d.lag_overflow(1, s(60)),
+            LagAction::Shed,
+            "the hold is a bound with an end, never a wait on a party that may never return"
+        );
+        d.set_lag_policy(LagPolicy {
+            arm: crate::config::LagOverBudget::DropRefresh,
+            target_bytes: usize::MAX,
+            hold_max: std::time::Duration::MAX,
+        });
+        assert_eq!(
+            d.lag_overflow(1, s(0)),
+            LagAction::Shed,
+            "the refresh arm sheds at once: the refresh, not the kept keys, answers for it"
+        );
+    }
 
     #[test]
     fn routed_follows_the_access_plan() {
