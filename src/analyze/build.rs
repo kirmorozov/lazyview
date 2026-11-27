@@ -1164,11 +1164,15 @@ fn name_mapped_cascades(
             continue;
         }
         // The bounded read filters `WHERE <fk cols> = <old key>` and is served by an index only when
-        // the FK columns are a LEADING PREFIX of the view's row key (`map.key`, the child's row key:
-        // the identity the materialized rows are keyed by, indexed UNIQUE `_lv_row` / PRIMARY). The
-        // target indexes only its unit / row-key / lineage / `_lv_p` columns, so any other FK set
-        // would be an unindexed full scan of the materialized table — costing more than the
-        // whole-view refresh it replaces — so such a route keeps `mark_all`.
+        // the FK columns are the LEADING row-key columns — the same SET of columns as the first
+        // `child_cols.len()` of `map.key` (the child's row key: the identity the materialized rows are
+        // keyed by, indexed UNIQUE `_lv_row` / PRIMARY), compared as a SET (sorted), so the FK's
+        // declared order relative to the row key does not matter: every tuple binds all FK columns to
+        // constants, so the optimizer still does a composite-index range scan whichever order the FK
+        // is declared in (EXPLAIN-pinned on every family by `reg_cascade_window_named_branch_two_col`,
+        // both forward and reverse). The target indexes only its unit / row-key / lineage / `_lv_p`
+        // columns, so any OTHER FK set would be an unindexed full scan of the materialized table —
+        // costing more than the whole-view refresh it replaces — so such a route keeps `mark_all`.
         let key = c.map.as_ref().expect("map checked above").key.clone();
         let n = c.child_cols.len();
         if n == 0 || n > key.len() {
