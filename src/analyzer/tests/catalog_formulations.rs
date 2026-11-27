@@ -494,3 +494,80 @@ fn not_in_twins_across_join_placements() {
     let w = plan(sql).where_sql.unwrap_or_default();
     assert!(w.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {w}");
 }
+
+/// The same identity through the analyzer, in the shapes the block planner does not plan: a
+/// semi-join subquery (its table adds no rows, `ViewPlan::rows_identified`'s first arm) next to a
+/// FROM table identified by the unit it carries (its row key is among the unit's own columns,
+/// the arm the keyed chunk write of #399 needed), and that table reached through a CTE or a
+/// derived table under another name. The near misses stay unidentified: a composite row key with
+/// a column the unit does not carry, a table the unit reaches by a non-key column (several rows
+/// per unit), and a table without a row key at all.
+#[test]
+fn unit_carrying_from_tables_identify_rows_in_every_formulation() {
+    let mut cat = formulation_catalog();
+    cat.extend([table("notes", &[("ent_id", "int"), ("body", "int")], &[])]);
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let identified_without_a_lineage_key = |v: &ViewPlan| {
+        (1..v.aliases.len())
+            .filter(|&a| v.aliases[a].semi.is_none() && v.aliases[a].pos.0 != usize::MAX)
+            .any(|a| {
+                v.aliases[a]
+                    .table
+                    .row_key()
+                    .is_some_and(|rk| !rk.is_empty())
+                    && v.lineage_of(a).is_none()
+            })
+    };
+    for (sql, semi) in [
+        (
+            "SELECT e.id, e.v, a.v AS av FROM entity e LEFT JOIN attr a ON a.id = e.id \
+             WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            true,
+        ),
+        (
+            "SELECT e.id, e.v, a.v AS av FROM entity e JOIN attr a ON e.id IN (a.id) \
+             WHERE NOT EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            true,
+        ),
+        (
+            "WITH x AS (SELECT id, v FROM entity) \
+             SELECT x.id, x.v, a.v AS av FROM x JOIN attr a ON a.id = x.id",
+            false,
+        ),
+        (
+            "SELECT t.id, t.v, a.v AS av FROM (SELECT id, v FROM entity) t \
+             LEFT JOIN attr a ON a.id IN (t.id)",
+            false,
+        ),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(
+            v.aliases.iter().any(|a| a.semi.is_some()),
+            semi,
+            "{sql}: semi-join table"
+        );
+        assert!(v.rows_identified(), "{sql}");
+        assert!(
+            identified_without_a_lineage_key(&v),
+            "{sql}: identified without the unit arm being used"
+        );
+    }
+    for sql in [
+        // A composite row key: the unit carries one of its two columns.
+        "SELECT e.id, e.v, p.v AS pv FROM entity e LEFT JOIN pair p ON p.a = e.id",
+        "SELECT e.id, p.v AS pv FROM entity e LEFT JOIN pair p ON p.a = e.id AND p.b = e.id",
+        // The unit reaches the table by a column that is not its row key.
+        "SELECT e.id, a.v AS av FROM entity e LEFT JOIN attr a ON a.ent_id = e.id",
+        // A table without a row key: equal rows of it are duplicates.
+        "SELECT e.id, n.body FROM entity e LEFT JOIN notes n ON n.ent_id = e.id",
+        "SELECT e.id, n.body FROM entity e LEFT JOIN notes n ON n.ent_id IN (e.id)",
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert!(!v.rows_identified(), "{sql}");
+    }
+}

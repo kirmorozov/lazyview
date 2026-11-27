@@ -1,0 +1,28 @@
+# The SLOW tier (owner 2026-11-27: "fast checks run for prs and comprehensive only for master").
+# Pull requests run every integration test EXCEPT these (scripts/ci-run-binaries.sh with
+# CI_TIER=fast adds one `--skip <name>` per line); pushes to main and the nightly run everything.
+# Not #[ignore]: every test stays visible to a local `cargo test`. A test moves tiers by editing
+# this file in a PR; build-tests fails when a line matches anything but exactly one test.
+#
+# Format: <suite> <test name>   # CI seconds on mysql84 (main run 9fa7186, tmp/out/lv-worker-test-time/audit.md)
+# Rule of the cut: every test of 30 s or more. The chaos binary (14 scenarios + 5 self-tests, 7.3 min)
+# and the soak legs are slow as a whole: no PR cell runs them (see .github/workflows/ci.yml).
+#
+# Risky paths (src/engine.rs flush/lag/lock/fence code, src/mv.rs writes, src/target/*, src/coord*,
+# src/meta*): a PR that touches them runs these locally through tmp/lvs-suite.sh before `gh pr ready`.
+health            alert_rules_behind_source_and_paused_reader                 # 421.9
+regressions       reg_cascade_refusal_seed_replay                             # 301.2
+migration         migration_definition_change_crawl_outlives_the_fixed_ready_floor  # 289.5
+rename_invariance ri_same_execution_plain_and_renamed                         # 144.0
+regressions       reg_cascade_window_seed_replay                              # 105.8
+exclusive         exclusive_server_restarts_are_not_fatal                     # 87.5
+health            lag_reports_the_gap_after_a_restart                         # 77.9
+health            health_database_outage                                      # 69.5
+rename_invariance ri_same_execution_with_case_varied_columns                  # 68.9
+health            alert_rules_stream_undecodable                              # 66.8
+supervisor        sup_hot_units_converge_without_reordering                   # 55.3
+health            lag_grows_while_the_reader_is_held                          # 46.3
+soak_widen        idle_widening_refreshes_only_the_kind_readers               # 35.7
+health            health_probe_transitions                                    # 32.6
+regressions       reg_down_target_keeps_its_keys                              # 32.4
+health            lag_idle_source_stays_zero                                  # 30.3
