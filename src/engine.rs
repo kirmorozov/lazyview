@@ -6148,7 +6148,11 @@ impl Engine {
     /// way: when the event names the unit keys of all its routes on this table — the unit
     /// columns present in both images — exactly those units are marked and the refresh reads
     /// their current rows from the source; otherwise the view is marked for one whole-view
-    /// refresh (`accumulate::mark_all`, the #167 path: a refresh, not a rebuild). Versions
+    /// refresh (`accumulate::mark_all`, the #167 path: a refresh, not a rebuild). A whole-view
+    /// answer for a version that follows a cascade route on this table is the answer the
+    /// cascade feed would have given this event, which it never sees (the guard above consumes
+    /// it): it charges the same counted short image and distrusts the cascade map the same way
+    /// (`ViewDirty::short_image`, `Cache::distrust`, the #58 sites in accumulate.rs). Versions
     /// whose rows the dedup core's consumer takes always take the whole-view refresh: the
     /// consumer is copy-set code and cannot tell the compacted image from a full one.
     #[allow(clippy::too_many_arguments)]
@@ -6262,6 +6266,19 @@ impl Engine {
                 // keys from the images; whole-view otherwise.
                 let mut al: Vec<(usize, &[u16])> = Vec::new();
                 let mut unitwise = true;
+                // Whether this version answers this table through a cascade route: the parent
+                // of a cascading FK, or a child whose rows the cascade map keeps. The caller
+                // consumed the event here (`feed_rows` never runs for it), so the cascade feed
+                // never gets to decide on this image — the whole-view refresh below is the
+                // answer its own unreadable-image sites would have given it (the three
+                // `ViewDirty::short_image` sites in accumulate.rs). That answer is owed here,
+                // charge included. Computed before the scan below, which stops at the first
+                // route that rules out unit-wise marking.
+                let cascade = route.iter().any(|x| {
+                    x.slot == r.slot
+                        && x.next == r.next
+                        && matches!(x.kind, RouteKind::Cascade(_) | RouteKind::MapChild(_))
+                });
                 for (i, x) in route.iter().enumerate() {
                     if x.slot != r.slot || x.next != r.next {
                         continue;
@@ -6299,6 +6316,13 @@ impl Engine {
                     }
                 } else {
                     dirty.mark_all(plan);
+                    if cascade {
+                        // The map never classified this row either: same one count per view
+                        // per flush and the same distrust the feed path charges a short image
+                        // with, so /stats tells the operator why the view keeps refreshing.
+                        dirty.short_image();
+                        dirty.cache.distrust = true;
+                    }
                 }
                 ver_since.get_or_insert_with(|| since.clone());
             }

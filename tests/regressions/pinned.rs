@@ -2143,8 +2143,11 @@ fn reg_cascade_window_seed_replay() {
 // pair for the rule is `reg_cascade_short_image_minimal`, which every flavor in the entry's list
 // runs (both families write MINIMAL and NOBLOB images), and `reg_cascade_partial_child_json`,
 // which only the MySQL family can make. `reg_cascade_virtual_only_image` is the guard, not a
-// fail-before case: the servers here write trailing VIRTUAL columns into every image, so it
-// passes before the change too and stays to pin that legality down.
+// fail-before case, and what it pins is per-statement legality, not a per-flavor layout: the
+// measured servers differ on the trailing VIRTUAL column (tmp/out/lvs-virtual/pr1/facts.md
+// §F.2) — mysql84 writes it into every image, mariadb114 leaves it out of UPDATE/DELETE images
+// and of INSERT under MINIMAL — and `provable_omission` admits exactly the leaving-out (§F.3:
+// there is no per-flavour layout constant to assume).
 
 /// The three short-image regressions share one shape: `entities` is the parent of a MAP route
 /// into `links` and is not an alias of the view (an alias of it would trace the change itself),
@@ -2302,11 +2305,14 @@ fn reg_cascade_partial_child_json() {
 /// A session that overrides `binlog_row_image` (the misconfiguration #58 is made of): a kept child
 /// row and a cascade parent that arrive as short images are unreadable, so each costs one
 /// whole-view refresh and one count — never a rebuild, and never a stale view. Both server
-/// families take the same case: `MINIMAL` and `NOBLOB` exist on both. Such an image also leaves the
-/// cascade map unable to vouch for the rows it keeps (`Cache::distrust`), so from then on a parent
-/// change refreshes the view rather than trusting the map: step (3)'s parent delete is the case
-/// that pinned that rule down, whose child row the map still filed under the key step (2)'s
-/// unreadable update should have moved it from.
+/// families take the same case: `MINIMAL` and `NOBLOB` exist on both, and both ship the
+/// present-column bitmaps the reader's C-02 guard tests, so the short events are answered there,
+/// ahead of the cascade feed — and the guard charges what the feed's own sites charge (count and
+/// map distrust, `Engine::note_short_image`), which is what this test proves reaches `/stats`.
+/// Such an image also leaves the cascade map unable to vouch for the rows it keeps
+/// (`Cache::distrust`), so from then on a parent change refreshes the view rather than trusting
+/// the map: step (3)'s parent delete is the case that pinned that rule down, whose child row the
+/// map still filed under the key step (2)'s unreadable update should have moved it from.
 #[test]
 fn reg_cascade_short_image_minimal() {
     scenario("reg_casc_short_min", |ctx| async move {
@@ -2412,9 +2418,12 @@ fn reg_cascade_short_image_minimal() {
     });
 }
 
-/// A VIRTUAL generated column no route reads is legal, not a limitation: neither server family
-/// writes one to an UPDATE image (issue #7), and an image of the other columns is a full image
-/// for the route. So neither the kept child row nor the view is short: no count, no whole-view
+/// A VIRTUAL generated column no route reads is legal, not a limitation, in both image shapes:
+/// mysql84 writes a trailing VIRTUAL into every image, mariadb114 leaves it out of UPDATE/DELETE
+/// images and of INSERT under MINIMAL (measured per statement and mode, issue #7:
+/// `tmp/out/lvs-virtual/pr1/facts.md` §F.2) — carrying it and omitting it are both a full image
+/// for the route, because `provable_omission` admits exactly an omission of trailing VIRTUAL
+/// columns. So neither the kept child row nor the view is short: no count, no whole-view
 /// refresh, and no rebuild, on every flavor. Before the fix this was the column-count test's
 /// doing on the flavors that leave VIRTUAL columns out: every kept row incomplete, every parent
 /// change a rebuild.
