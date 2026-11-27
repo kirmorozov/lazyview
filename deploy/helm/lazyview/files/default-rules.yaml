@@ -4,13 +4,18 @@
 # This file lives under files/ rather than templates/ on purpose: Helm does not process files/, so
 # the Prometheus template expansions ({{ $labels.job }}) stay literal instead of being read as Go
 # template actions. templates/prometheusrule.yaml loads it with .Files.Get, substitutes the two
-# __LV_*__ selector tokens below with the names THIS release renders, and renders it under spec:;
-# set prometheus.rules.groups to replace these rules with your own.
+# selector tokens on the expr lines below (LV_METRICS_SERVICE and LV_DEPLOYMENT, each wrapped in two
+# underscores on both sides) with the names THIS release renders, and renders it under spec:; set
+# prometheus.rules.groups to replace these rules with your own.
 #
 # The selectors are exact names, not a substring match, so a differently named deployment can never
 # answer for this one and a rule can never go silent when nameOverride / fullnameOverride produce a
 # name that does not contain "lazyview". The `job` label of a scraped pod is the name of the Service
-# the ServiceMonitor selects, which is what __LV_METRICS_SERVICE__ becomes.
+# the ServiceMonitor selects, which is what the LV_METRICS_SERVICE token becomes.
+#
+# Spell the marker prefix nowhere in this comment block: templates/prometheusrule.yaml refuses the
+# render while any marker survives substitution, so that a token the two files disagree on can never
+# ship as a literal in a selector, and that guard cannot tell a documented example from a real token.
 groups:
   - name: lazyview
     rules:

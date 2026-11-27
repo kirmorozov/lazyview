@@ -32,8 +32,22 @@ spec:
     */}}
     {{- $rules = $rules | replace "__LV_METRICS_SERVICE__" (include "lazyview.metricsServiceName" .)
              | replace "__LV_DEPLOYMENT__" (include "lazyview.fullname" .) }}
-    {{- if contains "__LV_" $rules }}
-    {{- fail "an alert-rule selector token (__LV_…) was not substituted: files/default-rules.yaml and templates/prometheusrule.yaml disagree" }}
+    {{/*
+    Absolute guard, not a spot check: a marker that survives the substitution above is a token this
+    template does not know, and one of those in a rendered rule is an alert whose selector matches
+    nothing, so it never fires — worse than a red install. The render therefore aborts on ANY marker
+    left, and names each one it found, because the usual cause is the two files disagreeing on a
+    token name (or a comment in files/ spelling the prefix, which no guard can tell from a token).
+    Nothing here may relax this to a substring match or drop a token to buy a green render.
+    */}}
+    {{- $left := list }}
+    {{- range $word := splitList " " (replace "\t" " " (replace "\n" " " $rules)) }}
+    {{-   if contains "__LV_" $word }}
+    {{-     $left = append $left $word }}
+    {{-   end }}
+    {{- end }}
+    {{- if $left }}
+    {{- fail (printf "an alert-rule selector token was not substituted (%s): files/default-rules.yaml and templates/prometheusrule.yaml disagree (the template substitutes only __LV_METRICS_SERVICE__ and __LV_DEPLOYMENT__)" (join ", " $left)) }}
     {{- end }}
     {{- $groups := (fromYaml $rules).groups }}
     {{- if not $groups }}
