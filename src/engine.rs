@@ -8531,6 +8531,15 @@ impl Engine {
         recent: &mut Lookback,
         since: Option<&Position>,
     ) -> Result<Refreshed> {
+        // The feed (accumulate) decided a gap window's vanished children could not be named and
+        // reported the whole-view fallback on the buffer; count it here, where the Metrics live, not
+        // in accumulate (lv-super ruling), and before the supervised dispatch so both refresh paths
+        // charge it. Taken from the buffer so a retried refresh of the same changes does not count
+        // the one decision twice.
+        Metrics::add(
+            &self.metrics.cascade_gap_mark_all,
+            std::mem::take(&mut dirty.gap_mark_all),
+        );
         if self.sup.is_some() {
             let mut p = self
                 .prepare_refresh(plan, layout, dirty, targets, table, recent, since)
@@ -9265,6 +9274,7 @@ impl Engine {
                         },
                     )
                     .await?;
+                Metrics::add(&self.metrics.cascade_children_named, rows.len() as u64);
                 for r in rows {
                     units.insert(r.into_iter().map(Datum::from_value).collect());
                 }

@@ -368,6 +368,12 @@ pub struct ViewDirty {
     /// flush, not one per key — instead of the whole-view refresh `mark_all` would cost.
     /// Deduplicated per (route, key), so a flush pays at most one bounded read per route.
     pub name_pending: Vec<(usize, Key)>,
+    /// Gap-window parent changes whose vanished children the route could NOT name (no
+    /// `name_cols`), so the whole-view refresh stood (`ViewDirty::mark_all_gap`). A plain fact the
+    /// feed reports on the buffer, carried by [`Self::take`] to the engine, which counts it as the
+    /// `cascade_gap_mark_all` Metric; [`Self::merge`] deliberately does not carry it (a retried
+    /// refresh must not count the same decision again). Internal, not a `/stats` field.
+    pub gap_mark_all: u64,
     /// Full views: rebuild needed. Global views: recompute the single row.
     pub all: bool,
     /// Incremental views: affected units unknown (cascading FK); rebuild in the background.
@@ -445,6 +451,17 @@ impl ViewDirty {
             self.tally.id(!self.all);
         }
         self.all = true;
+    }
+
+    /// The gap-window whole-view fallback: mapped-cascade children vanished and the route cannot
+    /// NAME them (see [`Self::name_cascade`]), so the in-place whole refresh stands. Same as
+    /// [`Self::mark_all`] (`all` coalesces, one refresh per flush) plus a counted fact the engine
+    /// reports as `cascade_gap_mark_all`; counted apart so the naming path and the fallback are
+    /// distinguishable to tests. Step 1c will make the fallback the counted streamed refresh.
+    #[inline]
+    pub fn mark_all_gap(&mut self, plan: &ViewPlan) {
+        self.gap_mark_all += 1;
+        self.mark_all(plan);
     }
 
     /// Records a nameable mapped cascade whose children vanished in a gap window: the refresh
@@ -848,7 +865,7 @@ fn feed_mapped_cascade(
                 if c.name_cols.is_some() {
                     dirty.name_cascade(ci, old)
                 } else {
-                    dirty.mark_all(plan);
+                    dirty.mark_all_gap(plan);
                 }
                 Fed::Recorded
             } else {
@@ -876,7 +893,7 @@ fn feed_mapped_cascade(
                 if c.name_cols.is_some() {
                     dirty.name_cascade(ci, old)
                 } else {
-                    dirty.mark_all(plan);
+                    dirty.mark_all_gap(plan);
                 }
                 fed = Fed::Recorded;
             }
@@ -1142,7 +1159,7 @@ pub fn drain(plan: &ViewPlan, dirty: &mut ViewDirty, log: Vec<cascade::Logged>) 
                         if c.name_cols.is_some() {
                             dirty.name_cascade(route, old.clone())
                         } else {
-                            dirty.mark_all(plan);
+                            dirty.mark_all_gap(plan);
                         }
                     } else {
                         expand(plan, route, rows, new.as_ref(), dirty);
@@ -1156,7 +1173,7 @@ pub fn drain(plan: &ViewPlan, dirty: &mut ViewDirty, log: Vec<cascade::Logged>) 
                             if c.name_cols.is_some() {
                                 dirty.name_cascade(route, old.clone())
                             } else {
-                                dirty.mark_all(plan);
+                                dirty.mark_all_gap(plan);
                             }
                         }
                     }

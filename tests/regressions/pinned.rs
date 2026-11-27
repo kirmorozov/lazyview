@@ -1318,20 +1318,17 @@ fn reg_cascade_window_parent_delete_named() {
         let f0 = eng.snapshot();
         eng.wait_caught_up(&mut sc, t_catchup()).await?;
         // /stats is published at the end of a flush; nothing else writes after the resume, so wait
-        // for the periodic flush (position save, 5 s) to publish the gap of the replay.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let _s = loop {
-            if let Some(s) = eng.view_stats(&db, "r_win_del_named") {
-                if s.cascade_gaps >= 1 {
-                    break s;
-                }
-            }
-            ensure!(
-                std::time::Instant::now() < deadline,
-                "the replayed parent delete was never counted as a gap in /stats within 15 s"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        };
+        // for the periodic flush (position save, 5 s) to publish the gap of the replay. Polls at the
+        // shared 50 ms cadence (`common::wait_until`), not a hand-rolled 200 ms loop (owner rule).
+        wait_until(
+            "the replayed parent delete counted as a gap in /stats",
+            std::time::Duration::from_secs(15),
+            || {
+                let s = eng.view_stats(&db, "r_win_del_named");
+                async move { Ok(s.is_some_and(|s| s.cascade_gaps >= 1)) }
+            },
+        )
+        .await?;
         // Nothing was written since the resume: the row under the deleted parent is gone at once and
         // the other two are exact (the named units were refreshed, not the whole view).
         verify(
@@ -1345,10 +1342,15 @@ fn reg_cascade_window_parent_delete_named() {
         let s = eng.stats_of(&db, "r_win_del_named")?;
         let d = eng.snapshot().since(&f0);
         ensure!(
-            s.cascade_gaps >= 1 && s.whole_view_refreshes == 0 && d.full_rebuilds == 0,
-            "the replayed parent delete was not counted as a gap, or fell back to a whole-view \
-             refresh / rebuilt (the vanished children must be named from the materialized table, \
-             not mark_all): {s:?} {}",
+            s.cascade_gaps >= 1
+                && s.whole_view_refreshes == 0
+                && d.full_rebuilds == 0
+                && d.cascade_children_named >= 1
+                && d.cascade_gap_mark_all == 0,
+            "the replayed parent delete was not counted as a gap, fell back to a whole-view \
+             refresh / rebuilt, or did not NAME the vanished children (must name them from the \
+             materialized table: cascade_children_named >= 1 and cascade_gap_mark_all == 0, not \
+             mark_all): {s:?} {}",
             fmt_snapshot(&d)
         );
         ctx.log(format!(
@@ -1386,12 +1388,21 @@ fn reg_cascade_window_parent_delete_named() {
 /// pinned). The per-branch gate decision (`name_cols` Some/None) is pinned deterministically by the
 /// `gap_window_*` and `*_nameable` lib tests in `accumulate`, which read the plan directly with no
 /// server.
+///
+/// Fail-before: each leg also asserts the routing counters accumulated since the resume, so the leg
+/// is RED on unfixed `main` (no naming feature) and GREEN on the fix — `whole_view_refreshes == 0`
+/// alone is NOT (a nameable and a non-nameable route both leave it 0, see above). A nameable leg
+/// requires `cascade_children_named >= 1` and `cascade_gap_mark_all == 0` (the vanished children were
+/// named from the materialized table); a non-nameable leg requires `cascade_children_named == 0` and
+/// `cascade_gap_mark_all >= 1` (it fell back to `mark_all`). The counters are the engine Metrics fed
+/// by `Engine::name_lookups` and the `ViewDirty::mark_all_gap` fact, respectively.
 async fn gap_named_branch(
     ctx: &Ctx,
     id: &str,
     links_ddl: &str,
     view_sql: &str,
     want_whole: u64,
+    nameable: bool,
 ) -> Result<()> {
     let mut ddl: Vec<String> = vec![
         "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
@@ -1413,21 +1424,18 @@ async fn gap_named_branch(
     wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
     let f0 = eng.snapshot();
     eng.wait_caught_up(&mut sc, t_catchup()).await?;
-    // /stats is published at the end of a flush; nothing else writes after the resume, so wait for
-    // the periodic flush (position save, 5 s) to publish the gap of the replay.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let _s = loop {
-        if let Some(s) = eng.view_stats(&db, id) {
-            if s.cascade_gaps >= 1 {
-                break s;
-            }
-        }
-        ensure!(
-            std::time::Instant::now() < deadline,
-            "the replayed parent delete was never counted as a gap in /stats within 15 s"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    };
+    // /stats is published at the end of a flush; nothing else writes after the resume, so wait
+    // for the periodic flush (position save, 5 s) to publish the gap of the replay. Polls at the
+    // shared 50 ms cadence (`common::wait_until`), not a hand-rolled 200 ms loop (owner rule).
+    wait_until(
+        "the replayed parent delete counted as a gap in /stats",
+        std::time::Duration::from_secs(15),
+        || {
+            let s = eng.view_stats(&db, id);
+            async move { Ok(s.is_some_and(|s| s.cascade_gaps >= 1)) }
+        },
+    )
+    .await?;
     verify(
         ctx,
         &mut eng,
@@ -1438,12 +1446,35 @@ async fn gap_named_branch(
     .await?;
     let s = eng.stats_of(&db, id)?;
     let d = eng.snapshot().since(&f0);
+    // The fail-before signal: a nameable route must NAME the vanished children (one bounded
+    // read, `cascade_children_named >= 1`, and not fall back to `mark_all`, `cascade_gap_mark_all
+    // == 0`); a non-nameable route must fall back (`cascade_children_named == 0`,
+    // `cascade_gap_mark_all >= 1`). On unfixed `main` the naming feature is absent, so a nameable
+    // leg sees `cascade_children_named == 0` and fails here — which is what makes these legs red
+    // before the fix and green after (`whole_view_refreshes == 0` alone does NOT: mark_all's
+    // in-place refresh is uncounted by it).
+    let (expect, ok) = if nameable {
+        (
+            "name the vanished children from the materialized table \
+             (cascade_children_named >= 1, cascade_gap_mark_all == 0)",
+            d.cascade_children_named >= 1 && d.cascade_gap_mark_all == 0,
+        )
+    } else {
+        (
+            "fall back to the whole-view mark_all \
+             (cascade_children_named == 0, cascade_gap_mark_all >= 1)",
+            d.cascade_children_named == 0 && d.cascade_gap_mark_all >= 1,
+        )
+    };
     ensure!(
-        s.cascade_gaps == 1 && s.whole_view_refreshes == want_whole && d.full_rebuilds == 0,
-        "expected the {id} gap-window parent-delete to record exactly one cascade gap and take no \
-         streamed whole-view rebuild (whole_view_refreshes == {want_whole}); the non-nameable legs \
-         still take mark_all's in-place whole-view refresh, which this counter does not count (see \
-         the helper doc), got {s:?} {}",
+        s.cascade_gaps == 1
+            && s.whole_view_refreshes == want_whole
+            && d.full_rebuilds == 0
+            && ok,
+        "expected the {id} gap-window parent-delete to record exactly one cascade gap, take no \
+         streamed whole-view rebuild (whole_view_refreshes == {want_whole}), and {expect}; the \
+         non-nameable legs take mark_all's in-place whole-view refresh, which whole_view_refreshes \
+         does not count (see the helper doc), got {s:?} {}",
         fmt_snapshot(&d)
     );
     ctx.log(format!("{id}: {s:?} {}", fmt_snapshot(&d)));
@@ -1464,6 +1495,7 @@ fn reg_cascade_window_named_branch_nameable() {
              FOREIGN KEY (gid) REFERENCES items (gid))",
             "SELECT l.gid, l.eid, l.pos FROM links l",
             0u64,
+            true,
         )
         .await
     });
@@ -1489,6 +1521,7 @@ fn reg_cascade_window_named_branch_omits_fk() {
              FOREIGN KEY (gid) REFERENCES items (gid))",
             "SELECT l.gid, l.pos FROM links l",
             0u64,
+            false,
         )
         .await
     });
@@ -1514,6 +1547,7 @@ fn reg_cascade_window_named_branch_fk_not_leading() {
              FOREIGN KEY (gid) REFERENCES items (gid))",
             "SELECT l.gid, l.eid, l.pos FROM links l",
             0u64,
+            false,
         )
         .await
     });
@@ -1535,6 +1569,7 @@ fn reg_cascade_window_named_branch_aliased_fk() {
              FOREIGN KEY (gid) REFERENCES items (gid))",
             "SELECT l.gid, l.eid AS fk, l.pos FROM links l",
             0u64,
+            true,
         )
         .await
     });
