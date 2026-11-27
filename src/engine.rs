@@ -643,6 +643,31 @@ const SET_WRITE_BACKLOG_BUDGET_MULTIPLIER: u32 = 8;
 /// its budget is the loop's own cadence: one [`Config::position_persist_interval`] is what it
 /// schedules per save, and [`SET_WRITE_BACKLOG_BUDGET_MULTIPLIER`] says how far a single one may
 /// overrun that.
+/// The one rule the fixed-size position statement obeys: it may publish the position **the set the
+/// row carries belongs to**, and nothing else.
+///
+/// `binlog_file`/`binlog_pos` are not decoration. They are the resume point for every reader that
+/// does not parse `binlog_cursor` — an older build taking over (`meta::save_position` promises them
+/// "filled through the bump, so an older build and the harness still find the position there"), the
+/// no-cursor fallback in [`meta::load_position`], and an operator's `SELECT * FROM _lazyview_status`.
+/// Publishing a position ahead of the durable set tells all three that events up to it are consumed
+/// when nothing recorded that, and a resume from there never reads them: #347's loss, in the
+/// opposite direction from the one the column widening was about. CI measured the symptom as
+/// `chaos_lock_blackhole_takeover` red on four flavors — the takeover seeded its start from the row's
+/// set, and its first save pulled the position columns back to where that set actually was.
+///
+/// Returning an error rather than clamping keeps the caller honest: a call site that reaches here
+/// with the run's read position had decided to publish it, and that decision is the bug.
+fn pair_publishes_the_rows_set(at: &Position, row_at: &Position) -> Result<()> {
+    if at != row_at {
+        anyhow::bail!(
+            "the position columns would be published at {at:?} while the row's set belongs to \
+             {row_at:?}: a resume from them would skip events nothing recorded as consumed"
+        );
+    }
+    Ok(())
+}
+
 fn set_write_budget(backlog: bool, target_timeout: Duration, interval: Duration) -> Duration {
     if backlog {
         interval * SET_WRITE_BACKLOG_BUDGET_MULTIPLIER
@@ -9679,14 +9704,14 @@ impl Engine {
     /// How long ago the run timed its last fixed-size save on the meta link — the sample the price's
     /// freshness is judged by ([`Self::price_set_write`]) — or [`Duration::MAX`] when it has timed
     /// none yet, which is the same as "the link is unknown to me".
-    fn pair_sample_age(&self) -> Duration {
-        self.last_cheap_write
-            .map_or(Duration::MAX, |(taken, _, _)| taken.elapsed())
+    /// How long ago the run last timed a fixed-size pair statement, or `None` when it has never
+    /// timed one: an age of `u64::MAX` in a log reads like a measurement, and it is not one.
+    fn pair_sample_age(&self) -> Option<Duration> {
+        self.last_cheap_write.map(|(taken, _, _)| taken.elapsed())
     }
 
-    /// Prices a cursor rewrite of `bytes` and keeps that price honest. Returns what the write would
-    /// cost (or `None`, nothing measured yet) and whether this call already put the fixed-size pair
-    /// save on the wire for `at` — the caller must not send that statement twice.
+    /// Prices a cursor rewrite of `bytes`, keeping that price honest with a probe (see
+    /// [`Self::price_set_write`]).
     ///
     /// The probe: whenever a rewrite is being considered, the loop first times **one fixed-size
     /// statement on the wire right now** ([`Self::save_pair_and_time`]) and prices from *it*. A price
@@ -9713,17 +9738,14 @@ impl Engine {
     ///    returned). A sample a runner could call fresh is not good enough to accept a write that is
     ///    five hundred times its size; the only sample that is fresh for that decision is one taken
     ///    for it.
-    async fn price_set_write(
-        &mut self,
-        bytes: usize,
-        at: &Position,
-        probe: bool,
-    ) -> Result<(Option<Duration>, bool)> {
+    async fn price_set_write(&mut self, bytes: usize, probe: bool) -> Result<Option<Duration>> {
         if probe {
-            self.save_pair_and_time(at).await?;
-            return Ok((self.set_write_cost(bytes), true));
+            // The probe writes what the row **already holds**, never what the run has just read: it is
+            // a measuring statement, not a publish (see the invariant in `persist_position`).
+            let at = self.persisted_at.clone();
+            self.save_pair_and_time(&at).await?;
         }
-        Ok((self.set_write_cost(bytes), false))
+        Ok(self.set_write_cost(bytes))
     }
 
     /// The price gate on a mid-run cursor rewrite (lv-super's ruling of 2026-11-26, on CI run
@@ -9735,17 +9757,22 @@ impl Engine {
     /// ([`set_write_budget`], which is the caller's `budget`), not against one fixed number: what the
     /// run can spend on a statement it waits for depends on whether it has work waiting. `None` —
     /// nothing of this shape timed yet — goes: the first write buys the next one its price. When the
-    /// gate refuses, the position half still moves (a fixed-size statement this same measurement says
-    /// the link carries), so the row's resume point stays current and the run keeps consuming.
+    /// gate refuses, **nothing** is written: the row keeps the position its own set belongs to (see
+    /// [`pair_publishes_the_rows_set`]) and the loop asks again on the next interval. A refusal costs
+    /// a longer replay after a restart and nothing else — consuming the stream never depended on the
+    /// row, which records where the run got to rather than licensing it to read.
     fn set_write_affordable(&self, cost: Option<Duration>, budget: Duration) -> bool {
         cost.is_none_or(|c| c < budget)
     }
 
     /// Writes the fixed-size `binlog_file`/`binlog_pos` half and **times** it, which is the second
     /// thing the price needs: the run's sample of what one statement costs on this meta link *now*
-    /// (its size is known exactly — [`meta::cheap_save_bytes`]). Used both when the set is too big to
-    /// send and as the probe below.
+    /// (its size is known exactly — [`meta::cheap_save_bytes`]). Its only caller is the probe in
+    /// [`Self::price_set_write`], and the position it publishes is checked by
+    /// [`pair_publishes_the_rows_set`]: this statement measures the link, it does not move the resume
+    /// point.
     async fn save_pair_and_time(&mut self, at: &Position) -> Result<()> {
+        pair_publishes_the_rows_set(at, &self.persisted_at)?;
         let began = Instant::now();
         meta::save_position_pair(&mut self.meta, &self.cfg.instance_id, at, self.leader.epoch)
             .await?;
@@ -9869,12 +9896,12 @@ impl Engine {
         //    the run is starting or ending —
         //    where nothing waits on the statement and the row must tell the whole truth (the confirmed
         //    rule of 2026-11-26: a clean stop writes both halves whatever they cost);
-        //  - the **position alone** goes otherwise ([`meta::save_position_pair`], one fixed-size
-        //    statement): the row keeps the last set a save afforded and its position moves, so a
-        //    restart re-reads the binlog its cursor has not reached yet. Re-applying is idempotent,
-        //    and `lifecycle_resumes_from_a_cursor_behind_the_applied_position` exists to prove that
-        //    path, not to assert it. A refused rewrite therefore costs a longer replay, never a stale
-        //    position and never a shed set.
+        //  - the **position alone** never goes on its own: what the row's `binlog_file`/`binlog_pos`
+        //    columns may publish is the position belonging to the set the row carries, and nothing
+        //    else ([`pair_publishes_the_rows_set`]). Everything else in this function is that rule. A
+        //    refused rewrite therefore writes nothing at all and is asked again on the next interval,
+        //    so it costs a longer replay after a restart — never a stale position, never a shed set,
+        //    and never a position the row's set does not back.
         //
         // The save is the engine's own word that the row holds this cursor byte for byte:
         // `meta::save_position` refuses a cursor the column cannot hold whole with an error naming
@@ -9893,12 +9920,12 @@ impl Engine {
         let text_len = wanted_text.as_ref().map_or(0, String::len);
         // Priced before the decision, by the rule in [`Self::price_set_write`]: a sample of the link
         // older than the write it predicts describes a link the run may no longer be on, and the pair
-        // save is the statement that finds out. `wrote_pair` says that statement already went for this
-        // position, so the branch below does not send it a second time.
-        let (cost, wrote_pair) = if text_changed {
-            self.price_set_write(text_len, &pos, !force).await?
+        // save is the statement that finds out — sent for the row's own position, so measuring costs
+        // a statement and not a claim about the resume point.
+        let cost = if text_changed {
+            self.price_set_write(text_len, !force).await?
         } else {
-            (None, false)
+            None
         };
         // What the loop can spend on a statement it waits for depends on whether it has work waiting:
         // the floor below the boundary means rows are still unapplied, and a save then competes with
@@ -9927,9 +9954,11 @@ impl Engine {
                 pair_write_ms = self
                     .last_cheap_write
                     .map_or(0, |(_, d, _)| d.as_millis() as u64),
-                pair_age_ms = self.pair_sample_age().as_millis().min(u64::MAX as u128) as u64,
+                pair_age_ms = self.pair_sample_age().map_or(0, |d| d.as_millis() as u64),
+                pair_sample = self.last_cheap_write.is_some(),
                 "the cursor's set is not saved this time: the priced rewrite would cost more than \
-                 one statement of the data path may cost; the position goes on its own"
+                 one statement of the data path may cost; nothing is published, the row keeps the \
+                 position its set belongs to"
             );
         }
         if cursor_due {
@@ -9964,7 +9993,7 @@ impl Engine {
                 bytes = text_len,
                 cost_ms = cost.map_or(0, |c| c.as_millis() as u64),
                 elapsed_ms = took.as_millis() as u64,
-                pair_age_ms = self.pair_sample_age().as_millis().min(u64::MAX as u128) as u64,
+                pair_age_ms = self.pair_sample_age().map_or(0, |d| d.as_millis() as u64),
                 "the status row's whole cursor went: position and set in one statement"
             );
             self.set_held_logged = false;
@@ -9973,15 +10002,29 @@ impl Engine {
             // the boundary (ruling 6).
             self.persisted = saved;
             self.persisted_at = pos.clone();
-        } else if pos != self.persisted_at {
-            // The cheap half, timed as it goes, because it is one of the two rates the next price is
-            // read from. Skipped when the probe above already sent exactly this statement for this
-            // position.
-            if !wrote_pair {
-                self.save_pair_and_time(&pos).await?;
-            }
-            self.persisted_at = pos.clone();
         }
+        // A refused rewrite publishes **nothing**. The first version of this branch sent the
+        // fixed-size `binlog_file`/`binlog_pos` half at the position the run had merely *read*, so the
+        // row kept the last set a save afforded while its position columns ran ahead of it — and
+        // those two columns are exactly what a reader that does not parse the cursor trusts: an
+        // older build resuming from them (`meta::save_position`'s own promise that they "stay filled
+        // through the bump, so an older build and the harness still find the position there"), an
+        // operator's `SELECT * FROM _lazyview_status`, and `load_position`'s no-cursor fallback. A
+        // position no durable set backs is #347's loss in the other direction: such a reader starts
+        // past events nothing recorded as consumed, and never sees them. CI measured it as
+        // `chaos_lock_blackhole_takeover` red on four flavors — "the saved position went backwards
+        // from `binlog.000003:2709040` to `binlog.000003:2542134` while the replaced instance was
+        // still running": the takeover seeded its start from the row's set, and its first save pulled
+        // the position columns back down to where that set actually was. The same lie is why
+        // `chaos_src_binlog_catchup_after_a_slow_reconnect` stopped reproducing its own shape (21.7 s
+        // where the leg needs a slow catch-up): a start from the runaway pair had less to read.
+        //
+        // What a refusal now costs is what it always should have cost and what the comment above
+        // promises: a longer replay after a restart, never a position the row cannot back with a set.
+        // The loop keeps asking — `set_pending` below stays true while the row lags, and
+        // `last_persist` spaces the attempts — and the probe above is still what keeps the price
+        // honest, because a probe writes what the row already holds and so measures the link without
+        // deciding anything about the resume point.
         // Held back: save again once the pending changes are applied.
         self.persist_needed = pos < self.boundary.to_position();
         // Still owed: the row does not say what this run would say. Asked the same allocation-free
@@ -11140,6 +11183,55 @@ mod lock_task_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule the fixed-size position statement obeys, measured at the shape CI caught:
+    /// `chaos_lock_blackhole_takeover` failed on four flavors because a refused set write had moved
+    /// `binlog_file`/`binlog_pos` to `binlog.000003:2709040` while the `binlog_cursor` in the same row
+    /// still described `binlog.000003:2542134`. The takeover seeded its start from the set — the only
+    /// half that is a resume point — and its first save pulled the position columns back, which is the
+    /// "went backwards" the leg named. A reader that trusts those columns (an older build, the
+    /// no-cursor fallback, an operator) would have started at the higher number and never read the
+    /// 166,906 bytes between them.
+    #[test]
+    fn the_position_columns_never_publish_ahead_of_the_set_the_row_carries() {
+        let row = Position {
+            file: "binlog.000003".into(),
+            pos: 2_542_134,
+        };
+        // The row's own position: allowed, because it says nothing the set does not back — this is
+        // what the probe writes while it measures the link.
+        pair_publishes_the_rows_set(&row, &row).expect("the row's own position is publishable");
+        // The position the run has merely read: refused, at any distance.
+        let read = Position {
+            file: "binlog.000003".into(),
+            pos: 2_709_040,
+        };
+        let e = pair_publishes_the_rows_set(&read, &row)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("2709040") && e.contains("2542134"),
+            "the refusal has to name both positions, the one it was asked for and the one the row's \
+             set belongs to: {e}"
+        );
+        // A file the set's position does not name is refused too: a lower `pos` in a later file is
+        // ahead, and comparing numbers alone would have let it through.
+        let later_file = Position {
+            file: "binlog.000004".into(),
+            pos: 4,
+        };
+        assert!(pair_publishes_the_rows_set(&later_file, &row).is_err());
+        // And a position behind the row's own is refused as well: it is not what the row's set says,
+        // so publishing it would be a save deciding the row's meaning on its own.
+        assert!(pair_publishes_the_rows_set(
+            &Position {
+                file: "binlog.000003".into(),
+                pos: 2_542_133,
+            },
+            &row
+        )
+        .is_err());
+    }
 
     /// The two directions the cursor's price has to get right, at the numbers the chaos legs
     /// measured: the same 78,766-byte statement is a 157 s one on the link sliced to a byte per
