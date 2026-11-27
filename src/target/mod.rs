@@ -506,6 +506,114 @@ pub(crate) fn is_lock_wait_timeout(e: &anyhow::Error) -> bool {
     })
 }
 
+/// How a write to a target died, for the per-class counters of Part B (`lazyview_target_write_err_*`
+/// in src/metrics.rs, added by [`crate::engine::Engine::note_target_write_err`]). The classes are the
+/// network edges the chaos suite's needles name (`target_write_error_logged` in tests/chaos.rs): a
+/// link cut mid-write, a stream closed under an open transaction, a backend the server terminated, a
+/// server-side error, a peer that never answered the connect at all.
+///
+/// Classified from the rendered chain rather than the drivers' types on purpose: `mysql_async` and
+/// `tokio_postgres` report the same edge in different types (a cut PG stream arrives as a closed
+/// connection or a `db error`, `mysql_async`'s as an io error), and the class is an operator's label
+/// — no retry policy branches on it, so a misclassification costs a wrong label, never a wrong action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteErr {
+    /// The socket was reset mid-write (`ECONNRESET`).
+    Reset,
+    /// The stream ended while a statement was open (`EOF`, broken pipe).
+    Closed,
+    /// The server ended the session: `pg_terminate_backend`, an idle-session kill.
+    Terminated,
+    /// The server answered with an error of its own (`db error`, a constraint, a full disk).
+    Server,
+    /// The target never answered the connect (refused, unroutable, unreachable host).
+    Connect,
+    /// Anything else — a statement that timed out on a live link, an unexpected driver error.
+    Other,
+}
+
+impl WriteErr {
+    /// The label of the class: the suffix of its counter's name, and the text of the log line.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            WriteErr::Reset => "reset",
+            WriteErr::Closed => "closed",
+            WriteErr::Terminated => "terminated",
+            WriteErr::Server => "server",
+            WriteErr::Connect => "connect",
+            WriteErr::Other => "other",
+        }
+    }
+
+    pub(crate) fn classify(e: &anyhow::Error) -> WriteErr {
+        let m = format!("{e:#}").to_lowercase();
+        // Order matters: every one of these strings contains "connect", so the classes that name
+        // what happened to an established link are asked before the one that names never reaching
+        // the target at all.
+        if m.contains("reset by peer")
+            || m.contains("connection reset")
+            || m.contains("os error 104")
+        {
+            WriteErr::Reset
+        } else if m.contains("terminating connection")
+            || m.contains("server closed the connection unexpectedly")
+        {
+            WriteErr::Terminated
+        } else if m.contains("connection closed")
+            || m.contains("broken pipe")
+            || m.contains("io error")
+            || m.contains("unexpected end of file")
+        {
+            WriteErr::Closed
+        } else if m.contains("could not connect")
+            || m.contains("connecting to")
+            || m.contains("connection refused")
+            || m.contains("no route to host")
+            || m.contains("network is unreachable")
+            || m.contains("name or service not known")
+        {
+            WriteErr::Connect
+        } else if m.contains("db error") || m.contains("server returned") {
+            WriteErr::Server
+        } else {
+            WriteErr::Other
+        }
+    }
+
+    /// The words a log line uses for the link condition of a failed write, in the vocabulary the
+    /// operator (and the chaos suite's `target_write_error_logged` needles) searches: a link cut
+    /// mid-write is a reset, a stream that ended under an open statement — or a peer that closed
+    /// the socket before the first byte of the answer, which is what a driver reports as an
+    /// `early eof` — is a closed connection, and a session the server ended says so itself.
+    ///
+    /// It says nothing about the [`WriteErr`] CLASS, and the class stays exactly what
+    /// [`Self::classify`] decided: a connect that reached EOF is still a connect (lv-super ruling
+    /// 2026-11-22 keeps the two questions apart, and the counter's label comes from the class).
+    /// A message none of the three families describes returns `""`: the caller then keeps the
+    /// driver's own words, which are in the line anyway.
+    pub(crate) fn link_words(e: &anyhow::Error) -> &'static str {
+        let m = format!("{e:#}").to_lowercase();
+        if m.contains("reset by peer")
+            || m.contains("connection reset")
+            || m.contains("os error 104")
+        {
+            "connection reset by peer"
+        } else if m.contains("terminating connection")
+            || m.contains("server closed the connection unexpectedly")
+        {
+            "server closed the connection unexpectedly"
+        } else if m.contains("connection closed")
+            || m.contains("broken pipe")
+            || m.contains("io error")
+            || m.contains("eof")
+        {
+            "connection closed"
+        } else {
+            ""
+        }
+    }
+}
+
 /// The statements that give a new pooled connection the family's session settings. Dispatched
 /// once per pooled connection (never per statement).
 pub(crate) fn session_setup(kind: Kind, sql_mode: &str, lock_wait_s: u64) -> Vec<String> {
@@ -927,6 +1035,35 @@ mod tests {
             Kind::Postgres
         );
         assert_eq!(family_is_kind(crate::dialect::Family::Mysql), Kind::Mysql);
+    }
+
+    /// Part B (lv-super ruling 2026-11-22): the one line of the down crossing names the link
+    /// condition in the words an operator (and the chaos suite's needles) searches for, without
+    /// moving the class `classify` gave the same error. The PostgreSQL driver's `early eof` on a
+    /// connect the peer cut is still a `Connect` on the counter and still reads as a closed
+    /// connection in the log; a refusal belongs to none of the three families and keeps its own
+    /// words rather than borrowing a phrase it cannot claim.
+    #[test]
+    fn link_words_names_the_edge_without_moving_the_class() {
+        let eof =
+            anyhow::anyhow!("target pg: the write could not connect: connecting to pg: early eof");
+        assert_eq!(WriteErr::classify(&eof), WriteErr::Connect);
+        assert_eq!(WriteErr::link_words(&eof), "connection closed");
+
+        let reset = anyhow::anyhow!("target t1: io error: connection reset by peer (os error 104)");
+        assert_eq!(WriteErr::classify(&reset), WriteErr::Reset);
+        assert_eq!(WriteErr::link_words(&reset), "connection reset by peer");
+
+        let term = anyhow::anyhow!("db error: terminating connection due to administrator command");
+        assert_eq!(WriteErr::classify(&term), WriteErr::Terminated);
+        assert_eq!(
+            WriteErr::link_words(&term),
+            "server closed the connection unexpectedly"
+        );
+
+        let refused = anyhow::anyhow!("the write could not connect: connection refused");
+        assert_eq!(WriteErr::classify(&refused), WriteErr::Connect);
+        assert_eq!(WriteErr::link_words(&refused), "");
     }
 
     /// The quoting seam dispatches each family to its own renderer: MySQL answers backticks

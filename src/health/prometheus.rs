@@ -114,6 +114,26 @@ pub(super) fn prometheus(m: &Metrics, o: &Observed, s: &Settings) -> String {
             }
         }
     }
+    // Per target the engine has reported down at least once (Part B, pg targets): 1 while none of
+    // its writes land — the changes are buffered for it and retried at the connect backoff — and 0
+    // once the owed set was written. The entry stays after the recovery so that "never down" and
+    // "was down" are told apart without a history query. The error CLASSES of the failed writes are
+    // the `lazyview_target_write_err_*_total` counters above.
+    let targets = m.target_states();
+    if !targets.is_empty() {
+        let _ = writeln!(
+            out,
+            "# HELP lazyview_target_down 1 while no write to this target lands (its changes are buffered and retried); 0 once it answered and its owed rows were written.\n# TYPE lazyview_target_down gauge"
+        );
+        for (name, g) in &targets {
+            let _ = writeln!(
+                out,
+                "lazyview_target_down{{target=\"{}\"}} {}",
+                escape_label(name),
+                g.down as u64
+            );
+        }
+    }
     if let Some(p) = m.applied() {
         let _ = writeln!(
             out,

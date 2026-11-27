@@ -446,6 +446,31 @@ fn connect_retry_delay(n: u32) -> Duration {
     supervisor::backoff(n, p.base, p.cap, p.jitter)
 }
 
+/// Part B (lv-super ruling 2026-11-22): counts one failed write to a target by error class on
+/// `/metrics` (`lazyview_target_write_err_*_total`), for a PostgreSQL-family target only — the
+/// MySQL family has no down-observable yet, which is the open question `05-target-down-observ`, and
+/// the suite's MySQL legs must read the same metrics as before. Observability, never policy: no
+/// retry, backoff or `lag_due` decision reads it. One count per failed write ATTEMPT, never per row
+/// and never per binlog event; its two callers are the flush's and the lag retry's own per-target
+/// failure reports, both off the event path.
+///
+/// A free function, not a method: its callers hold a mutable borrow of the engine's slots (the
+/// target map and the metrics are separate fields, so they stay readable beside it).
+fn note_target_write_err(
+    targets: &BTreeMap<String, Target>,
+    metrics: &Metrics,
+    t: &str,
+    e: &anyhow::Error,
+) {
+    if !targets
+        .get(t)
+        .is_some_and(|tg| tg.kind == target::Kind::Postgres)
+    {
+        return;
+    }
+    metrics.target_write_err(target::WriteErr::classify(e));
+}
+
 /// Consecutive failed refreshes of a live view after which its state rows show the error (it is
 /// retried with backoff all the same, never re-planned or rebuilt).
 const REFRESH_ERROR_SHOWN_AFTER: u32 = 3;
@@ -481,6 +506,29 @@ struct Version {
 }
 
 impl Version {
+    /// Takes back the changes a build of this slot buffered, when its build failed
+    /// ([`Engine::next_failed`]) or was dropped for its byte budget
+    /// ([`Engine::drop_catch_up_builds`]). The replay position travels **with the buffer it is the
+    /// oldest position of**: a build that holds nothing takes nothing back with it. Setting `since`
+    /// from such a build is the freeze CI's `chaos_tgt_bandwidth_starvation` prints — a live
+    /// version with an empty buffer and a position far behind the reader, and since `live_begin`
+    /// starts no round of a slot whose buffer is empty, nothing ever clears it again (the other
+    /// half of the rule is [`since_after_round`], where a round that applied its buffer gives the
+    /// position up). The callers fold their own extra ask into `incoming` (a `Mode::Full` slot is
+    /// owed another whole-view refresh), so `incoming` says exactly what the version owes from
+    /// here on, and `is_empty` is the whole test.
+    fn take_back(&mut self, incoming: ViewDirty, since: Option<Position>) {
+        if incoming.is_empty() {
+            return;
+        }
+        self.dirty.merge(incoming);
+        if let Some(p) = since {
+            if self.since.as_ref().is_none_or(|s| p < *s) {
+                self.since = Some(p);
+            }
+        }
+    }
+
     /// A position right after every catalog read its plan's table definitions come from (the
     /// latest of them).
     fn plan_head(&self) -> Option<Position> {
@@ -507,6 +555,59 @@ struct Lag {
     /// keys kept. Its kept keys live only in memory, so the saved position waits for its
     /// `since` (`pending_floor`) and a restart replays the outage rather than losing them.
     down: bool,
+    /// Units `note_refresh` re-fed to this group **since the last claim** (#214). A claimed
+    /// group's detached retry reads the sources at or after its claim, so an unit re-fed after
+    /// the claim may be missing from what that retry writes even when it was in the claim
+    /// snapshot: `lag_subtract` posts it back, and it stays owed until a later retry — whose
+    /// claim cleared this and whose read follows the change — writes it. Without this the
+    /// subtraction removed it (it was in the claim) and a change that arrived after the read
+    /// was lost: the target kept a row the source no longer had.
+    /// Cost (guard R3): one set feed per lagging target per refresh — the same shape as the
+    /// feed above it in `note_refresh`, cleared per claim — never per binlog event.
+    posted: UnitSet,
+    posted_partial: Vec<UnitSet>,
+    posted_all: bool,
+}
+
+impl Lag {
+    /// Forgets the re-fed-since-claim marks: the retry starting now reads the sources from
+    /// here on, so it writes everything fed until now; later feeds post again (`note_refresh`).
+    fn clear_posted(&mut self) {
+        self.posted = UnitSet::default();
+        self.posted_partial = Vec::new();
+        self.posted_all = false;
+    }
+
+    /// The streamed build ([`Engine::lag_build`]) swapped the whole view onto this target: that is
+    /// what pays the entry's whole-view debt, and it is the ONLY way an entry's `all` is ever paid —
+    /// a single lagging target never goes through `refresh`'s `dirty.all` arm, which reads the whole
+    /// source into memory (guard R1, owner rule 2026-11-26).
+    ///
+    /// A rebuild computes the view from its sources, so the fill covers everything the entry owed
+    /// when its read started — the units and partial keys as much as the whole view. What stays
+    /// owed is what the flushes re-fed **after** that moment, which is exactly what these marks
+    /// hold: [`Engine::lag_build`] cleared them with [`Self::clear_posted`] when the attempt began,
+    /// so a feed after the read re-posted it (ruling lv-super 2026-11-27 — the fold of
+    /// [`Engine::lag_subtract`]'s, applied to a build's result; a build entry never reaches that
+    /// function, because `lag_due` deliberately leaves it in the map so the flush keeps skipping
+    /// the target). A whole-view ask re-fed after the read therefore costs another attempt and
+    /// never a lost row. Returns whether the owed set is empty now: the catch-up to report and
+    /// count (ruling 2026-11-22: "caught up" is said only once it is written).
+    fn pay_whole_view(&mut self) -> bool {
+        if !self.all {
+            return false;
+        }
+        self.units = std::mem::take(&mut self.posted);
+        let re_fed = std::mem::take(&mut self.posted_partial);
+        for set in self.partial.iter_mut() {
+            *set = UnitSet::default();
+        }
+        extend_partial(&mut self.partial, re_fed);
+        self.all = std::mem::take(&mut self.posted_all);
+        self.failures = 0;
+        self.retry_at = Instant::now();
+        self.units.is_empty() && self.partial.iter().all(UnitSet::is_empty) && !self.all
+    }
 }
 
 /// Lowers `floor` to `p` when that is a known position older than it.
@@ -516,14 +617,236 @@ fn lower_pos(floor: &mut Position, p: Option<&Position>) {
     }
 }
 
-/// Lowers `floor` to the oldest `since` among the changes kept for targets that are behind,
-/// a target reported down included. The kept keys live only in memory, so the saved position
-/// waits for them and a restart replays the outage from the binlog, rebuilding the same key
-/// sets, instead of leaving that target silently stale.
-fn lag_floor(floor: &mut Position, lag: &BTreeMap<String, Lag>) {
-    for g in lag.values() {
-        lower_pos(floor, Some(&g.since));
+/// One thing that holds the reported and saved position back, and the position it holds it at
+/// (see [`floor_pins_of`]).
+///
+/// The floor is a minimum, and a minimum names nothing: `/stats`, `/livez` and a harness's
+/// liveliness failure all print the position, never the reason. This is the reason, so
+/// [`Engine::report_floor_stall`] can say which view, which target and which kind of wait the
+/// position is stuck behind — on 2026-11-27 three CI reds of the "a target never catches up"
+/// family were argued from an applied position and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloorPin<'a> {
+    /// A view whose definition changed and is not reconciled yet.
+    Stale { def_id: u64 },
+    /// What the live version still owes its table: the replay position of its oldest buffered
+    /// change. A frozen version counts as a maintained one (see [`pending_floor_of`]).
+    LiveSince { def_id: u64 },
+    /// The dedup core's oldest buffered id of the definition.
+    Dedup { def_id: u64 },
+    /// Images remembered for a lookup still to run (the save's hold, not the report's).
+    Lookback { def_id: u64 },
+    /// A target that is behind: what it owes, and since when. `all` is the whole view, which the
+    /// streamed build alone pays ([`Engine::lag_build`]), so waiting for this pin is waiting for
+    /// that build to be claimed, to read and to swap.
+    Lag {
+        def_id: u64,
+        target: &'a str,
+        all: bool,
+    },
+    /// A build in flight that is not the routine rebuild of the live version: the position stops
+    /// at its read. `catch_up` says it is a lagging target's whole-view catch-up, whose buffer is
+    /// bounded on its own account ([`Engine::build_budget_action`]).
+    Building { def_id: u64, catch_up: bool },
+}
+
+impl FloorPin<'_> {
+    /// The view this pin belongs to, for the log line.
+    fn def_id(&self) -> u64 {
+        match self {
+            FloorPin::Stale { def_id }
+            | FloorPin::LiveSince { def_id }
+            | FloorPin::Dedup { def_id }
+            | FloorPin::Lookback { def_id }
+            | FloorPin::Lag { def_id, .. }
+            | FloorPin::Building { def_id, .. } => *def_id,
+        }
     }
+
+    /// What an operator needs to act on it: the words the rest of the engine uses for the same
+    /// waits, so this line reads like the reports that already name them.
+    fn what(&self) -> &'static str {
+        match self {
+            FloorPin::Stale { .. } => "a definition change not reconciled yet",
+            FloorPin::LiveSince { .. } => "changes the live version still owes its table",
+            FloorPin::Dedup { .. } => "an id the dedup core holds",
+            FloorPin::Lookback { .. } => "images remembered for a lookup still to run",
+            FloorPin::Lag { all: true, .. } => {
+                "a target owed the whole view: its streamed catch-up build has not landed"
+            }
+            FloorPin::Lag { all: false, .. } => "a target owed units its flush has not written",
+            FloorPin::Building { catch_up: true, .. } => {
+                "a whole-view catch-up build in flight for one lagging target"
+            }
+            FloorPin::Building { .. } => "a build in flight of a version that is not live yet",
+        }
+    }
+}
+
+/// Calls `visit` for every pin [`pending_floor_of` ]takes the minimum over, in the order the rule
+/// looks at them, without the rest of the engine. One enumeration on purpose: the reported floor,
+/// the saved floor and the witness of a stalled position can then never disagree about what holds
+/// the position back.
+fn floor_pins_of<'a>(
+    slots: &'a [Slot],
+    mut pinned: impl FnMut(u64) -> Option<Position>,
+    held: bool,
+    mut visit: impl FnMut(FloorPin<'a>, &Position),
+) {
+    for s in slots.iter().filter(|s| s.error.is_none()) {
+        if let Some(p) = s.stale_since.as_ref() {
+            visit(FloorPin::Stale { def_id: s.def_id }, p);
+        }
+        // A frozen live version holds the floor as a maintained one does. The freeze only says its
+        // buffer is no longer being appended to and it is no longer refreshed: the table is still
+        // what readers see and the one a restart resumes on, and the changes it owes until the new
+        // version swaps are kept in memory alone, so the save waits for them too (C1, #345 #319).
+        // `Version::since`'s own contract — "the saved and the reported position never pass it" —
+        // never asked whether the version was frozen.
+        if let Some(l) = s.live.as_ref() {
+            if let Some(p) = l.since.as_ref() {
+                visit(FloorPin::LiveSince { def_id: s.def_id }, p);
+            }
+            if let Some(p) = pinned(s.def_id) {
+                visit(FloorPin::Dedup { def_id: s.def_id }, &p);
+            }
+            // The images remembered for later lookups are held only for a version that will still
+            // run them: a frozen one refreshes no more, and `after_boundary` stops pruning its
+            // lookback while its buffer holds images, which would pin the position for the whole
+            // freeze instead of for the lookback window.
+            if held && !l.frozen {
+                if let Some(p) = l.recent.floor() {
+                    visit(FloorPin::Lookback { def_id: s.def_id }, p);
+                }
+            }
+            // The changes kept for targets that are behind, a target reported down included: they
+            // live only in memory, so the saved position waits for them and a restart replays the
+            // outage from the binlog, rebuilding the same key sets, instead of leaving that target
+            // silently stale.
+            for (t, g) in &l.lag {
+                visit(
+                    FloorPin::Lag {
+                        def_id: s.def_id,
+                        target: t,
+                        all: g.all,
+                    },
+                    &g.since,
+                );
+            }
+        }
+        if let Some(p) = building_floor(s) {
+            visit(
+                FloorPin::Building {
+                    def_id: s.def_id,
+                    catch_up: s.next.as_ref().is_some_and(|n| n.catch_up),
+                },
+                p,
+            );
+        }
+    }
+}
+
+/// The live version's replay position once a flush round has applied its buffer
+/// ([`Engine::live_end`]): `since` is the position of the oldest change the version *holds*, so a
+/// buffer that holds nothing has no position. Kept apart from the method because the two states it
+/// decides between are one field apart and only one of them is safe to leave set: while a round is
+/// in flight its changes are in neither the table nor the slot, and `since` must hold the floor
+/// back; once the round has applied them, a `Some` with an empty buffer behind it pins the reported
+/// position for the rest of the run (`live_begin` will not start another round of the slot).
+///
+/// `ViewDirty::is_empty` counting `rebuild` is what makes the arms that leave the flag on the
+/// buffer keep their position, so the cases are asserted here rather than trusted.
+fn since_after_round(kept: &ViewDirty, since: Option<Position>) -> Option<Position> {
+    if kept.is_empty() {
+        None
+    } else {
+        since
+    }
+}
+
+/// What the slot keeps of a flush round that found no eligible target
+/// ([`Engine::live_begin`]'s no-target arm). Kept apart from the arm because both of its rules were
+/// measured and one is a guard rule, so each has its own line and its own test.
+///
+/// A rebuild round keeps its WHOLE buffer: the view's own maintenance lives in it, and clearing it
+/// left a Full view with nothing pending — after the black-holed `t1` failed one build,
+/// `w_union_kinds` was never rebuilt again and its HEALTHY targets froze at the rows of the last
+/// swap (percona84, seed 472297954799: `rebuilding view=w_union_kinds` appears exactly once in the
+/// run), and with the writers stopped no new change would ever re-arm it. Any other round keeps the
+/// base-row keys no owed set can name (`images`, `marks`, `holds`) and the record that travels with
+/// the buffer (`tally`, `cache`): those keys' units exist only after a lookup against the
+/// materialized table, which is exactly what a round with no target cannot do, and neither the marks
+/// nor the cascade state can be re-derived once the buffer is gone.
+///
+/// The whole-view flag goes with a Full-mode view alone (guard R1, owner rule 2026-11-26): what a
+/// re-derive changes is not knowable per key, so a Full view's owed maintenance IS the view. An
+/// Incremental view's owed debt stays `rebuild` and is paid by the slot's streamed build
+/// ([`Engine::lag_build`] / `BuildKind::LagCatchUp`, `mv::fill` into `<name>__lv_new` and the swap) —
+/// never by `refresh`'s in-memory `dirty.all` arm (`mv::read_source(…, chunk: None …)` plus one
+/// `mv::prepare`), which is the owner's memory rule. `ViewDirty::is_empty` counting `rebuild` is what
+/// lets the Incremental arm keep its debt, and wake the flush for it
+/// ([`Engine::flush_deadline`]'s `rebuild` test), without the flag.
+fn kept_after_no_target_round(taken: ViewDirty, full_mode: bool) -> ViewDirty {
+    if taken.rebuild {
+        let mut kept = taken;
+        kept.all = full_mode;
+        kept
+    } else {
+        // What no owed set can name (`images`, `marks`, `holds`), plus what cannot be re-derived:
+        // `tally` and `cache` are not debt. `ViewDirty::take` keeps them with the buffer by design,
+        // `publish_stats` folds this view's `/stats` counters out of `tally`, and the published
+        // counter is cumulative — a mark dropped here is never reported at all (the
+        // `reg_cascade_short_image_minimal` CI red at seed 892225811605, ruled in msg_15a6a77fbab9).
+        // A dropped `cache` is the same kind of loss on the other side of the map: a distrusted map,
+        // or an open gap window, would look clean again.
+        let ViewDirty {
+            images,
+            marks,
+            holds,
+            tally,
+            cache,
+            ..
+        } = taken;
+        ViewDirty {
+            images,
+            marks,
+            holds,
+            tally,
+            cache,
+            ..Default::default()
+        }
+    }
+}
+
+/// The lowest pin of [`floor_pins_of`]: what the position is actually stuck behind. `None` when
+/// nothing holds it back at all, when the floor is simply what the reader has read.
+fn floor_pin_of<'a>(
+    boundary: &Position,
+    slots: &'a [Slot],
+    pinned: impl FnMut(u64) -> Option<Position>,
+    held: bool,
+) -> Option<(FloorPin<'a>, Position)> {
+    let mut best: Option<(FloorPin<'_>, Position)> = None;
+    floor_pins_of(slots, pinned, held, |kind, p| {
+        if best.as_ref().is_none_or(|(_, at)| p < at) {
+            best = Some((kind, p.clone()));
+        }
+    });
+    best.filter(|(_, at)| *at < *boundary)
+}
+
+/// [`Engine::pending_floor`] over `slots` at `boundary`, without the rest of the engine (the
+/// method says what it means). `pinned` answers the dedup core's oldest buffered id of a
+/// definition.
+fn pending_floor_of(
+    boundary: &Position,
+    slots: &[Slot],
+    pinned: impl FnMut(u64) -> Option<Position>,
+    held: bool,
+) -> Position {
+    let mut floor = boundary.clone();
+    floor_pins_of(slots, pinned, held, |_, p| lower_pos(&mut floor, Some(p)));
+    floor
 }
 
 /// The position a build in flight holds the floor at: `Some(started)` unless the version being
@@ -545,41 +868,6 @@ fn building_floor(s: &Slot) -> Option<&Position> {
         .as_ref()
         .is_some_and(|l| Arc::ptr_eq(&l.plan, &n.plan) && !l.frozen);
     (!routine).then_some(&n.started)
-}
-
-/// [`Engine::pending_floor`] over `slots` at `boundary`, without the rest of the engine (the
-/// method says what it means). `pinned` answers the dedup core's oldest buffered id of a
-/// definition.
-fn pending_floor_of(
-    boundary: &Position,
-    slots: &[Slot],
-    mut pinned: impl FnMut(u64) -> Option<Position>,
-    held: bool,
-) -> Position {
-    let mut floor = boundary.clone();
-    for s in slots.iter().filter(|s| s.error.is_none()) {
-        lower_pos(&mut floor, s.stale_since.as_ref());
-        // A frozen live version holds the floor as a maintained one does. The freeze only says its
-        // buffer is no longer being appended to and it is no longer refreshed: the table is still
-        // what readers see and the one a restart resumes on, and the changes it owes until the new
-        // version swaps are kept in memory alone, so the save waits for them too (C1, #345 #319).
-        // `Version::since`'s own contract — "the saved and the reported position never pass it" —
-        // never asked whether the version was frozen.
-        if let Some(l) = s.live.as_ref() {
-            lower_pos(&mut floor, l.since.as_ref());
-            lower_pos(&mut floor, pinned(s.def_id).as_ref());
-            // The images remembered for later lookups are held only for a version that will still
-            // run them: a frozen one refreshes no more, and `after_boundary` stops pruning its
-            // lookback while its buffer holds images, which would pin the position for the whole
-            // freeze instead of for the lookback window.
-            if held && !l.frozen {
-                lower_pos(&mut floor, l.recent.floor());
-            }
-            lag_floor(&mut floor, &l.lag);
-        }
-        lower_pos(&mut floor, building_floor(s));
-    }
-    floor
 }
 
 /// What a statement of `bytes` costs at the **worst** per-byte rate the run measured on the meta
@@ -777,6 +1065,11 @@ struct Next {
     done: Option<Result<Built>>,
     /// Only adds these targets to the unchanged live version.
     partial: bool,
+    /// A lagging target's whole-view catch-up ([`BuildKind::LagCatchUp`]): the slot's optional work
+    /// for ONE target, which is why its buffer is bounded on its own account — past its budget the
+    /// attempt is dropped rather than pausing the binlog reader that every other view reads
+    /// through ([`Engine::build_budget_action`], lv-super ruling 2026-11-27).
+    catch_up: bool,
     hash: String,
     /// Targets already swapped (a swap interrupted on one target is resumed on the rest).
     swapped: HashSet<String>,
@@ -794,6 +1087,9 @@ struct Next {
     routine: bool,
     /// The swap runs in the background (`task`); the live version pauses until it is done.
     swapping: bool,
+    /// When a round first saw this version's task over without its report (see
+    /// [`Engine::lost_build_report`]). `None` while the report is still owed in good faith.
+    lost: Option<Instant>,
     /// As [`Version::catalog_head`], for its plan.
     catalog_head: Option<Position>,
 }
@@ -1078,6 +1374,27 @@ struct Built {
     swapped: Vec<String>,
     lock_wait: Vec<String>,
     cache: cascade::Cache,
+}
+
+/// Why a build runs: what it does to the unchanged live version, and how it is counted. The reason
+/// strings it produces are the engine's vocabulary of a whole-view rebuild —
+/// `tests/common/soakcheck.rs` (`UNOWNED_REASONS`) and `tests/soak_widen.rs` read them, so the two
+/// existing ones are contract.
+enum BuildKind {
+    /// Replaces the live version: a new definition, target list or source schema, a rebuild
+    /// request, a Full-mode cadence refresh, or an unknown-units heal of an incremental view.
+    Replace,
+    /// Builds `targets` onto the unchanged live version: targets the view was never built on
+    /// (startup resume, a target that was down and answered again — `Engine::retry_down`). Counted
+    /// as a whole rebuild, which is what the soak suite's budget expects for "a target that came
+    /// back is rebuilt as a whole" (`docs/operations.md:248`).
+    Rejoin,
+    /// Builds one target onto the unchanged live version because that lagging target owes the WHOLE
+    /// view (`Engine::lag_build`, #265 guard R1): its table was never filled — rows did not change.
+    /// Counted as a build and not a whole refresh (`stats::built`), so an incremental view's
+    /// `whole_view_refreshes` stays 0 through a lag catch-up, which is what `assert_no_rebuilds`
+    /// (tests/chaos.rs) reads.
+    LagCatchUp,
 }
 
 struct BuildDone {
@@ -1446,6 +1763,13 @@ struct Engine {
     /// (`Config::mem.lag_hold_bytes`), not per housekeeping
     /// tick (re-armed when the estimate falls back within the budget).
     lag_budget_warned: bool,
+    /// The reported position at the last stall check and when it first stopped moving
+    /// ([`Engine::report_floor_stall`]); `None` while the engine publishes everything it reads.
+    floor_held: Option<(Position, Instant)>,
+    /// The last time the stall check looked (once a second, never per event).
+    floor_checked: Instant,
+    /// When the stall was last reported, so a long one keeps a record without a flood.
+    floor_warned_at: Option<Instant>,
     /// (slot, targets written) of every live refresh of the flush in progress (`note_refresh`
     /// fills it, `flush_draining` reads it once when the flush is through, #215).
     flush_wrote: Vec<(usize, Vec<String>)>,
@@ -1457,8 +1781,25 @@ struct Engine {
     /// the task ends when this, its only sender, is dropped with the engine.
     stats_tx: crate::stats::FoldSender,
     /// Concurrent refreshes on connection pools; `None` with `LAZYVIEW_SUPERVISOR=off` (one
-    /// sequential refresh on the connections above).
+    /// sequential refresh on the connections above). Shared as an `Arc`: a detached lag
+    /// retry drives its writes from a spawned task while the flush tick moves on (#214).
     sup: Option<Arc<Supervisor>>,
+    /// Lag retries the detached tasks are running (#214): at most one per (slot, target), and
+    /// the entry is the claim, not just the handle — `(handle, claim id)`. The id is what makes
+    /// the invariant hold: a result folds (and frees its target) only when the entry still
+    /// carries the id the retry was started with, so a late result can never free a *newer*
+    /// claim, and a claim is never freed while its result is still in `lag_rx` (see
+    /// [`Engine::lag_service`]). A task that died without its message (a panic) frees its target
+    /// on the next tick; results are folded in by `lag_end` on a later tick.
+    lag_retries: HashMap<(usize, String), (tokio::task::JoinHandle<()>, u64)>,
+    /// The next claim id for [`Self::lag_retries`]: every claim of a (view, target) is unique,
+    /// which is what lets a fold tell its own retry from a newer one (#391).
+    lag_claim_seq: u64,
+    lag_tx: mpsc::UnboundedSender<(usize, LagRetry, Result<Refreshed>)>,
+    lag_rx: mpsc::UnboundedReceiver<(usize, LagRetry, Result<Refreshed>)>,
+    /// Results drained from `lag_rx` whose slot is mid-swap (see `refresh_all_live`): they
+    /// wait here, in arrival order, until the swap is in.
+    lag_held: VecDeque<(usize, LagRetry, Result<Refreshed>)>,
     /// Executor (a): the dedup core and its targets, one per live version on the Dedup route
     /// (src/exec.rs).
     dedup: crate::exec::Dedup,
@@ -1772,10 +2113,10 @@ impl Drained {
     /// Queues `r`, read from binlog file `file`. Heartbeats are dropped: they carry nothing, and
     /// one taken from the queue would move the position to the reader's, past the events queued
     /// behind it (see `Engine::on_item`); the next one read while idle does that instead.
-    fn push(&mut self, r: Read, file: &str) {
+    fn push(&mut self, r: Read, file: &str) -> usize {
         let b = match &r {
             Ok(Some(Item::Rows { event, .. })) => 64 + event.data().len(),
-            Ok(Some(Item::Heartbeat)) => return,
+            Ok(Some(Item::Heartbeat)) => return 0,
             _ => 64,
         };
         if self.queue.is_empty() {
@@ -1783,6 +2124,7 @@ impl Drained {
         }
         self.bytes += b;
         self.queue.push_back((r, b));
+        b
     }
 
     /// Whether the queue holds no event the views are still to be handed (see
@@ -2536,6 +2878,7 @@ impl Engine {
             .map(|(k, v)| (k, v.hash))
             .collect();
         let (build_tx, build_rx) = mpsc::unbounded_channel();
+        let (lag_tx, lag_rx) = mpsc::unbounded_channel();
         let cfg_build_concurrency = cfg.build_concurrency;
         match cfg.supervisor.mode {
             crate::config::SupervisorMode::Off => {
@@ -2659,12 +3002,20 @@ impl Engine {
             },
             ready_logged: false,
             lag_budget_warned: false,
+            floor_held: None,
+            floor_checked: Instant::now(),
+            floor_warned_at: None,
             flush_wrote: Vec::new(),
             refreshed: HashSet::new(),
             last_touch: Instant::now(),
             last_stats: (Instant::now(), Default::default()),
             stats_tx,
             sup,
+            lag_retries: HashMap::new(),
+            lag_claim_seq: 0,
+            lag_tx,
+            lag_rx,
+            lag_held: VecDeque::new(),
             dedup,
             stmt_dml_last: HashMap::new(),
         };
@@ -3754,9 +4105,15 @@ impl Engine {
             if build.is_empty() {
                 continue;
             }
-            let partial = self.slots[idx].live.is_some();
+            // What resume did not find live is built onto the live version (`Rejoin`); with no live
+            // version at all this is the view's first build (`Replace`).
+            let kind = if self.slots[idx].live.is_some() {
+                BuildKind::Rejoin
+            } else {
+                BuildKind::Replace
+            };
             let name = plan.name.clone();
-            self.start_next(idx, plan, name, build, partial).await;
+            self.start_next(idx, plan, name, build, kind).await;
         }
         // Chained views defined before an upstream that was resumed after them.
         let live: Vec<String> = self
@@ -4101,8 +4458,9 @@ impl Engine {
         plan: Arc<ViewPlan>,
         name: String,
         targets: Vec<String>,
-        partial: bool,
+        kind: BuildKind,
     ) {
+        let partial = !matches!(kind, BuildKind::Replace);
         if let Some(n) = self.slots[idx].next.take() {
             n.task.abort();
             if n.name != name || n.targets != targets {
@@ -4218,16 +4576,26 @@ impl Engine {
             }
         }
         Metrics::add(&self.metrics.full_rebuilds, 1);
-        let reason = if partial {
-            "build on a target that was down"
-        } else if !routine {
-            "new version: definition, targets or source schema changed, or rebuild requested"
-        } else if matches!(plan.mode, Mode::Full(_)) {
-            "full-mode view: the definition is not maintained incrementally"
-        } else {
-            "affected ids unknown (cascading foreign key, lookup overflow or untraced change)"
+        let reason = match kind {
+            // Not one of the two reasons the soak ledger accepts for a refresh no event owns: this
+            // build is never counted as a whole refresh, so it never reaches that check.
+            BuildKind::LagCatchUp => "lagging target owes the whole view: it is built for it",
+            BuildKind::Rejoin => "build on a target that was down",
+            BuildKind::Replace if !routine => {
+                "new version: definition, targets or source schema changed, or rebuild requested"
+            }
+            BuildKind::Replace if matches!(plan.mode, Mode::Full(_)) => {
+                "full-mode view: the definition is not maintained incrementally"
+            }
+            BuildKind::Replace => {
+                "affected ids unknown (cascading foreign key, lookup overflow or untraced change)"
+            }
         };
-        let replaces_live = self.slots[idx].live.is_some();
+        // A lag catch-up adds a target to the live version: nothing is replaced and no row
+        // changed, so it is a build (`stats::built`'s `false`), not a whole refresh. Both other
+        // kinds keep main's counting exactly.
+        let replaces_live =
+            !matches!(kind, BuildKind::LagCatchUp) && self.slots[idx].live.is_some();
         self.slots[idx].stats.built(replaces_live, reason);
         self.slots[idx].last_full = Some(Instant::now());
         // Building again: views waiting for this one no longer show its error.
@@ -4250,6 +4618,7 @@ impl Engine {
             task,
             done: None,
             partial,
+            catch_up: matches!(kind, BuildKind::LagCatchUp),
             hash,
             swapped: HashSet::new(),
             lock_wait: HashSet::new(),
@@ -4258,6 +4627,7 @@ impl Engine {
             recent: Lookback::default(),
             routine,
             swapping: false,
+            lost: None,
             catalog_head,
         });
         self.rebuild_routes();
@@ -4365,7 +4735,7 @@ impl Engine {
             } else {
                 info!(view = %name, "definition changed; building the new version online (current version stays live)");
             }
-            self.start_next(idx, plan, name, d.targets.clone(), false)
+            self.start_next(idx, plan, name, d.targets.clone(), BuildKind::Replace)
                 .await;
         }
         self.rebuild_routes();
@@ -4701,7 +5071,7 @@ impl Engine {
     /// (`Synced::lost_cache`, taken by `exec::Dedup::sync` / `advance_replacements` before
     /// `remove_target`) - restore it into the live version, so executor (b) keeps resolving
     /// cascaded and mapped child rows from the real map. Rows the core had already applied sit
-    /// at or after `boundary` (a target that is behind holds it back, see `lag_floor`), so no
+    /// at or after `boundary` (a target that is behind holds it back, see `floor_pins_of`), so no
     /// replay floor is lowered for them; a version whose own cache is seeding keeps its
     /// in-flight seed (the build's `deliver_cache` moves the fresh one in).
     fn restore_lost_caches(&mut self, synced: &mut crate::exec::Synced) {
@@ -5034,8 +5404,16 @@ impl Engine {
                     crate::metrics::unix_now(),
                 );
                 let deadline = self.flush_deadline();
-                let sleep_until =
-                    deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+                // A lag entry's `retry_at` also wakes the loop: the claim and the folding of
+                // a finished detached retry run at their scheduled time, not at the slot's
+                // next due flush (#214 — an entry armed by a just-failed swap would else
+                // wait a whole interval and its target's catch-up could miss a verify).
+                let wake = match (deadline, self.lag_any().then(|| self.lag_wake())) {
+                    (Some(d), Some(w)) => Some(d.min(w)),
+                    (Some(d), None) => Some(d),
+                    (None, Some(w)) => Some(w),
+                    (None, None) => None,
+                };
                 let mut idle = false;
                 let mut read = drained.pop();
                 // Freshness: what the queue still holds is read but not yet handed to the views,
@@ -5045,6 +5423,10 @@ impl Engine {
                     break 'reconnect;
                 }
                 if read.is_none() {
+                    let sleep_fut = tokio::time::sleep_until(
+                        wake.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
+                            .into(),
+                    );
                     tokio::select! {
                         biased;
                         _ = shutdown.changed() => {
@@ -5058,7 +5440,7 @@ impl Engine {
                             read = Some(item);
                         }
                         // Polled last: fires only while the stream has nothing to deliver.
-                        _ = tokio::time::sleep_until(sleep_until.into()), if deadline.is_some() && !self.in_txn => idle = true,
+                        _ = sleep_fut, if wake.is_some() && !self.in_txn => idle = true,
                         _ = tokio::time::sleep_until((last_event + silence).into()) => {
                             warn!("no binlog event or heartbeat for {silence:?}; reconnecting");
                             end = Some(StreamEnd::Silence);
@@ -5128,6 +5510,16 @@ impl Engine {
                         break;
                     }
                 }
+                // A report that arrived while this round was working the queue is applied by THIS
+                // round's flush. The channel is otherwise read only in the idle select above and in
+                // `hold_for_builds`, so a round that keeps finding work to do — which is exactly
+                // what a black-holed target produces, with every flush spending its connect timeout
+                // — never asks, and a build that finished in the meantime is not applied: the slot
+                // keeps its `next`, `live_begin` defers every later rebuild to it, and the targets
+                // that answer every write freeze at the rows of the last swap (#214).
+                while let Ok(done) = build_rx.try_recv() {
+                    self.on_build_done(done);
+                }
                 // A due flush runs once the stream is drained. While a backlog keeps delivering
                 // (catch-up), it runs only every CATCH_UP_BATCH past its deadline (or at
                 // LAZYVIEW_BATCH_MAX_KEYS), so a backlog is applied in batches rather than one
@@ -5140,9 +5532,16 @@ impl Engine {
                 if !self.in_txn && flush {
                     self.flush_draining(&mut reader, &mut drained, &mut last_event)
                         .await?;
-                    // Once per flush, never per event: building versions over their budget hold
-                    // the reader until a build is applied.
-                    if self.builds_over_budget().is_some()
+                    // Once per flush, never per event: the builds a view will be served from, over
+                    // their budget, hold the reader until one is applied — a lagging target's
+                    // whole-view catch-up is dropped past its own budget instead, so one starved
+                    // target never pauses the reader the other views read through (lv-super
+                    // ruling 2026-11-27).
+                    let (dropped, held) = self.build_budget_action();
+                    if !dropped.is_empty() {
+                        self.drop_catch_up_builds(&dropped).await;
+                    }
+                    if held.is_some()
                         && !self
                             .hold_for_builds(
                                 &mut reader,
@@ -5157,6 +5556,11 @@ impl Engine {
                     }
                 }
                 if !self.in_txn {
+                    if self.lag_any() {
+                        // Claims and folds at their scheduled time (see `lag_wake`), even
+                        // when no slot is due; when one is, the flush already did this.
+                        self.lag_service().await;
+                    }
                     self.housekeeping().await?;
                 }
             }
@@ -5287,6 +5691,22 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| reader.position().file.clone());
         let (mut read_any, mut full) = (false, false);
+        // The changes this flush read while it ran, and whether any of them is one the targets
+        // owe: rows of a table other than the engine's own bookkeeping (its definitions, state,
+        // status and commit-fence rows — the ones `on_item` filters out where they arrive, so no
+        // target ever applies them). The engine's own rows must not count as the stream moving:
+        // on a flavor whose visibility fence is a *write* rather than a wait — the commit-order
+        // row of the MySQL family without GTIDs (`mysql::commit_order`, `src/fence.rs`), which
+        // the flush commits itself, as Percona Server does with GTIDs off — the flush reads its
+        // own fence row back out of the binlog while it runs, and counting it accounts every
+        // target of every flush as behind on the engine's own account. From there the healthy
+        // targets are skipped by the refresh and their catch-up queues behind the target that is
+        // not answering: independence broken (#214, percona84). A table this run has no map
+        // entry for counts, as before. Cost (guard R3): one `contains` over the (at most four)
+        // ids of our own tables per event read during a flush, and one `String` clone per flush.
+        let (mut owed_bytes, mut owed_changes) = (0usize, false);
+        let mut own_ids: Vec<u64> = Vec::new();
+        let schema = self.schema.clone();
         let metrics = self.metrics.clone();
         // Everything fed so far (the binlog read position) is what this flush applies: the
         // position the targets will have applied when it is through (#215, see below).
@@ -5310,16 +5730,28 @@ impl Engine {
                     }
                     read = reader.next(), if open => {
                         *last_event = Instant::now();
+                        // A table map always precedes the rows events it describes, so the ids of
+                        // our own tables are known by the time their rows are weighed; an id the
+                        // server reused for another table is not ours (it drops out of the list).
+                        let owed = match &read {
+                            Ok(Some(item)) => Self::owed_item(item, schema.as_str(), &mut own_ids),
+                            _ => false,
+                        };
                         // Freshness (review O-01): `read_any` — which marks the stream
                         // not-at-head and the queue as read-not-applied — counts only a real
                         // item. A heartbeat carries no change and is dropped from the queue;
                         // claiming it would knock a caught-up view off the zero branch for a
                         // heartbeat period. Cost: one discriminant test on the item the push
                         // below matches on anyway.
-                        if !matches!(read, Ok(Some(Item::Heartbeat))) {
+                        let real = !matches!(read, Ok(Some(Item::Heartbeat)));
+                        let b = drained.push(read, &file);
+                        if owed {
+                            owed_bytes += b;
+                            owed_changes = true;
+                        }
+                        if real {
                             read_any = true;
                         }
-                        drained.push(read, &file);
                     }
                 }
             }
@@ -5328,9 +5760,11 @@ impl Engine {
         // more than the budget of the changes kept for targets that are behind — the targets
         // answered every write, yet demonstrably fall behind (a starved link; #215). Reported
         // and accounted as lagging, the same way a target that failed its writes is. Decided
-        // from the applied position against the budget, never from error text. Cost (guard R3):
-        // one position compare and one pass over the (view, target) pairs per flush; the event
-        // path is untouched (the reader's position is read once, here, not per event).
+        // from the applied position against the budget, never from error text, and only over
+        // the changes the targets owe (see above: the engine's own bookkeeping rows are not
+        // one, or a flavor that fences with a write flags its own targets behind). Cost (guard
+        // R3): one position compare and one pass over the (view, target) pairs per flush; the
+        // event path is untouched (the reader's position is read once, here, not per event).
         // The flush read past what the views were handed: those queued events are the source
         // being ahead of the views, so the stream is no longer at its head (the next heartbeat
         // after the queue drains says it is again) and the queued part counts as read-not-applied
@@ -5339,15 +5773,50 @@ impl Engine {
             self.clock.pending_read = true;
             self.clock.at_head = false;
         }
-        if r.is_ok() && read_any {
-            self.mark_behind_targets(&applied, reader.position(), drained.bytes);
+        if r.is_ok() && read_any && owed_changes {
+            self.mark_behind_targets(&applied, reader.position(), owed_bytes);
         }
         r
     }
 
+    /// Whether an event read while a flush ran is a change the targets owe: rows of a table
+    /// other than the engine's own bookkeeping, or a statement (DDL changes what the views mean).
+    /// `own_ids` is the table ids the table-map events of this flush named as ours: a map updates
+    /// it (a table map always precedes the rows events it describes), and an id the server reused
+    /// for another table leaves it. A table with no map entry in this flush counts, as before.
+    fn owed_item(item: &Item, schema: &str, own_ids: &mut Vec<u64>) -> bool {
+        match item {
+            Item::TableMap {
+                table_id,
+                schema: s,
+                table,
+                ..
+            } => {
+                if s.as_str() == schema
+                    && (table.as_str() == meta::DEFS
+                        || table.as_str() == meta::STATE
+                        || table.as_str() == meta::STATUS
+                        || table.as_str() == mysql::table())
+                {
+                    if !own_ids.contains(table_id) {
+                        own_ids.push(*table_id);
+                    }
+                } else {
+                    own_ids.retain(|x| *x != *table_id);
+                }
+                false
+            }
+            Item::Rows { table_id, .. } => !own_ids.contains(table_id),
+            Item::Statement { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Flags the targets the flush just wrote as behind: the flush applied everything up to
-    /// `applied`, while the stream was read up to `read` (events worth `drained_bytes` are
-    /// queued behind that position). Past the `Config::mem.lag_hold_bytes` budget
+    /// `applied`, while the stream was read up to `read` (`owed_bytes` of changes the targets
+    /// owe arrived meanwhile: rows of a table other than the engine's own bookkeeping, so a
+    /// flush is never flagged behind by the fence or state row it wrote itself). Past the
+    /// `Config::mem.lag_hold_bytes` budget
     /// (`LAZYVIEW_TEST_LAG_HOLD_BYTES` in tests) every target that took this flush's writes is
     /// flagged in [`Version::behind`]: the next refresh skips it and hands it its changes
     /// through a `lag` entry (`note_refresh`), or the entry is made when the flag's retry time
@@ -5355,14 +5824,14 @@ impl Engine {
     /// writes failed gets: kept keys, the budget warning, `retry_lag` catching it up and
     /// counting the catch-up. Nothing is rebuilt or dropped; a target that keeps up again
     /// simply never gets flagged (only a written target of a slow flush is).
-    fn mark_behind_targets(&mut self, applied: &Position, read: &Position, drained_bytes: usize) {
+    fn mark_behind_targets(&mut self, applied: &Position, read: &Position, owed_bytes: usize) {
         let budget = self.cfg.mem.lag_hold_bytes;
         // Bytes between the two positions: an offset difference in one binlog file; across a
         // rotation the size of the files between is unknown, so the queue alone decides.
         let behind = if read.file == applied.file {
             read.pos.saturating_sub(applied.pos) > budget as u64
         } else {
-            drained_bytes > budget
+            owed_bytes > budget
         };
         if !behind {
             return;
@@ -5378,20 +5847,24 @@ impl Engine {
                 }
                 l.behind.insert(t.clone(), retry_at);
                 warn!(view = %l.name, target = %t,
-                    "writes to this target are behind: the stream has moved {drained_bytes} \
+                    "writes to this target are behind: the stream has moved {owed_bytes} \
                      bytes of changes past the position this flush applied, over the {budget} \
                      byte budget; the target is accounted as lagging until it catches up");
             }
         }
     }
 
-    /// Holds the binlog reader while [`Self::builds_over_budget`]: a building version cannot take
+    /// Holds the binlog reader while [`Self::build_budget_action`] says the builds a view will be
+    /// served from are over their budget: a building version cannot take
     /// its buffered changes before its build is done, and dropping them would cost the view a
     /// rebuild after the swap (owner rule: never). Nothing is read meanwhile, so the server's
     /// socket fills and the stream waits; build results are taken, a due flush runs (applying a
     /// finished build's changes is what lifts the hold), and the loop keeps beating (`/livez`)
     /// and housekeeping. Called only after a flush, between transactions; counted once per hold
-    /// in `binlog_backpressure`. `Ok(false)`: shutdown was requested meanwhile.
+    /// in `binlog_backpressure`. A lagging target's whole-view catch-up is NEVER a reason to be
+    /// here: past its own budget it is dropped ([`Self::drop_catch_up_builds`]), because one
+    /// starved target must not pause the reader every other view reads through (lv-super ruling
+    /// 2026-11-27). `Ok(false)`: shutdown was requested meanwhile.
     async fn hold_for_builds(
         &mut self,
         reader: &mut BinlogReader,
@@ -5401,14 +5874,14 @@ impl Engine {
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<bool> {
         Metrics::add(&self.metrics.binlog_backpressure, 1);
-        let held = self.builds_over_budget().unwrap_or(0);
+        let held = self.build_budget_action().1.unwrap_or(0);
         warn!(buffered_mib = held >> 20, "changes buffered for building views exceed their budget; binlog reading paused until a build is applied");
         let since = Instant::now();
         // Freshness (review O-01): while the reader is held, the source keeps writing changes
         // nobody has read, so the stream is not at its head and a view's lag grows from here —
         // which is the number the "paused reader" alert reads.
         self.clock.reading = false;
-        while self.builds_over_budget().is_some() {
+        while self.build_budget_action().1.is_some() {
             let tick = Instant::now() + Duration::from_secs(1);
             let wake = self.flush_deadline().map_or(tick, |d| d.min(tick));
             tokio::select! {
@@ -5420,6 +5893,13 @@ impl Engine {
             self.metrics.beat();
             if self.flush_due() {
                 self.flush_draining(reader, drained, last_event).await?;
+            }
+            // The flush path above claims lag retries, so a catch-up can join the set of builds
+            // even here: past their budget they are dropped on the spot rather than left to add a
+            // reason for holding the reader (lv-super ruling 2026-11-27).
+            let (dropped, _) = self.build_budget_action();
+            if !dropped.is_empty() {
+                self.drop_catch_up_builds(&dropped).await;
             }
             self.housekeeping().await?;
         }
@@ -6274,6 +6754,9 @@ impl Engine {
             Some(_) => {}
             None => self.lag_budget_warned = false,
         }
+        // And when the position itself has stopped, what stopped it (the one pass per second this
+        // is gated to, never per tick).
+        self.report_floor_stall();
         Ok(())
     }
 
@@ -6806,7 +7289,7 @@ impl Engine {
     /// here re-reads everything still pending. Views in error do not hold it back (they are
     /// rebuilt after a restart). A target that is behind does, whether or not it was reported
     /// down: the keys kept for it live only in memory, so the saved position waits for them and
-    /// a restart replays the outage into them (see [`lag_floor`]). With `held`, also the oldest
+    /// a restart replays the outage into them (see [`floor_pins_of`]). With `held`, also the oldest
     /// change whose images are remembered for later lookups (applied, but a restart must read
     /// them again to have them; see [`Lookback`]). A version being built does too, at the
     /// position its build started at (see [`building_floor`]).
@@ -7090,29 +7573,196 @@ impl Engine {
         }
     }
 
+    /// Applies a build's (or a background swap's) report to the version waiting for it.
+    ///
+    /// The version is found by `generation`, not by `def_id`. `start_next` bumps the counter once
+    /// per build for the whole engine, so a generation names one version ever; a definition id
+    /// does not — a slot is re-keyed when its definition is re-planned or re-created, and a report
+    /// matched only against `def_id` then finds no slot (or another one), `done` is never set, and
+    /// nothing ever asks for that report again: the version stays in flight forever, `live_begin`
+    /// defers every later rebuild to it, and the targets that answer every write keep the rows of
+    /// the last swap. Both ways the report is dropped: only the second one says so.
     fn on_build_done(&mut self, done: BuildDone) {
-        if let Some(s) = self.slots.iter_mut().find(|s| s.def_id == done.def_id) {
-            if let Some(n) = s.next.as_mut() {
-                if n.generation == done.generation {
-                    n.done = Some(done.result);
-                    self.first_dirty.get_or_insert_with(Instant::now);
+        let i = self.slots.iter().position(|s| {
+            s.next
+                .as_ref()
+                .is_some_and(|n| n.generation == done.generation)
+        });
+        match i {
+            Some(i) => {
+                let slot_def = self.slots[i].def_id;
+                let n = self.slots[i].next.as_mut().unwrap();
+                let name = n.name.clone();
+                let moved = slot_def != done.def_id;
+                n.done = Some(done.result);
+                n.lost = None;
+                self.first_dirty.get_or_insert_with(Instant::now);
+                debug!(
+                    view = %name,
+                    generation = done.generation,
+                    swapping = n.swapping,
+                    def_id = done.def_id,
+                    "build report applied"
+                );
+                if moved {
+                    // The case the `def_id` lookup used to lose silently: same version, the slot
+                    // has moved on to another definition id since the build started.
+                    warn!(view = %name, generation = done.generation, def_id = done.def_id,
+                        slot_def_id = slot_def,
+                        "the build report names the definition this version started on, which \
+                         the slot no longer has; applied to the version by its generation");
                 }
             }
+            None => warn!(
+                def_id = done.def_id,
+                generation = done.generation,
+                "the build report belongs to no version in flight: nothing waits for it (its \
+                 changes were returned to the live version when the build was abandoned or the \
+                 slot was retired)"
+            ),
         }
     }
 
-    /// The estimated bytes buffered for building versions, when they exceed their budget
-    /// (`Config::mem.build_hold_bytes`; `LAZYVIEW_TEST_BUILD_HOLD_BYTES` in tests). One pass over the
-    /// slots: evaluated once per flush, never per event.
-    fn builds_over_budget(&self) -> Option<usize> {
-        let budget = self.cfg.mem.build_hold_bytes;
-        let held: usize = self
+    /// What the build byte budget asks of the binlog loop, over the two kinds of build in flight
+    /// (lv-super ruling 2026-11-27). `catch_ups` is `(slot, estimated bytes, swapping)` for each
+    /// whole-view catch-up a slot is doing for ONE lagging target; `ordinary` is what the other
+    /// builds buffer together.
+    ///
+    /// The rule is an escalation, not two budgets that ignore each other: a catch-up is the slot's
+    /// optional work for one target, so its buffer may cost THAT target its attempt but never the
+    /// shared reader — together the catch-ups get `catch_up_budget`, and while they are over it the
+    /// largest ones are dropped (each target keeps its `Lag` entry and its backoff) until the sum
+    /// fits — while the builds a view will actually be served from keep main's rule: over
+    /// `build_budget` the reader waits until one is applied. So one starved target can no longer
+    /// hold every other view's reading behind it — the stall #265 exists to remove — and the
+    /// memory the catch-ups may hold is one shared number, not one per view. (The CI stalls of
+    /// `chaos_tgt_bandwidth_starvation` are NOT this pause: their metric dumps carry
+    /// `binlog_backpressure: 0`, so the reader never stopped there. The rule is held anyway,
+    /// because this code path was open.)
+    ///
+    /// A catch-up whose swap is already running is never droppable: the rename is the point of no
+    /// return, and by then the table on the target is half the view.
+    ///
+    /// Pure, so the escalation is testable without a build or a server, as [`Engine::report_is_lost`]
+    /// is the state machine of a lost report.
+    fn build_budget_decision(
+        catch_ups: &[(usize, usize, bool)],
+        ordinary: usize,
+        catch_up_budget: usize,
+        build_budget: usize,
+    ) -> (Vec<usize>, Option<usize>) {
+        // Biggest first: the attempt that costs the most memory goes for the least lost work.
+        let mut droppable: Vec<(usize, usize)> = catch_ups
+            .iter()
+            .filter(|(_, _, swapping)| !*swapping)
+            .map(|(i, held, _)| (*i, *held))
+            .collect();
+        droppable.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut total: usize = droppable.iter().map(|(_, held)| *held).sum();
+        let mut dropped: Vec<usize> = Vec::new();
+        for (i, held) in droppable {
+            if total <= catch_up_budget {
+                break;
+            }
+            dropped.push(i);
+            total -= held;
+        }
+        dropped.sort_unstable();
+        (dropped, (ordinary > build_budget).then_some(ordinary))
+    }
+
+    /// What the build byte budget asks NOW: the slots to drop the catch-up build of, because the
+    /// catch-ups together passed their budget ([`Engine::drop_catch_up_builds`],
+    /// `Config::mem.lag_build_hold_bytes`), and the bytes that make the binlog reader wait
+    /// ([`Engine::hold_for_builds`], `Config::mem.build_hold_bytes`;
+    /// `LAZYVIEW_TEST_BUILD_HOLD_BYTES` in tests). One pass over the slots: evaluated once per
+    /// flush, never per event. The two kinds never trade against each other — a catch-up's bytes
+    /// cannot make the reader wait, and no ordinary build is ever dropped for them.
+    fn build_budget_action(&self) -> (Vec<usize>, Option<usize>) {
+        let mem = self.cfg.mem;
+        let catch_ups: Vec<(usize, usize, bool)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Some((i, s.next.as_ref()?)))
+            .filter(|(_, n)| n.catch_up)
+            .map(|(i, n)| (i, buffer_bytes(&n.dirty), n.swapping))
+            .collect();
+        let ordinary: usize = self
             .slots
             .iter()
             .filter_map(|s| s.next.as_ref())
+            .filter(|n| !n.catch_up)
             .map(|n| buffer_bytes(&n.dirty))
             .sum();
-        (held > budget).then_some(held)
+        Self::build_budget_decision(
+            &catch_ups,
+            ordinary,
+            mem.lag_build_hold_bytes,
+            mem.build_hold_bytes,
+        )
+    }
+
+    /// Drops the whole-view catch-up builds of these slots — the step [`Self::build_budget_action`]
+    /// chose over pausing the binlog reader (lv-super ruling 2026-11-27). The task is aborted and
+    /// its shadow table dropped the way [`Engine::retire_slot`] drops one; the changes the build
+    /// buffered while it ran go back to the live version, because the flush owed them to it and a
+    /// buffered change is never simply dropped (#214, the same return `next_failed` makes); and the
+    /// target keeps its `Lag` entry, so it still owes the whole view and waits for its next backoff
+    /// with its `failures` count UNCHANGED: passing a memory budget is this process's condition,
+    /// not the peer's, and `g.down` reports a peer that does not answer — counting these would let
+    /// memory pressure report a healthy target down. Called from the binlog loop after each flush
+    /// and from [`Self::hold_for_builds`], where the flush path can still start one.
+    async fn drop_catch_up_builds(&mut self, slots: &[usize]) {
+        for i in slots {
+            // Droppable: the slot's optional catch-up, its swap not started, no target renamed
+            // yet, and a live version to take its buffered changes back. That last test is what
+            // keeps this free of #214's failure mode — a slot without a live version to return
+            // to keeps its build, because a dropped change is never an option.
+            let droppable = self.slots[*i].live.is_some()
+                && self.slots[*i]
+                    .next
+                    .as_ref()
+                    .is_some_and(|n| n.catch_up && !n.swapping && n.swapped.is_empty());
+            if !droppable {
+                continue;
+            }
+            let n = self.slots[*i]
+                .next
+                .take()
+                .expect("the catch-up build was just checked");
+            let held = buffer_bytes(&n.dirty);
+            n.task.abort();
+            for t in &n.targets {
+                self.drop_shadow(t, &n.name).await;
+            }
+            let l = self.slots[*i]
+                .live
+                .as_mut()
+                .expect("the live version was just checked");
+            if Arc::ptr_eq(&l.plan, &n.plan) || matches!(l.plan.mode, Mode::Full(_)) {
+                let mut incoming = n.dirty;
+                if matches!(l.plan.mode, Mode::Full(_)) {
+                    incoming.all = true;
+                }
+                l.take_back(incoming, n.since);
+            }
+            for t in &n.targets {
+                if let Some(g) = self.slots[*i]
+                    .live
+                    .as_mut()
+                    .and_then(|l| l.lag.get_mut(t.as_str()))
+                {
+                    // One step further along the LAG ladder, without touching `failures`: that
+                    // field reports a peer that does not answer, and this is our own budget.
+                    g.retry_at = Instant::now() + connect_retry_delay(g.failures + 1);
+                }
+                warn!(view = %n.name, target = %t, buffered_mib = held >> 20,
+                      "the whole view is owed and its catch-up passed its own byte budget: the \
+                       attempt is dropped, the reader keeps reading");
+            }
+            self.rebuild_routes();
+        }
     }
 
     /// The estimated bytes kept for targets that are behind, when they exceed their budget
@@ -7135,7 +7785,7 @@ impl Engine {
     /// The budget of the changes kept for targets that are behind was passed: report only, take
     /// no action. A target that is down has nothing draining its keys while it is unreachable,
     /// but they are sets, bounded by the distinct ids the view can have, so it keeps them until
-    /// it catches up; the saved position waits for them ([`lag_floor`]), so a restart replays
+    /// it catches up; the saved position waits for them ([`floor_pins_of`]), so a restart replays
     /// the outage instead of losing the changes silently. Names the target that has been behind
     /// longest: it is the one keeping keys the longest, usually the unreachable one. Called
     /// once per crossing (the `lag_budget_warned` latch), not per housekeeping tick.
@@ -7158,6 +7808,165 @@ impl Engine {
             warn!(view = %view, target = %target, buffered_mib = held >> 20,
                 "the changes kept for this target exceed their {budget} byte budget; they are kept until it catches up, and the saved position waits for them");
         }
+    }
+
+    /// A reported position that stops moving is the one failure `/stats` cannot explain: it
+    /// prints the number, never the reason. Once the reader is ahead of the published position
+    /// and that has not closed for [`FLOOR_STALL_WARN`], name the pin — which view, which target,
+    /// which kind of wait. A flush that never completes, a whole-view debt whose catch-up build
+    /// never lands and a build whose report went missing all look the same from outside (an
+    /// `applied` that does not move) and want different answers; on 2026-11-27 three CI reds of
+    /// the "a target never catches up" family were argued from a position and nothing else.
+    ///
+    /// At most one pass over the slots per second, and one line per minute of a continuing stall
+    /// (the `floor_held` and `floor_warned_at` latches), so it is never per event and never per
+    /// tick. The counters stay the alerting signal (`/livez`'s beat, `lag_over_budget`); this is
+    /// the diagnosis an operator or a CI log reads once something is already wrong.
+    fn report_floor_stall(&mut self) {
+        if self.floor_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.floor_checked = Instant::now();
+        let read = self.boundary.to_position();
+        let floor = self.pending_floor(false);
+        if floor >= read {
+            // Nothing read is unapplied: the engine publishes everything it has, the one state in
+            // which a still position means nothing is wrong (an idle engine over a quiet source).
+            self.floor_held = None;
+            self.floor_warned_at = None;
+            return;
+        }
+        let now = Instant::now();
+        match &self.floor_held {
+            Some((at, since)) if *at == floor => {
+                if *since + FLOOR_STALL_WARN > now {
+                    return;
+                }
+                if self
+                    .floor_warned_at
+                    .is_some_and(|w| w.elapsed() < Duration::from_secs(60))
+                {
+                    return;
+                }
+                self.floor_warned_at = Some(now);
+            }
+            _ => {
+                self.floor_held = Some((floor.clone(), now));
+                self.floor_warned_at = None;
+                return;
+            }
+        }
+        let Some((pin, at)) = floor_pin_of(&read, &self.slots, |id| self.dedup.pinned(id), false)
+        else {
+            return;
+        };
+        let view = self
+            .slots
+            .iter()
+            .find(|s| s.def_id == pin.def_id())
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let target = match pin {
+            FloorPin::Lag { target, .. } => target.to_string(),
+            _ => self
+                .slots
+                .iter()
+                .find(|s| s.def_id == pin.def_id())
+                .and_then(|s| s.live.as_ref())
+                .and_then(|l| {
+                    l.lag
+                        .keys()
+                        .next()
+                        .cloned()
+                        .or_else(|| l.targets.first().cloned())
+                })
+                .unwrap_or_else(|| "-".to_string()),
+        };
+        // The floor's minimum names the debt; the slot's own account names why that debt is not
+        // being paid, which is the reason the line exists. From `/stats` alone the three states
+        // that matter print identically — a buffer no round can deliver, a catch-up declined by
+        // the work already in the slot, a claim whose task never came back — and CI's two
+        // bandwidth reds were argued from an applied position alone for exactly that reason.
+        let why = self
+            .slots
+            .iter()
+            .position(|s| s.def_id == pin.def_id())
+            .map(|i| self.slot_witness(i))
+            .unwrap_or_default();
+        let held = now.duration_since(self.floor_held.as_ref().expect("just latched").1);
+        warn!(view = %view, target = %target, since = %at, read = %read, held_s = held.as_secs(),
+              why = %why,
+              "the reported position has not advanced for {}s: {}",
+              held.as_secs(),
+              pin.what());
+    }
+
+    /// The slot's own account of why its floor cannot move, for [`Engine::report_floor_stall`]:
+    /// what it maintains, what it owes and to whom, what it has buffered, and what work of its own
+    /// is in flight. The floor is a minimum over exactly these, so a position that has stood still
+    /// for minutes is a claim about one of them — and the witness has to say which, or the line
+    /// prints a position and a guess (the state of the three CI reds of 2026-11-27).
+    ///
+    /// Cost (guard R3): one formatted line per stalled view per minute, off every hot path.
+    fn slot_witness(&self, i: usize) -> String {
+        let Some(s) = self.slots.get(i) else {
+            return String::new();
+        };
+        let common = format!(
+            "error={} stale={} in_flight={} swapping={} catch_up={} build_targets=[{}] waiting={} replan={}",
+            s.error.is_some(),
+            s.stale_since.is_some(),
+            s.next.is_some(),
+            s.next.as_ref().is_some_and(|n| n.swapping),
+            s.next.as_ref().is_some_and(|n| n.catch_up),
+            s.next
+                .as_ref()
+                .map(|n| n.targets.join(","))
+                .unwrap_or_default(),
+            s.waiting.is_some(),
+            self.replan.contains_key(&s.def_id),
+        );
+        let Some(l) = s.live.as_ref() else {
+            return format!("live=none {common}");
+        };
+        let now = Instant::now();
+        let owed: Vec<String> = l
+            .lag
+            .iter()
+            .map(|(t, g)| {
+                format!(
+                    "{t}(all={} down={} units={} due={} failures={})",
+                    g.all,
+                    g.down,
+                    g.units.len() + g.partial.iter().map(UnitSet::len).sum::<usize>(),
+                    g.retry_at <= now,
+                    g.failures,
+                )
+            })
+            .collect();
+        let d = &l.dirty;
+        format!(
+            "frozen={} maintained=[{}] owed=[{}] behind=[{}] buffered(units={} images={} marks={} \
+             holds={} partial={} all={} rebuild={}) in_flight_since={} build_done={} claims={} {common}",
+            l.frozen,
+            l.targets.join(","),
+            owed.join(","),
+            l.behind.keys().cloned().collect::<Vec<_>>().join(","),
+            d.units.len(),
+            d.images.iter().map(KeySet::len).sum::<usize>(),
+            d.marks.len(),
+            d.holds.len(),
+            d.partial.iter().map(UnitSet::len).sum::<usize>(),
+            d.all,
+            d.rebuild,
+            s.next
+                .as_ref()
+                .and_then(|n| n.since.as_ref())
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            s.next.as_ref().is_some_and(|n| n.done.is_some()),
+            self.lag_retries.keys().filter(|(j, _)| *j == i).count(),
+        )
     }
 
     fn key_count(&self) -> usize {
@@ -7375,6 +8184,20 @@ impl Engine {
             // Supervised: the live views refresh together (below), each after its swap.
             let together = self.sup.is_some();
             for i in 0..self.slots.len() {
+                // A version whose task is over but whose report never arrived would hold the slot
+                // forever: `live_begin` defers every later rebuild of the view to it, and the
+                // targets that answer every write keep the rows of the last swap (#214). Seen
+                // twice in a row, with the channel drained above, the report is not coming: the
+                // build is abandoned as a failed one, which keeps what this round buffered for the
+                // live version and schedules the rebuild.
+                if self.lost_build_report(i) {
+                    let n = self.slots[i].next.take().unwrap();
+                    warn!(view = %n.name, generation = n.generation, swapping = n.swapping,
+                        "the build report never arrived: this build is abandoned, its changes \
+                         stay buffered for the live version and the rebuild starts again");
+                    self.next_failed(i, n, anyhow!("the build report never arrived"))
+                        .await;
+                }
                 let t0 = Instant::now();
                 if self.slots[i]
                     .next
@@ -7818,7 +8641,8 @@ impl Engine {
                 if freeze {
                     info!(view = %name, "source schema changed; rebuilding online");
                 }
-                self.start_next(i, plan, name, targets, false).await;
+                self.start_next(i, plan, name, targets, BuildKind::Replace)
+                    .await;
             }
             Err(e)
                 if e.downcast_ref::<WaitingFor>().is_some()
@@ -7895,7 +8719,7 @@ impl Engine {
                 continue;
             }
             let (plan, name) = (l.plan.clone(), l.name.clone());
-            self.start_next(i, plan, name, due, true).await;
+            self.start_next(i, plan, name, due, BuildKind::Rejoin).await;
         }
     }
 
@@ -7912,22 +8736,20 @@ impl Engine {
         if let Some(l) = self.slots[i].live.as_mut() {
             // Changes buffered for the failed version also concern the live one.
             if Arc::ptr_eq(&l.plan, &n.plan) || matches!(l.plan.mode, Mode::Full(_)) {
-                l.dirty.merge(n.dirty);
+                let mut incoming = n.dirty;
                 if matches!(l.plan.mode, Mode::Full(_)) {
-                    l.dirty.all = true;
+                    incoming.all = true;
                 }
-                if let Some(p) = n.since {
-                    if l.since.as_ref().is_none_or(|s| p < *s) {
-                        l.since = Some(p);
-                    }
-                }
+                l.take_back(incoming, n.since);
             }
         }
         if n.partial {
             // Only some targets of an otherwise live view: those are retried on their own.
             let plan = n.plan.clone();
             for t in &n.targets {
-                self.target_down(i, &n.name, t, Some(&plan), &e).await;
+                if !self.lag_after_build_fail(i, t, &plan) {
+                    self.target_down(i, &n.name, t, Some(&plan), &e).await;
+                }
             }
             self.rebuild_routes();
             return;
@@ -7953,6 +8775,51 @@ impl Engine {
     /// `swap_lock_wait_s`, spent in the swap task off the loop: the shared reader is never
     /// paused for one target's metadata lock (N-01, N-02).
     const LOOP_SWAP_LOCK_WAIT_S: u64 = 1;
+
+    /// A version whose build (or swap) task is over and whose report has not arrived. Not on the
+    /// first round that sees it: the report of a task that returned is already in the channel, and
+    /// the round drains that before it gets here — so what survives a drain and a second look is a
+    /// report that is really gone (the task aborted or panicked, the channel closed under it, the
+    /// version no longer the one its slot waits for). Any other state forgets the observation.
+    fn lost_build_report(&mut self, i: usize) -> bool {
+        let Some(n) = self.slots[i].next.as_mut() else {
+            return false;
+        };
+        let (lost, seen) = Self::report_is_lost(
+            n.task.is_finished(),
+            n.done.is_some(),
+            n.lost,
+            Instant::now(),
+            Self::LOST_REPORT_GRACE,
+        );
+        n.lost = seen;
+        lost
+    }
+
+    /// [`Engine::lost_build_report`]'s decision over the three facts it reads, on its own so the
+    /// state machine is testable without a build: `task_over` (the build or swap task returned),
+    /// `has_report` (its report is applied), `seen` (when a round first saw the task over without
+    /// one). Returns whether to abandon the version now, and what to remember for the next round.
+    fn report_is_lost(
+        task_over: bool,
+        has_report: bool,
+        seen: Option<Instant>,
+        now: Instant,
+        grace: Duration,
+    ) -> (bool, Option<Instant>) {
+        if has_report || !task_over {
+            return (false, None);
+        }
+        match seen {
+            Some(at) if now.saturating_duration_since(at) >= grace => (true, Some(at)),
+            Some(at) => (false, Some(at)),
+            None => (false, Some(now)),
+        }
+    }
+
+    /// How long a finished build task may have been silent before its report is called lost:
+    /// long enough that the drain of the round (and one more) has had its chance at the channel.
+    const LOST_REPORT_GRACE: Duration = Duration::from_millis(250);
 
     /// Applies changes buffered during the build to the shadow tables, swaps them in.
     async fn finish_next(&mut self, i: usize) {
@@ -7980,7 +8847,12 @@ impl Engine {
             n.targets.retain(|x| *x != t);
             if n.partial || !n.targets.is_empty() || n.swapped.contains(&t) {
                 let plan = n.plan.clone();
-                self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                // A maintained Full-mode target that failed the build lags (its own
+                // whole-view refresh catches it up) instead of becoming a `Down` target
+                // that `retry_down` rebuilds onto through the fault (#214).
+                if !self.lag_after_build_fail(i, &t, &plan) {
+                    self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                }
             }
             first_err.get_or_insert(e);
         }
@@ -8191,9 +9063,15 @@ impl Engine {
                         if let Some(l) = self.slots[i].live.as_mut() {
                             if Arc::ptr_eq(&l.plan, &n.plan) || matches!(l.plan.mode, Mode::Full(_))
                             {
-                                l.dirty.merge(dirty);
+                                // The same merge as `next_failed`, and the same rule about the
+                                // position: it travels with the buffer it is the oldest position
+                                // of, so the ask this arm adds belongs to `incoming` and not to a
+                                // bare `l.since = Some(..)` — a Full view is owed another
+                                // whole-view refresh and an incremental one the re-armed rebuild,
+                                // both from that position.
+                                let mut incoming = dirty;
                                 if matches!(l.plan.mode, Mode::Full(_)) {
-                                    l.dirty.all = true;
+                                    incoming.all = true;
                                 } else {
                                     // Guard R1 (finding 3): "left to the next rebuild" must be a
                                     // promise the engine keeps for an INCREMENTAL view too. It
@@ -8202,13 +9080,9 @@ impl Engine {
                                     // at the `LAZYVIEW_FULL_REFRESH_MS` cadence: the loop wakes
                                     // for it (`flush_deadline`) and `refresh_live` starts it, and
                                     // that build swaps off the loop once the reader is gone.
-                                    l.dirty.rebuild = true;
+                                    incoming.rebuild = true;
                                 }
-                                if let Some(p) = since {
-                                    if l.since.as_ref().is_none_or(|s| p < *s) {
-                                        l.since = Some(p);
-                                    }
-                                }
+                                l.take_back(incoming, since);
                             }
                         }
                         // The same for the other shape of this branch: a version that REPLACES
@@ -8247,7 +9121,12 @@ impl Engine {
                     let e = e.context(format!("swapping in new version on target {t}"));
                     n.targets.retain(|x| *x != t);
                     let plan = n.plan.clone();
-                    self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                    // A Full-mode target that only failed the swap lags (its whole-view
+                    // refresh re-applies and the swap is not needed) — see the build path
+                    // above (#214). The dropped connection above is re-dialled by it.
+                    if !self.lag_after_build_fail(i, &t, &plan) {
+                        self.target_down(i, &n.name, &t, Some(&plan), &e).await;
+                    }
                     first_err.get_or_insert(e);
                 }
             }
@@ -8273,6 +9152,47 @@ impl Engine {
                     .await;
             }
             self.slots[i].down.remove(t);
+            // A target the build swapped in holds the WHOLE view as of the build's read position,
+            // which is what pays the `all` debt of [`Self::lag_build`]'s entry — the only way that
+            // debt is ever paid (guard R1). The accounting is `lag_end`'s, not a delete: what the
+            // flushes fed to the entry while the build ran is still owed, so those units stay for
+            // a later retry, and a whole-view ask that came in meanwhile builds again.
+            let (paid, was_down) = self.slots[i]
+                .live
+                .as_mut()
+                .filter(|l| l.name == n.name)
+                .and_then(|l| l.lag.get_mut(t))
+                .map(|g| (g.pay_whole_view(), g.down))
+                .unwrap_or((false, false));
+            if paid {
+                self.slots[i].live.as_mut().and_then(|l| l.lag.remove(t));
+                info!(view = %n.name, target = %t, "target caught up");
+                Metrics::add(&self.metrics.target_catchups, 1);
+                // The target is maintained again from now on, the way `lag_end` readmits one whose
+                // writes finally landed: back into the live version's targets (the cap took it out,
+                // and a partial build swaps only what it built on; the target reached this point
+                // through a lag entry, which only a target the definition lists can grow), its
+                // `Down` entry gone with the entry, and the Part B gauge back to 0 with the one line
+                // that pairs with the down one — the same authority `lag_end` reads, so the pair is
+                // what `/metrics` shows as 1 / 0.
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    if !l.targets.contains(t) {
+                        l.targets.push(t.clone());
+                        l.targets.sort();
+                    }
+                }
+                if was_down {
+                    self.rebuild_routes();
+                    if self.target_is_pg(t)
+                        && !self.target_held_down(t)
+                        && self.metrics.set_target_down(t, false, "")
+                    {
+                        warn!(view = %n.name, target = %t,
+                              "target answers again: the changes kept for it were written \
+                               (lazyview_target_down back to 0)");
+                    }
+                }
+            }
         }
         let s = &mut self.slots[i];
         s.error = None;
@@ -8352,6 +9272,19 @@ impl Engine {
             }
             None => {
                 let empty = live_dirty.is_empty();
+                // (#214) Targets still behind carry into the new version: the ones that
+                // were swapped in got the complete view and owe nothing (their entries
+                // would only delay a needed `ready`), but a target that was not — it
+                // failed the build or the swap above, or it already lagged — keeps its
+                // entry, or nothing would ever catch it up: it is in none of the version's
+                // targets, and `retry_down` no longer rebuilds onto it.
+                let (mut lag, mut behind) = self.slots[i]
+                    .live
+                    .take()
+                    .map(|l| (l.lag, l.behind))
+                    .unwrap_or_default();
+                lag.retain(|t, _| !swapped.iter().any(|s| s == t));
+                behind.retain(|t, _| !swapped.iter().any(|s| s == t));
                 self.slots[i].live = Some(Version {
                     plan: n.plan,
                     layout,
@@ -8360,8 +9293,8 @@ impl Engine {
                     dirty: live_dirty,
                     frozen: false,
                     since: if empty { None } else { since },
-                    lag: BTreeMap::new(),
-                    behind: BTreeMap::new(),
+                    lag,
+                    behind,
                     recent,
                     catalog_head: n.catalog_head,
                     table_heads: HashMap::new(),
@@ -8386,6 +9319,13 @@ impl Engine {
     }
 
     async fn refresh_live(&mut self, i: usize) {
+        // The sequential path (`LAZYVIEW_SUPERVISOR=off`): nothing else of this slot is running,
+        // so its lagging targets are retried here, ahead of the healthy writes. The supervised
+        // flush runs the same retries beside those writes instead (`refresh_all_live`). A swap
+        // in progress keeps its changes (see `live_begin`), and with them its retries.
+        if !self.slots[i].next.as_ref().is_some_and(|n| n.swapping) {
+            self.retry_lag(i).await;
+        }
         let Some(mut st) = self.live_begin(i).await else {
             return;
         };
@@ -8403,14 +9343,16 @@ impl Engine {
         self.live_end(i, st, r).await;
     }
 
-    /// What [`Self::refresh_live`] does before the refresh: lagging targets, full-mode views
-    /// (rebuilt instead), and the changes to apply. None: nothing to refresh now.
+    /// What [`Self::refresh_live`] does before the refresh: full-mode views (rebuilt instead) and
+    /// the changes to apply, on the targets that are not behind (a lagging target, including one
+    /// whose retry this flush is running, is not written here — see `lag_due`). The lagging
+    /// targets themselves are the caller's step (`retry_lag`, `refresh_all_live`).
+    /// None: nothing to refresh now.
     async fn live_begin(&mut self, i: usize) -> Option<LiveRefresh> {
         // A routine rebuild is being swapped in: changes wait for it (see `finish_next`).
         if self.slots[i].next.as_ref().is_some_and(|n| n.swapping) {
             return None;
         }
-        self.retry_lag(i).await;
         let def_id = self.slots[i].def_id;
         let replan_pending = self.replan.contains_key(&def_id);
         let backing_off = self.slots[i].retry_at.is_some_and(|t| t > Instant::now());
@@ -8423,13 +9365,151 @@ impl Engine {
         }
         let dirty = l.dirty.take();
         let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
-        let lagging: Vec<String> = l.lag.keys().chain(l.behind.keys()).cloned().collect();
-        let targets: Vec<String> = l
+        // Two kinds of excluded target, and they are not alike. `lag` holds the ones whose WRITES
+        // failed: the round must not hand them another connection. `behind` holds the ones that
+        // answered every write they were given and are only slow against the byte budget; they are
+        // excluded so the lag path can pull them along with the changes they missed. That exclusion
+        // is right only while another route exists. When it would leave the round with nobody to
+        // write to, they ARE the round's targets (main's behaviour, which converged): this path is
+        // their only delivery route, and with one dead peer and a tight budget they would otherwise
+        // sit out every round of the run — measured on `chaos_tgt_blackhole_during_flush` (percona84):
+        // the Full-mode view `w_union_kinds` had no eligible target on any round after the fault, so
+        // it was never rebuilt again and its healthy targets froze 129 rows behind the oracle.
+        let hard: Vec<String> = l.lag.keys().cloned().collect();
+        let behind: Vec<String> = l.behind.keys().cloned().collect();
+        let mut excluded: Vec<String> = hard.clone();
+        excluded.extend(behind.iter().cloned());
+        let mut lagging = excluded.clone();
+        let mut targets: Vec<String> = l
             .targets
             .iter()
             .filter(|t| !lagging.contains(t))
             .cloned()
             .collect();
+        if targets.is_empty() && !behind.is_empty() {
+            lagging = hard;
+            targets = l
+                .targets
+                .iter()
+                .filter(|t| !lagging.contains(t))
+                .cloned()
+                .collect();
+        }
+        // #214 (target isolation): with no eligible target there is nothing to write AND no target
+        // holding current rows to read the materialized table from — [`Self::read_materialized`]
+        // reads the write set (`source` first, they hold the same rows), so an empty set only bought
+        // a failing round: "reading the materialized table: no target answered", retried under
+        // [`crate::supervisor::Policy::STATEMENTS`], with the buffer above gone along with the error.
+        // Nor may the changes stay in the buffer: only a successful flush clears it, so with every
+        // target's writes failing (the case left here, the fallback above having kept the healthy
+        // ones in) the buffer grew forever while its rows reached the survivors only as re-fed
+        // claims. What a flush would have owed them, it owes them HERE: the taken buffer becomes
+        // their owed set, the entries are what `lag_end` writes and `floor_pins_of` pins into the saved
+        // position, and the buffer is cleared as a flush clears it. Cost (guard R3): one set feed
+        // per excluded target per round that carries something — never per binlog event.
+        if targets.is_empty() {
+            let carries = dirty.rebuild
+                || !dirty.units.is_empty()
+                || !dirty.partial.iter().all(UnitSet::is_empty)
+                || dirty.all;
+            if carries {
+                let floor = l
+                    .since
+                    .clone()
+                    .unwrap_or_else(|| self.boundary.to_position());
+                for t in &lagging {
+                    l.behind.remove(t.as_str());
+                    l.lag.entry(t.clone()).or_insert_with(|| Lag {
+                        units: UnitSet::default(),
+                        partial: Vec::new(),
+                        all: false,
+                        since: floor.clone(),
+                        failures: 0,
+                        retry_at: Instant::now(),
+                        down: false,
+                        posted: UnitSet::default(),
+                        posted_partial: Vec::new(),
+                        posted_all: false,
+                    });
+                    if let Some(g) = l.lag.get_mut(t) {
+                        if dirty.rebuild {
+                            // The whole-view case: what a re-derive changes is not knowable per
+                            // key, so the owed set cannot be listed (lv-super ruling 2026-11-22
+                            // keeps `all` for the genuinely unknowable debt only, documented at
+                            // each site: here, in the Full branch below, and in
+                            // [`Self::lag_after_build_fail`]). Its catch-up is
+                            // [`Self::lag_build`] — the slot's streamed build (`start_next` →
+                            // `build_task` → `mv::fill`, one batch at a time into
+                            // `<name>__lv_new`, then the swap) — and NEVER `refresh`'s `dirty.all`
+                            // arm, which collects the whole view in memory
+                            // (`mv::read_source(…, chunk: None …)` + one `mv::prepare`). That is
+                            // the owner's memory rule of 2026-11-26 and the reason NO lag retry
+                            // ever hands `all` to a refresh (#265's guard R1), in either mode.
+                            g.all = true;
+                            g.posted_all = true;
+                        } else {
+                            g.units.extend(dirty.units.clone());
+                            extend_partial(&mut g.partial, dirty.partial.clone());
+                            // `dirty.all` here is a whole-view debt the engine cannot list per
+                            // key either (a cascade gap window, an XA COMMIT the reader never
+                            // saw, a change no trace could follow): owed as `all`, caught up the
+                            // same streamed way.
+                            g.all |= dirty.all;
+                            // Same rule as `note_refresh` (#214): if this target's retry is claimed and
+                            // runs detached, its read predates these changes, so they must survive the
+                            // fold of its claim — `lag_subtract` re-adds exactly what was posted.
+                            g.posted.extend(dirty.units.clone());
+                            extend_partial(&mut g.posted_partial, dirty.partial.clone());
+                            g.posted_all |= dirty.all;
+                        }
+                    }
+                }
+                // #214 (regression this PR must not ship with, found on
+                // `chaos_tgt_bandwidth_starvation`, percona84, seed 475028141089): only the half the
+                // owed sets can NAME goes into them. `images`, `marks` and `holds` are BASE-ROW keys,
+                // not units — their units exist only after a lookup against the materialized table
+                // (`prepare_refresh`'s `lookups` / `presence_lookups`), and a round with no eligible
+                // target has nobody to read that from. Dropping them loses the DELETE half of the
+                // change on EVERY target at once: the oracle reported `w_item_entity_grp` 267 / 272
+                // with `0 row(s) missing, 5 unexpected`, the same five rows (all `total_qty='0.103'`)
+                // wrong on `source` and on `t1` — a write set that missed them would be wrong on one
+                // target only, so the loss is upstream of the write set, in the taken buffer. Main
+                // converges on that seed: there the empty write set made the MV read fail and
+                // `live_end`'s error arm merged the whole buffer back. So the keys no owed set can
+                // carry stay buffered until a round has a target to read them from; the units above
+                // are owed either way, and delivering a unit twice is idempotent (a unit write
+                // deletes then inserts). Cost: these three fields live in the buffer instead of being
+                // dropped, which is main's lifetime for them.
+                // What the round leaves in the slot is [`kept_after_no_target_round`]: a rebuild
+                // round keeps its whole buffer (its view's maintenance lives there) and a units round
+                // keeps only the base-row keys no owed set can name, and in both cases the whole-view
+                // flag goes with a Full-mode plan only — guard R1, the owner's memory rule of
+                // 2026-11-26, so an Incremental view's owed rebuild is paid by the slot's streamed
+                // build and never by `refresh`'s in-memory `dirty.all` arm. `ViewDirty::merge` folds
+                // `rebuild` and `all` in, so the flags need no second setting here.
+                l.dirty.merge(kept_after_no_target_round(
+                    dirty,
+                    matches!(plan.mode, Mode::Full(_)),
+                ));
+            } else {
+                // Nothing owed (the usual round of a quiescing schema): keep it for the round
+                // that has a target to write to.
+                l.dirty = dirty;
+            }
+            // The same rule as at the end of a round ([`since_after_round`]), because this arm
+            // emptied the buffer too: its units went into the owed sets above, which carry their
+            // own `since` (the `floor` fed to `Lag`), and what stays in the buffer is only the
+            // base-row keys no owed set can name. With nothing left buffered, the version has no
+            // replay position: it is the owed sets that hold the floor now (`FloorPin::Lag`). A
+            // `Some` left here is a duplicate pin of a debt the entries already hold — and once the
+            // target catches up and its entry goes, it is a pin of NOTHING: `live_begin` starts no
+            // round of an empty buffer, so nothing clears it, and the reported position stands
+            // still for the rest of the run. That is the freeze of
+            // `chaos_tgt_bandwidth_starvation` (witness: `owed=[] behind=[] buffered(all zero)
+            // since=binlog.000003:3820537`, the reader 130 KB ahead).
+            l.since = since_after_round(&l.dirty, l.since.take());
+            return None;
+        }
         if let Mode::Full(_) = plan.mode {
             // Rebuild into a shadow; at most one rebuild runs and at most one is pending. Changes
             // during a running build mark it for one more rebuild; a pending re-plan (a retry
@@ -8441,8 +9521,57 @@ impl Engine {
                     n.since.get_or_insert(p);
                 }
             } else if full_due && !replan_pending {
-                let all = l.targets.clone();
-                self.start_next(i, plan, name, all, false).await;
+                // #214: as on the unit path above, targets that are behind are not written
+                // here. Rebuilding onto a black-holed target would hold the next rebuild for
+                // its connect timeout and answer its lag with repeated full rebuilds
+                // (`retry_down`); a down target only lags — its own whole-view refresh in
+                // `lag_due`/`lag_end` catches it up when it answers. If every target is
+                // behind, those refreshes alone carry the view and nothing rebuilds.
+                let all: Vec<String> = l
+                    .targets
+                    .iter()
+                    .filter(|t| !lagging.contains(t))
+                    .cloned()
+                    .collect();
+                if all.is_empty() {
+                    l.dirty.all = true;
+                    return None;
+                }
+                // #214 (target isolation): the targets this rebuild excludes are not written by
+                // it, and what a whole-view rebuild changes is not knowable per key — the rows
+                // are whatever the re-derive produces, so no key list is cheaper than the view.
+                // Their owed set is the view itself: `all: true`, the one case the ruling of
+                // 2026-11-22 leaves it (the same reasoning as `lag_after_build_fail`). Its
+                // catch-up is [`Self::lag_build`] — the slot's streamed build (`start_next` →
+                // `mv::fill`, a batch at a time into `<name>__lv_new`, then the swap) — never the
+                // in-memory `dirty.all` arm of a refresh (guard R1, owner rule 2026-11-26).
+                // Without this record the buffer went to the version being built while the
+                // excluded target kept rows the engine's own diff believed current: after the
+                // black-holed `t1` failed one build, `w_union_kinds` on the HEALTHY targets of
+                // `chaos_tgt_blackhole_during_flush` (mysql80) stopped gaining rows for the rest
+                // of the run. Cost (guard R3): one entry per excluded target per rebuild.
+                for t in &lagging {
+                    l.behind.remove(t.as_str());
+                    l.lag.entry(t.clone()).or_insert_with(|| Lag {
+                        units: UnitSet::default(),
+                        partial: Vec::new(),
+                        all: false,
+                        since: live_since
+                            .clone()
+                            .unwrap_or_else(|| self.boundary.to_position()),
+                        failures: 0,
+                        retry_at: now,
+                        down: false,
+                        posted: UnitSet::default(),
+                        posted_partial: Vec::new(),
+                        posted_all: false,
+                    });
+                    if let Some(g) = l.lag.get_mut(t.as_str()) {
+                        g.all = true;
+                    }
+                }
+                self.start_next(i, plan, name, all, BuildKind::Replace)
+                    .await;
             } else {
                 // Not due yet: stay stale until the next refresh slot (see flush_deadline).
                 l.dirty.all = true;
@@ -8487,6 +9616,7 @@ impl Engine {
         self.flush_wrote.push((i, targets.to_vec()));
         // Targets that missed this refresh (or earlier ones) get the units later.
         for (t, e) in &r.failed {
+            note_target_write_err(&self.targets, &self.metrics, t, e);
             warn!(view = %name, target = %t, "write failed: {e:#}; retrying");
             l.behind.remove(t.as_str());
             l.lag.entry(t.clone()).or_insert(Lag {
@@ -8497,34 +9627,73 @@ impl Engine {
                 failures: 1,
                 retry_at: Instant::now() + connect_retry_delay(1),
                 down: false,
+                posted: UnitSet::default(),
+                posted_partial: Vec::new(),
+                posted_all: false,
             });
         }
-        // A target flagged behind (`mark_behind_targets`) that this refresh applied to none of:
-        // what it is owed is exactly what was fed since the flag, i.e. what this refresh
-        // carried. It becomes the lag entry the failed path above gives (#215): from here the
-        // accounting is the one a down target gets — kept keys over the budget reported, the
-        // saved position waiting, `retry_lag` catching it up and counting the catch-up.
+        // Owed-set accounting (#214, lv-super ruling 2026-11-22): every target this refresh
+        // excluded — flagged behind by `mark_behind_targets` or already lagging — is owed
+        // exactly what this refresh carried for the targets it did write, and the record of that
+        // debt is its lag entry: the pass below feeds every excluded target the units of this
+        // refresh, and an excluded target the refresh could have written something for always
+        // ends this call holding a lag entry. The old rule created the entry only on a surviving
+        // flag (a `behind` -> `lag` transition whose flag was still there): when `lag_due` took
+        // the flag between this refresh's `live_begin` (which still excluded the target) and
+        // this fold, no entry was made and the units this refresh applied to the other targets
+        // were lost for it — the target kept rows the engine's own diff then believed current,
+        // and `lag_end` reported "caught up (group empty)" without writing anything
+        // (`chaos_tgt_blackhole_during_flush` on percona84). A target excluded by `live_begin`
+        // owes what the refresh carried, whether or not the flag still stands. From here the
+        // accounting is the one a down target gets: kept keys over the budget reported, the
+        // saved position waiting at its `since` (`floor_pins_of`), `retry_lag` catching it up and
+        // counting the catch-up.
+        //
+        // An entry is opened only for a debt that exists: a refresh that carried nothing for the
+        // view (the usual case — the stream of a quiescing schema is mostly rows no view of this
+        // one reads) leaves the behind flag where it is, for `lag_due` to resolve with the
+        // buffer beside it. Turning every such refresh into a lag entry sent a HEALTHY target out
+        // of the flush path and into a claim-read-write-fold round trip per view per target per
+        // flush, which is how the direct target of `chaos_tgt_blackhole_during_flush` spent the
+        // 90 s its oracle allows on mysql80. Cost (guard R3): one entry feed per excluded target
+        // per refresh that carried units — never per binlog event.
+        let carried = !r.units.is_empty() || !r.partial.iter().all(UnitSet::is_empty) || r.all;
         for t in lagging {
-            if l.behind.remove(t.as_str()).is_some() && !l.lag.contains_key(t.as_str()) {
-                l.lag.insert(
-                    t.clone(),
-                    Lag {
-                        units: UnitSet::default(),
-                        partial: Vec::new(),
-                        all: false,
-                        since: floor.clone(),
-                        failures: 0,
-                        retry_at: Instant::now() + connect_retry_delay(1),
-                        down: false,
-                    },
-                );
+            if !carried || l.lag.contains_key(t.as_str()) {
+                continue; // nothing to owe, or the owed group the feed below extends is there
             }
+            l.behind.remove(t.as_str());
+            l.lag.insert(
+                t.clone(),
+                Lag {
+                    units: UnitSet::default(),
+                    partial: Vec::new(),
+                    all: false,
+                    since: floor.clone(),
+                    failures: 0,
+                    // No backoff: this target answered every write it was given, it was only
+                    // excluded from this round. The connect delay belongs to the failed path
+                    // above (a target that did not answer must not be hammered); a healthy
+                    // target made to wait it would let an unresponsive peer hold its rows
+                    // hostage (#214, the independence the black-hole tests measure).
+                    retry_at: Instant::now(),
+                    down: false,
+                    posted: UnitSet::default(),
+                    posted_partial: Vec::new(),
+                    posted_all: false,
+                },
+            );
         }
         for t in r.failed.iter().map(|(t, _)| t).chain(lagging) {
             if let Some(g) = l.lag.get_mut(t) {
                 g.units.extend(r.units.clone());
                 extend_partial(&mut g.partial, r.partial.clone());
                 g.all |= r.all;
+                // #214: if this target's retry was claimed and runs detached, its write may
+                // predate this refresh; post the units so the fold keeps them owed.
+                g.posted.extend(r.units.clone());
+                extend_partial(&mut g.posted_partial, r.partial.clone());
+                g.posted_all |= r.all;
             }
         }
         s.stats.refreshed(r.units, r.partial, r.all, &r.work);
@@ -8614,28 +9783,144 @@ impl Engine {
                         }
                     } else if full_due && !replan_pending {
                         debug!(view = %name, "affected rows unknown (cascading FK / overflow); rebuilding online");
-                        let all = l.targets.clone();
-                        self.start_next(i, plan, name, all, false).await;
+                        // #214 (target isolation): the targets this round excludes are not
+                        // written by the rebuild either — handed the whole list, every attempt
+                        // paid the black-holed target's connect timeout until the build failed
+                        // outright and was retried on the connect backoff, and the healthy
+                        // targets stayed two rows stale past the oracle's 90 s
+                        // (`wc_child_only` on mysql80). The rebuild flag survives instead: the
+                        // untraceable cascade is re-derived on the next round, when a target
+                        // that was behind is maintained again, and the keys this refresh did
+                        // carry stay owed in the entries the feed above made. An incremental
+                        // target is never answered with a whole-view refresh
+                        // (`lag_after_build_fail`), so there is nothing to record beyond that.
+                        let all: Vec<String> = l
+                            .targets
+                            .iter()
+                            .filter(|t| !lagging.contains(t))
+                            .cloned()
+                            .collect();
+                        if all.is_empty() {
+                            // Nothing to write to and no one to read the current rows from: the
+                            // flag stays, and the slot waits for the lagging targets' retry time
+                            // rather than rebuilding once per round of the loop.
+                            l.dirty.rebuild = true;
+                            self.slots[i].retry_at = Some(Instant::now() + connect_retry_delay(1));
+                        } else {
+                            self.start_next(i, plan, name, all, BuildKind::Replace)
+                                .await;
+                        }
                     } else {
                         l.dirty.rebuild = true;
                     }
-                } else {
-                    l.since = None;
+                }
+                // `Version::since` is the replay position of the **oldest change the live version
+                // still holds**: an empty buffer holds none, so it has no position. The round
+                // above applied everything its buffer carried, and each arm of the rebuild case
+                // leaves the version owing exactly one of two things — the rebuild flag on its own
+                // buffer (`l.dirty.rebuild = true`, which `is_empty` counts, so the position stays,
+                // as it must: that rebuild is still owed from that position) or the build in flight
+                // (which holds its own pin, `building_floor`, and `n.since` for what was handed to
+                // it). What no arm may leave is a `Some` with an empty buffer behind it, and this is
+                // the only place that can say whether the buffer was applied: `live_begin` takes the
+                // buffer when a round starts and keeps `since` set while it runs — the in-flight
+                // case, where the position MUST hold the floor back, since those changes are in
+                // neither the table nor the slot — and returns `None` for an empty one, so a `Some`
+                // left here is never cleared again: no further round of this slot ever begins, and
+                // the reported position stands still for the rest of the run while the reader
+                // reads on. That is the freeze `chaos_tgt_bandwidth_starvation` and
+                // `chaos_tgt_pg_bandwidth_starvation` print in CI as a position and nothing else
+                // (`binlog_backpressure: 0` in both dumps rules out the reader pausing), and
+                // `#265`'s R1 made it common: a lagging target's catch-up is now a build, so a
+                // round that asks for a rebuild lands while `s.next` is occupied far more often,
+                // which is the arm that hands the rebuild away and drained the buffer.
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    l.since = since_after_round(&l.dirty, l.since.take());
                 }
             }
         }
     }
 
     /// Retries targets whose writes failed; one that keeps failing is reported down (and
-    /// rebuilt once it answers again).
+    /// rebuilt once it answers again). The sequential path (`LAZYVIEW_SUPERVISOR=off`), where
+    /// nothing else of the slot is running to wait for them: the supervised flush prepares the
+    /// same retries with its healthy refreshes and runs them beside the writes
+    /// ([`Self::lag_due`], [`Self::lag_end`]).
+    ///
+    /// What a target owes here is a set of units, and only that: an entry that owes the WHOLE
+    /// view goes to [`Self::lag_build`] (the streamed build) instead, in either maintenance mode
+    /// — a lag catch-up is never the whole-view read of `prepare_refresh` (guard R1).
     async fn retry_lag(&mut self, i: usize) {
+        for mut g in self.lag_due(i, true) {
+            // The same rule as on the supervised path: what the target owes is the WHOLE view, so
+            // its catch-up is the slot's streamed build and never a refresh that reads the view
+            // into memory (`Self::lag_build`, #265's R1). `lag_due` left the entry in the map, and
+            // the swap is what discharges it.
+            if g.build {
+                self.lag_build(i, &g.t).await;
+                continue;
+            }
+            debug_assert!(
+                !g.dirty.all,
+                "a lag retry reached refresh owing the whole view ({} on {}): an `all` debt is \
+                 `lag_build`'s, never a refresh (guard R1)",
+                g.name, g.t
+            );
+            let r = self
+                .refresh(
+                    &g.plan,
+                    &g.layout,
+                    &mut g.dirty,
+                    std::slice::from_ref(&g.t),
+                    &g.name,
+                    &mut g.look,
+                    None,
+                )
+                .await;
+            self.lag_end(g, r).await;
+        }
+    }
+
+    /// The lagging targets of slot `i` whose `retry_at` has come due, each with the catch-up it
+    /// needs: `kept` is the group as the lag map holds it, `dirty` the units its retry writes.
+    /// `take`: the sequential path takes the group out of the map here (the flush is not written
+    /// while the retry runs, so nothing else looks at it); the supervised path leaves it there,
+    /// so the flush keeps skipping the target and keeps its floor (`live_begin`, `pending_floor`).
+    /// One flush cannot pick the same target twice: its retry is awaited before the next one
+    /// begins.
+    fn lag_due(&mut self, i: usize, take: bool) -> Vec<LagRetry> {
+        // A routine rebuild is being swapped in: its changes wait for it (see `finish_next`),
+        // and with them its retries (as in `live_begin`).
+        if self.slots[i].next.as_ref().is_some_and(|n| n.swapping) {
+            return Vec::new();
+        }
         let now = Instant::now();
         // Behind flags whose retry time came without a refresh handing them their units (a
         // one-target view: the skipped refresh has no target left to read the materialized
-        // table from) become lag entries on their own (#215): the changes buffered now are
-        // what the target is owed, so the entry seeds itself from them and the pass below
-        // catches it up. A flagged target that owes nothing (buffer empty) just drops the
-        // flag — it never missed a change, so there is no catch-up to count either.
+        // table from) become lag entries on their own (#215): the changes buffered now are what
+        // the target is owed at this moment, so the entry seeds itself from them and the pass
+        // below catches it up.
+        //
+        // An empty buffer is NOT the verdict, and neither is it the reason to keep the flag
+        // (#214, lv-super ruling 2026-11-22): what decides is whether anything is owed, which is
+        // the buffer AND the entry together. While a target is flagged behind, `live_begin`
+        // excludes it from every refresh, and `note_refresh` records what such a refresh carried
+        // for the other targets as its lag entry; `mark_behind_targets` flags only targets the
+        // flush itself wrote, so the flag's own flush left them current. No entry and an empty
+        // buffer therefore means no refresh has excluded this target since the flag and nothing
+        // has arrived since it was written: it owes nothing, and it goes straight back to the
+        // flush path instead of paying a claim for an empty group. The old rule read the empty
+        // buffer alone while `note_refresh` made the entry only on a surviving flag, so the
+        // record of a debt could be discarded with the flag — `chaos_tgt_blackhole_during_flush`
+        // saw the healthy direct `t2` left stale on exactly this while the black-holed `t1` was
+        // unresponsive. `or_insert` keeps an entry that already holds owed keys and adds the
+        // buffer to the catch-up otherwise. The seed's `all` is main's, and only ever the buffer's
+        // own verdict (a gap window, an XA COMMIT the reader never saw, a change no trace could
+        // follow): a flag never invents a whole-view debt the engine cannot name — where it knows
+        // the units, it feeds units (ruling 2026-11-22). Whatever of it is `all` is caught up by
+        // the streamed build below, never by a refresh ([`Self::lag_build`], guard R1). Cost
+        // (guard R3): one clone of the slot's buffer per due flag that owes something, off the
+        // binlog event path (this runs in `lag_service`/`retry_lag`).
         if let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
             let flagged: Vec<String> = l
                 .behind
@@ -8643,9 +9928,16 @@ impl Engine {
                 .filter(|(_, at)| **at <= now)
                 .map(|(t, _)| t.clone())
                 .collect();
+            let name = l.name.clone();
             for t in flagged {
+                let owed = l.lag.contains_key(t.as_str())
+                    || !l.dirty.units.is_empty()
+                    || !l.dirty.partial.iter().all(UnitSet::is_empty)
+                    || l.dirty.all;
                 l.behind.remove(&t);
-                if l.dirty.units.is_empty() && l.dirty.partial.is_empty() && !l.dirty.all {
+                if !owed {
+                    debug!(view = %name, target = %t,
+                           "behind flag resolved with nothing owed: back to the flush path");
                     continue;
                 }
                 let seed = Lag {
@@ -8659,6 +9951,9 @@ impl Engine {
                     failures: 0,
                     retry_at: now,
                     down: false,
+                    posted: UnitSet::default(),
+                    posted_partial: Vec::new(),
+                    posted_all: false,
                 };
                 l.lag.entry(t).or_insert(seed);
             }
@@ -8670,86 +9965,452 @@ impl Engine {
                 .filter(|(_, g)| g.retry_at <= now)
                 .map(|(t, _)| t.clone())
                 .collect(),
-            None => return,
+            None => return Vec::new(),
         };
+        let mut out = Vec::new();
         for t in due {
             let Some(l) = self.slots[i].live.as_mut() else {
-                return;
-            };
-            let Some(mut g) = l.lag.remove(&t) else {
-                continue;
+                return out;
             };
             let (plan, layout, name) = (l.plan.clone(), l.layout.clone(), l.name.clone());
-            let mut d = ViewDirty {
+            // What the entry owes is the WHOLE view: its catch-up is the streamed build, not a
+            // refresh ([`Self::lag_build`]), in either maintenance mode. Such an entry is NOT
+            // taken out of the map on the sequential path either: while the build runs the flush
+            // must keep skipping the target, `lag_wake` must keep pacing the attempts, and the
+            // swap is what discharges the debt.
+            let build = l.lag.get(&t).is_some_and(|g| g.all);
+            let kept = if take && !build {
+                // Sequential path: the group leaves the map and its retry runs at once
+                // (`retry_lag`), so nothing feeds it while it runs — the claim's read covers
+                // everything fed until now (#214).
+                l.lag.remove(&t).map(|mut g| {
+                    g.clear_posted();
+                    g
+                })
+            } else {
+                None
+            };
+            let Some(g) = kept.as_ref().or_else(|| l.lag.get(&t)) else {
+                continue;
+            };
+            let dirty = ViewDirty {
                 units: g.units.clone(),
                 partial: g.partial.clone(),
                 images: vec![KeySet::default(); plan.aliases.len()],
                 all: g.all,
                 ..Default::default()
             };
-            let r = self
-                .refresh(
-                    &plan,
-                    &layout,
-                    &mut d,
-                    std::slice::from_ref(&t),
-                    &name,
-                    &mut Lookback::default(),
-                    None,
-                )
-                .await;
-            let s = &mut self.slots[i];
-            let Some(l) = s.live.as_mut() else {
-                return;
+            out.push(LagRetry {
+                i,
+                // Assigned by whoever starts the retry (`lag_service`): a claim's id is what its
+                // fold is matched against (#391), and a group that never starts a task has none.
+                id: 0,
+                t,
+                name,
+                plan,
+                layout,
+                dirty,
+                claimed_units: g.units.clone(),
+                claimed_partial: g.partial.clone(),
+                claimed_all: g.all,
+                look: Lookback::default(),
+                kept,
+                build,
+                p: None,
+            });
+        }
+        out
+    }
+
+    /// Subtracts what a retry carried (the claim-time snapshot) from the group: while the
+    /// retry ran detached, the flushes of the intervening ticks added their units to the
+    /// same group (`note_refresh`) — those stay owed to the target until a later retry
+    /// writes them (#214). Whether the group is empty afterwards: the target caught up.
+    /// On the sequential path nothing writes to the group while its retry runs, so this
+    /// subtracts exactly what it holds and is a no-op check.
+    fn lag_subtract(
+        g: &mut Lag,
+        claimed_units: &UnitSet,
+        claimed_partial: &[UnitSet],
+        claimed_all: bool,
+    ) -> bool {
+        for v in claimed_units.ints.to_sorted_vec() {
+            g.units.ints.remove(v);
+        }
+        g.units.keys.retain(|k| !claimed_units.keys.contains(k));
+        for (set, c) in g.partial.iter_mut().zip(claimed_partial) {
+            for v in c.ints.to_sorted_vec() {
+                set.ints.remove(v);
+            }
+            set.keys.retain(|k| !c.keys.contains(k));
+        }
+        g.all &= !claimed_all;
+        // #214: units re-fed since the claim stay owed even though the claim also held them:
+        // this retry's write was computed from a read taken before those changes. The claim
+        // cleared these marks, so they hold exactly what `note_refresh` fed while it ran.
+        g.units.extend(std::mem::take(&mut g.posted));
+        extend_partial(&mut g.partial, std::mem::take(&mut g.posted_partial));
+        g.all |= std::mem::take(&mut g.posted_all);
+        g.units.is_empty() && g.partial.iter().all(UnitSet::is_empty) && !g.all
+    }
+
+    /// The target of a Full-mode view's maintained live version that a build or swap failed on
+    /// becomes a lagging target that owes the whole view (`all`) — not a `Down` target that
+    /// `retry_down` keeps rebuilding onto (each attempt pays the unresponsive target's connect, and
+    /// a down target answers lag with a rebuild, which #214 forbids: a down target only lags). Its
+    /// catch-up is the slot's streamed build ([`Self::lag_build`], one batch at a time into the
+    /// shadow table, then the swap), paced by the entry's own `retry_at`; after
+    /// [`LAG_MAX_FAILURES`] attempts it is reported down like a failed write. False: not a
+    /// maintained target of the live version (a new version, a frozen swap, an incremental view
+    /// with its own lag bookkeeping, or a target the view never had) — `target_down` and a retried
+    /// build as before.
+    ///
+    /// Where the whole-view debt comes from, and how it is paid (guard R1, owner rule 2026-11-26):
+    /// a `Lag` entry holds `all` from four sites only — this one, the two `live_begin` feeds (a
+    /// rebuild with no target left to write to, and the targets a Full-mode rebuild excludes), and
+    /// main's behind-flag seed in [`Self::lag_due`], which copies the buffer's own verdict. None of
+    /// them ever reaches `refresh`: what the whole view is owed to ONE target, the streamed build
+    /// delivers ([`Self::lag_build`]), because `refresh`'s `dirty.all` arm collects the view in
+    /// memory (`mv::read_source(…, chunk: None …)` + one `mv::prepare`) and is priced for
+    /// refreshing the whole live version, all targets at once. The owed-set paths (`note_refresh`)
+    /// must never seed `all` for an empty group: there the engine knows each refresh's units and
+    /// re-derives exactly those keys.
+    fn lag_after_build_fail(&mut self, i: usize, t: &str, plan: &Arc<ViewPlan>) -> bool {
+        if !matches!(plan.mode, Mode::Full(_)) {
+            return false;
+        }
+        let Some(l) = self.slots[i].live.as_mut().filter(|l| !l.frozen) else {
+            return false;
+        };
+        // The maintained targets, plus the one `lag_build` is rebuilding onto: it is not in
+        // `l.targets` (that is why it owes the view), and its failed attempt must re-arm its own
+        // backoff rather than fall through to `target_down` on its first miss.
+        if !Arc::ptr_eq(&l.plan, plan)
+            || !(l.targets.iter().any(|x| x == t) || l.lag.contains_key(t))
+        {
+            return false;
+        }
+        let since = l
+            .since
+            .clone()
+            .unwrap_or_else(|| self.boundary.to_position());
+        debug!(view = %plan.name, target = %t, "build or swap failed on the maintained target: it lags the whole view until it answers");
+        l.lag.entry(t.to_string()).or_insert(Lag {
+            units: UnitSet::default(),
+            partial: Vec::new(),
+            all: true,
+            since,
+            failures: 0,
+            retry_at: Instant::now() + connect_retry_delay(1),
+            down: false,
+            posted: UnitSet::default(),
+            posted_partial: Vec::new(),
+            posted_all: false,
+        });
+        true
+    }
+
+    /// The whole-view catch-up of one lagging target: the slot's own streamed build (`start_next`
+    /// → `build_task` → `mv::fill`, one batch into `<name>__lv_new` at a time, then the swap),
+    /// which is how a target is ever given the whole view. It is what the `all` debt of
+    /// [`Self::lag_after_build_fail`] and of the two `live_begin` feeds owes, in either
+    /// maintenance mode, and it exists so that catching up ONE target never runs `refresh`'s
+    /// `dirty.all` arm: that reads the whole view into memory (`mv::read_source(…, chunk: None …)`
+    /// with one `mv::prepare` after it), which the owner's memory rule of 2026-11-26 leaves to
+    /// main's own whole-version paths (the cadence rebuild, the gap window, the XA sweep) until
+    /// the bounded sweep lands. An INCREMENTAL view in particular never reads its source whole
+    /// for a lagging target: it is behind on units, and what it cannot list per key it gets by
+    /// the build.
+    ///
+    /// Target isolation holds as it does for a detached retry: the build is the slot's task, the
+    /// tick never awaits it, and the target stays out of the flush path because its lag entry stays
+    /// in the map (that is why `lag_due` does not take such a group). A slot that is already
+    /// building — its cadence rebuild, another target's catch-up, a pending re-plan — is not
+    /// interrupted: the attempt moves to the entry's own backoff, which `lag_wake` reads, so nothing
+    /// spins. `finish_next` discharges the debt of a target it swaps in; `next_failed` re-arms it
+    /// through [`Self::lag_after_build_fail`]; at [`LAG_MAX_FAILURES`] attempts the target is
+    /// reported down the way a failed write is, ONCE (`lag_end`'s rule) — the attempts are not
+    /// capped, because this entry is the only thing that can ever bring the target in: `retry_down`
+    /// builds targets with no lag entry and the flush skips a lagging one, so an entry that stopped
+    /// trying would strand its target for the life of the view and `applied` could never pass it.
+    /// A peer that never answers is retried at the capped backoff, which is what `lag_end` does for
+    /// a units entry whose writes never land.
+    ///
+    /// Cost (guard R3): one call per due whole-view entry per backoff period, nothing per event.
+    async fn lag_build(&mut self, i: usize, t: &str) {
+        let (name, plan) = match self.slots[i].live.as_ref().filter(|l| !l.frozen) {
+            Some(l) => (l.name.clone(), l.plan.clone()),
+            None => return,
+        };
+        let s = &self.slots[i];
+        if s.next.is_some() || s.waiting.is_some() || self.replan.contains_key(&s.def_id) {
+            // Why the attempt did not start, named: `applied` cannot pass this target until one of
+            // these builds lands, and without this line a decline is invisible — an entry that is
+            // due, declined and re-armed forever looks from `/stats` exactly like a build that is
+            // slow (which is how CI's two bandwidth reds were argued at positions alone). One line
+            // per paced attempt, never per event.
+            debug!(view = %name, target = %t,
+                   build_in_flight = s.next.is_some(),
+                   waiting = s.waiting.is_some(),
+                   replan = self.replan.contains_key(&s.def_id),
+                   "the whole view's catch-up waits for the work already in the slot");
+            if let Some(g) = self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
+                g.retry_at = Instant::now() + connect_retry_delay(g.failures.max(1));
+            }
+            return;
+        }
+        let failures = match self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
+            Some(g) => {
+                g.failures += 1;
+                g.retry_at = Instant::now() + connect_retry_delay(g.failures);
+                g.failures
+            }
+            None => return,
+        };
+        if failures >= LAG_MAX_FAILURES {
+            // Reported down ONCE, `lag_end`'s rule (`>= LAG_MAX_FAILURES && !g.down`). The report is
+            // once per target; the ATTEMPTS are not capped — and that is not a loose end, it is the
+            // only thing that can bring this target in: `retry_down` builds targets with no lag
+            // entry and the flush skips a lagging one, so an entry that stopped trying would strand
+            // its target for the life of the view and `applied` could never pass it (which is the
+            // class of bug #214 is about: a target silently left behind). At the capped backoff it
+            // keeps building until one attempt lands, and that swap is the catch-up `finish_next`
+            // counts and readmits.
+            let report = match self.slots[i].live.as_mut().and_then(|l| l.lag.get_mut(t)) {
+                Some(g) if g.down => false,
+                Some(g) => {
+                    g.down = true;
+                    true
+                }
+                None => return,
             };
-            match r {
-                Ok(r) if r.failed.is_empty() => {
+            if report {
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    l.targets.retain(|x| x != t);
+                }
+                warn!(view = %name, target = %t, failures,
+                      "the whole view never reached the target: it is reported down");
+                let e = anyhow!("the whole view never reached the target {t}");
+                self.target_down(i, &name, t, Some(&plan), &e).await;
+                self.rebuild_routes();
+            }
+        }
+        debug!(view = %name, target = %t, failures, posted_all = ?self.slots[i]
+            .live
+            .as_ref()
+            .and_then(|l| l.lag.get(t))
+            .is_some_and(|g| g.posted_all),
+               "the whole view is owed to a lagging target: its catch-up is the streamed build");
+        // The fill's read starts here, so everything owed now IS in what it reads: clear the
+        // re-fed marks the way a claim does, or the swap would refuse to pay a debt the fill has
+        // just covered (that is what the bar's six reds were: generation after generation swapped,
+        // `posted_all` set by the flushes, `pay_whole_view` refusing forever). `pay_whole_view`
+        // then folds these marks back as the owed set of a build's result — `lag_subtract`'s rule
+        // for a claim's, which a build entry never reaches because `lag_due` leaves it in the map.
+        // All three marks, not just the whole-view one: a rebuild recomputes the view from its
+        // sources, so the units and partial keys the fill read are covered by it too (ruling
+        // lv-super 2026-11-27). A feed after this point re-posts, so it stays owed: never a lost
+        // row, at the price of one more attempt.
+        if let Some(g) = self.slots[i]
+            .live
+            .as_mut()
+            .filter(|l| !l.frozen)
+            .and_then(|l| l.lag.get_mut(t))
+        {
+            g.clear_posted();
+        }
+        self.start_next(i, plan, name, vec![t.to_string()], BuildKind::LagCatchUp)
+            .await;
+    }
+
+    /// Part B (lv-super ruling 2026-11-22): the gate of the whole of it — PostgreSQL-family
+    /// targets only. Whether the MySQL side gets the same down signal is the open question
+    /// `05-target-down-observ`, so the MySQL legs of the suite expose exactly the metrics they
+    /// always did. Observability, never policy: no retry, backoff or `lag_due` decision reads any
+    /// of it, so a wrong label costs a label and nothing else.
+    fn target_is_pg(&self, t: &str) -> bool {
+        self.targets
+            .get(t)
+            .is_some_and(|tg| tg.kind == target::Kind::Postgres)
+    }
+
+    /// Whether any view still holds `t` down (a `lag` entry whose retry reported it down): the
+    /// gauge of a target is one number for the whole engine, so it goes back to 0 only when the
+    /// LAST view's catch-up proves the peer answers.
+    fn target_held_down(&self, t: &str) -> bool {
+        self.slots.iter().any(|s| {
+            s.live
+                .as_ref()
+                .is_some_and(|l| l.lag.get(t).is_some_and(|g| g.down))
+        })
+    }
+
+    /// The tail of one lagging target's retry, shared by both paths (the accounting of
+    /// [`Self::retry_lag`], unchanged): caught up, or behind at its `retry_at` backoff, and
+    /// reported down once its failures reach [`LAG_MAX_FAILURES`]. The group is taken out of the
+    /// lag map here (`kept`, when the retry did not already take it) so that whatever the flush
+    /// of a concurrent retry added to it — [`Self::note_refresh`] gives a target that is behind
+    /// the units this flush applied elsewhere — is kept with it, and put back last: `l` borrows
+    /// the slot, and `target_down` and `rebuild_routes` need `self` to itself.
+    async fn lag_end(&mut self, mut retry: LagRetry, r: Result<Refreshed>) {
+        let i = retry.i;
+        let (t, name, plan) = (retry.t.clone(), retry.name.clone(), retry.plan.clone());
+        let s = &mut self.slots[i];
+        let Some(l) = s.live.as_mut() else {
+            return;
+        };
+        let Some(mut g) = retry.kept.take().or_else(|| l.lag.remove(&t)) else {
+            // With one claim in flight per (view, target) and a fold that frees only its own
+            // handle, a result without its group means the group was dropped under the retry —
+            // which happens when its version is replaced (the entry rode over with the live
+            // version, and this is the only path that sees the result). Say so: silently
+            // swallowing it is what made the double-claim race invisible (#391).
+            debug!(view = %name, target = %t, "a retry result without its group: nothing to fold");
+            return;
+        };
+        match r {
+            Ok(r) if r.failed.is_empty() => {
+                // Only the units this retry carried were written; what the flushes of the
+                // ticks it ran through added to the group stay owed, and the catch-up is
+                // counted when the group empties (#214).
+                if !Self::lag_subtract(
+                    &mut g,
+                    &retry.claimed_units,
+                    &retry.claimed_partial,
+                    retry.claimed_all,
+                ) {
+                    g.failures = 0;
+                    g.retry_at = Instant::now();
+                    debug!(view = %name, target = %t,
+                           left = g.units.ints.len() as usize + g.units.keys.len(),
+                           claimed = retry.claimed_units.ints.len() as usize + retry.claimed_units.keys.len(),
+                           "lag retry wrote its claim: the group stays owed");
+                    l.lag.insert(t, g);
+                    return;
+                }
+                debug!(view = %name, target = %t,
+                       claimed = retry.claimed_units.ints.len() as usize + retry.claimed_units.keys.len(),
+                       "lag retry caught up (group empty)");
+                // "Caught up" is reported and counted only once the target's owed set has been
+                // written (ruling 2026-11-22). An empty claim wrote nothing: if nothing was
+                // owed at the claim and nothing re-fed arrived since (the check above keeps a
+                // re-fed group owed), the flag that led here was noise, not debt — no catch-up
+                // to count, announce, or persist. A target that had been reported down is the
+                // exception: its recovery line is an operator event whatever this claim held —
+                // but only once a write of its own proved the peer answers, which an empty
+                // claim does not (#214, below).
+                let owed_any = !retry.claimed_units.is_empty()
+                    || retry.claimed_partial.iter().any(|s| !s.is_empty())
+                    || retry.claimed_all;
+                let was_down = g.down;
+                // #214 (target isolation): a target with failed writes behind it is NOT readmitted
+                // by a claim that carried nothing. Nothing was written, so nothing proves the peer
+                // answers; clearing the entry here handed a black-holed target straight back to the
+                // flush path, which paid its connect timeout on the hot loop (`slow flush: refresh
+                // (dedup core) w_items_direct 10004ms`) and let the healthy target fall past its
+                // oracle budget while an unresponsive peer held the round. The entry's `retry_at`
+                // backoff paces the next attempt instead, and `note_refresh` keeps feeding it the
+                // units of every flush it missed, so the next claim is a real write that either
+                // lands (and is the catch-up) or fails (and reports it down).
+                if !owed_any && g.failures > 0 {
+                    debug!(view = %name, target = %t, failures = g.failures,
+                           "lag retry carried nothing to write and the target has not answered: still behind");
+                    g.retry_at = Instant::now() + connect_retry_delay(g.failures);
+                    if let Some(l) = self.slots[i].live.as_mut() {
+                        l.lag.insert(t, g);
+                    }
+                    return;
+                }
+                if owed_any {
                     info!(view = %name, target = %t, "target caught up");
                     Metrics::add(&self.metrics.target_catchups, 1);
                     let (id, hash) = (s.def_id, s.hash.clone());
                     self.set_state(&name, &t, id, &hash, Some(&plan), "ready", None)
                         .await;
-                    // A target reported down was taken out of the version's targets; it is
-                    // maintained again from now on, and its `Down` entry is gone with its keys.
-                    let was_down = g.down;
-                    if let Some(l) = self.slots[i].live.as_mut() {
-                        if was_down && !l.targets.contains(&t) {
-                            l.targets.push(t.clone());
-                            l.targets.sort();
+                } else {
+                    debug!(view = %name, target = %t,
+                           "behind flag resolved with nothing owed: nothing was written");
+                }
+                // A target reported down was taken out of the version's targets; it is
+                // maintained again from now on, and its `Down` entry is gone with its keys.
+                // A Full-mode target that failed a build/swap is not in the live version's
+                // targets either (it lagged instead of going down, #214): a target the view's
+                // definition lists is maintained again once it has caught up.
+                let rejoin = !was_down && self.slots[i].targets.contains(&t);
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    if (was_down || rejoin) && !l.targets.contains(&t) {
+                        l.targets.push(t.clone());
+                        l.targets.sort();
+                    }
+                }
+                if was_down {
+                    self.slots[i].down.remove(&t);
+                    self.rebuild_routes();
+                    // Part B: the matching one line, when the LAST view that held this target down
+                    // saw its owed set written — the same authority the gauge reads, so the pair of
+                    // lines (down / answers again) is what `/metrics` shows as 1 / 0.
+                    if self.target_is_pg(&t)
+                        && !self.target_held_down(&t)
+                        && self.metrics.set_target_down(&t, false, "")
+                    {
+                        warn!(view = %name, target = %t,
+                              "target answers again: the changes kept for it were written \
+                               (lazyview_target_down back to 0)");
+                    }
+                }
+            }
+            Ok(r) => {
+                g.failures += 1;
+                // Reported down after LAG_MAX_FAILURES: excluded from the refresh's targets,
+                // its state shows the error, and it is retried here at the capped backoff.
+                // Its keys stay (owner rule: a traceable change is never answered with a
+                // rebuild), so `retry_lag` catches it up when it answers; `retry_down` only
+                // builds targets that were never built on at all.
+                let e = r.failed.into_iter().next().unwrap().1;
+                warn!(view = %name, target = %t, failures = g.failures,
+                      "lagged target refresh failed: {e:#}");
+                if g.failures >= LAG_MAX_FAILURES && !g.down {
+                    g.down = true;
+                    l.targets.retain(|x| *x != t);
+                    self.target_down(i, &name, &t, Some(&plan), &e).await;
+                    self.rebuild_routes();
+                    // Part B: the crossing, reported once per target (not once per failed write,
+                    // and not once per view — `set_target_down` answers only for the first). The
+                    // state row and the "retrying in" line are `target_down`'s; this is the
+                    // operator's signal that the DATABASE is not answering, with the class of the
+                    // write that proved it, and the gauge `/metrics` renders.
+                    if self.target_is_pg(&t) {
+                        let class = target::WriteErr::classify(&e);
+                        if self.metrics.set_target_down(&t, true, class.as_str()) {
+                            // The phrase the operator greps for (and the chaos suite's needles):
+                            // the link condition of THIS error, in the driver's own vocabulary,
+                            // next to the driver's own words. The counter's label stays the class
+                            // `classify` decided — the ruling keeps the two apart.
+                            let link = target::WriteErr::link_words(&e);
+                            let edge = if link.is_empty() {
+                                format!("last error class {class:?}")
+                            } else {
+                                format!("{link}, last error class {class:?}")
+                            };
+                            warn!(view = %name, target = %t, failures = g.failures,
+                                  class = class.as_str(),
+                                  "target is down: no write reached it ({edge}: {e:#}); \
+                                   its changes stay buffered \
+                                   and its catch-up is retried at the connect backoff \
+                                   (lazyview_target_down back to 1)");
                         }
                     }
-                    if was_down {
-                        self.slots[i].down.remove(&t);
-                        self.rebuild_routes();
-                    }
                 }
-                Ok(r) => {
-                    g.failures += 1;
-                    // Reported down after LAG_MAX_FAILURES: excluded from the refresh's targets,
-                    // its state shows the error, and it is retried here at the capped backoff.
-                    // Its keys stay (owner rule: a traceable change is never answered with a
-                    // rebuild), so `retry_lag` catches it up when it answers; `retry_down` only
-                    // builds targets that were never built on at all.
-                    let e = r.failed.into_iter().next().unwrap().1;
-                    if g.failures >= LAG_MAX_FAILURES && !g.down {
-                        g.down = true;
-                        l.targets.retain(|x| *x != t);
-                        self.target_down(i, &name, &t, Some(&plan), &e).await;
-                        self.rebuild_routes();
-                    }
-                    g.retry_at = Instant::now() + connect_retry_delay(g.failures);
-                    // The keys go back into the lag map last: `l` borrows the slot, and
-                    // `target_down` and `rebuild_routes` above need `self` to itself.
-                    if let Some(l) = self.slots[i].live.as_mut() {
-                        l.lag.insert(t, g);
-                    }
-                }
-                Err(e) => {
-                    // The sources could not be read: not this target's fault.
-                    debug!(view = %name, target = %t, "retrying lagging target: {e:#}");
-                    g.retry_at = Instant::now() + Duration::from_secs(1);
+                g.retry_at = Instant::now() + connect_retry_delay(g.failures);
+                if let Some(l) = self.slots[i].live.as_mut() {
                     l.lag.insert(t, g);
                 }
+            }
+            Err(e) => {
+                // The sources could not be read: not this target's fault.
+                debug!(view = %name, target = %t, "retrying lagging target: {e:#}");
+                g.retry_at = Instant::now() + Duration::from_secs(1);
+                l.lag.insert(t, g);
             }
         }
     }
@@ -8822,7 +10483,7 @@ impl Engine {
     ) -> Result<Refreshed> {
         if self.sup.is_some() {
             let mut p = self
-                .prepare_refresh(plan, layout, dirty, targets, table, recent, since)
+                .prepare_refresh(plan, layout, dirty, targets, table, recent, since, true)
                 .await?;
             let out = run_pending(self.sup.as_ref().expect("supervised"), &mut p).await;
             self.metrics.beat();
@@ -8873,7 +10534,14 @@ impl Engine {
             // branch above: read the whole view once and apply it in place, which deletes the
             // vanished rows. One read per window, at most once per view per window; a refresh,
             // not a rebuild, and the other buffered units are subsumed by it, so the buffer
-            // clears with it (a failed target is retried as a whole refresh by `retry_lag`).
+            // clears with it.
+            //
+            // What is NOT here is a lagging target's catch-up (guard R1, owner rule 2026-11-26):
+            // these callers refresh the WHOLE live version, all of its targets at once, which is
+            // what makes reading the source once the right price. A single target behind on the
+            // same debt is caught up by the streamed build (`Self::lag_build`), and `retry_lag`
+            // and `lag_service` assert it — a `Lag` entry that still says `all` never reaches this
+            // branch, in either maintenance mode.
             let fresh = self.caps.fresh_snapshot;
             // One wait per whole-view read (PR G §3.2): the read endpoint must have applied
             // the set the engine consumed, at the bound, before any row is read.
@@ -8999,6 +10667,10 @@ impl Engine {
     /// engine's own connections) and the job for the supervisor's pools (see
     /// `src/supervisor.rs`), run by [`run_pending`] and completed by [`finish_refresh`]. A
     /// target without a working control connection (write limits, sql_mode) fails right away.
+    /// `connect`: the supervised healthy path makes sure of the target's control connection
+    /// first. A detached lag retry passes `false` (#214): its one target was written before,
+    /// so those settings are already in hand, and a black-holed target must not cost this tick
+    /// a connect — the supervisor's endpoint dials the write itself, on the task.
     async fn prepare_refresh(
         &mut self,
         plan: &Arc<ViewPlan>,
@@ -9008,6 +10680,7 @@ impl Engine {
         table: &str,
         recent: &mut Lookback,
         since: Option<&Position>,
+        connect: bool,
     ) -> Result<PendingRefresh> {
         let mut p = PendingRefresh {
             global: matches!(plan.mode, Mode::Global),
@@ -9060,9 +10733,11 @@ impl Engine {
         }
         let mut jobs = Vec::new();
         for t in targets {
-            if let Err(e) = self.target_conn(t).await {
-                p.failed.push((t.clone(), e.context(format!("target {t}"))));
-                continue;
+            if connect {
+                if let Err(e) = self.target_conn(t).await {
+                    p.failed.push((t.clone(), e.context(format!("target {t}"))));
+                    continue;
+                }
             }
             let target = &self.targets[t.as_str()];
             let (Some(write), Some(mode)) = (target.write, target.sql_mode.clone()) else {
@@ -9114,7 +10789,13 @@ impl Engine {
     }
 
     /// The live refreshes of every slot at once (supervised): each view's lookups in turn, then
-    /// every view's chunk reads and writes together on the shared pools, then each result.
+    /// every view's chunk reads and writes together on the shared pools, then each result. A
+    /// lagging target's retry belongs to the same round and to nothing else (#214): it is
+    /// prepared and run once every healthy target of this flush has been written, so an
+    /// unresponsive target is never ahead of, and never in the way of, the writes the others get
+    /// (it used to be retried at the head of `live_begin`, where one 10 s connect held up every
+    /// view behind it). The retries run beside each other, and its `retry_at` backoff alone
+    /// decides when it is tried again.
     async fn refresh_all_live(&mut self) {
         let mut started = Vec::new();
         for i in 0..self.slots.len() {
@@ -9130,30 +10811,222 @@ impl Engine {
                     &st.name,
                     &mut st.recent,
                     st.since.as_ref(),
+                    true,
                 )
                 .await;
             started.push((i, st, p));
         }
-        if started.is_empty() {
-            return;
-        }
-        let sup = self.sup.as_ref().expect("supervised refresh");
-        let outs = futures_util::future::join_all(started.iter_mut().map(|(_, _, p)| async move {
-            match p {
-                Ok(p) => Some(run_pending(sup, p).await),
-                Err(_) => None,
+        if !started.is_empty() {
+            let sup = self.sup.as_ref().expect("supervised refresh");
+            let outs =
+                futures_util::future::join_all(started.iter_mut().map(|(_, _, p)| async move {
+                    match p {
+                        Ok(p) => Some(run_pending(sup, p).await),
+                        Err(_) => None,
+                    }
+                }))
+                .await;
+            self.metrics.beat();
+            for ((i, mut st, p), out) in started.into_iter().zip(outs) {
+                let r = match (p, out) {
+                    (Ok(p), Some(out)) => finish_refresh(&mut st.dirty, p, out),
+                    (Err(e), _) => Err(e),
+                    (Ok(_), None) => unreachable!("every prepared refresh ran"),
+                };
+                self.live_end(i, st, r).await;
             }
-        }))
-        .await;
-        self.metrics.beat();
-        for ((i, mut st, p), out) in started.into_iter().zip(outs) {
-            let r = match (p, out) {
-                (Ok(p), Some(out)) => finish_refresh(&mut st.dirty, p, out),
-                (Err(e), _) => Err(e),
-                (Ok(_), None) => unreachable!("every prepared refresh ran"),
-            };
-            self.live_end(i, st, r).await;
         }
+        self.lag_service().await;
+    }
+
+    /// Servicing of the targets that are behind, run after every flush tick and on any wake
+    /// the manager loop takes for it (#214). A retry belongs to the same round as its target,
+    /// not to this tick: the tick spawns it and never awaits it, so one unresponsive target's
+    /// connect costs only the retry — the flush wrote the healthy targets while it ran, and
+    /// the next one does too. Its result folds here as soon as it arrives; while it runs the
+    /// group stays in `l.lag`, so the flush keeps skipping the target and `pending_floor`
+    /// keeps its floor. The writes go through the target's own pool, the same two-write
+    /// endpoint a healthy flush's writes take — a retry never reserves a target's pool ahead
+    /// of a flush that wants it. An entry armed after a flush's writes (a build or swap that
+    /// failed on its target) is claimed by this same pass, without waiting for the slot's
+    /// next due time: the entry's `retry_at` schedules a wake (`lag_wake`) and this servicing
+    /// claims at most once per target per pass. Cost (guard R3): per loop iteration only the
+    /// slot scan below (same shape as `flush_due`), never per binlog event.
+    async fn lag_service(&mut self) {
+        // Which retries have ended is read BEFORE the drain, and the sweep that frees them comes
+        // after it (#391). A task sends its result and only then ends, so a handle seen finished
+        // here has its result either already in `lag_held` or still in `lag_rx` — and the drain
+        // below collects that. Sweeping before the drain is what let one (view, target) run two
+        // retries at once: the sweep freed the target of a retry whose result was in flight, the
+        // claim pass started a second one, and the late fold of the first result then removed the
+        // SECOND one's handle (it keyed only on (slot, target)), so a third started beside it.
+        // Two retries writing the same units to a target leaves second copies of rows on a view
+        // without row identity, and nothing re-owes them.
+        let finished: Vec<(usize, String)> = self
+            .lag_retries
+            .iter()
+            .filter(|(_, (h, _))| h.is_finished())
+            .map(|((i, t), _)| (*i, t.clone()))
+            .collect();
+        while let Ok(m) = self.lag_rx.try_recv() {
+            self.lag_held.push_back(m);
+        }
+        let mut at = 0;
+        while at < self.lag_held.len() {
+            if self.slots[self.lag_held[at].0]
+                .next
+                .as_ref()
+                .is_some_and(|n| n.swapping)
+            {
+                // A routine rebuild is swapping into that slot: its changes, and the folding
+                // of its retries, wait for it (`lag_due` holds the target for the same
+                // reason). The message waits in `lag_held`, and the target stays claimed.
+                at += 1;
+                continue;
+            }
+            let (i, g, r) = self.lag_held.remove(at).unwrap();
+            // Free the target only if this result belongs to the claim still held: a late result
+            // must never release a newer claim of the same (view, target).
+            if self
+                .lag_retries
+                .get(&(i, g.t.clone()))
+                .is_some_and(|(_, id)| *id == g.id)
+            {
+                self.lag_retries.remove(&(i, g.t.clone()));
+            }
+            self.lag_end(g, r).await;
+        }
+        // A retry whose task ended without a message (it panicked): free the target so its
+        // `retry_at` schedules a new attempt. A finished handle whose result is in `lag_held` is
+        // not lost — that result is the proof it delivered, and its fold frees the target.
+        for k in finished {
+            if !self
+                .lag_held
+                .iter()
+                .any(|(i, g, _)| *i == k.0 && g.t == k.1)
+            {
+                self.lag_retries.remove(&k);
+            }
+        }
+        // Start the retries that are due — at most one per target (one still running is
+        // due again each pass: its `retry_at` stays behind until the result folds in).
+        let sup = match self.sup.clone() {
+            Some(s) => s,
+            None => return,
+        };
+        for i in 0..self.slots.len() {
+            for mut g in self.lag_due(i, false) {
+                let key = (i, g.t.clone());
+                if self.lag_retries.contains_key(&key) {
+                    continue;
+                }
+                // The whole view is owed to this target: the catch-up is the slot's streamed
+                // build, not a refresh, and nothing is spawned or claimed for it (guard R1, owner
+                // rule 2026-11-26, [`Self::lag_build`]).
+                if g.build {
+                    self.lag_build(i, &g.t).await;
+                    continue;
+                }
+                // The same rule from the other side, where it could be broken: what is claimed
+                // below is a set of units and nothing else — an entry that still says `all` here
+                // would read the source into memory for one target, which is the bug, not the
+                // design.
+                debug_assert!(
+                    !g.dirty.all,
+                    "a lag claim reached prepare_refresh owing the whole view ({} on {}): an \
+                     `all` debt is `lag_build`'s, never a refresh (guard R1)",
+                    g.name, g.t
+                );
+                // The retry starts here: its claim clears the re-fed marks, so what it reads
+                // from now on it writes (#214; feeds after this moment post again).
+                if let Some(lg) = self.slots[i].live.as_mut().filter(|l| !l.frozen) {
+                    if let Some(g0) = lg.lag.get_mut(&g.t) {
+                        g0.clear_posted();
+                    }
+                }
+                // The claim gets its identity here, with the task: the fold of this retry's
+                // result frees only the handle carrying this id, so a result that arrives after a
+                // newer claim was started cannot free that newer claim (#391).
+                g.id = self.lag_claim_seq;
+                self.lag_claim_seq += 1;
+                debug!(view = %g.name, target = %g.t, all = g.claimed_all, "lag refresh claimed");
+                // Prepared here: the lagging target's units are already resolved (its
+                // lookback is empty) and with `connect: false` nothing dials it — the
+                // connect happens on the task, on the supervisor's pool.
+                g.p = Some(
+                    self.prepare_refresh(
+                        &g.plan,
+                        &g.layout,
+                        &mut g.dirty,
+                        std::slice::from_ref(&g.t),
+                        &g.name,
+                        &mut g.look,
+                        None,
+                        false,
+                    )
+                    .await,
+                );
+                let (tx, metrics, sup) = (self.lag_tx.clone(), self.metrics.clone(), sup.clone());
+                let id = g.id;
+                let h = tokio::spawn(async move {
+                    let i = g.i;
+                    let r = match g.p.take() {
+                        Some(Ok(mut p)) => {
+                            let out = run_pending(&sup, &mut p).await;
+                            metrics.beat();
+                            finish_refresh(&mut g.dirty, p, out)
+                        }
+                        Some(Err(e)) => Err(e),
+                        None => Ok(Refreshed::default()),
+                    };
+                    let _ = tx.send((i, g, r));
+                });
+                self.lag_retries.insert(key, (h, id));
+            }
+        }
+    }
+
+    /// Whether [`Self::lag_service`] has anything to do: the manager loop calls it (and lets
+    /// it schedule wakes) only while some target is behind or a detached retry runs, so an
+    /// engine with no lag pays one emptiness check per slot per iteration, nothing per event.
+    fn lag_any(&self) -> bool {
+        !self.lag_held.is_empty()
+            || !self.lag_retries.is_empty()
+            || self.slots.iter().any(|s| {
+                s.live
+                    .as_ref()
+                    .is_some_and(|l| !l.lag.is_empty() || !l.behind.is_empty())
+            })
+    }
+
+    /// When [`Self::lag_service`] should run next, for the manager loop's idle wake: the
+    /// earliest `retry_at` of an unclaimed entry (a claimed one is a task that will report
+    /// through `lag_rx`, which wakes the loop by itself). Entries of a slot whose rebuild is
+    /// swapping are held anyway (`lag_due` returns none), so they schedule no wake. With a
+    /// detached retry running the fold is polled at a coarse step, bounded by the task's own
+    /// completion: nothing spins when there is nothing pending.
+    fn lag_wake(&self) -> Instant {
+        let now = Instant::now();
+        let mut w = now + Duration::from_secs(3600);
+        if !self.lag_retries.is_empty() || !self.lag_held.is_empty() {
+            w = now + Duration::from_millis(250);
+        }
+        for (si, s) in self.slots.iter().enumerate() {
+            if s.next.as_ref().is_some_and(|n| n.swapping) {
+                continue;
+            }
+            if let Some(l) = s.live.as_ref().filter(|l| !l.frozen) {
+                for (t, g) in &l.lag {
+                    // A claimed entry (its detached task runs) schedules nothing: the task's
+                    // result message wakes the loop, and its stale `retry_at` must not.
+                    if self.lag_retries.contains_key(&(si, t.clone())) {
+                        continue;
+                    }
+                    w = w.min(g.retry_at.max(now));
+                }
+            }
+        }
+        w
     }
 
     /// Executor (a): the dedup core's due jobs until none is due (a failed job's lane holds it
@@ -9282,6 +11155,16 @@ impl Engine {
         }
         let (lagging, targets) = {
             let l = self.slots[i].live.as_ref().expect("live, checked above");
+            // ONLY the `lag` map, deliberately — not `behind` as `live_begin` does. A target the
+            // byte budget flagged behind answered every write it was given; on the core's path it
+            // has no claim-based catch-up waiting behind the flush (its rows arrive through this
+            // job), so excluding it starves the view: measured on `chaos_tgt_blackhole_during_flush`,
+            // the budget of the test (1 byte) flags every written target behind on every round, and
+            // the healthy `source`/`t2` of the dedup view spent the run in 141+132 claim round trips
+            // while their rows piled up — the independence the test measures broke on the healthy
+            // target. A target whose writes really failed is in `lag` and IS excluded; the cost of
+            // that is one connect timeout per backoff period, which is what `Target::retry_at` and
+            // the `Policy::CONNECT` shape already bound.
             let lagging: Vec<String> = l.lag.keys().cloned().collect();
             let targets: Vec<String> = l
                 .targets
@@ -10243,6 +12126,40 @@ struct LiveRefresh {
     full_due: bool,
 }
 
+/// One lagging target's catch-up between [`Engine::lag_due`] and [`Engine::lag_end`] (the retry
+/// of [`Engine::retry_lag`], and of the supervised flush, which prepares it with the healthy
+/// refreshes of the same round). `kept` is the group as the lag map held it, when the retry took
+/// it out; `dirty` is what its retry writes (its kept keys, plus the units this flush gives the
+/// targets that are not behind); `p` is the prepared run, `None` until the flush prepares it.
+struct LagRetry {
+    /// The view's slot.
+    i: usize,
+    /// The claim this retry is: unique per claim ([`Engine::lag_claim_seq`]), so the fold of its
+    /// result frees only the handle this retry was started under, never a newer claim of the same
+    /// (view, target) (#391).
+    id: u64,
+    /// The target owes the WHOLE view: its catch-up is the slot's streamed build
+    /// ([`Engine::lag_build`]), so no refresh is prepared, no task is spawned and no handle is
+    /// kept for it (#265's guard R1: a single lagging target never reads the view into memory,
+    /// in either maintenance mode).
+    build: bool,
+    /// The target's name, and the view's name its state rows are kept under.
+    t: String,
+    name: String,
+    plan: Arc<ViewPlan>,
+    layout: Layout,
+    dirty: ViewDirty,
+    /// The units the group owed when the retry claimed it (a snapshot of its `dirty`): the
+    /// retry writes exactly these, and a success clears only these from the group — a flush
+    /// may have added more to it while a detached retry ran (`note_refresh`, #214).
+    claimed_units: UnitSet,
+    claimed_partial: Vec<UnitSet>,
+    claimed_all: bool,
+    look: Lookback,
+    kept: Option<Lag>,
+    p: Option<Result<PendingRefresh>>,
+}
+
 /// A supervised refresh with its lookups done (see [`Engine::prepare_refresh`]).
 #[derive(Default)]
 struct PendingRefresh {
@@ -10352,6 +12269,12 @@ const MAX_FILTER_PARAMS: usize = 60_000;
 
 /// A lagging target is reported down after this many failed retries.
 const LAG_MAX_FAILURES: u32 = 5;
+
+/// How long the reported position may stand still while the reader is ahead of it before the
+/// engine says *why* ([`Engine::report_floor_stall`]). Well past any bounded wait the engine
+/// itself takes — a connect cycle, a statement timeout, one build — so the line means "something
+/// is owed and nothing is coming", not "the engine is busy".
+const FLOOR_STALL_WARN: Duration = Duration::from_secs(30);
 
 /// One target of a build, with the ownership checks it needs there.
 struct BuildSpec {
@@ -10764,11 +12687,19 @@ async fn build_task(
             }
         }
     }
-    let _ = tx.send(BuildDone {
+    // The report is the only thing that ends this version: nothing else can set its `done`, so a
+    // send that fails (the engine's receiver is gone — the loop is over) is said out loud rather
+    // than swallowed, and the round that finds the task over without a report abandons the build.
+    debug!(view = %name, def_id, generation, built = result.is_ok(), "build report: sending");
+    if let Err(e) = tx.send(BuildDone {
         def_id,
         generation,
         result,
-    });
+    }) {
+        warn!(view = %name, def_id, generation, error = %e,
+            "build report lost: nothing will read it (the engine's build loop is over), so the \
+             version is left to the round that finds its task finished without a report");
+    }
 }
 
 #[cfg(test)]
@@ -11547,6 +13478,47 @@ mod tests {
         );
     }
 
+    /// A build whose task is over without its report is abandoned — but only once the report has
+    /// had its chance: the round that first sees it arms, a second look inside the grace only
+    /// watches, and any sign of life (the task running, the report applied) forgets the observation
+    /// (#214: a version waiting for a report that will never come freezes the targets that answer).
+    #[test]
+    fn a_build_report_is_lost_only_after_the_grace_and_only_while_nothing_comes() {
+        let t0 = Instant::now();
+        let grace = Duration::from_millis(250);
+        assert_eq!(
+            Engine::report_is_lost(false, false, Some(t0), t0, grace),
+            (false, None),
+            "a build that is still running is not lost, however long a round has been watching it"
+        );
+        assert_eq!(
+            Engine::report_is_lost(true, true, Some(t0), t0 + grace, grace),
+            (false, None),
+            "the report arrived: the observation is forgotten"
+        );
+        assert_eq!(
+            Engine::report_is_lost(true, false, None, t0, grace),
+            (false, Some(t0)),
+            "the round that first sees it only starts watching: the report may still be in the channel"
+        );
+        assert_eq!(
+            Engine::report_is_lost(
+                true,
+                false,
+                Some(t0),
+                t0 + Duration::from_millis(100),
+                grace
+            ),
+            (false, Some(t0)),
+            "one drain has had its chance, not two"
+        );
+        assert_eq!(
+            Engine::report_is_lost(true, false, Some(t0), t0 + grace, grace),
+            (true, Some(t0)),
+            "a task over and silent past the grace reports nothing: abandon the version"
+        );
+    }
+
     /// The drain queue keeps its byte total and the file of its oldest events in step with
     /// pushes and pops, stops at its bounds and at the end of the stream, and gives back its
     /// capacity once empty.
@@ -11591,6 +13563,110 @@ mod tests {
         assert!(d.full() && !d.open(), "256 bytes is over the budget");
     }
 
+    /// `Version::since` belongs to the buffer it is the oldest position of, so the round that
+    /// applied the buffer gives the position up ([`since_after_round`]). The case that matters is
+    /// the first: a live version with an empty buffer and a `since` eleven segments behind the
+    /// reader is what the witness of a stalled position printed on 2026-11-27
+    /// (`chaos_tgt_bandwidth_starvation`, mysql80, seed `252940217460`:
+    /// `since=binlog.000003:839266 read=binlog.000003:1699025`, buffer empty, nothing in flight,
+    /// no target owed), and nothing else could have left it — `live_begin` refuses to start a round
+    /// of a slot whose buffer is empty, so no later round ever cleared the position and the reported
+    /// position stood still for the rest of the run. The rest of the cases are the ones that must
+    /// NOT clear: an empty-looking buffer that still owes a rebuild, an image, a partial key or the
+    /// whole view is owed from that position, and `ViewDirty::is_empty` counting `rebuild` is what
+    /// keeps the pin, so it is asserted rather than trusted.
+    #[test]
+    fn a_round_that_applied_its_buffer_leaves_no_replay_position() {
+        let at = pos("binlog.000003", 839_266);
+        // Everything the round carried is in the table: no position, so nothing holds the floor.
+        let kept = ViewDirty::for_aliases(1);
+        assert_eq!(since_after_round(&kept, Some(at.clone())), None);
+        assert_eq!(since_after_round(&kept, None), None);
+
+        for owed in 0..5 {
+            let mut kept = ViewDirty::for_aliases(1);
+            match owed {
+                0 => kept.rebuild = true,
+                1 => kept.all = true,
+                2 => {
+                    kept.units.insert_int(3);
+                }
+                3 => {
+                    kept.images[0].insert(Key::from([Datum::Int(7), Datum::Null]));
+                }
+                _ => {
+                    kept.partial.push(UnitSet::default());
+                    kept.partial[0].insert_int(3);
+                }
+            }
+            assert!(
+                !kept.is_empty(),
+                "case {owed}: a buffer that owes something is not empty"
+            );
+            assert_eq!(
+                since_after_round(&kept, Some(at.clone())),
+                Some(at.clone()),
+                "case {owed}: what is owed from that position holds the floor back to it"
+            );
+        }
+    }
+
+    /// The other half of the same freeze: a build that buffered nothing takes no replay position
+    /// back with it ([`Version::take_back`]). `next_failed`, the budget drop and the abandoned swap
+    /// all take a build's buffer back into the live version and used to set `since` from the build
+    /// whether or not the buffer held anything — and a build whose changes had already gone to the
+    /// shadow (or that never buffered any) holds nothing. A live version left with an empty buffer
+    /// and a position behind the reader never gets another round to clear it, because `live_begin`
+    /// starts no round of an empty buffer: the position CI printed as
+    /// `since=binlog.000003:813165 read=binlog.000003:1476653` with
+    /// `buffered(units=0 images=0 marks=0 holds=0 all=false rebuild=false)`.
+    #[test]
+    fn a_build_that_buffered_nothing_takes_no_position_back() {
+        let p = Arc::new(plan("CREATE VIEW v AS SELECT i.id FROM items i"));
+        let at = pos("binlog.000003", 813_165);
+
+        // The failed catch-up held nothing: nothing travels, and the version keeps no position.
+        let mut l = live(&p, false, None);
+        l.take_back(ViewDirty::for_aliases(1), Some(at.clone()));
+        assert!(l.dirty.is_empty());
+        assert_eq!(l.since, None, "an empty buffer has no replay position");
+
+        // A Full view IS owed the whole view by the same event: a real ask, so the position
+        // travels with it and the floor waits for the refresh that pays it.
+        let mut l = live(&p, false, None);
+        let mut owed = ViewDirty::for_aliases(1);
+        owed.all = true;
+        l.take_back(owed, Some(at.clone()));
+        assert_eq!(l.since, Some(at.clone()));
+
+        let mut l = live(&p, false, Some(pos("binlog.000002", 7)));
+        let mut owed = ViewDirty::for_aliases(1);
+        owed.units.insert_int(3);
+        l.take_back(owed, Some(at.clone()));
+        assert_eq!(
+            l.since,
+            Some(pos("binlog.000002", 7)),
+            "the version's older position stands: it is owed something even earlier"
+        );
+        let mut owed = ViewDirty::for_aliases(1);
+        owed.units.insert_int(3);
+        let mut l = live(&p, false, Some(at.clone()));
+        l.take_back(owed, Some(pos("binlog.000001", 5)));
+        assert_eq!(
+            l.since,
+            Some(pos("binlog.000001", 5)),
+            "and the buffer that is owed from earlier lowers it"
+        );
+
+        // A buffer with no position of its own leaves the version's alone.
+        let mut owed = ViewDirty::for_aliases(1);
+        owed.rebuild = true;
+        let mut l = live(&p, false, Some(at.clone()));
+        l.take_back(owed, None);
+        assert!(l.dirty.rebuild, "the ask itself is taken back");
+        assert_eq!(l.since, Some(at), "and nothing lowered it");
+    }
+
     /// The memory estimate of a change buffer counts every kind of entry at its size.
     #[test]
     fn buffer_bytes_by_kind() {
@@ -11612,6 +13688,76 @@ mod tests {
         assert_eq!(m.xa_hold_bytes, 256 << 20);
         assert_eq!(m.lag_hold_bytes, 256 << 20);
         assert_eq!(m.dedup_max_bytes, 256 << 20);
+        assert_eq!(
+            m.lag_build_hold_bytes,
+            64 << 20,
+            "the catch-up hold is a quarter of the build hold"
+        );
+    }
+
+    /// The escalation of the build byte budget (lv-super ruling 2026-11-27): a lagging target's
+    /// catch-up builds, together over their budget, are dropped and the shared reader keeps
+    /// reading; the builds a view will be served from still hold it; and the two kinds never
+    /// borrow each other's threshold. What the catch-ups hold is bounded by one number and is
+    /// always the thing given up, never the reader's progress.
+    #[test]
+    fn a_catch_up_over_budget_is_dropped_and_never_holds_the_reader() {
+        let (catch_up_budget, build_budget) = (4 << 20, 64 << 20);
+        // One catch-up over the whole budget by itself: the attempt goes, the reader does not stop.
+        let (drop, hold) =
+            Engine::build_budget_decision(&[(3, 8 << 20, false)], 0, catch_up_budget, build_budget);
+        assert_eq!(drop, vec![3]);
+        assert_eq!(
+            hold, None,
+            "one target's catch-up never pauses the shared reader"
+        );
+        // Exactly at the budget, not over it: the attempt stands (the budget is a strict over).
+        let (drop, hold) = Engine::build_budget_decision(
+            &[(3, catch_up_budget, false)],
+            0,
+            catch_up_budget,
+            build_budget,
+        );
+        assert!(drop.is_empty());
+        assert_eq!(hold, None);
+        // Over the budget together: the LARGEST goes first, and only as many as it takes to fit.
+        let (drop, hold) = Engine::build_budget_decision(
+            &[(1, 1 << 20, false), (2, 6 << 20, false)],
+            0,
+            catch_up_budget,
+            build_budget,
+        );
+        assert_eq!(
+            drop,
+            vec![2],
+            "7 MiB over a 4 MiB budget: the 6 MiB attempt goes"
+        );
+        assert_eq!(hold, None);
+        // An ordinary build over its budget: the reader waits, and no catch-up is dropped for it.
+        let (drop, hold) = Engine::build_budget_decision(
+            &[(3, 1 << 20, false)],
+            96 << 20,
+            catch_up_budget,
+            build_budget,
+        );
+        assert!(drop.is_empty(), "those catch-ups are inside their budget");
+        assert_eq!(hold, Some(96 << 20));
+        // Both over: the optional work for one target goes first, and the hold is decided by the
+        // ordinary bytes alone — the catch-up's bytes are never counted against them.
+        let (drop, hold) = Engine::build_budget_decision(
+            &[(1, 40 << 20, false), (2, 40 << 20, false)],
+            96 << 20,
+            catch_up_budget,
+            build_budget,
+        );
+        assert_eq!(drop, vec![1, 2]);
+        assert_eq!(hold, Some(96 << 20), "96 MiB of ordinary builds, not 176");
+        // A catch-up whose swap is running is past the point of no return: whatever its buffer, it
+        // is not abandoned here, and it is still not the reason for a hold.
+        let (drop, hold) =
+            Engine::build_budget_decision(&[(7, 40 << 20, true)], 0, catch_up_budget, build_budget);
+        assert!(drop.is_empty(), "a swap in flight is not abandoned here");
+        assert_eq!(hold, None);
     }
 
     fn lag(since: (&str, u64), down: bool) -> Lag {
@@ -11626,18 +13772,206 @@ mod tests {
             failures: 0,
             retry_at: Instant::now(),
             down,
+            posted: UnitSet::default(),
+            posted_partial: Vec::new(),
+            posted_all: false,
         }
     }
 
-    /// The saved position waits for a lagging target reported down (`pending_floor` keeps
-    /// every `lag_floor` entry): its kept keys live only in memory, so a restart must replay
-    /// the outage into them instead of leaving the target silently stale.
+    /// Guard R1 (owner rule 2026-11-26) at the site lv-super's verdict of 2026-11-27 named: the
+    /// flush round that found no eligible target ([`kept_after_no_target_round`], called from
+    /// [`Engine::live_begin`]). Both modes keep the owed rebuild — `ViewDirty::is_empty` counts it,
+    /// which is what wakes the flush for it — but only a Full-mode view keeps the whole-view flag.
+    /// An Incremental view's catch-up is the slot's streamed build
+    /// ([`Engine::lag_build`] / `BuildKind::LagCatchUp`), never `refresh`'s in-memory read of the
+    /// whole view. And a units-only round keeps neither flag: what the owed sets already carry is
+    /// not kept a second time in the slot.
+    #[test]
+    fn no_eligible_target_keeps_the_whole_view_for_a_full_mode_view_only() {
+        // The shape the guard found: an Incremental view whose `rebuild` was set (a cascade gap
+        // window, a distrust rebuild) while every one of its targets was excluded.
+        let owed = || {
+            let mut d = ViewDirty::for_aliases(1);
+            d.rebuild = true;
+            d.units.insert_int(21);
+            d
+        };
+
+        let incremental = kept_after_no_target_round(owed(), false);
+        assert!(incremental.rebuild, "the owed rebuild stays owed");
+        assert!(
+            !incremental.all,
+            "guard R1: an Incremental view is owed units, never the whole view"
+        );
+        assert!(
+            !incremental.is_empty(),
+            "and the buffer still wakes the flush for it, on `rebuild` alone"
+        );
+        assert!(
+            !incremental.units.is_empty(),
+            "a rebuild round keeps its whole buffer: its maintenance lives there"
+        );
+
+        let full = kept_after_no_target_round(owed(), true);
+        assert!(
+            full.rebuild && full.all,
+            "a Full view's maintenance IS the view: what a re-derive changes is not knowable per key"
+        );
+
+        // A round with no rebuild keeps only the base-row keys no owed set can name, in either mode,
+        // so nothing here can reach the in-memory whole-view arm of a refresh.
+        for full_mode in [false, true] {
+            let mut units_only = ViewDirty::for_aliases(1);
+            units_only.units.insert_int(21);
+            let kept = kept_after_no_target_round(units_only, full_mode);
+            assert!(
+                kept.is_empty() && !kept.all && !kept.rebuild,
+                "units belong to the owed sets, not to the slot, in mode {full_mode:?}"
+            );
+        }
+    }
+
+    /// The same round keeps what it cannot re-derive either. `ViewDirty::take` documents `tally`
+    /// and `cache` as staying with the buffer they travel in (`src/accumulate.rs:449-456`), and
+    /// `publish_stats` folds this view's `/stats` counters out of `l.dirty.tally` — so marks the
+    /// flush had already counted are not owed work to be re-owed, they are a record, and dropping
+    /// them loses it for good because the published counter is cumulative. This is the mechanism of
+    /// `pinned::reg_cascade_short_image_minimal`'s CI red (run 46066115571, job 140735940097, seed
+    /// 892225811605, mysql97 and percona97): every oracle check passed, `/stats` reported 1 of 2
+    /// short images, and the failure's own `batches_dropped 0` ruled out the bounded fold channel —
+    /// the keep-list was where the count went (lv-super ruling msg_15a6a77fbab9).
+    #[test]
+    fn the_no_target_round_keeps_the_marks_the_flush_already_counted() {
+        for full_mode in [false, true] {
+            // The two shapes of the round, each with one image the reader could not read: the
+            // charge the flush made before the round decided what to keep.
+            let mut owed = ViewDirty::for_aliases(1);
+            owed.rebuild = true;
+            owed.units.insert_int(21);
+            owed.short_image();
+            owed.cache.gap = true;
+            let kept = kept_after_no_target_round(owed, full_mode);
+            assert_eq!(
+                kept.tally.cascade_short_images, 1,
+                "a rebuild round keeps the mark it was charged, mode {full_mode:?}"
+            );
+            assert!(
+                kept.cache.gap,
+                "and the cascade window the map is carrying, mode {full_mode:?}"
+            );
+
+            let mut units_only = ViewDirty::for_aliases(1);
+            units_only.units.insert_int(21);
+            units_only.short_image();
+            units_only.cache.distrust = true;
+            let mut kept = kept_after_no_target_round(units_only, full_mode);
+            // Exactly what `publish_stats` does at the end of a flush (`std::mem::take` of the
+            // slot's tally), so this asserts the NEXT publish reports the mark, not just the buffer.
+            let published = std::mem::take(&mut kept.tally);
+            assert_eq!(
+                published.cascade_short_images, 1,
+                "a units round keeps the mark too, mode {full_mode:?}: /stats reads it out of this \
+                 buffer and the counter is cumulative, so a dropped mark is never seen again"
+            );
+            assert!(
+                kept.cache.distrust,
+                "a map the engine distrusts stays distrusted through the round, mode {full_mode:?}"
+            );
+        }
+    }
+
+    /// Guard R1 (owner rule 2026-11-26) as a unit: the whole-view debt of a lagging target is paid
+    /// by the streamed build's swap ([`Engine::lag_build`]) and by nothing else, and the swap pays
+    /// exactly what its read covered (lv-super's ruling of 2026-11-27). The cases are the shapes an
+    /// entry holds when `finish_next` swaps such a build in: the whole view alone (paid, the catch-up
+    /// to count); the whole view plus units owed when the read began — a rebuild computes the view
+    /// from its sources, so those are covered too; units and partial keys re-fed AFTER the read
+    /// started (they are not in it, so they stay owed and no catch-up is counted); a whole-view ask
+    /// re-fed after the read (the debt stands, another attempt builds); and a units-only entry, the
+    /// refresh's own business, untouched.
+    #[test]
+    fn the_whole_view_of_a_lagging_target_is_paid_by_the_build_alone() {
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        g.failures = 2;
+        assert!(g.pay_whole_view(), "the swap covered the whole owed set");
+        assert!(
+            !g.all && g.failures == 0,
+            "a paid debt starts its backoff over"
+        );
+
+        // What the entry owed when the fill's read began is covered by it: a rebuild recomputes
+        // every row, so units, partial keys and the whole view are paid together.
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        g.units.insert_int(21);
+        assert!(
+            g.pay_whole_view(),
+            "the fill's read recomputed the units the entry owed at its start"
+        );
+        assert!(
+            g.units.is_empty() && !g.all,
+            "so both debts are gone, and the owed set is empty: the catch-up"
+        );
+
+        // Re-fed after the read started: not in what it read, so owed, and no catch-up yet.
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        assert!(
+            g.posted.insert_int(21),
+            "the flush fed this unit during the fill"
+        );
+        g.partial.push(UnitSet::default());
+        assert!(
+            !g.pay_whole_view(),
+            "a unit re-fed after the read is not covered by it"
+        );
+        assert!(!g.all, "the build's read paid the whole view");
+        assert!(
+            !g.units.is_empty(),
+            "and the re-fed unit is owed: nothing was lost, only re-timed"
+        );
+
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        let mut p = UnitSet::default();
+        p.insert_int(3);
+        g.posted_partial = vec![p];
+        assert!(
+            !g.pay_whole_view(),
+            "a partial key re-fed after the read stays owed too"
+        );
+        assert_eq!(g.partial.len(), 1, "and it is folded in, not dropped");
+        assert!(!g.partial[0].is_empty(), "the key is owed for its retry");
+
+        let mut g = lag(("binlog.000003", 100), false);
+        g.all = true;
+        g.posted_all = true;
+        assert!(
+            !g.pay_whole_view(),
+            "a whole-view ask that came after the read is not covered by it"
+        );
+        assert!(g.all, "the debt stands until a build reads past it");
+
+        let mut g = lag(("binlog.000003", 100), false);
+        g.units.insert_int(7);
+        g.failures = 3;
+        assert!(
+            !g.pay_whole_view(),
+            "a units entry is the refresh's business"
+        );
+        assert_eq!(g.failures, 3, "and its failures are the retry's own");
+        assert!(!g.units.is_empty());
+    }
+
+    /// The saved position waits for a lagging target reported down (`pending_floor` keeps every
+    /// lag entry): its kept keys live only in memory, so a restart must replay the outage into
+    /// them instead of leaving the target silently stale. And the witness of a stalled position
+    /// names THAT entry, not the healthy version's own buffer.
     #[test]
     fn the_saved_position_waits_for_a_down_target() {
-        let mut floor = Position {
-            file: "binlog.000009".to_string(),
-            pos: 500,
-        };
+        let p = Arc::new(plan("CREATE VIEW v AS SELECT i.id FROM items i"));
+        let boundary = pos("binlog.000009", 500);
         let lag: BTreeMap<String, Lag> = [
             ("t2", lag(("binlog.000003", 42), false)),
             ("t1", lag(("binlog.000002", 7), true)),
@@ -11646,14 +13980,100 @@ mod tests {
         .map(|(t, g)| (t.to_string(), g))
         .collect();
         assert!(lag["t1"].down);
-        lag_floor(&mut floor, &lag);
+        let mut l = live(&p, false, Some(pos("binlog.000004", 400)));
+        l.lag = lag;
+        let slots = [slot(Some(l), None)];
         assert_eq!(
-            floor,
-            Position {
-                file: "binlog.000002".to_string(),
-                pos: 7
+            pending_floor_of(&boundary, &slots, |_| None, true),
+            pos("binlog.000002", 7),
+            "the down target's `since` holds the saved position back, past the version's own buffer"
+        );
+        let (pin, at) = floor_pin_of(&boundary, &slots, |_| None, true).expect("a pin holds it");
+        assert_eq!(at, pos("binlog.000002", 7));
+        assert_eq!(
+            pin,
+            FloorPin::Lag {
+                def_id: 7,
+                target: "t1",
+                all: false
             },
-            "the down target's `since` holds the saved position back"
+            "the witness names the down target's units, which is the wait an operator can act on"
+        );
+    }
+
+    /// The other two shapes of a stalled position, the ones no counter shows: a whole-view debt
+    /// whose catch-up build has not landed, and a build in flight that is not the routine rebuild
+    /// of the live version. `applied` not moving looks the same from `/stats` for both of them and
+    /// for a flush that never completes, which is why the witness is part of the floor rule and
+    /// not of the reporting code.
+    #[test]
+    fn a_stalled_position_names_the_debt_and_the_build_that_owe_it() {
+        let p = Arc::new(plan("CREATE VIEW v AS SELECT i.id FROM items i"));
+        let boundary = pos("binlog.000009", 500);
+
+        // A target owed the WHOLE view: waiting for this pin is waiting for the streamed catch-up
+        // build to be claimed, to read and to swap (R1 — no other code pays `all`).
+        let mut l = live(&p, false, Some(pos("binlog.000008", 480)));
+        let mut g = lag(("binlog.000005", 100), false);
+        g.all = true;
+        l.lag = [("t1".to_string(), g)].into_iter().collect();
+        let slots = [slot(Some(l), None)];
+        let (pin, at) = floor_pin_of(&boundary, &slots, |_| None, false).expect("the debt pins it");
+        assert_eq!(at, pos("binlog.000005", 100));
+        assert_eq!(
+            pin,
+            FloorPin::Lag {
+                def_id: 7,
+                target: "t1",
+                all: true
+            },
+            "a whole-view debt is named as such, not as a units wait"
+        );
+        assert!(
+            pin.what().contains("catch-up build"),
+            "and the line points at the build that pays it: {}",
+            pin.what()
+        );
+
+        // A build in flight that the view will be served from: the position stops at its read, and
+        // the witness says whether it is one target's catch-up or the view's own replacement.
+        let n = next(&p, pos("binlog.000004", 90), None);
+        let slots = [slot(None, Some(n))];
+        let (pin, at) =
+            floor_pin_of(&boundary, &slots, |_| None, false).expect("the build pins it");
+        assert_eq!(at, pos("binlog.000004", 90), "the floor stops at the read");
+        assert_eq!(
+            pin,
+            FloorPin::Building {
+                def_id: 7,
+                catch_up: false
+            }
+        );
+        let mut n = next(&p, pos("binlog.000004", 90), None);
+        n.catch_up = true;
+        let slots = [slot(None, Some(n))];
+        let (pin, _) = floor_pin_of(&boundary, &slots, |_| None, false).expect("the build pins it");
+        assert_eq!(
+            pin,
+            FloorPin::Building {
+                def_id: 7,
+                catch_up: true
+            },
+            "a catch-up is the optional kind: it is the one the byte budget drops, never the reader"
+        );
+        assert!(pin.what().contains("one lagging target"), "{}", pin.what());
+
+        // Nothing owed: an unmoving position over an idle source means nothing is wrong, and the
+        // reporting latch must not invent a reason for it.
+        let l = live(&p, false, Some(pos("binlog.000009", 500)));
+        let slots = [slot(Some(l), None)];
+        assert_eq!(
+            pending_floor_of(&boundary, &slots, |_| None, false),
+            boundary
+        );
+        assert!(
+            floor_pin_of(&boundary, &slots, |_| None, false).is_none(),
+            "a position at the reader's head is not a stall"
         );
     }
 
@@ -11719,6 +14139,7 @@ mod tests {
             task: idle_task(),
             done: None,
             partial: false,
+            catch_up: false,
             hash: "h".to_string(),
             swapped: HashSet::new(),
             lock_wait: HashSet::new(),
@@ -11727,6 +14148,7 @@ mod tests {
             recent: Lookback::default(),
             routine: false,
             swapping: false,
+            lost: None,
             catalog_head: None,
         }
     }

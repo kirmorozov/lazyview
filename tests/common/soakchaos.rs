@@ -1384,6 +1384,19 @@ pub fn grep_log(path: &PathBuf, needle: &str) -> Result<Option<String>> {
         .map(|l| l.chars().take(200).collect()))
 }
 
+/// The engine log's lines, once, for a witness that asks the same question of several views (one
+/// pass per view, one read of the file): the owner's rule on test waiting — poll through
+/// `wait_until`, never a sleep loop — covers reading a growing log file inside a loop as well.
+/// [`Self::grep_log`] is the one-line answer for a witness that asks once; `None` when the engine
+/// has not written the log yet, which is a witness that found nothing, not an error.
+pub fn log_lines(path: &PathBuf) -> Result<Option<Vec<String>>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t.lines().map(str::to_string).collect())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read engine log {}", path.display())),
+    }
+}
+
 /// Waits until this engine has flushed every one of `specs` at least once, so `/stats` carries a
 /// row for each (`Engine::view_stats`, `engine.rs:230`: a view is listed only after a flush listed
 /// it). The writers keep going through an event (§3), which is what makes them flush; the names

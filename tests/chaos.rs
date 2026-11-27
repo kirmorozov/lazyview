@@ -1693,6 +1693,7 @@ fn assert_no_rebuilds(
 ) -> Result<()> {
     let d = eng.snapshot().since(before);
     let mut full_whole = 0u64;
+    let mut builds = 0u64;
     for s in specs {
         let vs = eng.stats_of(db, &s.name)?;
         if vs.mode.eq_ignore_ascii_case("incremental") {
@@ -1705,13 +1706,22 @@ fn assert_no_rebuilds(
         } else {
             full_whole += vs.whole_view_refreshes;
         }
+        // Every build the engine counts as a rebuild is accounted here, whatever the view's mode:
+        // the view's first build, a target that was never built on (`retry_down`), and a lagging
+        // target's whole-view catch-up (`Engine::lag_build`, #265 guard R1), which is a build onto
+        // the unchanged live version and not a whole refresh — so it moves the engine's
+        // `full_rebuilds` and this counter together and stays inside the budget. What stays outside
+        // it, and is the point of the check, is a whole refresh of an INCREMENTAL view: rows
+        // changed and the view was read whole instead of maintained.
+        builds += vs.builds;
     }
     ensure!(
-        d.full_rebuilds <= full_whole,
+        d.full_rebuilds <= full_whole + builds,
         "{what}: engine full_rebuilds delta {} exceeds the {} whole refreshes of the Full-mode \
-         views — an incremental view was rebuilt, not refreshed",
+         views and {} builds of all of them — an incremental view was rebuilt, not refreshed",
         d.full_rebuilds,
-        full_whole
+        full_whole,
+        builds,
     );
     Ok(())
 }
@@ -1743,6 +1753,48 @@ fn target_write_error_logged(log_path: &std::path::Path, target: &str) -> bool {
             .iter()
             .any(|needle| l.contains(needle))
     })
+}
+
+/// How many of the engine's log lines name `target` and carry the phrase `what` — the count the
+/// Part B assertions need: the crossing of the down state and its recovery are ONE line each, by
+/// ruling, not one per failed write.
+fn log_lines_about(log_path: &std::path::Path, target: &str, what: &str) -> usize {
+    let Ok(text) = std::fs::read_to_string(log_path) else {
+        return 0;
+    };
+    text.lines()
+        .filter(|l| l.contains(target) && l.contains(what))
+        .count()
+}
+
+/// The value of one `/metrics` series: `name{key="value"}` for a labelled gauge, `name` for a
+/// plain counter; `None` when the endpoint does not carry it at all (which is how "this target was
+/// never reported down" reads while the process is up).
+fn metric_value(body: &str, name: &str, label: Option<(&str, &str)>) -> Option<f64> {
+    let want = match label {
+        Some((k, v)) => format!("{name}{{{k}=\"{v}\"}} "),
+        None => format!("{name} "),
+    };
+    body.lines()
+        .find_map(|l| l.strip_prefix(&want))
+        .and_then(|rest| rest.trim().parse::<f64>().ok())
+}
+
+/// The sum of the per-class counters of failed writes to a target (Part B):
+/// `lazyview_target_write_err_{class}_total` over every class of `target::WriteErr`.
+fn target_write_err_counted(body: &str) -> u64 {
+    [
+        "reset",
+        "closed",
+        "terminated",
+        "server",
+        "connect",
+        "other",
+    ]
+    .iter()
+    .filter_map(|c| metric_value(body, &format!("lazyview_target_write_err_{c}_total"), None))
+    .map(|v| v as u64)
+    .sum()
 }
 
 /// `t1` → its schema, the shape `verify_targets` takes for one target.
@@ -1867,6 +1919,16 @@ async fn tgt_reset(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -> Re
         ("LAZYVIEW_SUPERVISOR", "fixed"),
     ] {
         ov.push((k.to_string(), v.to_string()));
+    }
+    // Part B reads the operator's own endpoint, so the PostgreSQL leg gets a health port. The MySQL
+    // leg keeps no health endpoint here, exactly as before: it has no down-observable until the
+    // question `05-target-down-observ` is answered, and its run must stay byte-identical.
+    let health = match &pgdb {
+        Some(_) => Some(free_local_addr()?),
+        None => None,
+    };
+    if let Some(a) = &health {
+        ov.push(("LAZYVIEW_HEALTH_ADDR".to_string(), a.clone()));
     }
     let (mut eng, _) = start_with_views(ctx, &db, &specs, &ov_refs(&ov)).await?;
     let tmysql = match &t1 {
@@ -2014,6 +2076,52 @@ async fn tgt_reset(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -> Re
          no refresh error, no supervisor retry, nothing in the log: {}",
         fmt_snapshot(&d)
     );
+    // Part B (lv-super ruling 2026-11-22): the down observability of a PostgreSQL target, read the
+    // way an operator reads it — `/metrics`, not the engine's private snapshot. A reset on the link
+    // need NOT take the target down (the edge may retry the write into success — the note above the
+    // catch-up wait), so what is asserted is the AGREEMENT between what the engine saw and what it
+    // exposes: a logged write failure has a counted class, and the down state is ONE warn at the
+    // crossing plus its one recovery line, with the gauge agreeing at both ends.
+    if let (Some(pgdb), Some(addr)) = (&pgdb, &health) {
+        let (_, body) = http_get(addr, "/metrics").await?;
+        let logged = target_write_error_logged(&eng.log_path, tname);
+        let counted = target_write_err_counted(&body);
+        let downs = log_lines_about(&eng.log_path, tname, "target is down");
+        let ups = log_lines_about(&eng.log_path, tname, "target answers again");
+        let gauge = metric_value(&body, "lazyview_target_down", Some(("target", tname)));
+        ensure!(
+            downs <= 1,
+            "{tag}: the down crossing was logged {downs} times: the ruling allows ONE warn per \
+             crossing, not one per failed write"
+        );
+        if logged {
+            ensure!(
+                counted >= 1,
+                "{tag}: the engine logged a write that died on the way to {tname} and counted no \
+                 error class for it (every lazyview_target_write_err_*_total is 0): the class of a \
+                 lost write is the observable Part B promises"
+            );
+        }
+        if downs == 1 {
+            // The two lines come as a pair, and `verify_targets` above proved the target exact: a
+            // target that answers again must not stay 1 on the series a dashboard alerts on.
+            ensure!(
+                ups == 1,
+                "{tag}: {tname} was reported down and caught up, but its recovery line is missing \
+                 ({ups} 'target answers again' lines): the pair is what makes the gauge readable"
+            );
+            ensure!(
+                gauge == Some(0.0),
+                "{tag}: {tname} caught up (checked above) but lazyview_target_down for it reads \
+                 {gauge:?}: a target that answers must not stay 1"
+            );
+        }
+        ctx.log(format!(
+            "{tag}: down observability for {tname} (schema {}): logged={logged} counted={counted} \
+             crossing lines={downs} recovery lines={ups} gauge={gauge:?}",
+            pgdb.schema
+        ));
+    }
     assert_no_rebuilds(&eng, &db, &specs, &before, tag)?;
     eng.check_alive()?;
     eng.stop().await?;
@@ -2142,10 +2250,13 @@ async fn tgt_blackhole(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -
     // failed target from the refresh and retries it from the kept keys; if a dead target can
     // stall `t2`, this wait fails and the suite says so.
     stop_writers(ctx, tx, writers).await?;
-    wait_until(
+    wait_target_exact(
+        &db,
+        "t2",
+        &t2,
+        &specs,
         "the direct target to stay exact while the proxied target is black-holed (independence broken)",
         FAULT_BUDGET,
-        || async { Ok(check_views_targets(&db, &tmap(&t2), &specs).await.is_ok()) },
     )
     .await?;
     toxi.remove_toxic(&p1, "bh").await?;
@@ -2178,6 +2289,46 @@ async fn tgt_blackhole(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -
         fmt_snapshot(&d)
     );
     assert_no_rebuilds(&eng, &db, &specs, &before, sname)?;
+    // Guard R1 (owner rule 2026-11-26), on the one site where a lagging target provably owed the
+    // whole view. What the engine's log can prove is the ROUTING, and the line that carries it is
+    // the claim's own: `lag refresh claimed view=<v> target=<t> all=<bool>` (`src/engine.rs:10075`)
+    // is printed only by `lag_service`'s and `retry_lag`'s claim, and the claim is the hand-off to
+    // `refresh`/`prepare_refresh`, whose `dirty.all` arm is the in-memory read (`mv::read_source`
+    // with `chunk: None`). So an `all=true` claim is exactly the violation the guard is about, in
+    // either maintenance mode, and both claim paths `debug_assert!` the same rule (the sequential
+    // `retry_lag` claim logs nothing, so for that path the assert, live in these debug binaries,
+    // is the guard). What the log CANNOT prove is the absence of a whole-source read in general:
+    // `whole-view refresh: reading the source again` is main's own line for the whole version
+    // (reason "a global aggregate view recomputes its one row", `log_whole_refresh`), which every
+    // one-row aggregate of this spec hits on the cadence while all its targets are served, and the
+    // same line for a lagging target would look identical. Grepping it here asserted a rule main
+    // never had and failed runs whose catch-up was correctly built (the 2026-11-27 bar probe:
+    // `target caught up` had been logged, the debt paid, and the witness still fired on the
+    // aggregate's cadence read).
+    // One read of the log for the whole witness: the owner's rule on test waiting (poll through
+    // `wait_until`, never a sleep loop) covers reading a growing log file inside a loop as well,
+    // and N views of one run is one pass over the file (`soakchaos::log_lines`).
+    let log = soakchaos::log_lines(&eng.log_path)?;
+    for s in &specs {
+        let view = format!("view={} ", s.name);
+        let hit = log.as_ref().and_then(|lines| {
+            lines
+                .iter()
+                .find(|l| {
+                    l.contains("lag refresh claimed") && l.contains(&view) && l.contains("all=true")
+                })
+                .map(|l| l.chars().take(200).collect::<String>())
+        });
+        if let Some(line) = hit {
+            return Err(anyhow::anyhow!(
+                "{sname}: a lagging target's whole view was claimed by a refresh: {line}\n\
+                 A lag catch-up owes the streamed build (`Engine::lag_build`: `build_task` → \
+                 `mv::fill`, one batch at a time into the shadow table), never `refresh`'s \
+                 `dirty.all` arm, which reads the source into memory (guard R1, owner rule \
+                 2026-11-26).",
+            ));
+        }
+    }
     eng.check_alive()?;
     eng.stop().await?;
     if let Some(pgdb) = &pgdb {
@@ -2195,6 +2346,43 @@ fn chaos_tgt_blackhole_during_flush() {
         };
         tgt_blackhole(&ctx, &toxi, None).await
     });
+}
+
+/// [`check_views_targets`] as a poll that keeps the reason it last disagreed. The plain
+/// `wait_until` shape used by `tgt_blackhole` reports "independence broken" and nothing else;
+/// #214 is a lost-rows bug, so the test names the view and the rows that are missing (or extra)
+/// on the target, which is the difference between a diagnosis and a rerun.
+async fn wait_target_exact(
+    src: &Db,
+    name: &str,
+    t: &Db,
+    specs: &[ViewSpec],
+    what: &str,
+    budget: Duration,
+) -> Result<()> {
+    // The owner's rule is that tests wait through the shared helper (one 50 ms cadence, one
+    // `wait_until`), never a sleep loop of their own. The reason a target disagrees is still the
+    // state at the deadline: `wait_until`'s own timeout ends the wait, and the check run once more
+    // there is the LAST check, which is what a reader of the failure needs. The one-entry map is
+    // built inside each poll because an `FnMut` cannot hand a borrow to the future it returns, and
+    // a `Db` is a pool handle, so the clone is not a connection.
+    if let Err(e) = wait_until(what, budget, || async {
+        let targets: HashMap<String, Db> = [(name.to_string(), t.clone())].into();
+        Ok(check_views_targets(src, &targets, specs).await.is_ok())
+    })
+    .await
+    {
+        let targets: HashMap<String, Db> = [(name.to_string(), t.clone())].into();
+        let why = check_views_targets(src, &targets, specs)
+            .await
+            .err()
+            .map_or_else(
+                || "it agrees again on the last check".to_string(),
+                |e| format!("{e:#}"),
+            );
+        return Err(anyhow::anyhow!("{e}: {why}"));
+    }
+    Ok(())
 }
 
 /// #7 against a PostgreSQL target (T8, plan §6): the black hole on `lv_<s>_pgt1`, upstream
