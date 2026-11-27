@@ -1362,18 +1362,19 @@ fn reg_cascade_window_parent_delete_named() {
 /// Issue #408 R4 — the analyzer's name-ability gate, exercised end to end. Every scenario is the
 /// same gap-window parent delete of `reg_cascade_window_parent_delete_named`, but the child table
 /// and the view differ so the analyzer's plan fact (`CascadeRoute::name_cols`) lands on a different
-/// gate branch. The two live paths are pinned:
+/// gate branch. All four assert the same engine invariant — a gap-window parent delete never costs
+/// a whole-view refresh (`whole_view_refreshes == 0`) and the view is exact at convergence.
 ///
-/// - nameable (FK projected AND a leading prefix of the child's row key): the vanished children are
-///   named by one bounded read of the materialized table, so `whole_view_refreshes == 0`;
-/// - not nameable (FK not projected, or not a leading row-key prefix): the window keeps its
-///   whole-view refresh, so `whole_view_refreshes == 1`.
-///
-/// `whole_view_refreshes == 1` for a non-nameable branch is the correct behaviour, not a failure:
-/// naming from an unindexed column would scan the whole materialized table (costing more than the
-/// refresh it replaces), so `mark_all` stands. The analyzer's per-branch decision is locked
-/// deterministically by the `*_nameable` lib tests in `accumulate` (which read `name_cols` off the
-/// plan with no server); these scenarios prove the same decision holds against a real engine.
+/// Why even the non-nameable legs are `whole_view_refreshes == 0`: in this single-alias shape the
+/// `ON DELETE CASCADE` also emits the child's OWN `links` DELETE on the source's binlog, and replay
+/// heals the stale row from that event (the child row's unit is in it) before the parent's event can
+/// fall back to `mark_all`. A window refreshes the whole view only when its children can be named by
+/// NEITHER the cache, the plan, NOR the binlog — so `mark_all` is reached only when the child's
+/// delete is not on the log, which this shape cannot reproduce. `mark_all` itself is pinned
+/// deterministically by the `gap_window_*` lib tests in `accumulate` (no server, no child binlog
+/// event), and the per-branch gate decision (`name_cols` Some/None) by the `*_nameable` lib tests,
+/// which read the plan directly; these scenarios are the real-engine guard that none of these shapes
+/// spuriously refreshes the whole view.
 async fn gap_named_branch(
     ctx: &Ctx,
     id: &str,
@@ -1428,8 +1429,8 @@ async fn gap_named_branch(
     let d = eng.snapshot().since(&f0);
     ensure!(
         s.cascade_gaps >= 1 && s.whole_view_refreshes == want_whole && d.full_rebuilds == 0,
-        "expected whole_view_refreshes == {want_whole} for the {id} gate branch \
-         (nameable -> 0, non-nameable -> 1), got {s:?} {}",
+        "expected whole_view_refreshes == {want_whole} for the {id} gap-window parent-delete \
+         (a gap heals without a whole-view refresh in every branch, see the helper doc), got {s:?} {}",
         fmt_snapshot(&d)
     );
     ctx.log(format!("{id}: {s:?} {}", fmt_snapshot(&d)));
@@ -1455,8 +1456,12 @@ fn reg_cascade_window_named_branch_nameable() {
     });
 }
 
-/// #408 R4, not nameable — the view omits the FK column. `name_cols` stays `None`, so the window
-/// keeps its whole-view refresh: `whole_view_refreshes == 1`.
+/// #408 R4, non-nameable (gate branch `name_cols == None`) — the view omits the FK column. At the
+/// engine this still refreshes NO whole view (`whole_view_refreshes == 0`) and is exact: the child's
+/// own `links` DELETE heals the stale row, so `mark_all` is not reached. That its `name_cols` is
+/// `None` (would take `mark_all` if a window had no other remedy) is locked by the lib test
+/// `single_alias_view_omitting_the_fk_is_not_nameable`; here it is the guard that the shape never
+/// spuriously refreshes the whole view.
 #[test]
 fn reg_cascade_window_named_branch_omits_fk() {
     scenario("reg_casc_named_omits", |ctx| async move {
@@ -1468,15 +1473,18 @@ fn reg_cascade_window_named_branch_omits_fk() {
              FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
              FOREIGN KEY (gid) REFERENCES items (gid))",
             "SELECT l.gid, l.pos FROM links l",
-            1u64,
+            0u64,
         )
         .await
     });
 }
 
-/// #408 R4, not nameable — the FK `eid` is projected but the primary key is `(gid, eid)`, so `eid`
-/// is not a leading row-key prefix; the read would scan unindexed, so `name_cols` stays `None` and
-/// the window keeps its whole-view refresh: `whole_view_refreshes == 1`.
+/// #408 R4, non-nameable (gate branch `name_cols == None`) — the FK `eid` is projected but the
+/// primary key is `(gid, eid)`, so `eid` is not a leading row-key prefix and the read would scan
+/// unindexed. At the engine this still refreshes NO whole view (`whole_view_refreshes == 0`) and is
+/// exact, for the same child-delete-heal reason as [`reg_cascade_window_named_branch_omits_fk`]; the
+/// gate decision (`name_cols == None`) is locked by the lib test
+/// `non_indexed_fk_column_is_not_nameable`.
 #[test]
 fn reg_cascade_window_named_branch_fk_not_leading() {
     scenario("reg_casc_named_notlead", |ctx| async move {
@@ -1488,7 +1496,7 @@ fn reg_cascade_window_named_branch_fk_not_leading() {
              FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
              FOREIGN KEY (gid) REFERENCES items (gid))",
             "SELECT l.gid, l.eid, l.pos FROM links l",
-            1u64,
+            0u64,
         )
         .await
     });
