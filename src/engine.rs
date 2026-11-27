@@ -506,6 +506,29 @@ struct Version {
 }
 
 impl Version {
+    /// Takes back the changes a build of this slot buffered, when its build failed
+    /// ([`Engine::next_failed`]) or was dropped for its byte budget
+    /// ([`Engine::drop_catch_up_builds`]). The replay position travels **with the buffer it is the
+    /// oldest position of**: a build that holds nothing takes nothing back with it. Setting `since`
+    /// from such a build is the freeze CI's `chaos_tgt_bandwidth_starvation` prints — a live
+    /// version with an empty buffer and a position far behind the reader, and since `live_begin`
+    /// starts no round of a slot whose buffer is empty, nothing ever clears it again (the other
+    /// half of the rule is [`since_after_round`], where a round that applied its buffer gives the
+    /// position up). The callers fold their own extra ask into `incoming` (a `Mode::Full` slot is
+    /// owed another whole-view refresh), so `incoming` says exactly what the version owes from
+    /// here on, and `is_empty` is the whole test.
+    fn take_back(&mut self, incoming: ViewDirty, since: Option<Position>) {
+        if incoming.is_empty() {
+            return;
+        }
+        self.dirty.merge(incoming);
+        if let Some(p) = since {
+            if self.since.as_ref().is_none_or(|s| p < *s) {
+                self.since = Some(p);
+            }
+        }
+    }
+
     /// A position right after every catalog read its plan's table definitions come from (the
     /// latest of them).
     fn plan_head(&self) -> Option<Position> {
@@ -720,6 +743,24 @@ fn floor_pins_of<'a>(
                 p,
             );
         }
+    }
+}
+
+/// The live version's replay position once a flush round has applied its buffer
+/// ([`Engine::live_end`]): `since` is the position of the oldest change the version *holds*, so a
+/// buffer that holds nothing has no position. Kept apart from the method because the two states it
+/// decides between are one field apart and only one of them is safe to leave set: while a round is
+/// in flight its changes are in neither the table nor the slot, and `since` must hold the floor
+/// back; once the round has applied them, a `Some` with an empty buffer behind it pins the reported
+/// position for the rest of the run (`live_begin` will not start another round of the slot).
+///
+/// `ViewDirty::is_empty` counting `rebuild` is what makes the arms that leave the flag on the
+/// buffer keep their position, so the cases are asserted here rather than trusted.
+fn since_after_round(kept: &ViewDirty, since: Option<Position>) -> Option<Position> {
+    if kept.is_empty() {
+        None
+    } else {
+        since
     }
 }
 
@@ -7353,15 +7394,11 @@ impl Engine {
                 .as_mut()
                 .expect("the live version was just checked");
             if Arc::ptr_eq(&l.plan, &n.plan) || matches!(l.plan.mode, Mode::Full(_)) {
-                l.dirty.merge(n.dirty);
+                let mut incoming = n.dirty;
                 if matches!(l.plan.mode, Mode::Full(_)) {
-                    l.dirty.all = true;
+                    incoming.all = true;
                 }
-                if let Some(p) = n.since {
-                    if l.since.as_ref().is_none_or(|s| p < *s) {
-                        l.since = Some(p);
-                    }
-                }
+                l.take_back(incoming, n.since);
             }
             for t in &n.targets {
                 if let Some(g) = self.slots[*i]
@@ -8353,15 +8390,11 @@ impl Engine {
         if let Some(l) = self.slots[i].live.as_mut() {
             // Changes buffered for the failed version also concern the live one.
             if Arc::ptr_eq(&l.plan, &n.plan) || matches!(l.plan.mode, Mode::Full(_)) {
-                l.dirty.merge(n.dirty);
+                let mut incoming = n.dirty;
                 if matches!(l.plan.mode, Mode::Full(_)) {
-                    l.dirty.all = true;
+                    incoming.all = true;
                 }
-                if let Some(p) = n.since {
-                    if l.since.as_ref().is_none_or(|s| p < *s) {
-                        l.since = Some(p);
-                    }
-                }
+                l.take_back(incoming, n.since);
             }
         }
         if n.partial {
@@ -8684,9 +8717,15 @@ impl Engine {
                         if let Some(l) = self.slots[i].live.as_mut() {
                             if Arc::ptr_eq(&l.plan, &n.plan) || matches!(l.plan.mode, Mode::Full(_))
                             {
-                                l.dirty.merge(dirty);
+                                // The same merge as `next_failed`, and the same rule about the
+                                // position: it travels with the buffer it is the oldest position
+                                // of, so the ask this arm adds belongs to `incoming` and not to a
+                                // bare `l.since = Some(..)` — a Full view is owed another
+                                // whole-view refresh and an incremental one the re-armed rebuild,
+                                // both from that position.
+                                let mut incoming = dirty;
                                 if matches!(l.plan.mode, Mode::Full(_)) {
-                                    l.dirty.all = true;
+                                    incoming.all = true;
                                 } else {
                                     // Guard R1 (finding 3): "left to the next rebuild" must be a
                                     // promise the engine keeps for an INCREMENTAL view too. It
@@ -8695,13 +8734,9 @@ impl Engine {
                                     // at the `LAZYVIEW_FULL_REFRESH_MS` cadence: the loop wakes
                                     // for it (`flush_deadline`) and `refresh_live` starts it, and
                                     // that build swaps off the loop once the reader is gone.
-                                    l.dirty.rebuild = true;
+                                    incoming.rebuild = true;
                                 }
-                                if let Some(p) = since {
-                                    if l.since.as_ref().is_none_or(|s| p < *s) {
-                                        l.since = Some(p);
-                                    }
-                                }
+                                l.take_back(incoming, since);
                             }
                         }
                         // The same for the other shape of this branch: a version that REPLACES
@@ -9127,6 +9162,18 @@ impl Engine {
                 // that has a target to write to.
                 l.dirty = dirty;
             }
+            // The same rule as at the end of a round ([`since_after_round`]), because this arm
+            // emptied the buffer too: its units went into the owed sets above, which carry their
+            // own `since` (the `floor` fed to `Lag`), and what stays in the buffer is only the
+            // base-row keys no owed set can name. With nothing left buffered, the version has no
+            // replay position: it is the owed sets that hold the floor now (`FloorPin::Lag`). A
+            // `Some` left here is a duplicate pin of a debt the entries already hold — and once the
+            // target catches up and its entry goes, it is a pin of NOTHING: `live_begin` starts no
+            // round of an empty buffer, so nothing clears it, and the reported position stands
+            // still for the rest of the run. That is the freeze of
+            // `chaos_tgt_bandwidth_starvation` (witness: `owed=[] behind=[] buffered(all zero)
+            // since=binlog.000003:3820537`, the reader 130 KB ahead).
+            l.since = since_after_round(&l.dirty, l.since.take());
             return None;
         }
         if let Mode::Full(_) = plan.mode {
@@ -9432,8 +9479,29 @@ impl Engine {
                     } else {
                         l.dirty.rebuild = true;
                     }
-                } else {
-                    l.since = None;
+                }
+                // `Version::since` is the replay position of the **oldest change the live version
+                // still holds**: an empty buffer holds none, so it has no position. The round
+                // above applied everything its buffer carried, and each arm of the rebuild case
+                // leaves the version owing exactly one of two things — the rebuild flag on its own
+                // buffer (`l.dirty.rebuild = true`, which `is_empty` counts, so the position stays,
+                // as it must: that rebuild is still owed from that position) or the build in flight
+                // (which holds its own pin, `building_floor`, and `n.since` for what was handed to
+                // it). What no arm may leave is a `Some` with an empty buffer behind it, and this is
+                // the only place that can say whether the buffer was applied: `live_begin` takes the
+                // buffer when a round starts and keeps `since` set while it runs — the in-flight
+                // case, where the position MUST hold the floor back, since those changes are in
+                // neither the table nor the slot — and returns `None` for an empty one, so a `Some`
+                // left here is never cleared again: no further round of this slot ever begins, and
+                // the reported position stands still for the rest of the run while the reader
+                // reads on. That is the freeze `chaos_tgt_bandwidth_starvation` and
+                // `chaos_tgt_pg_bandwidth_starvation` print in CI as a position and nothing else
+                // (`binlog_backpressure: 0` in both dumps rules out the reader pausing), and
+                // `#265`'s R1 made it common: a lagging target's catch-up is now a build, so a
+                // round that asks for a rebuild lands while `s.next` is occupied far more often,
+                // which is the arm that hands the rebuild away and drained the buffer.
+                if let Some(l) = self.slots[i].live.as_mut() {
+                    l.since = since_after_round(&l.dirty, l.since.take());
                 }
             }
         }
@@ -12612,6 +12680,110 @@ mod tests {
         assert!(d.open() && !d.full(), "192 of 200 bytes");
         d.push(Ok(Some(Item::Other)), "binlog.000004");
         assert!(d.full() && !d.open(), "256 bytes is over the budget");
+    }
+
+    /// `Version::since` belongs to the buffer it is the oldest position of, so the round that
+    /// applied the buffer gives the position up ([`since_after_round`]). The case that matters is
+    /// the first: a live version with an empty buffer and a `since` eleven segments behind the
+    /// reader is what the witness of a stalled position printed on 2026-11-27
+    /// (`chaos_tgt_bandwidth_starvation`, mysql80, seed `252940217460`:
+    /// `since=binlog.000003:839266 read=binlog.000003:1699025`, buffer empty, nothing in flight,
+    /// no target owed), and nothing else could have left it — `live_begin` refuses to start a round
+    /// of a slot whose buffer is empty, so no later round ever cleared the position and the reported
+    /// position stood still for the rest of the run. The rest of the cases are the ones that must
+    /// NOT clear: an empty-looking buffer that still owes a rebuild, an image, a partial key or the
+    /// whole view is owed from that position, and `ViewDirty::is_empty` counting `rebuild` is what
+    /// keeps the pin, so it is asserted rather than trusted.
+    #[test]
+    fn a_round_that_applied_its_buffer_leaves_no_replay_position() {
+        let at = pos("binlog.000003", 839_266);
+        // Everything the round carried is in the table: no position, so nothing holds the floor.
+        let kept = ViewDirty::for_aliases(1);
+        assert_eq!(since_after_round(&kept, Some(at.clone())), None);
+        assert_eq!(since_after_round(&kept, None), None);
+
+        for owed in 0..5 {
+            let mut kept = ViewDirty::for_aliases(1);
+            match owed {
+                0 => kept.rebuild = true,
+                1 => kept.all = true,
+                2 => {
+                    kept.units.insert_int(3);
+                }
+                3 => {
+                    kept.images[0].insert(Key::from([Datum::Int(7), Datum::Null]));
+                }
+                _ => {
+                    kept.partial.push(UnitSet::default());
+                    kept.partial[0].insert_int(3);
+                }
+            }
+            assert!(
+                !kept.is_empty(),
+                "case {owed}: a buffer that owes something is not empty"
+            );
+            assert_eq!(
+                since_after_round(&kept, Some(at.clone())),
+                Some(at.clone()),
+                "case {owed}: what is owed from that position holds the floor back to it"
+            );
+        }
+    }
+
+    /// The other half of the same freeze: a build that buffered nothing takes no replay position
+    /// back with it ([`Version::take_back`]). `next_failed`, the budget drop and the abandoned swap
+    /// all take a build's buffer back into the live version and used to set `since` from the build
+    /// whether or not the buffer held anything — and a build whose changes had already gone to the
+    /// shadow (or that never buffered any) holds nothing. A live version left with an empty buffer
+    /// and a position behind the reader never gets another round to clear it, because `live_begin`
+    /// starts no round of an empty buffer: the position CI printed as
+    /// `since=binlog.000003:813165 read=binlog.000003:1476653` with
+    /// `buffered(units=0 images=0 marks=0 holds=0 all=false rebuild=false)`.
+    #[test]
+    fn a_build_that_buffered_nothing_takes_no_position_back() {
+        let p = Arc::new(plan("CREATE VIEW v AS SELECT i.id FROM items i"));
+        let at = pos("binlog.000003", 813_165);
+
+        // The failed catch-up held nothing: nothing travels, and the version keeps no position.
+        let mut l = live(&p, false, None);
+        l.take_back(ViewDirty::for_aliases(1), Some(at.clone()));
+        assert!(l.dirty.is_empty());
+        assert_eq!(l.since, None, "an empty buffer has no replay position");
+
+        // A Full view IS owed the whole view by the same event: a real ask, so the position
+        // travels with it and the floor waits for the refresh that pays it.
+        let mut l = live(&p, false, None);
+        let mut owed = ViewDirty::for_aliases(1);
+        owed.all = true;
+        l.take_back(owed, Some(at.clone()));
+        assert_eq!(l.since, Some(at.clone()));
+
+        let mut l = live(&p, false, Some(pos("binlog.000002", 7)));
+        let mut owed = ViewDirty::for_aliases(1);
+        owed.units.insert_int(3);
+        l.take_back(owed, Some(at.clone()));
+        assert_eq!(
+            l.since,
+            Some(pos("binlog.000002", 7)),
+            "the version's older position stands: it is owed something even earlier"
+        );
+        let mut owed = ViewDirty::for_aliases(1);
+        owed.units.insert_int(3);
+        let mut l = live(&p, false, Some(at.clone()));
+        l.take_back(owed, Some(pos("binlog.000001", 5)));
+        assert_eq!(
+            l.since,
+            Some(pos("binlog.000001", 5)),
+            "and the buffer that is owed from earlier lowers it"
+        );
+
+        // A buffer with no position of its own leaves the version's alone.
+        let mut owed = ViewDirty::for_aliases(1);
+        owed.rebuild = true;
+        let mut l = live(&p, false, Some(at.clone()));
+        l.take_back(owed, None);
+        assert!(l.dirty.rebuild, "the ask itself is taken back");
+        assert_eq!(l.since, Some(at), "and nothing lowered it");
     }
 
     /// The memory estimate of a change buffer counts every kind of entry at its size.
