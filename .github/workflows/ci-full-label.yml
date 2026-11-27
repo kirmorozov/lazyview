@@ -1,0 +1,29 @@
+name: ci-full-label
+
+# Adding the `ci:full` label to a pull request runs the comprehensive CI set on its branch (owner
+# 2026-11-27): this workflow dispatches ci.yml, whose workflow_dispatch run is the comprehensive set
+# (every flavor, the slow tier, the chaos binary on every flavor). It exists because a trigger
+# cannot be filtered by label: `labeled` in ci.yml itself would start a run for EVERY label, and a
+# run that skips its jobs leaves SKIPPED check-runs on the head that the landing pass reads. Any
+# other label starts only this workflow, whose one job is skipped for it.
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: run the comprehensive CI set
+    if: github.event.label.name == 'ci:full' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: dispatch ci.yml on the PR branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          REPO: ${{ github.repository }}
+        run: gh workflow run ci.yml --repo "$REPO" --ref "$BRANCH"

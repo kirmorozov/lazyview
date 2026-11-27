@@ -426,6 +426,20 @@ impl ViewPlan {
                 let ap = &self.aliases[a];
                 ap.semi.is_some()
                     || ap.pos.0 == usize::MAX
+                    // A unit carried by a lineage alias identifies its rows as the alias's own
+                    // row does: when the unit's value is the alias's row key — every row-key
+                    // column of the alias is one of the unit's own columns (see
+                    // `AliasPlan::direct_unit`) — the unit has at most that one row of the
+                    // alias, so the keyed chunk write, which keeps every row of a changed unit
+                    // materialized until its replacements are in (the unit is never absent
+                    // mid-write, #399), is available for it.
+                    || ap.table.row_key().is_some_and(|rk| {
+                        !rk.is_empty()
+                            && ap
+                                .direct_unit
+                                .as_ref()
+                                .is_some_and(|du| rk.iter().all(|c| du.contains(c)))
+                    })
                     || keyed(a)
                         .is_some_and(|n| self.lineage_of(a).is_some_and(|k| k.cols.len() == n))
             })
