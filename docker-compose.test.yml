@@ -768,9 +768,10 @@ services:
   # socat's openssl-connect (verify=1) against those same per-node certificates, and it dies the same
   # way. That one is not a command-line option: wsrep_sst_xtrabackup-v2 reads
   # pxc-encrypt-cluster-traffic and [sst] encrypt out of the config file rather than out of mysqld's
-  # argv, so the three services
-  # also mount docker/pxc/lv-cluster-traffic.cnf into the image's last include directory. That file
-  # carries the measured SST failure and what giving up TLS on this network costs.
+  # argv, so the three services also mount docker/pxc/lv-cluster-traffic.cnf into
+  # /etc/percona-xtradb-cluster.conf.d/, the last directory /etc/my.cnf includes (checked against the
+  # pinned image: node.cnf, my.cnf.d, then this one), where it therefore wins. That file carries the
+  # measured SST failure and what giving up TLS on this network costs.
   # The image is pinned by digest (its tag moves with PXC's own build number), and the SST hash key is
   # a fixed test value: all three nodes must share it, and the containers are dropped after every run.
   # Start order as in Galera: PXC_ADDRESS_1=gcomm:// + PXC_BOOTSTRAP=ON on node 1, then the docker0
@@ -978,8 +979,25 @@ services:
       - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
       - --loose-group-replication-recovery-get-public-key=ON
       - --loose-group-replication-member-weight=100
+    # Group Replication registers this member in performance_schema.replication_group_members under its
+    # report_host, which defaults to the container's hostname, and distributed recovery then connects to
+    # MEMBER_HOST:3306. On Docker's default bridge - which these services use, see the family header -
+    # nothing resolves a container name, so a joiner can never reach its donor:
+    #   [ERROR] [MY-010584] [Repl] Replica I/O for channel 'group_replication_recovery': Error connecting
+    #     to source 'lvdoc@c4e2fb1bac3f:3306' ... Message: Unknown MySQL server host 'c4e2fb1bac3f' (-2)
+    #   [ERROR] [MY-011582] [Repl] Plugin group_replication reported: 'There was an error when connecting
+    #     to the donor server. Please check that group_replication_recovery channel credentials and all
+    #     MEMBER_HOST column values of performance_schema.replication_group_members table are correct and
+    #     DNS resolvable.'
+    # (measured 2026-11-27T20:52Z on a live family: tmp/out/lv-worker-gtid-e/gr84-probe/probe.log;
+    # lv-super's ruling of 2026-11-27, msg_7fdf803f9a34: keep the bridge, register an IP instead)
+    # report_host is startup-only and the member's docker0 address is only known inside the running
+    # container, so this entrypoint puts it on the start command. The script carries the full reasoning;
+    # the runner and the CI lane assert every MEMBER_HOST is an IPv4 address, so it cannot rot back.
+    entrypoint: ["/bin/sh", "/lv-report-host.sh"]
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - ./docker/gr84/lv-report-host.sh:/lv-report-host.sh:ro
       - gr84-1:/var/lib/mysql
 
   gr84-2:
@@ -1011,8 +1029,12 @@ services:
       - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
       - --loose-group-replication-recovery-get-public-key=ON
       - --loose-group-replication-member-weight=50
+    # See gr84-1: the entrypoint registers this member's docker0 address as report_host, because the
+    # default bridge resolves no container names and recovery connects to MEMBER_HOST.
+    entrypoint: ["/bin/sh", "/lv-report-host.sh"]
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - ./docker/gr84/lv-report-host.sh:/lv-report-host.sh:ro
       - gr84-2:/var/lib/mysql
 
   gr84-3:
@@ -1044,8 +1066,12 @@ services:
       - --transaction-isolation=${GR_ISOLATION:-REPEATABLE-READ}
       - --loose-group-replication-recovery-get-public-key=ON
       - --loose-group-replication-member-weight=50
+    # See gr84-1: the entrypoint registers this member's docker0 address as report_host, because the
+    # default bridge resolves no container names and recovery connects to MEMBER_HOST.
+    entrypoint: ["/bin/sh", "/lv-report-host.sh"]
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - ./docker/gr84/lv-report-host.sh:/lv-report-host.sh:ro
       - gr84-3:/var/lib/mysql
 
   # ---- chaos: Toxiproxy (profile `chaos`; nothing in the default stack depends on it) ----------

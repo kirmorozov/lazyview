@@ -28,9 +28,10 @@
 # of this file (`parse_cnf mysqld pxc-encrypt-cluster-traffic`, defaulting to on) and only when it is
 # off does it fall back to `[sst] encrypt`, which is what selects plain TCP instead of
 # openssl-connect with verify=1. They are `loose-` prefixed so a build that has dropped either name
-# warns instead of aborting node 1 (the `loose-` prefix in a config file is accepted by both the
-# server and the script's parse_cnf); on this image pxc_encrypt_cluster_traffic is a real server
-# variable, checked against the pinned binary rather than assumed.
+# warns instead of aborting node 1 (the `loose-` prefix in a config file is accepted by the server,
+# and parse_cnf matches it too: its grep is `--\(loose-\)\?$var=`); on this image
+# pxc_encrypt_cluster_traffic is a real server variable, checked against the pinned binary rather than
+# assumed.
 #
 # What this costs: nothing the lanes assert. They assert GTIDs, membership, causal reads and the
 # resume-by-GTID; encryption of the replication link between three containers on a throwaway

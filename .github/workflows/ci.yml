@@ -679,6 +679,16 @@ jobs:
             done
             [ "$got" = 3 ] || { q gr84-$n "SELECT MEMBER_ID, MEMBER_STATE, MEMBER_ROLE FROM performance_schema.replication_group_members"; echo "::error::gr84-$n never saw 3 ONLINE members"; exit 1; }
           done
+          # lv-super's ruling of 2026-11-27 (msg_7fdf803f9a34): a member that registers its container
+          # hostname is a member nobody can recover from on Docker's default bridge - "Unknown MySQL server
+          # host 'c4e2fb1bac3f' (-2)" then MY-011582 asking for MEMBER_HOST values that are DNS resolvable
+          # (measured: tmp/out/lv-worker-gtid-e/gr84-probe/probe.log). The compose file answers it with
+          # --report-host=<the member's own docker0 address>; this assertion keeps that from rotting back.
+          # Same assertion as tmp/lvs-cluster.sh's gr84 branch, so lane and runner cannot drift.
+          for n in 1 2 3; do
+            bad=$(q gr84-$n "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_HOST NOT REGEXP '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'")
+            [ "$bad" = 0 ] || { q gr84-$n "SELECT MEMBER_HOST, MEMBER_STATE FROM performance_schema.replication_group_members"; echo "::error::gr84-$n sees a MEMBER_HOST that is not an IPv4 address - distributed recovery connects to MEMBER_HOST and the bridge resolves no names"; exit 1; }
+          done
           [ "$(q gr84-1 "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_ROLE='PRIMARY'")" = 1 ] || { echo "::error::not exactly one primary"; exit 1; }
           [ "$(q gr84-1 "SELECT MEMBER_ROLE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid")" = PRIMARY ] || { echo "::error::gr84-1 is not the primary"; exit 1; }
           [ "$(q gr84-1 "SELECT @@GLOBAL.gtid_mode REGEXP '^ON'")" = 1 ] || { echo "::error::gtid_mode off: GR requires it"; exit 1; }
