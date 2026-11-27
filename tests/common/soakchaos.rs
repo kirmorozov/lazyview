@@ -1384,18 +1384,17 @@ pub fn grep_log(path: &PathBuf, needle: &str) -> Result<Option<String>> {
         .map(|l| l.chars().take(200).collect()))
 }
 
-/// [`Self::grep_log`] for a witness that needs more than one field of the SAME line, which one
-/// substring cannot say: the first line `pred` accepts, truncated like `grep_log`'s answer.
-pub fn grep_log_where(path: &PathBuf, pred: impl Fn(&str) -> bool) -> Result<Option<String>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("read engine log {}", path.display())),
-    };
-    Ok(text
-        .lines()
-        .find(|l| pred(l))
-        .map(|l| l.chars().take(200).collect()))
+/// The engine log's lines, once, for a witness that asks the same question of several views (one
+/// pass per view, one read of the file): the owner's rule on test waiting — poll through
+/// `wait_until`, never a sleep loop — covers reading a growing log file inside a loop as well.
+/// [`Self::grep_log`] is the one-line answer for a witness that asks once; `None` when the engine
+/// has not written the log yet, which is a witness that found nothing, not an error.
+pub fn log_lines(path: &PathBuf) -> Result<Option<Vec<String>>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t.lines().map(str::to_string).collect())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read engine log {}", path.display())),
+    }
 }
 
 /// Waits until this engine has flushed every one of `specs` at least once, so `/stats` carries a

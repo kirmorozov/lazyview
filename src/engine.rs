@@ -772,9 +772,11 @@ fn since_after_round(kept: &ViewDirty, since: Option<Position>) -> Option<Positi
 /// left a Full view with nothing pending — after the black-holed `t1` failed one build,
 /// `w_union_kinds` was never rebuilt again and its HEALTHY targets froze at the rows of the last
 /// swap (percona84, seed 472297954799: `rebuilding view=w_union_kinds` appears exactly once in the
-/// run), and with the writers stopped no new change would ever re-arm it. Any other round keeps only
-/// the base-row keys no owed set can name (`images`, `marks`, `holds`): their units exist only after
-/// a lookup against the materialized table, which is exactly what a round with no target cannot do.
+/// run), and with the writers stopped no new change would ever re-arm it. Any other round keeps the
+/// base-row keys no owed set can name (`images`, `marks`, `holds`) and the record that travels with
+/// the buffer (`tally`, `cache`): those keys' units exist only after a lookup against the
+/// materialized table, which is exactly what a round with no target cannot do, and neither the marks
+/// nor the cascade state can be re-derived once the buffer is gone.
 ///
 /// The whole-view flag goes with a Full-mode view alone (guard R1, owner rule 2026-11-26): what a
 /// re-derive changes is not knowable per key, so a Full view's owed maintenance IS the view. An
@@ -790,16 +792,27 @@ fn kept_after_no_target_round(taken: ViewDirty, full_mode: bool) -> ViewDirty {
         kept.all = full_mode;
         kept
     } else {
+        // What no owed set can name (`images`, `marks`, `holds`), plus what cannot be re-derived:
+        // `tally` and `cache` are not debt. `ViewDirty::take` keeps them with the buffer by design,
+        // `publish_stats` folds this view's `/stats` counters out of `tally`, and the published
+        // counter is cumulative — a mark dropped here is never reported at all (the
+        // `reg_cascade_short_image_minimal` CI red at seed 892225811605, ruled in msg_15a6a77fbab9).
+        // A dropped `cache` is the same kind of loss on the other side of the map: a distrusted map,
+        // or an open gap window, would look clean again.
         let ViewDirty {
             images,
             marks,
             holds,
+            tally,
+            cache,
             ..
         } = taken;
         ViewDirty {
             images,
             marks,
             holds,
+            tally,
+            cache,
             ..Default::default()
         }
     }
@@ -13000,6 +13013,55 @@ mod tests {
             assert!(
                 kept.is_empty() && !kept.all && !kept.rebuild,
                 "units belong to the owed sets, not to the slot, in mode {full_mode:?}"
+            );
+        }
+    }
+
+    /// The same round keeps what it cannot re-derive either. `ViewDirty::take` documents `tally`
+    /// and `cache` as staying with the buffer they travel in (`src/accumulate.rs:449-456`), and
+    /// `publish_stats` folds this view's `/stats` counters out of `l.dirty.tally` — so marks the
+    /// flush had already counted are not owed work to be re-owed, they are a record, and dropping
+    /// them loses it for good because the published counter is cumulative. This is the mechanism of
+    /// `pinned::reg_cascade_short_image_minimal`'s CI red (run 46066115571, job 140735940097, seed
+    /// 892225811605, mysql97 and percona97): every oracle check passed, `/stats` reported 1 of 2
+    /// short images, and the failure's own `batches_dropped 0` ruled out the bounded fold channel —
+    /// the keep-list was where the count went (lv-super ruling msg_15a6a77fbab9).
+    #[test]
+    fn the_no_target_round_keeps_the_marks_the_flush_already_counted() {
+        for full_mode in [false, true] {
+            // The two shapes of the round, each with one image the reader could not read: the
+            // charge the flush made before the round decided what to keep.
+            let mut owed = ViewDirty::for_aliases(1);
+            owed.rebuild = true;
+            owed.units.insert_int(21);
+            owed.short_image();
+            owed.cache.gap = true;
+            let kept = kept_after_no_target_round(owed, full_mode);
+            assert_eq!(
+                kept.tally.cascade_short_images, 1,
+                "a rebuild round keeps the mark it was charged, mode {full_mode:?}"
+            );
+            assert!(
+                kept.cache.gap,
+                "and the cascade window the map is carrying, mode {full_mode:?}"
+            );
+
+            let mut units_only = ViewDirty::for_aliases(1);
+            units_only.units.insert_int(21);
+            units_only.short_image();
+            units_only.cache.distrust = true;
+            let mut kept = kept_after_no_target_round(units_only, full_mode);
+            // Exactly what `publish_stats` does at the end of a flush (`std::mem::take` of the
+            // slot's tally), so this asserts the NEXT publish reports the mark, not just the buffer.
+            let published = std::mem::take(&mut kept.tally);
+            assert_eq!(
+                published.cascade_short_images, 1,
+                "a units round keeps the mark too, mode {full_mode:?}: /stats reads it out of this \
+                 buffer and the counter is cumulative, so a dropped mark is never seen again"
+            );
+            assert!(
+                kept.cache.distrust,
+                "a map the engine distrusts stays distrusted through the round, mode {full_mode:?}"
             );
         }
     }

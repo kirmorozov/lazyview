@@ -2305,11 +2305,21 @@ async fn tgt_blackhole(ctx: &Ctx, toxi: &Toxi, pg_server: Option<&pg::Server>) -
     // never had and failed runs whose catch-up was correctly built (the 2026-11-27 bar probe:
     // `target caught up` had been logged, the debt paid, and the witness still fired on the
     // aggregate's cadence read).
+    // One read of the log for the whole witness: the owner's rule on test waiting (poll through
+    // `wait_until`, never a sleep loop) covers reading a growing log file inside a loop as well,
+    // and N views of one run is one pass over the file (`soakchaos::log_lines`).
+    let log = soakchaos::log_lines(&eng.log_path)?;
     for s in &specs {
         let view = format!("view={} ", s.name);
-        if let Some(line) = soakchaos::grep_log_where(&eng.log_path, |l| {
-            l.contains("lag refresh claimed") && l.contains(&view) && l.contains("all=true")
-        })? {
+        let hit = log.as_ref().and_then(|lines| {
+            lines
+                .iter()
+                .find(|l| {
+                    l.contains("lag refresh claimed") && l.contains(&view) && l.contains("all=true")
+                })
+                .map(|l| l.chars().take(200).collect::<String>())
+        });
+        if let Some(line) = hit {
             return Err(anyhow::anyhow!(
                 "{sname}: a lagging target's whole view was claimed by a refresh: {line}\n\
                  A lag catch-up owes the streamed build (`Engine::lag_build`: `build_task` → \
@@ -2350,22 +2360,29 @@ async fn wait_target_exact(
     what: &str,
     budget: Duration,
 ) -> Result<()> {
-    let deadline = Instant::now() + budget;
-    let targets: HashMap<String, Db> = [(name.to_string(), t.clone())].into();
-    loop {
-        // The reason is the disagreement of the LAST check: at the deadline that is the state
-        // the target is in, which is what a reader of the failure needs.
-        match check_views_targets(src, &targets, specs).await {
-            Ok(()) => return Ok(()),
-            Err(e) if Instant::now() > deadline => {
-                return Err(anyhow::anyhow!(
-                    "timed out after {budget:?} waiting for {what}: {e:#}"
-                ));
-            }
-            Err(_) => {}
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    // The owner's rule is that tests wait through the shared helper (one 50 ms cadence, one
+    // `wait_until`), never a sleep loop of their own. The reason a target disagrees is still the
+    // state at the deadline: `wait_until`'s own timeout ends the wait, and the check run once more
+    // there is the LAST check, which is what a reader of the failure needs. The one-entry map is
+    // built inside each poll because an `FnMut` cannot hand a borrow to the future it returns, and
+    // a `Db` is a pool handle, so the clone is not a connection.
+    if let Err(e) = wait_until(what, budget, || async {
+        let targets: HashMap<String, Db> = [(name.to_string(), t.clone())].into();
+        Ok(check_views_targets(src, &targets, specs).await.is_ok())
+    })
+    .await
+    {
+        let targets: HashMap<String, Db> = [(name.to_string(), t.clone())].into();
+        let why = check_views_targets(src, &targets, specs)
+            .await
+            .err()
+            .map_or_else(
+                || "it agrees again on the last check".to_string(),
+                |e| format!("{e:#}"),
+            );
+        return Err(anyhow::anyhow!("{e}: {why}"));
     }
+    Ok(())
 }
 
 /// #7 against a PostgreSQL target (T8, plan §6): the black hole on `lv_<s>_pgt1`, upstream
