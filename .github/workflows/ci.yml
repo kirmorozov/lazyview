@@ -1609,6 +1609,37 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  ci-ok:
+    # The ONE check a branch ruleset needs (owner 2026-11-27: "is there final ok job, whether its a
+    # doc only change or code with fast run?"). It reports on every pull request -- docs-only, draft,
+    # fast tier, ci:full -- and on every push: it reads the results of every job a PR can run.
+    # failure / cancelled in any of them fails it; success and skipped pass (skipped = not in this
+    # run's tier: docs-only, draft, fast). `scope`, `lint` and `unit tests` must have SUCCEEDED, so a
+    # run whose gate jobs never ran cannot read green. Advisory matrix legs are continue-on-error and
+    # already report success; the known-red gate inside the cells already turns declared reds into
+    # success; publish/release/soak-smoke/report are not here (not part of a PR's verdict).
+    name: ci ok
+    needs: [scope, lint, unit, deny, features, build-tests, integration, integration-multi, integration-pg, integration-pg-multi, integration-pgsrc, e2e, scan-image, soak-pr]
+    if: ${{ always() && github.event_name != 'schedule' && github.event_name != 'workflow_call' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: every job a PR can run succeeded or was not in this tier
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<<"$NEEDS" | tee results.txt
+          rc=0
+          while read -r job result; do
+            case "$job:$result" in
+              scope:success|lint:success|unit:success) ;;
+              scope:*|lint:*|unit:*) echo "::error::$job is $result: it must succeed in every run"; rc=1;;
+              *:failure|*:cancelled) echo "::error::$job is $result"; rc=1;;
+            esac
+          done < results.txt
+          { echo "### ci ok"; echo '```'; cat results.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
   report:
     # The nightly's own reporter (schedule and the nightly call only; a manual run never writes
     # to the issue tracker): a failed nightly opens or updates the one open issue labelled
