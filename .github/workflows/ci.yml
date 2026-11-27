@@ -1613,7 +1613,7 @@ jobs:
     # The ONE check a branch ruleset needs (owner 2026-11-27: "is there final ok job, whether its a
     # doc only change or code with fast run?"). It reports on every pull request -- docs-only, draft,
     # fast tier, ci:full -- and on every push: it reads the results of every job a PR can run.
-    # failure / cancelled in any of them fails it; success and skipped pass (skipped = not in this
+    # It is an ALLOWLIST: only success and skipped pass, any other result (failure, cancelled, or a value GitHub may add) fails it (skipped = not in this
     # run's tier: docs-only, draft, fast). `scope`, `lint` and `unit tests` must have SUCCEEDED, so a
     # run whose gate jobs never ran cannot read green. Advisory matrix legs are continue-on-error and
     # already report success; the known-red gate inside the cells already turns declared reds into
@@ -1634,7 +1634,8 @@ jobs:
             case "$job:$result" in
               scope:success|lint:success|unit:success) ;;
               scope:*|lint:*|unit:*) echo "::error::$job is $result: it must succeed in every run"; rc=1;;
-              *:failure|*:cancelled) echo "::error::$job is $result"; rc=1;;
+              *:success|*:skipped) ;;
+              *) echo "::error::$job is $result (only success or skipped passes)"; rc=1;;
             esac
           done < results.txt
           { echo "### ci ok"; echo '```'; cat results.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
