@@ -38,9 +38,9 @@ name: ci
 # the binaries from the build artifact, start their group's servers with ONE `docker compose up`
 # and execute their shard against ALL of them at once, the way the PostgreSQL jobs run pg14-pg18
 # in one job (owner 2026-11-26: "build once, fan out the runs ... make sure we efficient on code";
-# "every supported flavor stays blocking on main"): the comprehensive set is 32 cells -- the mysql,
+# "every supported flavor stays blocking on main"): the comprehensive set is 33 cells -- the mysql,
 # mariadb, advisory and supervisor-off groups x binary shards (18) plus one chaos cell per flavor
-# (14, see below) -- and a PR runs the 5 cells of the latest-LTS group (scripts/ci-cells.sh is the one
+# (15 with the supervisor-off leg, see below) -- and a PR runs the 5 cells of the latest-LTS group (scripts/ci-cells.sh is the one
 # definition of both sets; the `scope` job feeds it to the matrix). A flavor that goes red on main
 # after a landing is reverted or fixed forward the SAME DAY.
 # The network-chaos suite (tests/chaos.rs) is SLOW tier as a whole: no PR cell runs it, and the
@@ -95,11 +95,14 @@ on:
     # ready_for_review (owner 2026-11-26): a DRAFT PR runs only the fast jobs (see the header), so
     # marking it ready is what starts the heavy set -- without this type the full run would only
     # arrive on the next push to the branch.
-    # `labeled`: adding the ci:full label starts the comprehensive run at once (a label event also
-    # starts a normal run for any other label; the concurrency group cancels the one it replaces).
-    # No `paths` filter any more: the `scope` job tells a docs-only PR apart, so `unit tests`
-    # reports on every PR (a required status check that never reports blocks the merge forever).
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    # No `labeled` here: GitHub cannot filter a trigger by label, so every label would start a run (and
+    # a run that skips its jobs would leave SKIPPED check-runs on the head). Adding the ci:full label
+    # is handled by ci-full-label.yml, which dispatches this workflow (workflow_dispatch = the
+    # comprehensive set) on the PR branch; a push to a PR that carries the label reads it from the
+    # event payload (scope job). No `paths` filter any more: the `scope` job tells a docs-only PR
+    # apart, so `unit tests` reports on every PR (a required status check that never reports blocks
+    # the merge forever).
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   # Called by nightly.yml (the nightly on main HEAD). Its caller's event is `schedule`, so every
   # regular job skips and only the soak jobs and report run; workflow_call is listed alongside
@@ -418,13 +421,13 @@ jobs:
     #              container (tests/exclusive.rs:14-20,40 names ONE container per invocation), so
     #              one invocation per flavor, ~2 min each (tmp/out/lv-git-keeper/multi-server-facts.md)
     #   shard CHAOS-<flavor> -- the chaos binary over the toxiproxy daemon, ONE CELL PER FLAVOR on the
-    #              comprehensive set (14: owner 2026-11-27 restored it on every flavor after #390
+    #              comprehensive set (15: owner 2026-11-27 restored it on every leg after #390
     #              had cut it to mysql84 and mariadb114): the harness arms one upstream
     #              (tests/common/toxi.rs:71-75, tmp/out/lv-git-keeper/multi-server-facts.md), so
     #              the cell starts that one server + the daemon. These cells are the only jobs that
     #              start the toxiproxy daemon; chaos_tgt_pg_ runs in the postgres-target job.
-    # The comprehensive set is 5+5+4+4 = 18 binary-shard cells plus 14 chaos cells (the `supervisor
-    # off` path has no chaos cell of its own: mariadb1011 is in the mariadb group) = 32, more than
+    # The comprehensive set is 5+5+4+4 = 18 binary-shard cells plus 15 chaos cells (14 flavors + the
+    # supervisor-off leg: mariadb1011 with LAZYVIEW_SUPERVISOR=off, as before #390) = 33, more than
     # the 20 runners of the repo: the last chaos cells queue behind the others on a push, which
     # nobody waits for. A PR runs the 5 cells of the latest-LTS group. The cell is named e.g.
     # "integration (mysql group, shard B)" or "integration (advisory group, shard A, advisory)".
@@ -442,7 +445,7 @@ jobs:
       matrix:
         # The cells come from the scope job (scripts/ci-cells.sh, the one definition of both sets):
         # a PR runs the 5 cells of the latest-LTS group on the fast tier, a push or ci:full runs the
-        # 32 comprehensive ones. `shard` labels the job title; `run` picks the shard's binaries
+        # 33 comprehensive ones. `shard` labels the job title; `run` picks the shard's binaries
         # (a b c d | excl | chaos); `exclusive` means shard D also loops the exclusive suite over the
         # group's flavors (the groups without a shard E); `tier` becomes CI_TIER (fast skips
         # tests/slow-tier.txt); `chaos_server` is the single flavor:port a chaos cell arms its faults on.
@@ -604,6 +607,8 @@ jobs:
           # the proxies, which is the point; setup and oracle queries stay on the admin account (Q4).
           LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           LAZYVIEW_HEALTH_ADDR: "off"
+          # Empty: the default mode; "off" in the supervisor-off chaos cell (the sequential refresh path).
+          LAZYVIEW_SUPERVISOR: ${{ matrix.supervisor || '' }}
         run: |
           s=${{ matrix.chaos_server }}
           export LAZYVIEW_TEST_DSNS="${s%%:*}=mysql://lv:lv@127.0.0.1:${s##*:}/lvtest"
@@ -627,6 +632,8 @@ jobs:
           LAZYVIEW_TEST_REQUIRE_MULTI: "0"
           LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
           LAZYVIEW_HEALTH_ADDR: "off"
+          # Empty: the default mode; "off" in the supervisor-off chaos cell (the sequential refresh path).
+          LAZYVIEW_SUPERVISOR: ${{ matrix.supervisor || '' }}
         # --color never: the gate's greps read these lines as plain text. The exit status of the
         # runner (not of tee) is what the gate judges, so a broken run cannot hide behind the pipe.
         run: |

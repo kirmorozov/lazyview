@@ -9,7 +9,9 @@
 #   scripts/ci-cells.sh full   pushes to main, tags, workflow_dispatch and PRs labelled ci:full: every
 #                              supported flavor, everything (slow tier included) plus the chaos
 #                              binary ONCE PER FLAVOR (the toxiproxy harness arms one upstream, so a
-#                              chaos cell starts one server + the daemon: tests/common/toxi.rs:71-75)
+#                              chaos cell starts one server + the daemon: tests/common/toxi.rs:71-75),
+#                              the supervisor-off leg (mariadb1011, LAZYVIEW_SUPERVISOR=off) included:
+#                              15 chaos cells = chaos on all 15 legs, as before #390
 #
 # Cell fields: group, servers ("service:port ..."), shard (the job title), run (a b c d = binary
 # shards, excl = the exclusive loop, chaos), advisory (continue-on-error), tier (fast|all, becomes
@@ -44,4 +46,5 @@ jq -nc --arg tier "$tier" '
       + [flavors($mysql)[] | chaos("mysql"; .; false)]
       + [flavors($maria)[] | chaos("mariadb"; .; false)]
       + [flavors($adv)[] | chaos("advisory"; .; true)]
+      + [chaos("supervisor-off"; "mariadb1011:33111"; false) + {supervisor:"off"}]
     end'
