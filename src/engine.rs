@@ -9192,9 +9192,13 @@ impl Engine {
     }
 
     /// Units of mapped cascade children that vanished in a gap window and the route can name (see
-    /// `ViewDirty::name_pending`): one bounded read of the materialized table per (route, old key)
-    /// for the units whose FK column still carries the parent's old key — the rows the cascade
-    /// left stale, which the whole view used to be refreshed for.
+    /// `ViewDirty::name_pending`). Groups the pending old keys by route and does ONE chunked
+    /// `SELECT DISTINCT <units> ... WHERE <name_cols> IN (<all old keys>)` of the materialized
+    /// table per (view, route) per flush — not one read per key — bounded by params/bytes like the
+    /// key lookups. The read is served by an index: the analyzer only sets `name_cols` when the FK
+    /// columns are a leading prefix of the view's row key (the `_lv_row` / PRIMARY index), so it is
+    /// an index range, never a full scan of the materialized table (which would cost more than the
+    /// whole-view refresh it replaces).
     async fn name_lookups(
         &mut self,
         plan: &ViewPlan,
@@ -9203,24 +9207,39 @@ impl Engine {
         (targets, table): (&[String], &str),
         units: &mut UnitSet,
     ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // Group by route so a flush with many windows pays one chunked read per route, not per key.
+        let mut by_route: std::collections::BTreeMap<usize, UnitSet> = std::collections::BTreeMap::new();
         for (ci, old) in pending {
-            let Some(cols) = plan.cascades[*ci].name_cols.as_ref() else {
+            by_route.entry(*ci).or_default().insert(old.clone());
+        }
+        for (ci, set) in by_route {
+            let Some(cols) = plan.cascades[ci].name_cols.as_ref() else {
                 continue;
             };
-            let chunk = UnitChunk::Keys(vec![old.clone()]);
-            let rows = self
-                .read_materialized(
-                    targets,
-                    table,
-                    layout,
-                    target::MvFilter::Keys {
-                        chunk: &chunk,
-                        cols,
-                    },
-                )
-                .await?;
-            for r in rows {
-                units.insert(r.into_iter().map(Datum::from_value).collect());
+            let per = self
+                .cfg
+                .query_chunk
+                .min(MAX_FILTER_PARAMS / cols.len().max(1))
+                .max(1);
+            for chunk in set.chunks(per) {
+                self.metrics.beat();
+                let rows = self
+                    .read_materialized(
+                        targets,
+                        table,
+                        layout,
+                        target::MvFilter::Keys {
+                            chunk: &chunk,
+                            cols,
+                        },
+                    )
+                    .await?;
+                for r in rows {
+                    units.insert(r.into_iter().map(Datum::from_value).collect());
+                }
             }
         }
         Ok(())

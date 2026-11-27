@@ -213,9 +213,11 @@ pub struct CascadeRoute {
     /// OLD key; one bounded `SELECT DISTINCT <units> ... WHERE <cols> = <old key>` names exactly
     /// the units `mark_all` would have refreshed — every materialized row under the parent is a
     /// child row still holding that FK, and each unit is one child row, so the read is complete
-    /// (and never over-wide: a row whose FK is `old` is a child of this parent). `None` (every
-    /// other map route): the children cannot be named and the window keeps its whole-view
-    /// refresh.
+    /// (and never over-wide: a row whose FK is `old` is a child of this parent). The FK columns
+    /// are a leading prefix of the child's row key (`map.key`), so the read filters a leading
+    /// prefix of the row-key (`_lv_row` / PRIMARY) index — an index range, never a full scan of
+    /// the materialized table. `None` (every other map route): the children cannot be named (or
+    /// cannot be named by an indexed read) and the window keeps its whole-view refresh.
     pub name_cols: Option<Vec<String>>,
 }
 

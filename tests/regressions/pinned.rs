@@ -1282,8 +1282,10 @@ fn reg_cascade_window_parent_delete_named() {
             "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
             "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)"
                 .into(),
+            // The FK `eid` is the LEADING primary-key column (row key `(eid, gid)`), so the naming
+            // read `WHERE eid = <old>` is a range on the row-key index, not a full scan (#408 R1).
             "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
-             pos INT NOT NULL, PRIMARY KEY (gid, eid), \
+             pos INT NOT NULL, PRIMARY KEY (eid, gid), \
              FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
              FOREIGN KEY (gid) REFERENCES items (gid))"
                 .into(),

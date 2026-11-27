@@ -1138,13 +1138,15 @@ pub fn plan_block(
 
 /// Marks each mapped cascade route whose children the refresh can NAME from the materialized
 /// table (see [`CascadeRoute::name_cols`]): `alias` (the view's single FROM alias) is the child
-/// table itself, and every FK column reaches the projection as a bare column. For such a route a
-/// materialized row is one child row, so `SELECT DISTINCT <units> ... WHERE <fk cols> = <old key>`
-/// names exactly the children a parent change vanished — the read is complete (every child of the
-/// parent still holds that FK) and never wider. The target column name is the one the materialized
-/// table gives the projection position: the `CREATE VIEW (…)` column list when given, else the
-/// column's own name (its alias, when it has one). A route that fails any test keeps `name_cols`
-/// `None`: the whole-view refresh stands.
+/// table itself, every FK column reaches the projection as a bare column, and the FK columns are a
+/// leading prefix of the view's row key (`map.key`) so the read is served by the row-key index.
+/// For such a route a materialized row is one child row, so
+/// `SELECT DISTINCT <units> ... WHERE <fk cols> = <old key>` names exactly the children a parent
+/// change vanished — the read is complete (every child of the parent still holds that FK) and never
+/// wider — and runs as an index range, not a full scan. The target column name is the one the
+/// materialized table gives the projection position: the `CREATE VIEW (…)` column list when given,
+/// else the column's own name (its alias, when it has one). A route that fails any test keeps
+/// `name_cols` `None`: the whole-view refresh stands.
 fn name_mapped_cascades(
     cascades: &mut [CascadeRoute],
     projection: &[SelectItem],
@@ -1159,6 +1161,24 @@ fn name_mapped_cascades(
             || (c.child.0.as_str(), c.child.1.as_str())
                 != (alias.table.schema.as_str(), alias.table.name.as_str())
         {
+            continue;
+        }
+        // The bounded read filters `WHERE <fk cols> = <old key>` and is served by an index only when
+        // the FK columns are a LEADING PREFIX of the view's row key (`map.key`, the child's row key:
+        // the identity the materialized rows are keyed by, indexed UNIQUE `_lv_row` / PRIMARY). The
+        // target indexes only its unit / row-key / lineage / `_lv_p` columns, so any other FK set
+        // would be an unindexed full scan of the materialized table — costing more than the
+        // whole-view refresh it replaces — so such a route keeps `mark_all`.
+        let key = c.map.as_ref().expect("map checked above").key.clone();
+        let n = c.child_cols.len();
+        if n == 0 || n > key.len() {
+            continue;
+        }
+        let mut fk = c.child_cols.clone();
+        let mut lead = key[..n].to_vec();
+        fk.sort_unstable();
+        lead.sort_unstable();
+        if fk != lead {
             continue;
         }
         let mut cols: Vec<String> = Vec::with_capacity(c.child_cols.len());

@@ -363,9 +363,10 @@ pub struct ViewDirty {
     pub holds: Vec<(usize, Datum)>,
     /// Mapped cascade children that vanished in a gap window but the refresh can NAME from the
     /// materialized table (see `CascadeRoute::name_cols`), as (route, the parent's old key): the
-    /// refresh reads `SELECT DISTINCT <units> ... WHERE <name_cols> = <old key>` and marks those
-    /// units — one bounded read per (view, route) per window — instead of the whole-view refresh
-    /// `mark_all` would cost. Deduplicated, so the window pays at most one read per route.
+    /// refresh reads `SELECT DISTINCT <units> ... WHERE <name_cols> IN (<old keys>)` (an index
+    /// range on the row-key index) and marks those units — one chunked read per (view, route) per
+    /// flush, not one per key — instead of the whole-view refresh `mark_all` would cost.
+    /// Deduplicated per (route, key), so a flush pays at most one bounded read per route.
     pub name_pending: Vec<(usize, Key)>,
     /// Full views: rebuild needed. Global views: recompute the single row.
     pub all: bool,
@@ -2986,9 +2987,11 @@ mod tests {
     }
 
     /// A `Spj` view over a single alias (one materialized row per child row) whose only FK is a
-    /// projected column: the shape whose vanished cascade children the refresh can NAME from the
-    /// materialized table (see [`CascadeRoute::name_cols`]). `ent` is a parent the view does not
-    /// read; `notes` hangs under it on `eid` (a CASCADE delete), which the view projects.
+    /// projected column AND a leading prefix of the child's row key (so the naming read is index-
+    /// served): the shape whose vanished cascade children the refresh can NAME from the materialized
+    /// table (see [`CascadeRoute::name_cols`]). `ent` is a parent the view does not read; `notes`
+    /// hangs under it on `eid` (a CASCADE delete), `eid` being the leading column of the primary
+    /// key `(eid, seq)` and a projected column.
     fn name_plan() -> ViewPlan {
         use std::sync::Arc;
 
@@ -3015,11 +3018,11 @@ mod tests {
             table("ent", vec![int("id"), int("ver")], vec![0], vec![]),
             table(
                 "notes",
-                vec![int("nid"), int("eid"), int("val")],
-                vec![0],
+                vec![int("eid"), int("seq"), int("val")],
+                vec![0, 1],
                 vec![ForeignKey {
                     parent: ("db".into(), "ent".into()),
-                    child_cols: vec![1],
+                    child_cols: vec![0],
                     parent_cols: vec!["id".to_string()],
                     on_delete: FkAction::Cascade,
                     on_update: FkAction::Cascade,
@@ -3029,7 +3032,7 @@ mod tests {
         .into_iter()
         .collect();
         plan(
-            &parse_definition("CREATE VIEW v AS SELECT nid, eid, val FROM notes").unwrap(),
+            &parse_definition("CREATE VIEW v AS SELECT eid, seq, val FROM notes").unwrap(),
             "db",
             &tables,
         )
@@ -3060,6 +3063,152 @@ mod tests {
             "the projected FK `eid` names the route from the materialized table: {c:?}"
         );
         ci
+    }
+
+    /// Builds the `ent`/`notes` plan for the gate-branch tests: `notes` hangs under `ent` on
+    /// `fk_child_cols` (a CASCADE delete), and the view is `view_sql` over the single alias `notes`.
+    fn gate_plan(
+        notes_cols: Vec<crate::catalog::Column>,
+        notes_pk: Vec<usize>,
+        fk_child_cols: Vec<usize>,
+        view_sql: &str,
+    ) -> ViewPlan {
+        use std::sync::Arc;
+
+        use crate::analyze::{parse_definition, plan};
+        use crate::catalog::{FkAction, TableInfo};
+
+        let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades| {
+            (
+                ("db".to_string(), name.to_string()),
+                Arc::new(TableInfo {
+                    schema: "db".into(),
+                    name: name.into(),
+                    columns,
+                    pk,
+                    unique_keys: vec![],
+                    cascades,
+                    is_view: false,
+                    view_bases: vec![],
+                }),
+            )
+        };
+        let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+        let tables: std::collections::HashMap<_, _> = [
+            table("ent", vec![int("id"), int("ver")], vec![0], vec![]),
+            table(
+                "notes",
+                notes_cols,
+                notes_pk,
+                vec![ForeignKey {
+                    parent: ("db".into(), "ent".into()),
+                    child_cols: fk_child_cols,
+                    parent_cols: vec!["id".to_string()],
+                    on_delete: FkAction::Cascade,
+                    on_update: FkAction::Cascade,
+                }],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        plan(&parse_definition(view_sql).unwrap(), "db", &tables).unwrap()
+    }
+
+    fn notes_route_name_cols(p: &ViewPlan) -> Option<Vec<String>> {
+        p.cascades
+            .iter()
+            .find(|c| c.child.1 == "notes")
+            .unwrap_or_else(|| panic!("no notes route: {:?}", p.cascades))
+            .name_cols
+            .clone()
+    }
+
+    /// Gate branch: the single-alias view does NOT project the FK column. `map_cols` would name it
+    /// from a hidden unit column only, and the gate requires it as a projected bare column — so the
+    /// route keeps `mark_all` (`name_cols` stays `None`). Over-invalidating never risks correctness,
+    /// but naming from a column the read cannot reach is not done.
+    #[test]
+    fn single_alias_view_omitting_the_fk_is_not_nameable() {
+        use crate::catalog::Column;
+        let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+        let p = gate_plan(
+            vec![int("eid"), int("seq"), int("val")],
+            vec![0, 1],
+            vec![0],
+            "CREATE VIEW v AS SELECT seq, val FROM notes",
+        );
+        assert!(
+            notes_route_name_cols(&p).is_none(),
+            "a view that omits the FK column is not nameable: {:?}",
+            p.cascades
+        );
+    }
+
+    /// Gate branch: the FK column is projected but is NOT a leading prefix of the child's row key
+    /// (`map.key`). Here the primary key is `(seq, eid)` so `eid` is the SECOND key column: the
+    /// bounded read `WHERE eid = old` would be an unindexed full scan of the materialized table
+    /// (the target indexes only the row-key leading prefix `_lv_row`/PRIMARY), costing more than the
+    /// whole-view refresh — so the route keeps `mark_all`.
+    #[test]
+    fn non_indexed_fk_column_is_not_nameable() {
+        use crate::catalog::Column;
+        let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+        // Primary key (seq, eid): `seq` is the leading key column, the FK `eid` is not a prefix.
+        let p = gate_plan(
+            vec![int("seq"), int("eid"), int("val")],
+            vec![0, 1],
+            vec![1],
+            "CREATE VIEW v AS SELECT seq, eid, val FROM notes",
+        );
+        let c = p.cascades.iter().find(|c| c.child.1 == "notes").unwrap();
+        assert!(c.map.is_some(), "still a mapped cascade (a map route is required to name)");
+        assert!(
+            c.name_cols.is_none(),
+            "an FK that is not a leading prefix of the row key would scan unindexed: {c:?}"
+        );
+    }
+
+    /// Gate branch: the FK column is projected under an `AS` alias (`eid AS fk`). It is still one
+    /// bare column of the single alias, so the route stays nameable — and `name_cols` must carry the
+    /// name the MATERIALIZED table gives the column (the alias `fk`), not the source column name, so
+    /// the bounded read filters the column the target actually has.
+    #[test]
+    fn aliased_fk_column_is_nameable_under_its_output_name() {
+        use crate::catalog::Column;
+        let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+        let p = gate_plan(
+            vec![int("eid"), int("seq"), int("val")],
+            vec![0, 1],
+            vec![0],
+            "CREATE VIEW v AS SELECT eid AS fk, seq, val FROM notes",
+        );
+        assert_eq!(
+            notes_route_name_cols(&p).as_deref(),
+            Some(&["fk".to_string()][..]),
+            "the read names the materialized column by its alias, not the source FK name"
+        );
+    }
+
+    /// Gate branch: the FK reaches the projection only through a CTE. A `WITH` (or a derived table
+    /// in FROM) makes the plan a full-refresh one (`build` returns `full(..)`), so it is not a
+    /// `Spj` select/join and has no mapped cascade route to name from: `name_cols` stays `None`.
+    #[test]
+    fn fk_renamed_through_a_cte_is_not_nameable() {
+        use crate::catalog::Column;
+        let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+        let p = gate_plan(
+            vec![int("eid"), int("seq"), int("val")],
+            vec![0, 1],
+            vec![0],
+            "CREATE VIEW v AS WITH t AS (SELECT eid, seq, val FROM notes) SELECT eid, seq, val FROM t",
+        );
+        assert!(
+            !matches!(p.mode, Mode::Spj) && p.cascades.iter().all(|c| c.name_cols.is_none()),
+            "a CTE view is a full-refresh plan (not `Spj`), so it has no nameable map route: \
+             mode={:?} cascades={:?}",
+            p.mode,
+            p.cascades
+        );
     }
 
     /// Issue #408, the mechanism: in a gap window a parent delete whose CASCADE children the cache
@@ -3102,7 +3251,7 @@ mod tests {
         // set is named for the vanished ones — no whole-view refresh either way.
         let mut d = ViewDirty::for_aliases(p.aliases.len());
         assert_eq!(
-            feed_map(&p, ci, &mut d, None, Some(&full_row(&[1, 10, 5]))),
+            feed_map(&p, ci, &mut d, None, Some(&full_row(&[10, 1, 5]))),
             Fed::Skipped
         );
         d.cache.gap = true;
@@ -3131,7 +3280,7 @@ mod tests {
             let mut d = ViewDirty::for_aliases(p.aliases.len());
             if keep {
                 assert_eq!(
-                    feed_map(&p, ci, &mut d, None, Some(&full_row(&[1, 10, 5]))),
+                    feed_map(&p, ci, &mut d, None, Some(&full_row(&[10, 1, 5]))),
                     Fed::Skipped
                 );
             }
