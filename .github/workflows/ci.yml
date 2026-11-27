@@ -410,12 +410,14 @@ jobs:
           fi
       - name: start the ${{ matrix.group }} group${{ matrix.run == 'chaos' && ' + toxiproxy' || '' }} (in the background)
         run: |
-          read -ra services <<<"$SERVERS"
+          # SERVERS holds service:port pairs; compose wants the service names only.
+          services=(); for s in $SERVERS; do services+=("${s%%:*}"); done
           [ "${{ matrix.run }}" = chaos ] && services+=("toxiproxy")
           docker compose up -d --quiet-pull "${services[@]}"
       - name: wait for the ${{ matrix.group }} group${{ matrix.run == 'chaos' && ' + toxiproxy' || '' }}
         run: |
-          read -ra services <<<"$SERVERS"
+          # SERVERS holds service:port pairs; compose wants the service names only.
+          services=(); for s in $SERVERS; do services+=("${s%%:*}"); done
           [ "${{ matrix.run }}" = chaos ] && services+=("toxiproxy")
           docker compose up -d --wait --wait-timeout 300 "${services[@]}"
       - name: group versions + docker stats (the spec says record them -- pre-change baseline tmp/out/lv-git-keeper/group-mem.txt)
