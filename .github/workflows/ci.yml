@@ -549,7 +549,10 @@ jobs:
         # measured times (the matrix comment above): "a" = health; "b" = regressions; "c" =
         # migration, bench_throughput, supervisor; "d" = every other tests/*.rs (enumerate so a NEW
         # suite joins automatically, the way --test '*' used to take every new one; the chaos binary
-        # is its own cells and the exclusive suite is its own step, both skipped here).
+        # is its own cells and the exclusive suite is its own step, both skipped here). The #278
+        # by-design index suite (tests/indexes.rs) is its OWN gated step below, so it is excluded
+        # here too — its by-design reds are declared through tests/indexes-known-red.txt, never
+        # folded into tests/integration-known-red.txt (a different contract: real, temporary reds).
         # The chaos binary (chaos_* scenarios + selftest_toxi_*) runs for real in its own cells and
         # steps below (strict there); filtered out here so it never runs twice.
         # The gate below is scripts/chaos-gate.sh with tests/integration-known-red.txt, used exactly
@@ -573,7 +576,7 @@ jobs:
               names=()
               for f in tests/*.rs; do
                 b=${f#tests/}; b=${b%.rs}
-                case " health regressions migration bench_throughput supervisor chaos exclusive " in *" $b "*) continue;; esac
+                case " health regressions migration bench_throughput supervisor chaos exclusive indexes " in *" $b "*) continue;; esac
                 names+=("$b")
               done;;
           esac
@@ -583,6 +586,37 @@ jobs:
             2>&1 | tee integration-tests.log
           scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "${{ matrix.group }} group shard ${{ matrix.shard }} integration" \
             integration-tests.log tests/integration-known-red.txt
+      - name: user-declared index reds (shard ${{ matrix.shard }} indexes)
+        # #278 — tests/indexes.rs is the owner-ruled D8 by-design red list, declared THROUGH this
+        # gate (handbook 4e, lv-super msg_04a368015c21): scripts/chaos-gate.sh reads
+        # tests/indexes-known-red.txt exactly as the chaos and integration steps read their own files.
+        # A FAILED test listed there passes the step and is written to the job summary with its issue;
+        # an unlisted one FAILS it (a ::error:: names the file to fix). No continue-on-error, no skip,
+        # no retry — the step is required. LAZYVIEW_TEST_STRICT=idx_ turns a soft skip (the no-PG-target
+        # leg of idx_pg_concurrently_invalid_swept) into a FAILED test, so it is a declared red and
+        # never green by vacuity (owner no-SKIP rule, lv-super ruling 3); the PostgreSQL legs print a
+        # skip note and run for real on the postgres-target job. NOT `if: always()`: if the group's
+        # servers did not start, this step is skipped (the job is already red) rather than reporting
+        # every case as a declared red on a run that tested nothing.
+        if: matrix.run == 'd'
+        timeout-minutes: 45
+        env:
+          # Strict on idx_: a scenario that skips (no server, no peer, no PG target) must fail, not
+          # pass vacuously. The MySQL-family legs run for real; the PG legs are the postgres-target's.
+          LAZYVIEW_TEST_STRICT: "idx_"
+          LAZYVIEW_HEALTH_ADDR: "off"
+          # idx_fanout_all_targets_converge uses scenario_multi (a view fanned to several targets):
+          # the group's servers must be used for real, so the harness may not skip it for too few.
+          LAZYVIEW_TEST_REQUIRE_MULTI: "1"
+          LAZYVIEW_TEST_ENGINE_USER: lvdoc:doc
+          LAZYVIEW_SUPERVISOR: ${{ matrix.supervisor || '' }}
+        run: |
+          export LAZYVIEW_TEST_DSNS="$GROUP_DSNS"
+          set +o pipefail
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv indexes -- \
+            --test-threads=1 --color never 2>&1 | tee indexes-tests.log
+          scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "${{ matrix.group }} indexes" \
+            indexes-tests.log tests/indexes-known-red.txt
       # The chaos binary over the toxiproxy daemon (compose profile `chaos`, started above) runs
       # only in the run:"chaos" cells, one per flavor on the comprehensive set (slow tier: no PR
       # cell runs it; tmp/out/lv-git-keeper/multi-server-facts.md). Each cell is ONE single-DSN

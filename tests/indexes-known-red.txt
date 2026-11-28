@@ -1,0 +1,52 @@
+# User-declared index cases (tests/indexes.rs) of #278: one "<test name> by-design #<open issue>"
+# per line, the shape of tests/chaos-known-red.txt. Blank lines and `#` comment lines are ignored;
+# the name is the test function, exactly as cargo prints it. The literal `by-design` between the
+# name and the issue marks that the case is RED BY DESIGN (the feature is absent, never a test bug);
+# scripts/chaos-gate.sh reads it there and reports the real issue after it.
+#
+# WIRED INTO THE EXISTING GATE (lv-super msg_04a368015c21, "declare the by-design reds THROUGH THE
+# GATE", handbook 4e). scripts/chaos-gate.sh reads this file in the `indexes` step of
+# .github/workflows/ci.yml (the MySQL-family integration job, `--label "$FLAVOR indexes"`): a FAILED
+# test listed here passes the step and is written to the job summary with its issue, an unlisted one
+# FAILS it. The step carries no continue-on-error and is required — the same way the chaos and
+# integration steps gate on their own known-red files. `indexes` is excluded from the shard-d
+# `--test '*'` enumeration precisely so these by-design reds are declared here, not silently folded
+# into tests/integration-known-red.txt (whose entries are real, temporary, owner-approved failures,
+# a different contract).
+#
+# THESE ARE THE OWNER-RULED D8 LIST (owner ruling D8: "expectations → plan → failing tests →
+# implementation"; breakdown.md P1-P6 turn them green). An entry leaves ONLY when its case turns
+# green AND the issue it cites is actually closed. None of them may be weakened, skipped, renamed or
+# deleted to make CI pass: this file is the specification, never a place to park a regression.
+#
+# The two entries that cite #332 ("indexes: per-flavor Kind split (closes
+# index_kind_supported_per_flavor and idx_on_declared_virtual_column)", lv-super msg_bf0f022918d7)
+# rather than #278 are `idx_on_declared_virtual_column` and `index_kind_supported_per_flavor`.
+# `idx_pg_concurrently_invalid_swept` stays (lv-super ruling 3: a test that `skip_scenario()`s
+# without LAZYVIEW_TEST_PG_DSNS is green by vacuity, which the owner's no-SKIP rule forbids; the
+# `indexes` step runs LAZYVIEW_TEST_STRICT=idx_ so that skip becomes a FAILED test — a declared red,
+# never a vacuous green — and the PostgreSQL leg runs where a PG target is published).
+idx_single_at_create by-design #278
+idx_unique_at_create by-design #278
+idx_fulltext_where_supported by-design #278
+idx_multi_column_order_matters by-design #278
+idx_coexist_with_engine_keys by-design #278
+idx_declared_later_online by-design #278
+idx_fanout_all_targets_converge by-design #278
+idx_on_declared_virtual_column by-design #332
+index_kind_supported_per_flavor by-design #332
+idx_reconciles_same_name_different_columns by-design #278
+idx_declared_twice_is_idempotent by-design #278
+idx_over_undeclared_column_errors by-design #278
+idx_declared_during_inflight_build by-design #278
+idx_resume_after_interrupted_reconcile by-design #278
+idx_drift_reconverges_without_report_only by-design #278
+idx_name_collision_two_views by-design #278
+idx_unsupported_forms_fail_at_parse by-design #278
+idx_fulltext_refused_on_pg by-design #278
+idx_unknown_column_errors by-design #278
+idx_over_budget_errors_with_reason by-design #278
+idx_unique_violated_reports_and_survives by-design #278
+idx_fulltext_declared_later_never_blocks_writes by-design #278
+idx_pg_concurrently_invalid_swept by-design #278
+idx_mdl_wait_does_not_stall_writes by-design #278

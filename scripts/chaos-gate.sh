@@ -15,7 +15,10 @@
 #                parser below reads are plain text). A downloaded GitHub job log (each line prefixed
 #                with an `…Z ` timestamp) also parses, so this gate can be run on a saved CI log.
 #     [known-red] defaults to tests/chaos-known-red.txt: one "<test name> #<open issue>" per line,
-#                blank and `#` lines ignored (the shape of tmp/out/lvsuper/ci/known-red.txt).
+#                blank and `#` lines ignored (the shape of tmp/out/lvsuper/ci/known-red.txt). An
+#                optional literal `by-design` between the name and the issue (the shape of
+#                tests/indexes-known-red.txt) marks a red-by-design case and is skipped by the
+#                parser, so the issue after it is still what the summary reports.
 #     --self-test runs the built-in fixtures (the exact line shapes of the CI logs in #392) through
 #                this same parser and asserts the verdicts; it needs no cargo and no servers. CI runs
 #                it in the lint job so this gate's own logic cannot regress silently.
@@ -341,6 +344,17 @@ EOF
   expect "empty list is strict" 1 \
     ": 14 ran, 2 failed, 0 known-red, 2 blocking" \
     --status 101 --label mariadb123 "$work/frozen.log" "$work/red-empty.txt"
+  # The `by-design` token of tests/indexes-known-red.txt: `name by-design #<issue>` declares the
+  # case, and the summary reports the ISSUE (#278), never the token — this is how the by-design
+  # index reds are gated while their issue reference stays honest.
+  printf '%s\n' 'running 2 tests' 'test idx_example ... FAILED' 'test idx_green ... ok' \
+    '' 'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s' >"$work/bydesign.log"
+  printf '%s\n' 'idx_example by-design #278' >"$work/red-bydesign.txt"
+  expect "by-design token declares and reports #278" 0 \
+    ": 2 ran, 1 failed, 1 known-red, 0 blocking" \
+    "known-red (#278)" \
+    "!known-red (by-design)" \
+    --status 101 --label "mysql84 indexes" "$work/bydesign.log" "$work/red-bydesign.txt"
   # The SKIP guard catches both the plain and the MEASURED-interleaved shape:
   printf '%s\n' 'running 2 tests' 'test chaos_x ... ok' 'SKIP chaos_y: server too old' 'test chaos_y ... ok' \
     '' 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s' >"$work/skip1.log"
@@ -395,12 +409,18 @@ fi
 declare -A failed_set=()
 parse_results "$log"
 
-# The known-red list: name -> issue.
+# The known-red list: name -> issue. `<name> #<issue>` and `<name> by-design #<issue>` both map the
+# name to its issue; an optional literal `by-design` after the name (tests/indexes-known-red.txt) is
+# a declaration that the case is red on purpose, so the real issue that follows it is what we keep.
 declare -A issue=()
-while read -r name num _; do
+while read -r name num tail; do
   [ -n "${name:-}" ] || continue
   case "$name" in '' | \#*) continue ;; esac
-  issue[$name]=${num:-no issue given}
+  if [ "$num" = "by-design" ]; then
+    issue[$name]=${tail%% *}
+  else
+    issue[$name]=${num:-no issue given}
+  fi
 done < <(grep -vE '^[[:space:]]*(#|$)' "$red")
 
 lines=()
