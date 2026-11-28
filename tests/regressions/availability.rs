@@ -556,7 +556,7 @@ fn reg_error_rows_are_rechecked_at_startup() {
         exec_all(
             &mut c,
             &[
-                "DELETE FROM _lazyview WHERE name = 'r_gone'",
+                "DELETE FROM _lazyview WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = 'r_gone' LIMIT 1)",
                 "CREATE TABLE no_such_c (id INT PRIMARY KEY)",
                 "INSERT INTO no_such_c VALUES (1), (2)",
             ],
@@ -615,7 +615,7 @@ fn reg_unparseable_definition_keeps_its_table() {
             typed_rows(&mut c, "SELECT grp, n FROM r_keep ORDER BY grp").await?;
         exec(
             &mut c,
-            "UPDATE _lazyview SET definition = 'CREATE VIEW r_keep AS SELEC grp FROM entities' WHERE name = 'r_keep'",
+            "UPDATE _lazyview SET definition = 'CREATE VIEW r_keep AS SELEC grp FROM entities' WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = 'r_keep' LIMIT 1)",
         )
         .await?;
         let mut eng = eng;
@@ -643,7 +643,7 @@ fn reg_unparseable_definition_keeps_its_table() {
         }
         exec(
             &mut c,
-            "UPDATE _lazyview SET definition = 'SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp' WHERE name = 'r_keep'",
+            "UPDATE _lazyview SET definition = 'CREATE VIEW r_keep AS SELECT grp, COUNT(*) AS n FROM entities GROUP BY grp' WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = 'r_keep' LIMIT 1)",
         )
         .await?;
         exec(&mut c, "INSERT INTO entities VALUES (14, 2, 'new')").await?;

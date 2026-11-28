@@ -1,5 +1,246 @@
 use super::*;
 
+/// One account-management statement (`CREATE USER` / `GRANT` / `DROP USER`), retried while a
+/// concurrent scenario holds the server's account lock (1205 / 1213).
+async fn acct_stmt(c: &mut mysql_async::Conn, sql: &str) -> Result<()> {
+    use mysql_async::prelude::Queryable;
+    for attempt in 1..=12 {
+        match c.query_drop(sql).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let e = anyhow::Error::from(e);
+                if matches!(server_code(&e), Some(1205 | 1213)) && attempt < 12 {
+                    tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                    continue;
+                }
+                return Err(e).with_context(|| format!("account statement: {sql}"));
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// The advanced setup of S-02 / S-03 (owner 2026-11-15: "we need to separate status table from
+/// definition. to limit write scope for the service"): `_lazyview` lives in a schema of its own
+/// (`LAZYVIEW_DEFINITIONS_DATABASE`) and the service account has SELECT there and nothing else.
+/// What the service must still do with only those rights: take the view name from a `CREATE VIEW`
+/// definition that carries no `name` (derived on every read, never written back), and serve a
+/// rebuild request exactly once — including the one the old version left behind (`rebuild = 1`,
+/// never served), which the new `_lazyview_state.rebuild_served` column serves once and then
+/// leaves alone.
+#[test]
+fn reg_definitions_schema_read_only_for_the_service() {
+    scenario("reg_defs_ro", |ctx| async move {
+        const DDL: &[&str] = &[
+            "CREATE TABLE entities (id BIGINT NOT NULL PRIMARY KEY, label VARCHAR(32) NOT NULL)",
+            "CREATE TABLE items (id BIGINT NOT NULL PRIMARY KEY, entity_id BIGINT NOT NULL, price INT NOT NULL)",
+            "CREATE TABLE links (id BIGINT NOT NULL PRIMARY KEY, entity_id BIGINT NOT NULL)",
+        ];
+        const VIEW_A: &str = "CREATE VIEW items_by_entity AS SELECT i.id, i.entity_id, i.price \
+                              FROM items i JOIN entities e ON e.id = i.entity_id WHERE i.price > 0";
+        const VIEW_B: &str = "CREATE VIEW links_by_entity AS SELECT l.id, l.entity_id \
+                              FROM links l JOIN entities e ON e.id = l.entity_id";
+        // The service's schema: the base tables, its status tables, its view tables.
+        let db = ctx.new_db("reg_defs_ro").await?;
+        // The definitions, in a schema of their own.
+        let defs_db = ctx.new_db("reg_defro_d").await?;
+        let mut c = db.conn().await?;
+        exec_all(&mut c, DDL).await?;
+        exec(
+            &mut c,
+            "INSERT INTO entities VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .await?;
+        exec(
+            &mut c,
+            "INSERT INTO items VALUES (1, 1, 10), (2, 1, 0), (3, 2, 5)",
+        )
+        .await?;
+        exec(&mut c, "INSERT INTO links VALUES (1, 1), (2, 2)").await?;
+        // The setup run (the setup account, here the schema owner) creates the status tables in
+        // the service's schema and the definitions table in the definitions schema.
+        setup_run_in(&db, &defs_db.name).await?;
+
+        // The management user (here the owner of both schemas) writes the definitions: two
+        // `CREATE VIEW` statements with no `name`, and the request the old version left.
+        let mut mgmt = connect(&dsn_with_db(&db.dsn, &defs_db.name)).await?;
+        let id_a = add_definition(&mut mgmt, VIEW_A, None).await?;
+        let id_b = add_definition(&mut mgmt, VIEW_B, None).await?;
+        exec(
+            &mut mgmt,
+            &format!("UPDATE _lazyview SET rebuild = 1 WHERE id = {id_b}"),
+        )
+        .await?;
+
+        // The service account: a neutral name, created and dropped by this test. SELECT in the
+        // definitions schema and nothing else; in its own schema it writes its status tables and
+        // owns its view tables (the no-DDL-on-the-status-tables grant is what
+        // `lifecycle_ops_run_restricted_user` pins; here the point is the definitions schema).
+        // A neutral name, from the schema's own random suffix (created and dropped below).
+        let user = format!("lvro{}", &db.name[db.name.len() - 6..]);
+        let d = ident(&db.name);
+        let k = ident(&defs_db.name);
+        let mut acct = db.conn().await?;
+        let outcome = async {
+            acct_stmt(&mut acct, &format!("DROP USER IF EXISTS '{user}'@'%'")).await?;
+            acct_stmt(&mut acct, &format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'")).await?;
+            acct_stmt(
+                &mut acct,
+                &format!("GRANT SELECT ON {k}.* TO '{user}'@'%'"),
+            )
+            .await?;
+            acct_stmt(
+                &mut acct,
+                &format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, \
+                     CREATE VIEW, SHOW VIEW ON {d}.* TO '{user}'@'%'"
+                ),
+            )
+            .await?;
+            acct_stmt(
+                &mut acct,
+                &format!("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{user}'@'%'"),
+            )
+            .await?;
+
+            let rdsn = dsn_with_user(&db.dsn, &format!("{user}:pw"));
+            let defs_name = defs_db.name.clone();
+            let mut eng = ctx.start_engine(&db, &[
+                ("LAZYVIEW_DSN", rdsn.as_str()),
+                ("LAZYVIEW_DEFINITIONS_DATABASE", defs_name.as_str()),
+            ])?;
+            wait_ready(
+                &mut c,
+                &mut eng,
+                &["items_by_entity", "links_by_entity"],
+                t_ready(),
+            )
+            .await?;
+            ctx.log("the service runs on SELECT only in the definitions schema");
+
+            // The name came from each definition, and nothing was written back to the table.
+            for id in [id_a, id_b] {
+                let n = scalar(&mut mgmt, &format!("SELECT name FROM _lazyview WHERE id = {id}"))
+                    .await?;
+                ensure!(
+                    n.is_none(),
+                    "the service wrote a name into the definitions table (row #{id}): {n:?}"
+                );
+            }
+            // And it could not have: the account has no write right there.
+            let mut ro = mgmt_ro(&db, &defs_db, &user).await?;
+            match exec(
+                &mut ro,
+                &format!("UPDATE {k}.`_lazyview` SET `name` = 'nope' WHERE `id` = {id_a}"),
+            )
+            .await
+            {
+                Ok(()) => bail!("the service account wrote the definitions table"),
+                Err(e) => ensure!(
+                    server_code(&e) == Some(1142),
+                    "writing _lazyview: expected ER_TABLEACCESS_DENIED (1142), got {e:#}"
+                ),
+            }
+
+            let served_is = |name: &'static str, want: i64| {
+                let dsn = db.dsn.clone();
+                move || {
+                    let dsn = dsn.clone();
+                    async move {
+                        let mut c = connect(&dsn).await?;
+                        let v = scalar_i64(
+                            &mut c,
+                            &format!(
+                                "SELECT rebuild_served FROM `_lazyview_state` WHERE `name` = '{name}' AND `target` = 'source'"
+                            ),
+                        )
+                        .await?;
+                        c.disconnect().await.ok();
+                        Ok::<bool, anyhow::Error>(v == want)
+                    }
+                }
+            };
+
+            // The request the old version left (`rebuild = 1`, never served): served once, and
+            // once only — the counter and the served value agree afterwards.
+            let before = eng.snapshot();
+            wait_until(
+                "the rebuild = 1 left by the old version served",
+                t_catchup(),
+                served_is("links_by_entity", 1),
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let d = eng.snapshot().since(&before);
+            ensure!(
+                d.full_rebuilds == 0,
+                "the already served request ran again: {}",
+                fmt_snapshot(&d)
+            );
+            ctx.log("the upgrade request was served exactly once");
+
+            // A new request, made the documented way by the management user: one rebuild, its
+            // result live, acknowledged in `_lazyview_state` (never in `_lazyview`).
+            exec(&mut c, "DELETE FROM items_by_entity").await?;
+            let before = eng.snapshot();
+            exec(
+                &mut mgmt,
+                &format!("UPDATE _lazyview SET rebuild = rebuild + 1 WHERE id = {id_a}"),
+            )
+            .await?;
+            wait_until(
+                "the rebuild request served",
+                t_catchup(),
+                served_is("items_by_entity", 1),
+            )
+            .await?;
+            wait_until("the rebuilt table has its rows again", t_catchup(), || {
+                let dsn = db.dsn.clone();
+                async move {
+                    let mut c = connect(&dsn).await?;
+                    let n = count(&mut c, "items_by_entity").await?;
+                    c.disconnect().await.ok();
+                    Ok::<bool, anyhow::Error>(n == 2)
+                }
+            })
+            .await?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let d = eng.snapshot().since(&before);
+            ensure!(
+                d.full_rebuilds == 1,
+                "expected exactly one rebuild of items_by_entity: {}",
+                fmt_snapshot(&d)
+            );
+            // The service never touched the definitions table: the counter is still the value the
+            // management user wrote, and `updated_at` is the management user's write too.
+            let rebuild =
+                scalar_i64(&mut mgmt, &format!("SELECT rebuild FROM _lazyview WHERE id = {id_a}"))
+                    .await?;
+            let name = scalar(
+                &mut mgmt,
+                &format!("SELECT CAST(name AS CHAR) FROM _lazyview WHERE id = {id_a}"),
+            )
+            .await?;
+            ensure!(
+                rebuild == 1 && name.is_none(),
+                "the service rewrote the definition row: rebuild {rebuild}, name {name:?}"
+            );
+            eng.stop().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        acct_stmt(&mut acct, &format!("DROP USER IF EXISTS '{user}'@'%'")).await?;
+        outcome
+    });
+}
+
+/// A connection as the service account, on the definitions schema (for the checks that must run
+/// with exactly its rights).
+async fn mgmt_ro(db: &Db, defs: &Db, user: &str) -> Result<mysql_async::Conn> {
+    let dsn = dsn_with_user(&dsn_with_db(&db.dsn, &defs.name), &format!("{user}:pw"));
+    connect(&dsn).await
+}
+
 /// Every `_lazyview` change made while streaming must be picked up, also in quick succession
 /// (changes were intermittently missed on all flavors: a definition never got a state row, a
 /// disabled view was never dropped, a re-enabled one never re-created, a retarget ignored).
@@ -228,11 +469,7 @@ fn reg_rename_via_definition() {
         let specs = vec![join_view()];
         let (db, mut eng) = setup(&ctx, "reg_rename_def", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
-        let id = scalar_i64(
-            &mut c,
-            "SELECT id FROM _lazyview WHERE name = 'r_order_customer'",
-        )
-        .await?;
+        let id = definition_id(&mut c, "r_order_customer").await?;
         let renamed = ViewSpec::new("r_renamed", Kind::Incremental, &specs[0].select);
         exec(
             &mut c,
@@ -243,14 +480,16 @@ fn reg_rename_via_definition() {
         )
         .await?;
         wait_ready(&mut c, &mut eng, &["r_renamed"], t_ready()).await?;
-        let name = scalar(
+        // The name is the definition's, and the service never writes it back: the state row above
+        // carries `r_renamed` while the definition row keeps the name its author gave it (none).
+        let stored = scalar(
             &mut c,
-            &format!("SELECT name FROM _lazyview WHERE id = {id}"),
+            &format!("SELECT CAST(name AS CHAR) FROM _lazyview WHERE id = {id}"),
         )
         .await?;
         ensure!(
-            name.as_deref() == Some("r_renamed"),
-            "_lazyview.name not updated: {name:?}"
+            stored.is_none(),
+            "the service wrote a name into the definitions table: {stored:?}"
         );
         wait_until("old table dropped", t_ready(), || {
             let dsn = db.dsn.clone();

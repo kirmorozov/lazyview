@@ -163,11 +163,7 @@ fn reg_swap_bg_abandoned_swap_rearms_the_next_rebuild() {
             ],
         )?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
-        exec(
-            &mut c,
-            "UPDATE _lazyview SET rebuild = 1 WHERE name = 'r_locked'",
-        )
-        .await?;
+        request_rebuild(&mut c, "r_locked").await?;
         let r = async {
             // The swap is waiting, and cannot succeed while the reader is open: the OTHER view is
             // refreshed promptly all the same. A loop that waits for the table lock stalls these.
@@ -218,7 +214,7 @@ fn reg_swap_bg_abandoned_swap_rearms_the_next_rebuild() {
         // to ask for the swap again (the re-armed rebuild), or the flag stays set forever.
         exec(&mut reader, "COMMIT").await?;
         r?;
-        wait_rebuild_flag_cleared(&mut c, &mut eng, "r_locked").await?;
+        wait_rebuild_served(&mut c, &mut eng, "r_locked").await?;
         wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
         verify(
             &ctx,
@@ -291,9 +287,12 @@ fn reg_dependent_of_view_in_error_shows_its_error() {
             "the troubleshooting query lists {listed} of the 3 views in error"
         );
         // Fixing the upstream builds the whole chain.
+        let bad = definition_id(&mut c, "lz_bad").await?;
         exec(
             &mut c,
-            "UPDATE _lazyview SET definition = 'SELECT id, status FROM orders' WHERE name = 'lz_bad'",
+            &format!(
+                "UPDATE `_lazyview` SET definition = 'SELECT id, status FROM orders' WHERE `id` = {bad}"
+            ),
         )
         .await?;
         let specs = vec![
@@ -431,34 +430,57 @@ fn reg_failed_build_keeps_planned_mode() {
 
 /// `_lazyview.rebuild` of view `name` (0 once lazyview has done the requested rebuild).
 async fn rebuild_flag(c: &mut mysql_async::Conn, name: &str) -> Result<i64> {
-    typed_exec_first(c, "SELECT rebuild FROM _lazyview WHERE name = ?", (name,))
-        .await?
-        .context("no _lazyview row")
+    // The definitions table keeps no view name of its own (the service never writes it): the row
+    // is found through the state row, which carries the name the definition resolves to.
+    typed_exec_first(
+        c,
+        "SELECT rebuild FROM _lazyview WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = ? LIMIT 1)",
+        (name,),
+    )
+    .await?
+    .context("no _lazyview row")
 }
 
-/// Waits until lazyview cleared `_lazyview.rebuild` of `name`.
-async fn wait_rebuild_flag_cleared(
+/// The `_lazyview_state.rebuild_served` value of view `name`: the lowest among its targets, since
+/// a target not built from the request yet keeps the request pending.
+async fn rebuild_served(c: &mut mysql_async::Conn, name: &str) -> Result<i64> {
+    typed_exec_first(
+        c,
+        "SELECT MIN(rebuild_served) FROM _lazyview_state WHERE name = ?",
+        (name,),
+    )
+    .await?
+    .context("no _lazyview_state row")
+}
+
+/// Waits until lazyview acknowledged the rebuild request: it never writes `_lazyview` (the counter
+/// is the management user's), so it is served when `_lazyview_state.rebuild_served` has reached
+/// `_lazyview.rebuild`.
+async fn wait_rebuild_served(
     c: &mut mysql_async::Conn,
     eng: &mut Engine,
     name: &str,
 ) -> Result<()> {
     let t = std::time::Instant::now();
-    while rebuild_flag(c, name).await? != 0 {
+    loop {
+        if rebuild_flag(c, name).await? == rebuild_served(c, name).await? {
+            return Ok(());
+        }
         eng.check_alive()?;
         ensure!(
             t.elapsed() < t_ready(),
-            "{name}: _lazyview.rebuild still set after {:?}",
+            "{name}: rebuild request not served after {:?}",
             t_ready()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(())
 }
 
 /// There was no way to rebuild one view (hand edits of its table are not noticed, and the
 /// tricks a user tries, `SET definition = definition`, do nothing). `UPDATE _lazyview SET
-/// rebuild = 1` rebuilds that view online and is cleared once the new table is live, also when
-/// set while lazyview is stopped; the other views are left alone.
+/// rebuild = rebuild + 1` (the management user's statement) rebuilds that view online and is
+/// acknowledged in `_lazyview_state.rebuild_served`, also when set while lazyview is stopped; the
+/// other views are left alone.
 #[test]
 fn reg_rebuild_flag_rebuilds_one_view() {
     scenario("reg_rebuild_flag", |ctx| async move {
@@ -483,23 +505,22 @@ fn reg_rebuild_flag_rebuilds_one_view() {
         for restart in [false, true] {
             // A hand edit lazyview cannot notice.
             exec(&mut c, "DELETE FROM r_counts WHERE customer_id = 1").await?;
-            let ask = "UPDATE _lazyview SET rebuild = 1 WHERE name = 'r_counts'";
             let updated_sql =
-                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE name = 'r_counts'";
+                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = 'r_counts' LIMIT 1)";
             let updated: Option<String> = if restart {
                 // Set while lazyview is stopped: the restart rebuilds instead of resuming.
                 let running = eng;
                 running.stop().await?;
-                exec(&mut c, ask).await?;
+                request_rebuild(&mut c, "r_counts").await?;
                 let u = typed_first(&mut c, updated_sql).await?;
                 eng = ctx.start_engine(&db, &[])?;
                 u
             } else {
-                exec(&mut c, ask).await?;
+                request_rebuild(&mut c, "r_counts").await?;
                 typed_first(&mut c, updated_sql).await?
             };
             let before = eng.snapshot();
-            wait_rebuild_flag_cleared(&mut c, &mut eng, "r_counts").await?;
+            wait_rebuild_served(&mut c, &mut eng, "r_counts").await?;
             wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
             let what = if restart { "restart" } else { "running" };
             verify(
@@ -518,7 +539,7 @@ fn reg_rebuild_flag_rebuilds_one_view() {
             );
             let after: Option<String> = typed_first(
                 &mut c,
-                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE name = 'r_counts'",
+                "SELECT CAST(updated_at AS CHAR) FROM _lazyview WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = 'r_counts' LIMIT 1)",
             )
             .await?;
             ensure!(
@@ -536,6 +557,162 @@ fn reg_rebuild_flag_rebuilds_one_view() {
             )
             .await?;
         }
+        eng.stop().await
+    });
+}
+
+/// The startup read of the service's own state rows (`_lazyview_state`, the served rebuild
+/// counters) decides whether a request is still pending, so a transient failure of it must never
+/// come out as an empty default: every view that ever had a request would start rebuilding on a
+/// blip, with no WARN. It goes through `retry_src` — the one retry policy at the network edge,
+/// WARNing the cause of every spent try — and a read that keeps failing keeps the whole start
+/// failed, so whoever supervises the process retries the start rather than half of it.
+#[test]
+fn reg_failed_state_read_never_asks_for_a_rebuild() {
+    scenario("reg_state_read_fail", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_counts",
+            Kind::Incremental,
+            "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_state_read_fail", &[], &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        // A served request: the counter is above 0 and acknowledged — the knowledge a failed
+        // read must not lose.
+        request_rebuild(&mut c, "r_counts").await?;
+        wait_rebuild_served(&mut c, &mut eng, "r_counts").await?;
+        ensure!(
+            rebuild_flag(&mut c, "r_counts").await? == 1
+                && rebuild_served(&mut c, "r_counts").await? == 1,
+            "the scenario stands on one served request"
+        );
+        eng.stop().await?;
+
+        // The blip: the first try of the startup read fails, the retry succeeds. The proof it
+        // was retried and WARNed, not defaulted (the WARN text of `retry_src`): the WARN lands
+        // before the engine gets past the read, and `wait_log_line` checks the engine is alive
+        // every turn — if the start died instead, it says so.
+        let mut eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_FAIL_STATE_READ", "1")])?;
+        eng.wait_log_line(
+            "reading _lazyview_state (the served rebuild counters) failed (try 1 of ",
+            t_ready(),
+        )
+        .await?;
+        wait_ready(&mut c, &mut eng, &names(&specs), t_ready()).await?;
+        // The start completed with the view live, not rebuilt: this line closes `load_slots`,
+        // so once it is in the log every rebuild decision of this start is made — and the
+        // counter says none was taken. The fail-before: defaulted to empty, every slot starts
+        // at `rebuild_served = 0`, the counter of 1 looks unserved, and the view rebuilds with
+        // nothing asked of it (the line appears only after that build, and it is counted).
+        eng.wait_log_line("ready: 1 view(s) live", t_ready())
+            .await?;
+        let d = eng.snapshot();
+        let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+        ensure!(
+            !log.contains("rebuild requested (_lazyview.rebuild =") && d.full_rebuilds == 0,
+            "a transient failure of the state read asked for a rebuild: {}",
+            fmt_snapshot(&d)
+        );
+        eng.stop().await?;
+
+        // The lasting failure: the start stays an error (the supervisor retries the whole of it),
+        // and the acknowledged request is untouched meanwhile.
+        let eng = ctx.start_engine(&db, &[("LAZYVIEW_TEST_FAIL_STATE_READ", "999999")])?;
+        let out = eng.wait_finished(Duration::from_secs(60)).await?;
+        ensure!(
+            matches!(&out, Err(m) if m.contains("LAZYVIEW_TEST_FAIL_STATE_READ")),
+            "a start whose state read keeps failing must fail naming that read, got {out:?}"
+        );
+        ensure!(
+            rebuild_served(&mut c, "r_counts").await? == 1,
+            "a start that failed kept its hands off the acknowledged request"
+        );
+        Ok(())
+    });
+}
+
+/// What `serve_rebuild` acknowledges and what the startup minimum reads must be the same set of
+/// rows: the definition's rows under its **current** name and **current** targets. A rename's
+/// leftover (the state row of the old name, `managed`, kept while its table may still be needed)
+/// and a retarget's leftover (a row of a target the definition dropped) keep the value they were
+/// written at; if the minimum read them, the view would be asked to rebuild on every start —
+/// forever, since nothing acknowledges a row the definition no longer has.
+#[test]
+fn reg_leftover_state_rows_do_not_pin_a_rebuild() {
+    scenario("reg_leftover_rows", |ctx| async move {
+        let specs = vec![ViewSpec::new(
+            "r_counts",
+            Kind::Incremental,
+            "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_leftover_rows", &[], &specs, &[]).await?;
+        let mut c = db.conn().await?;
+        // A rename through the definition (the management user's statement): the view comes up
+        // under the new name, the old-name state row stays as the rename left it.
+        let id = definition_id(&mut c, "r_counts").await?;
+        let renamed = ViewSpec::new(
+            "r_counts_v2",
+            Kind::Incremental,
+            "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+        );
+        exec(
+            &mut c,
+            &format!(
+                "UPDATE _lazyview SET definition = {} WHERE id = {id}",
+                q(&renamed.definition)
+            ),
+        )
+        .await?;
+        wait_ready(&mut c, &mut eng, &["r_counts_v2"], t_ready()).await?;
+        // A served request under the new name: the counter is 1 and acknowledged there.
+        request_rebuild(&mut c, "r_counts_v2").await?;
+        wait_rebuild_served(&mut c, &mut eng, "r_counts_v2").await?;
+        ensure!(
+            rebuild_flag(&mut c, "r_counts_v2").await? == 1,
+            "one request stands"
+        );
+        eng.stop().await?;
+        // The second leftover, as a retarget leaves it: a row of the current definition under a
+        // target it no longer writes, at the old lower value (the minimum must read the same set
+        // of rows `serve_rebuild` updates, whatever left the row behind).
+        exec(
+            &mut c,
+            &format!(
+                "INSERT INTO `_lazyview_state` \
+                 (`name`, `target`, `definition_id`, `definition_hash`, `mode`, `state`, `managed`, `rebuild_served`) \
+                 VALUES ('r_counts_v2', 'r_counts_dropped', {id}, 'ffffffffffffffff', 'i', 'ready', 1, 0) \
+                 ON DUPLICATE KEY UPDATE `rebuild_served` = 0, `managed` = 1"
+            ),
+        )
+        .await?;
+        // Restart twice. The fail-before is the first: the old-name row still carries request 0
+        // while the counter is 1, so a minimum over every row of the definition asks for a
+        // rebuild the moment the engine starts (and the `managed` leftover is never cleaned, so
+        // the second restart shows it is a loop, not one build). Fixed, both restarts just
+        // resume: the acknowledged rows cover the counter exactly.
+        for round in 1..=2 {
+            let mut eng = ctx.start_engine(&db, &[])?;
+            wait_ready(&mut c, &mut eng, &["r_counts_v2"], t_ready()).await?;
+            // The line that closes `load_slots`: once it is in the log, every rebuild decision
+            // of this start is made — and none was taken. The fail-before: the minimum over
+            // every row of the definition reads the leftover's request 0 against the counter 1,
+            // asks for a rebuild here (the line names it, and it is counted), on both rounds —
+            // the leftover is `managed`, so nothing cleans it.
+            eng.wait_log_line("ready: 1 view(s) live", t_ready())
+                .await?;
+            let d = eng.snapshot();
+            let log = std::fs::read_to_string(&eng.log_path).unwrap_or_default();
+            ensure!(
+                !log.contains("rebuild requested (_lazyview.rebuild =") && d.full_rebuilds == 0,
+                "restart {round}: a leftover state row pinned the view to a rebuild: {}",
+                fmt_snapshot(&d)
+            );
+            eng.stop().await?;
+        }
+        // The engine is still healthy, and the request stays served.
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut c, &mut eng, &["r_counts_v2"], t_ready()).await?;
+        eng.check_alive()?;
         eng.stop().await
     });
 }
@@ -599,9 +776,7 @@ fn reg_case_only_name_clash() {
         )];
         let (db, mut eng) = setup(&ctx, "reg_case_clash", &[], &specs, &[]).await?;
         let mut c = db.conn().await?;
-        let first: u64 = typed_first(&mut c, "SELECT id FROM _lazyview WHERE name = 'Lz_Case'")
-            .await?
-            .context("no Lz_Case row")?;
+        let first = definition_id(&mut c, "Lz_Case").await?;
         exec(
             &mut c,
             "INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW lz_case AS SELECT id, customer_id FROM orders')",

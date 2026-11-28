@@ -42,6 +42,37 @@ pub async fn add_definition(
     Ok(id as u64)
 }
 
+/// The `_lazyview.id` of a view's definition row.
+///
+/// Resolved through the state row, not through `_lazyview.name`: the service never writes that
+/// column, so a row inserted the way these tests insert it (only a `definition`) has `name`
+/// NULL and the name lives in the definition text and in `_lazyview_state`. A management user
+/// that stores the name itself can of course address rows by `name`.
+pub async fn definition_id(conn: &mut Conn, name: &str) -> Result<u64> {
+    let id: Option<i64> = typed_first(
+        conn,
+        format!(
+            "SELECT definition_id FROM `_lazyview_state` WHERE `name` = {} LIMIT 1",
+            q(name)
+        ),
+    )
+    .await?;
+    id.map(|v| v as u64)
+        .with_context(|| format!("no definition row for view `{name}`"))
+}
+
+/// Asks for a rebuild of one view, the way the documentation tells a management user to: bump
+/// the definition's counter. The service serves it and acknowledges the serve in
+/// `_lazyview_state.rebuild_served`, and never writes the definitions table.
+pub async fn request_rebuild(conn: &mut Conn, name: &str) -> Result<()> {
+    let id = definition_id(conn, name).await?;
+    exec(
+        conn,
+        &format!("UPDATE `_lazyview` SET `rebuild` = `rebuild` + 1 WHERE `id` = {id}"),
+    )
+    .await
+}
+
 /// Inserts every spec's definition; returns name → id.
 pub async fn add_views(conn: &mut Conn, specs: &[ViewSpec]) -> Result<HashMap<String, u64>> {
     let mut ids = HashMap::new();

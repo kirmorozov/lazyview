@@ -64,7 +64,7 @@ fn reg_slow_planning_is_bounded() {
         // A new definition is planned (and built) again.
         exec(
             &mut c,
-            "UPDATE _lazyview SET definition = 'SELECT id FROM orders' WHERE name = 'r_slow'",
+            "UPDATE _lazyview SET definition = 'CREATE VIEW r_slow AS SELECT id FROM orders' WHERE id = (SELECT definition_id FROM `_lazyview_state` WHERE `name` = 'r_slow' LIMIT 1)",
         )
         .await?;
         specs.push(ViewSpec::new(

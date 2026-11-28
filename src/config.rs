@@ -133,6 +133,14 @@ pub struct Config {
     pub targets: BTreeMap<String, String>,
     pub start_mode: StartMode,
     pub sync: bool,
+    /// `LAZYVIEW_DEFINITIONS_DATABASE`: the schema that holds `_lazyview`, the definitions table.
+    /// Unset it is the DSN's own database, so the simple setup is unchanged. Set, that schema
+    /// holds `_lazyview` only and the service account has SELECT there and nothing else: every
+    /// change of a definition is then the management user's, which the database's audit log
+    /// attributes (S-02 / S-03, owner 2026-11-15: "we need to separate status table from
+    /// definition. to limit write scope for the service"). The status tables and the view tables
+    /// stay in the service's own schema.
+    pub definitions_database: Option<String>,
     pub batch_window: Duration,
     pub batch_max_keys: usize,
     pub query_chunk: usize,
@@ -192,6 +200,11 @@ pub struct Config {
     /// reads of a fence fail (see `source::maria::snapshot_position`), the stand-in for a transient
     /// source error there (not a connection-class one).
     pub test_fail_snapshot: Option<usize>,
+    /// Test hook `LAZYVIEW_TEST_FAIL_STATE_READ=<n>`: the first `n` tries of the startup read of
+    /// `_lazyview_state` (the served rebuild counters, `Engine::load_slots`) fail — the stand-in
+    /// for a transient failure of the service's own state read there. That read decides whether a
+    /// rebuild request is still pending, so it must never come out as an empty default.
+    pub test_fail_state_read: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_UNDECODABLE_ROWS=<n>`: the first `n` rows events the reader
     /// delivers are handled as undecodable (review A-02), the stand-in for an event this build
     /// cannot decode. See `Engine::test_undecodable`.
@@ -494,6 +507,9 @@ impl Config {
             targets,
             start_mode,
             sync: flag("LAZYVIEW_SYNC", true)?,
+            definitions_database: get("LAZYVIEW_DEFINITIONS_DATABASE")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             batch_window: Duration::from_millis(num("LAZYVIEW_BATCH_WINDOW_MS", 200)?),
             batch_max_keys: num("LAZYVIEW_BATCH_MAX_KEYS", 50_000)? as usize,
             query_chunk,
@@ -521,6 +537,8 @@ impl Config {
             test_fail_identity: Some(num("LAZYVIEW_TEST_FAIL_IDENTITY", 0)? as usize)
                 .filter(|&n| n > 0),
             test_fail_snapshot: Some(num("LAZYVIEW_TEST_FAIL_SNAPSHOT", 0)? as usize)
+                .filter(|&n| n > 0),
+            test_fail_state_read: Some(num("LAZYVIEW_TEST_FAIL_STATE_READ", 0)? as usize)
                 .filter(|&n| n > 0),
             test_undecodable_rows: num("LAZYVIEW_TEST_UNDECODABLE_ROWS", 0)? as u32,
             test_binlog_dsn,

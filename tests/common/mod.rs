@@ -871,7 +871,14 @@ impl Ctx {
         // `LAZYVIEW_TEST_SKIP_SETUP=1` (via `overrides`) leaves the schema untouched: those
         // tests drive the setup themselves.
         if env.get("LAZYVIEW_TEST_SKIP_SETUP").map(|v| v.as_str()) != Some("1") {
-            run_setup_step(&db.dsn, &db.name)?;
+            // The advanced setup's second schema: when a test sets LAZYVIEW_DEFINITIONS_DATABASE,
+            // its `_lazyview` is created and migrated there by the setup step, as the setup
+            // account (the schema owner), never as the engine's restricted user.
+            let defs = env
+                .get("LAZYVIEW_DEFINITIONS_DATABASE")
+                .cloned()
+                .unwrap_or_else(|| db.name.clone());
+            run_setup_step(&db.dsn, &db.name, &defs)?;
         }
         let e = Engine::spawn(cfg, label, log_path)?;
         self.engines
@@ -886,21 +893,28 @@ impl Ctx {
     }
 }
 
-/// The setup run's table work: create/migrate lazyview's own tables in `db` (`meta::ensure`,
-/// what `lazyview setup` does) and write nothing else. Tests that need the metadata without
-/// starting an engine call this; `Ctx::start_engine` calls it automatically.
-pub async fn setup_run(db: &Db) -> Result<()> {
+/// The setup run's table work: create/migrate lazyview's own tables in `db`, and `_lazyview` in
+/// `defs_schema` (`meta::ensure`, what `lazyview setup` does) and write nothing else. Tests that
+/// need the metadata without starting an engine call this; `Ctx::start_engine` calls it
+/// automatically.
+pub async fn setup_run_in(db: &Db, defs_schema: &str) -> Result<()> {
     let mut c = db.conn().await?;
-    lazyview::meta::ensure(&mut c, &db.name).await?;
+    lazyview::meta::ensure(&mut c, &db.name, defs_schema).await?;
     c.disconnect().await.ok();
     Ok(())
 }
 
+/// [`setup_run_in`] with the definitions in the test's own schema (the simple setup).
+pub async fn setup_run(db: &Db) -> Result<()> {
+    setup_run_in(db, &db.name).await
+}
+
 /// [`setup_run`] from synchronous code: `Ctx::start_engine` is sync and often called from
 /// inside a runtime, so the setup step runs on its own thread with its own runtime.
-fn run_setup_step(dsn: &str, schema: &str) -> Result<()> {
+fn run_setup_step(dsn: &str, schema: &str, defs_schema: &str) -> Result<()> {
     let dsn = dsn.to_string();
     let schema = schema.to_string();
+    let defs_schema = defs_schema.to_string();
     std::thread::Builder::new()
         .name("lv-setup-step".into())
         .spawn(move || {
@@ -910,7 +924,7 @@ fn run_setup_step(dsn: &str, schema: &str) -> Result<()> {
                 .context("setup runtime")?;
             rt.block_on(async move {
                 let mut c = connect(&dsn).await?;
-                lazyview::meta::ensure(&mut c, &schema).await?;
+                lazyview::meta::ensure(&mut c, &schema, &defs_schema).await?;
                 c.disconnect().await.ok();
                 Ok::<(), anyhow::Error>(())
             })
