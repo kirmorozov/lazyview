@@ -94,6 +94,17 @@ counters!(
     // Child rows a mapped cascade changed, replayed from the in-memory cascade cache
     // (src/cascade.rs): the global sum over views, added in publish_stats.
     cascade_rows,
+    // Child units a parent change in a cascade gap window named from the materialized table
+    // (see `Engine::name_lookups` / `CascadeRoute::name_cols`): one per unit the bounded
+    // `SELECT DISTINCT <units> ... WHERE <name_cols> IN (<old keys>)` read returned, instead of
+    // the whole-view refresh `ViewDirty::mark_all` would have cost (#408). Internal, not `/stats`:
+    // step 1c will turn the in-place whole refresh into a counted streamed refresh and this moves.
+    cascade_children_named,
+    // Gap-window parent changes whose vanished children the route could NOT name (no
+    // `name_cols`), so the whole-view in-place refresh still ran (`ViewDirty::mark_all_gap`).
+    // The counterpart of `cascade_children_named`: it shows the fallback the naming did not cover.
+    // Counted in the engine from the fact the feed reports on the dirty buffer, never in accumulate.
+    cascade_gap_mark_all,
     // Beats of the leadership lock's own session that could not be answered (review A-06): the
     // session is dropped and re-opened, and the lock confirmed again, on the next beat. One count
     // per beat, never per binlog event: a GC pause or a proxy blip shows here, not in a fatality.

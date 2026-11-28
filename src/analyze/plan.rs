@@ -204,6 +204,23 @@ pub struct CascadeRoute {
     /// (`cascade_maps`). `None`: traced, unit, derived, another mode, or a child without a key
     /// (named in `untraced`).
     pub map: Option<MapPlan>,
+    /// A plan fact of a `map` route whose vanished children the refresh can NAME from the
+    /// materialized table instead of refreshing the whole view (`accumulate`'s gap-window
+    /// `mark_all`). `Some(cols)`: the view is a select/join whose rows are each one child row
+    /// (one alias, no grouping), and `cols` are the materialized column names, one per FK column
+    /// of `child_cols` (same order), that carry the child's FK value. A parent that vanished its
+    /// children (a delete, or SET NULL / SET DEFAULT) leaves the child rows stale at the parent's
+    /// OLD key; one bounded `SELECT DISTINCT <units> ... WHERE <cols> = <old key>` names exactly
+    /// the units `mark_all` would have refreshed — every materialized row under the parent is a
+    /// child row still holding that FK, and each unit is one child row, so the read is complete
+    /// (and never over-wide: a row whose FK is `old` is a child of this parent). The FK columns are
+    /// the leading row-key columns as a SET (compared sorted in `build.rs`, so the FK's declared order
+    /// is irrelevant): each read tuple binds every FK column to a constant, so the read filters the
+    /// row-key (`_lv_row` / PRIMARY) index as an index range, never a full scan of the materialized
+    /// table (EXPLAIN-pinned on every family by `reg_cascade_window_named_branch_two_col`). `None`
+    /// (every other map route): the children cannot be named (or cannot be named by an indexed read)
+    /// and the window keeps its whole-view refresh.
+    pub name_cols: Option<Vec<String>>,
 }
 
 /// What the cascade map keeps of a child's rows (see [`CascadeRoute::map`]).

@@ -954,6 +954,171 @@ fn derived_cascades_per_formulation() {
     }
 }
 
+/// The plan the naming gate (`name_mapped_cascades`) reads for the `name_cols` tests: a
+/// single-alias `Spj` view over a child `ch` (row key `(a, b, seq)`) whose composite FK
+/// `(a, b)` hangs under `pair (a, b)` on a CASCADE delete, `pair` itself not read by the view.
+/// `child_cols` / `parent_cols` declare the FK in that per-position pairing, so a test can flip
+/// their order; `view_sql` is the whole `CREATE VIEW`.
+fn gate_nameable_plan(child_cols: Vec<usize>, parent_cols: &[&str], view_sql: &str) -> ViewPlan {
+    use crate::catalog::{Column, FkAction, ForeignKey, TableInfo};
+    use std::sync::Arc;
+    let int = |n: &str| Column::new(n, "int", "int unsigned", None, None, None, false);
+    let table = |name: &str, columns: Vec<Column>, pk: Vec<usize>, cascades: Vec<ForeignKey>| {
+        (
+            ("db".to_string(), name.to_string()),
+            Arc::new(TableInfo {
+                schema: "db".into(),
+                name: name.into(),
+                columns,
+                pk,
+                unique_keys: vec![],
+                cascades,
+                is_view: false,
+                view_bases: vec![],
+            }),
+        )
+    };
+    let tables: std::collections::HashMap<_, _> = [
+        table(
+            "pair",
+            vec![int("a"), int("b"), int("note")],
+            vec![0, 1],
+            vec![],
+        ),
+        table(
+            "ch",
+            vec![int("a"), int("b"), int("seq"), int("val")],
+            vec![0, 1, 2],
+            vec![ForeignKey {
+                parent: ("db".into(), "pair".into()),
+                child_cols,
+                parent_cols: parent_cols.iter().map(|c| c.to_string()).collect(),
+                on_delete: FkAction::Cascade,
+                on_update: FkAction::Cascade,
+            }],
+        ),
+    ]
+    .into_iter()
+    .collect();
+    crate::analyzer::plan(&parse_definition(view_sql).unwrap(), "db", &tables).unwrap()
+}
+
+/// The `name_cols` of the child `ch` route (the fact the fix turns a gap-window `mark_all`
+/// into one bounded nameable read).
+fn ch_name_cols(p: &ViewPlan) -> Option<Vec<String>> {
+    p.cascades
+        .iter()
+        .find(|c| c.child.1 == "ch")
+        .unwrap_or_else(|| panic!("no ch route: {:?}", p.cascades))
+        .name_cols
+        .clone()
+}
+
+/// A composite FK is nameable whatever the order it is declared in relative to the row key, and
+/// `name_cols` keeps the FK's own per-position order so the bounded read pairs each target column
+/// with the matching value of the parent's old key (built from `parent_cols`, same order): forward
+/// `(a, b)` names `[a, b]`; the same FK declared `(b, a)` (the other order than the row key
+/// `(a, b, seq)`) is still a leading prefix by set equality and names `[b, a]`.
+#[test]
+fn two_column_fk_is_nameable_whatever_its_order_vs_the_row_key() {
+    let fwd = gate_nameable_plan(
+        vec![0, 1],
+        &["a", "b"],
+        "CREATE VIEW v AS SELECT a, b, seq, val FROM ch",
+    );
+    let c = fwd.cascades.iter().find(|c| c.child.1 == "ch").unwrap();
+    assert!(
+        matches!(fwd.mode, Mode::Spj)
+            && c.map.is_some()
+            && !c.traced
+            && !c.derived
+            && c.unit_from_parent.is_none(),
+        "the fixture must be a mapped single-alias select/join: {c:?} ({:?})",
+        fwd.mode
+    );
+    assert_eq!(
+        ch_name_cols(&fwd).as_deref(),
+        Some(&["a".to_string(), "b".to_string()][..]),
+        "a composite FK in row-key order names both columns"
+    );
+    let rev = gate_nameable_plan(
+        vec![1, 0],
+        &["b", "a"],
+        "CREATE VIEW v AS SELECT a, b, seq, val FROM ch",
+    );
+    assert!(matches!(rev.mode, Mode::Spj), "{:?}", rev.mode);
+    assert_eq!(
+        ch_name_cols(&rev).as_deref(),
+        Some(&["b".to_string(), "a".to_string()][..]),
+        "an FK declared in the other column order than the row key is still nameable, and \
+         name_cols keeps the FK's own per-position order so the read pairs each column with \
+         the matching old-key value"
+    );
+}
+
+/// A `CREATE VIEW (…)` column list names the materialized columns: the bounded read must filter
+/// the column the target table actually has, which is the output name from the column list, not
+/// the source column's own name (build.rs `output_names` branch).
+#[test]
+fn create_view_column_list_names_the_fk_under_its_output_name() {
+    let p = gate_nameable_plan(
+        vec![0, 1],
+        &["a", "b"],
+        "CREATE VIEW v (ca, cb, cs, cv) AS SELECT a, b, seq, val FROM ch",
+    );
+    assert_eq!(
+        ch_name_cols(&p).as_deref(),
+        Some(&["ca".to_string(), "cb".to_string()][..]),
+        "the CREATE VIEW column list gives the materialized column names, not `a`/`b`"
+    );
+}
+
+/// The naming gate keys on the flattened projection, not the SQL text. A `SELECT *` over the
+/// single child alias is flattened to the child's bare columns before the gate runs, so the FK is
+/// carried and the route IS nameable (a wildcard does not defeat the gate). The gate does refuse the
+/// shapes whose bounded read would be wrong or unindexed, so the route keeps the whole-view
+/// `mark_all`: an FK that reaches the projection only inside an expression (the read cannot filter a
+/// bare column on it), and more than one alias (one materialized row is no longer one child row) —
+/// the last even though the view is still a `Spj` select/join, so it isolates the alias gate from
+/// the mode gate.
+#[test]
+fn the_naming_gate_flattens_a_wildcard_and_refuses_an_expression_only_fk_or_a_second_alias() {
+    let w = gate_nameable_plan(vec![0, 1], &["a", "b"], "CREATE VIEW v AS SELECT * FROM ch");
+    assert!(matches!(w.mode, Mode::Spj), "{:?}", w.mode);
+    assert_eq!(
+        ch_name_cols(&w).as_deref(),
+        Some(&["a".to_string(), "b".to_string()][..]),
+        "a single-alias SELECT * is flattened to the child's bare columns, so the FK is carried \
+         and the route is nameable (the gate keys on the flattened projection, not the SQL text)"
+    );
+    let e = gate_nameable_plan(
+        vec![0, 1],
+        &["a", "b"],
+        "CREATE VIEW v AS SELECT a, seq, val, b + 0 AS b2 FROM ch",
+    );
+    assert!(matches!(e.mode, Mode::Spj), "{:?}", e.mode);
+    assert!(
+        ch_name_cols(&e).is_none(),
+        "an FK that reaches the projection only inside an expression is not a bare column: {:?}",
+        e.cascades
+    );
+    let m = gate_nameable_plan(
+        vec![0, 1],
+        &["a", "b"],
+        "CREATE VIEW v AS SELECT c.a, c.b, c.seq, c.val FROM ch c JOIN pair p \
+         ON p.a = c.a AND p.b = c.b",
+    );
+    assert!(
+        matches!(m.mode, Mode::Spj),
+        "a plain join is still a select/join, so this pins the alias gate, not the mode gate"
+    );
+    assert!(
+        ch_name_cols(&m).is_none(),
+        "more than one alias is not a single-child select/join: {:?}",
+        m.cascades
+    );
+}
+
 /// Cascades no derivation follows keep their child rows in the cascade map: a child read
 /// through a unit alias whose unit is not the FK, a child read through a lookup alias (kept
 /// only where that alias's filters pass), and a level the view does not read (a chain). The
