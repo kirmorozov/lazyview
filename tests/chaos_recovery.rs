@@ -173,35 +173,52 @@ fn kill_or_gone(e: &mut EngineProc) -> bool {
     e.kill_now().is_ok()
 }
 
+/// The scenario a measured kill belongs to: the label its rows carry in the summary table and the
+/// number of views its schema holds. Both are fixed for the whole scenario, unlike the kill point
+/// (which varies per kill), so they travel together rather than as separate arguments.
+struct Scenario {
+    mode: &'static str,
+    n_views: usize,
+}
+
 /// Kills `old` and measures the process that replaces it: the times are always the replacement's,
 /// from its own spawn (the owner's ruling on where "process start" is).
 async fn kill_and_recover(
     ctx: &Ctx,
     db: &Db,
     table: &mut Table,
-    mode: &str,
+    scn: &Scenario,
     point: &str,
-    n_views: usize,
     mut old: EngineProc,
+    unlock: Option<mysql_async::Conn>,
 ) -> Result<()> {
     let pid = old.pid();
     let killed = kill_or_gone(&mut old);
     let st = old.wait_exit(Duration::from_secs(30))?;
+    // The process is dead. Only now let go of a harness `LOCK TABLES … WRITE` this kill landed on
+    // (the swap point): holding it through the signal is what keeps the flush's target transaction
+    // open under the kill, and dropping it here — before the replacement starts — lets that process
+    // write the view table. Releasing it *before* the kill would let the blocked flush commit and
+    // the signal would land on a caught-up engine, not on a swap.
+    if let Some(c) = unlock {
+        recovery::release(c).await;
+    }
     let mut next = EngineProc::start(ctx, db, &engine_env(&[])).await?;
     let at_spawn = next.scrape().await.ok().and_then(|s| s.applied_position());
     let t = recovery::recover(&mut next, db, T_STREAM).await?;
     let s = next.scrape().await?;
     ensure!(
-        recovery::rebuilds_over(s.counter("full_rebuilds"), n_views) == 0,
-        "{} rebuilt an incremental view after the kill (full_rebuilds {} for {n_views} views); \
+        recovery::rebuilds_over(s.counter("full_rebuilds"), scn.n_views) == 0,
+        "{} rebuilt an incremental view after the kill (full_rebuilds {} for {} views); \
          log tail:\n{}",
         next.label,
         s.counter("full_rebuilds"),
+        scn.n_views,
         next.log_tail(15)
     );
     recovery::assert_views_exact(db, &recovery::neutral_views()).await?;
     table.record(
-        mode,
+        scn.mode,
         point,
         t,
         format!(
@@ -232,6 +249,10 @@ fn m1_sigkill_at_seeded_kill_points() {
         let n_views = views.len();
         let mut plan = KillPointPlan::new(seed);
         let mut table = Table::default();
+        let scn = Scenario {
+            mode: "M1",
+            n_views,
+        };
         let n = recovery::kills_n();
         ctx.log(format!(
             "M1 SIGKILL: seed {seed:#x}, {n} kills, points {:?}",
@@ -276,21 +297,32 @@ fn m1_sigkill_at_seeded_kill_points() {
             } else if point == KillPoint::Swap {
                 // The swap is induced black-box: our own session holds the view table with
                 // `LOCK TABLES … WRITE`, so the engine's next flush waits with its target transaction
-                // open (the N-01/N-02 mechanic) and `inflight_rows` stays above zero for the kill to
-                // land on. The table has to be live first — an engine killed before its first build
-                // has nothing to swap into, and a lock on a table that is not there is an error, not
-                // a swap. And the process itself has to be caught up before the lock lands: a fresh
-                // one still building its views writes into that very table during the build, so the
-                // lock would stall the build — not a flush — and the counter would never leave zero.
+                // open (the N-01/N-02 mechanic) and the kill lands on that open write. The table has
+                // to be live first — an engine killed before its first build has nothing to swap into,
+                // and a lock on a table that is not there is an error, not a swap. And the process
+                // itself has to be caught up before the lock lands: a fresh one still building its
+                // views writes into that very table during the build, so the lock would stall the
+                // build — not a flush — and there would be no open target transaction to interrupt.
                 recovery::recover(&mut e, &db, T_STREAM).await?;
                 recovery::wait_table(&db, "v_items", T_STREAM).await?;
                 let held = recovery::hold_writer_lock(&db, "v_items").await?;
                 // And the work has to arrive *behind* the lock: a flush of events the engine has
-                // already digested is no flush at all, and the counter would never leave zero.
+                // already digested is no flush at all, so nothing would be open under the kill.
                 let pending = burst(&db, seed ^ 0x5a1, 3000).await?;
-                let landed = recovery::wait_kill_point(&e, point, &pending, &None, T_STREAM).await;
-                recovery::release(held).await;
-                landed?;
+                // Wait until the flush is provably parked writing `v_items` behind the lock — the
+                // supervisor's `inflight_rows` on the on-modes, the loop's own stale beat with the
+                // supervisor off (`wait_kill_point`'s swap arm) — then let `kill_and_recover`
+                // `SIGKILL` the process while that write is still open and drop the table lock only
+                // once it is dead. On the timeout the lock is released before the error so the
+                // scenario never leaves the view table held on a shared server.
+                if let Err(err) =
+                    recovery::wait_kill_point(&e, point, &pending, &None, T_STREAM).await
+                {
+                    recovery::release(held).await;
+                    return Err(err);
+                }
+                kill_and_recover(&ctx, &db, &mut table, &scn, point.name(), e, Some(held)).await?;
+                continue;
             } else if point == KillPoint::CatchUp {
                 // A backlog only exists for a process that resumes: an engine that starts without a
                 // saved position takes the whole burst into its snapshot build and streams from the
@@ -323,7 +355,7 @@ fn m1_sigkill_at_seeded_kill_points() {
                 next.stop()?;
                 continue;
             }
-            kill_and_recover(&ctx, &db, &mut table, "M1", point.name(), n_views, e).await?;
+            kill_and_recover(&ctx, &db, &mut table, &scn, point.name(), e, None).await?;
         }
         table.summary();
         Ok(())
@@ -553,7 +585,7 @@ fn m3_connection_crash_mid_flush() {
         // when the RST goes out (the 20k-row transaction precedent of `tests/efficiency.rs`).
         let w = recovery::Writer::start(&db, seed, 12, Duration::from_millis(25))?;
         let backlog = burst(&db, seed ^ 11, 20_000).await?;
-        recovery::wait_kill_point(&e, KillPoint::Swap, &backlog, &None, T_STREAM).await?;
+        recovery::wait_flush_underway(&e, &backlog, T_STREAM).await?;
         let before = e.scrape().await?;
         let target = server_position_of(&db).await?;
 

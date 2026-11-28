@@ -166,14 +166,56 @@ pub async fn wait_kill_point(
             .await?;
             Ok(())
         }
-        // A flush with the target transaction open: the caller holds the lock that blocks the swap
-        // (`hold_writer_lock`), so `inflight_rows` stays above zero while the flush waits.
+        // A flush genuinely in flight with the target transaction open, in **either** supervisor
+        // mode. The caller holds `LOCK TABLES … WRITE` on the view table (`hold_writer_lock`), so
+        // the engine's write there cannot commit. Which proof `/metrics` gives depends on how the
+        // engine runs the flush, so the wait accepts the one the running mode can give and nothing
+        // else can satisfy it while the table is ours:
+        //   * supervisor on (`adaptive`/`fixed`): the write goes through the refresh supervisor's
+        //     admission budget, which publishes `inflight_rows` > 0 for the rows being written;
+        //   * supervisor `off`: the flush is sequential on the binlog loop (`SupervisorMode::Off`,
+        //     `src/config.rs`) and the `inflight_rows` gauge is **never written** — only the
+        //     supervisor's `Budget` sets it (`src/supervisor.rs`) — so the blocked write instead
+        //     parks the loop on the flush future and the loop's own heartbeat stops advancing.
+        // `WEDGE_AGE` sits far above the healthy beat (the suite runs a 1 s binlog and lock beat)
+        // and far below the 120 s liveness stall, so a streaming engine's beat only ages that far
+        // when the loop is stuck inside the flush. Requiring the applied position still short of the
+        // backlog keeps a caught-up process from passing as "in flight" — the state is proved, not
+        // guessed, which is what the no-SKIP rule asks of a green leg.
         KillPoint::Swap => {
-            e.wait_scrape(t, "a flush in flight", |s| s.gauge("inflight_rows") > 0.0)
-                .await?;
+            const WEDGE_AGE: f64 = 5.0;
+            let want = backlog.clone();
+            e.wait_scrape(t, "a flush in flight", move |s| {
+                s.gauge("streaming") == 1.0
+                    && s.applied_position().as_ref().is_some_and(|a| *a < want)
+                    && (s.gauge("inflight_rows") > 0.0
+                        || s.gauge("heartbeat_age_seconds") >= WEDGE_AGE)
+            })
+            .await?;
             Ok(())
         }
     }
+}
+
+/// Waits until the engine is **actively flushing** a backlog it has read but not yet applied — the
+/// window `m3` cuts the link in. Unlike the blocked-swap [`wait_kill_point`] arm it does not assume
+/// the harness is holding the target table: here the flush is real and fast, so it neither parks the
+/// loop (no stale beat) nor, under `SupervisorMode::Off`, moves the supervisor-only `inflight_rows`
+/// gauge. The mode-independent proof it is underway is the engine's **own** `flushes` counter
+/// advancing while the applied position is still short of `backlog`: a completed flush between two
+/// polls means the flushes are churning through the backlog, so the cut is armed during dense
+/// catch-up rather than at an idle moment. Same reading under every supervisor mode, because
+/// `flushes` belongs to the engine, not to the supervisor.
+pub async fn wait_flush_underway(e: &EngineProc, backlog: &Position, t: Duration) -> Result<()> {
+    let start = e.scrape().await?.counter("flushes");
+    let want = backlog.clone();
+    e.wait_scrape(t, "the engine to be flushing the backlog", move |s| {
+        s.gauge("streaming") == 1.0
+            && s.applied_position().as_ref().is_some_and(|a| *a < want)
+            && s.counter("flushes") > start
+    })
+    .await?;
+    Ok(())
 }
 
 /// Brings a process that was just spawned (or killed and restarted) back to the point a measurement
