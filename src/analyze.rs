@@ -24,6 +24,7 @@ use crate::datum::Datum;
 
 mod build;
 mod columns;
+pub(crate) mod decls;
 mod expr;
 mod parse;
 mod plan;
@@ -33,11 +34,12 @@ mod vocab;
 pub(crate) use self::build::expand_star_over_using;
 pub use self::build::{plan, plan_block};
 pub(crate) use self::columns::virtual_expansion;
+pub use self::decls::{parsed_decls, ColumnDecl, Decl, IndexDecl};
 pub(crate) use self::expr::null_propagating;
 use self::parse::tokenize;
 pub use self::parse::{
-    definition_hash, function_calls, is_create_statement, parse_definition, parse_select,
-    referenced_tables, select_tables, ParsedDef,
+    body_hash, decls_hash, definition_hash, definition_name, function_calls, is_create_statement,
+    parse_definition, parse_select, referenced_tables, select_tables, ParsedDef,
 };
 pub(crate) use self::plan::int_sql;
 pub use self::plan::{

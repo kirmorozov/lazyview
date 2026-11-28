@@ -13,6 +13,7 @@ pub async fn ensure_lazyview_table(conn: &mut Conn) -> Result<()> {
            id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
            name       VARCHAR(64) NULL,
            definition MEDIUMTEXT NOT NULL,
+           statements MEDIUMTEXT NULL,
            enabled    TINYINT(1) NOT NULL DEFAULT 1,
            targets    VARCHAR(255) NULL,
            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

@@ -20,6 +20,46 @@ pub struct ParsedDef {
     /// The output columns the caller names as the target id (`IdSpec::Outputs`), in order; empty: the
     /// view's own unit. lazyview never sets it.
     pub id_outputs: Vec<String>,
+    /// #278 (D1): the view's follow-up statements, parsed from the same `definition` cell after
+    /// the `CREATE VIEW` (a declaration AST per statement, in the order written). This is where
+    /// the declaration survives the parse: name, kind and columns in order (the parse result's own
+    /// rendering is what the RED-TEST list probes). The last field on purpose: the probe reads the
+    /// declaration *after* the query, as the script is written.
+    pub decls: Vec<Decl>,
+}
+
+/// The hash of the view's own statement (everything but its follow-up declarations): a definition
+/// whose declarations changed and nothing else is reconciled, not rebuilt (#278, D6). A script of
+/// one statement hashes exactly as [`definition_hash`] does, so the state rows of every view that
+/// declares nothing keep the hash they had before the declarations existed.
+pub fn body_hash(def: &str) -> Result<String> {
+    let statements = super::decls::split_statements(def)?;
+    match statements.len() {
+        0 => Ok(definition_hash("")),
+        1 => Ok(definition_hash(def)),
+        _ => Ok(definition_hash(&statements[0])),
+    }
+}
+
+/// The hash of a definition's follow-up statements alone (#278): what a view's slot compares
+/// against to notice that a declaration was added, changed or removed — the trigger of the
+/// reconcile pass, which is not a rebuild.
+pub fn decls_hash(def: &str) -> Result<String> {
+    let statements = super::decls::split_statements(def)?;
+    Ok(definition_hash(&statements[1..].join("; ")))
+}
+
+/// The view's own name, when its OWN statement parses and only a follow-up declaration is refused
+/// (#278, E8/E3/E10). The name is written in the head, before anything the declaration grammar
+/// rejects, so a refused script still names its view: a refusal that cannot be written on the
+/// view's own `_lazyview_state` row is a refusal nobody can find. `None` when the view statement
+/// itself is the problem — the case that has always fallen back to `_lazyview.name`.
+pub fn definition_name(def: &str) -> Option<String> {
+    let first = super::decls::split_statements(def)
+        .ok()?
+        .into_iter()
+        .next()?;
+    parse_definition(&first).ok().map(|p| p.name)
 }
 
 pub fn definition_hash(def: &str) -> String {
@@ -91,8 +131,25 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
     if !word(i).map(|t| kw(t, "AS")).unwrap_or(false) {
         bail!("expected AS after view name");
     }
-    // Hand the remaining tokens (with their locations in `def`) to the query parser.
-    let rest = &tokens[words[i] + 1..];
+    // Hand the remaining tokens (with their locations in `def`) to the query parser: up to the
+    // `;` that ends the view's own statement, so a follow-up declaration is never parsed as part
+    // of the SELECT.
+    // The view's own statement ends at its top-level `;` (a `;` in parentheses or a string is not
+    // top-level; the tokenizer knows both). Everything after it is the script's declarations.
+    let mut head_end = tokens.len();
+    let mut depth = 0i32;
+    for (j, tk) in tokens.iter().enumerate().skip(words[i] + 1) {
+        match tk.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            Token::SemiColon if depth <= 0 => {
+                head_end = j;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let rest = &tokens[words[i] + 1..head_end];
     match word(i + 1) {
         None => bail!("the definition is empty after AS: {SINGLE_SELECT}"),
         Some(t)
@@ -112,7 +169,12 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
                     && word(k + 1).is_some_and(|t| !matches!(t, Token::SemiColon))
             })
             .count();
-    if statements > 1 {
+    // #278 (D1): more than the view's own statement is allowed, but only as the free-standing
+    // follow-up statements of the script (`CREATE [UNIQUE|FULLTEXT] INDEX … ON <view>(cols)`,
+    // D4's generated-column statement): they are declarations, not a second query. The view's own
+    // statement is the first one; the query parser never sees past its terminating `;`.
+    if statements > 1 && head_end == tokens.len() {
+        // A `;` the splitter does not consider top-level (it opens a paren): not a script.
         bail!("the definition contains {statements} statements: {SINGLE_SELECT}");
     }
     let mut parser = crate::dialect::new_parser(crate::dialect::Family::Mysql, rest.to_vec())?;
@@ -192,6 +254,30 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
         _ => Vec::new(),
     };
     let name = parts.pop().unwrap();
+    // #278 (D1): the rest of the script is the view's follow-up statements — the declarations.
+    // Each is refused here, at parse, if it is not one of the two forms the grammar allows (E8).
+    let mut decls: Vec<Decl> = Vec::new();
+    for s in super::decls::split_statements(def)?
+        .into_iter()
+        .skip(1)
+        .filter(|s| !super::decls::is_empty_statement(s))
+    {
+        // A follow-up that does not even begin like a declaration — a second SELECT, an INSERT, a
+        // DROP — is not a definition script at all. Its refusal is the one this parser has always
+        // given for a multi-statement definition (the count and the single-SELECT rule), not a
+        // declaration's own message: what the declaration grammar refuses is a statement that
+        // *looks* like a declaration and is not one (E8).
+        let up = s.trim_start().to_ascii_uppercase();
+        if !(up.starts_with("CREATE ") || up.starts_with("ALTER ")) {
+            bail!("the definition contains {statements} statements: {SINGLE_SELECT}");
+        }
+        decls.push(
+            super::decls::parse_decl(&s)
+                .with_context(|| format!("the follow-up statement `{s}`"))?,
+        );
+    }
+    let cols = super::decls::view_columns(&query, &decls);
+    super::decls::check(&name, &cols, &decls)?;
     Ok(ParsedDef {
         schema: parts.pop(),
         name,
@@ -201,6 +287,7 @@ pub fn parse_definition(def: &str) -> Result<ParsedDef> {
         query_sql,
         item_sql,
         id_outputs: Vec::new(),
+        decls,
     })
 }
 

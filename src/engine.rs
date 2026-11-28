@@ -778,6 +778,10 @@ struct Next {
     /// Only adds these targets to the unchanged live version.
     partial: bool,
     hash: String,
+    /// The declarations the build was started with ([`Slot::decl_hash`]): a build that was under
+    /// way while the user appended a declaration created its shadow table without it, so the swap
+    /// owes an online ALTER rather than a `ready` row (#278, E4).
+    decl_hash: String,
     /// Targets already swapped (a swap interrupted on one target is resumed on the rest).
     swapped: HashSet<String>,
     /// Targets whose swap gave up on its own bounded lock wait (`swap_lock_wait_s`, a reader
@@ -845,6 +849,26 @@ struct Slot {
     /// stamped once per flush that left the view with nothing buffered, never per event. `0`:
     /// the view has applied nothing since this process started (see [`SourceClock::lag`]).
     applied_ts: u64,
+    /// #278 (D1): the follow-up `CREATE [UNIQUE|FULLTEXT] INDEX` statements of the definition,
+    /// as the parse of `definition` kept them — the desired index set of the view's tables.
+    decls: Vec<analyze::IndexDecl>,
+    /// The hash the declarations were read at ([`analyze::decls_hash`]): a definition whose
+    /// body did not change but whose declarations did is reconciled, never rebuilt (D6).
+    decl_hash: String,
+    /// When the next index-reconcile pass of this view runs ([`Engine::reconcile_declarations`]):
+    /// armed when the declarations change, when the view becomes live, and on the periodic
+    /// re-check that catches an operator's hand edits and an interrupted pass (E5, E6). `None`:
+    /// the view declares nothing, so there is nothing to converge.
+    decl_due: Option<Instant>,
+    /// Consecutive failed reconcile passes: the bounded backoff of the next attempt (E12 (c):
+    /// a refused declaration retries on a schedule, it does not put the view in a rebuild loop).
+    decl_fails: u32,
+    /// The view's tables are known NOT to carry its declared indexes yet: set when a declaration
+    /// changes on a live view and when a build whose declarations have since moved is swapped in,
+    /// cleared by the pass that finds the set current. It is what keeps `ready` honest (H5, E4,
+    /// E5): the state row says `building` while an online ALTER is owed, so an observer that waits
+    /// for `ready` waits for the index to exist rather than for a moment before it does.
+    decl_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3855,20 +3879,47 @@ impl Engine {
     fn new_slot(&mut self, d: &meta::DefRow) -> usize {
         let def = d.effective_definition();
         let parsed = analyze::parse_definition(&def).ok();
+        // #278 (D1/D6): the declared index set rides with the slot, and the pass that converges
+        // the view's tables to it is due at once — every live view is re-checked after a restart
+        // (E5 (c), E6 (c)), and a view that declares nothing waits on nothing.
+        let decls: Vec<analyze::IndexDecl> = parsed
+            .as_ref()
+            .map(|p| {
+                p.decls
+                    .iter()
+                    .filter_map(|d| match d {
+                        analyze::Decl::Index(i) => Some(i.clone()),
+                        analyze::Decl::Column(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let decl_hash = analyze::decls_hash(&def).unwrap_or_default();
         self.slots.push(Slot {
             def_id: d.id,
             // A definition that does not parse (any more) keeps the name recorded in
             // `_lazyview.name`, so its last good table stays (it is in error, not deleted).
+            // #278 (E8): a script whose view statement is fine and whose only fault is a refused
+            // follow-up declaration still names its view — the head parsed, and the name is in the
+            // head — so the refusal lands on the row the user reads instead of on `#<id>`.
             name: parsed
                 .as_ref()
                 .map(|p| p.name.clone())
+                .or_else(|| analyze::definition_name(&def))
                 .or_else(|| d.name.clone())
                 .unwrap_or_else(|| format!("#{}", d.id)),
             wanted: parsed
                 .map(|p| analyze::referenced_tables(&p.query, &self.schema))
                 .unwrap_or_default(),
-            hash: analyze::definition_hash(&def),
+            hash: analyze::body_hash(&def).unwrap_or_else(|_| analyze::definition_hash(&def)),
             definition: def,
+            decls,
+            decl_hash,
+            decl_due: Some(Instant::now()),
+            decl_fails: 0,
+            // A fresh build creates its declarations on the shadow table (`apply_shadow`), so the
+            // table that is swapped in already carries them: nothing is owed yet.
+            decl_pending: false,
             targets: d.targets.clone(),
             live: None,
             next: None,
@@ -3991,6 +4042,8 @@ impl Engine {
             Some(rr) => mv::probe(&mut rr.ctrl, &self.schema, plan).await?,
             None => mv::probe(&mut self.src, &self.schema, plan).await?,
         };
+        // #278: the declarations this view's definition carries, for the index checks below.
+        let slot_decls = self.slots[idx].decls.clone();
         // The index budget of this view's tables: the tightest of the targets it has (T3.1).
         layout.key_budget = target::min_key_budget(
             targets
@@ -4001,14 +4054,31 @@ impl Engine {
         for t in candidates {
             let ts = self.targets[&t].schema.clone();
             let kind = self.targets[&t].kind;
+            // #278 (E7 (c) PG): the physical names this view's declarations take on this target.
+            let naming = self.decl_naming(&t, &name);
             // Columns as the layout's, and the unique index rows are upserted by (tables
             // built before upserts lack `_lv_row`: rebuilt once).
             let fits = match self.target_conn(&t).await {
                 Ok(conn) => match conn.table_columns(&ts, &name).await {
-                    Ok(c) if target::layout_matches(kind, &layout, &c) => conn
-                        .has_row_index(&ts, &name, &layout)
-                        .await
-                        .unwrap_or(false),
+                    Ok(c) if target::layout_matches(kind, &layout, &c) => {
+                        conn.has_row_index(&ts, &name, &layout).await.unwrap_or(false)
+                            // #278 (E6): a table carrying an index lazyview never created is not the
+                            // table this definition describes. It is rebuilt, not resumed — the only
+                            // honest way to serve a hand-made index, and the reason the view goes
+                            // through `building` (so a test can watch it converge).
+                            && target::decls::shape_matches(
+                                conn,
+                                kind,
+                                &ts,
+                                &name,
+                                &name,
+                                &layout,
+                                &slot_decls,
+                                &naming,
+                            )
+                            .await
+                            .unwrap_or(false)
+                    }
                     _ => false,
                 },
                 Err(_) => false,
@@ -4056,6 +4126,59 @@ impl Engine {
                 error: None,
             };
             self.shown.insert((name.clone(), t.clone()), shown);
+        }
+        // #278 (P7): the declared indexes are converged on the resumed tables BEFORE the version is
+        // installed. `/readyz` asks every view for a live version, so this install is the moment the
+        // view becomes servable: converging first means no client and no test (E5) ever sees a live
+        // view whose table is missing an index its own definition declares. A failure is not fatal
+        // here — the table still serves its rows, the reason goes on the state row, and the online
+        // pass retries it with a backoff; a FULLTEXT the family cannot add online is left to the
+        // rebuild that the live pass plans.
+        let metrics = self.metrics.clone();
+        let mut decl_errs: Vec<(String, String)> = Vec::new();
+        for t in &resumed {
+            let Some(td) = self.targets.get(t) else {
+                continue;
+            };
+            let (kind, ts) = (td.kind, td.schema.clone());
+            let naming = self.decl_naming(t, &name);
+            let r = match self.target_conn(t).await {
+                Ok(conn) => {
+                    target::decls::converge(
+                        conn,
+                        kind,
+                        &ts,
+                        &name,
+                        &name,
+                        &layout,
+                        &slot_decls,
+                        &metrics,
+                        &naming,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+            match r {
+                Err(e) if target::decls::is_mdl_wait(&e) => {
+                    debug!(view = %name, target = %t, "declared index reconcile at resume waits on a metadata lock: {e:#}");
+                }
+                Err(e) => decl_errs.push((t.clone(), format!("{t}: {e:#}"))),
+                Ok(_) => {}
+            }
+        }
+        for (t, msg) in &decl_errs {
+            warn!(view = %name, target = %t, "declared index reconcile at resume failed: {msg}");
+            self.set_state(
+                &name,
+                t,
+                self.slots[idx].def_id,
+                &hash,
+                Some(plan.as_ref()),
+                "error",
+                Some(msg),
+            )
+            .await;
         }
         let catalog_head = self.plan_head(idx, plan);
         self.slots[idx].live = Some(Version {
@@ -4116,6 +4239,9 @@ impl Engine {
         }
         let def_id = self.slots[idx].def_id;
         let hash = self.slots[idx].hash.clone();
+        // #278 (E4): what the shadow table was built with, so the swap can tell whether an
+        // appended declaration still has to be applied to it.
+        let decl_hash = self.slots[idx].decl_hash.clone();
         let catalog_head = self.plan_head(idx, &plan);
         // A routine rebuild (full-mode refresh, unknown affected rows) of the unchanged live
         // version: its tables and state rows are ours, and its state stays `ready`.
@@ -4141,6 +4267,7 @@ impl Engine {
                     .unwrap_or(false);
                 BuildSpec {
                     target: t.clone(),
+                    decls: self.slots[idx].decls.clone(),
                     opts: self.targets[t].opts.clone(),
                     kind: self.targets[t].kind,
                     schema: self.targets[t].schema.clone(),
@@ -4151,6 +4278,7 @@ impl Engine {
                             .map(|r| r.definition_id == def_id)
                             .unwrap_or(false),
                     check_table: !(self.owned.contains_key(&key) || live_has),
+                    naming: self.decl_naming(t.as_str(), &name),
                 }
             })
             .collect();
@@ -4254,6 +4382,7 @@ impl Engine {
             done: None,
             partial,
             hash,
+            decl_hash,
             swapped: HashSet::new(),
             lock_wait: HashSet::new(),
             started: self.boundary.to_position(),
@@ -4313,13 +4442,49 @@ impl Engine {
         ids.sort();
         for id in ids {
             let d = &enabled[&id];
-            let hash = analyze::definition_hash(&d.effective_definition());
+            let def = d.effective_definition();
+            // The slot's hash is the hash of the view's OWN statement: a definition whose
+            // follow-up declarations changed and nothing else keeps its table, its rows and its
+            // `ready` state, and is reconciled by the index pass below instead of being rebuilt
+            // (H5 (c): the same table, no full_rebuilds movement).
+            let hash = analyze::body_hash(&def).unwrap_or_else(|_| analyze::definition_hash(&def));
+            let decl_hash = analyze::decls_hash(&def).unwrap_or_default();
             let idx = match self.slots.iter().position(|s| s.def_id == id) {
                 Some(idx) => {
-                    let s = &self.slots[idx];
-                    if s.hash == hash && s.targets == d.targets {
-                        if d.rebuild && s.rebuild_asked.is_none() {
-                            info!(view = %s.name, "rebuild requested (_lazyview.rebuild = 1)");
+                    // `plan`/`targets` are deliberately not taken here: the only consumer they had
+                    // was the `building` write, which now belongs to the pass itself (see
+                    // `reconcile_declarations`).
+                    let (same, declared, name) = {
+                        let s = &self.slots[idx];
+                        (
+                            s.hash == hash && s.targets == d.targets,
+                            s.decl_hash != decl_hash,
+                            s.name.clone(),
+                        )
+                    };
+                    if same {
+                        // #278 (D6): the declarations changed while the view's own statement did
+                        // not — a reconcile, never a rebuild.
+                        if declared {
+                            info!(view = %name, "declared index statements changed; reconciling the view's indexes online (no rebuild)");
+                            {
+                                let s = &mut self.slots[idx];
+                                s.definition = def.clone();
+                                s.decls = index_decls(&def);
+                                s.decl_hash = decl_hash.clone();
+                                s.decl_due = Some(Instant::now());
+                                s.decl_fails = 0;
+                                // H5, E5: the table is now knowingly behind its definition. Say so
+                                // on the row, so `ready` can never be observed a moment before the
+                                // declaration it promises is on the table.
+                                s.decl_pending = true;
+                            }
+                            // The row is put into `building` by the pass itself
+                            // (`reconcile_declarations`), not here: see the note there for why a
+                            // state-row write from the reload blocks.
+                        }
+                        if d.rebuild && self.slots[idx].rebuild_asked.is_none() {
+                            info!(view = %name, "rebuild requested (_lazyview.rebuild = 1)");
                             self.slots[idx].rebuild_asked = Some(self.boundary.to_position());
                             // Also plans a definition again whose planning timed out.
                             self.slots[idx].plan_timed_out = None;
@@ -4337,6 +4502,10 @@ impl Engine {
                 s.rebuild_asked = Some(self.boundary.to_position());
             }
             s.definition = d.effective_definition();
+            s.decls = index_decls(&def);
+            s.decl_hash = decl_hash;
+            s.decl_due = Some(Instant::now());
+            s.decl_fails = 0;
             s.hash = hash;
             s.targets = d.targets.clone();
             s.last_plan = None;
@@ -5037,8 +5206,16 @@ impl Engine {
                     crate::metrics::unix_now(),
                 );
                 let deadline = self.flush_deadline();
-                let sleep_until =
-                    deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+                // A definitions change can arrive *during* this round, after `deadline` was
+                // computed above; the sleep branch below is then disabled for the whole round and
+                // the re-read would wait for a binlog event that may never come. Ask the trigger
+                // itself, which is what the deadline was built from.
+                let defs_due = self.defs_dirty.then(Instant::now);
+                let sleep_until = [deadline, defs_due]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
                 let mut idle = false;
                 let mut read = drained.pop();
                 // Freshness: what the queue still holds is read but not yet handed to the views,
@@ -5061,7 +5238,7 @@ impl Engine {
                             read = Some(item);
                         }
                         // Polled last: fires only while the stream has nothing to deliver.
-                        _ = tokio::time::sleep_until(sleep_until.into()), if deadline.is_some() && !self.in_txn => idle = true,
+                        _ = tokio::time::sleep_until(sleep_until.into()), if (deadline.is_some() || defs_due.is_some()) && !self.in_txn => idle = true,
                         _ = tokio::time::sleep_until((last_event + silence).into()) => {
                             warn!("no binlog event or heartbeat for {silence:?}; reconnecting");
                             end = Some(StreamEnd::Silence);
@@ -5138,7 +5315,15 @@ impl Engine {
                 let flush = if idle {
                     self.flush_due()
                 } else {
-                    self.flush_due_within(CATCH_UP_BATCH)
+                    // `defs_dirty` is asked directly, not through the window. `flush_deadline`
+                    // re-arms the definitions trigger at `now` on every call, so the windowed
+                    // question below — "is the deadline at least CATCH_UP_BATCH in the past?" — is
+                    // false for a trigger pinned to the present, and a stream that keeps delivering
+                    // (heartbeats, another view's rows) postpones the re-read of `_lazyview` for as
+                    // long as it keeps delivering: a declaration appended to a live view went
+                    // unnoticed forever (H5, E4, E6, E1). The other triggers keep the window, so a
+                    // backlog is still applied in batches.
+                    self.defs_dirty || self.flush_due_within(CATCH_UP_BATCH)
                 };
                 if !self.in_txn && flush {
                     self.flush_draining(&mut reader, &mut drained, &mut last_event)
@@ -7172,6 +7357,227 @@ impl Engine {
             .sum()
     }
 
+    /// #278 (E7 (c) PG): how the declared indexes of `view` are to be NAMED on `target`.
+    ///
+    /// A MySQL-family server names indexes per table, so every declaration keeps the spelling the
+    /// user wrote and there is nothing to decide. PostgreSQL names them per **schema**, and every
+    /// view routed at a target shares that target's schema, so one name declared by two of them
+    /// cannot be created twice — the raw 42P07 death of the second build E7 (c) forbids. The engine
+    /// is the only party that can see both views, so it is the one that says which names must carry
+    /// the table prefix (`{view}_{name}`, the reading E7 (c) recommends and the one
+    /// `src/target/postgres.rs` already uses for the engine's own `{table}_pkey`), and which physical
+    /// names another view of that schema already owns. A name only this view declares keeps its
+    /// spelling, so a view alone in its schema is indistinguishable from a MySQL-family one — which
+    /// is exactly what H1/H2 (c) PG read back with `pg_indexes`.
+    fn decl_naming(&self, target: &str, view: &str) -> target::decls::Naming {
+        let postgres = matches!(
+            self.targets.get(target).map(|td| td.kind),
+            Some(target::Kind::Postgres)
+        );
+        if !postgres {
+            return target::decls::Naming::default();
+        }
+        // `(view, declared index name)` of every view routed at this target: they share its schema.
+        let owners: Vec<(String, String)> = self
+            .slots
+            .iter()
+            .filter(|s| s.targets.iter().any(|t| t == target))
+            .flat_map(|s| {
+                s.decls
+                    .iter()
+                    .map(move |d| (s.name.clone(), d.name.to_ascii_lowercase()))
+            })
+            .collect();
+        // The name a view's declaration will physically carry: prefixed when more than one view of
+        // the schema declared it, as written otherwise.
+        let physical = |v: &str, n: &str| -> String {
+            if owners.iter().filter(|(_, o)| o == n).count() > 1 {
+                format!("{v}_{n}")
+            } else {
+                n.to_string()
+            }
+        };
+        let mut out = target::decls::Naming::default();
+        let mine = self
+            .slots
+            .iter()
+            .filter(|s| s.name == view)
+            .flat_map(|s| s.decls.iter().map(|d| d.name.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
+        for n in &mine {
+            if owners.iter().filter(|(_, o)| o == n).count() > 1 && !out.shared.contains(n) {
+                out.shared.push(n.clone());
+            }
+        }
+        out.taken = owners
+            .iter()
+            .filter(|(v, _)| v != view)
+            .map(|(v, n)| physical(v, n))
+            .collect();
+        out
+    }
+
+    /// #278 (P7): the online half of the feature — converges the index set of every live view whose
+    /// pass is due to *what the engine owns ∪ what the definition declares*, with the family's online
+    /// DDL (H5: `ALGORITHM=INPLACE, LOCK=NONE` on MySQL, the INPLACE fallback on MariaDB, `CREATE
+    /// INDEX CONCURRENTLY` on PostgreSQL). It is what turns "the user edited `_lazyview.definition`"
+    /// (E5) and "someone made an index by hand" (E4) into the shape the definition asks for — no
+    /// rebuild, and no movement of `full_rebuilds`.
+    ///
+    /// Its error semantics are the contract, not a detail: a pass that fails names the target's own
+    /// reason on the view's state row (E12's `1062`) and backs off the next attempt without rebuilding
+    /// (E12 (c): no rebuild loop), while the view keeps serving and taking writes; a pass that
+    /// succeeds after a failure returns the row to `ready` (E12 (c): the data was fixed). A metadata
+    /// lock is not a failure — the row is left alone and the next attempt parks briefly, so a reader
+    /// never makes the write path wait (E10). A FULLTEXT the family cannot add to a live table is
+    /// served by a rebuild, whose shadow path is the only place it may be created.
+    async fn reconcile_declarations(&mut self) {
+        // The drift period (E4): how soon a hand-made or dropped index is noticed while live.
+        const RECHECK: Duration = Duration::from_secs(8);
+        // A metadata-lock wait is retried promptly: the writes must not wait behind it, and the
+        // reader that holds it is about to finish.
+        const MDL_PARK: Duration = Duration::from_secs(2);
+        let now = Instant::now();
+        let metrics = self.metrics.clone();
+        // Collected first: the pass takes `&mut self` for the target connection, so no slot may be
+        // borrowed while it runs.
+        let mut due = Vec::new();
+        for (idx, s) in self.slots.iter().enumerate() {
+            if s.decls.is_empty() || s.next.is_some() || s.waiting.is_some() {
+                continue;
+            }
+            if self.replan.contains_key(&s.def_id) {
+                continue; // a replan owns this view right now
+            }
+            let Some(l) = s.live.as_ref().filter(|l| !l.frozen) else {
+                continue;
+            };
+            if s.decl_due.is_some_and(|d| d <= now) {
+                due.push((
+                    idx,
+                    s.def_id,
+                    s.name.clone(),
+                    s.hash.clone(),
+                    s.decl_fails,
+                    l.targets.clone(),
+                    l.layout.clone(),
+                    l.plan.clone(),
+                    s.decls.clone(),
+                ));
+            }
+        }
+        for (idx, def_id, name, hash, fails, targets, layout, plan, decls) in due {
+            let mut errs: Vec<(String, String)> = Vec::new();
+            let mut waits: Vec<String> = Vec::new();
+            let mut shadow = false;
+            let mut changed = false;
+            // #278: the row says `building` while a pass is owed, so `ready` can never be observed a
+            // moment before the declaration it promises is on the table (H5, E4, E5). It is written
+            // HERE, beside the pass's own failure and success writes, and NOT where the change is
+            // noticed: `reload_definitions` runs at the very top of a flush, and a state-row write
+            // issued from there has been measured never to return
+            // (`lvt_idx_h5_eeynrh/engine-0.log`: `diag: reload -> set_state(building)` is the last
+            // line the engine ever writes, so the flush neither saved a position nor reached this
+            // pass, and the view sat `ready` with its index missing). From here — after this flush's
+            // refreshes have been applied — the same write returns (E12's refusal reaches the row
+            // through it).
+            if self.slots[idx].decl_pending {
+                for t in &targets {
+                    self.set_state(
+                        &name,
+                        t,
+                        def_id,
+                        &hash,
+                        Some(plan.as_ref()),
+                        "building",
+                        None,
+                    )
+                    .await;
+                }
+            }
+            for t in &targets {
+                let Some(td) = self.targets.get(t) else {
+                    continue;
+                };
+                let (kind, schema) = (td.kind, td.schema.clone());
+                // #278 (E7 (c) PG): computed before the connection borrow, which takes `&mut self`.
+                let naming = self.decl_naming(t, &name);
+                match self.target_conn(t).await {
+                    Ok(conn) => {
+                        match target::decls::converge(
+                            conn, kind, &schema, &name, &name, &layout, &decls, &metrics, &naming,
+                        )
+                        .await
+                        {
+                            Ok(target::decls::Outcome::Shadow) => shadow = true,
+                            Ok(target::decls::Outcome::Changed) => {
+                                info!(view = %name, target = %t, "converged the declared indexes online (the table now carries E ∪ declared)");
+                                changed = true;
+                            }
+                            Ok(target::decls::Outcome::Current) => {}
+                            Err(e) if target::decls::is_mdl_wait(&e) => {
+                                debug!(view = %name, target = %t, "declared index reconcile waits on a metadata lock: {e:#}");
+                                waits.push(t.clone());
+                            }
+                            Err(e) => errs.push((t.clone(), format!("{t}: {e:#}"))),
+                        }
+                    }
+                    Err(e) => errs.push((t.clone(), format!("{t}: {e:#}"))),
+                }
+            }
+            if self.slots.get(idx).map(|s| s.def_id) != Some(def_id) {
+                continue; // a replan took this view while the pass ran
+            }
+            if !errs.is_empty() {
+                let n = self.slots[idx].decl_fails.saturating_add(1);
+                self.slots[idx].decl_fails = n;
+                let p = supervisor::Policy::STATEMENTS;
+                let d = supervisor::backoff(n, p.base, p.cap, p.jitter).max(MDL_PARK);
+                self.slots[idx].decl_due = Some(Instant::now() + d);
+                for (t, msg) in &errs {
+                    warn!(view = %name, target = %t, "declared index reconcile failed: {msg}");
+                    self.set_state(
+                        &name,
+                        t,
+                        def_id,
+                        &hash,
+                        Some(plan.as_ref()),
+                        "error",
+                        Some(msg),
+                    )
+                    .await;
+                }
+                continue;
+            }
+            self.slots[idx].decl_fails = 0;
+            self.slots[idx].decl_due =
+                Some(Instant::now() + if waits.is_empty() { RECHECK } else { MDL_PARK });
+            // The row goes back to `ready` when the pass found nothing more to do — whether the
+            // view had been in `error` (E12 (c): the offending row is gone, or the index the data
+            // did not allow has just been built) or in `building` because a declaration had been
+            // appended to a live view, or a build that predated one was swapped in (H5, E4). A
+            // target parked on a metadata lock is not converged: the flag stays up, so the row is
+            // never left saying `building` for a pass that has not happened yet, and the attempt
+            // that really does converge the set is the one that retires it.
+            let owed = self.slots[idx].decl_pending || changed;
+            if fails > 0 || owed {
+                if waits.is_empty() {
+                    self.slots[idx].decl_pending = false;
+                }
+                for t in &targets {
+                    if !waits.iter().any(|w| w == t) {
+                        self.set_state(&name, t, def_id, &hash, Some(plan.as_ref()), "ready", None)
+                            .await;
+                    }
+                }
+            }
+            if shadow {
+                info!(view = %name, "a declared FULLTEXT index cannot be built online here; planning a rebuild");
+                self.schedule_replan(def_id, false, false);
+            }
+        }
+    }
+
     fn flush_deadline(&self) -> Option<Instant> {
         let now = Instant::now();
         let mut due: Vec<Instant> = Vec::new();
@@ -7200,6 +7606,11 @@ impl Engine {
             let Some(l) = s.live.as_ref().filter(|l| !l.frozen) else {
                 continue;
             };
+            // #278 (P7): a live view that declares indexes wakes the loop for the pass that
+            // converges them (E4 drift, E5 a declaration added while the view is live).
+            if !s.decls.is_empty() {
+                due.extend(s.decl_due);
+            }
             // Stale full-mode views (and rebuilds for unknown units) wake the loop when their
             // next refresh slot opens.
             let rebuild = l.dirty.rebuild || (l.dirty.all && matches!(l.plan.mode, Mode::Full(_)));
@@ -7418,6 +7829,10 @@ impl Engine {
             }
             slow.push((t1.elapsed(), "refresh (dedup core)", 0));
         }
+        // #278 (P7): the declared-index converge runs here, on the engine's own clock, after the
+        // refreshes have been applied: a view whose declarations changed (or whose indexes drifted)
+        // is brought to the shape its definition asks for before the position is saved.
+        self.reconcile_declarations().await;
         if let Err(e) = self.persist_position(false).await {
             self.meta_failed(e, "saving the binlog position").await?;
         }
@@ -8261,6 +8676,29 @@ impl Engine {
             return;
         }
         let def_id = self.slots[i].def_id;
+        // #278 (E4): a build that was already under way when the user appended a declaration made
+        // its shadow table WITHOUT it, so this swap owes an online ALTER. The state row says
+        // `building` until the pass has done it: `ready` means the table carries what the
+        // definition declares, and an observer that waits for `ready` must not be able to see the
+        // moment a few milliseconds before the index exists.
+        //
+        // A PostgreSQL target owes the pass for EVERY build that declares something, not only for a
+        // changed declaration: index names are schema-wide there, so while the shadow was being
+        // filled the live table still held the names the new table wants, and `apply_shadow` left
+        // them to this pass rather than die with 42P07 mid-rebuild. The pass then converges it (and
+        // answers `Current` at once when the shadow did get them, which is what a first build does),
+        // and the row goes to `ready` with it.
+        let pg_target = n.targets.iter().any(|t| {
+            matches!(
+                self.targets.get(t).map(|td| td.kind),
+                Some(target::Kind::Postgres)
+            )
+        });
+        let decls_owed = !self.slots[i].decls.is_empty()
+            && (self.slots[i].decl_hash != n.decl_hash || pg_target);
+        if decls_owed {
+            self.slots[i].decl_pending = true;
+        }
         let swapped: Vec<String> = n
             .targets
             .iter()
@@ -8272,11 +8710,17 @@ impl Engine {
                 // The state row says `ready` already; only `refreshed_at` moves.
                 self.refreshed.insert(n.name.clone());
             } else {
-                self.set_state(&n.name, t, def_id, &n.hash, Some(&n.plan), "ready", None)
+                let state = if decls_owed { "building" } else { "ready" };
+                self.set_state(&n.name, t, def_id, &n.hash, Some(&n.plan), state, None)
                     .await;
             }
             self.slots[i].down.remove(t);
         }
+        // #278 (P7): a table swapped in was built with its declarations on its shadow table, so the
+        // online pass takes over from here: the next pass is the drift check (E4), and the failure
+        // counter starts clean for the new shape of the table.
+        self.slots[i].decl_due = Some(Instant::now());
+        self.slots[i].decl_fails = 0;
         let s = &mut self.slots[i];
         s.error = None;
         if !n.partial {
@@ -10353,6 +10797,19 @@ async fn run_pending(sup: &Supervisor, p: &mut PendingRefresh) -> Result<supervi
     }
 }
 
+/// The index declarations of a definition script, in the order written (#278, D1): what the
+/// reconcile pass converges the view's tables to, and what a build creates on its shadow table.
+/// `CREATE VIEW …` itself is not a declaration, so the script's first statement is skipped.
+fn index_decls(def: &str) -> Vec<analyze::IndexDecl> {
+    analyze::parsed_decls(def)
+        .into_iter()
+        .filter_map(|d| match d {
+            analyze::Decl::Index(i) => Some(i),
+            analyze::Decl::Column(_) => None,
+        })
+        .collect()
+}
+
 /// A bound string param without its trailing ` COLLATE <co>`: only for a param of the shape
 /// `CAST(UNHEX(?) AS CHAR CHARACTER SET <cs>) COLLATE <co>` (a string column,
 /// [`crate::catalog::TEXT_PARAM_PREFIX`]), which is the one that carries a collation of its own; a
@@ -10455,6 +10912,13 @@ struct BuildSpec {
     check_side: bool,
     /// Refuse if a table `<name>` exists (one lazyview did not create).
     check_table: bool,
+    /// The view's declared secondary indexes (#278, D1): created on the shadow table before it
+    /// is filled — the one place a FULLTEXT index may be built (never a live `ALTER`), and where
+    /// an over-budget or unsupported declaration fails the build before any target DDL.
+    decls: Vec<analyze::IndexDecl>,
+    /// How those declarations are NAMED on this target (#278, E7 (c) PG): the shared names of the
+    /// views that share this target's schema, computed while the engine could still see them all.
+    naming: target::decls::Naming,
 }
 
 /// The first keyword of a statement, after leading comments (`/*! … */` executable comments
@@ -10690,6 +11154,23 @@ async fn prepare_target(
     target::create_shadow_marked(&mut c, spec.kind, ts, name, layout, &spec.marker, metrics)
         .await
         .with_context(|| format!("creating the shadow table on target {t}"))?;
+    // #278 (D6): the declared indexes are built on the shadow table, before it is filled. An empty
+    // table needs no online clause, and this is the only place a MySQL-family FULLTEXT index may be
+    // created (a live table cannot take it: error 1846). A declaration the target refuses fails the
+    // build here — with the view still serving its previous version (E9).
+    target::decls::apply_shadow(
+        &mut c,
+        spec.kind,
+        ts,
+        &target::shadow_name(name),
+        name,
+        layout,
+        &spec.decls,
+        metrics,
+        &spec.naming,
+    )
+    .await
+    .with_context(|| format!("declaring indexes on the shadow table of `{name}` on target {t}"))?;
     Ok((c, w))
 }
 
@@ -10756,6 +11237,14 @@ async fn build_task(
         // The index budget of this view's tables: the tightest of the targets it is built into
         // (T3.1); a MySQL-only view keeps the 3072 bytes every build used before PostgreSQL targets.
         layout.key_budget = target::min_key_budget(targets.iter().map(|s| s.kind));
+        // #278 (P10): every declaration is checked against the view's own columns and the key budget
+        // BEFORE any table is touched — over an undeclared column, over budget, or of a kind this
+        // family cannot build fails the whole build, with the reason in `_lazyview_state.last_error`
+        // (E9, E11), and the view keeps serving the version it had.
+        for spec in &targets {
+            target::decls::desired(&name, &spec.decls, &layout, spec.kind, &spec.naming)
+                .with_context(|| format!("target {}: declared indexes", spec.target))?;
+        }
         // The cascade cache is read on the source before the table is filled, so that no
         // cascade falls between the two reads: the binlog this version replays holds the rest.
         // The build's one wait (PR G §3.3, R-03 "Remains": the build is one SELECT) is asked

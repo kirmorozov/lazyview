@@ -15,6 +15,7 @@ use crate::metrics::Metrics;
 use crate::mv::{Layout, MvCol, Upsert, WriteOpts};
 use crate::supervisor::{Policy, Timeout, CONNECT_TIMEOUT};
 
+pub(crate) mod decls;
 pub mod mysql;
 pub mod postgres;
 
@@ -672,7 +673,7 @@ impl KeyPlan {
     }
 
     /// `name` as this family's DDL writes it.
-    fn quote(&self, name: &str) -> String {
+    pub(crate) fn quote(&self, name: &str) -> String {
         match self.dialect {
             Kind::Mysql => q(name),
             Kind::Postgres => postgres::quote_ident(name),
@@ -680,7 +681,7 @@ impl KeyPlan {
     }
 
     /// How `col` can be part of an index of this plan's family.
-    fn part(&self, col: &MvCol) -> KeyPart {
+    pub(crate) fn part(&self, col: &MvCol) -> KeyPart {
         match self.widths {
             Kind::Mysql => mysql::key_part(col),
             Kind::Postgres => postgres::key_part(col),
@@ -691,8 +692,50 @@ impl KeyPlan {
 /// Key parts of `cols` within the plan's budget. The MySQL family takes fixed-size columns whole
 /// and lets string columns share the rest (each whole if it fits, else a prefix). A PostgreSQL
 /// index never carries a prefix (T3.2): there the whole key goes or nothing does, which is the
-/// same decision [`min_key_budget`] already made.
+/// same decision [`min_key_budget`] already makes.
+///
+/// #278: what a **declared** key may not get is a prefix nobody wrote. `E8` refuses
+/// `CREATE INDEX … (name(4))` at parse, so a declared part whose own length does not fit the
+/// budget is refused here — `None`, which the caller turns into the named budget error — instead
+/// of being rendered as `name(764)`. `must_prefix` parts are the engine's own answer to an
+/// unsized `TEXT`/`BLOB` (no length was ever declared, so a prefix is the only key there can be)
+/// and keep being prefixed. `unit_index`, `row_index` and the lineage/partial keys are sized by
+/// the same seam and keep their prefixes for exactly that reason.
+/// Renders the parts of a **declared** key within the plan's budget, or `None` when the key as
+/// declared does not fit. A declared key is never shortened: E11 (c) asks for the refusal, "not
+/// rendered with a prefix the user never wrote" — `name(765)` indexes a different key than the one
+/// the user declared, and E8 refuses the `name(4)` spelling outright, so there is no honest way to
+/// ask for a prefix. The engine's own keys, whose names nobody wrote, keep [`fit_key_prefixed`].
 pub(crate) fn fit_key(cols: &[(&MvCol, KeyPart)], plan: &KeyPlan) -> Option<String> {
+    // InnoDB's own limit, and the tighter of the two families': a key with more parts than this is
+    // refused rather than rendered (E11: "separately a 17-column index").
+    if cols.len() > MAX_KEY_PARTS {
+        return None;
+    }
+    // Whole columns only: a part that cannot be indexed whole (`KeyPart::None`, a `must_prefix`
+    // string) has no whole size and refuses the key, exactly as the whole-key path of
+    // [`unit_index`] and [`row_index`] already reads it.
+    let whole: Option<u64> = cols.iter().map(|(_, k)| k.full_bytes()).sum();
+    if whole? > plan.budget {
+        return None;
+    }
+    Some(
+        cols.iter()
+            .map(|(c, _)| plan.quote(&c.name))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// The engine's own keys (`_lv_a*`, `_lv_p*`, the non-unique unit index): the budget seam that may
+/// shorten a long string to a prefix, because the name and the shape of these indexes belong to
+/// lazyview and no user declared them. A **declared** key goes through [`fit_key`] instead, which
+/// refuses rather than invents a prefix.
+pub(crate) fn fit_key_prefixed(cols: &[(&MvCol, KeyPart)], plan: &KeyPlan) -> Option<String> {
+    // The same part cap as the strict seam: a key with more parts than this is refused.
+    if cols.len() > MAX_KEY_PARTS {
+        return None;
+    }
     if matches!(plan.dialect, Kind::Postgres) {
         let whole: Option<u64> = cols.iter().map(|(_, k)| k.full_bytes()).sum();
         if whole? > plan.budget {
@@ -776,7 +819,7 @@ pub(crate) fn unit_index(layout: &Layout, plan: &KeyPlan) -> Option<(bool, Strin
         .collect();
     (1..=lead.len())
         .rev()
-        .find_map(|n| fit_key(&lead[..n], plan))
+        .find_map(|n| fit_key_prefixed(&lead[..n], plan))
         .map(|k| (false, k))
 }
 
@@ -834,7 +877,7 @@ pub(crate) fn lineage_indexes(layout: &Layout, plan: &KeyPlan) -> Vec<(String, S
             if parts.len() > MAX_KEY_PARTS || parts.iter().any(|(_, k)| *k == KeyPart::None) {
                 return None;
             }
-            Some((format!("_lv_a{alias}"), fit_key(&parts, plan)?))
+            Some((format!("_lv_a{alias}"), fit_key_prefixed(&parts, plan)?))
         })
         .collect()
 }
@@ -975,5 +1018,272 @@ mod tests {
         assert_eq!(plan.widths, Kind::Postgres);
         assert_eq!(plan.dialect, Kind::Mysql);
         assert_eq!(plan.budget, PG_KEY_BYTES);
+    }
+
+    /// E11 (c): a declared key the engine's own key budget cannot hold is refused *before* anything is
+    /// rendered, with the budget (`MY_KEY_BYTES` 3072 / `PG_KEY_BYTES` 2704 / `MAX_KEY_PARTS` 16,
+    /// src/target/mod.rs:575-596) quoted and the tightest target named (the integration half of this
+    /// row is `idx_over_budget_errors_with_reason`); a declared column is never silently truncated,
+    /// because E8 refuses a prefix length in the user grammar.
+    ///
+    /// It pins what the decision is COMPUTED from as well, per family: the width and signedness of
+    /// each part (`bigint unsigned` is the 8 bytes of a `bigint` on the MySQL family and the 160-byte
+    /// exact decimal on the PostgreSQL one, `tinyint` the 1 and the 2), and the point where one
+    /// composite declared key — the target id, a `BIGINT UNSIGNED`, a `TINYINT` and a `VARCHAR(K)` —
+    /// flips from accepted to refused on each flavor (764/765 characters on the MySQL widths, 16/17
+    /// parts on the PostgreSQL ones). A plan that sizes `BIGINT UNSIGNED` like `TINYINT` moves the
+    /// MySQL boundary to 766/767 and fails the pinned pair.
+    ///
+    /// The seam that answers it now: `fit_key` (src/target/mod.rs) is the DECLARED key's seam — its
+    /// `None` is the named budget error the integration row asserts — while the engine's own keys
+    /// keep prefixing under `fit_key_prefixed`, so a declared key over the budget is refused rather
+    /// than rendered with a prefix the user never wrote (E8 refuses that spelling outright).
+    #[test]
+    fn index_key_budget_refused_before_render() {
+        use crate::mv::MvCol;
+        let col = |name: &str, column_type: &str| MvCol {
+            name: name.to_string(),
+            src_name: name.to_string(),
+            column_type: column_type.to_string(),
+            data_type: column_type
+                .split('(')
+                .next()
+                .unwrap_or(column_type)
+                .to_string(),
+            charset: None,
+            collation: None,
+            nullable: false,
+        };
+        let plan_for = |cols: &[MvCol], budget: u64| {
+            let layout = crate::mv::Layout {
+                cols: cols.to_vec(),
+                n_visible: cols.len(),
+                hidden: Vec::new(),
+                unit_pos: Vec::new(),
+                primary: false,
+                lineage: Vec::new(),
+                epoch: Vec::new(),
+                identity: Vec::new(),
+                partial: Vec::new(),
+                key_budget: budget,
+            };
+            (KeyPlan::for_layout(&layout, Kind::Mysql), layout)
+        };
+
+        // The refusals are asserted LAST in this test: everything that holds today — the budget
+        // constants, the per-part widths and the accepted sides of each flip — is asserted first, so
+        // a run checks them before the first RED assert stops it.
+        // The seam the error must quote (E11 (c) "quotes the budget and the offending index", and
+        // names the target whose budget was the tightest — asserted end-to-end by the integration row).
+        assert_eq!(
+            (MY_KEY_BYTES, PG_KEY_BYTES, MAX_KEY_PARTS),
+            (3072, 2704, 16)
+        );
+        assert_eq!(min_key_budget([Kind::Mysql, Kind::Postgres]), PG_KEY_BYTES);
+
+        // What that decision is made FROM: the width and signedness of every part, per family.
+        // `data_type` / `column_type` are the two spellings information_schema reports, so an
+        // unsigned 64-bit integer arrives as DATA_TYPE `bigint` with COLUMN_TYPE `bigint unsigned`
+        // and a 1-byte one as DATA_TYPE `tinyint`.
+        let typed = |name: &str, data_type: &str, column_type: &str| MvCol {
+            name: name.to_string(),
+            src_name: name.to_string(),
+            column_type: column_type.to_string(),
+            data_type: data_type.to_string(),
+            charset: None,
+            collation: None,
+            nullable: false,
+        };
+        // The MySQL family keys an integer by its width, and signedness changes nothing: the
+        // `BIGINT UNSIGNED` part is the 8 bytes of a `bigint`, never the 1 of a `TINYINT`.
+        assert_eq!(
+            mysql::key_part(&typed("b", "bigint", "bigint unsigned")),
+            KeyPart::Fixed(8)
+        );
+        assert_eq!(
+            mysql::key_part(&typed("b", "bigint", "bigint")),
+            KeyPart::Fixed(8)
+        );
+        assert_eq!(
+            mysql::key_part(&typed("s", "tinyint", "tinyint")),
+            KeyPart::Fixed(1)
+        );
+        assert_eq!(
+            mysql::key_part(&typed("i", "int", "int")),
+            KeyPart::Fixed(4)
+        );
+        // On the PostgreSQL widths the same three are 8 / 8 / 2 — `tinyint` becomes the `smallint`
+        // (2 bytes) and `bigint unsigned`, which no PostgreSQL type holds, the exact decimal whose
+        // digits travel in the key (src/target/postgres.rs:640-647, 806-810), never the 2 bytes of
+        // that smallint. Sizing the unsigned 64-bit part like the 1-byte one is the plan this pins
+        // out, and the integration pair `idx_e11_width_fit` / `idx_e11_width_over` is its end-to-end
+        // half.
+        assert_eq!(
+            postgres::key_part(&typed("b", "bigint", "bigint unsigned")).full_bytes(),
+            Some(160)
+        );
+        assert_eq!(
+            postgres::key_part(&typed("b", "bigint", "bigint")),
+            KeyPart::Fixed(8)
+        );
+        assert_eq!(
+            postgres::key_part(&typed("s", "tinyint", "tinyint")),
+            KeyPart::Fixed(2)
+        );
+        assert_eq!(
+            postgres::key_part(&typed("i", "int", "int")),
+            KeyPart::Fixed(4)
+        );
+
+        // One composite declared key — the target id, a `BIGINT UNSIGNED`, a `TINYINT` and a
+        // `VARCHAR(K)` — at the point where it flips from accepted to refused on each flavor. Its
+        // fixed bytes are 4 + 8 + 1 = 13 and `wide` costs 4 bytes a character (unknown charset =
+        // utf8mb4), so on the MySQL widths the WHOLE key goes up to (3072 - 13) / 4 = 764 characters;
+        // at 765 the honest answer is the refusal, not `wide(764)`, because E8 refuses a prefix the
+        // user never wrote. Both spellings of the 64-bit part answer the same way.
+        let mixed = |k: u32, unsigned: bool| -> Vec<MvCol> {
+            vec![
+                typed("id", "int", "int"),
+                typed(
+                    "big",
+                    "bigint",
+                    if unsigned {
+                        "bigint unsigned"
+                    } else {
+                        "bigint"
+                    },
+                ),
+                typed("small", "tinyint", "tinyint"),
+                typed("wide", "varchar", &format!("varchar({k})")),
+            ]
+        };
+        let rendered_my = |k: u32, unsigned: bool| {
+            let cols = mixed(k, unsigned);
+            let (plan, layout) = plan_for(&cols, MY_KEY_BYTES);
+            let parts: Vec<(&MvCol, KeyPart)> =
+                layout.cols.iter().map(|c| (c, plan.part(c))).collect();
+            fit_key(&parts, &plan)
+        };
+        // The ACCEPTED sides, both flavors: 13 fixed bytes (4 + 8 + 1) plus 764 characters at 4
+        // bytes is 3069 bytes, inside MY_KEY_BYTES, so the whole key is accepted exactly as
+        // declared — no part carries a prefix the user never wrote (E8). Signed and unsigned answer
+        // the same way, which is what stops a plan from treating the two differently.
+        for unsigned in [true, false] {
+            let how = if unsigned { "unsigned" } else { "signed" };
+            let whole = rendered_my(764, unsigned);
+            assert!(
+                whole.is_some(),
+                "E11 (c) {how}: (id INT, big BIGINT{how}, small TINYINT, wide VARCHAR(764)) is \
+                 13 + 764*4 = 3069 bytes inside MY_KEY_BYTES {MY_KEY_BYTES}, so the declared key \
+                 must be accepted; fit_key answered {whole:?}",
+            );
+            assert!(
+                !whole.unwrap().contains('('),
+                "E11 (c) {how}: at 764 characters the key is inside the budget, so no part may \
+                 carry a prefix the user never wrote (E8)",
+            );
+        }
+        // On the PostgreSQL widths the same mix of signed and unsigned parts flips at the part cap:
+        // a whole PostgreSQL key of at most MAX_KEY_PARTS indexable parts costs no more than
+        // 16 * 160 = 2560 bytes, inside PG_KEY_BYTES 2704, so the 17th part — not the bytes — is
+        // what must refuse it. (A `varchar` part cannot stand in a PostgreSQL key at all: it is
+        // `must_prefix`, so `fit_key` has no whole size for it at any K. That is why the byte
+        // boundary above belongs to the MySQL flavor and its legs there are myf-only.)
+        let mixed_pg = |n: usize| -> Vec<MvCol> {
+            let mut cols = vec![
+                typed("id", "int", "int"),
+                typed("big", "bigint", "bigint unsigned"),
+                typed("small", "tinyint", "tinyint"),
+            ];
+            for i in 3..n {
+                // both signed and unsigned, and two more integer widths, so no arm of the width
+                // table goes unpinned.
+                cols.push(if i % 2 == 0 {
+                    typed(&format!("c{i}"), "smallint", "smallint unsigned")
+                } else {
+                    typed(&format!("c{i}"), "mediumint", "mediumint")
+                });
+            }
+            cols
+        };
+        // The PostgreSQL widths, which is what `min_key_budget` hands a view that has a PostgreSQL
+        // target at all (T3.1): the widths AND the quoting of the decision follow the tightest budget.
+        let decided_pg = |n: usize| {
+            let cols = mixed_pg(n);
+            let layout = crate::mv::Layout {
+                cols: cols.to_vec(),
+                n_visible: cols.len(),
+                hidden: Vec::new(),
+                unit_pos: Vec::new(),
+                primary: false,
+                lineage: Vec::new(),
+                epoch: Vec::new(),
+                identity: Vec::new(),
+                partial: Vec::new(),
+                key_budget: PG_KEY_BYTES,
+            };
+            let plan = KeyPlan::for_layout(&layout, Kind::Postgres);
+            let parts: Vec<(&MvCol, KeyPart)> =
+                layout.cols.iter().map(|c| (c, plan.part(c))).collect();
+            fit_key(&parts, &plan)
+        };
+        assert!(
+            decided_pg(MAX_KEY_PARTS).is_some(),
+            "E11 (c): a declared PG key of exactly MAX_KEY_PARTS ({MAX_KEY_PARTS}) mixed \
+             signed/unsigned integer parts is 4 + 160 + 2 + 13*4 bytes, inside PG_KEY_BYTES \
+             {PG_KEY_BYTES}, so it must be accepted; fit_key answered {:?}",
+            decided_pg(MAX_KEY_PARTS),
+        );
+
+        // ---- the REFUSALS. These are what `fit_key`'s `None` means for a DECLARED key: the named
+        // budget error, never a rendered prefix (the engine's own keys prefix under
+        // `fit_key_prefixed`, and no user wrote those names). ----
+        //
+        // E11 (a), second half: "separately a 17-column index" — over MAX_KEY_PARTS.
+        let wide17: Vec<MvCol> = (0..MAX_KEY_PARTS + 1)
+            .map(|i| col(&format!("c{i}"), "int"))
+            .collect();
+        let (plan, layout) = plan_for(&wide17, MY_KEY_BYTES);
+        let parts: Vec<(&MvCol, KeyPart)> = layout.cols.iter().map(|c| (c, plan.part(c))).collect();
+        assert!(
+            parts.len() > MAX_KEY_PARTS,
+            "E11 (a): the case must declare more parts than MAX_KEY_PARTS ({MAX_KEY_PARTS})"
+        );
+        assert!(
+            fit_key(&parts, &plan).is_none(),
+            "E11 (c): a declared key of {} parts must be refused by the budget seam (MAX_KEY_PARTS \
+             is {MAX_KEY_PARTS}) instead of being rendered; fit_key answered {:?}",
+            parts.len(),
+            fit_key(&parts, &plan),
+        );
+        // E11 (a), first half: `name VARCHAR(2000)` in the key, so `(3072|2704) * 4` bytes overflow.
+        // A declared key may not be shortened by the engine: E8 refuses `name(4)`, so the only honest
+        // answer is the named budget error, not a silently-prefixed `name(768)`.
+        let over: Vec<MvCol> = vec![col("name", "varchar(2000)"), col("total", "decimal(10,2)")];
+        let (plan, layout) = plan_for(&over, MY_KEY_BYTES);
+        let parts: Vec<(&MvCol, KeyPart)> = layout.cols.iter().map(|c| (c, plan.part(c))).collect();
+        assert!(
+            fit_key(&parts, &plan).is_none(),
+            "E11 (c): a declared key over the budget must be refused, not rendered with a prefix the \
+             user never wrote; fit_key answered {:?}",
+            fit_key(&parts, &plan),
+        );
+        // The mixed key one character over its boundary: refused, not rendered as `wide(764)`.
+        for unsigned in [true, false] {
+            let how = if unsigned { "unsigned" } else { "signed" };
+            assert!(
+                rendered_my(765, unsigned).is_none(),
+                "E11 (c) {how}: one character more overflows MY_KEY_BYTES {MY_KEY_BYTES} \
+                 (13 + 765*4 = 3073), so the key must be refused by the budget seam rather than \
+                 rendered as `wide(764)`",
+            );
+        }
+        // And on the PostgreSQL widths the same mixed key one part over the cap.
+        assert!(
+            decided_pg(MAX_KEY_PARTS + 1).is_none(),
+            "E11 (c): one part more than MAX_KEY_PARTS ({MAX_KEY_PARTS}) must be refused by the \
+             budget seam on the PostgreSQL widths too; fit_key answered {:?}",
+            decided_pg(MAX_KEY_PARTS + 1),
+        );
     }
 }
