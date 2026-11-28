@@ -33,7 +33,10 @@ The caller gives you either
   src/fence.rs (the commit-order visibility fence, #28), src/intset.rs (the shared
 integer set), src/cascade.rs (the in-memory cascade cache), src/source/mod.rs (the flavor-neutral
   source types the binlog re-exports: `Position`, `Flavor`, `SourceCaps`, `ServerInfo`, `Item`,
-  `RowsKind`; its header keeps the copy-set contract), and the dedup core files
+  `RowsKind`; its header keeps the copy-set contract), the opt-in telemetry module
+  (src/otel.rs, src/otel/** — the span vocabulary, the W3C `traceparent` seam and the reader's stamping
+  of it, which the embedder's copy must stamp too; it reads no `LAZYVIEW_*` variable and imports nothing
+  outside the copy set, the host's own settings arriving as parameters of `otel::init`), and the dedup core files
   (src/dedup.rs, src/dedup/**, or whatever files the change declares as the core). Together they form
   the COPY SET.
 

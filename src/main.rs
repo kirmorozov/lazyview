@@ -37,6 +37,19 @@ COMMON SETTINGS:
   LAZYVIEW_HEALTH_TOKEN=<token> (gates /metrics and /stats)
   LAZYVIEW_LOG_FORMAT=text|json   RUST_LOG=info
 
+ TELEMETRY (off until you turn it on):
+   OTEL_CONFIG_FILE=/etc/lazyview/otel/config.json
+                         the standard OpenTelemetry declarative-configuration variable: the switch
+                         and the whole config, in that one JSON file (traces over OTLP/gRPC today).
+                         Unset = off. A path that is not an existing readable file = off, with one
+                         WARN and a normal start. No other OTEL_* variable is read: the file names
+                         the standard ones itself, through ${...} substitution —
+                           resource: { attributes_list: ${OTEL_RESOURCE_ATTRIBUTES} }
+                           endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}
+                         so an operator carries service.name and service.instance.id the standard
+                         way; see the OpenTelemetry section of docs/configuration.md. The Prometheus
+                         /metrics endpoint is unchanged.
+
 Then: INSERT INTO _lazyview (definition) VALUES ('CREATE VIEW v AS SELECT ...');
 See README.md for everything else.
 ";

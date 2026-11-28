@@ -20,6 +20,7 @@ pub mod intset;
 pub mod lookback;
 pub mod mem;
 pub mod metrics;
+pub mod otel;
 pub mod pgoutput;
 pub(crate) mod pgsrc;
 pub mod secrets;

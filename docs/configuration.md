@@ -217,6 +217,7 @@ the source plus 1 + `LAZYVIEW_MAX_TARGET_CONCURRENCY` on each other target, besi
 | `RUST_LOG` | `info` | log filter, for example `debug` or `lazyview=debug,warn`. `info` logs lifecycle events and problems only |
 | `LAZYVIEW_LOG_FORMAT` | `text` | `json` writes one JSON object per line |
 | `NO_COLOR` | — | set to anything to disable colored output (colors are only used on a terminal anyway) |
+| `OTEL_CONFIG_FILE` | — (off) | the standard declarative-configuration file: its path is the switch *and* the config. Unset is off; the path of an existing readable file turns telemetry on and that file says everything; any other value is off with one `WARN`. See [OpenTelemetry](#opentelemetry) |
 
 The endpoints are described in [operations](operations.md#health-endpoints).
 
@@ -228,6 +229,163 @@ The endpoints are described in [operations](operations.md#health-endpoints).
 Before 0.1.0 the default was `0.0.0.0:8080`. An endpoint that describes the workload should not be
 published by default, so it now binds loopback. Anything that scraped it from outside the container
 or the pod must set `LAZYVIEW_HEALTH_ADDR=0.0.0.0:8080` (the manifests in `deploy/k8s` already do).
+
+## OpenTelemetry
+
+Telemetry is opt-in and off by default, and there is no bespoke name for it: the standard
+declarative-configuration variable `OTEL_CONFIG_FILE` is the switch *and* the config source — "why
+would we need explicit params if OTEL_CONFIG_FILE can have everything we need for otel".
+
+| `OTEL_CONFIG_FILE` | effect |
+|---|---|
+| unset, empty, whitespace-only | off. No tracer provider and no exporter are ever built; the instrumented paths are one atomic load each and allocate nothing — `tests/otel_off_free.rs` counts the allocations and fails if that stops being true |
+| the path of an existing readable regular file | on, and **that file is the whole config**: resource, propagators, sampler, processors, exporters and limits all come from it |
+| anything else (a missing path, a directory, an unreadable file) | off, with one `WARN` naming the variable and the path — never a failed start, never a panic |
+
+| key | default | meaning |
+|---|---|---|
+| `file_format` | — (required) | the model version, `1.x`. Missing or an unsupported major is off with one `WARN` |
+| `disabled` | `false` | `true` is off, silently: that is what the operator asked for |
+| `resource.attributes` | — | `[{name, value}]` added to the resource |
+| `resource.attributes_list` | — | `"k1=v1,k2=v2"`; the recommended file puts `${OTEL_RESOURCE_ATTRIBUTES}` here, which is how `service.name` and `service.instance.id` are carried |
+| `propagator` | `[tracecontext]` | `tracecontext`, `baggage`; anything else is `WARN`ed and skipped. `tracecontext` is always kept — the shared-core seam propagates W3C `traceparent` |
+| `tracer_provider.sampler` | `always_on` | `always_on`, `always_off`, `trace_id_ratio_based{ratio}` (`arg` accepted), `parent_based{root, remote_parent_sampled, remote_parent_not_sampled, local_parent_sampled, local_parent_not_sampled}`; the `_parented` / `_unsampled` spellings are aliases. Anything else (`jaeger_remote`, …) is `WARN`ed and the SDK default is used |
+| `tracer_provider.processors[]` | one batch `otlp_grpc` | `batch{exporter, schedule_delay, export_timeout, max_queue_size, max_export_batch_size}` and `simple{exporter}` — built with the SDK's own builders, so the values land in the real processor. Durations are `5s`, `200ms`, or a number of seconds |
+| `…exporter.otlp_grpc` | `endpoint` `http://localhost:4317`, `timeout` 10s | `endpoint`, `headers` (`k1=v1,k2=v2`, read and reported — see the note under the table), `compression` (`none`, `gzip`, `zstd`), `timeout`, `insecure`. **gRPC only**: `otlp_http` / `otlp_http/json` are off with one `WARN`, as are `certificate` / `client_certificate` / `client_key` — the HTTP transport and TLS are not taken on for one signal (terminate TLS at the collector, or export to a local endpoint with `insecure: true`) |
+| `…exporter.console` | — | one line per span on stdout |
+| `tracer_provider.limits` | SDK defaults | `attribute_count_limit`, `event_count_limit`, `link_count_limit`, `event_attribute_count_limit`, `link_attribute_count_limit` as the SDK's span limits; `attribute_value_length_limit` is recognised and `WARN`ed (this SDK build has no such limit) |
+| `meter_provider`, `logger_provider` | — | recognised and reported as ignored, once each: metrics and logs land in their own PRs on this same file and the same gate |
+
+Unknown optional keys and components are `WARN`ed and skipped, as the model asks; something required
+that is missing (a processor with no exporter) is off with one `WARN`. The recommended starting file
+is `deploy/k8s/base/otel-config.json`, and it is the fixture the tests read:
+
+```json
+{
+  "file_format": "1.2",
+  "resource": { "attributes_list": "${OTEL_RESOURCE_ATTRIBUTES}" },
+  "propagator": ["tracecontext", "baggage"],
+  "tracer_provider": {
+    "processors": [
+      { "batch": { "exporter": { "otlp_grpc": {
+        "endpoint": "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
+      } } } }
+    ]
+  }
+}
+```
+
+JSON is the encoding this build reads — the model's own, and a strict subset of YAML 1.2, so anything
+the model has to say is sayable, and no YAML parser (maintained or otherwise) enters the tree for
+syntax this configuration never uses. One thing the file can name but this build cannot yet send is
+`headers`: the official OTLP/gRPC exporter exposes per-request headers only as `tonic` metadata
+(`WithTonicConfig::with_metadata`), and this build takes no **direct** `tonic` dependency for them —
+applying them needs that dep named in `Cargo.toml`, which is a follow-up PR. So the file's `headers`
+are read and `WARN`ed about once, and sent at the collector or the network path instead.
+
+What the export itself costs the tree is said plainly, because an audit reads the lock, not this
+page's prose: `Cargo.toml` names the four official SDK crates at 0.33.1 and the `grpc-tonic` exporter
+pulls their gRPC set in transitively — `opentelemetry-proto`, `tonic`, `tonic-prost`, `tonic-types`,
+`prost`, `prost-derive`, `prost-types`, `tokio-stream`, `futures-executor`, `hyper-timeout`,
+`itertools`, `pin-project`, `pin-project-internal`, `portable-atomic`, `ppv-lite86`, `rand_chacha`,
+`sync_wrapper`, `zerocopy` and `zerocopy-derive` — 23 crates new to `Cargo.lock` (`rand` and
+`rand_core` appear at a second, older version as well). `tonic` and `prost` are not direct
+dependencies of this crate; they are here because the OTLP/gRPC exporter is a gRPC client. They
+compile in every build: there is no `otel` feature to build them out, and `OTEL_CONFIG_FILE` is a
+runtime switch, not a compile-time one.
+
+### `${…}` substitution, and what else the environment does
+
+The reader resolves references inside the file, and that is the only environment access anywhere:
+`${NAME}`, `${env:NAME}` and `${NAME:-default}`, with `$$` for a literal `$`. An unset name with no
+default is empty. Substitution happens in **values only, never in a key** — the environment must not
+be able to rename a section — and a value stays one string, so a value carrying `:` or a newline
+cannot add a member to the document.
+
+**When the file is set, no other `OTEL_*` variable is consulted** — which surprises people who arrive
+with a collector setup that worked for another language's SDK, so it is worth saying plainly. Identity
+travels *through the file*: `attributes_list: ${OTEL_RESOURCE_ATTRIBUTES}` and
+`endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}` are exactly why the recommended file
+looks the way it does, and they are what carries `service.name` and `service.instance.id`. Five names
+are still the SDK's own doing, because this build cannot set them programmatically, so the recommended
+file works around each of them: `OTEL_EXPORTER_OTLP_HEADERS` (the SDK merges it into the request
+headers — the file's own `headers` are read and `WARN`ed about, not sent, because the official gRPC
+exporter takes per-request headers only as `tonic` metadata), `OTEL_EXPORTER_OTLP_COMPRESSION` (only
+when the file names no compressor), `OTEL_EXPORTER_OTLP_INSECURE` (which can downgrade a scheme-less
+endpoint to `http://`), and the batch processor's `OTEL_BSP_MAX_EXPORT_TIMEOUT` and
+`OTEL_BSP_MAX_CONCURRENT_EXPORTS` (the SDK's `BatchConfigBuilder` has no setters for those two outside
+its experimental async-runtime feature, so a file that names an `export_timeout` of its own is told to
+the log once and the SDK's value is used).
+
+### Two deliberate deviations from the specification
+
+1. The specification has the loader return an error for a missing or unreadable config file. Here it is
+   off with one `WARN` and a normal start, by lv-super's ruling: telemetry must never be able to stop a
+   pipeline (`src/otel/config.rs`, `gate`).
+2. The specification's model is larger than this build reads: only the keys in the table above are
+   implemented, and everything else is warn-and-skip rather than an error — except the components the
+   table marks, where something required cannot be carried and traces stay off.
+
+The resource carries `service.name` (the file's, or `lazyview`), `service.version` (the crate version,
+unless the file sets it), `lazyview.source.server` (the source's server identity — a name, never a
+DSN), whatever `resource` says, plus `telemetry.sdk.*`. Nothing in the telemetry path reads
+`LAZYVIEW_INSTANCE_ID`: that variable names the saved position row, the single-active-instance named
+lock and the fence counter, and it is not telemetry's to use.
+
+### What is traced
+
+Spans, one per unit of work, with the attributes a backend groups on. `lazyview.binlog.*` are opened
+by the copy set ([`src/binlog/stream.rs`](https://github.com/kirmorozov/lazyview/blob/main/src/binlog/stream.rs));
+the rest by the engine and the coordinator.
+
+| span | one per | attributes |
+|---|---|---|
+| `lazyview.binlog.read_batch` | the events read between two flushes | `lazyview.source.position`, `lazyview.source.flavor`, `lazyview.events`, `lazyview.rows` |
+| `lazyview.binlog.transaction` | one source transaction read | `lazyview.source.position`, `lazyview.source.gtid`, `lazyview.events`, `lazyview.rows` |
+| `lazyview.view.flush` | one engine flush | `lazyview.epoch`, `lazyview.links`, `lazyview.outcome` |
+| `lazyview.view.refresh` | one view brought up to date | `lazyview.view.id`, `lazyview.view.name`, `lazyview.mode`, `lazyview.keys`, `lazyview.targets`, `lazyview.forced`, `lazyview.links`, `lazyview.outcome` |
+| `lazyview.target.write_batch` | one batch of statements to one target | `lazyview.target.name`, `lazyview.rows`, `lazyview.keys`, `lazyview.outcome` |
+| `lazyview.position.persist` | one save of the replay position | `lazyview.epoch`, `lazyview.source.position`, `lazyview.outcome` |
+| `lazyview.epoch.takeover` | one leadership takeover | `lazyview.epoch`, `lazyview.outcome` |
+
+`lazyview.outcome` is one of `success`, `error`, `timeout`, so a dashboard can count failures without
+matching on message text. Failures also set the span's status.
+
+**No span carries anything a customer wrote.** Attribute values are names, ids, counts, positions and
+outcomes: never a row value, never a key, never a statement, never a DSN or a credential. `Span::fail`
+takes a `&'static str` error class (`"timeout"`, `"target"`, `"meta"`) rather than an error's text for
+exactly that reason.
+
+A flush and a refresh **link** the source transactions whose rows they merged, they are not parented
+by them: `N` transactions merge into one delivery, and a parent–child relation would make a span of
+one row event the ancestor of everything that row ever touched. A batch links at most
+`otel::MAX_LINKS` (16) of them, which is why the parents live on the reader (one per transaction) and
+in a capped sidecar in the engine rather than in the dedup core's pending-key entry.
+
+Telemetry never breaks the pipeline: a file that is missing, unreadable, malformed or full of
+components this build does not have leaves telemetry off with one `WARN`, and an export that fails
+afterwards is counted (`/metrics`' `lazyview_otel_export_errors_total` will report it once metrics
+land) and `WARN`ed about
+at most once a minute. The last spans are flushed on the exit path, bounded by 3 s so a collector that
+has gone cannot hold a shutdown open.
+
+### Why an embedder sees the same traces
+
+`src/otel.rs`, `src/otel/**` and the binlog reader are copied verbatim by
+[lazy-wire-fire](https://github.com/kirmorozov/lazy-wire-fire) (its copy set). The `traceparent` of a
+source transaction is therefore stamped **inside the reader**, at read time, and handed out by
+`BinlogReader::tx_parent()`: a copied reader stamps it too, and the delivery it later merges those
+rows into can link back to the transaction — in the same process or another one. The module reads no
+`LAZYVIEW_*` variable and imports nothing outside the copy set: the host's own settings arrive as
+parameters of `otel::init`, which is how lazy-wire-fire feeds its own (`LAZYWF_OTEL`).
+
+### Prometheus, and the other two signals
+
+`/metrics` is untouched: it stays the pull-based Prometheus endpoint it always was (see
+[health and logging](#health-and-logging)), and it does not depend on this switch. OTLP *metrics* (over
+the same fields `/metrics` and `/stats` read) and the `tracing` → OTLP *logs* bridge arrive in their
+own changes on this module's once-cell and resource; `OTEL_METRICS_EXPORTER` and `OTEL_LOGS_EXPORTER`
+are read there. For Kubernetes, see [the collector side](kubernetes.md#opentelemetry).
 
 ## TLS
 

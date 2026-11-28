@@ -142,6 +142,13 @@ pub struct Config {
     pub write_batch_bytes: usize,
     pub server_id: u32,
     pub instance_id: String,
+    /// `OTEL_CONFIG_FILE` (the standard declarative-configuration variable) resolved to the file to
+    /// build telemetry from: `None` is off, which is the default. Unset, empty or whitespace-only is
+    /// off silently; a path that is not an existing readable regular file is off with one `WARN`
+    /// naming the variable and the path — telemetry must never be able to stop a pipeline. That one
+    /// JSON carries everything (lv-super ruling 2026-11-22), and [`crate::otel`] is the only reader of
+    /// it; no other `OTEL_*` name is consulted when the file is set.
+    pub otel_config_file: Option<std::path::PathBuf>,
     pub drop_removed: bool,
     pub on_missing_binlog: MissingBinlog,
     pub heartbeat: Duration,
@@ -301,6 +308,27 @@ impl Config {
         // the MySQL-only DSN parser).
         let source_family = crate::dialect::Family::from_source_dsn(&dsn)?;
         let instance_id = get("LAZYVIEW_INSTANCE_ID").unwrap_or_else(|| "default".into());
+        // The telemetry gate, read once and here only: `crate::otel` is copy-set code and takes the
+        // resolved file as a parameter of `init`, so the same module serves lazy-wire-fire's own
+        // value too. The gate opens the file and parses it, so anything that is not an existing
+        // readable regular file *and* a readable declarative config is off — and says so, because a
+        // typo in a path that quietly disabled telemetry is worse than a loud start, and a telemetry
+        // problem that failed the start would be worse still.
+        let otel_gate = crate::otel::gate(
+            crate::otel::CONFIG_FILE_ENV,
+            get(crate::otel::CONFIG_FILE_ENV).as_deref(),
+        );
+        if let Some(w) = &otel_gate.warning {
+            tracing::warn!("OpenTelemetry: {w}");
+        }
+        // Only a gate that said *yes* leaves a file here. That is what makes a switched-off start
+        // free: `otel::init` is handed `None`, so it neither opens a file nor builds an exporter,
+        // and the off reasons above have already been said once, here.
+        let otel_config_file = if otel_gate.is_on() {
+            otel_gate.file.clone()
+        } else {
+            None
+        };
         let num = |k: &str, d: u64| -> Result<u64> {
             match get(k) {
                 Some(v) => v
@@ -505,6 +533,7 @@ impl Config {
             .max(1024) as usize,
             server_id,
             instance_id,
+            otel_config_file,
             drop_removed: flag("LAZYVIEW_DROP_REMOVED", true)?,
             on_missing_binlog,
             build_concurrency: num("LAZYVIEW_BUILD_CONCURRENCY", 2)?.max(1) as usize,
@@ -977,6 +1006,45 @@ mod tests {
             ("LAZYVIEW_TEST_LOCK_DSN", "postgres://lv@db:5432/app"),
         ])
         .is_err());
+    }
+
+    /// The telemetry gate: `OTEL_CONFIG_FILE` is the switch *and* the config source. Unset, empty or
+    /// whitespace-only is off, and off quietly; an existing readable regular file is on; anything
+    /// else — a missing path, a directory — is off with the one `WARN` that names the variable and
+    /// the path, and never an error, because telemetry must not be able to stop a start.
+    #[test]
+    fn otel_config_file_gates_telemetry_and_never_fails_a_start() {
+        let dsn = "mysql://lv@db:3306/app";
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // The file the operator is pointed at is the fixture for "on": it exists, it is regular
+        // and readable, and it parses, so the gate says yes to it and `init` is handed it.
+        let real = manifest.join("deploy/k8s/base/otel-config.json");
+        let with = |v: &str| cfg(&[("LAZYVIEW_DSN", dsn), ("OTEL_CONFIG_FILE", v)]);
+
+        assert_eq!(
+            cfg(&[("LAZYVIEW_DSN", dsn)]).unwrap().otel_config_file,
+            None,
+            "no file, no telemetry: an ambient collector changes nothing"
+        );
+        for v in ["", "   "] {
+            assert_eq!(
+                with(v).unwrap().otel_config_file,
+                None,
+                "{v:?} names no file, so it is off"
+            );
+        }
+        assert_eq!(
+            with(&real.display().to_string()).unwrap().otel_config_file,
+            Some(real.clone()),
+            "the file the operator named is the one telemetry is built from"
+        );
+        for (v, why) in [
+            ("/definitely/not/here/lazyview-otel.yaml", "a missing path"),
+            (manifest.to_str().unwrap(), "a directory"),
+        ] {
+            let c = with(v).expect("a telemetry path never fails the start");
+            assert_eq!(c.otel_config_file, None, "{why} is off, not an error");
+        }
     }
 
     /// The leadership lock's lease (review A-06): the two settings, their floors, and the rule
