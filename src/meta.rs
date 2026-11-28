@@ -375,7 +375,7 @@ pub async fn verify(conn: &mut Conn, schema: &str, defs_schema: &str) -> Result<
     // The width of the cursor column is a rule, not a nicety: a `TEXT` (or older) column is the
     // #347 truncation, and only the setup run's `ensure` widens it. Asking here names the fix at
     // startup (`SetupRequired`), instead of the operations run dying at its first oversized save.
-    if present.iter().any(|t| t == STATUS) {
+    if table_present(conn, schema, STATUS).await? {
         let cursor_type: Option<Option<String>> = conn
             .exec_first(
                 "SELECT CAST(DATA_TYPE AS CHAR) FROM information_schema.COLUMNS WHERE \
@@ -594,10 +594,19 @@ impl DefRow {
 /// writes `_lazyview`, so every change of a definition stays the management user's and the
 /// database's audit log attributes it).
 ///
+/// The rows it acknowledges — this definition's rows under its **current** name and its
+/// **current** targets — are exactly the rows `Engine::served_sofar` measures the served minimum
+/// over at the next start: a row the definition left behind (the name before a rename, a target
+/// dropped by a retarget) is outside both sets, so it can neither pin the view to a rebuild on
+/// every start nor be a counted row this UPDATE fails to reach (guard R1 of #320). The
+/// `definition_id` keeps the acknowledgment from touching another definition's row that happens
+/// to carry this view's current name (a rename's leftover, until its table is reclaimed).
+///
 /// Cost: one UPDATE per view per served request, on the build-completion path — never per binlog
 /// event. The `<> ?` guard keeps it from rewriting a row that already carries the value.
 pub async fn serve_rebuild(
     conn: &mut Conn,
+    definition_id: u64,
     name: &str,
     targets: &[String],
     served: u64,
@@ -606,14 +615,15 @@ pub async fn serve_rebuild(
         return Ok(());
     }
     let marks = vec!["?"; targets.len()].join(",");
-    let mut params: Vec<mysql_async::Value> = Vec::with_capacity(targets.len() + 3);
+    let mut params: Vec<mysql_async::Value> = Vec::with_capacity(targets.len() + 4);
     params.push(served.into());
+    params.push(definition_id.into());
     params.push(name.into());
     params.extend(targets.iter().map(|t| t.as_str().into()));
     params.push(served.into());
     conn.exec_drop(
         format!(
-            "UPDATE `_lazyview_state` SET `rebuild_served` = ? WHERE `name` = ? AND `target` IN ({marks}) AND `rebuild_served` <> ?"
+            "UPDATE `_lazyview_state` SET `rebuild_served` = ? WHERE `definition_id` = ? AND `name` = ? AND `target` IN ({marks}) AND `rebuild_served` <> ?"
         ),
         Params::Positional(params),
     )
@@ -648,7 +658,8 @@ pub struct StateRow {
     /// The access plan EXPLAIN text written with the state (NULL before the column existed).
     pub access: Option<String>,
     /// The `_lazyview.rebuild` value this view and target were last built from: a definition whose
-    /// counter differs from it asks for one rebuild (see [`serve_rebuild`]).
+    /// counter differs from it asks for one rebuild (see [`serve_rebuild`], and
+    /// `Engine::served_sofar` for the rows that decide at a start).
     pub rebuild_served: u64,
 }
 
@@ -687,19 +698,25 @@ pub struct StateUpdate<'a> {
     pub error: Option<&'a str>,
     /// Marks the table as created by lazyview; never cleared by later updates.
     pub managed: bool,
+    /// The request value a row INSERTed here was built from, so a row written for a first
+    /// build, a rename's new name or a retarget's new target does not ask for a rebuild at
+    /// the next start. Never written for an existing row: `serve_rebuild` alone owns that
+    /// column, and `Engine::served_sofar` reads it as the minimum over exactly the rows that
+    /// UPDATE covers.
+    pub rebuild_served: u64,
 }
 
 pub async fn set_state(conn: &mut Conn, u: StateUpdate<'_>) -> Result<()> {
     let refreshed = u.state == "ready";
     conn.exec_drop(
-        "INSERT INTO `_lazyview_state` (`name`, `target`, `definition_id`, `definition_hash`, `mode`, `detail`, `route`, `access`, `state`, `managed`, `last_error`, `refreshed_at`) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, IF(?, CURRENT_TIMESTAMP(3), NULL)) \
+        "INSERT INTO `_lazyview_state` (`name`, `target`, `definition_id`, `definition_hash`, `mode`, `detail`, `route`, `access`, `state`, `managed`, `last_error`, `refreshed_at`, `rebuild_served`) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, IF(?, CURRENT_TIMESTAMP(3), NULL), ?) \
          ON DUPLICATE KEY UPDATE `definition_id` = VALUES(`definition_id`), `definition_hash` = VALUES(`definition_hash`), \
          `mode` = VALUES(`mode`), `detail` = VALUES(`detail`), `route` = VALUES(`route`), `access` = VALUES(`access`), \
          `state` = VALUES(`state`), `managed` = GREATEST(`managed`, VALUES(`managed`)), \
          `last_error` = VALUES(`last_error`), `refreshed_at` = IF(?, CURRENT_TIMESTAMP(3), `refreshed_at`), \
          `updated_at` = CURRENT_TIMESTAMP(3)",
-        // A 13-element list: `Params` tuples top out at 12.
+        // A 14-element list: `Params` tuples top out at 12. `rebuild_served` is INSERT-only.
         Params::Positional(vec![
             u.name.into(),
             u.target.into(),
@@ -713,6 +730,7 @@ pub async fn set_state(conn: &mut Conn, u: StateUpdate<'_>) -> Result<()> {
             u.managed.into(),
             u.error.into(),
             refreshed.into(),
+            u.rebuild_served.into(),
             refreshed.into(),
         ]),
     )

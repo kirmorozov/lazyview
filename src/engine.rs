@@ -436,6 +436,34 @@ where
     }
 }
 
+/// The rebuild request the view's acknowledged rows already carry: the minimum
+/// `rebuild_served` over exactly the rows [`meta::serve_rebuild`] acknowledges — this
+/// definition's state rows under its **current** name and its **current** targets. A target
+/// not built from the request yet keeps the request pending (the minimum stays below the
+/// counter); rows the definition left behind — the name before a rename, a target dropped
+/// by a retarget — are not read, so they can neither pin the view to a rebuild on every
+/// start nor sit counted-but-unacknowledged (guard R1 of #320). No row at all: nothing was
+/// ever served (0), which asks for the build a fresh view needs anyway.
+///
+/// The set equality with `serve_rebuild` is the invariant: whatever this reads, that UPDATE
+/// reaches, and whatever it leaves out, this ignores.
+fn served_sofar(
+    states: &HashMap<(String, String), meta::StateRow>,
+    def_id: u64,
+    name: &str,
+    targets: &[String],
+) -> u64 {
+    let mut served: Option<u64> = None;
+    for t in targets {
+        if let Some(r) = states.get(&(name.to_string(), t.clone())) {
+            if r.definition_id == def_id {
+                served = Some(served.map_or(r.rebuild_served, |m| m.min(r.rebuild_served)));
+            }
+        }
+    }
+    served.unwrap_or(0)
+}
+
 struct Target {
     /// The target family, from the DSN's scheme.
     kind: target::Kind,
@@ -855,8 +883,10 @@ struct Slot {
     /// after this position is live.
     rebuild_asked: Option<Position>,
     /// The `_lazyview.rebuild` value this view's live tables were built from: any other value in
-    /// the definitions table asks for one rebuild (`src/meta.rs: serve_rebuild`). Read from
-    /// `_lazyview_state` at startup, written back there when a requested build is live.
+    /// the definitions table asks for one rebuild (`src/meta.rs: serve_rebuild`). Read at startup
+    /// by `served_sofar` over the state rows of the view's current name and current targets (the
+    /// same rows `serve_rebuild` acknowledges), and written back there when a requested build is
+    /// live.
     rebuild_served: u64,
     /// The counter value of the rebuild in flight, acknowledged in `_lazyview_state` when the
     /// build is live. `None`: no request being served.
@@ -1282,6 +1312,10 @@ struct Engine {
     /// there and nothing else, so nothing may write `_lazyview` from here; everything that reads or
     /// watches the definitions table follows this field.
     defs_schema: String,
+    /// (`defs_schema`, `meta::DEFS`): the one table pair the definitions table is addressed by,
+    /// precomputed for the item path — every event that tests it already tested one pair, so the
+    /// definitions schema costs the comparisons it replaced, none it adds (R3, guard #320).
+    own_defs: TableRef,
     flavor: Flavor,
     /// Source capabilities, detected from the flavor once at connect.
     caps: SourceCaps,
@@ -1298,14 +1332,10 @@ struct Engine {
     def_names: HashMap<String, u64>,
     /// See [`Engine::index_definitions`]: folded name → (owner id, the name as written).
     def_owners: HashMap<String, (u64, String)>,
-    /// `_lazyview.rebuild` last served per definition id, read from `_lazyview_state` at startup
-    /// and kept current by [`meta::serve_rebuild`]: the request is a value this map does not hold.
-    /// A cache of the service's own rows, so no reload pays a query for it.
-    rebuild_served_map: HashMap<u64, u64>,
     /// The name each definition had in `_lazyview_state` at startup, by definition id. The name of
     /// a definition the parser rejects comes from nowhere else (the service never writes
     /// `_lazyview.name`), and without it its state row and its last good table would be treated as
-    /// leftovers of a rename. Same read as [`Engine::rebuild_served_map`], so it costs no query.
+    /// leftovers of a rename. Same read as [`served_sofar`] at startup, so it costs no query.
     prior_names: HashMap<u64, String>,
     /// Tables we have created and own: (name, target) → definition hash.
     owned: HashMap<(String, String), String>,
@@ -2633,6 +2663,7 @@ impl Engine {
             meta_opts,
             binlog_opts,
             schema,
+            own_defs: (defs_schema.clone(), meta::DEFS.to_string()),
             defs_schema,
             flavor: info.flavor,
             caps: info.flavor.detect(),
@@ -2644,7 +2675,6 @@ impl Engine {
             slots: Vec::new(),
             def_names: HashMap::new(),
             def_owners: HashMap::new(),
-            rebuild_served_map: HashMap::new(),
             prior_names: HashMap::new(),
             owned,
             routes: HashMap::new(),
@@ -3307,6 +3337,15 @@ impl Engine {
                 error: err,
                 // Ownership is recorded only once our table is in place under `name`.
                 managed: state == "ready",
+                // A row INSERTed here (a first build, a rename's new name, a retarget's new
+                // target) is written at the request value the view is built at, so it does not
+                // ask for a rebuild at the next start; an existing row keeps the value
+                // `serve_rebuild` gave it (the column is not in the UPDATE list).
+                rebuild_served: self
+                    .slots
+                    .iter()
+                    .find(|s| s.def_id == def_id)
+                    .map_or(0, |s| s.rebuild_served),
             },
         )
         .await;
@@ -3697,6 +3736,13 @@ impl Engine {
                     state: &v.state,
                     error: v.error.as_deref(),
                     managed: self.owned.contains_key(&(name.clone(), target.clone())),
+                    // The row is INSERTed again as it was last written: the value the view was
+                    // built at, not a request for a fresh rebuild.
+                    rebuild_served: self
+                        .slots
+                        .iter()
+                        .find(|s| s.def_id == v.definition_id)
+                        .map_or(0, |s| s.rebuild_served),
                 },
             )
             .await?;
@@ -3796,31 +3842,49 @@ impl Engine {
 
     /// Initial slot creation at startup. With `resume`, valid existing tables become live (per
     /// target; the others are built). The rebuild counter already served is read once here from
-    /// `_lazyview_state` — per start, never per definition reload or binlog event.
+    /// `_lazyview_state` — per start, never per definition reload or binlog event. The read is
+    /// never defaulted: a failure to read the service's own rows must not look like "nothing
+    /// served" and turn every acknowledged request into an unasked rebuild (guard R1 of #320).
     async fn load_slots(&mut self, defs: Vec<meta::DefRow>, resume: bool) -> Result<()> {
         let defs: Vec<meta::DefRow> = defs.into_iter().filter(|d| d.enabled).collect();
         self.index_definitions(&defs);
-        // One read of the service's own state rows feeds both caches: per start, never per
-        // definition reload or binlog event.
-        let states = meta::load_state(&mut self.meta).await.unwrap_or_default();
-        let mut served: HashMap<u64, u64> = HashMap::new();
+        // One read of the service's own state rows feeds the name fallback and the served
+        // values: per start, never per definition reload or binlog event. Through `retry_src` —
+        // the one retry policy at the network edge, which re-opens the connection on a
+        // connection-class error and WARNs the cause of every spent try — and it stays an error:
+        // defaulting to empty would start every slot at `rebuild_served = 0` and rebuild every
+        // view that ever had a request, on nothing but a failed read of the service's own table.
+        // A start that cannot read its state fails; whoever supervises the process retries the
+        // whole start.
+        let fail_state = self.cfg.test_fail_state_read;
+        let states = retry_src(
+            &self.metrics,
+            "reading _lazyview_state (the served rebuild counters)",
+            &mut self.meta,
+            &self.meta_opts,
+            self.cfg.lock_wait_s,
+            |try_no, conn| {
+                Box::pin(async move {
+                    if fail_state.is_some_and(|n| try_no <= n) {
+                        bail!("LAZYVIEW_TEST_FAIL_STATE_READ: injected failure of the state read")
+                    }
+                    meta::load_state(conn).await
+                })
+            },
+        )
+        .await?;
         let mut prior: HashMap<u64, String> = HashMap::new();
-        for ((name, _), r) in states {
-            // The lowest value served among the view's targets: a target that has not been
-            // built from the request yet keeps the request pending.
-            let e = served.entry(r.definition_id).or_insert(u64::MAX);
-            *e = (*e).min(r.rebuild_served);
+        for ((name, _), r) in &states {
             // Among a definition's state rows the name is the same; a leftover `#<id>` row (a
             // definition that did not parse) never wins over the real name.
             match prior.get_mut(&r.definition_id) {
-                Some(p) if p.starts_with('#') && !name.starts_with('#') => *p = name,
+                Some(p) if p.starts_with('#') && !name.starts_with('#') => *p = name.clone(),
                 Some(_) => {}
                 None => {
-                    prior.insert(r.definition_id, name);
+                    prior.insert(r.definition_id, name.clone());
                 }
             }
         }
-        self.rebuild_served_map = served;
         self.prior_names = prior;
         for d in &defs {
             let idx = self.new_slot(d);
@@ -3828,6 +3892,11 @@ impl Engine {
                 continue;
             };
             self.slots[idx].name = plan.name.clone();
+            // The request already served, over exactly the rows `serve_rebuild` acknowledges:
+            // this definition's rows under its current name and current targets. Leftovers of a
+            // rename or a dropped target are outside both sets and must not pin the view to a
+            // rebuild on every start (guard R1 of #320).
+            self.slots[idx].rebuild_served = served_sofar(&states, d.id, &plan.name, &d.targets);
             let mut build = d.targets.clone();
             if d.rebuild != self.slots[idx].rebuild_served {
                 info!(view = %plan.name, "rebuild requested (_lazyview.rebuild = {})", d.rebuild);
@@ -3973,7 +4042,10 @@ impl Engine {
             refresh_failures: 0,
             replan_after: false,
             rebuild_asked: None,
-            rebuild_served: self.rebuild_served_map.get(&d.id).copied().unwrap_or(0),
+            // The value that decides a rebuild request is set after the plan (load_slots,
+            // `served_sofar`); a slot without a plan never asks, and `reload_definitions`
+            // re-checks every slot whose plan it can make.
+            rebuild_served: 0,
             rebuild_ack: None,
             plan_timed_out: None,
             stats: Default::default(),
@@ -5692,17 +5764,25 @@ impl Engine {
                 // Our own tables: the commit fence's rows are not a foreign change, and no view
                 // reads them. The definitions table counts as ours for this even where the
                 // service may only read it (the schema follows `LAZYVIEW_DEFINITIONS_DATABASE`).
-                if !((key.0 == self.schema
-                    && (key.1 == meta::STATUS || key.1 == meta::STATE || key.1 == mysql::table()))
-                    || (key.0 == self.defs_schema && key.1 == meta::DEFS))
+                // R3 cost (guard #320, finding 3): one shared decision from the two comparisons
+                // this branch chain already made — a foreign table's map pays the two
+                // short-circuiting `key.0` compares the chain did before the definitions split
+                // (each of the two `if`s made one), and the pair `(defs_schema, DEFS)`, which
+                // the remembered-without-a-route test below already compared, is compared once
+                // here and reused, not twice per event. No comparison is added on this path.
+                let on_schema = key.0 == self.schema;
+                let own_defs = key == self.own_defs;
+                if !(own_defs
+                    || (on_schema
+                        && (key.1 == meta::STATUS
+                            || key.1 == meta::STATE
+                            || key.1 == mysql::table())))
                 {
                     self.txn_foreign = true;
                 }
                 // The definitions table and the commit fence's table are ours: no view reads
                 // them, both are remembered without a route.
-                if (key.0 == self.defs_schema && key.1 == meta::DEFS)
-                    || (key.0 == self.schema && key.1 == mysql::table())
-                {
+                if own_defs || (on_schema && key.1 == mysql::table()) {
                     self.table_ids.insert(table_id, (key, None, None, None));
                     return Ok(());
                 }
@@ -5851,7 +5931,10 @@ impl Engine {
                 let Some((key, route, src, need)) = self.table_ids.get(&table_id).cloned() else {
                     return Ok(());
                 };
-                if key.0 == self.defs_schema && key.1 == meta::DEFS {
+                // The table id was resolved once by its TABLE_MAP (which decided ours-ness
+                // against the same precomputed pair); one tuple compare on this path, the same
+                // the rows branch made before the definitions split (R3, guard #320).
+                if key == self.own_defs {
                     self.defs_dirty = true;
                     self.first_dirty.get_or_insert_with(Instant::now);
                     return Ok(());
@@ -6950,6 +7033,15 @@ impl Engine {
                 .iter()
                 .any(|t| t.0 == x.0 && (t.1 == "*" || t.1 == x.1))
         };
+        // A DDL against the definitions table itself (the management user's ALTER, or a drop of
+        // the schema that holds it) asks for a reload. R3 cost (guard #320, finding 3): the one
+        // pair (`defs_schema`, DEFS) goes through the same `hit_t` comparison this function
+        // already runs per DDL, instead of a second pair of schema string comparisons per table
+        // of the event; where the definitions schema is the service's own, it is exactly the one
+        // comparison this line made before the split.
+        if hit_t(&self.own_defs) {
+            self.defs_dirty = true;
+        }
         let clean: Vec<TableRef> = self
             .readahead
             .iter()
@@ -6962,10 +7054,6 @@ impl Engine {
                 self.catalog.clear();
             } else {
                 self.catalog.invalidate(t);
-            }
-            if (t.0 == self.schema || t.0 == self.defs_schema) && (t.1 == meta::DEFS || t.1 == "*")
-            {
-                self.defs_dirty = true;
             }
         }
         let hit = |x: &TableRef| {
@@ -8393,7 +8481,7 @@ impl Engine {
                 s.rebuild_asked = None;
                 if let Some(v) = served {
                     if let Err(e) =
-                        meta::serve_rebuild(&mut self.meta, &n.name, &n.targets, v).await
+                        meta::serve_rebuild(&mut self.meta, def_id, &n.name, &n.targets, v).await
                     {
                         warn!(view = %n.name, "acknowledging _lazyview.rebuild: {e:#}");
                     } else {
@@ -8405,7 +8493,6 @@ impl Engine {
                             "rebuild of {} served at request {v}; request another with UPDATE _lazyview SET rebuild = rebuild + 1",
                             n.name
                         );
-                        self.rebuild_served_map.insert(def_id, v);
                         let s = &mut self.slots[i];
                         s.rebuild_served = v;
                     }
@@ -11523,6 +11610,61 @@ mod lock_task_tests {
 mod tests {
     use super::*;
 
+    /// The served-rebuild floor a restart keeps covers exactly the rows `meta::serve_rebuild`
+    /// acknowledges (guard R1 of #320): a leftover of a rename, a row of a dropped target or a
+    /// target the request has not served yet cannot pin the view to a rebuild on every start,
+    /// and a view whose acknowledged rows all carry the request must not ask for one.
+    #[test]
+    fn the_served_minimum_reads_exactly_the_acknowledged_rows() {
+        fn row(definition_id: u64, rebuild_served: u64) -> meta::StateRow {
+            meta::StateRow {
+                definition_id,
+                hash: "h".into(),
+                state: "ready".into(),
+                managed: true,
+                access: None,
+                rebuild_served,
+            }
+        }
+        fn rows(v: &[((&str, &str), u64, u64)]) -> HashMap<(String, String), meta::StateRow> {
+            v.iter()
+                .map(|((n, t), d, s)| ((n.to_string(), t.to_string()), row(*d, *s)))
+                .collect()
+        }
+        let t = |s: &str| s.to_string();
+        let targets = || [t("t1"), t("t2")];
+
+        // Both acknowledged rows carry request 7: nothing pending.
+        let states = rows(&[(("v", "t1"), 3, 7), (("v", "t2"), 3, 7)]);
+        assert_eq!(served_sofar(&states, 3, "v", &targets()), 7);
+
+        // The rename to `v` left its old-name row at 2, and a dropped target left a row at 1:
+        // outside the acknowledged set, so neither pins the view to a rebuild (the bug: the old
+        // minimum read every row the definition ever wrote, so this state rebuilt `v` on every
+        // start forever).
+        let states = rows(&[
+            (("v", "t1"), 3, 7),
+            (("v", "t2"), 3, 7),
+            (("v_old", "t1"), 3, 2),
+            (("v", "t_gone"), 3, 1),
+        ]);
+        assert_eq!(served_sofar(&states, 3, "v", &targets()), 7);
+
+        // A target the request has not served yet keeps it pending: the minimum is over the
+        // rows that are acknowledged, so the lower one wins.
+        let states = rows(&[(("v", "t1"), 3, 7), (("v", "t2"), 3, 5)]);
+        assert_eq!(served_sofar(&states, 3, "v", &targets()), 5);
+
+        // Nothing acknowledged anywhere: 0, so a fresh view asks for the build it needs.
+        let states = rows(&[(("other", "t1"), 9, 4)]);
+        assert_eq!(served_sofar(&states, 3, "v", &targets()), 0);
+
+        // A target with no row at all does not drag the minimum: it is built anyway (no row
+        // means no table to go live), and `serve_rebuild` reaches its row once it exists.
+        let states = rows(&[(("v", "t1"), 3, 7)]);
+        assert_eq!(served_sofar(&states, 3, "v", &targets()), 7);
+    }
+
     /// The bounded name read's chunk split for a two-column route: `query_chunk` keys, capped by the
     /// statement's placeholder budget divided by the COLUMNS per key — so `cols == 2` splits at
     /// `MAX_FILTER_PARAMS / 2`, half the single-column limit (the guard's `MAX_FILTER_PARAMS / cols`
@@ -11990,6 +12132,8 @@ mod tests {
             refresh_failures: 0,
             replan_after: false,
             rebuild_asked: None,
+            rebuild_served: 0,
+            rebuild_ack: None,
             plan_timed_out: None,
             stats: crate::stats::Flush::default(),
             applied_ts: 0,

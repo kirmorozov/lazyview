@@ -2528,7 +2528,7 @@ fn lifecycle_setup_widens_an_old_cursor_column() {
             "ALTER TABLE `_lazyview_status` MODIFY `binlog_cursor` TEXT NULL",
         )
         .await?;
-        let err = lazyview::meta::verify(&mut c, &db.name)
+        let err = lazyview::meta::verify(&mut c, &db.name, &db.name)
             .await
             .expect_err("the operations run must not accept a narrow cursor column");
         let msg = format!("{err:#}");
@@ -2537,7 +2537,7 @@ fn lifecycle_setup_widens_an_old_cursor_column() {
             "the pre-flight says {msg:?}, which names neither the column nor the fix"
         );
         setup_run(&db).await?;
-        lazyview::meta::verify(&mut c, &db.name)
+        lazyview::meta::verify(&mut c, &db.name, &db.name)
             .await
             .context("the operations run still refuses after the migration")?;
         c.disconnect().await.ok();

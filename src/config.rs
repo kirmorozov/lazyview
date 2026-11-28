@@ -200,6 +200,11 @@ pub struct Config {
     /// reads of a fence fail (see `source::maria::snapshot_position`), the stand-in for a transient
     /// source error there (not a connection-class one).
     pub test_fail_snapshot: Option<usize>,
+    /// Test hook `LAZYVIEW_TEST_FAIL_STATE_READ=<n>`: the first `n` tries of the startup read of
+    /// `_lazyview_state` (the served rebuild counters, `Engine::load_slots`) fail — the stand-in
+    /// for a transient failure of the service's own state read there. That read decides whether a
+    /// rebuild request is still pending, so it must never come out as an empty default.
+    pub test_fail_state_read: Option<usize>,
     /// Test hook `LAZYVIEW_TEST_UNDECODABLE_ROWS=<n>`: the first `n` rows events the reader
     /// delivers are handled as undecodable (review A-02), the stand-in for an event this build
     /// cannot decode. See `Engine::test_undecodable`.
@@ -532,6 +537,8 @@ impl Config {
             test_fail_identity: Some(num("LAZYVIEW_TEST_FAIL_IDENTITY", 0)? as usize)
                 .filter(|&n| n > 0),
             test_fail_snapshot: Some(num("LAZYVIEW_TEST_FAIL_SNAPSHOT", 0)? as usize)
+                .filter(|&n| n > 0),
+            test_fail_state_read: Some(num("LAZYVIEW_TEST_FAIL_STATE_READ", 0)? as usize)
                 .filter(|&n| n > 0),
             test_undecodable_rows: num("LAZYVIEW_TEST_UNDECODABLE_ROWS", 0)? as u32,
             test_binlog_dsn,
