@@ -23,10 +23,14 @@
 # it, with one `--skip <name>` each; any other value (the default, "all") runs every test. The list
 # is data, never #[ignore]: local runs still see every test. Format, one test per line:
 #   <suite> <test name as `--list` prints it>   # free text (measured seconds, reason)
+# Child-only tests: the other list this script owns (tests/harness-children.txt, CI_CHILD_LIST
+# overrides the path), same format. A test another test spawns as its own process is skipped by
+# name in EVERY tier: the job asks for the parent, the parent asks for the child (see the file).
 # `--skip` matches by substring, so a name that is also a prefix of another test would silently skip
-# both: `scripts/ci-run-binaries.sh --check-slow-list <manifest>` (run by build-tests on every build)
-# lists each listed suite and fails unless every entry matches EXACTLY ONE test -- a renamed or
-# deleted test breaks the build instead of quietly moving back into the fast tier.
+# both: `scripts/ci-run-binaries.sh --check-slow-list <manifest>` (run by build-tests on every
+# build) checks BOTH lists: it lists each listed suite and fails unless every entry matches EXACTLY
+# ONE test -- a renamed or deleted test breaks the build instead of quietly moving back into the
+# fast tier or back into the plan.
 #
 # Semantics the callers rely on:
 #   SEQUENTIAL: one binary at a time, in the listed order -- the suites that mutate GLOBAL server
@@ -56,30 +60,40 @@ usage() {
 
 [ $# -ge 1 ] || usage
 slow_list=${CI_SLOW_LIST:-tests/slow-tier.txt}
+child_list=${CI_CHILD_LIST:-tests/harness-children.txt}
+
+# Entries of one per-suite list for one suite: prints the test names, comments and blanks dropped.
+list_names() {
+  [ -f "$1" ] || return 0
+  awk -v n="$2" '$1 !~ /^#/ && NF >= 2 && $1 == n { print $2 }' "$1"
+}
 
 # Entries of the slow list for one suite: prints the test names, comments and blanks dropped.
 slow_names() {
-  [ -f "$slow_list" ] || return 0
-  awk -v n="$1" '$1 !~ /^#/ && NF >= 2 && $1 == n { print $2 }' "$slow_list"
+  list_names "$slow_list" "$1"
 }
 
+# Both lists are checked the same way: each line names one suite and one test, and build-tests
+# fails when that name does not match exactly one test of the built suite.
 if [ "$1" = "--check-slow-list" ]; then
   [ $# -eq 2 ] || usage
   manifest=$2
   [ -f "$manifest" ] || { echo "::error title=slow tier::no manifest at ${manifest}" >&2; exit 1; }
-  [ -f "$slow_list" ] || { echo "::error title=slow tier::no slow list at ${slow_list}" >&2; exit 1; }
   rc=0
-  while read -r suite name _; do
-    case "$suite" in ""|"#"*) continue;; esac
-    [ -n "${name:-}" ] || { echo "::error title=slow tier::${slow_list}: line for suite ${suite} has no test name" >&2; rc=1; continue; }
-    exe=$(awk -F'\t' -v n="$suite" '$1 == n { print $2; exit }' "$manifest")
-    [ -n "$exe" ] && [ -x "$exe" ] || { echo "::error title=slow tier::${slow_list}: suite ${suite} is not in the build" >&2; rc=1; continue; }
-    hits=$("$exe" --list 2>/dev/null | grep -c -F -- "${name}" || true)
-    if [ "$hits" -ne 1 ]; then
-      echo "::error title=slow tier::${slow_list}: ${suite} ${name} matches ${hits} tests (must be exactly 1): fix the name or delete the line" >&2
-      rc=1
-    fi
-  done < "$slow_list"
+  for list in "$slow_list" "$child_list"; do
+    [ -f "$list" ] || { echo "::error title=slow tier::no list at ${list}" >&2; rc=1; continue; }
+    while read -r suite name _; do
+      case "$suite" in ""|"#"*) continue;; esac
+      [ -n "${name:-}" ] || { echo "::error title=slow tier::${list}: line for suite ${suite} has no test name" >&2; rc=1; continue; }
+      exe=$(awk -F'\t' -v n="$suite" '$1 == n { print $2; exit }' "$manifest")
+      [ -n "$exe" ] && [ -x "$exe" ] || { echo "::error title=slow tier::${list}: suite ${suite} is not in the build" >&2; rc=1; continue; }
+      hits=$("$exe" --list 2>/dev/null | grep -c -F -- "${name}" || true)
+      if [ "$hits" -ne 1 ]; then
+        echo "::error title=slow tier::${list}: ${suite} ${name} matches ${hits} tests (must be exactly 1): fix the name or delete the line" >&2
+        rc=1
+      fi
+    done < "$list"
+  done
   exit "$rc"
 fi
 
@@ -113,6 +127,9 @@ for n in ${names[@]+"${names[@]}"}; do
   # One header line per binary: running executables directly prints libtest's own "running N
   # tests" but no per-suite name, and this is the log a human reads in the artifact.
   args=(${extra[@]+"${extra[@]}"})
+  # A child-only test (tests/harness-children.txt) is never part of a plan, in any tier: its
+  # parent spawns it by name and reads its output, so the job asks for the parent alone.
+  while read -r t; do [ -n "$t" ] && args+=(--skip "$t"); done < <(list_names "$child_list" "$n")
   if [ "${CI_TIER:-all}" = fast ]; then
     while read -r t; do [ -n "$t" ] && args+=(--skip "$t"); done < <(slow_names "$n")
   fi

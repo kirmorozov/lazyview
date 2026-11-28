@@ -329,7 +329,11 @@ fn selftest_multi_skip_or_fail() {
     );
 }
 
-/// Child of `selftest_multi_skip_or_fail` (never runs on its own: `--ignored`).
+/// Child of `selftest_multi_skip_or_fail`: the parent spawns it as its own process (`--exact
+/// --ignored` at the call site above), so it stays `#[ignore]`d — a plan that ran it on its own
+/// would report the very SKIP or failure the parent is asserting on. No plan asks for it:
+/// `scripts/ci-run-binaries.sh` passes `--skip selftest_multi_skip_probe` to this suite in every
+/// tier, from the data in `tests/harness-children.txt`. The parent runs for real everywhere.
 #[test]
 #[ignore]
 fn selftest_multi_skip_probe() {

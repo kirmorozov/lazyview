@@ -49,38 +49,141 @@ fn referenced_tables_follow_cte_scopes() {
     );
 }
 
+/// The renderings of this file's formulations, pinned: what `select_sql` and `lookup_sql` really
+/// produce for them. This is `show_plans`, the `LV_SQL` diagnostic that printed a plan and asserted
+/// nothing (with no `LV_SQL` it iterated over nothing): the cases are now fixed and checked, so a
+/// plan that renders differently fails here instead of scrolling past whoever ran it by hand. The
+/// five are the shapes the guards above plan — a lookup-resolved table on an inner join and on the
+/// NULL side of a LEFT JOIN (with the NOT IN keeping or dropping its NULL branches), a semi-join on
+/// a cascading child, a composite unit, a grouped view — each with the unit columns, the hidden
+/// lineage column and the lookup of every alias the binlog images cannot answer.
 #[test]
-#[ignore]
-fn show_plans() {
-    for sql in std::env::var("LV_SQL").unwrap_or_default().split(";;") {
-        if sql.trim().is_empty() {
-            continue;
-        }
-        let d = parse_definition(sql).unwrap();
-        match analyzer_plan(&d, "db", &wide_catalog()) {
-            Ok(v) => {
-                println!(
-                    "== {sql}\n mode {:?}\n select: {}",
-                    v.mode,
-                    v.select_sql(&[], None)
-                );
-                println!(
-                    " units {:?} in_proj {:?} unique {}",
-                    v.unit_exprs, v.unit_in_projection, v.unit_unique
-                );
-                for (i, a) in v.aliases.iter().enumerate() {
-                    println!(
-                        "  alias {i} {} ({}) direct {:?} ref {:?} mem {:?}",
-                        a.name, a.table.name, a.direct_unit, a.referenced, a.membership
-                    );
-                    if a.direct_unit.is_none() && a.pos.0 != usize::MAX {
-                        println!("    lookup: {}", v.lookup_sql(i, "(LIT)"));
-                    }
-                }
-                println!(" tables {:?}", v.tables);
-            }
-            Err(e) => println!("== {sql}\n ERROR {e:#}"),
-        }
+fn plan_renderings_formulations() {
+    let cat = formulation_catalog();
+    struct Pinned<'a> {
+        sql: &'a str,
+        mode: Mode,
+        tracing: &'a str,
+        tables: &'a [&'a str],
+        units: &'a [&'a str],
+        in_proj: &'a [Option<usize>],
+        unique: bool,
+        select: &'a str,
+        /// (alias name, its lookup) for every alias with `direct_unit == None`, in FROM order.
+        lookups: &'a [(&'a str, &'a str)],
+    }
+    let cases = [
+        // The NOT IN over never-NULL columns (R4): the NOT EXISTS form, the joined table resolved
+        // by its primary key (the hidden `_lv_a1_pk0`), its lookup and the subquery's.
+        Pinned {
+            sql: "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id \
+                  WHERE e.id NOT IN (SELECT a.ent_id FROM attr a WHERE a.v > 5)",
+            mode: Mode::Spj,
+            tracing: "l:unit,e:lineage,a:lookup",
+            tables: &["entity", "link", "attr"],
+            units: &["`l`.`id`"],
+            in_proj: &[Some(0)],
+            unique: false,
+            select: r#"SELECT l.id, `e`.`id` AS `_lv_a1_pk0` FROM link l JOIN entity e ON e.id = l.ent_id WHERE (NOT EXISTS (SELECT 1 FROM attr a WHERE (`a`.v > 5) AND (`a`.ent_id = e.id)))"#,
+            lookups: &[
+                (
+                    "e",
+                    r#"SELECT DISTINCT `l`.`id` FROM link l JOIN (R) AS `e` ON e.id = l.ent_id WHERE (NOT EXISTS (SELECT 1 FROM attr a WHERE (`a`.v > 5) AND (`a`.ent_id = e.id)))"#,
+                ),
+                (
+                    "a",
+                    r#"SELECT DISTINCT `l`.`id` FROM link l JOIN entity e ON e.id = l.ent_id WHERE (TRUE) AND (EXISTS (SELECT 1 FROM (R) AS `a` WHERE (`a`.ent_id = e.id) AND (`a`.v > 5)))"#,
+                ),
+            ],
+        },
+        // The same predicate on the NULL side: NOT IN keeps its NULL branches, and the lookup of
+        // the NULL-side table carries no WHERE (a row image of it may be all NULL).
+        Pinned {
+            sql: "SELECT l.id FROM link l LEFT JOIN entity e ON e.id = l.ent_id \
+                  WHERE e.id NOT IN (SELECT a.ent_id FROM attr a WHERE a.v > 5)",
+            mode: Mode::Spj,
+            tracing: "l:unit,e:lookup,a:lookup",
+            tables: &["entity", "link", "attr"],
+            units: &["`l`.`id`"],
+            in_proj: &[Some(0)],
+            unique: false,
+            select: r#"SELECT l.id FROM link l LEFT JOIN entity e ON e.id = l.ent_id WHERE ((NOT EXISTS (SELECT 1 FROM attr a WHERE (`a`.v > 5)) OR (e.id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM attr a WHERE (`a`.v > 5) AND (`a`.ent_id = e.id)) AND NOT EXISTS (SELECT 1 FROM attr a WHERE (`a`.v > 5) AND (`a`.ent_id IS NULL)))))"#,
+            lookups: &[
+                (
+                    "e",
+                    r#"SELECT DISTINCT `l`.`id` FROM link l JOIN (R) AS `e` ON e.id = l.ent_id WHERE TRUE"#,
+                ),
+                (
+                    "a",
+                    r#"SELECT DISTINCT `l`.`id` FROM link l LEFT JOIN entity e ON e.id = l.ent_id WHERE (TRUE) AND (EXISTS (SELECT 1 FROM (R) AS `a` WHERE (`a`.ent_id = e.id OR e.id IS NULL OR `a`.ent_id IS NULL) AND (`a`.v > 5)))"#,
+                ),
+            ],
+        },
+        // A semi-join over a child of a cascading FK: direct units for both tables, no lookup.
+        Pinned {
+            sql: "SELECT e.id FROM entity e \
+                  WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id AND i.v > 5)",
+            mode: Mode::Spj,
+            tracing: "e:unit,i:unit,^entity:unit",
+            tables: &["entity", "item"],
+            units: &["`e`.`id`"],
+            in_proj: &[Some(0)],
+            unique: true,
+            select: r#"SELECT e.id FROM entity e WHERE (EXISTS (SELECT 1 FROM item i WHERE `i`.ent_id = e.id AND `i`.v > 5))"#,
+            lookups: &[],
+        },
+        // A composite unit: both columns of `pair`, and the child's columns that equal them.
+        Pinned {
+            sql: "SELECT p.a, p.b FROM pair p \
+                  WHERE EXISTS (SELECT 1 FROM pair_item q WHERE q.pa = p.a AND q.pb = p.b)",
+            mode: Mode::Spj,
+            tracing: "p:unit,q:unit,^pair:unit",
+            tables: &["pair", "pair_item"],
+            units: &["`p`.`a`", "`p`.`b`"],
+            in_proj: &[Some(0), Some(1)],
+            unique: true,
+            select: r#"SELECT p.a, p.b FROM pair p WHERE (EXISTS (SELECT 1 FROM pair_item q WHERE `q`.pa = p.a AND `q`.pb = p.b))"#,
+            lookups: &[],
+        },
+        // Grouped: the unit is the group key as written (`e.id`, not the quoted form the direct
+        // units use), and the projection already yields it.
+        Pinned {
+            sql: "SELECT e.id, COUNT(*) AS n FROM entity e \
+                  WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id) GROUP BY e.id",
+            mode: Mode::Grouped,
+            tracing: "e:unit,i:unit,^entity:unit",
+            tables: &["entity", "item"],
+            units: &["e.id"],
+            in_proj: &[Some(0)],
+            unique: true,
+            select: r#"SELECT e.id, COUNT(*) AS n FROM entity e WHERE (EXISTS (SELECT 1 FROM item i WHERE `i`.ent_id = e.id)) GROUP BY e.id"#,
+            lookups: &[],
+        },
+    ];
+    for c in cases {
+        let d = parse_definition(&format!("CREATE VIEW v AS {}", c.sql)).unwrap();
+        let v = analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{}: {e:#}", c.sql));
+        assert_eq!(v.mode, c.mode, "{}", c.sql);
+        assert_eq!(v.tracing(), c.tracing, "{}", c.sql);
+        let tables: Vec<String> = v.tables.iter().map(|t| t.1.clone()).collect();
+        assert_eq!(tables, c.tables, "{}", c.sql);
+        assert_eq!(v.unit_exprs, c.units, "{}", c.sql);
+        assert_eq!(v.unit_in_projection, c.in_proj, "{}", c.sql);
+        assert_eq!(v.unit_unique, c.unique, "{}", c.sql);
+        assert_eq!(v.select_sql(&[], None), c.select, "{}", c.sql);
+        let lookups: Vec<(String, String)> = v
+            .aliases
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.direct_unit.is_none())
+            .map(|(i, a)| (a.name.clone(), v.lookup_sql(i, "(R)")))
+            .collect();
+        let want: Vec<(String, String)> = c
+            .lookups
+            .iter()
+            .map(|(n, s)| ((*n).to_string(), (*s).to_string()))
+            .collect();
+        assert_eq!(lookups, want, "{}", c.sql);
     }
 }
 

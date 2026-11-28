@@ -1,0 +1,17 @@
+# Child-only tests: a test that ANOTHER test spawns as its own process, so libtest must never run
+# it as part of a plan. scripts/ci-run-binaries.sh passes one `--skip <name>` per line to that
+# suite, in EVERY tier (unlike tests/slow-tier.txt, which the fast tier alone skips): the job asks
+# for the parent, the parent asks for the child by name.
+#
+# Why a child cannot be a normal test: it exists to be run under an environment only its parent
+# can set, and its output is the parent's assertion. Run standalone it would report exactly the
+# SKIP or fail verdict the parent is testing, which is a red the suite cannot fix. It stays
+# `#[ignore]`d (without it `--exact --ignored` at the call site selects nothing and the parent has
+# nothing to read), and it is not asked for by any plan — an exclusion in the job's own invocation,
+# auditable here. Not an allowlist: nothing is excused from the skip guard, the child is simply not
+# a test the job runs, and the parent's own self-test runs for real.
+# `scripts/ci-run-binaries.sh --check-slow-list` fails when a line here matches anything but
+# exactly one test, so a renamed child breaks the build instead of quietly joining the plan.
+#
+# Format: <suite> <test name as `--list` prints it>   # who spawns it
+harness_selftest selftest_multi_skip_probe   # spawned by selftest_multi_skip_or_fail (--exact --ignored)
