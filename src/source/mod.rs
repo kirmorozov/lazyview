@@ -29,6 +29,12 @@ use mysql_async::binlog::events::{BinlogEventHeader, Event};
 pub(crate) mod maria;
 pub(crate) mod percona;
 
+/// The MariaDB anchor rule, public because it is the product's own: a run whose saved set does not
+/// name every pair the node's state carries anchors on file and position, not on the set (see
+/// [`maria::dump_state_covers`]). A test that has to say which anchor it expects asks here instead
+/// of keeping a second copy of what `sql/sql_repl.cc`'s `contains_all_slave_gtid` does.
+pub use maria::{dump_state_covers, dump_state_unnamed};
+
 /// The binlog coordinate a stream read hands back: `pos` is the offset of the next event to read.
 /// It is the *wire* shape, known inside the source layer and to whoever opens the stream; what
 /// the engine and the metadata tables hold is [`Cursor`], which says nothing about files.
@@ -117,6 +123,12 @@ impl Cursor {
     /// The binlog coordinate to open a stream from / to answer the server's own questions with.
     pub fn to_position(&self) -> Position {
         self.at.clone()
+    }
+
+    /// The flavor whose rules spell this cursor's text — what `binlog_cursor` is stored and read
+    /// under.
+    pub fn flavor(&self) -> Flavor {
+        self.flavor
     }
 
     /// The GTID state this cursor carries, as the flavor's canonical set text (MySQL/Percona:
@@ -931,6 +943,100 @@ mod tests {
                 "{bad:?} refused with the wrong words: {e:#}"
             );
         }
+    }
+
+    /// The CI red of run 45446296665 (all 15 MariaDB legs): the dump is anchored on a state that
+    /// names only the pairs the reader consumed, while the node has written others, and MariaDB
+    /// answers such a request by searching for the first transaction of the pair the state omits —
+    /// `Could not find GTID state requested by slave in any binlog files`, before strict mode has
+    /// any say. So the question the engine asks before anchoring is *coverage of the node's pairs*,
+    /// and it is asked in MariaDB's terms: a `domain-server` pair with a transaction in it.
+    #[test]
+    fn maria_dump_state_covers_every_pair_the_node_wrote() {
+        // The cursor the failing legs saved: one window, joined mid-stream, no holes in it.
+        let saved = "0-33114-486898-486924";
+        // The node wrote only that pair, in either of the two spellings its state prints.
+        assert!(maria::dump_state_covers("0-33114-486924", saved));
+        assert!(maria::dump_state_covers("0-33114-1-486924", saved));
+        // A node that has written nothing has no pair to name; seq 0 names no transaction.
+        assert!(maria::dump_state_covers("", saved));
+        assert!(maria::dump_state_covers("0-33114-0", saved));
+        // A second domain the reader never saw — a writer with its own `gtid_domain_id`, which is
+        // what the lifecycle suite's own injector leaves on a server every later job reuses: the
+        // request would name only `0-33114`, and the dump would die choosing the binlog file.
+        assert!(!maria::dump_state_covers(
+            "0-33114-486924,4000000000-33114-7",
+            saved
+        ));
+        // A second server id within the same domain is a second pair, and missing just the same.
+        assert!(!maria::dump_state_covers("0-33114-486924,0-33115-2", saved));
+        // Name the pair and the anchor is locatable again — the whole-set leg's own shape, which
+        // is why that test passes on these same servers: its set grew to include what it injected.
+        assert!(maria::dump_state_covers(
+            "0-33114-486924,4000000000-33114-7",
+            &format!("{saved},4000000000-33114-7")
+        ));
+        // The bar is the pair, not its height: the node having run ahead of the saved set is what
+        // a resume *means*, and the server answers that (the dump starts after the named state).
+        assert!(maria::dump_state_covers("0-33114-999999", saved));
+    }
+
+    /// The refusal says which pair it refused over: the engine logs this, and a test that expects
+    /// one anchor rather than the other reads the same answer. Naming the pair is the difference
+    /// between `set_bytes=0` and an operator being able to tell a foreign `gtid_domain_id` from a
+    /// set that was never saved at all.
+    #[test]
+    fn maria_says_which_pair_a_dump_state_does_not_name() {
+        let saved = "0-33114-486898-486924";
+        assert_eq!(maria::dump_state_unnamed("0-33114-486924", saved), None);
+        assert_eq!(maria::dump_state_unnamed("", saved), None);
+        assert_eq!(maria::dump_state_unnamed("0-33114-0", saved), None);
+        assert_eq!(
+            maria::dump_state_unnamed("0-33114-486924,4000000000-33114-7", saved).as_deref(),
+            Some("4000000000-33114"),
+            "the foreign domain is what the dump thread dies on, so it is what the line names"
+        );
+        assert_eq!(
+            maria::dump_state_unnamed("0-33114-486924,0-33115-2", saved).as_deref(),
+            Some("0-33115")
+        );
+        // A pair the set names but only at seq 0 does not count as named: it claims no
+        // transaction, which is the same thing as being absent.
+        assert_eq!(
+            maria::dump_state_unnamed("0-33114-486924,7-9-3", "0-33114-486924,7-9-0").as_deref(),
+            Some("7-9")
+        );
+    }
+
+    /// The same cursor the failing legs stored reads back through the flavor's own grammar
+    /// unchanged, and what the resume query *sends* is one `domain-server-seq` per pair: the
+    /// interval form is the engine's storage spelling only, never the packet.
+    #[test]
+    fn maria_cursor_round_trips_and_the_dump_asks_in_mariadb_syntax() {
+        use super::{parse_set, render_set};
+        let text = "0-33114-486898-486924";
+        assert_eq!(
+            render_set(Flavor::MariaDb, &parse_set(Flavor::MariaDb, text)),
+            text,
+            "the window form does not survive a parse/render round trip"
+        );
+        let list = maria::dump_gtid_list(text).expect("the saved set renders as a dump list");
+        assert_eq!(list, "0-33114-486924");
+        // Every entry is `digits-digits-digits`, the only shape the dump thread's parser reads, and
+        // the window's low end is gone from the request (it claimed contiguity the server must find).
+        for tok in list.split(',') {
+            let fields: Vec<&str> = tok.split('-').collect();
+            assert_eq!(fields.len(), 3, "{list:?} is not a MariaDB gtid list");
+            for f in fields {
+                assert!(
+                    !f.is_empty() && f.chars().all(|c| c.is_ascii_digit()),
+                    "{tok:?} is not a MariaDB gtid list"
+                );
+            }
+        }
+        // A set with two pairs keeps two entries, each in that shape.
+        let two = maria::dump_gtid_list("0-33114-1-40,4000000000-33114-7-9").unwrap();
+        assert_eq!(two, "0-33114-40,4000000000-33114-9");
     }
 
     /// PR D: the engine's per-transaction merge (`source::merge_gtid`) and the render back to
