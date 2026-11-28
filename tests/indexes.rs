@@ -858,8 +858,11 @@ const CASE_H6: Case = Case {
 
 /// H6 — declared indexes coexist with the engine's own set. `happy · MYF · PG`
 /// (a) the join view `links` of corpus `B` + `CREATE INDEX i_amount ON links (amount);` (b) corpus
-/// `B`; (c) the engine's own `PRIMARY KEY`/`_lv_unit`, `UNIQUE _lv_row`, `_lv_a<k>`, `_lv_p<k>` are
-/// all still there **plus** `i_amount (amount)` — dropping or renaming any `_lv_*` index is a
+/// `B`; (c) the engine's own keys **for this JOIN shape** — the join has `unit_unique = false`, so
+/// `Layout::identity` is empty (src/mv.rs:421), `row_index` is `None` (src/target/mod.rs:788), and
+/// `create_sql_marked` renders `KEY _lv_unit` with no PRIMARY (src/target/mysql.rs:113-118): the
+/// engine set `E` here is `{_lv_unit}` plus the engine's other `_lv_*` keys. They are all still
+/// there **plus** `i_amount (amount)` — dropping or renaming any `_lv_*` index is a
 /// failure (the D9-literal-reading guard, Q2) — and the `_lv_*` invisible columns stay invisible
 /// (src/target/mysql.rs:107-109).
 #[test]
@@ -868,11 +871,18 @@ fn idx_coexist_with_engine_keys() {
         let (_db, mut eng, mut sc) = open(&ctx, "idx_h6", B, &spec_of(&CASE_H6, None), &[]).await?;
         check_myf(&mut eng, &mut sc, &CASE_H6, "source").await?;
         let got = myf_idx(&mut sc, "links").await?;
-        // (c) the engine set is unchanged: the row key that the upsert path needs above all.
+        // (c) the engine set is unchanged. `links` is the JOIN `SEL_LINKS`, whose plan has
+        // `unit_unique = false` → `row_index` `None` → `create_sql_marked` emits `KEY _lv_unit`
+        // with no PRIMARY (src/target/mysql.rs:113-118): the engine's own key the upsert path
+        // relies on for THIS shape is `_lv_unit`, so its surviving is the contract (deputy H6 fix
+        // 2026-11-24 — the old `_lv_row`/`PRIMARY` assert asked for what no engine can emit for a
+        // non-unit-unique view and could never pass; the declared half in `check_myf` is the real
+        // red, this (c) half must not be a second, wrong-reason failure).
         ensure!(
-            got.iter()
-                .any(|(n, _, _, _)| n == "_lv_row" || n == "PRIMARY"),
-            "H6 (c): the engine's own row key is gone — `E` must be unchanged: {got:?}",
+            got.iter().any(|(n, _, _, _)| n == "_lv_unit"),
+            "H6 (c): the engine's own unit key `_lv_unit` is gone — for the join view `links` \
+             (unit_unique = false) `E` is `{{_lv_unit}}` (src/target/mysql.rs:113-118) and must be \
+             unchanged: {got:?}",
         );
         ensure!(
             got.iter().any(|(n, _, _, _)| n.contains("_lv_")),
@@ -1064,11 +1074,19 @@ fn idx_declared_later_online() {
 /// H7 — one view, several targets, one declared set (D2 destination-only).
 /// `happy · MYF + PG (fan-out) · MYF + MYF (two schemas)`
 /// (a) the `links` view of H6 with `targets = 'source,mysql2,pg'` + `CREATE INDEX i_amount ON
-/// links (amount);` and `CREATE UNIQUE INDEX u_id_name ON links (id, name);` (b) corpus `B` on the
-/// source; (c) every target's own table carries `E ∪ { i_amount (amount), u_id_name (id, name)
-/// UNIQUE }`, the PG instance's physical names being `links_i_amount` / `links_u_id_name`
+/// links (amount);` and `CREATE INDEX i_id_name ON links (id, name);` (b) corpus `B` on the
+/// source; (c) every target's own table carries `E ∪ { i_amount (amount), i_id_name (id, name) }`,
+/// the PG instance's physical names being `links_i_amount` / `links_i_id_name`
 /// (src/target/postgres.rs:754-762); a target that is down does not block the others (the fan-out
 /// rule tests/targets.rs already asserts).
+///
+/// CASE fix (deputy H7, 2026-11-24): (id, name) is **not** unique in corpus `B` — `items`
+/// (1,1,10.50) and (2,1,20.25) both carry `owner_id = 1`, so `SEL_LINKS` projects `(1, 'alpha')`
+/// twice and a `UNIQUE` over (id, name) is refused by the server (`ERROR 1062 '1-alpha'`, verified
+/// at the `lvt_idx_*` engine logs on both flavors): a UNIQUE the seed violates cannot be built by
+/// anyone. The declared pair is therefore a plain key, which keeps this case a test of *fan-out
+/// convergence* over the declared set — its real subject — rather than of uniqueness (E12 owns the
+/// violated-UNIQUE path); the corpus stays the pinned `B`, nothing in the seed is changed.
 #[test]
 fn idx_fanout_all_targets_converge() {
     scenario_multi("idx_fanout_all_targets_converge", 2, |ctx| async move {
@@ -1083,7 +1101,7 @@ fn idx_fanout_all_targets_converge() {
             SEL_LINKS,
             &[
                 "CREATE INDEX i_amount ON links (amount)",
-                "CREATE UNIQUE INDEX u_id_name ON links (id, name)",
+                "CREATE INDEX i_id_name ON links (id, name)",
             ],
         );
         add_views(&mut c, std::slice::from_ref(&spec)).await?;
@@ -1137,7 +1155,7 @@ fn idx_fanout_all_targets_converge() {
             let client = pg::connect(&pgdb.dsn).await?;
             let rows = pg_idx(&client, &pgdb.schema, "links").await?;
             expect_idx("H7", "links", &rows, H7_DECLARED)?;
-            for want in ["links_i_amount", "links_u_id_name"] {
+            for want in ["links_i_amount", "links_i_id_name"] {
                 ensure!(
                     rows.iter().any(|(n, ..)| n == want),
                     "H7 (c) PG: the physical index `{want}` is missing: {rows:?}",
@@ -1155,7 +1173,7 @@ fn idx_fanout_all_targets_converge() {
 
 const H7_DECLARED: &[Decl] = &[
     decl("i_amount", &["amount"]),
-    unique("u_id_name", &["id", "name"]),
+    decl("i_id_name", &["id", "name"]),
 ];
 
 /// H8 — a virtual generated column declared the same way, then indexed (D4).
@@ -1924,8 +1942,9 @@ const CASE_E9_PG: Case = Case {
 /// `_lazyview_state.last_error` with `state = 'error'`, the live table and its existing indexes
 /// untouched, the other targets unaffected (today `create_index` renders no method clause at all,
 /// src/target/postgres.rs:754-762). Whether a capability gate is consulted per target product/version
-/// is Q5/OPEN (facts.md: `Kind` has no MariaDB/Percona distinction); the unit half of this row is
-/// `index_kind_supported_per_flavor` in src/ddl/tests.rs.
+/// is Q5/OPEN (facts.md: `Kind` has no MariaDB/Percona distinction); the per-flavor capability split
+/// itself is the `index_kind_supported_per_flavor` case in this file (#332), the case lv-super filed
+/// to close it together with `idx_on_declared_virtual_column`.
 #[test]
 fn idx_fulltext_refused_on_pg() {
     scenario("idx_fulltext_refused_on_pg", |ctx| async move {
@@ -2557,4 +2576,42 @@ fn idx_mdl_wait_does_not_stall_writes() {
         )?;
         eng.stop().await
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The per-flavor Kind split (#332) — E9's unit half, promoted into this integration suite so it is
+// declared through the known-red gate. The lib suite is never red (owner rule 4e; lv-super
+// msg_abbfab83f74c ruling 1: no lib reds, and no pub-ify of private items to move tests), so a
+// by-design-red capability assertion belongs here, where the gate reads `tests/indexes-known-red.txt`.
+// ---------------------------------------------------------------------------------------------
+
+/// #332 — `index_kind_supported_per_flavor`: a per-flavor index-kind capability gate needs the
+/// target to name its PRODUCT, not just its family. Asserted against the public
+/// `lazyview::target::Kind::from_dsn` (already public — `tests/target_units.rs:23` uses it), so no
+/// private item was exposed to move it here (ruling 1). E9's FULLTEXT-per-flavor behaviour is the
+/// end-to-end half (`idx_fulltext_refused_on_pg` / `idx_fulltext_where_supported` in this file).
+///
+/// INTENTIONALLY RED (owner ruling D8; closes with #332): today `target::Kind` is `Mysql | Postgres`
+/// alone (src/target/mod.rs:23-26), so `mariadb://` answers `Mysql` exactly like `mysql://` and no
+/// seam can tell MariaDB from MySQL — the two answer FULLTEXT differently (online-ddl-research.md
+/// items 1 and 6), so the kind gate cannot be decided per product. Never weaken or skip this case:
+/// #332 turns it green.
+#[test]
+fn index_kind_supported_per_flavor() {
+    use lazyview::target::Kind;
+    let mysql = Kind::from_dsn("mysql://u@h/db").expect("mysql:// is a target");
+    let maria =
+        Kind::from_dsn("mariadb://u@h/db").expect("mariadb:// is a target (D5: MariaDB IN)");
+    assert_ne!(
+        mysql, maria,
+        "E9/#332 (c): a per-flavor capability gate needs the target to name its product: \
+         `mariadb://` and `mysql://` both answer {mysql:?} today (src/target/mod.rs:23-26), so \
+         FULLTEXT (which MariaDB and MySQL answer differently) cannot be decided per product"
+    );
+    // D2 + the D5 flag: ClickHouse is last on the roadmap and no target exists for it
+    // (src/target/mod.rs:18-19) — nothing here is written for it, so it must stay refused.
+    assert!(
+        Kind::from_dsn("clickhouse://u@h/db").is_err(),
+        "D2 (c): a clickhouse:// target must not answer as a flavor while no target module exists"
+    );
 }
