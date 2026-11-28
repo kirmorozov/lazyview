@@ -1,6 +1,8 @@
-//! The dedup core's acceptance test (keymap §12; lazywf's proposal §9 cases 1-3): an in-memory source, a
-//! fake clock and a recording action. Default scale 200 key values × 2,000 items; the `#[ignore]`d full
-//! scale is 200 × 100,000 (`cargo test --release --lib dedup::acceptance -- --ignored`).
+//! The dedup core's acceptance test (keymap §12; lazywf's proposal §9 cases 1-3): an in-memory
+//! source, a fake clock and a recording action. Two scales, both run by every `cargo test`: 200
+//! key values × 2,000 items (the default) and × 20,000 (`burst_multi_chunk_scale`, the tier where
+//! the chunk limits bind — see it for the measurements and for why the old `#[ignore]`d
+//! 200 × 100,000 hand-run became this.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -290,6 +292,20 @@ fn burst(n: i64) {
         (even as usize).div_ceil(100),
         "S3: one hop query per chunk of misses"
     );
+    // Above one chunk's worth of ids the generation must really work off in bounded chunks —
+    // several FULL ones, not one flush that happens to fit. Vacuous at the default scale (its
+    // 1,000 ids are exactly one chunk), which is why `burst_multi_chunk_scale` exists.
+    if even > 1_000 {
+        let full = world
+            .jobs
+            .iter()
+            .filter(|(ids, _)| ids.len() == 1_000)
+            .count();
+        assert!(
+            full >= 2,
+            "S1: {full} full chunks of 1000 ids, want at least 2"
+        );
+    }
     let mut got = world.resolved.clone();
     got.sort_unstable();
     let mut want: Vec<i64> = world
@@ -402,10 +418,18 @@ fn burst_default_scale() {
     burst(2_000)
 }
 
+/// The same scenario at 10× the default scale, the tier where the chunk limits bind for real.
+/// At 2,000 items the burst marks exactly 1,000 ids: that is ONE chunk of `chunk_ids 1000`, so
+/// the default scale asserts the chunk bound without ever working off more than one chunk. Here
+/// the 10,000 ids go out as ten full chunks and the hop misses as a hundred queries of 100
+/// (`burst` counts both, exactly). Measured 2026-11-28 on this tree: 9.4 s and 43 MiB in the
+/// debug profile, against 52 s for the `#[ignore]`d 200 × 100,000 hand-run this replaces (the
+/// same code path 5× over, nothing beyond more chunks of the same shape: linear in the item
+/// count, 0.52 ms per item measured at 10k/20k/50k/100k). A scale a PR job pays, so the tier
+/// runs everywhere instead of never.
 #[test]
-#[ignore]
-fn burst_full_scale() {
-    burst(100_000)
+fn burst_multi_chunk_scale() {
+    burst(20_000)
 }
 
 #[test]
