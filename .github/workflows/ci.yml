@@ -263,14 +263,56 @@ jobs:
         # `test result: ok` on its own says nothing about the tests that did not run, so the
         # output is teed for the guard step below. The lib tests with the roaring feature are
         # `features`' subject (it runs --lib --bins --features roaring), so this job keeps no
-        # roaring leg of its own.
+        # roaring leg of its own. Both `#[ignore]`d lib tests (the full-scale dedup burst and
+        # the analyzer's plan dumper) run for real in their own named steps below, so they are
+        # not this step's subject: libtest counts a test as ignored only when the run's filters
+        # select it, and filtering them here (a subject filter, the same shape shard d's suite
+        # list uses) keeps this step's own summary at 0 ignored instead of hiding an unrun test
+        # in an "ok" line.
         if: needs.scope.outputs.code == 'true'
         run: |
           set -o pipefail
           mkdir -p "$LV_TEST_LOGS"
           chmod +x ci-bins/deps/* ci-bins/lazyview
-          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv lib lazyview -- --color never 2>&1 \
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv lib lazyview -- --color never --skip burst_full_scale --skip show_plans 2>&1 \
             | tee "$LV_TEST_LOGS/lib-bins.log"
+      - name: full-scale dedup burst (the ignored acceptance test, run for real)
+        # C4, no allowlist: an `#[ignore]`d test must run for real in a job that has its
+        # subject, not sit ignored forever (guard findings on PR #285). So the full-scale
+        # acceptance burst gets this named step: --include-ignored makes libtest run it (its
+        # summary reads 0 ignored, so the guard below judges it like any other run), --exact
+        # pins the subject, and the grep fails the step if the test ever vanishes (0 selected
+        # exits 0 on its own). Measured 52 s on a warm runner; unit's 20 min covers it.
+        if: needs.scope.outputs.code == 'true'
+        run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv lib -- --color never --include-ignored \
+            --exact dedup::acceptance::burst_full_scale 2>&1 \
+            | tee "$LV_TEST_LOGS/lib-full-scale-burst.log"
+          grep -q "^test dedup::acceptance::burst_full_scale \.\.\. ok$" "$LV_TEST_LOGS/lib-full-scale-burst.log" \
+            || { echo "::error::dedup::acceptance::burst_full_scale did not run and pass: the ignored acceptance test must run here"; exit 1; }
+      - name: catalog plan dump (the ignored show_plans tool, run for real)
+        # C4, no allowlist: the analyzer's plan dumper is `#[ignore]`d (it reads LV_SQL and
+        # prints, a dev tool with no asserts of its own), so it gets this named step instead
+        # of sitting ignored forever. --include-ignored makes libtest run it (summary reads 0
+        # ignored), --nocapture shows the dump, and the greps fail the step unless the fixed
+        # sample from the project's own analyzer test catalog actually built its plan: a
+        # regression that panics or plans the sample as Err is red here, not a printed ERROR.
+        if: needs.scope.outputs.code == 'true'
+        env:
+          # The same SPJ view catalog_formulations asserts plans as Mode::Spj.
+          LV_SQL: CREATE VIEW v AS SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id
+        run: |
+          set -o pipefail
+          mkdir -p "$LV_TEST_LOGS"
+          scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv lib -- --color never --include-ignored \
+            --nocapture --exact analyzer::tests::catalog_formulations::show_plans 2>&1 \
+            | tee "$LV_TEST_LOGS/lib-show-plans.log"
+          grep -q "^test analyzer::tests::catalog_formulations::show_plans \.\.\. ok$" "$LV_TEST_LOGS/lib-show-plans.log" \
+            || { echo "::error::analyzer::tests::catalog_formulations::show_plans did not run and pass: the ignored plan dumper must run here"; exit 1; }
+          grep -q ' mode Spj' "$LV_TEST_LOGS/lib-show-plans.log" \
+            || { echo "::error::show_plans did not build the Spj plan for the sample view: the dumper leg is broken"; exit 1; }
       # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
       # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
       # only way to keep this job green is to run every test for real in a job that has its subject.
@@ -345,11 +387,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo test --lib --bins (feature ${{ matrix.features }})
         # Builds the feature's dependency tree (the aws tree only ever compiles
-        # here) and runs the unit tests against it. Required by `release`.
+        # here) and runs the unit tests against it. Required by `release`. Both
+        # `#[ignore]`d lib tests (the full-scale dedup burst and the ignored plan
+        # dumper) run for real in `unit`'s named steps (not this job's subject), so
+        # they are filtered out here: libtest counts a test as ignored only when the
+        # run's filters select it, and this step's own summary must read 0 ignored.
         run: |
           set -o pipefail
           mkdir -p "$LV_TEST_LOGS"
-          cargo test --locked --lib --bins --features "${{ matrix.features }}" 2>&1 \
+          cargo test --locked --lib --bins --features "${{ matrix.features }}" -- --skip burst_full_scale --skip show_plans 2>&1 \
             | tee "$LV_TEST_LOGS/features-${{ matrix.features }}.log"
       # C4 skip guard (owner, 2026-11-16: "all skip seam wrong", no allowlist): a suite that
       # skipped is not a suite that passed, and a test libtest counted as ignored never ran. The
@@ -632,8 +678,15 @@ jobs:
           esac
           set +o pipefail
           mkdir -p "$LV_TEST_LOGS"
+          # harness_selftest's selftest_multi_skip_probe is a child-only fixture: its parent
+          # selftest_multi_skip_or_fail starts it with --ignored under a controlled environment
+          # and asserts on its output (bailing if it ever runs against servers), so it must stay
+          # #[ignore]d and outside this shard's subject. Filtering it out here is a subject
+          # filter, not an allowlist: libtest counts a test as ignored only when the run's
+          # filters select it, so the summary the skip guard below reads says 0 ignored.
           scripts/ci-run-binaries.sh ci-bins/ci-manifest.tsv "${names[@]}" -- \
             --test-threads=1 --color never --skip targets_pg_ --skip chaos_ --skip selftest_toxi_ \
+            --skip selftest_multi_skip_probe \
             2>&1 | tee integration-tests.log "$LV_TEST_LOGS/integration-tests.log"
           scripts/chaos-gate.sh --status "${PIPESTATUS[0]}" --label "${{ matrix.group }} group shard ${{ matrix.shard }} integration" \
             integration-tests.log tests/integration-known-red.txt
