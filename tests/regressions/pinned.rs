@@ -1,4 +1,5 @@
 use super::*;
+use mysql_async::prelude::Queryable;
 
 /// Key / value sources: one value table joined once per (key, scope), each alias pinned by
 /// constant equalities. Columns of one table use different integer types. Seeded so that every
@@ -1262,6 +1263,471 @@ fn reg_cascade_window_parent_delete() {
             "gap-window parent delete: {s:?} {}",
             fmt_snapshot(&d)
         ));
+        eng.stop().await
+    });
+}
+
+/// Restart gap, a CASCADE delete whose children the view CAN name from the materialized table
+/// (issue #408): the parent is deleted while the engine is stopped, so the resume replays it from
+/// before the startup seed and the cache counts a gap. The storage engine deleted the children with
+/// it, so the cache's lookup under the parent's key hits nothing and the seed never held them. But
+/// the view carries the child's FK value in a materialized column, so the vanished children's units
+/// are named by ONE bounded read of the materialized table instead of `mark_all`: the view is exact
+/// at convergence and the incremental view never falls back to a whole-view refresh
+/// (`whole_view_refreshes == 0`).
+///
+/// The MAP route is `^entities:map` (`entities` is the cascade's parent and no alias of the view);
+/// its child `links` is read by the view and its FK `eid` is a selected column, so every materialized
+/// row a child under `entities` contributes to carries that child's FK value (the plan fact of the
+/// cascade map, issue #408), and no cascade continues out of `links`.
+#[test]
+fn reg_cascade_window_parent_delete_named() {
+    scenario("reg_casc_win_del_named", |ctx| async move {
+        let mut ddl: Vec<String> = vec![
+            "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+            "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)"
+                .into(),
+            // The FK `eid` is the LEADING primary-key column (row key `(eid, gid)`), so the naming
+            // read `WHERE eid = <old>` is a range on the row-key index, not a full scan (#408 R1).
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (eid, gid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))"
+                .into(),
+        ];
+        ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into());
+        ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into());
+        ddl.push("INSERT INTO links VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into());
+        let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+        // A child-only style view: it reads `links` and selects the FK `eid`, so the vanished
+        // children's units (the `links` primary keys) are nameable from the materialized table.
+        let specs = vec![ViewSpec::new(
+            "r_win_del_named",
+            Kind::Incremental,
+            "SELECT l.gid, l.eid, l.pos FROM links l",
+        )];
+        let (db, mut eng) = setup(&ctx, "reg_casc_win_del_named", &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // `links (3, 6)` is the only row under entity 6: deleting that parent must drop it.
+        eng.stop().await?;
+        // Both the parent delete and the ON DELETE CASCADE that removed links (3, 6) sit inside
+        // the replay window: the startup seed read the row already gone.
+        exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 6"]).await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        let f0 = eng.snapshot();
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        // /stats is published at the end of a flush; nothing else writes after the resume, so wait
+        // for the periodic flush (position save, 5 s) to publish the gap of the replay. Polls at the
+        // shared 50 ms cadence (`common::wait_until`), not a hand-rolled 200 ms loop (owner rule).
+        wait_until(
+            "the replayed parent delete counted as a gap in /stats",
+            std::time::Duration::from_secs(15),
+            || {
+                let s = eng.view_stats(&db, "r_win_del_named");
+                async move { Ok(s.is_some_and(|s| s.cascade_gaps >= 1)) }
+            },
+        )
+        .await?;
+        // Nothing was written since the resume: the row under the deleted parent is gone at once and
+        // the other two are exact (the named units were refreshed, not the whole view).
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the rows the replayed parent delete removed",
+        )
+        .await?;
+        let s = eng.stats_of(&db, "r_win_del_named")?;
+        let d = eng.snapshot().since(&f0);
+        ensure!(
+            s.cascade_gaps >= 1
+                && s.whole_view_refreshes == 0
+                && d.full_rebuilds == 0
+                && d.cascade_children_named >= 1
+                && d.cascade_gap_mark_all == 0,
+            "the replayed parent delete was not counted as a gap, fell back to a whole-view \
+             refresh / rebuilt, or did not NAME the vanished children (must name them from the \
+             materialized table: cascade_children_named >= 1 and cascade_gap_mark_all == 0, not \
+             mark_all): {s:?} {}",
+            fmt_snapshot(&d)
+        );
+        ctx.log(format!(
+            "gap-window named parent delete: {s:?} {}",
+            fmt_snapshot(&d)
+        ));
+        eng.stop().await
+    });
+}
+
+/// Issue #408 R4 — the analyzer's name-ability gate, exercised end to end. Every scenario is the
+/// same gap-window parent delete of `reg_cascade_window_parent_delete_named`, but the child table
+/// and the view differ so the analyzer's plan fact (`CascadeRoute::name_cols`) lands on a different
+/// gate branch. All four assert the same guard — a gap-window parent delete never forces a STREAMED
+/// whole-view rebuild (`whole_view_refreshes == 0`; that counter counts only `built(whole = true)`)
+/// — and require `cascade_gaps == 1` with the view exact at convergence. Read the mechanism note
+/// below before reading `whole_view_refreshes == 0` as "no whole-view read happened".
+///
+/// The parent's DELETE reaches the engine only through the **cascade cache** — a row the server
+/// moves with `ON DELETE CASCADE` never appears on the source's binlog (`docs/views.md:340`,
+/// `docs/internals.md:81`), so after the restart the flush replays the parent change from the cache
+/// it seeds, not from a child binlog event. Where that cache pins the vanished child's old unit key,
+/// the engine refreshes exactly that unit — a targeted refresh, no whole-view read — whether or not
+/// the route is nameable; that is what the two non-nameable legs do (measured
+/// `cascade_gap_mark_all == 0` on mariadb114). The #408 fix matters on the NAMEABLE route: it names
+/// the vanished children with one bounded read of the materialized table under the parent's old key
+/// (`cascade_children_named >= 1`, `cascade_gap_mark_all == 0`) instead of falling back.
+/// `whole_view_refreshes == 0` (that counter counts only the streamed `built(whole = true)` rebuild)
+/// is a guard against a streamed rebuild, on every leg. The per-branch gate decision (`name_cols`
+/// Some/None) is pinned deterministically by the `gap_window_*` and `*_nameable` lib tests in
+/// `accumulate`, which read the plan directly with no server.
+///
+/// Fail-before: each leg also asserts the routing counters accumulated since the resume. A nameable
+/// leg requires `cascade_children_named >= 1` and `cascade_gap_mark_all == 0`; disabling the naming
+/// gate (unfixed `main`) leaves the route unable to name, so the same leg sees `cascade_children_named
+/// == 0` and fails — RED before the fix, GREEN after (verified on mariadb114: the three nameable legs
+/// are red with the gate disabled, green with it on; CI runs the full flavor matrix). A non-nameable
+/// leg asserts the invariant `cascade_children_named == 0` (the gate refused the route, so it is
+/// never named) plus correctness — it stays green before and after. `whole_view_refreshes == 0` alone
+/// does NOT distinguish the branches, so the counters carry the fail-before.
+async fn gap_named_branch(
+    ctx: &Ctx,
+    id: &str,
+    links_ddl: &str,
+    view_sql: &str,
+    want_whole: u64,
+    nameable: bool,
+) -> Result<()> {
+    let mut ddl: Vec<String> = vec![
+        "CREATE TABLE items (gid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+        "CREATE TABLE entities (eid INT UNSIGNED PRIMARY KEY, label VARCHAR(20) NOT NULL)".into(),
+        links_ddl.into(),
+    ];
+    ddl.push("INSERT INTO items VALUES (1, 'i1'), (2, 'i2'), (3, 'i3')".into());
+    ddl.push("INSERT INTO entities VALUES (5, 'e5'), (6, 'e6')".into());
+    ddl.push("INSERT INTO links VALUES (1, 5, 10), (2, 5, 20), (3, 6, 30)".into());
+    let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+    let specs = vec![ViewSpec::new(id, Kind::Incremental, view_sql)];
+    let (db, mut eng) = setup(ctx, id, &ddl, &specs, &[]).await?;
+    let mut sc = db.conn().await?;
+    eng.wait_caught_up(&mut sc, t_catchup()).await?;
+    // `links (3, 6)` is the only row under entity 6: the parent delete cascades it away.
+    eng.stop().await?;
+    exec_all(&mut sc, &["DELETE FROM entities WHERE eid = 6"]).await?;
+    let mut eng = ctx.start_engine(&db, &[])?;
+    wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+    let f0 = eng.snapshot();
+    eng.wait_caught_up(&mut sc, t_catchup()).await?;
+    // /stats is published at the end of a flush; nothing else writes after the resume, so wait
+    // for the periodic flush (position save, 5 s) to publish the gap of the replay. Polls at the
+    // shared 50 ms cadence (`common::wait_until`), not a hand-rolled 200 ms loop (owner rule).
+    wait_until(
+        "the replayed parent delete counted as a gap in /stats",
+        std::time::Duration::from_secs(15),
+        || {
+            let s = eng.view_stats(&db, id);
+            async move { Ok(s.is_some_and(|s| s.cascade_gaps >= 1)) }
+        },
+    )
+    .await?;
+    verify(
+        ctx,
+        &mut eng,
+        &db,
+        &specs,
+        "the rows the replayed parent delete removed",
+    )
+    .await?;
+    let s = eng.stats_of(&db, id)?;
+    let d = eng.snapshot().since(&f0);
+    ctx.log(format!(
+        "[{id}] counters: nameable={nameable} cascade_children_named={} cascade_gap_mark_all={}",
+        d.cascade_children_named, d.cascade_gap_mark_all
+    ));
+    // The fail-before signal rides on the NAMEABLE legs. A nameable route must NAME the vanished
+    // children from the materialized table (`cascade_children_named >= 1`) and not fall back
+    // (`cascade_gap_mark_all == 0`); with the naming feature off (unfixed `main`) the route cannot
+    // name, so the same leg sees `cascade_children_named == 0` and fails — RED before the fix,
+    // GREEN after. A non-nameable route must never name (the gate refused it): `cascade_children_named
+    // == 0` is an invariant, and these fixtures take a targeted unit refresh (the cascade cache pins
+    // the vanished child's old key), so `cascade_gap_mark_all` is 0 here too — they are acceptance
+    // legs (exact view, no streamed rebuild), not fail-before witnesses. `whole_view_refreshes == 0`
+    // alone does NOT distinguish the branches (see the helper doc).
+    let (expect, ok) = if nameable {
+        (
+            "name the vanished children from the materialized table \
+             (cascade_children_named >= 1, cascade_gap_mark_all == 0)",
+            d.cascade_children_named >= 1 && d.cascade_gap_mark_all == 0,
+        )
+    } else {
+        (
+            "never name the vanished children \
+             (the gate refused the route: cascade_children_named == 0)",
+            d.cascade_children_named == 0,
+        )
+    };
+    ensure!(
+        s.cascade_gaps == 1
+            && s.whole_view_refreshes == want_whole
+            && d.full_rebuilds == 0
+            && ok,
+        "expected the {id} gap-window parent-delete to record exactly one cascade gap, take no \
+         streamed whole-view rebuild (whole_view_refreshes == {want_whole}), and {expect}; the \
+         non-nameable legs resolve the vanished child by a targeted unit refresh (the cascade cache \
+         pins its old key), so no whole-view refresh happens (see the helper doc), got {s:?} {}",
+        fmt_snapshot(&d)
+    );
+    ctx.log(format!("{id}: {s:?} {}", fmt_snapshot(&d)));
+    eng.stop().await
+}
+
+/// #408 R4, nameable: the FK `eid` is projected and the leading primary-key column, so the read is
+/// a row-key range and the vanished children are named — `whole_view_refreshes == 0`.
+#[test]
+fn reg_cascade_window_named_branch_nameable() {
+    scenario("reg_casc_named_nameable", |ctx| async move {
+        gap_named_branch(
+            &ctx,
+            "reg_casc_named_nameable",
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (eid, gid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))",
+            "SELECT l.gid, l.eid, l.pos FROM links l",
+            0u64,
+            true,
+        )
+        .await
+    });
+}
+
+/// #408 R4, non-nameable (gate branch `name_cols == None` in `build.rs` `name_mapped_cascades`): the
+/// view projects neither FK column, so no FK column reaches the projection as a bare column and the
+/// route cannot be named. The parent's DELETE, replayed from the cascade cache, then resolves the
+/// vanished child by a TARGETED unit refresh — the cache pins the child's old unit key, so the engine
+/// refreshes exactly that unit and never reads the whole view (measured `cascade_gap_mark_all == 0`).
+/// The leg asserts the route is never named (`cascade_children_named == 0`), `whole_view_refreshes
+/// == 0` (the streamed-rebuild guard), `cascade_gaps == 1`, and exact convergence. The gate decision
+/// is locked by the lib test `single_alias_view_omitting_the_fk_is_not_nameable`.
+#[test]
+fn reg_cascade_window_named_branch_omits_fk() {
+    scenario("reg_casc_named_omits", |ctx| async move {
+        gap_named_branch(
+            &ctx,
+            "reg_casc_named_omits",
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (eid, gid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))",
+            "SELECT l.gid, l.pos FROM links l",
+            0u64,
+            false,
+        )
+        .await
+    });
+}
+
+/// #408 R4, non-nameable (gate branch `name_cols == None` in `build.rs` `name_mapped_cascades`): the
+/// FK `eid` is carried as a bare column but the primary key is `(gid, eid)`, so `eid` is not the
+/// leading row-key prefix — the bounded `WHERE eid = <old>` read would scan the target unindexed, so
+/// the route keeps `name_cols == None`. As in [`reg_cascade_window_named_branch_omits_fk`] the cache
+/// pins the vanished child's old unit key and the engine resolves it by a TARGETED unit refresh (no
+/// whole-view read, `cascade_gap_mark_all == 0`), so `whole_view_refreshes == 0` is the streamed-rebuild
+/// guard; the leg asserts the route is never named (`cascade_children_named == 0`), `cascade_gaps == 1`,
+/// and exact convergence. The gate decision is locked by the lib test `non_indexed_fk_column_is_not_nameable`.
+#[test]
+fn reg_cascade_window_named_branch_fk_not_leading() {
+    scenario("reg_casc_named_notlead", |ctx| async move {
+        gap_named_branch(
+            &ctx,
+            "reg_casc_named_notlead",
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (gid, eid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))",
+            "SELECT l.gid, l.eid, l.pos FROM links l",
+            0u64,
+            false,
+        )
+        .await
+    });
+}
+
+/// #408 R4, nameable through an alias: the FK is projected as `l.eid AS fk`. It is still one bare
+/// column of the single alias and a leading row-key prefix, so the route is nameable and `name_cols`
+/// carries the materialized name `fk` — the read filters the column the target actually has, so the
+/// children are still named: `whole_view_refreshes == 0`.
+#[test]
+fn reg_cascade_window_named_branch_aliased_fk() {
+    scenario("reg_casc_named_aliased", |ctx| async move {
+        gap_named_branch(
+            &ctx,
+            "reg_casc_named_aliased",
+            "CREATE TABLE links (gid INT UNSIGNED NOT NULL, eid INT UNSIGNED NOT NULL, \
+             pos INT NOT NULL, PRIMARY KEY (eid, gid), \
+             FOREIGN KEY (eid) REFERENCES entities (eid) ON DELETE CASCADE ON UPDATE CASCADE, \
+             FOREIGN KEY (gid) REFERENCES items (gid))",
+            "SELECT l.gid, l.eid AS fk, l.pos FROM links l",
+            0u64,
+            true,
+        )
+        .await
+    });
+}
+
+/// #408 guard item (1) — the READ side of a TWO-column nameable route, against a real server.
+///
+/// `ch(a, b, seq, val)` has `PRIMARY KEY (a, b, seq)` and a cascade FK `FK (a, b) -> p2 (a, b)`;
+/// the child-only view `SELECT a, b, seq, val FROM ch` is therefore nameable with
+/// `name_cols == [a, b]` (the FK is the leading row-key SET). This is the shape lv-super asked to
+/// exercise end to end: the bounded read of the materialized table `SELECT <units> WHERE (a, b) IN
+/// (…)` (the same `MvFilter::Keys` `lineage_lookup` uses; the engine de-dups on the client, so the
+/// statement itself is a plain row read), its 2-position key, and — the point — proof that the read
+/// is served by the row-key index on EVERY family, never a full scan. Two probes `EXPLAIN` the read
+/// in the FK's declared (forward) order and in the reverse order the SET-equality gate also admits,
+/// accepting an index access on `PRIMARY` / `_lv_row` (range/ref/eq_ref) OR an optimizer-eliminated
+/// plan (`type` NULL — MySQL 9.7 proves the projection comes from the constant key tuples and reads
+/// no base table), and rejecting any scan (`ALL` / full-index `index`). A `STATISTICS` read shows the
+/// row-key index really leads with `(a, b)`. Then the gap-window parent delete names the vanished
+/// children across two parent keys (two 2-position `name_pending` entries), so
+/// `cascade_children_named >= 1` and the view is exact.
+///
+/// The chunk split at `query_chunk.min(MAX_FILTER_PARAMS / cols)` for `cols == 2` is locked by the
+/// lib unit test `name_lookups_chunks_by_params_over_columns`; here two parent keys exercise the
+/// multi-tuple IN rendering (two tuples, not one).
+#[test]
+fn reg_cascade_window_named_branch_two_col() {
+    scenario("reg_casc_named_2col", |ctx| async move {
+        let id = "reg_casc_named_2col";
+        let ddl: Vec<&str> = vec![
+            "CREATE TABLE p2 (a INT NOT NULL, b INT NOT NULL, label VARCHAR(20) NOT NULL, \
+             PRIMARY KEY (a, b))",
+            "CREATE TABLE ch (a INT NOT NULL, b INT NOT NULL, seq INT NOT NULL, val INT NOT NULL, \
+             PRIMARY KEY (a, b, seq), \
+             FOREIGN KEY (a, b) REFERENCES p2 (a, b) ON DELETE CASCADE ON UPDATE CASCADE)",
+            "INSERT INTO p2 VALUES (1, 1, 'p11'), (1, 2, 'p12'), (2, 1, 'p21'), (2, 2, 'p22'), \
+             (3, 1, 'p31')",
+            "INSERT INTO ch VALUES (1, 1, 1, 10), (1, 1, 2, 11), (1, 2, 1, 12), (2, 1, 1, 13), \
+             (2, 2, 1, 14), (3, 1, 1, 15)",
+        ];
+        let specs = vec![ViewSpec::new(
+            id,
+            Kind::Incremental,
+            "SELECT a, b, seq, val FROM ch",
+        )];
+        let (db, mut eng) = setup(&ctx, id, &ddl, &specs, &[]).await?;
+        let mut sc = db.conn().await?;
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+
+        // Show (do not hard-assert) the row-key index columns: the EXPLAIN below is the real proof,
+        // but this confirms the row key really leads with the FK (a, b) rather than some other set,
+        // so the read filters indexed columns. (A hard `ensure!` here risks brittleness if a family
+        // names the index PRIMARY vs _lv_row differently; EXPLAIN settles the index-usage question.)
+        let rk = scalar(
+            &mut sc,
+            &format!(
+                "SELECT GROUP_CONCAT(CONCAT(INDEX_NAME,':',SEQ_IN_INDEX,'=',COLUMN_NAME) \
+                 ORDER BY INDEX_NAME, SEQ_IN_INDEX) FROM information_schema.STATISTICS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} \
+                 AND INDEX_NAME IN ('PRIMARY', '_lv_row')",
+                q(id)
+            ),
+        )
+        .await?;
+        ctx.log(format!("[{id}] two-col row-key index columns: {rk:?}"));
+
+        // EXPLAIN the read the engine issues, in both orders the SET gate admits (forward = the FK's
+        // declared order, reverse = the order the SET-equality gate also admits). Each must be served
+        // by the row-key index, never a full scan of the materialized table.
+        //
+        // It probes the READ THE ENGINE ISSUES — `SELECT <units> ... WHERE <fk cols> IN (...)` —
+        // without `DISTINCT`: the engine's `read_materialized` de-duplicates on the client, so the
+        // statement it sends is a plain row read (the same `MvFilter::Keys` `lineage_lookup` uses),
+        // which must plan a base-table access, so the assertion exercises the row-key index on every
+        // family. Reading the plan BY COLUMN NAME because MariaDB's `EXPLAIN` has no `partitions`/
+        // `filtered` columns where MySQL's does, so positional reads skew between families.
+        //
+        // A plan is accepted when it is either (a) an index access on the row key (range/ref/eq_ref
+        // on PRIMARY / _lv_row), or (b) fully eliminated by the optimizer (`type` NULL — MySQL 9.7
+        // proves the projection is satisfied from the constant key tuples and reads no base table at
+        // all, the strongest no-scan outcome). Only a scan (`ALL`, or a full-index `index` scan) is
+        // rejected. So a real regression to an unindexed scan fails the leg with the flavor named.
+        for (order, where_) in [
+            ("forward", "(a, b) IN ((1, 1), (2, 1), (3, 1))"),
+            ("reverse", "(b, a) IN ((1, 1), (1, 2), (1, 3))"),
+        ] {
+            let sql = format!("EXPLAIN SELECT a, b, seq FROM `{id}` WHERE {where_}");
+            let plan: Vec<mysql_async::Row> = sc.query(sql.as_str()).await?;
+            let row = plan
+                .first()
+                .with_context(|| format!("no EXPLAIN row for the {order} two-column read"))?;
+            let ty: Option<String> = row.get("type");
+            let key: Option<String> = row.get("key");
+            ctx.log(format!(
+                "[{id}] two-col EXPLAIN {order}: type={ty:?} key={key:?}"
+            ));
+            let eliminated = ty.is_none();
+            let index_read = matches!(
+                ty.as_deref(),
+                Some("range") | Some("ref") | Some("eq_ref") | Some("const") | Some("system")
+            ) && matches!(key.as_deref(), Some("PRIMARY") | Some("_lv_row"));
+            ensure!(
+                eliminated || index_read,
+                "the {order} two-column name read must use the row-key index (PRIMARY / _lv_row) \
+                 or be optimizer-eliminated (no base-table read), never a full scan: \
+                 type={ty:?} key={key:?}"
+            );
+        }
+
+        // Now the gap-window parent delete: two parent keys vanish, so two 2-position name_pending
+        // entries; the flush names their children with one bounded read per route.
+        eng.stop().await?;
+        exec_all(
+            &mut sc,
+            &["DELETE FROM p2 WHERE (a, b) IN ((1, 1), (1, 2))"],
+        )
+        .await?;
+        let mut eng = ctx.start_engine(&db, &[])?;
+        wait_ready(&mut sc, &mut eng, &names(&specs), t_ready()).await?;
+        let f0 = eng.snapshot();
+        eng.wait_caught_up(&mut sc, t_catchup()).await?;
+        wait_until(
+            "the replayed two-column parent delete counted as a gap in /stats",
+            std::time::Duration::from_secs(15),
+            || {
+                let s = eng.view_stats(&db, id);
+                async move { Ok(s.is_some_and(|s| s.cascade_gaps >= 1)) }
+            },
+        )
+        .await?;
+        verify(
+            &ctx,
+            &mut eng,
+            &db,
+            &specs,
+            "the rows the replayed two-column parent delete removed",
+        )
+        .await?;
+        let s = eng.stats_of(&db, id)?;
+        let d = eng.snapshot().since(&f0);
+        ctx.log(format!(
+            "[{id}] two-col counters: cascade_children_named={} cascade_gap_mark_all={} \
+             whole_view_refreshes={}",
+            d.cascade_children_named, d.cascade_gap_mark_all, s.whole_view_refreshes
+        ));
+        ensure!(
+            s.cascade_gaps >= 1
+                && s.whole_view_refreshes == 0
+                && d.full_rebuilds == 0
+                && d.cascade_children_named >= 1
+                && d.cascade_gap_mark_all == 0,
+            "the two-column nameable route must NAME the vanished children from the materialized \
+             table (cascade_children_named >= 1, cascade_gap_mark_all == 0), not fall back and not \
+             rebuild: {s:?} {}",
+            fmt_snapshot(&d)
+        );
         eng.stop().await
     });
 }

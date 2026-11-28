@@ -1521,7 +1521,10 @@ fn units_bytes(units: &UnitSet, partial: &[UnitSet]) -> usize {
 /// Estimated memory of a change buffer, from the sizes of its sets (no walk over the keys).
 fn buffer_bytes(d: &ViewDirty) -> usize {
     units_bytes(&d.units, &d.partial)
-        + (d.images.iter().map(HashSet::len).sum::<usize>() + d.marks.len() + d.holds.len())
+        + (d.images.iter().map(HashSet::len).sum::<usize>()
+            + d.marks.len()
+            + d.holds.len()
+            + d.name_pending.len())
             * KEY_BYTES
 }
 
@@ -8820,6 +8823,15 @@ impl Engine {
         recent: &mut Lookback,
         since: Option<&Position>,
     ) -> Result<Refreshed> {
+        // The feed (accumulate) decided a gap window's vanished children could not be named and
+        // reported the whole-view fallback on the buffer; count it here, where the Metrics live, not
+        // in accumulate (lv-super ruling), and before the supervised dispatch so both refresh paths
+        // charge it. Taken from the buffer so a retried refresh of the same changes does not count
+        // the one decision twice.
+        Metrics::add(
+            &self.metrics.cascade_gap_mark_all,
+            std::mem::take(&mut dirty.gap_mark_all),
+        );
         if self.sup.is_some() {
             let mut p = self
                 .prepare_refresh(plan, layout, dirty, targets, table, recent, since)
@@ -8923,6 +8935,14 @@ impl Engine {
             plan,
             layout,
             (&dirty.marks, &dirty.holds),
+            (targets, table),
+            &mut units,
+        )
+        .await?;
+        self.name_lookups(
+            plan,
+            layout,
+            &dirty.name_pending,
             (targets, table),
             &mut units,
         )
@@ -9045,6 +9065,14 @@ impl Engine {
                 plan,
                 layout,
                 (&dirty.marks, &dirty.holds),
+                (targets, table),
+                &mut units,
+            )
+            .await?;
+            self.name_lookups(
+                plan,
+                layout,
+                &dirty.name_pending,
                 (targets, table),
                 &mut units,
             )
@@ -9486,6 +9514,58 @@ impl Engine {
             Metrics::add(&self.metrics.lookup_queries, 1);
             for r in rows {
                 units.insert(r.unwrap().into_iter().map(Datum::from_value).collect());
+            }
+        }
+        Ok(())
+    }
+
+    /// Units of mapped cascade children that vanished in a gap window and the route can name (see
+    /// `ViewDirty::name_pending`). Groups the pending old keys by route and does ONE chunked
+    /// `SELECT DISTINCT <units> ... WHERE <name_cols> IN (<all old keys>)` of the materialized
+    /// table per (view, route) per flush — not one read per key — bounded by params/bytes like the
+    /// key lookups. The read is served by an index: the analyzer only sets `name_cols` when the FK
+    /// columns are a leading prefix of the view's row key (the `_lv_row` / PRIMARY index), so it is
+    /// an index range, never a full scan of the materialized table (which would cost more than the
+    /// whole-view refresh it replaces).
+    async fn name_lookups(
+        &mut self,
+        plan: &ViewPlan,
+        layout: &Layout,
+        pending: &[(usize, Key)],
+        (targets, table): (&[String], &str),
+        units: &mut UnitSet,
+    ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // Group by route so a flush with many windows pays one chunked read per route, not per key.
+        let mut by_route: std::collections::BTreeMap<usize, UnitSet> =
+            std::collections::BTreeMap::new();
+        for (ci, old) in pending {
+            by_route.entry(*ci).or_default().insert(old.clone());
+        }
+        for (ci, set) in by_route {
+            let Some(cols) = plan.cascades[ci].name_cols.as_ref() else {
+                continue;
+            };
+            let per = name_chunk_per(self.cfg.query_chunk, cols.len());
+            for chunk in set.chunks(per) {
+                self.metrics.beat();
+                let rows = self
+                    .read_materialized(
+                        targets,
+                        table,
+                        layout,
+                        target::MvFilter::Keys {
+                            chunk: &chunk,
+                            cols,
+                        },
+                    )
+                    .await?;
+                Metrics::add(&self.metrics.cascade_children_named, rows.len() as u64);
+                for r in rows {
+                    units.insert(r.into_iter().map(Datum::from_value).collect());
+                }
             }
         }
         Ok(())
@@ -10349,6 +10429,15 @@ fn finish_refresh(
 
 /// Placeholders per statement (the server limit is 65535).
 const MAX_FILTER_PARAMS: usize = 60_000;
+
+/// The per-chunk key count of the bounded name read (see [`Engine::name_lookups`]): `query_chunk`
+/// keys, but no more than the statement can carry — `MAX_FILTER_PARAMS` placeholders divided by the
+/// columns per key (`cols`), so a `cols == 2` read chunks at `MAX_FILTER_PARAMS / 2` (not 2 × the
+/// single-column limit), keeping one chunked `IN` per (view, route) per flush within the server cap.
+/// `cols` of 0 (a route with no FK) or a `query_chunk` of 0 still yields at least 1.
+fn name_chunk_per(query_chunk: usize, cols: usize) -> usize {
+    query_chunk.min(MAX_FILTER_PARAMS / cols.max(1)).max(1)
+}
 
 /// A lagging target is reported down after this many failed retries.
 const LAG_MAX_FAILURES: u32 = 5;
@@ -11315,6 +11404,25 @@ mod lock_task_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bounded name read's chunk split for a two-column route: `query_chunk` keys, capped by the
+    /// statement's placeholder budget divided by the COLUMNS per key — so `cols == 2` splits at
+    /// `MAX_FILTER_PARAMS / 2`, half the single-column limit (the guard's `MAX_FILTER_PARAMS / cols`
+    /// boundary), and never empties to 0 for a degenerate `cols` / `query_chunk`.
+    #[test]
+    fn name_lookups_chunks_by_params_over_columns() {
+        // A wide query_chunk is capped by the params budget: cols == 2 halves the single-column split.
+        assert_eq!(name_chunk_per(usize::MAX, 1), MAX_FILTER_PARAMS);
+        assert_eq!(name_chunk_per(usize::MAX, 2), MAX_FILTER_PARAMS / 2);
+        assert_eq!(name_chunk_per(usize::MAX, 3), MAX_FILTER_PARAMS / 3);
+        // A small query_chunk wins when it is below the params cap.
+        assert_eq!(name_chunk_per(64, 2), 64);
+        assert_eq!(name_chunk_per(64, 1), 64);
+        // Degenerate inputs never split to zero (a chunk of 0 would loop forever).
+        assert_eq!(name_chunk_per(0, 2), 1);
+        assert_eq!(name_chunk_per(0, 0), 1);
+        assert_eq!(name_chunk_per(10, 0), 10);
+    }
 
     /// The rule the fixed-size position statement obeys, measured at the shape CI caught:
     /// `chaos_lock_blackhole_takeover` failed on four flavors because a refused set write had moved
