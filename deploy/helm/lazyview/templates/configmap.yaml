@@ -1,0 +1,22 @@
+{{/*
+The non-secret settings, the counterpart of the kustomize configMapGenerator over base/config.env.
+Unlike the generator this name is stable, so the Deployment rolls the pods on a change through the
+checksum annotation of the pod template instead of through a hashed name.
+
+Nothing here is a credential: a key whose name says credential fails the render (see
+lazyview.config), and credentials come from the Secret named by secret.existingSecret.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lazyview.configMapName" . }}
+  labels:
+    {{- include "lazyview.componentLabels" (dict "root" . "component" "config") | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{- range $key, $value := (include "lazyview.config" . | fromYaml) }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

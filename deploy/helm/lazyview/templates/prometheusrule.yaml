@@ -1,0 +1,58 @@
+{{/*
+The alert rules of components/prometheus, behind the same `prometheus.enabled` switch as the
+ServiceMonitor (each is separately optional through its own `enabled`). Needs the Prometheus
+Operator CRDs.
+*/}}
+{{- if and .Values.prometheus.enabled .Values.prometheus.rules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "lazyview.fullname" . }}
+  labels:
+    {{- include "lazyview.componentLabels" (dict "root" . "component" "metrics") | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    {{- if .Values.prometheus.rules.groups }}
+    {{- toYaml .Values.prometheus.rules.groups | nindent 4 }}
+    {{- else }}
+    {{- $rules := .Files.Get "files/default-rules.yaml" }}
+    {{- if not $rules }}
+    {{- fail "files/default-rules.yaml is missing from the chart (it holds the default alert rules)" }}
+    {{- end }}
+    {{/*
+    The rules are not a template (they carry Prometheus `{{ $labels.x }}` expansions), so they live
+    under files/ and name this release through these two tokens. Exact names, never a substring
+    match: a rule that also matches another release can hide its own outage, and a rule that stops
+    matching when nameOverride / fullnameOverride drops "lazyview" from the names is a down alert
+    that never fires.
+    */}}
+    {{- $rules = $rules | replace "__LV_METRICS_SERVICE__" (include "lazyview.metricsServiceName" .)
+             | replace "__LV_DEPLOYMENT__" (include "lazyview.fullname" .) }}
+    {{/*
+    Absolute guard, not a spot check: a marker that survives the substitution above is a token this
+    template does not know, and one of those in a rendered rule is an alert whose selector matches
+    nothing, so it never fires — worse than a red install. The render therefore aborts on ANY marker
+    left, and names each one it found, because the usual cause is the two files disagreeing on a
+    token name (or a comment in files/ spelling the prefix, which no guard can tell from a token).
+    Nothing here may relax this to a substring match or drop a token to buy a green render.
+    */}}
+    {{- $left := list }}
+    {{- range $word := splitList " " (replace "\t" " " (replace "\n" " " $rules)) }}
+    {{-   if contains "__LV_" $word }}
+    {{-     $left = append $left $word }}
+    {{-   end }}
+    {{- end }}
+    {{- if $left }}
+    {{- fail (printf "an alert-rule selector token was not substituted (%s): files/default-rules.yaml and templates/prometheusrule.yaml disagree (the template substitutes only __LV_METRICS_SERVICE__ and __LV_DEPLOYMENT__)" (join ", " $left)) }}
+    {{- end }}
+    {{- $groups := (fromYaml $rules).groups }}
+    {{- if not $groups }}
+    {{- fail "files/default-rules.yaml must define a non-empty `groups` list" }}
+    {{- end }}
+    {{- toYaml $groups | nindent 4 }}
+    {{- end }}
+{{- end }}

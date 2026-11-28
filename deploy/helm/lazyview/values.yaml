@@ -1,0 +1,383 @@
+# Default values for the lazyview chart.
+#
+# `helm install lazyview deploy/helm/lazyview -n lazyview` renders the same pod the kustomize base
+# (deploy/k8s/base) ships today: one active instance with the `setup` initContainer, the probes
+# that make rollouts and drains work, and the metrics Service. Everything below is safe as it is.
+#
+# Credentials are the one thing this chart never carries. `secret.existingSecret` is a NAME: the
+# Secret itself (LAZYVIEW_HOST/_PORT/_USER/_PASSWORD/_DATABASE, or LAZYVIEW_DSN, plus the
+# LAZYVIEW_TARGET_* keys) is yours to create out of band, and no credential value is ever read
+# from values.yaml or written into a ConfigMap. A key under `config` whose name looks like a
+# credential fails the render instead of leaking it.
+
+# -- Overrides the chart name: the `app.kubernetes.io/name` label and the prefix of every name.
+nameOverride: ""
+# -- Overrides every generated name. Leave it empty: installing the release as `lazyview` already
+# produces the names the kustomize base uses (`lazyview`, `lazyview-metrics`, `lazyview-config`),
+# which is what the alert rules of components/prometheus select on.
+fullnameOverride: ""
+
+# -- Labels added to every object of this chart.
+commonLabels: {}
+# -- Annotations added to every object of this chart.
+commonAnnotations: {}
+
+image:
+  # -- Image repository. `edge` (the default tag while no release is tagged) is the latest build
+  # of main: pin a release tag, a `sha-<commit>` tag or a digest in production.
+  repository: ghcr.io/kirmorozov/lazyview
+  # -- Image tag. Empty means .Chart.AppVersion.
+  tag: ""
+  # -- Image pull policy. The image is distroless and the tag is mutable, so pin a digest and use
+  # IfNotPresent, or Always if you stay on a moving tag.
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets (names of Secrets of the same namespace). The public image needs none.
+imagePullSecrets: []
+
+# -- Number of pods. lazyview's model is a single instance that exits on fatal errors, is
+# restarted by Kubernetes and resumes from the saved binlog position. Set 2 for a hot standby:
+# the replicas compete for a MySQL named lock (GET_LOCK) on the source, the loser waits (alive,
+# /readyz "hot standby") and takes over within about 5 s of the winner releasing the lock. A pod
+# whose node died keeps the lock only until the source waits out the lock session's own
+# `wait_timeout`, which that session sets to LAZYVIEW_LOCK_LEASE_MS (20 s) and beats with a
+# heartbeat of its own (a `DO 1` and an ownership check every LAZYVIEW_LOCK_HEARTBEAT_MS, 5 s): the
+# standby streams after about one lease plus its own poll and its start, with no `KILL`, no database
+# restart and no human in the loop. Set the lease from your recovery objective — it is the time a
+# partitioned node still holds the lock; both knobs go under `config` below. Lowering the server's
+# `wait_timeout` or the host's `net.ipv4.tcp_keepalive_*` is no longer required for that recovery.
+replicas: 1
+
+# -- Old ReplicaSets to keep for `kubectl rollout undo`.
+revisionHistoryLimit: 5
+# -- A rollout that does not progress for this long (database unreachable, image pull errors) is
+# reported as failed. New pods become Ready as standbys within seconds.
+progressDeadlineSeconds: 600
+
+# -- The Deployment's update strategy. maxSurge 1 / maxUnavailable 0 is what the base ships: the
+# new pod starts as a standby and becomes Ready before an old pod is terminated, so a rollout
+# never leaves the deployment without a pod. A rollout replaces the active pod, so a view build
+# in progress starts over on the new active pod. `Recreate` also works but stops everything first.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# -- Seconds the pod gets to shut down after SIGTERM (stop reading the binlog, flush buffered
+# changes, save the position, release the lock). A kill after the grace period is safe too: the
+# changes since the saved position are re-applied idempotently, it only means more work for the
+# next instance.
+terminationGracePeriodSeconds: 60
+
+# -- The `setup` initContainer: `lazyview setup` creates and migrates lazyview's own tables
+# (definitions, state, status, fence) and validates every enabled definition. The service
+# container never issues DDL on those tables: it refuses to start and names `lazyview setup`.
+# This run is idempotent and runs on every pod start, so a rollout with a new image is also the
+# upgrade step; a failed setup fails the pod and the rollout reports it (`kubectl rollout undo`).
+setup:
+  enabled: true
+  # -- Arguments of the setup container.
+  args:
+    - setup
+  # -- Resources of the setup container.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# -- The Secret this release reads its credentials from, by NAME only (see the header). Create it
+# once, then restart the pods after changing it (`kubectl rollout restart deployment/lazyview`):
+#   kubectl -n lazyview create secret generic lazyview-db \
+#     --from-literal=LAZYVIEW_HOST=db.example.com --from-literal=LAZYVIEW_PORT=3306 \
+#     --from-literal=LAZYVIEW_USER=lazyview --from-literal=LAZYVIEW_PASSWORD='change-me' \
+#     --from-literal=LAZYVIEW_DATABASE=app
+# The Secret is read at container start. Keys are used verbatim (no URL encoding); LAZYVIEW_DSN
+# works instead of the separate keys, and extra targets take LAZYVIEW_TARGET_<NAME>_HOST/_USER/
+# _PASSWORD/_DATABASE (or _DSN) plus LAZYVIEW_TARGETS.
+secret:
+  # -- Name of the existing Secret for both runs. Required when `secret.create` is false.
+  existingSecret: lazyview-db
+  # -- Name of the Secret the `setup` initContainer uses (the advanced two-account setup: a
+  # setup account with DDL on lazyview's own tables only, while the service account is DML-only).
+  # Empty means the same Secret as the service, which keeps a simple install one Secret.
+  setupSecret: ""
+
+# -- The non-secret settings, as the ConfigMap `lazyview-config` (every variable lazyview reads:
+# docs/configuration.md). The keys below mirror deploy/k8s/base/config.env. Values are rendered as
+# strings. Add any other LAZYVIEW_* key here; a key that looks like a credential (PASSWORD, DSN,
+# SECRET, TOKEN, ...) is refused: put it in the Secret instead.
+config:
+  # Must match the container port `http` (containerPort below). An unspecified address listens on
+  # IPv4 and IPv6.
+  LAZYVIEW_HEALTH_ADDR: 0.0.0.0:8080
+  LAZYVIEW_LOG_FORMAT: json
+  RUST_LOG: info
+  LAZYVIEW_START_MODE: resume
+  LAZYVIEW_BATCH_WINDOW_MS: "200"
+  # Probes (src/health.rs). /livez fails after this many seconds without engine progress (at
+  # least 30, and more than twice LAZYVIEW_HEARTBEAT_MS + 10 s).
+  LAZYVIEW_LIVENESS_STALL_SECS: "120"
+  # The same while booting: connecting (an unreachable host can take ~130 s per attempt),
+  # migrating metadata, and after taking the lock loading and resuming views.
+  LAZYVIEW_LIVENESS_BOOT_STALL_SECS: "900"
+  # /readyz tolerates a disconnected binlog stream this long (reconnects do not flap readiness).
+  LAZYVIEW_READY_DISCONNECT_GRACE_SECS: "30"
+  # true: a view in error state makes /readyz fail. Default false: reported, alert on
+  # lazyview_views_error instead (a broken definition must not block rollouts and node drains).
+  LAZYVIEW_READY_REQUIRE_ALL: "false"
+
+# -- Names of the instance. It names the row of the saved binlog position in `_lazyview_status`,
+# the MySQL named lock that makes one instance per (schema, id) active (the others are hot
+# standbys) and `_lazyview_fence`. It stays a value on purpose: every replica of one deployment
+# must share it, so it is deliberately NOT derived from the pod name. It lands in the ConfigMap as
+# LAZYVIEW_INSTANCE_ID; set `config.LAZYVIEW_INSTANCE_ID` to override it there directly.
+instanceId: default
+
+# -- Extra environment variables on both containers, as Kubernetes EnvVar objects. Use this for
+# variables lazyview does not own (an OTLP endpoint for the declarative config to substitute, a
+# proxy); the LAZYVIEW_* settings belong in `config` above.
+#
+# Example — OpenTelemetry identity through the standard resource attributes (the file named by
+# OTEL_CONFIG_FILE substitutes them; see the otel block below for the file itself). POD_NAME must
+# come first: `$(POD_NAME)` is expanded by kubelet from the variables defined before it, and the
+# pod name is unique per replica, so the active pod and its standby are told apart in the backend:
+#   extraEnv:
+#     - name: POD_NAME
+#       valueFrom:
+#         fieldRef:
+#           fieldPath: metadata.name
+#     - name: OTEL_RESOURCE_ATTRIBUTES
+#       value: >-
+#         service.name=lazyview,service.instance.id=$(POD_NAME),
+#         deployment.environment.name=production
+#     - name: OTEL_EXPORTER_OTLP_ENDPOINT
+#       value: http://otel-collector.observability:4317
+extraEnv: []
+
+# -- Extra envFrom entries on both containers (configMapRef / secretRef names you manage outside
+# this chart). The ConfigMap of this chart and the Secret of `secret.existingSecret` are added
+# before these.
+extraEnvFrom: []
+
+containerPort: 8080
+
+# -- The probes; their semantics are in src/health.rs. Keep the paths: `tests/health.rs` pins the
+# readiness path, and the rollout and drain behaviour of the base manifests depends on the
+# `standby=ok` / `building=ok` parameters (without standby=ok a new pod could never become Ready
+# while an old one holds the lock, so rollouts deadlock and the PodDisruptionBudget would block
+# every drain; without building=ok the deployment is unavailable for the whole of a long first
+# build and the ReplicaSet kills the not-ready builder, starting it over).
+probes:
+  # -- Set false only to debug a pod that must not be restarted or pulled from the Service.
+  enabled: true
+  # The process serves and the engine reports progress. It does not wait for the database: a pod
+  # restarted during a database outage would only be restarted again.
+  startup:
+    path: /startupz
+    periodSeconds: 2
+    timeoutSeconds: 3
+    failureThreshold: 30
+  # Restarts about 30 s after the stall limit is reached. Fails only when the engine loop is
+  # wedged: no progress for LAZYVIEW_LIVENESS_STALL_SECS, or for LAZYVIEW_LIVENESS_BOOT_STALL_SECS
+  # while booting (which also covers the boot after a standby took over). Never because of long
+  # builds, the database being down, lag, views in error or standby.
+  liveness:
+    path: /livez
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  # A healthy member of the pair: a standby connected to the source and polling the lock, or the
+  # active pod streaming the binlog (first builds may still be running). Plain /readyz (humans,
+  # monitoring, lazyview_ready) is stricter.
+  readiness:
+    path: /readyz?standby=ok&building=ok
+    periodSeconds: 5
+    timeoutSeconds: 3
+    successThreshold: 1
+    failureThreshold: 3
+
+# -- Resources of the service container. Raise `limits.memory` before a large first build: the
+# build is streaming work, but a wide table with many modified rows per batch needs headroom.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "2"
+    memory: 512Mi
+
+# -- Pod-level securityContext. lazyview satisfies the `restricted` Pod Security Standard.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container-level securityContext, on both the service and the setup container. The image is
+# distroless: no shell, and it runs as 65532.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- The ServiceAccount. lazyview does not talk to the Kubernetes API, so no token is mounted.
+serviceAccount:
+  # -- Set false to use a ServiceAccount you manage, with `name`.
+  create: true
+  # -- Name of the ServiceAccount. Empty means the release's fullname (the base's `lazyview`).
+  name: ""
+  annotations: {}
+  # -- Mount the API token. Keep false.
+  automountServiceAccountToken: false
+
+# -- The metrics Service. lazyview serves nothing else than /metrics and the probe endpoints, so
+# this Service exists only for scraping.
+service:
+  # -- Service type. lazyview takes no user traffic; ClusterIP (or none) is what the base ships.
+  type: ClusterIP
+  # -- Publish pods that are not Ready too, so a pod that is building views or standing by is
+  # still scraped (lazyview_up must not drop during a build or a takeover).
+  publishNotReadyAddresses: true
+  # -- The port the Service listens on; targetPort is the container port `http`.
+  port: 8080
+  annotations: {}
+
+# -- The PodDisruptionBudget: voluntary disruptions (node drains) take one pod at a time. A healthy
+# standby and an active pod that streams the binlog are both Ready, so a drain is allowed whenever
+# both pods are healthy and waits only while the other pod is not. Evicting the active pod hands
+# over to the standby within seconds; a view build in progress starts over on the new active pod,
+# so avoid drains and rollouts during long builds. Pods that are not Ready never block a drain.
+pdb:
+  enabled: true
+  # -- How many pods may be unavailable during a voluntary disruption. Set this or minAvailable,
+  # not both.
+  maxUnavailable: 1
+  # -- Set instead of maxUnavailable to pin a number of healthy pods (needs 2+ replicas).
+  minAvailable: null
+  # -- Pods that are not Ready (crash-looping, still booting) never block a drain.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+
+# -- Restricts who may connect to port 8080. Kubelet probes come from the pod's own node, which
+# NetworkPolicy always allows. Egress (DNS, the databases) is not restricted here.
+networkPolicy:
+  # -- Off by default, like the kustomize component: only on a cluster with a CNI that enforces it.
+  enabled: false
+  # -- Namespace selectors allowed in (the namespace Prometheus runs in). Each entry is the
+  # matchLabels of a namespaceSelector.
+  allowFromNamespaces:
+    - kubernetes.io/metadata.name: monitoring
+  # -- Pod selectors within this release's namespace, added as further `from` terms.
+  allowFromPods: []
+  # -- Extra ingress rules, appended to the generated one, as NetworkPolicyIngressRule objects.
+  extraIngress: []
+
+# -- Prometheus Operator objects. Both are optional: leave `enabled` false on a cluster without
+# the Prometheus Operator (the CRDs must exist, or the install fails).
+prometheus:
+  enabled: false
+  serviceMonitor:
+    # -- Scrape /metrics of every lazyview pod (active and standby) through the metrics Service.
+    enabled: true
+    # -- Scrape interval and timeout.
+    interval: 30s
+    scrapeTimeout: 10s
+    # -- Extra labels on the ServiceMonitor. kube-prometheus-stack only picks up ServiceMonitors
+    # carrying its `release: <name>` label by default (or set
+    # serviceMonitorSelectorNilUsesHelmValues=false):
+    #   labels:
+    #     release: kube-prometheus-stack
+    labels: {}
+    # -- Optional relabelings / metricRelabelings, as Endpoint objects.
+    relabelings: []
+    metricRelabelings: []
+  rules:
+    # -- The alert rules of components/prometheus (LazyviewDown, LazyviewUnavailable,
+    # LazyviewNotScraped, LazyviewNotStreaming, LazyviewViewsInError, LazyviewViewsNotLive,
+    # LazyviewRefreshFailing, LazyviewRefreshErrors, LazyviewViewBehindSource,
+    # LazyviewBinlogReadingPaused, LazyviewBinlogReadingStuck, LazyviewTargetBehind,
+    # LazyviewViewMetricAbsent, LazyviewStreamUndecodable). They alert on what the probes
+    # deliberately ignore, because a restart would not fix those. They are the same set the
+    # kustomize component ships, and the render check fails on any rule the chart drops.
+    enabled: true
+    # -- Set to your own rule groups (PrometheusRule spec.groups) to replace the shipped ones.
+    # Leave empty to get the chart's own defaults, which select on this release's names.
+    groups: []
+
+# -- OpenTelemetry: an operator-provided configuration file for the SDK, mounted at
+# `otel.mountPath/otel.fileName` and named by `OTEL_CONFIG_FILE`. The contract is that variable:
+# unset means telemetry is OFF. So when `otel.enabled` is false the pod gets no OTEL_CONFIG_FILE at
+# all, no volume and no telemetry path initialised — off stays free.
+#
+# The mount (a ConfigMap, or a Secret when the file carries an endpoint credential, plus
+# OTEL_CONFIG_FILE pointing at it) is lv-super's ruling, not an owner ruling.
+#
+# This chart deliberately ships no example of the file: its document (the OpenTelemetry
+# declarative-configuration model) is defined and parsed by the otel program's phase 1
+# (tmp/out/lvs-otel-expert/PROGRAM.md) and documented in docs/configuration.md, which is what to
+# read before writing one. Its format is lv-super's call too, so nothing here names an extension in
+# stone: `otel.fileName` and `otel.key` are values, and the default is the path the docs promise.
+# Set `otel.config` to your own file, or keep it outside this chart and name it with
+# `otel.existingConfigMap` / `otel.existingSecret`.
+#
+# Identity comes from the standard resource attributes, not from a lazyview variable: put
+# service.name and service.instance.id in OTEL_RESOURCE_ATTRIBUTES (see extraEnv above, with the pod
+# name through the downward API), and let the file substitute them. Nothing here reads
+# LAZYVIEW_INSTANCE_ID: that variable is lazyview's own instance name, not telemetry.
+#
+# There is no collector in this chart. The otel program's phase 3 owns the collector component.
+otel:
+  # -- Off by default: telemetry is opt-in, and off must cost nothing.
+  enabled: false
+  # -- Directory the file is mounted at (read-only), and the directory part of OTEL_CONFIG_FILE.
+  mountPath: /etc/lazyview/otel
+  # -- File name inside mountPath. OTEL_CONFIG_FILE is mountPath/fileName.
+  fileName: config.yaml
+  # -- Key inside the ConfigMap or Secret that holds the file.
+  key: config.yaml
+  # -- Read the file from an existing Secret by name instead of the `config` below (use this when
+  # the file embeds an exporter header or a client certificate). The volume then projects that
+  # Secret's `key`; nothing of it is ever rendered into this chart's output.
+  existingSecret: ""
+  # -- Read the file from an existing ConfigMap by name instead of `config` below (this chart then
+  # creates no ConfigMap for it).
+  existingConfigMap: ""
+  # -- The config itself, rendered into a ConfigMap of this release unless existingSecret /
+  # existingConfigMap names another source. There is deliberately NO example of it here: the
+  # document's keys and its format belong to the OpenTelemetry declarative-configuration model that
+  # the otel program's phase 1 implements (tmp/out/lvs-otel-expert/PROGRAM.md; the reader is what
+  # decides the format), and they are documented in docs/configuration.md. Ship your own file with
+  # `config: |`-style block scalar, or keep it outside this chart and name the object. It must be
+  # non-empty when otel.enabled is true, or the render fails.
+  config: ""
+
+# -- Extra volumes on the pod (EnvVar-free additions; the otel config volume is added by the
+# `otel` block).
+extraVolumes: []
+# -- Extra volumeMounts on the service container. The otel config volume is mounted by the
+# `otel` block, on both containers.
+extraVolumeMounts: []
+
+# -- Node selection and scheduling.
+nodeSelector: {}
+tolerations: []
+# -- Full affinity block. When set, it replaces the generated podAntiAffinity below.
+affinity: {}
+# -- Keeps the active pod and its standby on different nodes when possible, so one node failure
+# never takes both (see the node failure note under `replicas`). The chart generates the preferred
+# term itself, selecting on this release's labels. Set false to drop it.
+spreadAcrossNodes: true
+# -- Your own podAntiAffinity block; it replaces the generated one.
+podAntiAffinity: {}
+
+# -- Extra pod labels and annotations (a checksum annotation for the ConfigMap is added by the
+# chart, so a config change rolls the pods).
+podLabels: {}
+podAnnotations: {}

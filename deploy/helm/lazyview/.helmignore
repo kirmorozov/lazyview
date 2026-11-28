@@ -1,0 +1,37 @@
+# Version control and editor files.
+.git/
+.gitignore
+.gitattributes
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.bak
+*.tmp
+*.swp
+*~
+.project
+.idea/
+*.tmproj
+.vscode/
+
+# macOS
+.DS_Store
+
+# Charts and rendered output must never end up inside a packaged chart.
+*.tgz
+*.tar.gz
+rendered/
+output/
+values-render-check*.yaml
+
+# Local overrides: a developer's values file is not part of the chart (it usually holds the
+# credentials this chart deliberately refuses to carry).
+values.local.yaml
+secrets*.yaml
+
+# Documentation and tests that belong to the repository, not to the packaged chart.
+README.md.gotmpl
+__pycache__/
+*.pyc

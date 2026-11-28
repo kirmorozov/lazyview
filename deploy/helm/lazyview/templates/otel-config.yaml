@@ -1,0 +1,25 @@
+{{/*
+The operator-provided declarative config for OpenTelemetry, mounted at otel.mountPath and named by
+OTEL_CONFIG_FILE. Rendered only when otel.enabled and the file comes from `otel.config`: name an
+existing object with otel.existingConfigMap, or (when the file embeds an exporter header or a
+client certificate) otel.existingSecret, and this object is not created.
+
+The file is not a secret by itself, but it is configuration that changes behaviour, so treat it
+like one when it references credentials: keep those in the pod's environment (the SDK substitutes
+${VAR} from it) and mount the file from a Secret.
+*/}}
+{{- if and .Values.otel.enabled (not .Values.otel.existingSecret) (not .Values.otel.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lazyview.otelConfigMapName" . }}
+  labels:
+    {{- include "lazyview.componentLabels" (dict "root" . "component" "otel") | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{ .Values.otel.key }}: |
+    {{- .Values.otel.config | nindent 4 }}
+{{- end }}

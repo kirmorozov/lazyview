@@ -1,0 +1,30 @@
+{{/*
+Only for scraping /metrics: lazyview serves no other traffic. Not-ready pods are published too, so
+a pod that is building views or standing by is still scraped (lazyview_up must not drop during a
+build or a takeover).
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lazyview.metricsServiceName" . }}
+  labels:
+    {{- include "lazyview.componentLabels" (dict "root" . "component" "metrics") | nindent 4 }}
+  {{- if or .Values.service.annotations .Values.commonAnnotations }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.service.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  publishNotReadyAddresses: {{ .Values.service.publishNotReadyAddresses }}
+  selector:
+    {{- include "lazyview.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
