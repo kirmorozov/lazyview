@@ -3165,8 +3165,16 @@ impl AtRest {
 /// statement: whether a write op is admitted in the milliseconds before the instance's own beat reads
 /// the moved epoch is a race (1 leg in the 15 chaos cells that ran it), and a bar that fails only on a
 /// race tests nothing. Needs no engine and no database, like the rest of the self-tests.
+///
+/// The name starts with `chaos_` so CI runs it: the chaos binary is invoked twice, by the two filters
+/// of the chaos cells (`.github/workflows/ci.yml`: `selftest_toxi_` in *toxi self-tests*, `chaos_
+/// --skip chaos_tgt_pg_` in *chaos scenarios*), and a name matching neither — `selftest_frozen_bar…`,
+/// the first shape of this pin — is compiled and never executed there. The prefix is what makes it a
+/// pin: the *chaos scenarios* step is required (`scripts/chaos-gate.sh`, no `continue-on-error`), so a
+/// bar that stops counting writes turns the chaos cells red instead of rotting quietly. It skips
+/// nothing, so `LAZYVIEW_TEST_STRICT=chaos_` is satisfied by running it.
 #[test]
-fn selftest_frozen_bar_counts_writes_not_target_reads() {
+fn chaos_selftest_frozen_bar_counts_writes_not_target_reads() {
     // The exact numbers of the red (job 140755328056): two `read_old` SELECTs, no write. The bar that
     // also required `mv_queries` to stand still refused this — a fenced instance reading the target
     // on its way out, writing nothing.
