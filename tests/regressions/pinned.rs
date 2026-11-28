@@ -1582,14 +1582,17 @@ fn reg_cascade_window_named_branch_aliased_fk() {
 /// `ch(a, b, seq, val)` has `PRIMARY KEY (a, b, seq)` and a cascade FK `FK (a, b) -> p2 (a, b)`;
 /// the child-only view `SELECT a, b, seq, val FROM ch` is therefore nameable with
 /// `name_cols == [a, b]` (the FK is the leading row-key SET). This is the shape lv-super asked to
-/// exercise end to end: the bounded `SELECT DISTINCT <units> WHERE (a, b) IN (…)` of the
-/// materialized table, its 2-position read, and — the point — proof that the read is served by the
-/// row-key index on EVERY family, never a full scan. Two probes run `EXPLAIN` of the read the
-/// engine issues, in the FK's declared (forward) order and in the reverse order the SET-equality
-/// gate also admits, asserting the optimizer picks the `PRIMARY` / `_lv_row` index (type range/ref),
-/// and a `STATISTICS` read pins that the row-key index really leads with `(a, b)`. Then the gap-
-/// window parent delete names the vanished children across two parent keys (two 2-position
-/// `name_pending` entries), so `cascade_children_named >= 1` and the view is exact.
+/// exercise end to end: the bounded read of the materialized table `SELECT <units> WHERE (a, b) IN
+/// (…)` (the same `MvFilter::Keys` `lineage_lookup` uses; the engine de-dups on the client, so the
+/// statement itself is a plain row read), its 2-position key, and — the point — proof that the read
+/// is served by the row-key index on EVERY family, never a full scan. Two probes `EXPLAIN` the read
+/// in the FK's declared (forward) order and in the reverse order the SET-equality gate also admits,
+/// accepting an index access on `PRIMARY` / `_lv_row` (range/ref/eq_ref) OR an optimizer-eliminated
+/// plan (`type` NULL — MySQL 9.7 proves the projection comes from the constant key tuples and reads
+/// no base table), and rejecting any scan (`ALL` / full-index `index`). A `STATISTICS` read shows the
+/// row-key index really leads with `(a, b)`. Then the gap-window parent delete names the vanished
+/// children across two parent keys (two 2-position `name_pending` entries), so
+/// `cascade_children_named >= 1` and the view is exact.
 ///
 /// The chunk split at `query_chunk.min(MAX_FILTER_PARAMS / cols)` for `cols == 2` is locked by the
 /// lib unit test `name_lookups_chunks_by_params_over_columns`; here two parent keys exercise the
@@ -1635,26 +1638,46 @@ fn reg_cascade_window_named_branch_two_col() {
         .await?;
         ctx.log(format!("[{id}] two-col row-key index columns: {rk:?}"));
 
-        // EXPLAIN the read the engine issues, in both orders the SET gate admits. Each must be a
-        // range/ref on the row-key index, never an ALL scan of the materialized table.
+        // EXPLAIN the read the engine issues, in both orders the SET gate admits (forward = the FK's
+        // declared order, reverse = the order the SET-equality gate also admits). Each must be served
+        // by the row-key index, never a full scan of the materialized table.
+        //
+        // It probes the READ THE ENGINE ISSUES — `SELECT <units> ... WHERE <fk cols> IN (...)` —
+        // without `DISTINCT`: the engine's `read_materialized` de-duplicates on the client, so the
+        // statement it sends is a plain row read (the same `MvFilter::Keys` `lineage_lookup` uses),
+        // which must plan a base-table access, so the assertion exercises the row-key index on every
+        // family. Reading the plan BY COLUMN NAME because MariaDB's `EXPLAIN` has no `partitions`/
+        // `filtered` columns where MySQL's does, so positional reads skew between families.
+        //
+        // A plan is accepted when it is either (a) an index access on the row key (range/ref/eq_ref
+        // on PRIMARY / _lv_row), or (b) fully eliminated by the optimizer (`type` NULL — MySQL 9.7
+        // proves the projection is satisfied from the constant key tuples and reads no base table at
+        // all, the strongest no-scan outcome). Only a scan (`ALL`, or a full-index `index` scan) is
+        // rejected. So a real regression to an unindexed scan fails the leg with the flavor named.
         for (order, where_) in [
             ("forward", "(a, b) IN ((1, 1), (2, 1), (3, 1))"),
             ("reverse", "(b, a) IN ((1, 1), (1, 2), (1, 3))"),
         ] {
-            let sql = format!("EXPLAIN SELECT DISTINCT a, b, seq FROM `{id}` WHERE {where_}");
-            // Read the plan BY COLUMN NAME: MariaDB's `EXPLAIN` has no `partitions`/`filtered`
-            // columns where MySQL's does, so positional reads would skew between families.
+            let sql = format!("EXPLAIN SELECT a, b, seq FROM `{id}` WHERE {where_}");
             let plan: Vec<mysql_async::Row> = sc.query(sql.as_str()).await?;
             let row = plan
                 .first()
                 .with_context(|| format!("no EXPLAIN row for the {order} two-column read"))?;
             let ty: Option<String> = row.get("type");
             let key: Option<String> = row.get("key");
+            ctx.log(format!(
+                "[{id}] two-col EXPLAIN {order}: type={ty:?} key={key:?}"
+            ));
+            let eliminated = ty.is_none();
+            let index_read = matches!(
+                ty.as_deref(),
+                Some("range") | Some("ref") | Some("eq_ref") | Some("const") | Some("system")
+            ) && matches!(key.as_deref(), Some("PRIMARY") | Some("_lv_row"));
             ensure!(
-                matches!(ty.as_deref(), Some("range") | Some("ref") | Some("eq_ref"))
-                    && matches!(key.as_deref(), Some("PRIMARY") | Some("_lv_row")),
+                eliminated || index_read,
                 "the {order} two-column name read must use the row-key index (PRIMARY / _lv_row) \
-                 as a range/ref, not a scan: type={ty:?} key={key:?}"
+                 or be optimizer-eliminated (no base-table read), never a full scan: \
+                 type={ty:?} key={key:?}"
             );
         }
 
